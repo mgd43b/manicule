@@ -38,7 +38,7 @@ dependencies = [
 # (empty until then) so that the boundary between core and implementations is visible in one
 # place rather than discovered by accident.
 storage = [        # #2
-  "sqlalchemy[asyncio]>=2.0.36",
+  "sqlalchemy[asyncio]>=2.0.51",
   "aiosqlite>=0.20",
   "alembic>=1.14",
   "lancedb>=0.17",
