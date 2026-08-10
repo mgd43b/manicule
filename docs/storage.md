@@ -50,6 +50,7 @@ for anything except genuinely new content — which is what `original_ref` in
 
 ```
 <data_dir>/
+  manicule.lock            exclusive; one instance per directory
   manicule.db              SQLite — the authority
   manicule.db-wal
   manicule.db-shm
@@ -59,6 +60,10 @@ for anything except genuinely new content — which is what `original_ref` in
   blobs/                   immutable, content-addressed
     sha256/ab/cd/abcd…     retained original bytes
 ```
+
+`manicule.lock` is held for the process lifetime. The recovery sweep, the tombstone sweep and
+the blob GC all assume a single writer, and WAL permits several — so the assumption is enforced
+rather than hoped for ([`ingest.md`](ingest.md) §6.5).
 
 `<data_dir>` resolution and precedence belong to config
 ([#1](https://github.com/mgd43b/manicule/issues/1)). The only requirement storage places on
@@ -491,7 +496,7 @@ Anything fractional is carried as a string.
 |---|---|---|
 | `workspaces` | `id`, `name UNIQUE`, `mode`, `settings JSON` | `mode` gets a `CHECK` (`personal`/`team`) |
 | `workspace_members` | composite PK, `role` | **`api_key` column removed.** It held a raw, unhashed key — precisely what `api_keys.key_hash` exists to avoid. `api_keys` is the only key store. `role` gets a `CHECK` (`admin`/`member`/`viewer`) |
-| `connectors` | `type`, `config JSON`, `sync_interval_seconds`, `last_synced_at`, `status`, `error_message`, `deleted_at` | `config` validated by the connector's Pydantic schema, not stored blind. `UNIQUE (workspace_id, name) WHERE deleted_at IS NULL`. `watermark JSON` added — `Connector.discover` takes a watermark (`contracts.md` §3) and it has to persist somewhere; `last_synced_at` is a timestamp, and a watermark is not always a timestamp |
+| `connectors` | `type`, `config JSON`, `sync_interval_seconds`, `last_synced_at`, `status`, `error_message`, `deleted_at` | `config` validated by the connector's Pydantic schema, not stored blind. `UNIQUE (workspace_id, name) WHERE deleted_at IS NULL`. `watermark JSON` added — `Connector.discover` takes a watermark (`contracts.md` §3) and it has to persist somewhere; `last_synced_at` is a timestamp, and a watermark is not always a timestamp. `metadata JSON` added, matching `documents` — last-run counters live here ([`ingest.md`](ingest.md) §13.1), overwritten per run rather than accumulated, which is the right retention policy for a diagnostic |
 | `tags` | `UNIQUE(workspace_id, name)`, `color` | `workspace_id NOT NULL` |
 | `document_tags` | composite PK, both cascades | `WITHOUT ROWID` |
 | `collections` | `auto_rules JSON` | `UNIQUE (workspace_id, name)`; `workspace_id NOT NULL` |

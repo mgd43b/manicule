@@ -64,6 +64,46 @@ This is why `discover` takes a watermark and `fetch` takes a `DocRef`
 (`contracts.md` §3): they are separately schedulable, and the gap between them is where the
 skip decision lives.
 
+### 2.2 `Document.status` is this pipeline's state machine
+
+The enum belongs to [#1](https://github.com/mgd43b/manicule/issues/1), and both
+[`storage.md`](storage.md) §4.2 and [`parsing.md`](parsing.md) §6.4 name the members they
+depend on. Neither enumerates the whole set, because neither owns the transitions — **the
+pipeline does**, and it is the only component that sees every one. Collected here so #1 has a
+single place to read it from, since the value set is `CHECK`-constrained and extending it later
+means an Alembic batch rebuild (`storage.md` §3.4).
+
+```
+pending ──> fetching ──> parsing ──> parsed ──> embedding ──> indexed
+   ^            │            │          │           │            │
+   └── §6.4 sweep, from any non-terminal state      │            │
+                │            │          │           │            │
+                v            v          v           v            v
+          fetch_failed   parse_failed  middleware_failed    (stays indexed
+                         no_extractable_text                 on a failed
+                         unsupported_media_type              re-ingest, §9)
+                         container
+```
+
+| Member | Set by | Terminal | Servable |
+|---|---|---|---|
+| `pending` | discovery, or the §6.4 sweep | no | no |
+| `fetching` `parsing` `embedding` | the pipeline, in flight | no | no |
+| `parsed` | parse stage, ≥ 1 chunk (`parsing.md` §6.4) | no | no |
+| `indexed` | store stage, last write (`storage.md` §8.2 I3) | yes | **yes** |
+| `no_extractable_text` `parse_failed` `unsupported_media_type` `container` | parse stage (`parsing.md` §6.4) | yes | no |
+| `fetch_failed` | fetch stage | yes | no |
+| `middleware_failed` | any hook that raises (§3.2) | yes | no |
+
+Three of these are asserted by this document and by nothing else — `fetching`, `embedding` and
+`middleware_failed` — along with `fetch_failed`. They are named here rather than assumed
+because §6.4's recovery sweep selects on the non-terminal ones by name, and a sweep whose
+`WHERE` clause disagrees with the enum silently recovers nothing.
+
+**Only `indexed` is servable**, and that is enforced by the join in `storage.md` §6.2 rather
+than by anything here. Every other state is invisible to retrieval whatever exists in the
+derived stores, which is what makes an interrupted document harmless rather than wrong.
+
 ---
 
 ## 3. Middleware
@@ -151,8 +191,13 @@ is what it is.
 
 Undeclared mutation is not detectable at runtime, so this is a contract rather than a check —
 but a declared-but-inert middleware costs only a spurious re-index, while an undeclared active
-one silently corrupts the space. The default is therefore `True` for any hook at
-`after:parse`, `before:chunk` or `after:chunk`, and a plugin must opt *out*.
+one silently corrupts the space. The default is therefore `True` for every hook positioned
+where text can still reach the embedder — `after:parse`, `before:chunk`, `after:chunk` and
+**`before:embed`** — and a plugin must opt *out*.
+
+`before:embed` is the most direct case of the four and the easiest to overlook: it operates on
+chunks that are about to be embedded, so a rewrite there reaches `embed_text` with nothing
+downstream to normalise it away.
 
 ### 3.4 PII redaction, decided
 
@@ -200,6 +245,12 @@ avoids a parse, chunk and embed cycle — which is the expensive part, not the f
 
 **Level 1 exists because level 2 requires a fetch.** Over a rate-limited API across ten
 thousand pages, that difference is the whole sync.
+
+**A connector that supplies no `version_token` falls straight to level 2**, which means every
+sync fetches every document and the saving comes only from skipping parse, chunk and embed.
+That is correct rather than degraded — it is the best available behaviour when the source
+offers no change signal — but it is a materially different cost profile, so `doctor` reports
+which connectors are running without a token rather than leaving a slow sync unexplained.
 
 ### 4.1 A skip is not a no-op
 
@@ -310,7 +361,9 @@ for a resource limit to be missing, because that is where the malformed PDF gets
 | macOS | Parent polls child RSS (`psutil`) on a timer | Parent sends `SIGKILL` |
 
 `SIGKILL` works identically on both — verified, child exit code `-9`. `psutil` is a permissive
-(BSD) dependency already implied by the hardware detection in `PLAN.md` §16.
+(BSD) dependency and a natural fit alongside the hardware detection in `PLAN.md` §16, though
+nothing there requires it today; if that dependency is unwelcome, the macOS path can shell out
+to `ps`, at the cost of a fork per poll.
 
 The parent-side poll is a sampling check, so it can overshoot between ticks. That is accepted
 and stated: the goal is to stop a runaway before it takes the machine down, not to enforce a
@@ -588,8 +641,8 @@ owns when that sweep runs:
 
 - **The sweep is scheduled, not triggered by deletion** — otherwise a large reconciliation
   produces a sweep storm during a sync.
-- **It does not run during a backup**, which is the one thing the backup lock blocks
-  (`storage.md` §9.1).
+- **It does not run during a backup.** The backup lock blocks exactly two things — this sweep
+  and the blob GC — because they are the only two that remove data (`storage.md` §9.1).
 - **It does not run during an active sync**, so an ingest run and a purge are never competing
   for the same vector table.
 - **`doctor` reports the soft-deleted fraction**, which is the input to tuning the vector leg's
@@ -650,10 +703,17 @@ Each run records id, connector, start/end, watermark before and after, and count
 counters are what the summary line in `parsing.md` §6.5 is built from, and what makes the
 fallback-rate signal in §6.6 computable.
 
-**This needs no new table.** `connectors.status`, `error_message`, `last_synced_at` and
-`watermark` already exist (`storage.md` §4.7); per-run counters are `metadata` on that row.
+**This needs no new table**, but it does need one column. `connectors.status`, `error_message`,
+`last_synced_at` and `watermark` already exist (`storage.md` §4.7); the per-run counters have
+nowhere to go, because unlike `documents` the `connectors` row has no `metadata` column. Adding
+`metadata JSON NOT NULL DEFAULT '{}'` there — matching the convention `documents` already
+follows — is the smallest thing that works, and it is made in `storage.md` §4.7 as part of this
+change rather than assumed here.
+
 Resisting a `runs` table is deliberate — run history is diagnostic, not relational, and a table
-that only ever grows needs a retention policy nobody has asked for.
+that only ever grows needs a retention policy nobody has asked for. Keeping the last run's
+counters on the connector row means they are overwritten rather than accumulated, which is the
+correct retention policy for a diagnostic.
 
 ### 13.2 Resume is a consequence of the design, not a feature
 
@@ -719,6 +779,7 @@ Calls made in the absence of a stated position.
 | Middleware transforms; the return value is assigned and validated | §3.1 |
 | An explicit may/may-not list, with no store handle for middleware | §3.2 |
 | Text-mutating middleware is a `ChunkFingerprint` input, defaulting to opt-out | §3.3 |
+| The complete `Document.status` set and its transitions, collected for #1 | §2.2 |
 | PII redaction moves to the generation boundary; ingest-time redaction rejected | §3.4 |
 | Two-level change detection, and a skip that still writes three things | §4, §4.1 |
 | Parse and chunk in `spawn`ed worker subprocesses; embed deliberately not | §6 |
