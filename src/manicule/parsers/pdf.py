@@ -24,7 +24,7 @@ marked at the point where they are avoided:
 from __future__ import annotations
 
 import contextlib
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass
 
 import pypdfium2 as pdfium
@@ -293,9 +293,7 @@ class PdfParser:
             textpage = raw_page.get_textpage()
             try:
                 pieces = [
-                    textpage.get_text_bounded(
-                        *_bounded_arguments(denormalise_rect(rect, page.box, page.rotation))
-                    )
+                    _bounded_text(textpage, denormalise_rect(rect, page.box, page.rotation))
                     for rect in anchor.rects
                 ]
             finally:
@@ -304,20 +302,26 @@ class PdfParser:
             return joined or None
 
 
-def _bounded_arguments(user_rect: tuple[float, float, float, float]) -> tuple[float, ...]:
-    """``(left, bottom, right, top)`` for pdfium's bounded-text call.
+BOX_MARGIN = 0.5
+"""How far a box is grown before it is quoted back to pdfium, in points.
 
-    Grown by a hair on every side. A character box and the glyph inside it agree to within
-    rounding, and a box quoted back to pdfium exactly can exclude the very glyph it was
-    measured from — which reads as a citation resolving to nothing.
-    """
+A character box and the glyph inside it agree to within rounding, and a box handed back
+exactly as measured can exclude the very glyph it came from — which reads as a citation
+resolving to nothing at all."""
+
+
+def _bounded_text(
+    textpage: pdfium.PdfTextPage, user_rect: tuple[float, float, float, float]
+) -> str:
+    """The text inside a user-space rectangle, as pdfium reads it back."""
     left, bottom, right, top = user_rect
-    margin = 0.5
-    return left - margin, bottom - margin, right + margin, top + margin
+    return textpage.get_text_bounded(
+        left - BOX_MARGIN, bottom - BOX_MARGIN, right + BOX_MARGIN, top + BOX_MARGIN
+    )
 
 
 @contextlib.contextmanager
-def _open(raw: RawDocument) -> Iterator[pdfium.PdfDocument]:
+def _open(raw: RawDocument) -> Generator[pdfium.PdfDocument]:
     """Open a PDF, translating the failures that mean "not for me" into a decline.
 
     A PDF with a *user* password cannot be read at all. One with only an **owner** password
@@ -414,17 +418,24 @@ def _outline_paths(document: pdfium.PdfDocument) -> dict[int, tuple[str, ...]]:
     stack: list[str] = []
     paths: dict[int, tuple[str, ...]] = {}
     try:
-        items = list(document.get_toc())
+        bookmarks: list[pdfium.PdfBookmark] = list(document.get_toc())
     except pdfium.PdfiumError:
+        # A malformed outline is not a reason to lose the document's text. The pages keep
+        # their exact provenance; only the breadcrumb is poorer for it.
         return {}
-    for item in items:
-        title = (item.title or "").strip()
+    for bookmark in bookmarks:
+        title: str = (bookmark.get_title() or "").strip()
         if not title:
             continue
-        del stack[item.level :]
+        level: int = bookmark.level
+        del stack[level:]
         stack.append(title)
-        if item.page_index is not None:
-            paths.setdefault(item.page_index, tuple(stack))
+        destination = bookmark.get_dest()
+        if destination is None:
+            continue
+        page_index: int | None = destination.get_index()
+        if page_index is not None:
+            paths.setdefault(page_index, tuple(stack))
     return _fill_forward(paths)
 
 
@@ -454,6 +465,7 @@ def outline_page_paths(raw: RawDocument) -> dict[int, tuple[str, ...]]:
 __all__ = [
     "MEDIA_TYPES",
     "QUARTER_TURNS",
+    "BOX_MARGIN",
     "PdfConfig",
     "PdfParser",
     "denormalise_rect",

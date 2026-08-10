@@ -35,6 +35,7 @@ from manicule.core.protocols import (
     Parser,
     RetrievalStage,
     VectorStore,
+    read_blocks,
 )
 from manicule.core.retrieval import Candidate, Query
 
@@ -161,11 +162,7 @@ async def assert_parser_contract(parser: Parser, raw: RawDocument) -> list[Parse
     """
     _require(parser.media_types, "parser declares no media types, so nothing routes to it")
 
-    # aclosing, not a bare drain: an async generator suspended at a yield is finalised by
-    # the event loop's generator hook at GC time, which has been observed to crash the
-    # interpreter on 3.13. Closing it here makes the lifetime deterministic.
-    async with closing(parser.parse(raw)) as blocks_iter:
-        blocks = [block async for block in blocks_iter]
+    blocks = await read_blocks(parser, raw)
 
     for index, block in enumerate(blocks):
         where = f"block {index}"

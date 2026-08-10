@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from typing import cast
 
 from manicule.chunking import breadcrumb
 from manicule.chunking.sentences import paragraphs, sentences
@@ -69,7 +70,7 @@ class _Unit:
     anchor: Anchor
     heading_path: tuple[str, ...]
     tokens: int
-    metadata: Metadata = field(default_factory=dict)
+    metadata: Metadata = field(default_factory=Metadata)
     starts_section: bool = False
 
 
@@ -677,9 +678,14 @@ def _group_metadata(units: Sequence[_Unit], *, provisional: bool) -> Metadata:
 
 
 def _string_list(value: object) -> list[str] | None:
+    """A metadata value as a list of strings, or ``None`` when it is anything else.
+
+    Metadata arrives as JSON, so a parser can put anything there. A malformed value means
+    the chunker has no structure to split on, which is a fallback rather than a crash.
+    """
     if not isinstance(value, list):
         return None
-    items: list[object] = value
+    items = cast("list[object]", value)
     if not all(isinstance(item, str) for item in items):
         return None
     return [item for item in items if isinstance(item, str)]

@@ -25,7 +25,7 @@ from manicule.chunking import StructuralChunker
 from manicule.core.anchors import Anchor, PageAnchor, Rect
 from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
-from manicule.core.protocols import Parser
+from manicule.core.protocols import Parser, read_blocks
 from manicule.testing import assert_round_trip
 from tests.corpus.pdf import MARKER
 from tests.parsers.support import check_corpus, check_fixture, raw_from
@@ -114,11 +114,11 @@ def _covers(outer: Rect, inner: Rect, tolerance: float = BOX_TOLERANCE) -> bool:
 
 
 async def _blocks(raw: RawDocument) -> list[ParsedBlock]:
-    return [block async for block in _pdf_parser().parse(raw)]
+    return await read_blocks(_pdf_parser(), raw)
 
 
 async def _first_rect(parser: Parser, raw: RawDocument) -> Rect:
-    blocks = [block async for block in parser.parse(raw)]
+    blocks = await read_blocks(parser, raw)
     anchors = [block.anchor for block in blocks if isinstance(block.anchor, PageAnchor)]
     if not anchors or not anchors[0].rects:
         message = f"{raw.uri} produced no rectangles, so the transform cannot be checked"
@@ -286,7 +286,7 @@ async def test_astral_text_addresses_the_glyphs_the_block_claims(corpus: Path) -
     """
     path = corpus / "pdf" / "astral.pdf"
     raw = raw_from(path, MEDIA_TYPE)
-    blocks = [block async for block in _pdf_parser().parse(raw)]
+    blocks = await _blocks(raw)
     assert blocks, "the astral fixture produced no blocks"
     assert blocks[0].text.count("\U0001f600") == 2
     measured = await _first_rect(_pdf_parser(), raw)
@@ -307,7 +307,7 @@ async def test_a_page_with_no_text_layer_yields_no_blocks_and_does_not_raise(
     is a bug report.
     """
     raw = raw_from(corpus / "pdf" / "no-text-layer.pdf", MEDIA_TYPE)
-    blocks = [block async for block in _pdf_parser().parse(raw)]
+    blocks = await _blocks(raw)
     assert blocks == []
 
 
@@ -323,7 +323,7 @@ async def test_a_user_password_is_declined_and_an_owner_password_is_read(corpus:
         await _blocks(locked)
 
     owner = raw_from(corpus / "pdf" / "owner-password.pdf", MEDIA_TYPE)
-    blocks = [block async for block in _pdf_parser().parse(owner)]
+    blocks = await _blocks(owner)
     assert any(MARKER in block.text for block in blocks)
 
 
@@ -348,7 +348,7 @@ async def test_page_numbers_count_from_one_as_a_reader_does(corpus: Path) -> Non
     raw = raw_from(corpus / "pdf" / "typical.pdf", MEDIA_TYPE)
     pages = {
         block.anchor.page
-        async for block in _pdf_parser().parse(raw)
+        for block in await _blocks(raw)
         if isinstance(block.anchor, PageAnchor)
     }
     assert pages == {1, 2, 3}
@@ -362,7 +362,7 @@ async def test_a_paragraph_spanning_lines_keeps_one_rect_per_line(corpus: Path) 
     text on the other side of it — a highlight that is confidently wrong.
     """
     raw = raw_from(corpus / "pdf" / "multicolumn.pdf", MEDIA_TYPE)
-    blocks = [block async for block in _pdf_parser().parse(raw)]
+    blocks = await _blocks(raw)
     multiline = [
         block
         for block in blocks
@@ -382,7 +382,7 @@ async def test_heading_paths_come_from_the_outline_and_are_empty_without_one(
     keeps its exact page and rectangle provenance.
     """
     raw = raw_from(corpus / "pdf" / "typical.pdf", MEDIA_TYPE)
-    blocks = [block async for block in _pdf_parser().parse(raw)]
+    blocks = await _blocks(raw)
     assert blocks
     assert all(block.heading_path == () for block in blocks)
 
@@ -396,7 +396,7 @@ class _OffByOnePdfParser:
         self._real = _pdf_parser()
 
     async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
-        async for block in self._real.parse(raw):
+        for block in await read_blocks(self._real, raw):
             anchor = block.anchor
             if isinstance(anchor, PageAnchor):
                 yield block.model_copy(

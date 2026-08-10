@@ -17,8 +17,9 @@ runtime or an HTTP client; :mod:`tests.test_import_boundary` fails the build if 
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Sequence
 from collections.abc import Set as AbstractSet
+from contextlib import asynccontextmanager
 from typing import Protocol, runtime_checkable
 
 from manicule.core.anchors import Anchor
@@ -87,6 +88,62 @@ class Parser(Protocol):
         defect, and :func:`manicule.testing.assert_parser_contract` fails on it.
         """
         ...
+
+
+@asynccontextmanager
+async def parsing(parser: Parser, raw: RawDocument) -> AsyncGenerator[AsyncIterator[ParsedBlock]]:
+    """Iterate a parser's blocks, closing the stream on **every** exit path.
+
+    :meth:`Parser.parse` returns an :class:`~collections.abc.AsyncIterator`, and in practice
+    every parser implements it as an async *generator*. A generator abandoned part-way — a
+    caller that stops early, an assertion that fails between blocks, an exception in the loop
+    body — stays suspended, holding whatever it had open at the ``yield``: a document handle,
+    a native text page, a decompression stream.
+
+    Nothing collects it promptly. CPython finalises a live async generator through the event
+    loop that created it, so one still suspended when that loop closes is finalised late,
+    from the wrong loop, after the resources it is about to release have been torn down. The
+    observable result is not a warning; it is a crash inside the interpreter's allocator, on
+    a stack that names no library anyone here wrote.
+
+    So iteration goes through here, and ``aclose`` runs in a ``finally``::
+
+        async with parsing(parser, raw) as blocks:
+            async for block in blocks:
+                ...
+
+    Parsers hold their resources in ``with``/``try``-``finally`` around the ``yield`` for the
+    same reason: ``aclose()`` throws :class:`GeneratorExit` in at the suspension point, and
+    only a ``finally`` runs after that.
+    """
+    stream = parser.parse(raw)
+    try:
+        yield stream
+    finally:
+        await aclose(stream)
+
+
+async def aclose(stream: AsyncIterator[ParsedBlock]) -> None:
+    """Close a block stream if it is a generator, and do nothing if it is not.
+
+    :meth:`Parser.parse` promises an ``AsyncIterator``, which is a weaker thing than an async
+    generator and has no ``aclose``. A parser returning a hand-written iterator is a
+    legitimate implementation of the protocol, so this asks rather than assumes.
+    """
+    closer = getattr(stream, "aclose", None)
+    if closer is None:
+        return
+    await closer()
+
+
+async def read_blocks(parser: Parser, raw: RawDocument) -> list[ParsedBlock]:
+    """Every block a parser produces for a document, with the stream closed afterwards.
+
+    The ordinary way to consume a parser. Use :func:`parsing` instead when the blocks are
+    wanted one at a time or the loop may stop early.
+    """
+    async with parsing(parser, raw) as blocks:
+        return [block async for block in blocks]
 
 
 @runtime_checkable
@@ -463,4 +520,7 @@ __all__ = [
     "RetrievalStage",
     "TokenStateEmbedder",
     "VectorStore",
+    "aclose",
+    "parsing",
+    "read_blocks",
 ]

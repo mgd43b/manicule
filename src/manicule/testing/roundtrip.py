@@ -34,7 +34,7 @@ from typing import NoReturn
 
 from manicule.core.anchors import Anchor, HeadingAnchor, PageAnchor, Unlocated
 from manicule.core.content import BlockKind, Chunk, Document, ParsedBlock, RawDocument
-from manicule.core.protocols import Chunker, Parser
+from manicule.core.protocols import Chunker, Parser, read_blocks
 from manicule.testing.normalise import normalise
 
 TIGHTNESS: dict[str, float] = {
@@ -340,7 +340,7 @@ async def assert_round_trip(
         Counts for :func:`assert_location_budget`, which is the corpus-level assertion.
     """
     name = fixture or raw.uri
-    blocks = [block async for block in parser.parse(raw)]
+    blocks = await read_blocks(parser, raw)
 
     for index, block in enumerate(blocks):
         _require(
@@ -354,7 +354,7 @@ async def assert_round_trip(
     _assert_tightness(items, resolved)
     _assert_discrimination(items, resolved, overlapping=False)
 
-    again = [block async for block in parser.parse(raw)]
+    again = await read_blocks(parser, raw)
     _require(
         _comparable(blocks) == _comparable(again),
         f"{name}: parsing the same bytes twice produced different blocks. Chunk ids are "

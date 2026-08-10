@@ -557,6 +557,7 @@ storage = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "manicule", extra = ["parsers"] },
     { name = "manicule-plugin-example" },
     { name = "openpyxl" },
     { name = "pyright" },
@@ -595,6 +596,7 @@ provides-extras = ["storage", "embeddings", "parsers", "generation", "serve"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "manicule", extras = ["parsers"], editable = "." },
     { name = "manicule-plugin-example", editable = "packages/manicule-plugin-example" },
     { name = "openpyxl", specifier = ">=3.1" },
     { name = "pyright", specifier = ">=1.1.390" },

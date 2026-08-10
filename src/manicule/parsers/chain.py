@@ -32,6 +32,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from pydantic import JsonValue
+
 from manicule.core.content import (
     BlockKind,
     DocumentStatus,
@@ -41,7 +43,7 @@ from manicule.core.content import (
     RawDocument,
 )
 from manicule.core.errors import ConfigError, ParseError
-from manicule.core.protocols import Parser
+from manicule.core.protocols import Parser, read_blocks
 
 WILDCARD = "*"
 """The key whose chain is appended to every other chain.
@@ -82,7 +84,7 @@ class Attempt:
     outcome: Outcome
     reason: str = ""
 
-    def as_metadata(self) -> list[str]:
+    def as_metadata(self) -> list[JsonValue]:
         return [self.parser, self.outcome.value, self.reason]
 
 
@@ -104,9 +106,8 @@ class ChainResult:
         Falling back is **not** a status. It is metadata, so ``status`` stays coarse enough
         to filter on while the detail remains available to diagnostics.
         """
-        recorded: Metadata = {
-            "parsers_attempted": [attempt.as_metadata() for attempt in self.attempts]
-        }
+        attempted: list[JsonValue] = [attempt.as_metadata() for attempt in self.attempts]
+        recorded: Metadata = {"parsers_attempted": attempted}
         if self.parser_used is not None:
             recorded["parser_used"] = self.parser_used
         if self.status_detail:
@@ -182,7 +183,7 @@ class ParserChain:
     async def _attempt(self, name: str, raw: RawDocument) -> tuple[list[ParsedBlock], Attempt]:
         parser = self.parsers[name]
         try:
-            blocks = [block async for block in parser.parse(raw)]
+            blocks = await read_blocks(parser, raw)
         except ParseError as exc:
             return [], Attempt(parser=name, outcome=Outcome.DECLINED, reason=str(exc))
         except Exception as exc:  # noqa: BLE001 - a parser's own bug must not end the batch
