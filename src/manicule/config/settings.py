@@ -352,8 +352,11 @@ class EmbeddingSettings(Section):
     cache_entries: int = Field(
         default=10_000,
         ge=0,
-        description="Embedding cache size. Keyed by model identity, so a model change can "
-        "never serve vectors made by the previous one.",
+        description="Embedding cache size, in vectors. ``0`` disables it. Keyed by the "
+        "canonical ``EmbedFingerprint`` — not by the model's name, which carries neither the "
+        "pooling nor the revision, so a name-keyed cache would serve vectors from the previous "
+        "space to a re-embed and report success. Changing any identity field makes the old "
+        "entries unreachable rather than stale, so there is no flush step to forget.",
     )
 
 

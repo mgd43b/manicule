@@ -89,7 +89,7 @@ class EmbedFingerprint(Fingerprint):
 
     Persisted alongside an index and compared before every write.
 
-    Two fields are recorded and excluded from identity. Both exclusions are deliberate, and
+    Three fields are recorded and excluded from identity. Every exclusion is deliberate, and
     each rests on something that has to stay true.
 
     **:attr:`max_sequence_length` is excluded because the invariant it protects is checked
@@ -101,15 +101,24 @@ class EmbedFingerprint(Fingerprint):
     and therefore never runs the chunker's own budget check. That is the one route by which
     a lowered limit could otherwise truncate a whole corpus in silence.
 
-    **:attr:`backend` is excluded on the assumption that runtimes agree.** The same model
-    under MLX and under ONNX is taken to produce interchangeable vectors, which keeps a
-    corpus portable between machines instead of demanding a re-embed on arrival. That is an
-    assumption, not a measurement: the parity test belongs to the embeddings work and has
-    not yet been run. ``docs/contracts.md`` §3 already sets the precedent that a backend is
-    "admitted only by measurement". **If parity cannot be brought within tolerance, this
-    exclusion is the decision to revisit** — moving ``backend`` into ``IDENTITY_FIELDS``
-    makes a runtime change a loud error with a re-embed path, which is the correct
-    behaviour if the vectors really do differ.
+    **:attr:`backend` is excluded because the runtimes were measured to agree.** The same
+    model under MLX and under ONNX produces interchangeable vectors, which keeps a corpus
+    portable between machines instead of demanding a re-embed on arrival. That is now a
+    measurement rather than an assumption: ``tests/test_embedding_backends.py`` embeds the
+    same texts through both runtimes and fails if any pair falls outside the tolerance stated
+    there. **If parity ever stops holding, this exclusion is the decision to revisit** —
+    moving ``backend`` into ``IDENTITY_FIELDS`` makes a runtime change a loud error with a
+    re-embed path, which is the correct behaviour if the vectors really do differ.
+
+    **:attr:`weights_ref` is excluded for the same reason and needs the same care.** A
+    backend rarely runs the canonical repository's own files: MLX needs safetensors and
+    ``BAAI/bge-m3`` publishes only a PyTorch pickle, so the weights actually executed come
+    from a conversion. Recording which conversion ran is the difference between a diagnosable
+    index and a mystery. It stays out of identity because a faithful re-encoding of the same
+    weights is the thing parity certifies — and because the one re-encoding that *does* move
+    the vectors, quantisation, is refused at load time rather than absorbed here: 4-bit
+    ``bge-m3`` sits at cosine 0.92-0.97 to the same model in fp16, which is a different vector
+    space wearing the same name.
     """
 
     IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = (
@@ -155,6 +164,14 @@ class EmbedFingerprint(Fingerprint):
         description="Which runtime produced the vectors, e.g. ``mlx`` or ``onnx``. "
         "Excluded from identity — see the class docstring, which records what that "
         "exclusion is betting on.",
+    )
+    weights_ref: str = Field(
+        default="",
+        description="The artefact whose bytes the backend actually executed, when that is "
+        "not the model's own repository — for example ``mlx-community/bge-m3-mlx-fp16`` for "
+        "``BAAI/bge-m3`` under MLX, which publishes no safetensors. Recorded so that a "
+        "vector can be traced to the weights that made it. Excluded from identity — see the "
+        "class docstring.",
     )
 
     @override

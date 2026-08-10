@@ -104,6 +104,22 @@ class ContextOverflowError(ManiculeError):
     """
 
 
+class TokenStateError(ManiculeError):
+    """A backend returned something other than per-token hidden states.
+
+    Raised where a pooling path expected an array of shape ``(batch, sequence, dimension)``
+    and got a different rank. That is not a hypothetical: ``mlx-embeddings`` returns genuine
+    token states under ``last_hidden_state`` for some architectures and the *already pooled*
+    vector under the same name for others, and an ONNX export names its 3-D output whatever
+    the exporter felt like. Pooling a 2-D array does not fail — it reduces over the batch
+    axis instead of the sequence axis and produces one plausible, normalised, entirely wrong
+    vector per input.
+
+    Fatal, never a warning. Nothing downstream can tell a wrongly pooled vector from a right
+    one.
+    """
+
+
 __all__ = [
     "ChunkingError",
     "CircularDependencyError",
@@ -120,5 +136,6 @@ __all__ = [
     "PluginError",
     "PluginLoadError",
     "PolicyError",
+    "TokenStateError",
     "UnknownComponentError",
 ]
