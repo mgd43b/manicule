@@ -111,7 +111,13 @@ def contains_claimed_text(resolved: str | None, claimed: str) -> bool:
     """
     if resolved is None:
         return False
-    return normalise(claimed) in normalise(resolved)
+    claim = normalise(claimed)
+    if not claim:
+        # An empty claim is contained in everything, so without this a whitespace-only chunk
+        # reaches the strongest verification level whether or not its anchor points anywhere.
+        # Absent evidence is a failure of containment, exactly as ``resolved is None`` is.
+        return False
+    return claim in normalise(resolved)
 
 
 __all__ = ["NORMALISER_VERSION", "contains_claimed_text", "normalise"]

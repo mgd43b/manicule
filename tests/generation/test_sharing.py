@@ -75,9 +75,14 @@ def test_an_anonymous_viewer_gets_the_label_and_the_verification_state_but_no_pa
 
     shared = redact_for_anonymous(citation)
 
-    assert shared.quote == ""
-    assert shared.uri == "", "an attestation, not a link they could follow"
     assert shared.title == "Deploy runbook"
     assert shared.heading_path == ("Operations", "Rollback")
+    assert shared.location == "page 4"
     assert shared.verification is Verification.RESOLVED
-    assert shared.anchor == citation.anchor
+
+    # A *different type*, not a blanked-out Citation. The corpus's internal identifiers have
+    # nowhere to go: `LineAnchor.symbol` is a private repository's function name and
+    # `CellAnchor` names a spreadsheet and a cell, so keeping the anchor "because it is not
+    # text" would disclose exactly the things a workspace boundary exists to hold.
+    fields = set(type(shared).model_fields)
+    assert not fields & {"quote", "uri", "document_id", "chunk_id", "anchor"}

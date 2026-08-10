@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from manicule.core.generation import FinishReason
 from manicule.generation.answers import AnswerEnvelope, Citation
 from manicule.generation.history import Turn
+from manicule.generation.sharing import CitationLabel
 
 
 class Feedback(StrEnum):
@@ -89,9 +90,13 @@ class ConversationStore(Protocol):
     """Reading history and writing turns. Sharing lives in :mod:`manicule.generation.sharing`."""
 
     async def create_conversation(
-        self, *, workspace_id: str, user_id: str | None = None, title: str | None = None
+        self, *, user_id: str | None = None, title: str | None = None
     ) -> str:
-        """Start a conversation and return its id."""
+        """Start a conversation and return its id.
+
+        No workspace parameter: an implementation is bound to one, because a scope a caller
+        can forget to pass — or pass wrongly — is not a scope.
+        """
         ...
 
     async def history(self, conversation_id: str, *, limit: int = 20) -> Sequence[Turn]:
@@ -122,6 +127,22 @@ class ConversationStore(Protocol):
         ...
 
 
+class SharedTurn(BaseModel):
+    """One turn of a conversation as an **anonymous** viewer of a share link receives it.
+
+    A distinct type from :class:`~manicule.generation.history.Turn`, and the distinction is
+    the enforcement. A shared transcript must carry citation *labels* and never passage text,
+    document ids or anchors — and a rule kept by remembering to blank fields is one a route
+    forgets. This type has nowhere to put them.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str
+    citations: tuple[CitationLabel, ...] = ()
+
+
 @runtime_checkable
 class ShareStore(Protocol):
     """Minting, reading and revoking share links."""
@@ -132,12 +153,18 @@ class ShareStore(Protocol):
 
     async def revoke_share(self, conversation_id: str) -> bool: ...
 
-    async def find_shared(self, token_hash: str, *, now: datetime) -> str | None:
-        """The conversation a live token names, or ``None``.
+    async def shared_conversation(
+        self, token_hash: str, *, now: datetime, sharing_enabled: bool = True
+    ) -> Sequence[SharedTurn]:
+        """The conversation a live token names, projected for an anonymous reader.
 
-        ``None`` covers every reason at once — unknown token, expired link, revoked link,
-        soft-deleted conversation — because distinguishing them for an unauthenticated caller
-        tells them which of their guesses was closest.
+        Deliberately **one** call rather than "resolve the token" followed by "read the
+        messages". Two calls leave a window in which an owner's revocation lands between
+        them, and they let a caller reach the second one holding only a conversation id.
+
+        An empty result covers every reason at once — unknown token, expired link, revoked
+        link, soft-deleted conversation, sharing switched off — because distinguishing them
+        for an unauthenticated caller tells them which of their guesses was closest.
         """
         ...
 
@@ -147,5 +174,6 @@ __all__ = [
     "Feedback",
     "FeedbackReason",
     "ShareStore",
+    "SharedTurn",
     "StoredMessage",
 ]

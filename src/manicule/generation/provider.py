@@ -122,6 +122,13 @@ def error_table() -> tuple[tuple[type[Exception], type[GenerationError]], ...]:
     )
 
 
+TIMEOUT_SETTINGS: Mapping[str, str] = {
+    "first token": "llm.first_token_timeout_s",
+    "gap between tokens": "llm.stream_idle_timeout_s",
+    "total generation time": "llm.timeout_s",
+}
+"""Which setting governs each interval, so a message names the knob that would have helped."""
+
 RETRYABLE: frozenset[type[GenerationError]] = frozenset(
     {ProviderConnectionError, ProviderRateLimitError, ProviderTimeoutError}
 )
@@ -402,34 +409,46 @@ class LitellmGenerator:
         total_deadline = started + self._settings.timeout_s
         stream: Any = None
         try:
-            stream, first = await self._open(messages, total_deadline)
-            finish, usage, delivered = None, None, False
-            chunk: Any = first
-            while chunk is not None:
-                text = _delta_text(chunk)
+            stream, leading = await self._open(messages, total_deadline)
+            finish: FinishReason | None = None
+            usage: Usage | None = None
+            pending: list[Any] = list(leading)
+            while pending:
+                chunk = pending.pop(0)
                 finish = _finish_reason(chunk) or finish
                 usage = _usage(chunk) or usage
+                text = _delta_text(chunk)
                 if text:
-                    delivered = True
                     yield Token(text=text)
+                if pending:
+                    continue
                 try:
-                    chunk = await self._next(stream, total_deadline)
+                    following = await self._next(stream, total_deadline)
                 except GenerationError as exc:
-                    # After the first token there is no correct retry: restarting makes the
-                    # reader watch the answer rewind, and continuing splices two
+                    # After the first token there is no correct retry: restarting means the
+                    # reader watches the answer rewind, and continuing splices two
                     # independently-sampled answers into text no single generation produced.
-                    if not delivered:
-                        raise
-                    yield Token(finish_reason=FinishReason.ERROR, error=str(exc))
+                    # The usage seen so far travels with the error: truncation is the path
+                    # where cost accounting matters most.
+                    yield Token(finish_reason=FinishReason.ERROR, error=str(exc), usage=usage)
                     return
+                if following is not None:
+                    pending.append(following)
             yield Token(finish_reason=finish or FinishReason.STOP, usage=usage)
         finally:
             await _close(stream)
 
     async def _open(
         self, messages: Sequence[ChatMessage], total_deadline: float
-    ) -> tuple[Any, Any]:
-        """Open the stream and take its first chunk, retrying only until that succeeds.
+    ) -> tuple[Any, list[Any]]:
+        """Open the stream and read up to the first chunk **bearing text**, retrying until then.
+
+        Up to the first *token*, not the first chunk. Every OpenAI-compatible provider opens
+        with a role-only chunk carrying no content, so stopping at the first chunk closes the
+        retry window before anything has been delivered — and a connection dropping a
+        millisecond later, which is the commonest real failure shape, becomes terminal for a
+        reader who has seen nothing. Re-consuming a couple of empty leading chunks on a fresh
+        stream costs nothing and is invisible.
 
         The retry loop is manicule's, and the library's own ``num_retries`` is deliberately
         unused. Under ``stream=True`` it is wrong in three separate ways, each invisible: it
@@ -440,23 +459,41 @@ class LitellmGenerator:
         """
         attempt = 0
         while True:
-            budget = min(
-                self._settings.first_token_timeout_s, max(total_deadline - time.monotonic(), 0.0)
-            )
+            remaining = max(total_deadline - time.monotonic(), 0.0)
+            if remaining <= 0:
+                raise ProviderTimeoutError(self._timeout_message("total generation time", 0.0))
+            budget = min(self._settings.first_token_timeout_s, remaining)
             stream: Any = None
             try:
                 stream = await self._call(messages, budget)
-                return stream, await self._next(stream, total_deadline, budget)
+                leading: list[Any] = []
+                while True:
+                    chunk = await self._next(stream, total_deadline, budget, phase="first token")
+                    if chunk is None:
+                        return stream, leading
+                    leading.append(chunk)
+                    if _delta_text(chunk):
+                        return stream, leading
             except GenerationError as exc:
                 # An attempt that opened a stream and then failed still holds a connection to
                 # a model that is working. Retrying without closing it would leave one live
                 # provider call per attempt, which is the leak this whole design is careful
                 # about, arriving through the recovery path.
                 await _close(stream)
-                if type(exc) not in RETRYABLE or attempt >= self._settings.max_retries:
+                left = max(total_deadline - time.monotonic(), 0.0)
+                if type(exc) not in RETRYABLE or attempt >= self._settings.max_retries or not left:
                     raise
                 attempt += 1
-                await asyncio.sleep(_backoff(attempt))
+                # Clamped to the wall clock. An unclamped backoff sleeps seconds past a
+                # deadline that has already expired, on a budget that cannot improve.
+                await asyncio.sleep(min(_backoff(attempt), left))
+            except BaseException:
+                # Cancellation lands here, and the caller's `stream` is still unassigned — so
+                # this frame is the only thing holding the connection. Losing it means an open
+                # response to a model that keeps generating, which is exactly what the cleanup
+                # contract exists to prevent.
+                await _close(stream)
+                raise
 
     async def _call(self, messages: Sequence[ChatMessage], budget: float) -> Any:  # noqa: ANN401
         completion = self._completion
@@ -493,12 +530,33 @@ class LitellmGenerator:
         try:
             return await asyncio.wait_for(completion(**kwargs), budget)
         except TimeoutError as exc:
-            raise ProviderTimeoutError(self._timeout_message("first token", budget)) from exc
+            # Which budget bound this call is decided by which was smaller, not by where in
+            # the stream we are: a total shorter than the first-token allowance is the
+            # constraint that expired, and naming the other one is a wrong remedy.
+            expired = (
+                "first token"
+                if budget >= self._settings.first_token_timeout_s
+                else "total generation time"
+            )
+            raise ProviderTimeoutError(self._timeout_message(expired, budget)) from exc
         except Exception as exc:
             raise map_error(exc, self.model_id, self._api_key_source()) from exc
 
-    async def _next(self, stream: Any, total_deadline: float, budget: float | None = None) -> Any:  # noqa: ANN401
-        """The next chunk, under whichever of the three deadlines expires first."""
+    async def _next(
+        self,
+        stream: Any,  # noqa: ANN401 - a provider SDK's own stream wrapper
+        total_deadline: float,
+        budget: float | None = None,
+        *,
+        phase: str = "gap between tokens",
+    ) -> Any:  # noqa: ANN401 - and its own chunk type
+        """The next chunk, under whichever of the three deadlines expires first.
+
+        ``phase`` names which one this call is under rather than leaving it to be inferred:
+        the same code serves the first-token wait and the inter-token gap, and a message that
+        guesses sends an operator to raise a setting with no effect on the interval that
+        actually expired.
+        """
         remaining_total = max(total_deadline - time.monotonic(), 0.0)
         gap = self._settings.stream_idle_timeout_s if budget is None else budget
         allowed = min(gap, remaining_total)
@@ -507,18 +565,20 @@ class LitellmGenerator:
         except StopAsyncIteration:
             return None
         except TimeoutError as exc:
-            expired = "total generation time" if remaining_total <= gap else "gap between tokens"
+            expired = "total generation time" if remaining_total <= gap else phase
             raise ProviderTimeoutError(self._timeout_message(expired, allowed)) from exc
         except Exception as exc:
             raise map_error(exc, self.model_id, self._api_key_source()) from exc
 
     def _timeout_message(self, which: str, budget: float) -> str:
+        knob = TIMEOUT_SETTINGS.get(which, "llm.timeout_s")
         return (
-            f"{self.model_id} exceeded the {which} budget of {budget:.1f}s. The three are "
-            f"llm.first_token_timeout_s ({self._settings.first_token_timeout_s}s), "
-            f"llm.stream_idle_timeout_s ({self._settings.stream_idle_timeout_s}s) and "
-            f"llm.timeout_s ({self._settings.timeout_s}s); they cover different intervals, so "
-            f"raise the one that expired."
+            f"{self.model_id} exceeded the {which} budget of {budget:.1f}s. Raise {knob}. The "
+            f"three cover different intervals: llm.first_token_timeout_s "
+            f"({self._settings.first_token_timeout_s}s) covers connect, queue, prompt "
+            f"evaluation and model load; llm.stream_idle_timeout_s "
+            f"({self._settings.stream_idle_timeout_s}s) covers the gap between two tokens; "
+            f"llm.timeout_s ({self._settings.timeout_s}s) is the total wall clock."
         )
 
     def _api_key_source(self) -> str:

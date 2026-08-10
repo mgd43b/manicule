@@ -36,6 +36,7 @@ drift would show up as citations that pass CI and fail in production.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
@@ -45,7 +46,7 @@ from typing import Protocol, runtime_checkable
 from manicule.core.anchors import Anchor, Unlocated
 from manicule.core.content import Document, RawDocument
 from manicule.core.lifecycle import HealthReport
-from manicule.core.protocols import Parser
+from manicule.core.protocols import CLOSE_DEADLINE_S, Parser
 from manicule.core.retrieval import Candidate, Context
 from manicule.generation.answers import CitationDrop, DropReason, Verification
 from manicule.testing.normalise import contains_claimed_text
@@ -153,10 +154,18 @@ class ChainRouter:
 
     chain: ParserChainLike
 
+    @property
+    def _parsers(self) -> Mapping[str, Parser]:
+        return self.chain.parsers
+
     def parser_for(self, document: Document) -> Parser | None:
         used = document.metadata.get("parser_used")
-        if isinstance(used, str) and used in self.chain.parsers:
-            return self.chain.parsers[used]
+        if isinstance(used, str):
+            # Named but absent — a plugin removed or renamed — is `None`, not the chain head.
+            # The argument against trying every parser applies to this fallback too: a parser
+            # that never saw this document can return text containing the chunk's own words
+            # by coincidence, and the citation is then certified by the wrong reader.
+            return self._parsers.get(used)
         for name in self.chain.resolve(document.media_type):
             parser = self.chain.parsers.get(name)
             if parser is not None:
@@ -219,21 +228,25 @@ class UnverifiableSource:
 
 @dataclass(slots=True)
 class _Cache:
-    """Verified levels, keyed by ``(chunk_id, version_token)``.
+    """Verified levels, keyed by chunk id, document version, **anchor and reader**.
 
-    Chunk ids are content-derived and ``version_token`` changes whenever the document does,
-    so the key is exact and can never go stale — the same property the token-count cache
-    relies on. A verified anchor stays verified until its document changes, which across a
-    corpus's life makes this close to a once-per-chunk cost rather than a per-query one.
+    A chunk id is derived from its document, position and text — deliberately *not* from its
+    anchor — so a re-parse that moves an anchor while leaving the text alone produces the same
+    id under the same ``version_token``. Keying on those two alone would replay a stale
+    ``resolved`` for an anchor nothing has ever checked, which is precisely the "anchors
+    written by code that no longer runs" case level 2 exists for. The parser's identity is in
+    the key for the same reason: a different reader is a different check.
+
+    With all four, the key is exact and cannot go stale, and a verified anchor stays verified
+    until something about it changes — which across a corpus's life makes this close to a
+    once-per-chunk cost rather than a per-query one.
     """
 
     limit: int = 10_000
-    _entries: OrderedDict[tuple[str, str], Verification] = field(
-        default_factory=OrderedDict[tuple[str, str], Verification]
-    )
+    _entries: OrderedDict[str, Verification] = field(default_factory=OrderedDict[str, Verification])
     hits: int = 0
 
-    def get(self, key: tuple[str, str]) -> Verification | None:
+    def get(self, key: str) -> Verification | None:
         found = self._entries.get(key)
         if found is None:
             return None
@@ -241,7 +254,7 @@ class _Cache:
         self.hits += 1
         return found
 
-    def put(self, key: tuple[str, str], level: Verification) -> None:
+    def put(self, key: str, level: Verification) -> None:
         if self.limit <= 0:
             return
         self._entries[key] = level
@@ -358,7 +371,15 @@ class VerificationRun:
         self._verdicts: dict[int, SlotVerdict] = {}
         self._ready: dict[int, asyncio.Event] = {}
         self._tasks: list[asyncio.Task[None]] = []
+        self.cache_hits = 0
+        """Hits **this run**. The verifier's counter is process-lifetime, so reporting it per
+        answer would make one answer's trace claim every hit since start-up."""
         self._start()
+
+    @property
+    def passages(self) -> Sequence[Candidate]:
+        """What this run is verifying. The one list a slot number indexes."""
+        return self._passages
 
     @property
     def slots_offered(self) -> int:
@@ -437,7 +458,10 @@ class VerificationRun:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a parser's own bug drops citations, not answers
-            self._settle_remaining(slots, f"{type(exc).__name__}: {exc}")
+            # The exception *type* only. A parser's message routinely quotes the input that
+            # upset it, and this detail travels into the trace, which promises to carry no
+            # document text.
+            self._settle_remaining(slots, f"the parser raised {type(exc).__name__}")
         finally:
             self._settle_remaining(slots, "verification did not complete")
 
@@ -449,7 +473,10 @@ class VerificationRun:
                 self._settle(slot, SlotVerdict(Verification.LOCATED, None, document))
             return
         version = document.version_token or document.content_hash
-        pending = [slot for slot in slots if not self._settle_from_cache(slot, version, document)]
+        reader = str(document.metadata.get("parser_used") or document.media_type)
+        pending = [
+            slot for slot in slots if not self._settle_from_cache(slot, version, reader, document)
+        ]
         if not pending:
             return
         source = await self._resolver.open(document)
@@ -469,7 +496,7 @@ class VerificationRun:
                 if contains_claimed_text(resolved, chunk.text)
                 else Verification.LOCATED
             )
-            self._cache.put((chunk.id, version), reached)
+            self._cache.put(self._cache_key(slot, version, reader), reached)
             detail = (
                 "the anchor resolves to text that does not contain what this chunk claims"
                 if resolved is not None
@@ -477,10 +504,15 @@ class VerificationRun:
             )
             self._settle(slot, self._verdict_for(slot, reached, detail, document))
 
-    def _settle_from_cache(self, slot: int, version: str, document: Document) -> bool:
-        cached = self._cache.get((self._passages[slot - 1].chunk.id, version))
+    def _cache_key(self, slot: int, version: str, reader: str) -> str:
+        chunk = self._passages[slot - 1].chunk
+        return "\x1f".join((chunk.id, version, reader, chunk.anchor.model_dump_json()))
+
+    def _settle_from_cache(self, slot: int, version: str, reader: str, document: Document) -> bool:
+        cached = self._cache.get(self._cache_key(slot, version, reader))
         if cached is None:
             return False
+        self.cache_hits += 1
         self._settle(
             slot,
             self._verdict_for(
@@ -520,6 +552,7 @@ class VerificationRun:
                 CitationDrop(
                     slot=slot,
                     reason=DropReason.OUT_OF_RANGE,
+                    reached=Verification.BOUND,
                     detail=f"slot {slot} named, but only {len(self._passages)} were offered",
                 ),
             )
@@ -530,27 +563,48 @@ class VerificationRun:
         try:
             await asyncio.wait_for(self._ready[slot].wait(), remaining)
         except TimeoutError:
-            return SlotVerdict(
-                Verification.LOCATED,
-                CitationDrop(
-                    slot=slot,
-                    reason=DropReason.VERIFICATION_TIMEOUT,
-                    reached=Verification.LOCATED,
-                    detail="verification did not finish inside llm.citation_verify_timeout_s",
+            # **Recorded**, not synthesised on the fly. Verification that finishes after the
+            # first marker timed out would otherwise give a later marker for the same slot a
+            # different answer, and the reader would be told the citation was dropped for a
+            # slow disk *and* shown it as resolved — with the accounting counting both.
+            self._settle(
+                slot,
+                SlotVerdict(
+                    Verification.LOCATED,
+                    CitationDrop(
+                        slot=slot,
+                        reason=DropReason.VERIFICATION_TIMEOUT,
+                        reached=Verification.LOCATED,
+                        detail="verification did not finish inside llm.citation_verify_timeout_s",
+                    ),
                 ),
             )
         return self._verdicts[slot]
 
-    async def aclose(self) -> None:
-        """Cancel any verification still running, and wait for it to stop."""
+    async def aclose(self, deadline_s: float = CLOSE_DEADLINE_S) -> None:
+        """Cancel any verification still running, settle every slot, and return.
+
+        **Settling here is not belt-and-braces.** Cancelling a task that has not yet had its
+        first step throws :exc:`asyncio.CancelledError` in *before* the body's ``try`` is
+        entered, so `_verify_document`'s ``finally`` never runs and its slots are left with no
+        verdict and an event nobody will set — exactly the state that makes a later
+        :meth:`verdict` sit out its whole budget with nothing in flight.
+
+        The wait is bounded for the same reason the provider close is: this runs in a caller's
+        ``finally``, and a parser doing long blocking work inside its own cleanup must not be
+        able to stall request teardown indefinitely.
+        """
         for task in self._tasks:
             task.cancel()
-        for task in self._tasks:
-            try:  # noqa: SIM105 - suppress() would also swallow a cancellation of *this* task
-                await task
-            except asyncio.CancelledError:
-                pass
+        if self._tasks:
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(deadline_s):
+                    await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        self._settle_remaining(
+            range(1, len(self._passages) + 1),
+            "verification was closed before it finished",
+        )
 
 
 __all__ = [

@@ -57,16 +57,30 @@ BUILTIN_DETECTORS: Mapping[str, Detector] = {
         # context on every query, and a nested or unbounded quantifier is how a redactor
         # becomes a denial-of-service surface against the machine it protects.
         _detector("email", 1, r"[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,4}"),
+        # A separator is required, and so are seven digits. Version 1 needed only five and
+        # made the separators optional, which ate every ISO date, every order and build
+        # number, and — worst — bit into the middle of `1,234,567.89`, leaving
+        # `1,234,[REDACTED]`. Removing part of a figure changes what it says rather than
+        # hiding it, which is a different and worse failure from over-matching.
         _detector(
             "phone",
-            1,
-            r"(?<![\w.])\+?\d{1,3}[\s.-]?(?:\(\d{1,4}\)[\s.-]?)?\d{2,4}(?:[\s.-]?\d{2,4}){1,3}(?![\w.])",
+            2,
+            r"(?<![\w.,-])(?:\+\d{7,15}|\+?\d{1,3}[\s.-]\(?\d{2,4}\)?(?:[\s.-]?\d{2,4}){2,4})(?![\w.,-])",
         ),
         _detector("credit-card", 1, r"(?<!\d)(?:\d{4}[ -]?){3}\d{1,4}(?!\d)"),
+        # IPv6 must be a full eight groups or carry a `::`. Version 1 accepted two to seven
+        # colon-separated hex groups, which is also the shape of a clock time — so
+        # `12:30:45` was redacted as an address on every corpus that contains a timestamp,
+        # which is all of them.
         _detector(
             "ip-address",
-            1,
-            r"(?<![\w.:])(?:\d{1,3}(?:\.\d{1,3}){3}|(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4})(?![\w.:])",
+            2,
+            r"(?<![\w.:])(?:"
+            r"\d{1,3}(?:\.\d{1,3}){3}"
+            r"|(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"
+            r"|(?:[0-9a-fA-F]{1,4}:){1,7}:(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?"
+            r"|::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?"
+            r")(?![\w.:])",
         ),
     )
 }
@@ -121,7 +135,17 @@ def resolve_detectors(settings: RedactionSettings) -> tuple[Detector, ...]:
         raise ConfigError(msg)
     for index, pattern in enumerate(settings.custom_patterns):
         try:
-            detectors.append(Detector(f"custom[{index}]", 1, re.compile(pattern)))
+            compiled = re.compile(pattern)
+            if compiled.search("") is not None:
+                msg = (
+                    f"security.data_policy.auto_redact.custom_patterns[{index}] is "
+                    f"{pattern!r}, which matches the empty string. Every position in every "
+                    f"passage would be a match, so a 32k-token context becomes a prompt "
+                    f"several times larger sent to a metered endpoint. Anchor the pattern, or "
+                    f"require at least one character."
+                )
+                raise ConfigError(msg)
+            detectors.append(Detector(f"custom[{index}]", 1, compiled))
         except re.error as exc:
             msg = (
                 f"security.data_policy.auto_redact.custom_patterns[{index}] is {pattern!r}, "
@@ -182,23 +206,44 @@ class Redactor:
         return self._settings.enabled and bool(self._detectors)
 
     def redact(self, text: str) -> RedactionResult:
-        """Apply every detector. Synchronous; see :meth:`redact_all` for the deadline."""
+        """Apply every detector in **one pass** over the original string.
+
+        Every detector matches against ``text`` as it arrived, and the spans are merged and
+        substituted once. Running them in sequence over the already-substituted text — the
+        obvious implementation — lets a replacement be matched again by a later detector: a
+        ``hash`` replacement ends in sixteen hex characters, so ``credit-card`` fires on any
+        digest that happens to start with thirteen digits. That reports a card in text
+        containing none, which is false security telemetry, and it mangles the co-reference
+        token that is the only reason the ``hash`` method exists.
+
+        Overlapping spans go to whichever detector is configured first, so a substitution is
+        never applied inside another one.
+        """
         if not self.enabled or not text:
             return RedactionResult(text)
-        counts: dict[str, int] = {}
-        redacted = text
+        found: list[tuple[int, int, str]] = []
         for detector in self._detectors:
-            hits = 0
+            found.extend(
+                (match.start(), match.end(), detector.name)
+                for match in detector.pattern.finditer(text)
+                if match.end() > match.start()
+            )
+        if not found:
+            return RedactionResult(text)
+        found.sort(key=lambda span: (span[0], -span[1]))
 
-            def substitute(match: re.Match[str]) -> str:
-                nonlocal hits
-                hits += 1
-                return self._replacement(match.group(0))
-
-            redacted = detector.pattern.sub(substitute, redacted)
-            if hits:
-                counts[detector.name] = counts.get(detector.name, 0) + hits
-        return RedactionResult(redacted, counts)
+        counts: dict[str, int] = {}
+        pieces: list[str] = []
+        cursor = 0
+        for start, end, name in found:
+            if start < cursor:
+                continue
+            pieces.append(text[cursor:start])
+            pieces.append(self._replacement(text[start:end]))
+            counts[name] = counts.get(name, 0) + 1
+            cursor = end
+        pieces.append(text[cursor:])
+        return RedactionResult("".join(pieces), counts)
 
     def _replacement(self, value: str) -> str:
         method = self._settings.method
@@ -252,8 +297,14 @@ class Redactor:
                 f"patterns, or raise the deadline if the corpus is simply large."
             )
             raise RedactionError(msg) from exc
-        except re.error as exc:
-            msg = f"a redaction pattern failed while running, so nothing was sent: {exc}"
+        except Exception as exc:
+            # Every failure, not only `re.error`. CPython's regex engine raises
+            # `RecursionError` on its own recursion limit and `MemoryError` is reachable for a
+            # pathological pattern, and letting either escape as itself would make the
+            # refuse-to-send guarantee depend on what the caller happens to catch.
+            msg = (
+                f"redaction failed while running, so nothing was sent: {type(exc).__name__}: {exc}"
+            )
             raise RedactionError(msg) from exc
 
     def _redact_all_blocking(self, texts: Sequence[str]) -> tuple[list[str], Mapping[str, int]]:

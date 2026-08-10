@@ -18,7 +18,7 @@ exactly as the model wrote it, and the drop is reported in band and persisted.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from manicule.core.retrieval import Candidate
@@ -28,7 +28,6 @@ from manicule.generation.answers import (
     CitationAccounting,
     CitationDrop,
     DropReason,
-    Verification,
 )
 from manicule.generation.markers import MarkerScanner, ScanEvent, ScanEventKind, render_marker
 from manicule.generation.verification import SlotVerdict, VerificationRun
@@ -54,8 +53,18 @@ class CitationBinder:
     answers to.
     """
 
-    passages: Sequence[Candidate]
     run: VerificationRun
+
+    @property
+    def passages(self) -> Sequence[Candidate]:
+        """The passages the run is verifying.
+
+        Read through the run rather than held separately. Two copies would let
+        :meth:`VerificationRun.verdict` range-check against one list while
+        :meth:`_citation_for` indexes another — which yields either an ``IndexError`` or,
+        worse, a citation built from the wrong passage.
+        """
+        return self.run.passages
 
     _scanner: MarkerScanner = field(default_factory=MarkerScanner, init=False)
     _text: list[str] = field(default_factory=list[str], init=False)
@@ -103,29 +112,36 @@ class CitationBinder:
         """
         return bool(self.passages) and self._markers_seen > 0 and not self._citations
 
-    async def feed(self, chunk: str) -> AsyncIterator[AnswerEvent]:
-        """Consume a piece of model output and yield what it produced."""
+    async def feed(self, chunk: str) -> list[AnswerEvent]:
+        """Consume a piece of model output and return what it produced, in stream order.
+
+        A list rather than an async generator, deliberately. This is consumed from inside
+        another async generator, and an abandoned generator's ``finally`` does not run until
+        something finalises it — so a nested one is a resource this layer cannot close on a
+        client disconnect. Returning a list makes the nesting disappear: the only generators
+        on the answer path are the two that genuinely have to suspend.
+        """
+        produced: list[AnswerEvent] = []
         for event in self._scanner.feed(chunk):
-            async for produced in self._bind(event):
-                yield produced
+            produced.extend(await self._bind(event))
+        return produced
 
-    async def finish(self) -> AsyncIterator[AnswerEvent]:
+    async def finish(self) -> list[AnswerEvent]:
         """Flush the scanner. Must run, or a trailing partial marker is lost."""
+        produced: list[AnswerEvent] = []
         for event in self._scanner.finish():
-            async for produced in self._bind(event):
-                yield produced
+            produced.extend(await self._bind(event))
+        return produced
 
-    async def _bind(self, event: ScanEvent) -> AsyncIterator[AnswerEvent]:
+    async def _bind(self, event: ScanEvent) -> list[AnswerEvent]:
         if event.kind is ScanEventKind.TEXT:
-            yield self._emit(event.text)
-            return
+            return [self._emit(event.text)]
         if event.kind is ScanEventKind.UNTERMINATED:
             # Not a marker, so not the binder's to delete. Released exactly as the model
             # wrote it: the scanner has no evidence about where it was meant to end, and
             # deleting to a guessed boundary is the sentence-level surgery this design refuses.
             self._unterminated += 1
-            yield self._emit(event.text)
-            return
+            return [self._emit(event.text)]
 
         self._markers_seen += 1
         if event.kind is ScanEventKind.MALFORMED:
@@ -134,23 +150,23 @@ class CitationBinder:
                 detail=f"{event.text!r} is not a slot reference",
             )
             self._drops.append(drop)
-            yield AnswerEvent.dropped(drop)
-            return
+            return [AnswerEvent.dropped(drop)]
 
+        produced: list[AnswerEvent] = []
         survivors: list[int] = []
         for slot in event.slots:
             verdict = await self.run.verdict(slot)
             citation = self._citation_for(slot, verdict)
             if citation is None:
-                for produced in self._record_drop(slot, verdict):
-                    yield produced
+                produced.extend(self._record_drop(slot, verdict))
                 continue
             survivors.append(slot)
             if slot not in self._citations:
                 self._citations[slot] = citation
-                yield AnswerEvent.cited(citation)
+                produced.append(AnswerEvent.cited(citation))
         if survivors:
-            yield self._emit(render_marker(tuple(survivors)))
+            produced.append(self._emit(render_marker(tuple(survivors))))
+        return produced
 
     def _emit(self, text: str) -> AnswerEvent:
         self._text.append(text)
@@ -197,9 +213,4 @@ class CitationBinder:
         )
 
 
-def strongest_available(run: VerificationRun) -> Verification:
-    """The level this run could reach, for the answer to report."""
-    return run.ceiling
-
-
-__all__ = ["CitationBinder", "strongest_available"]
+__all__ = ["CitationBinder"]

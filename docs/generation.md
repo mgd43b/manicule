@@ -909,8 +909,8 @@ to have refused at startup. It is a reason to keep the ordering, not a reason to
 it.
 
 **The citation protocol is not configurable.** An operator may *append* instructions to the
-system prompt; they may not replace the section that defines slots and markers, because the
-binder's guarantees assume the model was told the protocol. The appended text is counted into
+system prompt — `llm.system_prompt_extra` — but may not replace the section that defines slots
+and markers, because the binder's guarantees assume the model was told the protocol. The appended text is counted into
 `system_prompt_tokens` for §4.3, so a long custom prompt is refused at startup rather than
 silently displacing passages.
 
@@ -1040,7 +1040,12 @@ away rather than on the one that merely names a hosted provider.
 
 ### 7.2 What is redacted, and what deliberately is not
 
-Redaction applies to **everything on the egress path and nothing else**:
+Redaction applies to **everything on the egress path and nothing else** — which is five text
+channels, not three. Implementation initially redacted the passage bodies, the query and the
+history and left the slot *labels* alone, so a title like `"Q3 comp review —
+someone@example.invalid.docx"` and a URI like `https://intranet/hr/salaries/employee-4471` went
+to a hosted model verbatim above a redacted body. Titles, URIs and heading paths are in the same
+batch:
 
 | Redacted | Not redacted | Why |
 |---|---|---|
@@ -1166,6 +1171,12 @@ did not leave. They already had read access; nothing is disclosed that was not.
 
 Three rules to keep it coherent:
 
+- **A passage whose document cannot be found fails closed when anything is leaving.** The
+  document store filters soft-deleted rows while the chunk index still returns their chunks, so
+  a document deleted between retrieval and generation — including one deleted *precisely
+  because* somebody decided it was sensitive — arrives as an absent row. Keeping it would send
+  its text to a hosted model with no policy evaluated at all. Where nothing leaves the machine
+  there is nothing to fail closed about, and the passage is kept.
 - **Policy filtering only removes.** It never reorders, never adds, and never re-runs assembly.
   Re-assembling to backfill the freed budget would make the context a function of which model
   you asked, and two runs that saw different passages are not comparable.
@@ -1286,8 +1297,9 @@ content type.
 The estimate follows `retrieval.md` §7.2 exactly and this document adds nothing to it:
 `tiktoken.get_encoding("o200k_base")` by encoding name rather than
 `encoding_for_model("gpt-4o")` — naming a model that is not being used makes the estimate look
-authoritative — with a per-model safety factor biased toward overcounting, no sampling, and
-counts cached by content-derived `chunk.id`.
+authoritative — with a per-model safety factor biased toward overcounting
+(`llm.token_safety_factor`, default 1.15), no sampling, and counts cached by content-derived
+`chunk.id`.
 
 > **Prior art.** A module-level singleton hardcoded to `encodingForModel('gpt-4o')`, with no
 > parameter and no configuration. The defaults it measures for are `qwen2.5:14b`,
@@ -1327,9 +1339,9 @@ started. That is the property `retrieval.md` §11.2 protects, arriving through a
 first long CJK or code-heavy prompt then overflows a window that a fixed factor would have
 respected.
 
-So drift beyond tolerance is an **error-level event with both numbers and the model named**, and
-`doctor` reports the observed distribution and recommends a factor. The human changes the
-setting. `CONTRIBUTING.md`'s "configuration is declarative" applies to the values a system uses
+So drift beyond tolerance — `llm.token_drift_tolerance`, default 15% — is an **error-level event
+with both numbers and the model named**, and `doctor` reports the observed distribution and
+recommends a factor. The human changes `llm.token_safety_factor`. `CONTRIBUTING.md`'s "configuration is declarative" applies to the values a system uses
 to protect itself, not only to the ones an operator types.
 
 **A provider that reports no usage after being asked** is recorded as `usage_unavailable`, which
@@ -1493,7 +1505,16 @@ person with no workspace membership must not receive.
 **Resolution: a shared conversation shows the questions, the answers, and the citation
 *labels* — document title, heading path, page — together with the verification state recorded
 when the answer was generated. It does not show passage text, and its citations do not link into
-the corpus.** An authenticated viewer with access to the workspace opens the same conversation
+the corpus.**
+
+Implementation makes that structural rather than careful. The anonymous read is a *different
+type* — a `CitationLabel` with nowhere to put a quote, a URI, a document id, a chunk id or an
+anchor — and the projection happens inside the store's anonymous path rather than in a helper a
+route must remember to call. Two of those omissions are not obvious: an anchor is not "not
+text", it is a `LineAnchor.symbol` naming a private repository's function, or a `CellAnchor`
+naming a spreadsheet and a cell range. And the read **resolves the share token itself** rather
+than taking a conversation id, because a projection reached by holding an id is one that
+revocation, expiry and workspace membership never see. An authenticated viewer with access to the workspace opens the same conversation
 and sees the passages, because they could have retrieved them anyway.
 
 So the *same message renders differently by audience, and the difference is content only* —
@@ -1511,10 +1532,13 @@ configure correctly.
 
 - **Revocation exists**, as a real endpoint, and clears the hash rather than flipping a boolean
   beside a still-valid token.
+- **Switching sharing off stops existing links resolving**, not merely the minting of new ones.
+  An operator who turns `security.sharing.enabled` off has decided the disclosure already made
+  is the problem; a mint-time-only check would make the setting a statement about the future.
 - **Soft-deleting the conversation revokes the link.** The public read applies
   `deleted_at IS NULL`, like every other read in the system.
-- **Links expire.** `share_expires_at`, defaulting to 30 days, set at creation and enforced on
-  every read. A capability with no expiry accumulates forever, and the set of live ones becomes
+- **Links expire.** `share_expires_at`, set at creation from `security.sharing.link_ttl_s`
+  (default 30 days) and enforced on every read. A capability with no expiry accumulates forever, and the set of live ones becomes
   unknowable.
 - **Both are visible to the owner**: which conversations are shared, when each link expires,
   and one action to revoke.

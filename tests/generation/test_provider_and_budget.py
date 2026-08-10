@@ -99,8 +99,14 @@ def generator(**overrides: Any) -> tuple[LitellmGenerator, list[dict[str, Any]]]
         overrides.pop("streams", [FakeStream([chunk("hello"), chunk(finish="stop")])])
     )
 
+    # A call that misbehaves in a way no scripted stream can — one that hangs, or refuses
+    # before a stream exists at all.
+    supplied: Any = overrides.pop("completion", None)
+
     async def completion(**kwargs: Any) -> Any:
         calls.append(kwargs)
+        if supplied is not None:
+            return await supplied(**kwargs)
         outcome = streams.pop(0)
         if isinstance(outcome, Exception):
             raise outcome

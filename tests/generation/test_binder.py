@@ -68,6 +68,7 @@ async def bind(
     timeout_s: float = 5.0,
     passages: tuple[Candidate, ...] | None = None,
     documents: dict[str, Document] | None = None,
+    chunks: int = 1,
 ) -> CitationBinder:
     """Run one model output through a binder over the two-passage fixture."""
     verifier = CitationVerifier(
@@ -75,13 +76,24 @@ async def bind(
     )
     assembled = context(passages if passages is not None else two_passages())
     run = verifier.start(assembled, documents or two_documents(), started_at=time.monotonic())
-    binder = CitationBinder(passages=assembled.passages, run=run)
-    async for _ in binder.feed(text):
-        pass
-    async for _ in binder.finish():
-        pass
+    binder = CitationBinder(run=run)
+    for piece in _split(text, chunks):
+        await binder.feed(piece)
+    await binder.finish()
     await run.aclose()
     return binder
+
+
+def _split(text: str, chunks: int) -> list[str]:
+    """Cut ``text`` into ``chunks`` roughly equal pieces.
+
+    Feeding in one piece is the case that never happens in production: a provider splits its
+    output wherever the network did, and a marker straddling that boundary is ordinary.
+    """
+    if chunks <= 1:
+        return [text]
+    size = max(len(text) // chunks, 1)
+    return [text[at : at + size] for at in range(0, len(text), size)] or [text]
 
 
 # --- the guarantee, and the three ways a model breaks it ---------------------------------
@@ -204,9 +216,8 @@ async def test_without_retained_bytes_the_ceiling_drops_and_citations_still_work
     verifier = CitationVerifier(UnverifiableSource("retention is off"))
     assembled = context(two_passages())
     run = verifier.start(assembled, two_documents())
-    binder = CitationBinder(passages=assembled.passages, run=run)
-    async for _ in binder.feed(f"Roll back.{ATTEMPT_PREFIX}:1]]"):
-        pass
+    binder = CitationBinder(run=run)
+    await binder.feed(f"Roll back.{ATTEMPT_PREFIX}:1]]")
     await run.aclose()
 
     assert verifier.ceiling is Verification.LOCATED
@@ -311,13 +322,10 @@ async def test_events_arrive_in_stream_order_so_a_citation_lands_where_its_marke
     verifier = CitationVerifier(resolver(honest_parser()))
     assembled = context(two_passages())
     run = verifier.start(assembled, two_documents())
-    binder = CitationBinder(passages=assembled.passages, run=run)
+    binder = CitationBinder(run=run)
 
-    kinds: list[EventKind] = []
-    async for event in binder.feed(f"First.{ATTEMPT_PREFIX}:1]] Second."):
-        kinds.append(event.kind)
-    async for event in binder.finish():
-        kinds.append(event.kind)
+    kinds = [event.kind for event in await binder.feed(f"First.{ATTEMPT_PREFIX}:1]] Second.")]
+    kinds.extend(event.kind for event in await binder.finish())
     await run.aclose()
 
     assert kinds == [EventKind.DELTA, EventKind.CITATION, EventKind.DELTA, EventKind.DELTA]

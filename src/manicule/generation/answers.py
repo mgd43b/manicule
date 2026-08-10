@@ -182,7 +182,7 @@ class CitationDrop(BaseModel):
     def _slots_and_reasons_agree(self) -> Self:
         if self.reason is DropReason.MALFORMED_MARKER:
             if self.slot is not None:
-                msg = "a malformed marker names no slot; got slot={self.slot!r}"
+                msg = f"a malformed marker names no slot; got slot={self.slot!r}"
                 raise ValueError(msg)
         elif self.slot is None:
             msg = f"drop reason {self.reason.value!r} must name the slot it dropped"

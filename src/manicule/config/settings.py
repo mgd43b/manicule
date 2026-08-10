@@ -1030,8 +1030,20 @@ class Settings(BaseSettings):
         """
         import re  # noqa: PLC0415 - only this check needs it
 
+        from manicule.generation.redaction import BUILTIN_DETECTORS  # noqa: PLC0415
+
         redaction = self.security.data_policy.auto_redact
         problems: list[str] = []
+        unknown = sorted(
+            name for name in redaction.patterns if name.strip().lower() not in BUILTIN_DETECTORS
+        )
+        if unknown:
+            available = ", ".join(sorted(BUILTIN_DETECTORS))
+            problems.append(
+                f"security.data_policy.auto_redact.patterns names {', '.join(unknown)}, which "
+                f"is not a built-in detector. Available: {available}. Put a regex of your own "
+                f"in custom_patterns instead."
+            )
         for pattern in redaction.custom_patterns:
             try:
                 re.compile(pattern)
@@ -1058,15 +1070,31 @@ class Settings(BaseSettings):
         of the two settings is not in force and nothing says which.
         """
         restrictions = self.security.data_policy.source_restrictions
+        problems: list[str] = []
         both = sorted(set(restrictions.local_only) & set(restrictions.cloud_allowed))
-        if not both:
-            return []
-        return [
-            f"security.data_policy.source_restrictions names {', '.join(both)} in both "
-            f"local_only and cloud_allowed. local_only is a floor that no exemption releases, "
-            f"so one of the two settings would not be in force. Remove the source from "
-            f"whichever list is wrong."
-        ]
+        if both:
+            problems.append(
+                f"security.data_policy.source_restrictions names {', '.join(both)} in both "
+                f"local_only and cloud_allowed. local_only is a floor that no exemption "
+                f"releases, so one of the two settings would not be in force. Remove the "
+                f"source from whichever list is wrong."
+            )
+
+        # A workspace override is only ever consulted by exact name, so a key naming no
+        # workspace is a restriction that reads as in force and is not — and the direction it
+        # fails in is permissive.
+        stray = sorted(
+            name
+            for name in self.security.data_policy.workspace_overrides
+            if name.strip().lower() != self.workspace.strip().lower()
+        )
+        if stray:
+            problems.append(
+                f"security.data_policy.workspace_overrides names {', '.join(stray)}, which is "
+                f"not this installation's workspace ({self.workspace!r}). An override keyed to "
+                f"a workspace that never asks a question is never applied."
+            )
+        return problems
 
     def require_valid(self) -> Self:
         """Raise if this configuration cannot be run.

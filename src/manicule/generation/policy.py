@@ -47,7 +47,10 @@ class EgressPolicy:
             point for point in settings.selected_endpoints if point.role is ModelRole.LLM
         )
         policy = settings.security.data_policy
-        override = policy.workspace_overrides.get(workspace or settings.workspace)
+        overrides = {
+            name.strip().lower(): value for name, value in policy.workspace_overrides.items()
+        }
+        override = overrides.get((workspace or settings.workspace).strip().lower())
         workspace_cloud = (
             policy.cloud_allowed
             if override is None
@@ -133,13 +136,13 @@ def filter_context(
     drops: list[PolicyDrop] = []
     for candidate in context.passages:
         document = documents.get(candidate.chunk.document_id)
-        reason = policy.refuses(document.source) if document is not None else ""
+        reason = _refusal(candidate.chunk.document_id, document, policy)
         if reason:
             drops.append(
                 PolicyDrop(
                     document_id=candidate.chunk.document_id,
                     chunk_id=candidate.chunk.id,
-                    source=document.source if document else "",
+                    source=document.source if document else "(unknown)",
                     reason=reason,
                 )
             )
@@ -147,7 +150,38 @@ def filter_context(
             kept.append(candidate)
     if not drops:
         return context, ()
-    return context.model_copy(update={"passages": tuple(kept)}), tuple(drops)
+    # `token_count` is recomputed rather than carried over: `model_copy` does not re-validate,
+    # so a stale total would over-report the prompt in the trace and in any budget check
+    # downstream of it.
+    kept_tokens = sum(candidate.chunk.token_count for candidate in kept)
+    return (
+        context.model_copy(update={"passages": tuple(kept), "token_count": kept_tokens}),
+        tuple(drops),
+    )
+
+
+def _refusal(document_id: str, document: Document | None, policy: EgressPolicy) -> str:
+    """Why this passage may not be sent, or ``""``.
+
+    **A document that cannot be found fails closed when anything is leaving.** The miss is
+    realistic rather than theoretical: the document store filters soft-deleted rows while the
+    chunk index still returns their chunks, so a document deleted between retrieval and
+    generation — including one deleted *precisely because* somebody decided it was sensitive
+    — arrives here as an absent row. Keeping it would send its full text to a hosted model
+    with no policy evaluated at all, which is the irreversible direction.
+
+    When nothing leaves the machine there is nothing to fail closed about, so the passage is
+    kept and the proportionality argument for dropping-rather-than-refusing stands.
+    """
+    if not policy.leaves_machine:
+        return ""
+    if document is None:
+        return (
+            f"document {document_id} is not in the index, so the source policy that governs "
+            f"it cannot be evaluated, and the {policy.endpoint.describe()} is not on this "
+            f"machine"
+        )
+    return policy.refuses(document.source)
 
 
 __all__ = ["EgressPolicy", "filter_context"]

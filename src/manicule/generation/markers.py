@@ -47,7 +47,7 @@ the buffered text is released **verbatim** — the binder deletes markers, and s
 is not a marker is not the binder's to delete.
 """
 
-_SLOT_LIST = re.compile(r"^\s*:\s*(\d+)(?:\s*,\s*(\d+))*\s*$")
+_SLOT_LIST = re.compile(r"^\s*:\s*(\d+)(?:\s*,\s*(\d+))*\s*$", re.ASCII)
 """The payload of a well-formed marker: a colon and one or more slot numbers.
 
 Whitespace is tolerated on both sides of the colon and around the separators, which is the
@@ -56,7 +56,7 @@ one normalisation the binder performs — of syntax it defined itself. ``[[cite:
 edit to the answer in any sense a reader could observe.
 """
 
-_SLOT = re.compile(r"\d+")
+_SLOT = re.compile(r"\d+", re.ASCII)
 
 _ESCAPE = re.compile(re.escape(ATTEMPT_PREFIX), re.IGNORECASE)
 """What :func:`escape_markers` neutralises in a passage body."""
@@ -152,19 +152,25 @@ class MarkerScanner:
     _pending: str = field(default="", init=False)
     _in_attempt: bool = field(default=False, init=False)
 
-    def feed(self, chunk: str) -> Iterator[ScanEvent]:
-        """Consume ``chunk`` and yield everything now decidable."""
-        self._pending += chunk
-        yield from self._drain(final=False)
+    def feed(self, chunk: str) -> list[ScanEvent]:
+        """Consume ``chunk`` and return everything now decidable.
 
-    def finish(self) -> Iterator[ScanEvent]:
+        A plain method rather than a generator: as a generator the buffer append happens on
+        the first ``next()``, so a caller that built the iterator and did not drain it would
+        lose the chunk entirely — silently, in a class whose contract is that no byte of the
+        answer goes missing.
+        """
+        self._pending += chunk
+        return list(self._drain(final=False))
+
+    def finish(self) -> list[ScanEvent]:
         """Flush whatever is still held.
 
         An attempt still open at the end of a stream never closed, so it is released verbatim
         under the same rule as one that overran the bound — the provider stopped, which says
         nothing about what the model meant.
         """
-        yield from self._drain(final=True)
+        return list(self._drain(final=True))
 
     def _drain(self, *, final: bool) -> Iterator[ScanEvent]:
         """Yield every decidable event. ``final`` forbids holding anything back.
@@ -222,20 +228,29 @@ class MarkerScanner:
         return False if final else None
 
     def _close_attempt(self, *, final: bool) -> ScanEvent | None:
-        """Resolve an open attempt once its closing brackets arrive, or its bound expires."""
-        end = self._pending.find(MARKER_CLOSE, len(ATTEMPT_PREFIX))
+        """Resolve an open attempt once its closing brackets arrive, or its bound expires.
+
+        **The search is bounded as tightly as the release is**, and both matter. Searching the
+        whole buffer for ``]]`` — or releasing the whole buffer on overrun — makes the result
+        a function of where the network chunks fell rather than of the text: the same model
+        output split one way yields a verified citation, and split another way leaves
+        ``[[cite:1]]`` visible as prose. Nothing is lost either way, but *which citations
+        exist* has to be chunk-invariant, because that is the property the whole streaming
+        design rests on.
+        """
+        limit = len(MARKER_OPEN) + MARKER_MAX_LEN
+        end = self._pending.find(MARKER_CLOSE, len(ATTEMPT_PREFIX), limit)
         if end < 0:
-            overrun = len(self._pending) - len(MARKER_OPEN) > MARKER_MAX_LEN
-            if not (overrun or final):
+            if not (len(self._pending) >= limit or final):
                 return None
-            raw, self._pending, self._in_attempt = self._pending, "", False
+            size = min(limit, len(self._pending))
+            raw, self._pending, self._in_attempt = (
+                self._pending[:size],
+                self._pending[size:],
+                False,
+            )
             return ScanEvent(ScanEventKind.UNTERMINATED, raw)
         raw = self._pending[: end + len(MARKER_CLOSE)]
-        if len(raw) - len(MARKER_OPEN) > MARKER_MAX_LEN:
-            # It closed, but not within the bound. Released verbatim for the same reason: a
-            # marker this long is not one, and the scanner is not entitled to delete prose.
-            self._pending, self._in_attempt = self._pending[len(raw) :], False
-            return ScanEvent(ScanEventKind.UNTERMINATED, raw)
         self._pending, self._in_attempt = self._pending[len(raw) :], False
         slots = parse_slots(raw[len(ATTEMPT_PREFIX) : -len(MARKER_CLOSE)])
         if slots is None:

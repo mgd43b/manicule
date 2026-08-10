@@ -33,8 +33,11 @@ import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from manicule.core.errors import PolicyError
-from manicule.generation.answers import Citation
+from manicule.generation.answers import Citation, Verification
+from manicule.generation.prompt import describe_location
 
 TOKEN_BYTES = 32
 """256 bits. Guessing is not the threat model a shorter token would fail; leaking is."""
@@ -75,8 +78,18 @@ class ShareLink:
         return f"/shared/{self.token}"
 
 
-def new_share(conversation_id: str, *, ttl_s: int, now: datetime | None = None) -> ShareLink:
+def new_share(
+    conversation_id: str,
+    *,
+    ttl_s: int,
+    maximum_ttl_s: int | None = None,
+    now: datetime | None = None,
+) -> ShareLink:
     """Mint a link for a conversation.
+
+    ``maximum_ttl_s`` is ``security.sharing.link_ttl_s`` and is a **ceiling**, not a default:
+    a requested lifetime is clamped to it rather than refused, so a route that surfaces the
+    choice to a user cannot mint a capability that outlives the policy.
 
     Raises:
         ValueError: ``ttl_s`` is not positive. A link that expires at or before the moment it
@@ -85,6 +98,8 @@ def new_share(conversation_id: str, *, ttl_s: int, now: datetime | None = None) 
     if ttl_s <= 0:
         msg = f"a share link needs a positive lifetime; got ttl_s={ttl_s}"
         raise ValueError(msg)
+    if maximum_ttl_s is not None:
+        ttl_s = min(ttl_s, maximum_ttl_s)
     moment = now or datetime.now(UTC)
     token = mint_token()
     return ShareLink(
@@ -115,7 +130,26 @@ def require_sharing_enabled(enabled: bool) -> None:
         raise PolicyError(msg)
 
 
-def redact_for_anonymous(citation: Citation) -> Citation:
+class CitationLabel(BaseModel):
+    """What an anonymous viewer of a shared conversation is given about one citation.
+
+    A **different type**, not a blanked-out :class:`~manicule.generation.answers.Citation`.
+    The projection has to be structural: a helper that clears two fields is one a route can
+    forget to call, and the fields it left behind were the corpus's internal identifiers —
+    ``document_id``, ``chunk_id``, and the anchor itself, whose ``symbol`` is a private
+    repository's function name and whose ``sheet``/``ref`` name a spreadsheet and a cell.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    slot: int = Field(ge=1)
+    title: str
+    heading_path: tuple[str, ...] = ()
+    location: str = Field(default="", description="A human location: 'page 4'. Never an id.")
+    verification: Verification
+
+
+def redact_for_anonymous(citation: Citation) -> CitationLabel:
     """The same citation as an anonymous viewer of a shared link receives it.
 
     **The label and the verification state survive; the passage text does not.** Two of this
@@ -132,7 +166,13 @@ def redact_for_anonymous(citation: Citation) -> Citation:
     to the workspace opens the same conversation and sees the passages, because they could
     have retrieved them anyway.
     """
-    return citation.model_copy(update={"quote": "", "uri": ""})
+    return CitationLabel(
+        slot=citation.slot,
+        title=citation.title,
+        heading_path=citation.heading_path,
+        location=describe_location(citation.anchor),
+        verification=citation.verification,
+    )
 
 
 def is_live(expires_at: datetime | None, *, now: datetime | None = None) -> bool:
@@ -150,6 +190,7 @@ def is_live(expires_at: datetime | None, *, now: datetime | None = None) -> bool
 
 __all__ = [
     "TOKEN_BYTES",
+    "CitationLabel",
     "ShareLink",
     "hash_token",
     "is_live",
