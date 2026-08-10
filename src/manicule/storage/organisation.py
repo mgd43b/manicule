@@ -23,6 +23,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import ColumnElement, Select, and_, delete, false, func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from manicule.core.errors import NameInUseError, UnknownEntityError
 from manicule.core.organisation import Collection, CollectionRule, Tag
@@ -109,24 +110,31 @@ class CollectionsMixin(WorkspaceScoped):
     async def create_collection(
         self, name: str, *, description: str | None = None, rule: CollectionRule | None = None
     ) -> Collection:
+        """Create a collection, or refuse because the name is taken.
+
+        The check and the insert are in one transaction, and the unique constraint is still
+        the authority: two requests naming the same new collection can both find nothing and
+        both insert, and the loser must come back with the same sentence as an ordinary
+        duplicate rather than an ``IntegrityError`` naming a constraint. A caller cannot act on
+        the name of an index.
+        """
         label = normalise_name(name)
-        async with self._sessions.begin() as session:
-            if await self._collection_named(session, label) is not None:
-                msg = (
-                    f"workspace {self._workspace_id!r} already has a collection called "
-                    f"{label!r}. Add to it, or choose another name."
+        try:
+            async with self._sessions.begin() as session:
+                if await self._collection_named(session, label) is not None:
+                    raise NameInUseError(_name_taken(self._workspace_id, "collection", label))
+                row = models.Collection(
+                    id=str(uuid.uuid4()),
+                    workspace_id=self._workspace_id,
+                    name=label,
+                    description=description,
+                    auto_rules=cast("Any", rule.model_dump(mode="json") if rule else None),
                 )
-                raise NameInUseError(msg)
-            row = models.Collection(
-                id=str(uuid.uuid4()),
-                workspace_id=self._workspace_id,
-                name=label,
-                description=description,
-                auto_rules=cast("Any", rule.model_dump(mode="json") if rule else None),
-            )
-            session.add(row)
-            await session.flush()
-            return _to_collection(row)
+                session.add(row)
+                await session.flush()
+                return _to_collection(row)
+        except IntegrityError as clash:
+            raise NameInUseError(_name_taken(self._workspace_id, "collection", label)) from clash
 
     async def get_collection(self, collection_id: str) -> Collection | None:
         async with self._sessions() as session:
@@ -160,8 +168,8 @@ class CollectionsMixin(WorkspaceScoped):
             rival = await self._collection_named(session, label)
             if rival is not None and rival.id != row.id:
                 msg = (
-                    f"workspace {self._workspace_id!r} already has a collection called "
-                    f"{label!r}; renaming onto it would merge two sets under one name."
+                    f"{_name_taken(self._workspace_id, 'collection', label)} Renaming onto it "
+                    f"would merge two sets under one name."
                 )
                 raise NameInUseError(msg)
             row.name = label
@@ -386,23 +394,37 @@ class TagsMixin(WorkspaceScoped):
     """:class:`~manicule.core.protocols.TagStore` over SQLite."""
 
     async def ensure_tag(self, name: str, *, color: str | None = None) -> Tag:
+        """Return the tag with this name, creating it if it is new.
+
+        **The race is resolved rather than reported**, and that is the difference between this
+        and :meth:`CollectionsMixin.create_collection`. Two requests applying the same new label
+        can both find nothing and both insert; the loser has still got what it asked for — a tag
+        with that name — so handing it back is the honest answer, where refusing a *collection*
+        is, because a collection is a set somebody is building and a tag is a word.
+        """
         label = normalise_name(name)
-        async with self._sessions.begin() as session:
-            existing = await self._tag_named(session, label)
-            if existing is not None:
-                # The colour is deliberately not overwritten. Otherwise the last person to type
-                # a tag name decides how it looks for everyone, from a call that reads like a
-                # no-op.
-                return _to_tag(existing)
-            row = models.Tag(
-                id=str(uuid.uuid4()),
-                workspace_id=self._workspace_id,
-                name=label,
-                color=color,
-            )
-            session.add(row)
-            await session.flush()
-            return _to_tag(row)
+        try:
+            async with self._sessions.begin() as session:
+                existing = await self._tag_named(session, label)
+                if existing is not None:
+                    # The colour is deliberately not overwritten. Otherwise the last person to
+                    # type a tag name decides how it looks for everyone, from a call that reads
+                    # like a no-op.
+                    return _to_tag(existing)
+                row = models.Tag(
+                    id=str(uuid.uuid4()),
+                    workspace_id=self._workspace_id,
+                    name=label,
+                    color=color,
+                )
+                session.add(row)
+                await session.flush()
+                return _to_tag(row)
+        except IntegrityError:
+            settled = await self.find_tag(label)
+            if settled is None:  # pragma: no cover - the constraint said it was there
+                raise
+            return settled
 
     async def get_tag(self, tag_id: str) -> Tag | None:
         async with self._sessions() as session:
@@ -436,9 +458,9 @@ class TagsMixin(WorkspaceScoped):
             rival = await self._tag_named(session, label)
             if rival is not None and rival.id != row.id:
                 msg = (
-                    f"workspace {self._workspace_id!r} already has a tag called {label!r}. "
-                    f"Renaming onto it would move every document from one label to the other "
-                    f"with nothing to undo it; untag and re-tag if that is what you mean."
+                    f"{_name_taken(self._workspace_id, 'tag', label)} Renaming onto it would "
+                    f"move every document from one label to the other with nothing to undo it; "
+                    f"untag and re-tag if that is what you mean."
                 )
                 raise NameInUseError(msg)
             row.name = label
@@ -632,6 +654,15 @@ async def resolve_filter(
     Fields combine as :class:`~manicule.core.retrieval.Filter` says they do — disjunction
     within a field, conjunction between them. So several collections union, several tags union,
     and a filter naming both keeps only the documents in both sets.
+
+    Raises:
+        ValueError: A collection or a tag holds more documents than
+            :data:`MAX_RESOLVED_DOCUMENTS`. Refused rather than truncated: a truncated id set
+            is a filter that *looks* complete and quietly excludes documents that are in the
+            collection, which is the same silent wrongness the ``None`` above exists to
+            prevent, arriving from the opposite direction. The remedy is the id-list threshold
+            ``docs/retrieval.md`` §3.3 already owns — over-fetch and post-filter instead of a
+            million-element ``IN`` clause.
     """
     if not filter.collection_ids and not filter.tag_ids:
         return filter
@@ -640,11 +671,18 @@ async def resolve_filter(
     if filter.collection_ids:
         from_collections: set[str] = set()
         for collection_id in sorted(filter.collection_ids):
-            members = await collections.collection_documents(collection_id, limit=_UNBOUNDED)
+            members = await collections.collection_documents(
+                collection_id, limit=MAX_RESOLVED_DOCUMENTS + 1
+            )
+            _refuse_if_truncated(len(members), f"collection {collection_id!r}")
             from_collections.update(document.id for document in members)
+        _refuse_if_truncated(len(from_collections), "the named collections together")
         scopes.append(from_collections)
     if filter.tag_ids:
-        tagged = await tags.documents_with_tags(sorted(filter.tag_ids), limit=_UNBOUNDED)
+        tagged = await tags.documents_with_tags(
+            sorted(filter.tag_ids), limit=MAX_RESOLVED_DOCUMENTS + 1
+        )
+        _refuse_if_truncated(len(tagged), "the named tags")
         scopes.append({document.id for document in tagged})
     if filter.document_ids:
         scopes.append(set(filter.document_ids))
@@ -666,15 +704,38 @@ async def resolve_filter(
     )
 
 
-_UNBOUNDED = 1_000_000
-"""A limit high enough to mean "all of them" for a membership resolution.
+MAX_RESOLVED_DOCUMENTS = 10_000
+"""How many document ids a membership resolution will produce before it refuses.
 
-Named rather than inlined because it is a real ceiling and not a synonym for infinity. A
-collection larger than this resolves to a truncated id set, and the honest answer to that is
-the id-list threshold ``docs/retrieval.md`` §3.3 already owns — over-fetch and post-filter
-rather than a million-element ``IN`` clause — which is a decision for the query planner there,
-not something to paper over here.
+A real ceiling, not a synonym for infinity, and the reason it is enforced rather than merely
+documented: past it, the resolution would hand back a filter that looks complete and silently
+omits documents that *are* in the collection. That is the same failure as resolving an empty
+collection to "no restriction", from the other end.
+
+Refusing is also the only answer SQLite can act on. A resolved set reaches the lexical query as
+one bind parameter per id, against a ``SQLITE_MAX_VARIABLE_NUMBER`` that is 32 766 on a modern
+build and 999 on an older one — so a large ``IN`` list does not degrade, it fails, and it fails
+somewhere that reads as a bug in search. The regime that serves a collection this size is
+``docs/retrieval.md`` §3.3's other plan: over-fetch and post-filter, decided per query against
+``prefilter_id_limit``, which starts two orders of magnitude below this number.
 """
+
+
+def _refuse_if_truncated(found: int, what: str) -> None:
+    if found <= MAX_RESOLVED_DOCUMENTS:
+        return
+    msg = (
+        f"{what} holds more than {MAX_RESOLVED_DOCUMENTS} documents, which is more than a "
+        f"filter can carry as an id list. Truncating it would return a filter that looks "
+        f"complete while excluding members of the collection; search it with the "
+        f"over-fetch-and-post-filter plan instead."
+    )
+    raise ValueError(msg)
+
+
+def _name_taken(workspace_id: str, kind: str, name: str) -> str:
+    """One sentence for a name clash, so the pre-check and the constraint agree."""
+    return f"workspace {workspace_id!r} already has a {kind} called {name!r}."
 
 
 def _tagged_ids(tag_ids: Sequence[str], *, match_all: bool) -> Select[tuple[str]]:
@@ -723,6 +784,7 @@ def _to_tag(row: models.Tag) -> Tag:
 
 
 __all__ = [
+    "MAX_RESOLVED_DOCUMENTS",
     "CollectionsMixin",
     "TagsMixin",
     "normalise_name",

@@ -1399,6 +1399,17 @@ empty collection into `document_ids = frozenset()` would not lose the restrictio
 ranked and plausible. Same family as the `MATCH`-then-hydrate result in §6.1: a well-formed
 answer to a question nobody asked.
 
+**And the other end refuses rather than truncates.** Past `MAX_RESOLVED_DOCUMENTS` (10 000) the
+resolution raises instead of returning the first N ids, because a truncated id set is a filter
+that *looks* complete while excluding documents that are in the collection — the same silent
+wrongness arriving from the opposite direction. It could not degrade gracefully in any case: a
+resolved set reaches the lexical statement as one bind parameter per id, against a
+`SQLITE_MAX_VARIABLE_NUMBER` of 32 766 on a modern build and 999 on an older one, so a large
+`IN` list does not get slower, it fails, somewhere that reads as a bug in search. The regime
+that serves a collection that size is [`retrieval.md`](retrieval.md) §3.3's other plan —
+over-fetch and post-filter, decided per query against `prefilter_id_limit`, which starts two
+orders of magnitude below this ceiling.
+
 ### 11.4 Tag and collection names
 
 Normalised to NFKC with whitespace collapsed. Without NFKC, `café` typed on two keyboards is
@@ -1411,6 +1422,14 @@ person notices. Compare what the schema's `CHECK` constraints exist for — a mi
 `documents.status` makes a document unservable for ever with nothing rendered anywhere. Case
 folding is also not free: `str.casefold` maps `İ` to two codepoints and `ẞ` to `ss`, so a label
 would come back spelled differently from how it was typed, and a label is display text.
+
+**The unique constraint is the authority, and the two surfaces lose the race differently.** A
+check-then-insert can be beaten, so both paths catch the constraint violation rather than
+letting an `IntegrityError` naming an index reach a caller. `create_collection` re-raises it as
+the same refusal an ordinary duplicate gets — a collection is a set somebody is building, and
+silently handing back another one under that name merges two people's work. `ensure_tag`
+returns the tag the winner created, because the loser has still got exactly what it asked for:
+a tag with that name. A collection is a set; a tag is a word.
 
 ### 11.5 Versions, and what a stale citation resolves to
 

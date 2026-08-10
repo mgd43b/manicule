@@ -167,7 +167,15 @@ class CitationState(StrEnum):
     """
 
     PRESENT = "present"
-    """The chunk is live and its document is servable. The citation resolves."""
+    """The chunk is stored and its document is not in the trash. The citation resolves.
+
+    **Servability is a separate question and is deliberately not folded in here.** A document
+    mid-re-index is not ``indexed`` and must not appear in a search — that boundary belongs to
+    the hydrating join, and :func:`manicule.testing.assert_pipeline_enforces_scope` holds it
+    there. But the text this citation named is in the store, and answering "absent" about it
+    would be wrong in the direction that matters: it would report a citation as broken while
+    the passage it quotes is sitting in the row.
+    """
 
     SUPERSEDED = "superseded"
     """The document was re-ingested and no longer contains that text.

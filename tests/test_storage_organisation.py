@@ -38,6 +38,7 @@ from manicule.core.protocols import (
     VersionStore,
 )
 from manicule.core.retrieval import Filter
+from manicule.storage import organisation
 from manicule.storage.blobs import BlobStore
 from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.organisation import normalise_name, resolve_filter
@@ -570,6 +571,28 @@ async def test_resolving_a_collection_and_a_tag_keeps_only_documents_in_both(
     assert resolved.document_ids == frozenset({first.id})
     assert not resolved.collection_ids
     assert not resolved.tag_ids
+
+
+async def test_a_collection_too_large_to_carry_is_refused_rather_than_truncated(
+    store: SqliteDocStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same silent wrongness as an empty collection, arriving from the other end.
+
+    A truncated id set is a filter that looks complete while excluding documents that are in
+    the collection — and the caller has nothing to notice it by. It cannot degrade gracefully
+    either: the ids reach SQLite as one bind parameter each, against a limit of 32 766 on a
+    modern build, so a large list fails somewhere that reads as a bug in search.
+    """
+    documents = await _seed(store, 3)
+    collection = await store.create_collection("large")
+    await store.add_to_collection(collection.id, [document.id for document in documents])
+    monkeypatch.setattr(organisation, "MAX_RESOLVED_DOCUMENTS", 2)
+
+    scope = Filter(
+        workspace_ids=frozenset({DEFAULT_WORKSPACE}), collection_ids=frozenset({collection.id})
+    )
+    with pytest.raises(ValueError, match="more than 2 documents"):
+        await resolve_filter(scope, collections=store, tags=store)
 
 
 async def test_a_filter_naming_neither_is_returned_untouched(store: SqliteDocStore) -> None:
