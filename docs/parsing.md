@@ -1243,9 +1243,25 @@ the bucket that triggers the OCR warning in §6.5. The container is not indexed 
 either; a chunk listing filenames is retrieval noise that competes with the real content
 inside it. The member list is metadata, visible through `document list --container <id>`.
 
-**Deletion cascades.** Removing a container removes its members; a container whose bytes
-changed has its members re-derived rather than merged, since matching old members to new
-ones is guesswork.
+**Deletion cascades.** Removing a container removes its members — `ON DELETE CASCADE` on
+`container_id` ([`storage.md`](storage.md) §4.2).
+
+**A changed container has its member set re-derived, which is not the same as replaced.**
+The parse stage re-walks the archive and emits the members it finds; it does no matching
+against what was there before, because matching members *by content* is guesswork.
+
+That must not reach storage as delete-then-insert, and it does not. Members carry a
+`source_id` built from the inner path, so storage reconciles the re-derived set against the
+stored one by that key — present in both is an upsert, absent from the new set is a
+soft-delete — the same shape as `Connector.reconcile`. No content matching happens anywhere.
+
+The distinction is worth stating because the naive reading is destructive. `documents.id` is
+a `uuid4`, not derived from content, so delete-then-insert would mint a fresh id for every
+member, cascade away its `document_versions` history, and dangle every citation into the
+archive — **including for members whose bytes never changed.** One edited file in a 200-file
+zip would cost the provenance of all 200. Under reconcile an unchanged member keeps its id
+and its history, and its unchanged `content_hash` lets ingest skip re-parse and re-embed
+entirely.
 
 **Breadcrumbs nest.** A member's breadcrumb begins with the container's, so a chunk from
 `archive.zip!/reports/2026-q1.pdf` embeds under `archive.zip > reports > 2026-q1.pdf > …`.
