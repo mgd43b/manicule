@@ -396,7 +396,7 @@ await litellm.acompletion(
     model=...,           # "<provider>/<model>"
     messages=[...],      # §6
     stream=True,
-    stream_options={"include_usage": True},   # §4.10 — not optional
+    stream_options={"include_usage": True},   # §4.10
     base_url=...,        # None for hosted providers with a default
     api_key=...,
     temperature=...,
@@ -432,15 +432,23 @@ and `tests/test_import_boundary.py` keeps it out of `import manicule`.
 `LlmSettings` carries `provider` and `model` separately; litellm wants one string. The
 composition is `f"{provider}/{model}"` with one correction that is not cosmetic:
 
-> **The Ollama provider prefix is `ollama_chat`, not `ollama`.** They are different endpoints.
-> `ollama/` routes to `/api/generate`, the raw completion endpoint, which does **not** apply
-> the model's chat template. `ollama_chat/` routes to `/api/chat`, which does.
+> **The Ollama provider prefix is `ollama_chat`, not `ollama`.** They are different endpoints:
+> `ollama/` routes to `/api/generate` and `ollama_chat/` routes to `/api/chat`. litellm's own
+> documentation says "We recommend using `ollama_chat` for better responses", and the reason
+> matters more than the recommendation.
 
-A chat-tuned model driven through the completion endpoint gets a prompt in a shape it was
-never trained on. It still answers — plausibly, in fluent prose, with no error anywhere — and
-it follows instructions measurably worse, which for this design means it follows the citation
-protocol worse. That is a silent quality regression with no symptom other than more dropped
-markers.
+**The failure is double-templating, not a missing template.** `/api/generate` applies the
+model's template perfectly well — that is why Ollama has a `raw` option to bypass it. The
+problem is upstream: litellm's `ollama/` path first flattens the `messages` array into a
+single string using **its own** prompt template, and Ollama then applies the **model's** real
+template on top of that already-formatted string. The model receives its own turn markers
+wrapped around a foreign approximation of them.
+
+It still answers — plausibly, in fluent prose, with nothing raised anywhere — and it follows
+instructions worse, which for this design means it follows the citation protocol worse. The
+only symptom is more dropped markers, which reads as a weak model rather than as a wiring
+mistake. `ollama_chat/` hands the `messages` array to `/api/chat` and lets exactly one
+template apply.
 
 So `ollama` in configuration maps to `ollama_chat/` in the call, the resolved model string is
 recorded in the trace, and `doctor` prints it. Configuration keeps the name an operator
@@ -469,34 +477,44 @@ context_tokens + history_tokens + system_prompt_tokens + generation_reserve
         must fit the configured generator's context window
 ```
 
-and assigns the enforcement point here. The trap is in the last three words.
+and assigns the enforcement point here. The trap is in the last three words: on the default
+local runtime, "the configured generator's context window" is not one number and is not the
+model's.
 
-**Ollama's served window is `num_ctx`, a runtime option that defaults far below what modern
-models are trained for**, and a prompt exceeding it is truncated to fit rather than refused.
-So `qwen2.5:14b`, trained at 32768, is served at the default `num_ctx` unless something says
-otherwise — and manicule's `balanced` profile assembles 16384 context tokens plus 1024 of
-history against it. The overflow does not error. It is discarded, and it is discarded from the
-**front** of the prompt, which is where the system prompt and the citation protocol live.
+**Ollama serves `num_ctx`, which is a runtime option, not a property of the model.** Its
+default is not the model's trained length and is not a constant — current Ollama tiers it by
+available VRAM (roughly 4k below 24 GiB, 32k from 24–48 GiB, more above), and Ollama's own FAQ
+and context-length pages disagree about it. **So the served window is a property of the machine
+manicule happens to be running on.** A profile that fits on the developer's 64 GB Mac Studio is
+served an eighth of the window on a 16 GB laptop, with no configuration difference between
+them.
 
-The failure mode is therefore: the model answers, fluently, having never seen the instruction
-telling it how to cite, and every marker is missing or malformed. Nothing raises. It reads as a
-weak model.
+**What happens on overflow is version-dependent, and neither behaviour is acceptable to rely
+on.** Older Ollama truncated the prompt to fit. Current Ollama (tested at 0.32.5) does the
+opposite: it *grows* the context to hold the prompt — a 6743-token prompt against
+`num_ctx=256` was evaluated in full, `prompt_eval_count` reported all 6743, and text at the
+very start of the prompt came back verbatim. So the modern failure is not silent data loss; it
+is **memory**. An auto-grown context spills to CPU or fails to allocate, which on unified
+memory is a collapse in throughput or an outright failure to load (§15).
 
-Three consequences:
+Relying on either is wrong. Truncation loses the system prompt silently on an old build;
+auto-growth turns a budgeting mistake into an OOM on a new one. The fix is the same for both,
+and it is to stop leaving the number to the runtime:
 
-- **`Generator.context_window` means the window that will actually be served**, not the
-  model's trained maximum. For Ollama that is read from `/api/show` combined with what
-  manicule itself sets.
+- **`Generator.context_window` means the window that will actually be served**, not the model's
+  trained maximum. For Ollama it is read from `/api/show` and combined with what manicule
+  itself sets.
 - **manicule sets `num_ctx` explicitly on every Ollama call**, derived from the profile
   arithmetic above. Derived rather than configured, so it cannot disagree with the budget it
-  exists to satisfy.
-- **The first response's true prompt count is checked against the estimate** (§9.2). If a
-  server truncated, the true count comes back pinned at the window and the discrepancy is
-  visible immediately rather than as a mysterious quality drop.
+  exists to satisfy — and so the served window stops varying with the host's VRAM.
+- **The first response's true prompt count is checked against the estimate** (§9.2), which
+  catches a server that trimmed on an older build: the true count comes back pinned at the
+  window rather than tracking the estimate.
 
 **The shipped defaults do not all fit, and this document says so rather than leaving it to be
-discovered.** With `LlmSettings.model = "qwen2.5:14b"` (32768 trained) and a system prompt of
-roughly 400 tokens:
+discovered.** `LlmSettings.model` defaults to `qwen2.5:14b`, which on Ollama is the Instruct
+model — 32768 native, and 131072 only with opt-in YaRN scaling that Ollama does not apply by
+default. Against a system prompt of roughly 400 tokens:
 
 | Profile | context | history | system | reserve (`max_tokens`) | total | fits 32768? |
 |---|---|---|---|---|---|---|
@@ -504,7 +522,8 @@ roughly 400 tokens:
 | `balanced` | 16384 | 1024 | ~400 | 1024 | ~18832 | yes |
 | `precise` | 32768 | 2048 | ~400 | 1024 | ~36240 | **no** |
 
-`precise` does not fit the default model's own window, before `num_ctx` is even considered.
+`precise` does not fit the default model's own native window, before `num_ctx` is even
+considered.
 That is a real finding, not a rounding issue, and the honest response is the one the rule
 already prescribes: **it is refused at startup, with both numbers named and the three fixes
 listed** — a model with a longer window, a lower `context_tokens` override, or a different
@@ -569,11 +588,23 @@ independently-sampled answers into one text that neither model produced. Both ar
 stopping, and both would put text on the screen that no single generation ever emitted, which
 this design refuses in the same way it refuses rewriting a sentence (§3.4).
 
-**A specific consequence: litellm's own `num_retries` is not used for streaming.** litellm
-retries the whole `acompletion` call, which under `stream=True` restarts the stream from the
-beginning — exactly the rewind above, done by a library that cannot know a token was already
-delivered. The retry loop is manicule's, and its boundary is the first token, because that is
-the only place that knows.
+**litellm's own `num_retries` is not used.** The retry loop is manicule's, and the reason is
+not that litellm's is redundant — it is that under `stream=True` it is wrong in three separate
+ways, each of which would be invisible:
+
+- **It does not fire where it is needed.** litellm's retry wraps the call that *returns* the
+  stream wrapper, and that call returns almost immediately. A failure raised mid-iteration
+  comes out of the iterator, outside the wrapped region, and is never retried. So the case this
+  section is about — a stream dying at token 200 — is precisely the case litellm's retry cannot
+  see.
+- **It fires indiscriminately where it does.** The retry gate matches every litellm exception
+  tested, `AuthenticationError` and `ContextWindowExceededError` included, and there is no
+  retry predicate inside. A bad API key becomes three slow attempts at a bad API key.
+- **`num_retries` counts total attempts, not retries.** `num_retries=1` performs no retry at
+  all. A setting that reads as "retry once" and means "do not retry" is worse than no setting.
+
+manicule's loop retries the connection only, on the error classes named above, and stops at the
+first token — the one boundary that knows whether anything has been delivered.
 
 ### 4.7 What a provider failure does to a half-streamed answer
 
@@ -623,6 +654,14 @@ name what was wrong, what was expected, and what to do:
 - Everything unmapped keeps the provider's message text. Discarding it is how "OpenAI error:
   429" becomes an operator's whole afternoon.
 
+**Order the `except` clauses most-specific first, and assert it.** Both
+`ContextWindowExceededError` and `ContentPolicyViolationError` subclass litellm's
+`BadRequestError`, so a `BadRequestError` arm placed above them swallows the two cases that
+have specific, actionable remedies and reports them as a generic bad request. This is the one
+place in the adapter where a correct-looking refactor silently deletes a diagnosis, so the
+mapping is table-driven rather than a chain of `except` blocks, and a unit test asserts that
+each exception class maps to its own manicule error rather than to the base one.
+
 > **Prior art.** `throw new Error(\`OpenAI error: ${res.status}\`)` — the response body is
 > discarded, so quota, rate-limit and content-filter details never reach anyone. Worse, all
 > four streaming clients wrap frame parsing in `catch {}`, so a provider emitting an error
@@ -632,28 +671,56 @@ name what was wrong, what was expected, and what to do:
 
 ### 4.9 Ollama is optional, and the install proves it
 
-`generation = ["litellm>=1.55"]`. No Ollama client library — litellm speaks HTTP — and no
+`generation = ["litellm>=1.83"]`. No Ollama client library — litellm speaks HTTP — and no
 import of anything Ollama-shaped anywhere. Ollama is a *runtime* dependency of one
 *configuration*, not an install dependency of manicule, which is what the ticket's comment
 requires and what keeps `uv tool install manicule` a single command.
+
+The floor is not decoration: §4.2, §4.6, §4.8 and §4.10 all rest on behaviours verified against
+a specific litellm — the `ollama_chat` routing, the retry gate, the `BadRequestError` hierarchy
+and the usage fallbacks. Lowering it means re-verifying those four, not just resolving the
+dependency.
 
 Two behaviours follow. A hosted configuration never probes an Ollama endpoint, never mentions
 it in an error, and never reports it in health. And an Ollama configuration whose endpoint is
 absent fails at startup with `ollama serve` and `ollama pull <model>` in the remedy — not at
 the first question a user asks.
 
-### 4.10 `stream_options` is not optional
+### 4.10 The true token count, and the two silent fallbacks under it
 
-OpenAI-compatible streaming **omits usage entirely unless `stream_options: {include_usage:
-true}` is sent.** Without it, `usage` is `None` on every chunk including the last.
+`retrieval.md` §7.2 builds the whole token-budget calibration on the true prompt count —
+"Measuring once beats a safety factor forever, and #7 owns the call that makes it available" —
+so this section is that call, and the hazard is not where it first appears to be.
 
-That is not a missing statistic. `retrieval.md` §7.2 builds the whole token-budget calibration
-on the true prompt count — "Measuring once beats a safety factor forever, and #7 owns the call
-that makes it available" — and without this flag the calibration never runs, never fails, and
-never says why. The estimate stays a guess forever while everything reports normally.
+**`stream_options={"include_usage": True}` is sent on every call.** Under streaming, litellm
+gates a usage-bearing final chunk on it; without it, usage is reachable only through
+`_hidden_params`, which is a private attribute this design will not build a correctness
+guarantee on. Sending the flag puts the number in the documented place. Two caveats worth
+recording rather than discovering: it is an OpenAI-compatible parameter, so for `ollama_chat`
+litellm drops it before the request and honours it client-side only — which is fine, and is not
+the same as it being supported end to end; and Ollama's own count arrives regardless, since
+litellm maps `prompt_eval_count` onto `usage.prompt_tokens`.
 
-So it is sent on every call, and a provider that returns no usage after being asked is recorded
-as such (§9.3) rather than treated as agreeing with the estimate.
+**The real hazard is what litellm reports when the provider gives it nothing.** The fallbacks
+differ by path and neither announces itself:
+
+| Path | Fallback when the provider reports no usage |
+|---|---|
+| Non-streaming | `litellm.token_counter(...)` — **an estimate, returned in the field reserved for the measurement** |
+| Streaming | **`0`** |
+
+Both are worse than an error. The first is the exact failure this project keeps naming: a
+plausible number in the place a real one belongs, so the calibration in §9.2 compares manicule's
+estimate against litellm's estimate, agrees with itself, and reports a healthy drift forever. The
+second silently reads as "the prompt was empty".
+
+So the adapter **does not trust `usage` by itself.** A count of `0`, or a count that matches
+manicule's own estimator to the token, is treated as `usage_unavailable` (§9.3) rather than as a
+measurement. Neither is proof of a fallback on its own — a genuinely empty completion and a
+lucky exact match both exist — which is why it degrades the reading to "unknown" rather than
+raising. The calibration needs a number that came from the model counting; a number that came
+from an estimator agreeing with an estimator is not evidence, and must not be recorded as if it
+were.
 
 ---
 
@@ -724,19 +791,28 @@ misbehaving remote server is a worse failure than a leaked socket.
 > pass an `AbortSignal`, but it only aborts the browser's own fetch; nothing propagates to the
 > server.
 
-### 5.3 The partial answer is persisted by the wrapper, and the write is shielded
+### 5.3 The partial answer is persisted by the wrapper, under a second-cancellation guard
 
 Persistence cannot live in the consumer, because on a disconnect there is no consumer left to
 run it. It lives in the answer wrapper — the thing that owns the accumulated text — in its own
 `finally`, which runs on completion, on error, and on cancellation alike.
 
-That `finally` runs in a task that has just been cancelled, so **the write is shielded and
-bounded**: `asyncio.shield` over a short database write with a deadline, and no possibility of
-the shielded work restarting the request or issuing another provider call. Without the shield,
-the first `await` inside the `finally` re-raises `CancelledError` and the partial answer is
-lost — which is precisely the outcome §4.7 exists to prevent, arriving by a subtler route than
-the prior art's `if (!streamError)`. With an unbounded shield, a cancelled request can outlive
-its own shutdown.
+**One thing about that `finally` is worth getting right, because the folklore about it is
+wrong.** `CancelledError` is delivered **once**. An `await` inside a `finally` reached by
+cancellation completes normally — a database write there is not silently skipped, and it does
+not need a shield to run at all. Testing this rather than assuming it is the difference between
+a design that reasons about the real failure and one that guards a failure that does not
+happen.
+
+The real exposure is narrower and is a **second** cancellation: a shutdown escalation, or a
+supervisor that cancels twice, arriving while the cleanup write is in flight. That is what
+`asyncio.shield` is for, and it is why the write is shielded — not because the first
+cancellation would have stopped it.
+
+Two bounds go with it. The shielded write has a **deadline**, because a cancelled request that
+can outlive its own shutdown indefinitely is a worse failure than a lost partial answer. And it
+may not restart the request or issue another provider call; it writes what is already in hand
+and returns.
 
 The persisted message carries its finish reason (`stop`, `length`, `content_filter`, `error`)
 and its citation accounting, so a truncated or abandoned answer is a first-class stored object
@@ -772,11 +848,21 @@ A `messages` array with a real system message, real prior turns, and the questio
 Order: **system, then prior turns, then one final user message containing the numbered passages
 followed by the question.**
 
-The question goes last for a reason beyond convention. When a server truncates an over-long
-prompt it truncates from the front (§4.3), so the ordering decides what is lost first. Losing a
-passage degrades the answer; losing the question produces one that answers nothing. The system
-message is first because it is the stable prefix hosted providers can cache — and because if it
-is being lost, the §4.3 cross-check has already failed and should have refused at startup.
+The system message is first because it is the stable prefix hosted providers can cache: it does
+not vary per query, so putting anything ahead of it forfeits the discount on every request.
+
+The question is last because that is the position models are trained to answer from, and
+because it is the shortest thing in the prompt — so whatever else is competing for attention,
+the instruction to answer *this* is adjacent to the point of generation.
+
+There is a weaker third argument that used to be the main one, and it is recorded as demoted
+rather than deleted, because it is still true on some deployments: an older Ollama build
+truncates an over-long prompt **from the front**, so ordering decides what is lost first, and
+losing a passage is survivable where losing the question is not. Current Ollama grows the
+context instead (§4.3), and hosted providers raise `ContextWindowExceededError` rather than
+trimming, so this now protects only against a runtime the §4.3 cross-check is already supposed
+to have refused at startup. It is a reason to keep the ordering, not a reason to have chosen
+it.
 
 **The citation protocol is not configurable.** An operator may *append* instructions to the
 system prompt; they may not replace the section that defines slots and markers, because the
@@ -845,24 +931,48 @@ through a changed redactor would churn chunk ids and vectors on every pattern ed
 
 ### 7.1 The predicate is the endpoint, not the provider's name
 
-The question "is this text leaving the machine?" has an obvious wrong answer.
+The question "is this text leaving the machine?" has an obvious wrong answer, and **manicule
+currently gives it.**
 
 > **Prior art.** `const cloudProviders = new Set(['openai', 'anthropic', 'google', 'grok'])`,
-> hardcoded in `bootstrap.ts`. It is wrong in both directions the moment `base_url` exists:
-> `provider: 'ollama'` pointed at `http://gpu-box.lan:11434` is classified local and crosses
-> the network, while an OpenAI-compatible endpoint on `127.0.0.1` is classified cloud. The set
-> also has to be edited every time a provider is added, and nothing fails when someone forgets.
+> hardcoded in `bootstrap.ts`. The set has to be edited every time a provider is added, and
+> nothing fails when someone forgets.
 
-The classification is derived from the **resolved endpoint**:
+That much is easy to disown. What is not is that merged manicule config has the same shape:
+
+```python
+LOCAL_PROVIDERS = frozenset({"ollama", "mlx", "onnx", "local"})
+
+def is_local(provider: str) -> bool:
+    return provider.strip().lower() in LOCAL_PROVIDERS
+```
+
+with the docstring "Selecting one of these is also what satisfies a local-only data policy:
+nothing leaves." `Settings.cloud_providers_in_use` and the `cloud_allowed` check in
+`Settings.policy_problems()` are both built on it. And `ProviderSettings.base_url` exists
+precisely so that "local and hosted models differ by this and nothing else" — so
+`provider = "ollama"` with `base_url = "http://gpu-box.lan:11434"` and
+`cloud_allowed = false` **starts cleanly today** while every prompt and every retrieved passage
+crosses the network. The policy that exists to prevent that reports itself satisfied. It errs
+the other way too: an OpenAI-compatible endpoint on `127.0.0.1` is classified cloud, so the
+safe configuration is the one that fails.
+
+Naming this rather than quietly designing around it, because a document that criticises a
+pattern its own codebase implements has not finished the argument. Filed as
+[#44](https://github.com/mgd43b/manicule/issues/44).
+
+**The predicate splits what the provider name conflates:**
 
 ```
-egress = LOCAL   if the resolved base_url host is loopback
-         REMOTE  otherwise, including every hosted provider default
+in-process backends (mlx, onnx, local)   → LOCAL unconditionally: there is no endpoint
+served backends (ollama, anything HTTP)  → LOCAL only if the resolved base_url host
+                                           is loopback; otherwise REMOTE
+hosted providers                         → REMOTE
 ```
 
 Loopback is the only host that is local by construction. A LAN address is remote — it is
 another machine, on a network, and "the office GPU box" is exactly the case where an operator
-believes otherwise.
+believes otherwise. Provider name is a **default, not evidence**.
 
 Two honest limits, stated because a security predicate that is quietly approximate is worse
 than one that is openly so. A local proxy on `127.0.0.1` that forwards to a hosted provider
@@ -873,8 +983,9 @@ believed is auditable, and `RedactionSettings` gains a `scope` (§7.2) so an ope
 about the proxy can force redaction on regardless.
 
 **`cloud_allowed = false` plus a remote endpoint is a startup refusal**, not a silent fallback
-to a local model. A policy that quietly downgrades the model instead of failing is a policy
-nobody knows is in force.
+to a local model. That refusal already exists in `policy_problems()`; what #44 changes is the
+input it is computed from, so that it fires on the configuration that actually sends content
+away rather than on the one that merely names a hosted provider.
 
 ### 7.2 What is redacted, and what deliberately is not
 
@@ -1135,13 +1246,17 @@ counts cached by content-derived `chunk.id`.
 
 **What #7 owns is turning the estimate into a measurement.** The true prompt token count comes
 back from the provider as `Usage.prompt_tokens` on the final `Token` — Ollama's
-`prompt_eval_count`, and the equivalent from every hosted provider — which is why §4.10 makes
-`stream_options` non-optional. The estimate is compared against it after every call and the
-drift is recorded per model.
+`prompt_eval_count`, and the equivalent from every hosted provider. The estimate is compared
+against it after every call and the drift is recorded per model.
 
-The comparison also catches the §4.3 truncation: a server that trimmed the prompt reports a true
-count pinned at its window, which is a different signature from ordinary tokenizer drift and is
-reported as such.
+**The comparison is only worth anything if the "true" number is true**, which is why §4.10
+refuses a usage figure that could be litellm's own estimator wearing the measurement's field
+name. A calibration loop fed an estimate on both sides agrees with itself forever and reports
+excellent health.
+
+The comparison also catches an older Ollama build that trimmed the prompt (§4.3): the reported
+count comes back pinned at the window rather than tracking the estimate, which is a different
+signature from ordinary tokenizer drift and is reported as such.
 
 ### 9.3 Drift is reported, never auto-tuned
 
@@ -1500,12 +1615,16 @@ Three concrete Apple-specific notes, all throughput:
   pays a multi-second load from disk. For interactive use that is the single largest avoidable
   latency, so `keep_alive` is set (default `10m`) and is a pure throughput knob: it changes
   nothing about any answer.
-- **`num_ctx` costs unified memory.** The KV cache scales with the window, and §4.3 requires
-  manicule to *demand* a window large enough for the profile. On a 16 GB Mac, a 14B model at
-  4-bit plus a 36k-token KV cache is not a configuration that runs well, and `precise` on the
-  default model does not pass the cross-check anyway (§4.3). The honest position: the startup
-  refusal is the right place to find that out, and `doctor` reports the memory implication of
-  the window it is about to demand.
+- **`num_ctx` costs unified memory, and this is where §4.3's two behaviours converge.** The KV
+  cache scales with the window, and §4.3 requires manicule to *demand* a window large enough
+  for the profile. On a 16 GB Mac, a 14B model at 4-bit plus a 36k-token KV cache is not a
+  configuration that runs well. What makes this Apple-specific rather than general is that
+  Ollama's default window is itself tiered by available VRAM — so the same profile is served a
+  different window on a laptop than on a Mac Studio, and the *auto-grow* behaviour on current
+  builds converts a budgeting mistake into a spill to CPU or a failed allocation rather than
+  into an error anyone can read. Setting `num_ctx` explicitly is what makes the memory cost
+  predictable; the startup refusal is where an impossible combination should be found, and
+  `doctor` reports the memory implication of the window it is about to demand.
 - **Local generation and local embedding compete.** The embedder is in-process MLX
   (`PLAN.md` §7) and Ollama is a separate process; a large ingest running during interactive
   chat contends for the same GPU and unified memory. This is a scheduling observation rather
@@ -1544,21 +1663,21 @@ Three concrete Apple-specific notes, all throughput:
 | The runtime check reuses the parser suite's containment predicate rather than a second one | §3.8 |
 | The binder and verification sit above `Generator` and are not pluggable | §2.2 |
 | `Generator` needs `context_window`; filed rather than edited into `contracts.md` | §2.3 |
-| Ollama is reached through `ollama_chat/`, because `ollama/` skips the chat template | §4.2 |
+| Ollama is reached through `ollama_chat/`, because `ollama/` double-templates the prompt | §4.2 |
 | One generation model; the bulk/interactive split is satisfied by the embedder being local | §4.2 |
-| `context_window` means the served window; `num_ctx` is derived and sent explicitly | §4.3 |
+| `context_window` means the served window; `num_ctx` is derived and sent explicitly, because Ollama's default is tiered by host VRAM | §4.3 |
 | The shipped `precise` profile does not fit the default model and is refused at startup | §4.3 |
 | Three timeouts — first token, inter-token idle, total — because one covers the wrong interval | §4.5 |
-| Retries stop at the first token; litellm's `num_retries` is not used for streaming | §4.6 |
+| Retries stop at the first token; litellm's `num_retries` is not used, and the three reasons are named | §4.6 |
 | A mid-stream failure is in band, and the partial answer is persisted and ratable | §4.7 |
 | litellm exceptions are mapped at the adapter; provider message text is preserved | §4.8 |
-| `stream_options={"include_usage": True}` is mandatory, or the calibration never runs | §4.10 |
+| `stream_options` is always sent, and a usage figure that may be litellm's own estimate is treated as unavailable | §4.10 |
 | `generating()` mirrors `parsing()`; cleanup is bounded, never yields, and covers both exits | §5.1, §5.2 |
-| Persistence lives in the wrapper's `finally` and is shielded against the cancellation | §5.3 |
+| Persistence lives in the wrapper's `finally`; the shield guards a *second* cancellation, not the first | §5.3 |
 | System / turns / passages-then-question, with the question last so truncation loses a passage | §6.1 |
 | The citation protocol section of the system prompt is not configurable | §6.1 |
 | The label carries the breadcrumb; the body is `Chunk.text`; no chunk ids in the prompt | §6.2 |
-| Egress is classified by resolved endpoint, never by provider name, with the limits stated | §7.1 |
+| Egress is classified by resolved endpoint, never by provider name — merged `is_local` gets this wrong today | §7.1 |
 | Query and history are redacted on egress; the answer and the index are not | §7.2 |
 | `RedactionSettings.scope` (`remote` default, `always` available) | §7.2 |
 | Detectors are named and versioned; a custom pattern that does not compile is a startup refusal | §7.3 |
@@ -1604,6 +1723,11 @@ Places this design had to decide something no merged document had a position on.
 - **`SourceRestrictions.local_only`, `SourceRestrictions.cloud_allowed` and
   `WorkspaceOverride.cloud_allowed` had no defined behaviour.** They are declared in merged
   configuration and nothing reads them; §7.5 gives them one.
+- **The `cloud_allowed` policy that *is* enforced is computed from the wrong input.**
+  `is_local` classifies egress by provider name, so a LAN Ollama satisfies a local-only policy
+  while content leaves the machine (§7.1,
+  [#44](https://github.com/mgd43b/manicule/issues/44)). No document had noticed that
+  `base_url` makes the provider name insufficient.
 - **`RedactionSettings` had no scope, no detector registry and no failure semantics.** The
   section's docstring settles *where* redaction happens; §7.2 and §7.3 settle what it does, what
   it costs, and which direction it fails in.
@@ -1624,6 +1748,7 @@ Places this design had to decide something no merged document had a position on.
 |---|---|---|
 | [#41](https://github.com/mgd43b/manicule/issues/41) | **Add `context_window` to the `Generator` protocol** (§2.3, §4.3) | It changes `docs/contracts.md` and `manicule.core.protocols`, which three implementation tickets are building against right now. Additive, and neither `Anchor` nor `RetrievalStage`, so it carries no lock — but it is a seam change and belongs in its own reviewable commit |
 | [#42](https://github.com/mgd43b/manicule/issues/42) | **Conversation schema for sharing and feedback** (§11.1, §11.4, §12.1) — hash `share_token`, add `share_expires_at` and `shared_at`, add `messages.feedback`, `messages.feedback_reason`, `messages.query_log_id`, `messages.finish_reason` | It is an additive Alembic migration against tables merged under [#2](https://github.com/mgd43b/manicule/issues/2), and [#11](https://github.com/mgd43b/manicule/issues/11) and [#13](https://github.com/mgd43b/manicule/issues/13) both depend on the result. Worth landing as its own change for the same reason [#36](https://github.com/mgd43b/manicule/issues/36) was: it moves a security boundary |
+| [#44](https://github.com/mgd43b/manicule/issues/44) | **Fix `is_local` so egress is decided by the resolved endpoint** (§7.1) | It changes `manicule.config`, merged under [#1](https://github.com/mgd43b/manicule/issues/1), and it moves a security boundary. #7's implementation depends on the result, since the egress class is what selects the redaction path |
 
 [#28](https://github.com/mgd43b/manicule/issues/28) — refuse-to-ingest rules — stays where
 `ingest.md` §3.4 filed it. It is the coherent version of "this content must never be stored",
@@ -1655,7 +1780,7 @@ document implements only the second.
   Ollama optional at install, and the invariant across the choice stated as the citation
   guarantee rather than the text.
 - **litellm as the single provider interface** — §4, including the `ollama_chat/` endpoint, the
-  `num_ctx` window trap, three timeouts, the first-token retry boundary, mapped exceptions and
-  mandatory `stream_options`.
+  `num_ctx` window trap, three timeouts, the first-token retry boundary, the exception-ordering
+  trap, and the usage fallbacks that would otherwise report an estimate as a measurement.
 - **PII redaction at the generation boundary** — §7, which is where `PLAN.md` defect #5 and
   `ingest.md` §3.4 left it and where it is now specified.
