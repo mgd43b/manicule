@@ -85,11 +85,14 @@ do for itself:
 3. **Records** the stage's declared configuration, so a recorded result names the thing it
    measured.
 
-Timing from outside is not merely convenient. A stage that reports its own latency reports the
-time it thinks it spent, which excludes the time the event loop spent elsewhere inside its own
-`await` — the component of latency a user actually experiences. It is also a number the stage
-could be wrong about while everything still looks fine, which is the failure profile this
-project spends its effort on.
+Timing from outside is not merely convenient, and the reason is not that a stage would measure a
+different interval — wrapping its own body in `perf_counter` would measure almost the same one.
+It is that a self-reported number is **unverifiable and optional**. Every stage gets timed
+identically, including third-party plugin stages whose authors would never think to instrument
+themselves; a stage cannot under-report by forgetting or by measuring only the part it considers
+its own work; and there is nothing to compare a self-reported figure against. Timing is the
+runner's concern rather than the stage's, which is the same reasoning that keeps it out of the
+signature (§2.3).
 
 **Stages run sequentially.** The dense and lexical legs touch different stores and could run
 concurrently, and the saving is real but small: the lexical leg is one SQLite statement, and
@@ -133,7 +136,7 @@ them out:
 
 | Option | Why not |
 |---|---|
-| Widen the return to `(candidates, StageReport)` | Every stage now returns a tuple to serve the two that have anything to say, and every recorded result predating the change is unreplayable. This is the widening the warning in `contracts.md` §3 exists to prevent |
+| Widen the return to `(candidates, StageReport)` | Every stage now returns a tuple, including the ones with nothing to report, and every recorded result predating the change is unreplayable. This is the widening the warning in `contracts.md` §3 exists to prevent |
 | An optional `drain_report()` on the stage | Stages are container singletons shared across concurrent queries. Per-run state on a shared object is a race, and the failure is two queries swapping diagnostics — plausible-looking numbers attached to the wrong run |
 | A `contextvars.ContextVar` trace frame, installed by the runner | **Chosen.** Per-task by construction, so concurrent queries cannot cross; invisible to stages that ignore it; no signature changes |
 
@@ -153,7 +156,7 @@ it does. Working that out produced a fusion stage that is configured with the na
 it fuses rather than hardcoding `"dense"` and `"bm25"` — which is precisely what lets the
 learned-sparse leg (§13) be measured against BM25 by editing configuration.
 
-### 2.4 What "independently switchable" means, and the two things that are not stages
+### 2.4 What "independently switchable" means, and the three things that are not switchable
 
 #15's whole method is comparing two pipelines that differ in exactly one place. That requires
 switching to be *declarative*: `rag.pipeline` is a tuple of names in configuration, the
@@ -213,7 +216,7 @@ restricts nothing. That part is unchanged from what shipped. Four things change.
 **`workspace_id: str | None` becomes `workspace_ids: frozenset[str]`, required and non-empty.**
 §3.2.
 
-**`source: str | None` becomes `sources: frozenset[str]`.** A scalar among nine set-valued
+**`source: str | None` becomes `sources: frozenset[str]`.** A scalar among seven set-valued
 fields is a drafting accident, and "these two connectors" is an ordinary query. The name follows
 the merged vocabulary — `Document.source`, `DocStore.find_document(source, source_id)` — rather
 than `storage.md` §6.6's `connector_ids`, because a filter field that does not match the column
@@ -301,16 +304,29 @@ set it.**
 The lexical leg needs none of this: it is one SQL statement against the authoritative store and
 applies the whole filter inline, before `LIMIT` ([`storage.md`](storage.md) §6.1).
 
-The dense leg has two regimes and the rule that picks between them is:
+The dense leg has two regimes — push the ids down, or over-fetch and post-filter — plus one
+early exit. The rule that picks between them:
 
 ```
-1.  Resolve the join-requiring fields in SQLite into a document-id set.
-2.  If that set is non-empty and |set| <= prefilter_id_limit:
-        push it down as document_ids. Selectivity is now the store's problem.
-3.  Otherwise:
-        push down only what has a column, over-fetch (§4.3), and let the
+1.  If no join-requiring field is set, there is nothing to resolve:
+        push down what has a column, over-fetch (§4.3), and let the
         hydrating join do the rest.
+2.  Otherwise resolve those fields in SQLite into a document-id set.
+3.  If the set is EMPTY, the filter matches no document:
+        return no candidates. Do not fall through.
+4.  If |set| <= prefilter_id_limit:
+        push it down as document_ids. Selectivity is now the store's problem.
+5.  Otherwise:
+        push down only what has a column, over-fetch, and post-filter.
 ```
+
+**Step 3 is not a special case, it is the one that has to be written down.** "No join-requiring
+field was set" and "the join-requiring fields resolved to nothing" both produce an empty
+document-id set, and they are opposite instructions: the first means *do not constrain*, the
+second means *constrain to nothing*. Collapsing them is a filter bypass — a query filtered to a
+collection that happens to be empty would return the whole workspace, ranked and plausible. It
+is the same shape as the empty `workspace_ids` hazard in §3.2, one layer down, and it is why
+step 1 tests whether the *fields* are set rather than whether the *result* is empty.
 
 `prefilter_id_limit` starts at **1000** and is configuration, not a constant. It is a starting
 value and this document says so plainly rather than dressing it up: an `IN` list of a thousand
@@ -323,10 +339,10 @@ distribution of both across a real corpus, and the threshold gets set from that 
 instead of from an argument. That is what "contact with real data volumes" was waiting for, and
 this design produces the contact as a side effect of running.
 
-**The escape hatch, with its trigger stated.** One regime fails both tests: a workspace that is
-a small slice of a large corpus *and* has more documents than `prefilter_id_limit`. Then the
-pre-filter list is too big and the derived over-fetch exceeds its cap, and neither plan is good.
-The condition is precise —
+**The escape hatch, with its trigger stated.** One case defeats both plans: a workspace that is a
+small slice of a large corpus *and* has more documents than `prefilter_id_limit`. The pre-filter
+list is then too big to push down and the derived over-fetch exceeds its cap, so neither branch of
+the rule is good. The condition is precise —
 
 ```
 derived_overfetch > overfetch_max · k   AND   resolved_id_count > prefilter_id_limit
@@ -372,11 +388,13 @@ The statement is settled and built ([`storage.md`](storage.md) §6.1): one joine
 `chunks_fts`, `chunks` and `documents`, filters inline, `LIMIT` last, `ORDER BY bm25(...)`
 ascending. Retrieval adds three things and changes none of it.
 
-**It re-keys the score.** `DocStore.search_lexical` returns candidates carrying
-`scores["bm25"]`. The stage is named `lexical`, and `Candidate.scores` is keyed by *stage* name,
-so the stage records its own name. Fusion reads the names it was configured with (§5.2) and never
-a key some store happened to write — which is what lets the lexical leg be swapped for a
-learned-sparse one without touching the fusion stage.
+**It re-keys the score.** `DocStore.search_lexical` returns candidates carrying `scores["bm25"]`
+— a key describing the *algorithm*, not the stage. The stage is named `lexical`, and
+`Candidate.scores` is keyed by *stage* name, so the stage records its own name over the top.
+`scored_by` merges rather than replaces, so both keys survive; the duplicate is harmless and
+nothing needs to strip it. What matters is that fusion reads the names it was configured with
+(§5.2) and never a key some store happened to write — which is what lets the lexical leg be
+swapped for a learned-sparse one without touching the fusion stage.
 
 **It merges rather than replaces.** The lexical stage receives whatever the dense stage produced
 and returns the union: a chunk both legs found carries both scores, via `Candidate.scored_by`,
@@ -441,14 +459,22 @@ is computed from a quantity the system can measure about itself, on the same pri
 embed batch size in [`ingest.md`](ingest.md) §8.2.
 
 ```
-live_fraction = chunks of live, indexed, in-scope documents
-                ─────────────────────────────────────────────
-                        rows in the vector table
+live_fraction = chunks of live, indexed documents IN THIS WORKSPACE
+                ───────────────────────────────────────────────────
+                          rows in the vector table
 
 k′ = ceil(k / clamp(live_fraction, 0.05, 1.0))
 k′ = max(k′, overfetch_min · k)
 k′ = min(k′, overfetch_max · k, absolute_row_cap)
 ```
+
+**The numerator is workspace-scoped and stops there — it does not model the rest of the filter.**
+That is deliberate, and it is what keeps the fraction cacheable. Workspace and liveness are the
+two exclusions the dense leg *cannot* push down and must therefore absorb by over-fetching;
+everything else in the filter either has a Lance column or takes the pre-filter path in §3.3, so
+it is already the store's problem rather than the over-fetch's. Folding the whole filter into the
+fraction would make it a per-query aggregate — two `COUNT`s on the hot path of every search, to
+refine a number that then gets clamped and rounded to a multiple anyway.
 
 | Knob | Default | Why that value |
 |---|---|---|
@@ -460,9 +486,11 @@ k′ = min(k′, overfetch_max · k, absolute_row_cap)
 still rows in Lance and still consume top-`k` slots; a fraction computed against SQLite's chunk
 count would call an index clean while it was full of pending deletions.
 
-**It is computed once per generation, not per query.** Two counts — one SQLite aggregate, one
-`VectorStore.count()` — cached against the same generation counter that invalidates the L1 cache
-(§10.3), so ingest, re-embed, delete and restore all refresh it for free.
+**It is computed once per `(generation, workspace)`, not per query.** Two counts — one SQLite
+aggregate, one `VectorStore.count()` — cached against the same generation counter that invalidates
+the L1 cache (§10.3), so ingest, re-embed, delete and restore all refresh it for free. Keying on
+the workspace as well as the generation is what the paragraph above buys: the fraction depends on
+nothing else that varies between queries.
 
 **What the numbers mean in practice.** A personal deployment with one workspace and a few
 percent of soft-deleted content lands at the floor: `k′ = 3k`, and for the balanced profile that
@@ -479,8 +507,9 @@ specified rather than left to whoever implements it:
 1. **Expand and retry**, at most twice, each time `k′ ← min(4·k′, absolute_row_cap)`. Four
    because a factor that failed is usually wrong by more than a little, and two expansions
    because a third would cost more than the query is worth.
-2. **Stop when the leg has seen everything.** If `k′` reaches the vector table's row count, every
-   candidate the store holds has been examined and there is nothing left to expand into.
+2. **Stop when the leg has seen everything.** If `k′` reaches the number of rows the pushed-down
+   predicate admits — the whole table when there is no predicate — every candidate the store can
+   offer has been examined and there is nothing left to expand into.
 3. **Report, in the trace**: `requested`, `fetched`, `survived`, `expansions`, and one of
    `satisfied | exhausted_corpus | exhausted_budget`.
 
@@ -501,8 +530,9 @@ was satisfied, because the two ran different amounts of search.
 ### 4.5 `min_score` belongs to the dense leg and to nothing else
 
 `ProfileConfig.min_score` ships as 0.5 / 0.3 / 0.15 with a `ge=0.0, le=1.0` bound and the
-description "floor below which a candidate drops". Where it is applied is the whole question,
-and two of the three plausible places are arithmetically broken.
+description "floor below which a candidate drops". Where it is applied is the whole question, and
+two of the three plausible places are unusable — the first arithmetically, the second because the
+quantity has no absolute scale to compare a constant against.
 
 **Not on the fused score.** With two legs and `K = 60`, the maximum reachable RRF score is
 `2/61 ≈ 0.033`. A floor of 0.3 applied there discards every candidate, in every profile, and
@@ -649,8 +679,9 @@ is a scalar on a fixed scale for a fixed model.
 > well the passage answers the query. Respond with a single integer from 0 to 10", one call per
 > candidate, `maxTokens: 8`, and parses the first integer out of the reply with a regex —
 > returning **0** when nothing parses, which is indistinguishable from a genuine "irrelevant".
-> The reranked head is then concatenated with an unreranked tail whose scores are still RRF
-> values around 0.016 while the head's are 0.0–1.0, so one list carries two scales. And on any
+> The reranked head is then concatenated with an unreranked tail still carrying whatever the
+> fusion left on it — RRF sums on the order of 0.016 — while the head's are 0.0–1.0, so one list
+> carries two scales that differ by nearly two orders of magnitude. And on any
 > exception the function returns the input unchanged, so a failed rerank is a silent no-op that
 > the profile still reports as reranked. Four separate ways for the ranking to be wrong without
 > anything raising, in 62 lines.
@@ -775,10 +806,10 @@ passage behind it. Order is never changed — only membership. `Context.truncate
 trace lists which candidates were dropped and how large they were.
 
 **The budget is a rail, not the selection mechanism, and saying so is more useful than implying
-otherwise.** A passage is bounded by the 512-token chunk budget, and the 64 tokens reserved for
-the breadcrumb come out of that budget rather than adding to it — and the breadcrumb never
-appears in `text` anyway ([`parsing.md`](parsing.md) §5.1, §5.2), so what reaches the context is
-smaller still. `fast` allows 3 passages against 8192 context tokens; `precise` allows 10 against
+otherwise.** [`parsing.md`](parsing.md) §1.3 splits the 512-token chunk budget as `64` for the
+breadcrumb and `448` for the text, and the breadcrumb never appears in `text` at all
+([`parsing.md`](parsing.md) §5.1) — so a passage reaching the context is at most **448** embedder
+tokens, not 512. `fast` allows 3 of those against 8192 context tokens; `precise` allows 10 against
 32768. Selection is done by `final_top_k` in every shipped profile and the fitter never binds. It
 exists for the configurations that do not ship — a raised chunk budget, a raised `final_top_k`, a
 long history — and it asserts rather than handles the case where even the top-ranked passage does
@@ -862,6 +893,15 @@ them.
 **An `exhausted_budget` leg (§4.4) caps confidence at `medium`,** because the retrieval is known
 to be a floor rather than a result.
 
+**A degraded leg (§5.3) suppresses the agreement term rather than scoring it zero.** This one
+matters and is easy to get backwards. If the lexical leg returned nothing, no passage can carry
+both leg scores, so cross-leg agreement computes to 0 and drags confidence down by up to 0.15 —
+reporting lower confidence because *FTS5 threw*, which is a statement about the system dressed up
+as a statement about the evidence. So when a leg is degraded, the agreement component is absent
+in the same sense the reranker component is absent under `fast`: it contributes nothing and is
+not renormalised, the ceiling drops accordingly, and the trace says which component was
+suppressed and why. Confidence never blames the corpus for a fault in the pipeline.
+
 ### 8.3 No fallback term, and why `fast` cannot report high confidence
 
 When no reranker ran, the reranker term **contributes zero and the remaining weights are not
@@ -898,9 +938,10 @@ nobody can act on, and one that cannot say what produced it is one #15 cannot co
 
 ### 9.1 Deterministic, and only the routes that exist
 
-A pure function over the query text, no model call, running before the cache and before any
-store is touched. `PLAN.md` §16 keeps it because trivial input should not consume an LLM call,
-and that is reason enough.
+A pure function over the query text: no model call, no store access, and nothing but the text
+decides the route. It runs before the L1 cache. `PLAN.md` §16 keeps it because trivial input
+should not consume an LLM call, and that is reason enough. (A `UTILITY` *handler* will go on to
+read a store — that is the answer being computed, not the route being chosen.)
 
 ```
 Route = RETRIEVE | GREETING | UTILITY(kind)
@@ -980,13 +1021,21 @@ A hash over the canonical form of, in order:
 
 ```
 generation counter
-workspace_ids (sorted)          the rest of the Filter (canonical JSON)
-profile name + overrides        pipeline declaration (stage names, in order)
-reranker model_id or null       RRF K
+the whole Filter, canonicalised (workspace_ids sorted, then every other field)
+profile name + effective overrides
+Query.limit
+pipeline declaration (stage names, in order)
+reranker model_id, or null
+RRF K
 query text (trimmed, otherwise exact)
 ```
 
-Notes on three of those:
+Notes on four of those:
+
+- **`Query.limit` is in the key even though it looks like a presentation concern.** Retrieval
+  depth is `max(limit, final_top_k)` (Appendix B), so a larger `limit` is a deeper run, and
+  serving a cached 10-result ranking to a request for 50 would return a short list that looks
+  like a corpus with nothing more in it — the §4.4 failure arriving through the cache.
 
 - **The whole `Filter`, not just the workspace.** Two filters produce two different rankings; a
   key that omits one is a cache that answers a different question.
@@ -1009,9 +1058,15 @@ Notes on three of those:
 ### 10.3 Invalidation is a generation counter, and re-embed is why
 
 An in-memory counter, bumped by any commit that changes what a query could return: document
-upsert, `replace_chunks`, soft delete, hard delete, reconcile-driven deletion, and the
-`vector_table` swap at the end of `reindex --re-embed`. The counter is in the key, so a bump
-invalidates everything at once with no eviction pass and no per-entry bookkeeping.
+upsert, `replace_chunks`, soft delete and undelete, hard delete, reconcile-driven deletion, a
+`doctor` repair that rewrites a derived index, a restore, and the `vector_table` swap at the end
+of `reindex --re-embed`. The counter is in the key, so a bump invalidates everything at once with
+no eviction pass and no per-entry bookkeeping.
+
+The list is a liability, and the right way to hold it is to bump on the **write paths in the
+document store** rather than at each of these call sites — the same reasoning that puts FTS5
+synchronisation in triggers rather than in application code ([`storage.md`](storage.md) §6.1).
+Application-level bookkeeping covers only the write paths someone remembered.
 
 **An in-process counter is sufficient, and the reason is a property this project already
 enforces:** exactly one instance per data directory, held by an exclusive lock for the process
@@ -1081,8 +1136,8 @@ consumed by #15's harness, which writes its own versioned result artefacts. It d
 into `query_logs` — that table's `response_time_ms` is whole-query product telemetry, and a
 per-stage trace there would be a schema change in service of a consumer that keeps its results in
 the repository anyway. If operations later wants per-stage latency persisted
-([#14](https://github.com/mgd43b/manicule/issues/14)), it is one JSON column and a rung-0
-migration.
+([#14](https://github.com/mgd43b/manicule/issues/14)), it is one nullable JSON column and an
+additive migration — it invalidates nothing and rebuilds nothing.
 
 ---
 
@@ -1132,7 +1187,7 @@ does not ship. A rule is only enforceable if it says what would count, so:
 | **Intent classification** | Its only proposed consumer is per-intent context allocation, which does not change retrieval at all — the same passages are retrieved and the window is divided differently. Needs an *answer*-quality metric, which #15 does not have yet. Nothing to measure it with today, and that is the finding |
 | **Cross-lingual expansion** | The null hypothesis is that it adds nothing, because bge-m3 is already one multilingual space ([`embeddings.md`](embeddings.md) §1.2). recall@20 on query-in-A / gold-passage-in-B pairs. A likely outcome is that this measurement retires the feature rather than admitting it |
 | **Parent-document retrieval** | nDCG@`final_top_k` with parents substituted for chunks, **plus a citation check**: the anchor must still resolve to the quoted span. A parent that widens the citation is a regression at any nDCG, because `contracts.md` §1 does not trade accuracy of location for relevance |
-| **Propositions** | Changes what is indexed and therefore the `ChunkFingerprint`, so adopting it costs a full re-chunk and re-embed (rungs 3 and 4 of the ladder). recall@10 has to improve by enough to justify that, and it changes what a citation points at — same anchor obligation as above |
+| **Propositions** | Changes what is indexed and therefore the `ChunkFingerprint`, so adopting it costs a re-chunk *and* a re-embed — rungs 3 and 2 of the blast-radius ladder, and no re-fetch, because retained original bytes keep rung 4 out of it. recall@10 has to improve by enough to justify that, and it changes what a citation points at — same anchor obligation as above |
 | **Prompt compression** | Not a retrieval feature: it changes what the generator sees. Answer quality at fixed context tokens, and a hard check that no cited span was rewritten — PR #32 forbids middleware rewriting cited text and compression is the same act at the other end of the pipeline |
 | **Hallucination guard** | Precision *and* recall of the guard itself against a labelled set of grounded and ungrounded answers. Recall alone is the trap: a guard that suppresses correct answers is worse than no guard, and only precision shows it |
 | **BGE-M3 learned-sparse leg** | Recorded against #6 already. nDCG@10 with learned-sparse replacing the FTS5 BM25 leg — **on a multilingual corpus first**, where Porter stemming is English-only and the current lexical leg is at its weakest. Also a runtime change: neither installed backend exposes the head ([`embeddings.md`](embeddings.md) §1.4) |
@@ -1157,8 +1212,10 @@ Calls made in the absence of a stated position.
 | `Filter` settled: `workspace_ids` required/non-empty, `sources` and `langs` set-valued, `extra` removed | §3.1 |
 | Cross-workspace search is N scoped queries merged on cosine, never one unscoped query, never RRF | §3.2 |
 | The pre-filter/post-filter split is a rule with recorded inputs, not a constant | §3.3 |
+| "No join-requiring field set" and "resolved to the empty set" are opposite instructions, not one case | §3.3 |
 | The hydrating join lives *inside* the dense stage, so scope is a per-stage invariant | §2.4, §4.2 |
 | Over-fetch is derived from a measured `live_fraction`, with floor, cap and row cap | §4.3 |
+| `live_fraction` is workspace-scoped only, so it stays cacheable per `(generation, workspace)` | §4.3 |
 | Three distinct shortfall outcomes; `exhausted_budget` is a defect and the others are not | §4.4 |
 | `min_score` applies to dense cosine only, and the shipped values are placeholders | §4.5 |
 | RRF is rank-only: no score weighting, no leg weighting, no normalisation | §5.1 |
@@ -1173,9 +1230,11 @@ Calls made in the absence of a stated position.
 | Profile-versus-generator window is a startup refusal | §7.4 |
 | Confidence is a retrieval-support score with named components, no fallback term | §8.2, §8.3 |
 | `fast` cannot reach `high` confidence, by arithmetic and on purpose | §8.3 |
+| A degraded leg suppresses the agreement component rather than scoring it zero — confidence never blames the corpus for a pipeline fault | §8.2 |
 | Router: full-match only, tuned for precision, no citations and absent confidence on a direct route | §9 |
 | L1 caches ranked ids, not content, so a hit cannot leak a deleted or foreign chunk | §10.1 |
-| L1 key excludes conversation history and includes the generation counter and pipeline identity | §10.2 |
+| L1 key excludes conversation history and includes the generation counter, `Query.limit` and the pipeline identity | §10.2 |
+| The generation counter is bumped on the document store's write paths, not at each caller | §10.3 |
 | Invalidation by in-process generation counter, justified by the one-instance lock; re-embed is the case that forces it | §10.3 |
 | The trace is a return value, not a `query_logs` column | §11.2 |
 | `Query.limit` bounds what is returned to a caller; `final_top_k` bounds what enters the context | Appendix B |
