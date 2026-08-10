@@ -188,9 +188,12 @@ ChunkFingerprint  budget_tokens, overlap_tokens, breadcrumb_budget_tokens,
                   min_tokens, chunker_version, tokenizer_id, grammar_pack_version
 ```
 
-Recorded at first ingest alongside the embedder fingerprint. **Ingest refuses to start when
-the stored fingerprint differs from the running one**, and names the differing field and
-the re-index command. This is the same guard, in the same place, for the same reason.
+Recorded at first ingest alongside the embedder fingerprint, in the same index-identity row
+([`storage.md`](storage.md) §6.3). **Ingest refuses to start when the stored fingerprint
+differs from the running one**, and names the differing field and the re-index command. This
+is the same guard, in the same place, for the same reason — and it is the strictly larger
+invalidation of the two, since a chunk-size change means re-chunk *and* re-embed where a
+dimensionality change means only re-embed.
 
 Two of the fields are less obvious than they look:
 
@@ -240,24 +243,51 @@ which the fingerprint makes an explicit, priced operation rather than an acciden
 5. **`Unlocated` is bounded, not free.** Every parser declares a maximum `Unlocated` ratio
    over its fixture corpus and the test suite enforces it (§3.4). Otherwise rule 1 is
    satisfiable by returning `Unlocated` for everything.
+6. **Every ordinal in an anchor is 1-based and inclusive.** `LineAnchor.start`/`end` and
+   `PageAnchor.page` both count from one, and a line range includes its last line — which is
+   what `token.py:42` means to a person and what every editor and viewer shows. Almost every
+   library underneath counts from zero: pdfium page indices, tree-sitter node rows, and
+   `markdown-it-py`'s `token.map` (which is additionally half-open) are all 0-based.
+   **Convert once, at the parser boundary, never at the call site.** An off-by-one here
+   produces a citation that resolves to adjacent text, which reads plausibly and is wrong;
+   assertion 3 in §3.3 exists largely to catch it.
 
 ### 2.2 `Rect` — one coordinate convention, normalised at parse time
 
 `Rect` is `(x0, y0, x1, y1)` in **points (1/72 inch), origin top-left, y increasing
 downward, relative to the page as displayed.**
 
-Normalising at parse time means a consumer needs the page number and nothing else. Two
-transforms happen inside the PDF parser and never leak out:
+Normalising at parse time means a consumer needs the page number and nothing else. Getting
+there is not one flip, and the shape of the mistake is worth spelling out because it is
+invisible when it happens.
 
-- **Origin flip.** PDF user space is origin-bottom-left. Viewers, canvases and CSS are
-  top-left. Storing user space would make every consumer re-derive the flip from the page
-  height, and one of them would forget.
-- **Rotation.** A page with `/Rotate 90` displays rotated, but text coordinates are reported
-  in the unrotated space. A rect stored unrotated draws in the wrong place — usually off the
-  page entirely, which at least fails visibly, but on a square page fails invisibly. The
-  parser applies the rotation and stores display coordinates. A page whose rotation is not
-  a multiple of 90 (malformed, but it occurs) yields `rects=[]` with the page number still
-  correct.
+**pdfium reports character and rect coordinates in raw PDF user space** — bottom-left
+origin, points, **with `/Rotate` not applied, the CropBox not applied, and the MediaBox
+origin not subtracted.** Verified directly: the same text returns byte-identical rects
+across `/Rotate` 0/90/180/270, across a MediaBox of `[0 0 612 792]` versus `[50 50 662
+842]`, and with a CropBox applied. Content objects stay in user space because the page
+matrix that encodes crop and rotation is only composed in at render time.
+
+**The page dimensions, however, *do* honour both.** The convenient page-size call returns
+the rotated, cropped size — `(792, 612)` for a `/Rotate 90` page, `(350, 500)` for a cropped
+one.
+
+So the two live in **different coordinate spaces**, and the obvious one-liner —
+`top = page_height - rect_top` — is silently wrong on every rotated or cropped page. It
+produces rects that are plausible, on the right page, and in the wrong place. On a square
+page it is not even visibly wrong.
+
+The transform, in order, using the box and rotation accessors and **never** the page-size
+convenience:
+
+1. **Translate** by the CropBox origin (falling back to the MediaBox), so coordinates are
+   relative to the visible page rather than to the media.
+2. **Rotate** by `/Rotate` about the cropped box, swapping width and height for 90 and 270.
+3. **Flip y** using the height of the box *after* rotation.
+
+A page whose rotation is not a multiple of 90 — malformed, but it occurs — yields
+`rects=[]` with the page number still correct. This whole transform is a required
+structurally-hard fixture (§3.5): rotated and cropped pages, with expected rects.
 
 PPTX uses the same convention. `python-pptx` reports shape geometry in EMU, origin
 top-left; the parser converts (`1 pt = 12700 EMU`) and stores points. Same `Rect`, same
@@ -325,6 +355,31 @@ it is the v1 source and its anchors have to obey the same rules as everything el
 emitted as `media` blocks carrying their tag name, never as prose, because a component
 invocation embedded as text is noise in the vector and nonsense in a citation. Any Markdown
 inside a component's children is parsed normally.
+
+**Two library corrections to `PLAN.md` §5**, found while specifying the anchors. Both are in
+someone else's file, so they are flagged rather than edited.
+
+- **`python-calamine` does not read CSV.** `PLAN.md` pairs it with "XLSX/CSV"; the
+  underlying Rust crate handles Excel and ODF only (`xls`, `xlsx`, `xlsm`, `xlsb`, `ods`) and
+  a `.csv` raises "cannot detect file format". **CSV goes through stdlib `csv`**, inside the
+  same parser, since the block model and `CellAnchor` are identical once a sheet name is
+  supplied. This costs nothing — stdlib `csv` handles the quoting and embedded-newline cases
+  that actually matter — but it has to be written down, because the alternative is
+  discovering it as a crash on the first `.csv`.
+- **`selectolax` ships two engines in one wheel**, and one of them is LGPL-2.1 (the Modest
+  backend) alongside the permissive lexbor backend. manicule imports the **lexbor** backend
+  only. See §12.
+
+Calamine does give what `CellAnchor` needs beyond values: per-sheet used-range corners,
+dimensions, and merged-range list, so an absolute cell reference is the used-range origin
+plus the row and column index. Merged ranges matter — a merged header cell reports its value
+once, and a row-splitting table (§4.2) that ignores merges repeats the wrong header.
+
+**PPTX slide numbers are positional and that is deliberate.** `PageAnchor.page` is the slide's
+position in presentation order, because that is what a viewer shows and what a person says.
+It is *not* stable across a reorder — but neither is the citation, since a reorder changes
+`version_token` and the document is re-parsed. The stable per-slide identifier is recorded in
+`metadata.slide_id` so a diff between two versions can tell a moved slide from a new one.
 
 `heading_path` on `ParsedBlock` is populated for every parser that can recover one,
 including the ones whose anchor is not a `HeadingAnchor` — a PPTX slide title and an XLSX
@@ -532,9 +587,9 @@ Per parser, four kinds, all four required:
 | Kind | What it is |
 |---|---|
 | **Typical** | a well-formed document of the sort the parser will mostly see |
-| **Structurally hard** | multi-column PDF; a table spanning a page break; merged cells; nested lists five deep; a heading path that repeats; a code file with nested classes |
+| **Structurally hard** | multi-column PDF; **a `/Rotate 90` page and a CropBox page, with expected rects** (§2.2); a table spanning a page break; merged cells; nested lists five deep; a heading path that repeats; a code file with nested classes |
 | **Degenerate** | zero bytes; headers with no body; a single heading and nothing else; one cell; a `.txt` with no trailing newline |
-| **Hostile** | malformed UTF-8; a PDF with no text layer; a zip bomb; a `.docx` whose internal XML is truncated; a CSV with 200 columns and an unterminated quote |
+| **Hostile** | malformed UTF-8; **astral-plane text** (emoji, CJK extensions) in a PDF and a heading (§7); a PDF with no text layer; a zip bomb; an OOXML file with a `.zip` extension (§9.4); JSON with duplicate keys and JSON containing `NaN` (§11); a `.docx` whose internal XML is truncated; a CSV with 200 columns and an unterminated quote |
 
 Fixture size cap: **256 KiB**, with one deliberate exception per parser for a generated
 large file that exercises the streaming path.
@@ -625,9 +680,11 @@ chunks that each cite the function they contain. The enclosing symbol chain reac
 embedder through the ordinary breadcrumb mechanism (§5) — `src/auth/token.py > TokenStore >
 refresh` — so no comment is injected into `text` and the cited code stays byte-honest.
 
-When the grammar for a language is unavailable, the fallback is blank-line runs then lines,
-`symbol=None`, and the line numbers are still exact. §8.1 explains why that path should be
-rare.
+**There is no fallback splitter when the grammar is missing.** A file whose grammar has not
+been fetched is refused, not line-split (§8.1) — a fallback here would make the same file
+chunk differently on two machines. The degradation that *is* allowed is narrower and
+deterministic: a declared language with a grammar but no symbol source still splits on its
+real AST and simply carries `symbol=None` (§8.2).
 
 **Panels — split as prose, keep the semantic.**
 
@@ -806,7 +863,9 @@ Status stays coarse enough to filter on; metadata carries the detail.
 
 **The four chunk-less statuses still store the document** — id, uri, title, `content_hash`,
 `version_token`, `original_ref`, metadata — with **zero chunks and zero rows in the vector
-store.**
+store.** A document with no chunks is a normal, round-trippable state, not an edge case
+([`storage.md`](storage.md) §4.2), and `status` is indexed so both `doctor` and re-parse
+selection are queries rather than scans.
 
 Storing the failures is the point. An unstored failure is re-fetched on every sync, is
 absent from `document list`, and is invisible to any future re-parse. Stored, it has a
@@ -885,8 +944,10 @@ not fail an ingest run. It is a normal outcome, counted and reported.
 
 **`pypdfium2` is the fast path.** Licensing is the reason the obvious choice is wrong:
 PyMuPDF is AGPL, which is incompatible with an MIT project regardless of how good it is.
-pypdfium2 wraps Google's pdfium under a permissive licence and is not slower in any way that
-shows up here.
+pypdfium2 is `Apache-2.0 OR BSD-3-Clause` and the pdfium it bundles is BSD-3-Clause — both
+permissive, and it is not slower in any way that shows up here. Its binary wheels ship a
+`BUILD_LICENSES/` directory that must be carried through into anything manicule
+redistributes.
 
 `docling` and `marker` are optional entries in the fallback chain, not default dependencies.
 They are layout models, they are heavy, and they earn their place on documents where
@@ -900,11 +961,21 @@ as they come (rule 3, §2.1).
 
 **Traps, each of which produces a wrong citation rather than an error:**
 
-- **Page rotation.** §2.2. Applied at parse time; stored coordinates are display
-  coordinates.
-- **Page index origin.** pdfium is 0-based; `PageAnchor.page` is **1-based**, matching what a
-  viewer shows and what a person says. Converted once, at the boundary, and asserted by the
-  discrimination test (§3.3, assertion 3), which is the test that catches an off-by-one.
+- **Rects and page size are in different coordinate spaces.** §2.2, and the most expensive
+  mistake available in this parser.
+- **Text extraction has a UCS-2 variant and a full-Unicode variant**, and the shorter-named
+  one is the UCS-2 one. Anything outside the basic multilingual plane — emoji, some CJK
+  extensions, mathematical alphanumerics — comes back mangled. Use the bounded/full-Unicode
+  extraction call. A mangled character does not raise; it fails the round-trip containment
+  assertion (§3.3) on any fixture that contains one, which is why the hostile fixture set
+  includes astral-plane text.
+- **Rect counting is stateful.** The rect count for a range must be requested before
+  individual rects are read; reading them without it returns nothing useful. This is an
+  API-shape trap that produces empty `rects` — that is, silently page-level anchors — rather
+  than an error, and the page-level budget in §3.4 is what catches it.
+- **Page index origin.** pdfium is 0-based; `PageAnchor.page` is **1-based** (§2.1, rule 6).
+  Converted once, at the boundary, and asserted by the discrimination test (§3.3,
+  assertion 3), which is the test that catches an off-by-one.
 - **Encrypted PDFs.** A PDF with a user password cannot be read; status `parse_failed` with
   `reason="encrypted"`. A PDF with only an owner password *can* be read by pdfium and is
   parsed normally — the distinction matters because owner-password PDFs are common and
@@ -929,44 +1000,72 @@ PyPI package per grammar (40 dependencies, a compiler on the user's machine), or
 shared library at install time (the API for which was removed from `py-tree-sitter` at
 0.22).
 
-**Decision: `tree-sitter-language-pack`, as a required dependency.**
+**Decision: `tree-sitter-language-pack` (MIT), as a required dependency, with grammars
+pre-seeded at install time and a declared language set.**
 
-It ships pre-built grammars for well over a hundred languages as binary wheels, tracks
-current `py-tree-sitter`, and is maintained — it is the successor to the older bundled-
-grammar package, which stopped tracking Python releases.
+It is the maintained successor to the older bundled-grammar package, requires
+`tree-sitter >= 0.23`, and its manifest lists 371 languages.
 
-The obvious objection is size: the wheel is tens of megabytes, and `uv tool install
-manicule` being one command is a stated goal (`PLAN.md` §1). The objection does not survive
-arithmetic. The dependency set already includes MLX, LanceDB, and `sentence-transformers`
-for the reranker — and `sentence-transformers` pulls PyTorch, which is on the order of a
-gigabyte. Grammar wheels are a rounding error against that, and paying it buys the removal
-of an entire failure mode.
+**The size objection is not the problem; the delivery mechanism is.** The wheel is about
+2.1 MB and installs to roughly 4.7 MB — negligible next to a dependency set that already
+pulls PyTorch for the reranker. It is that small for a reason that matters far more than
+the number: **the grammars are not in the wheel.** They are downloaded on first use, per
+language, from GitHub releases into a per-user cache. A fresh install has zero grammars and
+needs network egress to GitHub the first time it parses a `.py` file.
 
-That failure mode is the reason it is **required rather than an optional extra.** An
-optional grammar pack means code files chunk one way on a machine that has it and another
-way on a machine that does not — different boundaries, different embeddings, one corpus.
-That is the same corpus-consistency hazard that put OCR out of scope, arriving through a
-different door. A guardrail applied to OCR and waived for grammars is not a guardrail.
+That is a corpus-consistency hazard wearing a different hat. Left alone it means code
+chunks one way on a machine that reached GitHub and another way on a machine that did not —
+different boundaries, different embeddings, one corpus. It is the same failure the OCR
+decision exists to prevent, and a guardrail applied to OCR and waived here is not a
+guardrail. So it is closed in three moves:
 
-**Two obligations on whoever implements this:**
+1. **A declared language set**, pinned in configuration rather than discovered from whatever
+   happens to be cached. manicule supports the languages it declares and no others.
+2. **Pre-seed, never lazy-load.** `manicule init` and `manicule doctor --fix` prefetch the
+   declared set (`download_all()` / `prefetch()`, with the cache directory and language set
+   fixed via `configure(PackConfig(...))`). Container images prefetch at build time. The
+   manifest URL is overridable, so an air-gapped deployment can point at an internal mirror.
+3. **A missing grammar is a refusal, not a fallback.** If a declared language's grammar is
+   absent at parse time, the document gets `unsupported_media_type` with
+   `reason="grammar unavailable: python — run manicule doctor --fix"`. It does **not**
+   quietly fall back to line-splitting, because a silent fallback is precisely how two
+   machines end up with two chunkings of the same file. The document is stored, visible,
+   and re-indexable the moment the grammar arrives.
 
-- **Record the real wheel size** in the PR that adds the dependency. "Tens of megabytes" is
-  the estimate this decision rests on; if it turns out to be hundreds, the decision is worth
-  re-examining and the arithmetic above is the thing to redo.
-- **Audit the bundled grammar licences.** The pack itself is permissive, but it aggregates
-  grammars from many upstream repositories with individually-chosen licences. Almost all are
-  MIT or Apache-2.0, but "almost all" is not a licence audit, and this project has already
-  rejected one excellent library on exactly these grounds. Dump the licence list at
-  packaging time and fail the build on any copyleft entry, with an allowlist for any that
-  are deliberately excluded from the shipped set.
+The declared set, the pack version, and the resolved grammar versions all feed
+`grammar_pack_version` in `ChunkFingerprint` (§8.3), so "which grammars built this corpus"
+is recorded rather than inferred from a cache directory.
+
+**Licences are settled, not an open audit.** The pack's stated policy is that every included
+grammar is permissively licensed — MIT, Apache-2.0, BSD, ISC or similar — and that copyleft
+licences (GPL, AGPL, LGPL, MPL) are not accepted. Individual grammar licences vary across
+those permissive terms, which is fine for an MIT project. The packaging step still asserts
+the policy rather than trusting it: dump the licence list at build time and fail on any
+copyleft entry, so a change in upstream policy surfaces as a build failure instead of a
+licence problem discovered later.
+
+**Filed, because it is the one weak point left:** an offline grammar bundle, so
+`uv tool install manicule` on a machine with no GitHub access can still parse code
+(§14).
 
 ### 8.2 Deriving `LineAnchor.symbol`
 
 `symbol` is the qualified name of the smallest definition enclosing the chunk:
 `TokenStore.refresh`, `parse_config`, `Anchor::render`.
 
-Derived from a small declarative table mapping, per language, the node types that introduce
-a symbol and the field holding its name:
+**Two sources, in order.**
+
+**First, the pack's own tags queries.** Unlike the grammars, the `.scm` query files *are*
+compiled into the wheel and resolve **offline**, with no download — which is what makes them
+usable here at all, since a query set that varied by machine would be the §8.1 hazard again.
+`get_tags_query()` covers **71 of the 371 manifest languages**, including every one that
+matters for a code corpus: python, javascript, typescript, tsx, go, rust, java, c, cpp,
+ruby, php, kotlin, swift, scala, lua, r, elixir, dart. Using them means symbol extraction
+matches what the wider tree-sitter ecosystem produces for the same file, which is worth more
+than anything hand-written.
+
+**Second, an in-repo node-type table**, for declared languages with no tags query — bash,
+sql, html, css and similar. Its shape:
 
 ```
 python:     function_definition → name, class_definition → name
@@ -981,16 +1080,21 @@ join innermost-last with **the language's own scope separator** — `.` for Pyth
 and Java, `::` for Rust, C++ and PHP — because the symbol is read by people who know the
 language, and `Anchor.render` for Rust reads as a mistake.
 
-A language absent from the table yields `symbol=None` — a `LineAnchor` with exact line
+A language covered by neither source yields `symbol=None` — a `LineAnchor` with exact line
 numbers and no symbol, which is honest and still cites correctly. Because the pack version
-is pinned (§8.3) and required (§8.1), which languages fall into that case is identical on
-every machine, so this degradation does not reintroduce the corpus-consistency hazard.
+is pinned (§8.3) and the language set is declared (§8.1), which languages fall into that case
+is identical on every machine, so this degradation does not reintroduce the
+corpus-consistency hazard.
 
-The table is maintained in-repo rather than read from upstream `tags.scm` query files,
-because the pack does not reliably ship those and a query file that is present for some
-languages and absent for others produces exactly the machine-dependent variation §8.1
-rejects. Consuming upstream tag queries where they can be vendored deterministically is a
-worthwhile later improvement and is filed (§13).
+Note that **`symbol` does not affect chunk boundaries** — those come from the AST, which is
+the grammar's business, not the tags query's. A language gaining a tags query in a later pack
+release therefore improves symbols without re-chunking anything, which is the right way round
+for something this cosmetic to behave.
+
+**One naming trap worth writing down**, since it fails at lookup time with an unhelpful
+message: the pack's language key for C# is **`csharp`**, not `c_sharp`. Language keys are
+validated against the manifest at startup rather than on first use, so a typo in the declared
+set is a configuration error and not a document that mysteriously will not parse.
 
 `symbol` also feeds the breadcrumb (§5.1), so it reaches the embedder: a chunk of a
 `refresh` method embeds with `src/auth/token.py > TokenStore > refresh` in front of it,
@@ -1005,8 +1109,19 @@ chunks that would be produced today.
 `grammar_pack_version` is therefore in `ChunkFingerprint` (§1.7). Because it can only affect
 code documents, a mismatch on this field alone permits a **partial** re-parse — re-chunk and
 re-embed the code documents, leave everything else — rather than the full re-index a
-`budget_tokens` change demands. That distinction is worth having in the guard rather than
-discovering it during an upgrade.
+`budget_tokens` change demands.
+
+The global fingerprint on its own cannot express that, since it is one value for the whole
+index. What makes it actionable is that each document also records the fingerprints it was
+last built with ([`storage.md`](storage.md) §6.4), so partial invalidation is a query over
+`documents` rather than a policy someone has to remember:
+
+```sql
+SELECT id FROM documents WHERE chunk_fp <> :current AND media_type IN (:code_types)
+```
+
+The global refusal still stands — one vector table cannot hold two embedding spaces — but
+once a new fingerprint is adopted the repair is targeted instead of total.
 
 ---
 
@@ -1022,13 +1137,29 @@ its own `Document`, its own parser, its own chunks and its own anchors, exactly 
 been fetched directly.
 
 ```
+source_id        zip:<container-source-id>!/reports/2026-q1.pdf
 uri              zip:<container-uri>!/reports/2026-q1.pdf
-source_id        derived from container source_id + inner path
-metadata         container_document_id, container_depth, member_compressed_size
+container_id     the container document (real column, FK, ON DELETE CASCADE)
+container_depth  1 for a member of a top-level archive
+metadata         member_compressed_size, member_modified
 ```
 
 The `!/` separator is the long-standing convention for addressing inside a container and
 survives being pasted into a bug report.
+
+**The member's `source_id` comes from the container walk, not from the connector.** Document
+identity is `(workspace_id, connector_id, source_id)` and `uri` is citable display data that
+is expected to change ([`storage.md`](storage.md) §4.2) — a Confluence URL carries a
+title-derived slug, so a rename would mint a duplicate if identity rested on the URI. A
+connector knows nothing about what is inside an archive it fetched, so the parse stage
+assigns member `source_id`s, and it must do so from the inner path rather than from anything
+positional: a member that moves within the archive keeps its identity, and one that is
+inserted ahead of another does not steal it.
+
+`container_id` and `container_depth` are **real columns rather than metadata**, because the
+cascade in §9.1 is a foreign key and a foreign key cannot point into a JSON field. Depth is
+additionally bounded by a `CHECK` in the schema, so the limit in §9.2 holds even against a
+code path that forgets to check it.
 
 **The container itself emits no chunks** and gets status `container` (§6.4). It is not
 `no_extractable_text` — nothing failed, and conflating the two would put every archive into
@@ -1120,6 +1251,13 @@ Two defences, both required, because either alone fails:
 > the **first `text/html` part**, run through the HTML parser. Line numbers address the
 > decoded, transfer-decoding-removed text of that part.
 
+For an HTML-only body the line numbers address the *converted* text rather than the source
+bytes, so **the HTML-to-text conversion is pinned and its version is part of
+`chunker_version`** (§1.7). Without that, a converter upgrade silently shifts every anchor
+in every HTML email — round-tripping today and pointing at the wrong paragraph after a
+dependency bump, with no test failing in between. `resolve` applies the same pinned
+conversion, which is what makes the anchor exact rather than approximately right.
+
 Headers (`From`, `To`, `Cc`, `Date`, `Subject`) become a single `prose` block preceding the
 body, with its own line span. `Subject` also becomes the document title and the first
 element of the heading path, since it is the only structure an email has.
@@ -1138,19 +1276,31 @@ from.
 Python `.msg` parser is GPL-3.0, which is the same class of problem as PyMuPDF and has the
 same answer: do not take the dependency.
 
-The route that works is that a `.msg` file is a compound-file (OLE/CFBF) container, readable
-with `olefile` (BSD, already permissive), holding MAPI properties as named streams. The one
-that matters:
+Two permissive routes, to be tried in this order. **`msg_parser` is BSD-2-Clause** and is a
+higher-level reader — evaluate it first, because if it works the rest of this section is
+unnecessary. Failing that, a `.msg` file is a compound-file (OLE/CFBF) container readable
+with **`olefile` (BSD-2-Clause)** — which is the same layer the GPL library itself sits on —
+holding MAPI properties as named streams. The ones that matter:
 
 ```
-__substg1.0_007D001F    PR_TRANSPORT_MESSAGE_HEADERS   the original RFC 5322 headers
-__substg1.0_1000001F    PR_BODY                        plain-text body
-__substg1.0_0037001F    PR_SUBJECT
+__substg1.0_007D001F    PidTagTransportMessageHeaders  the original RFC 5322 headers
+__substg1.0_1000001F    PidTagBody                     plain-text body
+__substg1.0_0037001F    PidTagSubject
+__substg1.0_10130102    PidTagHtml                     note the type: binary, not string
 __attach_version1.0_#XXXXXXXX/…                        attachment storages
+__recip_version1.0_#XXXXXXXX/…                         recipients
 ```
 
-Property-name suffixes are the MAPI type tag: `001F` UTF-16 string, `001E` 8-bit string,
-`0102` binary.
+The four hex digits after the property id are the MAPI type tag — `001F` UTF-16 string,
+`001E` 8-bit string, `0102` binary — and **the HTML body is the one that catches people**,
+because `PidTagHtml` is `PT_BINARY`, so the stream is `…10130102` and a reader that assumes
+`…1013001F` by analogy with the plain body simply finds nothing and concludes the message has
+no HTML part.
+
+Storage suffixes are 8 zero-based hex digits, so the eleventh attachment is `#0000000A`, not
+`#00000011`. String encoding across the whole file is signalled once, by `STORE_UNICODE_OK`
+(`0x00040000`) in `PidTagStoreSupportMask` within `__properties_version1.0`: set means every
+string property is Unicode, absent or unset means 8-bit.
 
 So `.msg` is a **shim, not a second parser**: read the transport headers and the body,
 reconstitute an RFC 5322 message, and hand it to the `.eml` code path. Anchors, chunking and
@@ -1163,7 +1313,7 @@ There the shim synthesises headers from `PR_SUBJECT`, the sender properties and 
 recipient table. The synthesised path is a required fixture (§3.5).
 
 Because this is a MAPI property reader rather than a library call, it is sized as its own
-unit of work and filed separately (§13). `.eml` ships in v1 regardless; `.msg` is not
+unit of work and filed separately (§14). `.eml` ships in v1 regardless; `.msg` is not
 blocking.
 
 ---
@@ -1178,12 +1328,15 @@ the source, produces anchors that drift the moment formatting differs.
 - **YAML** — `ruamel.yaml` in round-trip mode carries line and column marks on mappings and
   sequences. Blocks split at top-level keys; `symbol` is the dotted key path.
 - **JSON** — YAML 1.2 is very nearly a superset of JSON, so the same mark-bearing parser
-  gives positions for JSON files. It is *nearly*, not exactly: duplicate keys, tab
-  indentation and a few escape sequences differ. So JSON is validated with stdlib `json`
-  first — that decides whether the document is valid and what its values are — and the
-  mark-bearing parse is used only for positions. If the two disagree or the position parse
-  fails, the file is still indexed and its blocks carry
-  `Unlocated(reason="JSON source positions unavailable")`.
+  gives positions for JSON files, including compact one-line objects with no space after the
+  colon. It is *nearly*, not exactly, and the two divergences are both real:
+  **duplicate keys**, which are legal JSON but raise in the YAML reader, and **`NaN`**, which
+  loads as the string `"NaN"`. So JSON is validated with stdlib `json` first — that decides
+  whether the document is valid and what its values are — and the mark-bearing parse supplies
+  positions only. If the two disagree or the position parse raises, the file is still indexed
+  and its blocks carry `Unlocated(reason="JSON source positions unavailable")`. Both
+  divergences are required hostile fixtures (§3.5), because each is a file that indexes fine
+  and would lose its anchors silently.
 - **TOML** — `tomllib` gives values and no positions. TOML has a usable structural signal
   instead: table headers are `[dotted.name]` at line start. Blocks split at table headers,
   and the line span is found by a single forward scan for the literal header. Arrays of
@@ -1198,7 +1351,38 @@ the JSON position path can legitimately decline.
 
 ---
 
-## 12. Where this differs from the prior art
+## 12. Licence obligations
+
+Parsing is where this project's licences get decided, because the best library for a format
+is repeatedly the one that cannot be used. Recorded together so the next person choosing a
+parser has the precedents rather than re-deriving them.
+
+| Dependency | Licence | Note |
+|---|---|---|
+| **pypdfium2** | `Apache-2.0 OR BSD-3-Clause`; bundled pdfium BSD-3-Clause | wheels ship `BUILD_LICENSES/`, which must be redistributed |
+| **tree-sitter-language-pack** | MIT; grammars uniformly permissive by stated upstream policy | policy asserted at build time, not trusted (§8.1) |
+| **python-calamine**, **python-pptx**, **ruamel.yaml**, **markdown-it-py**, **olefile** | MIT / BSD-2-Clause | no obligations beyond attribution |
+| **selectolax** | wheel bundles **two** engines: lexbor (Apache-2.0) and Modest (**LGPL-2.1**) | import the lexbor backend only; see below |
+| **PyMuPDF** | AGPL-3.0 | **rejected** — incompatible with MIT, despite being the obvious PDF choice |
+| **extract-msg** | GPL-3.0 | **rejected** — same reason; `.msg` is routed through permissive libraries instead (§10) |
+
+**selectolax is the one that needs a judgement rather than a rule.** Both engines ship as
+separate compiled objects in the same wheel, so importing only the permissive backend still
+means an LGPL-2.1 binary is present on disk. That is not a problem for manicule as
+distributed — the wheel is resolved from PyPI by the user's installer, unmodified, and
+dynamic use of an LGPL library from an MIT program is exactly what LGPL permits. It **would**
+become an obligation if manicule ever shipped a bundled or frozen distribution containing
+that binary, and that is the moment to revisit rather than a reason to change parser now. It
+is written down here so the decision is inherited rather than rediscovered.
+
+The general rule, since it has now been applied three times: **a copyleft dependency is
+rejected at selection time, not worked around later.** Twice the permissive alternative was
+equal or better; once (`.msg`) it costs real work, and that work is filed rather than
+quietly skipped.
+
+---
+
+## 13. Where this differs from the prior art
 
 > Confined to this section deliberately. It records design information — these are defects
 > found in a working system, and each one motivates a rule above — but nothing here is
@@ -1207,7 +1391,7 @@ the JSON position path can legitimately decline.
 | | OpenDocuments | manicule |
 |---|---|---|
 | PDF pages | extracted text split on blank-line runs, fragments numbered as pages | page index from the PDF library; rects from character boxes |
-| PDF boxes | none | per-line rects, rotation applied, top-left points |
+| PDF boxes | none | per-line rects, crop and rotation applied, top-left points |
 | Token counting | `tiktoken` for `gpt-4o`, sampled and extrapolated past 10 000 characters | the embedder's own tokenizer, on the exact string it will see |
 | Chunk budget | seven per-kind budgets, up to 800 tokens | one budget, 512, checked against the model's limit at startup |
 | Budget applies to | the chunk text | `embed_text`, breadcrumb included |
@@ -1220,21 +1404,21 @@ the JSON position path can legitimately decline.
 
 ---
 
-## 13. Filed, not deferred
+## 14. Filed, not deferred
 
 Real tickets, because "later" is how these disappear.
 
 | What | Why it is not in v1 |
 |---|---|
-| **`.msg` MAPI property reader** (§10) | a hand-written property reader, not a library call, and `.eml` covers the common case. The route is specified; only the work is out of scope |
+| **`.msg` support** (§10) | either a BSD-licensed higher-level reader works, or it is a hand-written MAPI property reader — not a library call either way. `.eml` covers the common case. The route is specified; only the work is out of scope |
+| **Offline grammar bundle** (§8.1) | the grammar pack fetches grammars from GitHub on first use, so an air-gapped install cannot parse code until someone mirrors them. Pre-seeding covers the normal case; a vendored bundle is the real fix |
 | **OCR** (`PLAN.md` §5) | settled. `no_extractable_text` and the 5% `doctor` warning (§6.5) are the trigger for revisiting |
 | **`docling` / `marker` in the default PDF chain** (§7) | layout models are heavy and unmeasured; they belong behind #15 like every other quality change |
-| **Upstream `tags.scm` symbol queries** (§8.2) | better symbol coverage than the in-repo table, but only once grammar-query files can be vendored deterministically |
 | **PDF reading-order recovery for multi-column layouts** (§7) | any heuristic here risks emitting text that never appeared contiguously; needs the measured baseline first |
 
 ---
 
-## 14. Checklist against ticket #4
+## 15. Checklist against ticket #4
 
 - **Each parser behind the protocol from #1** — §2.4, plus the `resolve` addition in §3.1.
 - **Round-trip check** — §3, six assertions and two declared budgets per parser.
