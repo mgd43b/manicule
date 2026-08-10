@@ -605,7 +605,18 @@ recorded because it eliminated E5 (§1.2).
 ## 8. The embedding cache
 
 An L2 cache of computed vectors, keyed by **the canonical `EmbedFingerprint` bytes plus the
-text** — `(canonical(fp), text) → vector`.
+exact string the embedder is asked to encode** — `(canonical(fp), embed_text) → vector`.
+
+**"Exact" is load-bearing, and it is the `before:embed` hook that makes it so.** A middleware
+running at that hook rewrites `embed_text` *after* the chunker produced it and *before* the
+encoder sees it. So the cache must key on the **post-middleware** string. Keying on what the
+chunker emitted would return a vector computed from different text — a cache that is wrong
+only when a middleware is installed, which is the worst possible distribution of a bug.
+
+The backend's own instruction prefix is **not** part of the key, because `document_prefix` is
+already a fingerprint field (§5): the same text under a changed prefix gets a different
+fingerprint and therefore a different key. Including it as well would be redundant, and
+redundant key material is how two call sites end up disagreeing about what the key is.
 
 **Not keyed by model name.** A name admits two models with different pooling, prefix, dtype or
 revision, and would serve a confidently wrong vector for the right text with no error — the
