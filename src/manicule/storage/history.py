@@ -7,7 +7,7 @@ document is on its way out". Both exist so that something which is no longer cur
 can still be undone.
 
 **Nothing outside this module writes a version.** History is recorded inside the transaction
-that supersedes a document (:meth:`VersionsMixin.record_supersession`, called by
+that supersedes a document (:meth:`VersionsMixin._record_supersession`, called by
 ``upsert_document``), because that is the only place both states are visible at once and the
 only place the write cannot be forgotten. A public "record a version" verb would be a second
 author of a monotonic counter.
@@ -216,7 +216,7 @@ class VersionsMixin(WorkspaceScoped):
 
     # --- written by the store, never by a caller ----------------------------------------------
 
-    async def record_supersession(
+    async def _record_supersession(
         self, session: AsyncSession, row: models.Document, incoming: Document
     ) -> None:
         """Record the state ``row`` is about to leave, if it is leaving one.

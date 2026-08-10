@@ -149,7 +149,7 @@ class SqliteDocStore(
                 # either both land or neither does. A caller-driven "record a version" would
                 # be two transactions with a crash window between them, and the crash loses
                 # exactly the record that exists to explain the change.
-                await self.record_supersession(session, row, document)
+                await self._record_supersession(session, row, document)
             apply_document(row, document)
             row.last_seen_at = utcnow()
             await session.flush()

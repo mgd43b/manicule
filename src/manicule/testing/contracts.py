@@ -946,7 +946,10 @@ async def assert_version_store_contract(
     """Check that history is recorded on a change, and that a stale citation says so.
 
     ``document`` is written twice, the second time with different bytes, so this needs a
-    document the caller is content to have superseded.
+    document the caller is content to have superseded, whose id belongs to the workspace both
+    handles serve. Nothing in either protocol writes a version: history is recorded by the
+    store, inside the transaction that supersedes a document, which is why this suite reaches
+    it through ``upsert_document`` rather than through a verb of its own.
 
     The part worth having is the last check. A citation into a superseded version must not
     resolve to whatever replaced it: chunk ids are derived from their own text, so the old id
