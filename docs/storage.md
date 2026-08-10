@@ -109,7 +109,7 @@ platform provides, and a build without FTS5 fails at the first query rather than
   URL, no coordination.
 - **`chunks.id` is content-derived**: `sha256(document_id || "\0" || embed_text)`, hex,
   truncated to 32 characters, with a `:n` suffix disambiguating byte-identical chunks within
-  one document.
+  one document. `n` is assigned by ascending `position` among the colliding set.
 
   This is worth the deviation from a positional scheme. A chunk's identity is its
   content-in-context, so re-parsing a document that changed in one paragraph produces the
@@ -117,6 +117,28 @@ platform provides, and a build without FTS5 fails at the first query rather than
   re-embedded. It also makes a stale citation *dangle* rather than silently re-point: if the
   text a citation named no longer exists, its ID no longer exists either. That is the same
   rule `docs/contracts.md` §1 states for anchors — a location is correct, or it is absent.
+
+  **The `:n` suffix is the one exception to that stability, and it is a real one.** Because
+  `n` is an enumeration, it depends on how many duplicates precede a chunk — not only on the
+  chunk itself. A document with three byte-identical chunks yields `…:0`, `…:1`, `…:2`;
+  delete the first and the survivors renumber. Two chunks that did not change have new IDs,
+  their vectors are re-embedded for nothing, and citations to text that still exists dangle.
+  So: **duplicate churn within a single document is the one case where an unchanged chunk
+  can change ID.** Anyone implementing against this should not assume more.
+
+  Two things make it acceptable rather than a defect. The scope is narrow — the hash covers
+  `embed_text`, which carries the heading breadcrumb, so a collision needs byte-identical
+  text under an identical heading path, not merely a repeated sentence. And the failure runs
+  in the conservative direction: a needless re-embed and a false dangle, never a citation
+  silently re-pointed at different text.
+
+  **The alternative, recorded.** Fold `position` into the hash and every ID is unique with no
+  suffix. Rejected because it trades a rare failure for a universal one: inserting a paragraph
+  shifts every downstream position, so *every* subsequent chunk gets a new ID, is re-embedded,
+  and drops its citations — on every edit, to every document. The suffix confines that
+  behaviour to duplicate sets. A stable suffix assigned on first sight and carried forward
+  would avoid both, but it requires matching old chunks to new ones, which is the state this
+  scheme exists to avoid keeping.
 
   > **Prior art.** OpenDocuments builds chunk IDs as `${documentId}_chunk_${i}` and then
   > parses them back out with `/^(.+)_chunk_(\d+)$/` to find neighbours, and deletes FTS rows
@@ -262,11 +284,29 @@ class Document(Base):
 ```
 
 **`source_id` is new and it is the important one.** Document identity must be whatever the
-connector can promise is stable. For Confluence that is the page ID; the URL contains a slug
-derived from the title (`docs/connectors/confluence.md` §8), so keying identity on the URL
-means renaming a page creates a second document and leaves the first one serving stale
-content forever, invisible to reconciliation. `uri` remains, because a citation needs
-somewhere to point, but it is display data and it is expected to change.
+connector can *promise* is stable, and a URI is not that. A URI is display data — the string
+a citation points at, chosen for a human to read — and nothing obliges a source to keep it
+fixed. Identity has to be the handle the source itself uses.
+
+Every connector already has one, and it is visible in how each one is addressed rather than
+in how it is displayed. `docs/connectors/confluence.md` fetches by page ID
+(`GET /wiki/api/v2/pages/{id}`, §4) and tracks change by `version.number` per page ID (§2);
+its citation template (§8) is `…/pages/{pageId}/{slug}`, where the ID and the trailing
+human-readable component are separate fields — the API is keyed on one of them. For the local
+filesystem connector (`PLAN.md` §6) the case needs no citation at all: a file that is moved or
+renamed is the same file, and watch mode will report exactly that.
+
+Keying identity on the URI instead means any source that re-mints a URI for an unchanged
+document creates a second row, while the first keeps serving stale content forever, invisible
+to reconciliation because the connector never reports it again. Keying on `source_id` costs
+nothing and cannot fail that way. `uri` remains, because a citation needs somewhere to point.
+
+> **Not established here.** An earlier draft claimed the `{slug}` component of a Confluence
+> URL is title-derived and changes on rename. Nothing in `docs/connectors/confluence.md`
+> supports that, and it is not verified against Atlassian's documentation, so it has been
+> removed rather than softened. The design deliberately does not depend on it: if slugs turn
+> out to be perfectly stable, keying on `source_id` is still correct for every other source,
+> and still free.
 
 ```python
 Index("uq_documents_identity", "workspace_id", "connector_id", "source_id",
