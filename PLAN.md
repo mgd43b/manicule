@@ -81,6 +81,8 @@ what the working reference implementation does.
 
 This closes the BM25 question with it — the two were one decision.
 
+Full storage design in [`docs/storage.md`](docs/storage.md).
+
 ## 3. Plugin system
 
 Four kinds — parser, connector, model, middleware — with `setup` / `teardown` /
@@ -112,17 +114,32 @@ re-ingest against a pinned corpus a first-class operation rather than a re-crawl
 | Format | OpenDocuments | manicule | |
 |---|---|---|---|
 | **PDF** | `pdf-parse` | **pypdfium2** fast path; **docling** or **marker** optional | **Gain.** Real page and bbox provenance. Avoid PyMuPDF — AGPL, incompatible with MIT. **No OCR in v1** — see below |
-| **Code** | pattern-matched functions/classes | **tree-sitter** | **Biggest gain.** Real ASTs, 40+ languages |
-| HTML | `node-html-parser` | **selectolax** structural; **trafilatura** for crawled pages only | Two different jobs — fidelity vs boilerplate removal |
+| **Code** | pattern-matched functions/classes | **tree-sitter** via `tree-sitter-language-pack` | **Biggest gain.** Real ASTs. Grammars are **fetched from GitHub on first use**, not bundled — pre-seed them, see below |
+| HTML | `node-html-parser` | **selectolax** structural; **trafilatura** for crawled pages only | Two different jobs — fidelity vs boilerplate removal. Import the **lexbor** backend only — the wheel also carries an LGPL-2.1 engine |
 | DOCX | `mammoth` | **python-docx** | |
-| XLSX/CSV | `xlsx` | **python-calamine** | Rust-backed, much faster |
+| XLSX | `xlsx` | **python-calamine** | Rust-backed, much faster |
+| CSV | `xlsx` | stdlib **`csv`** | Same parser as XLSX, different reader — calamine is Excel/ODF only and rejects `.csv` |
 | PPTX | custom XML | **python-pptx** | |
 | Jupyter | custom JSON | **nbformat** | |
-| Email | custom | stdlib **`email`** | |
+| Email | custom | stdlib **`email`**; `.msg` via **`olefile`** | `extract-msg` is GPL-3.0 — same trap as PyMuPDF |
 | Markdown | custom | **markdown-it-py** | |
 | Plain text | custom | stdlib | |
-| Structured | custom | stdlib `json`/`tomllib`, **PyYAML** | |
+| Structured | custom | stdlib `json`/`tomllib`, **`ruamel.yaml`** | Not PyYAML: it is YAML **1.1**, which is not a JSON superset and parses unquoted `no` as `False` |
 | Archive | placeholder | **zipfile** + recurse into the parser chain | OpenDocuments never implemented this |
+
+Full parsing, anchor and chunking design in [`docs/parsing.md`](docs/parsing.md).
+
+### tree-sitter grammars are not in the wheel
+
+`tree-sitter-language-pack` is a ~2 MB wheel because it contains **no grammars** — they are
+downloaded per language from GitHub releases on first use, into a per-user cache. A fresh
+install therefore cannot parse code without network egress, and left alone that means code
+chunks one way on a machine that reached GitHub and another way on one that did not: the
+same corpus-consistency hazard that put OCR out of scope.
+
+So the language set is **declared**, grammars are **pre-seeded** at `init`, and a missing
+grammar is a **refusal** rather than a silent fallback. Tags queries, unlike grammars, are
+compiled into the native library and do resolve offline.
 
 ### OCR — out of scope for v1
 
@@ -175,19 +192,34 @@ neither is good at both.
 | Runtime | Ollama / cloud HTTP | **MLX** (`mlx-embeddings`) | **No server process.** Runs inside the application, which is what keeps `uv tool install manicule` a single command with nothing to operate alongside it |
 | Fallback | — | **onnxruntime** | Anywhere that is not Apple Silicon |
 | Pooling | whatever the provider does | **ours, in numpy** | **Gain.** See below |
-| Caching | in-memory L2 | same, keyed by model identity | A model change is a loud error with a re-embed path, never quietly worse results |
+| Caching | in-memory L2 | same, keyed by the **full `EmbedFingerprint`** | Not by model *name*: same weights with different pooling differ by ~0.85 cosine, and a prefix, dtype or revision change moves the vector too. Same key as `index_state`, so cache and index cannot disagree |
 
 **Why not speed.** An earlier draft justified MLX with "~50% faster than llama.cpp on
 embeddings." That figure has no traceable primary measurement and should not be repeated.
 The argument for MLX is that it runs in-process; benchmark it during #3 if the number
 matters.
 
-**Why pooling is ours.** `mlx-embeddings` binds `last_hidden_state` to the *pooled*
-vector — token states are one attribute below, on the inner encoder. Anyone trusting the
-field name gets pooled output and never knows. On the target model, CLS versus mean
-pooling differs by **0.856 cosine**: plausible vectors, materially worse retrieval, no
-error raised. So manicule reads token states and pools in its own numpy, driven by the
-model's declared pooling.
+**Why pooling is ours.** `mlx-embeddings` does not give `last_hidden_state` one meaning.
+On `bert`, `xlm_roberta`, `gemma3_text` and `qwen3` it is genuine 3-D token states. On
+`modernbert` it is the **2-D pooled vector** — the library rebinds the name before
+returning it — and token states are reachable only from the inner encoder.
+
+**That inconsistency is a worse hazard than a uniform lie**, because code verified against
+one architecture breaks silently on another. It is not even per-architecture: the same
+ModernBERT module returns 3-D for a `ForMaskedLM` checkpoint and 2-D for a `ModernBertModel`
+one. So manicule reads token states from the inner encoder and pools in its own numpy,
+driven by the model's declared pooling, and **asserts the array is 3-D** rather than trusting
+a field name.
+
+How much this costs when it goes wrong is length-dependent, and the single figure quoted in
+an earlier draft was misleading. Measured on `gte-modernbert-base`, CLS versus mean pooling
+diverges from **0.90 cosine at 7 tokens to 0.69 at 450** — so at the 512-token chunk budget
+the two are furthest apart, not closest. The often-quoted **0.856** is the short-chunk end of
+that curve, not a constant. On BERT the same comparison stays at 0.87–0.96, so pooling
+choice matters far less there — which is exactly why verifying on BERT and shipping
+ModernBERT would hide the problem.
+
+Full design, and the model choice, in [`docs/embeddings.md`](docs/embeddings.md).
 
 ### Ollama is not an embedding backend
 
@@ -318,7 +350,7 @@ the sections above.
 
 | | What it does | manicule |
 |---|---|---|
-| **Caching** | `RAGCache` with TTL — L1 query results, L2 embeddings, L3 web-search | Keep. Materially affects perceived latency. Key the embedding cache by model identity so a model change cannot serve stale vectors |
+| **Caching** | `RAGCache` with TTL — L1 query results, L2 embeddings, L3 web-search | Keep. Materially affects perceived latency. Key the embedding cache by the **full `EmbedFingerprint`**, not a model name — see §7. A fingerprint change then cold-misses automatically, so a re-embed cannot repopulate the new table with old-space vectors |
 | **Query routing** | Deterministic classifier so greetings and utility queries never reach the model | Keep. Cheap, and it stops trivial input consuming an LLM call |
 | **Token counting** | tiktoken, lazily initialised | **tiktoken** — same library, Python-native. Drives context-window fitting |
 | **Config loading** | 196 lines resolving provider API keys from `.env` by convention | Keep the behaviour, express it in **pydantic-settings** |
@@ -372,7 +404,7 @@ Issue numbers match these steps exactly — step 4 is [#4](https://github.com/mg
 | 7 | [Generation & chat](https://github.com/mgd43b/manicule/issues/7) | Usable | |
 | 8 | [MCP server & CLI](https://github.com/mgd43b/manicule/issues/8) | Usable | **Ship early** — daily use finds what tests do not |
 | 15 | [Retrieval quality baseline](https://github.com/mgd43b/manicule/issues/15) | Usable | Starts here, continues forever |
-| 9 | [Connectors](https://github.com/mgd43b/manicule/issues/9) | Reach | All eight, with real incremental sync |
+| 9 | [Confluence connector](https://github.com/mgd43b/manicule/issues/9) | Usable | v1 ships this one, with real incremental sync. The other seven are [#16](https://github.com/mgd43b/manicule/issues/16), in Reach |
 | 10 | [Document management](https://github.com/mgd43b/manicule/issues/10) | Reach | |
 | 11 | [HTTP API](https://github.com/mgd43b/manicule/issues/11) | Interfaces | |
 | 12 | [Web UI](https://github.com/mgd43b/manicule/issues/12) | Interfaces | |
