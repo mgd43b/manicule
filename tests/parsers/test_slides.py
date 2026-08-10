@@ -374,9 +374,12 @@ async def test_no_block_is_unlocated(corpus: Path) -> None:
     The declared unlocated budget is 0.00 for exactly this reason: a PPTX block can be
     page-level when its box is unusable, but it is never unplaceable.
     """
+    seen = 0
     for name in HARNESS_FIXTURES:
         blocks = await _blocks(corpus / "slides" / name)
+        seen += len(blocks)
         assert not any(isinstance(block.anchor, Unlocated) for block in blocks), name
+    assert seen, "every fixture yielded nothing, so the assertion above never ran"
 
 
 # --- stream lifecycle --------------------------------------------------------------------

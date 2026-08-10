@@ -42,6 +42,14 @@ from tests.parsers.support import check_corpus, check_fixture, raw_from
 
 MEDIA_TYPE = "application/pdf"
 
+MIN_CORPUS_BLOCKS = 60
+"""A floor on the blocks this corpus produces.
+
+A literal rather than ``len(readable)``: deriving the floor from the fixture list it
+guards makes deleting a fixture lower the bar with it, and one block per PDF is a bar a
+sixty-page fixture clears on its own. Raise it when the corpus grows.
+"""
+
 GEOMETRY_FIXTURES = (
     "upright.pdf",
     "rotated-90.pdf",
@@ -458,7 +466,7 @@ async def test_every_pdf_fixture_round_trips_within_the_declared_budgets(
         "many-pages-large.pdf",
     )
     raws = [raw_from(corpus / "pdf" / name, MEDIA_TYPE) for name in readable]
-    await check_corpus(_pdf_parser(), raws, chunker=chunker, min_blocks=len(readable))
+    await check_corpus(_pdf_parser(), raws, chunker=chunker, min_blocks=MIN_CORPUS_BLOCKS)
 
 
 async def test_the_page_with_no_text_contributes_no_blocks_to_the_budget(

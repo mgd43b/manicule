@@ -25,7 +25,6 @@ from manicule.parsers.expansion import (
 from manicule.parsers.mail import MailConfig, MailParser
 from manicule.testing import assert_round_trip
 from tests.corpus.mail import ATTACHMENT_TEXT
-from tests.corpus.mail import build as build_mail_corpus
 from tests.parsers.support import check_corpus, document_for, raw_from
 
 READABLE = (
@@ -203,21 +202,6 @@ async def test_zero_bytes_is_declined_rather_than_read_as_an_empty_message(
 
 
 # --- attachments ---------------------------------------------------------------------------
-
-
-def test_the_message_fixtures_are_byte_identical_on_every_build(tmp_path: Path) -> None:
-    """Generated fixtures have to be deterministic or nothing built on them measures anything.
-
-    :mod:`email` mints a random MIME boundary for every multipart part, so the multipart
-    fixtures would otherwise hash differently on every run — and a corpus that churns cannot
-    be used to assert that a parser does not.
-    """
-    first, second = tmp_path / "first", tmp_path / "second"
-    for target in (first, second):
-        target.mkdir()
-        build_mail_corpus(target)
-    for path in sorted(first.iterdir()):
-        assert path.read_bytes() == (second / path.name).read_bytes(), path.name
 
 
 async def test_the_parser_satisfies_the_expansion_protocol(parser: MailParser) -> None:

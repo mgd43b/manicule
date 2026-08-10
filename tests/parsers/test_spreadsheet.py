@@ -375,10 +375,13 @@ async def test_astral_text_survives_into_the_cells_and_the_sheet_name(corpus: Pa
 
 async def test_no_block_is_unlocated(corpus: Path) -> None:
     """Every cell has a reference, so a spreadsheet block is never unplaceable."""
+    seen = 0
     for name in [*WORKBOOK_FIXTURES, *CSV_FIXTURES]:
         blocks = await _blocks(corpus / "spreadsheet" / name)
+        seen += len(blocks)
         assert not any(isinstance(block.anchor, Unlocated) for block in blocks), name
         assert all(block.kind is BlockKind.TABLE for block in blocks), name
+    assert seen, "every fixture yielded nothing, so the assertions above never ran"
 
 
 # --- stream lifecycle --------------------------------------------------------------------

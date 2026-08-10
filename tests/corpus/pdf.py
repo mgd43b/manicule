@@ -13,11 +13,22 @@ corner, so that "where does this end up when the page is turned" has a visible a
 from __future__ import annotations
 
 import io
+import re
 from pathlib import Path
 
 import pypdfium2 as pdfium  # pyright: ignore[reportMissingTypeStubs] - no stubs upstream
-from reportlab.lib import pdfencrypt
-from reportlab.pdfgen import canvas as rl_canvas
+from reportlab import rl_config
+
+# Set before the modules below are imported, because they read it at import time. Without it
+# reportlab stamps the wall clock into /CreationDate, /ModDate and the trailer /ID, and the
+# encrypted fixtures take their key from os.urandom — so every PDF here differs on every
+# build and the two password-protected ones differ in their content streams. A fixture corpus
+# that is not byte-reproducible cannot be compared between runs, and every assertion built on
+# it is measuring something that changed for reasons nobody recorded.
+rl_config.invariant = 1
+
+from reportlab.lib import pdfencrypt  # noqa: E402 - after the setting above, deliberately
+from reportlab.pdfgen import canvas as rl_canvas  # noqa: E402
 
 LETTER = (612.0, 792.0)
 MARKER = "ANCHORTEST"
@@ -79,9 +90,27 @@ def _reshape(
         page.gen_content()
         out = io.BytesIO()
         document.save(out)  # pyright: ignore[reportUnknownMemberType]
-        return out.getvalue()
+        return _stable_trailer_id(out.getvalue())
     finally:
         document.close()
+
+
+_TRAILER_ID = re.compile(rb"/ID\[<([0-9A-Fa-f]{32})><[0-9A-Fa-f]{32}>\]")
+
+
+def _stable_trailer_id(data: bytes) -> bytes:
+    """Make the trailer's second file identifier equal its first.
+
+    PDF gives ``/ID`` two elements: a permanent identifier, and one that changes every time
+    the file is written. pdfium derives the second from the moment of the save, so a fixture
+    passed through it differs on every build for a reason that has nothing to do with the
+    document — and a corpus that is not byte-reproducible cannot be compared between runs.
+
+    Copying the permanent identifier over the changing one keeps the array well-formed and
+    the file valid, and nothing in manicule reads either value. Done here rather than by
+    asking pdfium for determinism because pdfium's save API exposes no such option.
+    """
+    return _TRAILER_ID.sub(rb"/ID[<\1><\1>]", data)
 
 
 _ASTRAL_CMAP = b"""/CIDInit /ProcSet findresource begin

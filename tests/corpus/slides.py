@@ -21,12 +21,44 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pptx
+from pptx.presentation import Presentation
 from pptx.shapes.autoshape import Shape
 from pptx.shapes.graphfrm import GraphicFrame
 from pptx.slide import Slide
 from pptx.util import Inches, Length, Pt
 
 __all__ = ["build"]
+
+
+_FIXED_TIMESTAMP = (2026, 1, 1, 0, 0, 0)
+"""One timestamp for every zip member, so the package bytes are the same on every run.
+
+An OOXML file is a zip, and :mod:`zipfile` fills a member's ``date_time`` from the local
+clock whenever it is given a name rather than a :class:`zipfile.ZipInfo`. Both python-docx
+and python-pptx do exactly that, so without this every fixture differs between two builds and
+between two timezones — and a corpus that is not byte-reproducible cannot be compared between
+runs, which is the whole basis of asserting anything about it.
+"""
+
+
+def _fixed_timestamps(package: bytes) -> bytes:
+    """The same package with one timestamp on every member, in the same member order."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(package)) as source, zipfile.ZipFile(out, "w") as target:
+        for info in source.infolist():
+            entry = zipfile.ZipInfo(info.filename, date_time=_FIXED_TIMESTAMP)
+            entry.compress_type = info.compress_type
+            entry.external_attr = info.external_attr
+            target.writestr(entry, source.read(info.filename))
+    return out.getvalue()
+
+
+def _save_presentation(package: Presentation, path: Path) -> None:
+    """Write a package to disk with reproducible member timestamps."""
+    buffer = io.BytesIO()
+    package.save(buffer)
+    path.write_bytes(_fixed_timestamps(buffer.getvalue()))
+
 
 _TITLE_AND_CONTENT = 1
 _BLANK = 6
@@ -79,7 +111,7 @@ def _typical(path: Path) -> None:
     _set_title(third, "Asks for next quarter")
     _set_body(third, [("One more reviewer on the release rota", 0)])
 
-    presentation.save(str(path))
+    _save_presentation(presentation, path)
 
 
 def _structurally_hard(path: Path) -> None:
@@ -129,19 +161,19 @@ def _image_only(path: Path) -> None:
     presentation = pptx.Presentation()
     slide = presentation.slides.add_slide(presentation.slide_layouts[_BLANK])
     slide.shapes.add_picture(io.BytesIO(_PNG_1X1), Inches(2), Inches(2), Inches(1), Inches(1))
-    presentation.save(str(path))
+    _save_presentation(presentation, path)
 
 
 def _no_slides(path: Path) -> None:
     """A presentation with no slides at all."""
-    pptx.Presentation().save(str(path))
+    _save_presentation(pptx.Presentation(), path)
 
 
 def _blank_slide(path: Path) -> None:
     """One slide with no shapes on it."""
     presentation = pptx.Presentation()
     presentation.slides.add_slide(presentation.slide_layouts[_BLANK])
-    presentation.save(str(path))
+    _save_presentation(presentation, path)
 
 
 def _astral(path: Path) -> None:
@@ -151,7 +183,7 @@ def _astral(path: Path) -> None:
     # the fixture, and a citation has to reproduce them exactly.
     _set_title(slide, "図表 𝔊raphs")  # noqa: RUF001
     _set_body(slide, [("Supplementary plane glyphs: 🜃 𠀋 and 𝕐", 0)])  # noqa: RUF001
-    presentation.save(str(path))
+    _save_presentation(presentation, path)
 
 
 def _large(path: Path) -> None:
@@ -170,7 +202,7 @@ def _large(path: Path) -> None:
                 )
             ],
         )
-    presentation.save(str(path))
+    _save_presentation(presentation, path)
 
 
 def _set_notes(slide: Slide, text: str) -> None:
@@ -237,7 +269,10 @@ def _plain_zip(path: Path) -> None:
     """A zip that is not an OOXML package at all, under a `.pptx` name."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("slides.txt", "not a presentation")
+        archive.writestr(
+            zipfile.ZipInfo("slides.txt", date_time=_FIXED_TIMESTAMP),
+            "not a presentation",
+        )
     path.write_bytes(buffer.getvalue())
 
 
@@ -248,7 +283,9 @@ def _rewrite(package: bytes, member: str, transform: Callable[[bytes], bytes]) -
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
         for info in source.infolist():
             blob = source.read(info.filename)
-            archive.writestr(info.filename, transform(blob) if info.filename == member else blob)
+            entry = zipfile.ZipInfo(info.filename, date_time=_FIXED_TIMESTAMP)
+            entry.compress_type = info.compress_type
+            archive.writestr(entry, transform(blob) if info.filename == member else blob)
     return out.getvalue()
 
 

@@ -47,8 +47,13 @@ from manicule.core.errors import ManiculeError, ParseError
 from manicule.core.protocols import Parser
 from manicule.parsers import config as parser_config
 from manicule.parsers.plugin import PARSERS
-from manicule.testing import ParserProfile, RoundTripReport, assert_parser_contract
-from tests.parsers.support import check_fixture, raw_from
+from manicule.testing import (
+    ParserProfile,
+    RoundTripReport,
+    assert_parser_contract,
+    assert_round_trip,
+)
+from tests.parsers.support import document_for, raw_from
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +271,19 @@ async def test_a_parsers_corpus_round_trips_within_its_location_budget(
         if path.name in entry.ambiguous:
             continue
         try:
-            reports.append(await check_fixture(parser, _raw(path, entry), chunker=chunker))
+            # ``assert_round_trip`` rather than ``check_fixture``: the shipped contract is
+            # established over this same corpus by the test above, and running it twice
+            # re-parses every large fixture for no signal.
+            raw = _raw(path, entry)
+            reports.append(
+                await assert_round_trip(
+                    parser,
+                    raw,
+                    fixture=raw.uri,
+                    chunker=chunker,
+                    document=document_for(raw),
+                )
+            )
         except ParseError:
             declined.append(path.name)
         except ManiculeError as refusal:

@@ -194,14 +194,23 @@ async def test_a_zip_bomb_is_stopped_by_the_counting_wrapper_not_by_its_declared
 async def test_trusting_the_declared_size_does_not_stop_the_bomb(corpus: Path) -> None:
     """The guard disabled, to show it was carrying the weight.
 
-    A reader that lets the archive's own ``file_size`` bound the read comes back with a
-    truncated member or a CRC complaint — never with the limit the member actually hit. Both
-    outcomes look like a corrupt file rather than an attack, and one of them indexes a
-    kilobyte of a four-megabyte member as though it were the whole thing.
+    A reader that lets the archive's own ``file_size`` bound the read never reports the limit
+    the member actually hit. :mod:`zipfile` truncates the decompressed stream at the declared
+    size and then fails the checksum, so the attack is reported as a corrupt file — and on an
+    archive whose declared size happened to match its checksum it would instead be indexed as
+    a kilobyte of a four-megabyte member, silently.
     """
     outcomes = await _expand(_HeaderTrustingParser(ArchiveConfig()), _raw(corpus, "bomb.zip"))
+
+    assert outcomes, "the disabled guard produced no outcomes at all, so this measures nothing"
     reasons = [failure.reason for failure in _failures(outcomes)]
+    assert reasons, "the disabled guard produced no failure, so there is nothing to compare"
+
+    # The point of the test: whatever went wrong, it was not reported as the limit. Every
+    # assertion below would pass vacuously on an empty list, which is why the two above are
+    # there — the shape is asserted before the property.
     assert not any("while streaming" in reason for reason in reasons)
+    assert any("could not be decompressed" in reason for reason in reasons), reasons
     delivered = [len(member.raw.as_bytes()) for member in _members(outcomes)]
     assert all(size < BOMB_REAL_SIZE for size in delivered)
 

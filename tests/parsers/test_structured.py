@@ -87,7 +87,9 @@ async def test_a_block_is_an_exact_slice_of_the_source_rather_than_a_reprinted_v
     """
     raw = _raw(corpus, "typical.yaml")
     lines = raw.as_text().split("\n")
-    for block in await _blocks(parser, raw):
+    blocks = await _blocks(parser, raw)
+    assert blocks, "no blocks, so the slice comparison below never ran"
+    for block in blocks:
         assert isinstance(block.anchor, LineAnchor)
         assert block.text == "\n".join(lines[block.anchor.start - 1 : block.anchor.end])
 

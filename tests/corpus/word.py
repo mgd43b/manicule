@@ -32,6 +32,37 @@ from docx.table import Table
 
 __all__ = ["build"]
 
+
+_FIXED_TIMESTAMP = (2026, 1, 1, 0, 0, 0)
+"""One timestamp for every zip member, so the package bytes are the same on every run.
+
+An OOXML file is a zip, and :mod:`zipfile` fills a member's ``date_time`` from the local
+clock whenever it is given a name rather than a :class:`zipfile.ZipInfo`. Both python-docx
+and python-pptx do exactly that, so without this every fixture differs between two builds and
+between two timezones — and a corpus that is not byte-reproducible cannot be compared between
+runs, which is the whole basis of asserting anything about it.
+"""
+
+
+def _fixed_timestamps(package: bytes) -> bytes:
+    """The same package with one timestamp on every member, in the same member order."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(package)) as source, zipfile.ZipFile(out, "w") as target:
+        for info in source.infolist():
+            entry = zipfile.ZipInfo(info.filename, date_time=_FIXED_TIMESTAMP)
+            entry.compress_type = info.compress_type
+            entry.external_attr = info.external_attr
+            target.writestr(entry, source.read(info.filename))
+    return out.getvalue()
+
+
+def _save_document(package: Document, path: Path) -> None:
+    """Write a package to disk with reproducible member timestamps."""
+    buffer = io.BytesIO()
+    package.save(buffer)
+    path.write_bytes(_fixed_timestamps(buffer.getvalue()))
+
+
 _ASTRAL_HEADING = "配置 𝔘nicode"  # noqa: RUF001 - astral letters are the point of this fixture
 """CJK plus a mathematical-alphanumeric letter: both outside Latin-1, both sluggable."""
 
@@ -77,7 +108,7 @@ def _typical(path: Path) -> None:
     )
     document.add_heading("Verification", level=1)
     document.add_paragraph("Watch error budget burn for one hour after promotion.")
-    document.save(str(path))
+    _save_document(document, path)
 
 
 def _structurally_hard(path: Path) -> None:
@@ -129,7 +160,7 @@ def _structurally_hard(path: Path) -> None:
             for index in range(1, 41)
         ],
     )
-    document.save(str(path))
+    _save_document(document, path)
 
 
 def _untitled_preamble(path: Path) -> None:
@@ -141,19 +172,19 @@ def _untitled_preamble(path: Path) -> None:
     document.add_paragraph("Loose note with no heading and no title above it.")
     document.add_heading("Findings", level=1)
     document.add_paragraph("The retry storm began when the health check timeout was lowered.")
-    document.save(str(path))
+    _save_document(document, path)
 
 
 def _heading_only(path: Path) -> None:
     document = docx.Document()
     document.core_properties.title = "Stub"
     document.add_heading("Placeholder section", level=1)
-    document.save(str(path))
+    _save_document(document, path)
 
 
 def _empty(path: Path) -> None:
     """A well-formed package with no content. Zero blocks, and that is not a failure."""
-    docx.Document().save(str(path))
+    _save_document(docx.Document(), path)
 
 
 def _astral(path: Path) -> None:
@@ -167,7 +198,7 @@ def _astral(path: Path) -> None:
     _fill(table, [["Symbol", "Plane"], ["🌐", "supplementary"]])
     document.add_heading(_EMOJI_HEADING, level=1)
     document.add_paragraph("This section's heading has no sluggable characters at all.")
-    document.save(str(path))
+    _save_document(document, path)
 
 
 def _repeated_heading_path(path: Path) -> None:
@@ -189,7 +220,7 @@ def _repeated_heading_path(path: Path) -> None:
     document.add_paragraph("First unsluggable section.")
     document.add_heading("🌏", level=1)
     document.add_paragraph("Second unsluggable section.")
-    document.save(str(path))
+    _save_document(document, path)
 
 
 def _large(path: Path) -> None:
@@ -204,7 +235,7 @@ def _large(path: Path) -> None:
                 f"{section * 1000 + paragraph} requests per second with no queue growth, and "
                 f"the p99 stayed inside the objective for the whole window."
             )
-    document.save(str(path))
+    _save_document(document, path)
 
 
 def _add_deep_list_styles(document: Document) -> None:
@@ -246,7 +277,10 @@ def _plain_zip(path: Path) -> None:
     """A zip that is not an OOXML package at all, under a `.docx` name."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("notes.txt", "not an office document")
+        archive.writestr(
+            zipfile.ZipInfo("notes.txt", date_time=_FIXED_TIMESTAMP),
+            "not an office document",
+        )
     path.write_bytes(buffer.getvalue())
 
 
@@ -257,7 +291,7 @@ def _truncate_member(package: bytes, member: str) -> bytes:
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
         for info in source.infolist():
             blob = source.read(info.filename)
-            archive.writestr(
-                info.filename, blob[: len(blob) // 2] if info.filename == member else blob
-            )
+            entry = zipfile.ZipInfo(info.filename, date_time=_FIXED_TIMESTAMP)
+            entry.compress_type = info.compress_type
+            archive.writestr(entry, blob[: len(blob) // 2] if info.filename == member else blob)
     return out.getvalue()

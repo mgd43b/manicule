@@ -155,12 +155,18 @@ async def test_blocks_never_claim_a_line_another_block_already_claimed(corpus: P
     two citations each containing a fragment of the other's text.
     """
     require_grammar(*FIXTURE_LANGUAGES)
+    compared = 0
     for path in fixtures(corpus):
         if path.name == "hostile-malformed-utf8.py":
             continue
         found = await anchors(raw_from(path, MEDIA_TYPES_BY_SUFFIX[path.suffix]))
         for earlier, later in pairwise(found):
+            compared += 1
             assert earlier.end < later.start, f"{path.name}: {earlier} overlaps {later}"
+    # A single-block fixture is legitimate and contributes no pair, so the floor is on
+    # the corpus rather than on each file — without it, a parser that stopped emitting
+    # more than one block per document would pass this by having nothing to compare.
+    assert compared > 20, f"only {compared} adjacent pairs were compared"
 
 
 # --- the refusals --------------------------------------------------------------------------
@@ -467,6 +473,7 @@ async def test_a_long_string_literal_is_never_cut_in_half(corpus: Path) -> None:
     require_grammar("python")
     blocks = await read_blocks(parser(max_block_chars=200), fixture(corpus, "hard-long-string.py"))
 
+    assert blocks, "no blocks, so nothing below checked that a literal survived"
     for block in blocks:
         assert block.text.count('"""') % 2 == 0, f"a triple-quoted string was cut: {block.anchor}"
 
