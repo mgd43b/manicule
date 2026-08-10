@@ -47,8 +47,11 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-    # Five groups plus whatever falls outside them. The default of 5 would leave the queue
-    # permanently full and silently stop opening the rest.
+    # Five groups, and headroom. The default of 5 would sit exactly on the boundary, and the
+    # failure mode is silent: Dependabot stops opening pull requests rather than reporting
+    # that it wanted to. The headroom is for the weeks when a group cannot be updated as one
+    # — a member with an incompatible constraint is raised on its own — which is precisely
+    # when the queue is longest and least worth truncating.
     open-pull-requests-limit: 10
     # Security updates are deliberately left alone by everything above. They are not subject
     # to `open-pull-requests-limit`, they do not wait for Monday, and `groups` defaults to
