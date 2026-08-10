@@ -247,6 +247,29 @@ event bus with webhook dispatch · degraded-mode warnings · update checks.
 | Webhooks | httpx with retry and backoff |
 | Diagnostics | Rich-formatted `doctor` |
 
+## 16. Cross-cutting subsystems
+
+Found in a source audit against the plan — each is real behaviour with no obvious home in
+the sections above.
+
+| | What it does | manicule |
+|---|---|---|
+| **Caching** | `RAGCache` with TTL — L1 query results, L2 embeddings, L3 web-search | Keep. Materially affects perceived latency. Key the embedding cache by model identity so a model change cannot serve stale vectors |
+| **Query routing** | Deterministic classifier so greetings and utility queries never reach the model | Keep. Cheap, and it stops trivial input consuming an LLM call |
+| **Token counting** | tiktoken, lazily initialised | **tiktoken** — same library, Python-native. Drives context-window fitting |
+| **Config loading** | 196 lines resolving provider API keys from `.env` by convention | Keep the behaviour, express it in **pydantic-settings** |
+| **Hardware detection** | CPU and RAM probing to recommend a model during `init` | Keep, and extend — detect Apple Silicon and unified memory to pick the embedding backend |
+| **Plugin compatibility** | `checkCompatibility` against a declared `coreVersion` | Keep. Version mismatch is a loud error, not a runtime surprise |
+| **Community registry** | GitHub-hosted list of community plugins, browsable and installable | Keep. Decide whether install stays admin-only — in OpenDocuments it shells out to a package manager |
+| **Cross-workspace search** | Admin-only search spanning workspaces | Keep, gated on team mode |
+
+### HTTP surface is larger than "11 route groups"
+
+**52 endpoints**, not 11: admin 12 · collections 6 · conversations 6 · documents 6 ·
+auth 5 · tags 5 · health 4 · plugins 4 · chat 3 · workbench 1, plus a websocket channel.
+The workbench is a single read-only endpoint behind a `document:read` scope.
+
+
 ---
 
 ## Defects to fix on the way
