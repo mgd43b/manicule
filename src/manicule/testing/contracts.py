@@ -28,16 +28,22 @@ from typing import TYPE_CHECKING
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
 from manicule.core.embedding import EmbedFingerprint, Pooling, Vector
-from manicule.core.errors import ContextOverflowError, FingerprintMismatchError
+from manicule.core.errors import ContextOverflowError, FingerprintMismatchError, ManiculeError
+from manicule.core.organisation import ChunkRelationType, CitationState, CollectionRule
 from manicule.core.protocols import (
     Chunker,
+    ChunkRelationStore,
+    CollectionStore,
     Connector,
     DocStore,
     Embedder,
     Middleware,
     Parser,
     RetrievalStage,
+    TagStore,
+    TrashStore,
     VectorStore,
+    VersionStore,
     read_blocks,
 )
 from manicule.core.retrieval import Candidate, Query
@@ -698,6 +704,461 @@ async def assert_pipeline_enforces_scope(
     return candidates
 
 
+# --- organisation --------------------------------------------------------------------------
+#
+# Five suites for five protocols, and every one of them spends most of its length on the same
+# two properties, because those are the two that fail silently. **A write that names something
+# outside the workspace is refused, and refused whole** — a partially applied batch reports a
+# success it did not have, and the id it dropped is the interesting one. **Deleting a grouping
+# never deletes what it grouped** — a cascade pointed one table too far takes a corpus with it,
+# and the schema alone cannot say which direction was intended.
+
+
+async def assert_collection_store_contract(
+    store: CollectionStore,
+    documents: DocStore,
+    *,
+    document_ids: Sequence[str],
+    foreign_document_id: str | None = None,
+) -> None:
+    """Check a collection store's promises against two live documents.
+
+    Args:
+        store: The implementation under test.
+        documents: The document store for the *same* workspace — one object usually satisfies
+            both. Used to read a document's source, so the rule check restricts on something
+            real, and to prove that deleting a collection leaves its members alone.
+        document_ids: At least two live, indexed document ids in that workspace.
+        foreign_document_id: A document id this handle must not be able to touch — another
+            workspace's, or one that does not exist. Optional only because a caller may not
+            have one to hand; pass it whenever you do, because the refusal it checks is the
+            one that keeps membership inside a tenant.
+
+    Raises:
+        AssertionError: Any promise is broken.
+    """
+    _require(
+        len(document_ids) >= _COLLECTION_SAMPLE,
+        "assert_collection_store_contract needs at least two live document ids",
+    )
+    first, second = document_ids[0], document_ids[1]
+    subject = await documents.get_document(first)
+    _require(subject is not None, f"document {first!r} is not visible to the document store")
+
+    collection = await store.create_collection("conformance", description="made by the suite")
+    _require(collection.id, "create_collection returned a collection with no id")
+
+    try:
+        await store.create_collection("conformance")
+    except ManiculeError:
+        pass
+    else:
+        _fail(
+            "a second collection was created under a name already in use. Two collections "
+            "with one name merge two people's sets, and every later lookup by name picks "
+            "whichever the query planner returned first"
+        )
+
+    found = await store.find_collection("  conformance  ")
+    _require(
+        found is not None and found.id == collection.id,
+        "a name with surrounding whitespace did not find the collection it names. Names are "
+        "normalised on the way in, so they must be normalised on the way out too — otherwise "
+        "a label typed with a trailing space is a second, invisible collection",
+    )
+
+    _require(
+        await store.add_to_collection(collection.id, [first, second]) == _COLLECTION_SAMPLE,
+        "add_to_collection did not report two new memberships",
+    )
+    _require(
+        await store.add_to_collection(collection.id, [first]) == 0,
+        "adding the same document twice reported a second membership; membership is a set",
+    )
+
+    members = {document.id for document in await store.collection_documents(collection.id)}
+    _require(
+        {first, second} <= members,
+        f"collection_documents returned {sorted(members)}, missing what was just added",
+    )
+    holding = {held.id for held in await store.collections_for(first)}
+    _require(collection.id in holding, "collections_for did not report a collection it is in")
+
+    if foreign_document_id is not None:
+        try:
+            await store.add_to_collection(collection.id, [second, foreign_document_id])
+        except ManiculeError:
+            pass
+        else:
+            _fail(
+                f"document {foreign_document_id!r} was added to a collection by a handle that "
+                f"cannot see it. Collection membership is the join a search resolves into "
+                f"document ids, so an out-of-workspace member is a cross-tenant result with a "
+                f"perfectly ordinary explanation"
+            )
+
+    _require(
+        await store.remove_from_collection(collection.id, [second]) == 1,
+        "remove_from_collection did not report the membership it removed",
+    )
+    remaining = {document.id for document in await store.collection_documents(collection.id)}
+    _require(second not in remaining, "a removed document is still a member")
+
+    await _assert_rule_membership(store, subject)
+
+    await store.delete_collection(collection.id)
+    _require(
+        await store.get_collection(collection.id) is None, "a deleted collection is still there"
+    )
+    survivor = await documents.get_document(first)
+    _require(
+        survivor is not None,
+        f"deleting a collection deleted document {first!r}. A collection groups documents; "
+        f"the cascade runs to the membership rows and stops there",
+    )
+
+
+_COLLECTION_SAMPLE = 2
+"""Two documents: one to keep and one to remove, so removal is distinguishable from emptying."""
+
+
+async def _assert_rule_membership(store: CollectionStore, subject: Document | None) -> None:
+    """Check that a rule-driven collection reports what the rule selects, not a snapshot."""
+    if subject is None:  # pragma: no cover - the caller has already required it
+        return
+    ruled = await store.create_collection(
+        "conformance-rule", rule=CollectionRule(sources=frozenset({subject.source}))
+    )
+    try:
+        members = {document.id for document in await store.collection_documents(ruled.id)}
+        _require(
+            subject.id in members,
+            f"a collection ruled on source {subject.source!r} did not contain document "
+            f"{subject.id!r}, which has that source and was never added by hand. A rule that "
+            f"is stored and not evaluated is a saved query that answers about the day it was "
+            f"written",
+        )
+        holding = {held.id for held in await store.collections_for(subject.id)}
+        _require(
+            ruled.id in holding,
+            "collections_for missed a rule-driven collection. Reporting only manual "
+            "memberships makes the two kinds of membership disagree about the same document",
+        )
+    finally:
+        await store.delete_collection(ruled.id)
+
+
+async def assert_tag_store_contract(
+    store: TagStore,
+    documents: DocStore,
+    *,
+    document_id: str,
+    foreign_document_id: str | None = None,
+) -> None:
+    """Check a tag store's promises against one live document.
+
+    Raises:
+        AssertionError: Any promise is broken.
+    """
+    tag = await store.ensure_tag("Conformance", color="#123456")
+    again = await store.ensure_tag("  Conformance  ", color="#abcdef")
+    _require(
+        again.id == tag.id,
+        "ensure_tag made a second tag for a name that differs only by whitespace. Tags are "
+        "how a corpus is filtered, so a split label halves every answer that uses it",
+    )
+    _require(
+        again.color == tag.color,
+        "ensure_tag overwrote an existing tag's colour. Applying a label is a repeated "
+        "operation, and the last person to type the name should not decide how it looks",
+    )
+
+    _require(await store.tag_document(document_id, [tag.id]) == 1, "tag_document applied nothing")
+    _require(
+        await store.tag_document(document_id, [tag.id]) == 0,
+        "applying the same tag twice reported a second application",
+    )
+    _require(
+        {applied.id for applied in await store.tags_for(document_id)} == {tag.id},
+        "tags_for did not report the tag just applied",
+    )
+    tagged = {document.id for document in await store.documents_with_tags([tag.id])}
+    _require(document_id in tagged, "documents_with_tags missed a document carrying the tag")
+
+    other = await store.ensure_tag("conformance-second")
+    both = {
+        document.id
+        for document in await store.documents_with_tags([tag.id, other.id], match_all=True)
+    }
+    _require(
+        document_id not in both,
+        "match_all returned a document carrying only one of the two tags, so it is a union "
+        "wearing an intersection's name",
+    )
+
+    try:
+        await store.rename_tag(other.id, "Conformance")
+    except ManiculeError:
+        pass
+    else:
+        _fail(
+            "a tag was renamed onto a name already in use. Nothing merges the two, so the "
+            "corpus ends up with one label meaning two things or a unique constraint failing "
+            "at the write"
+        )
+
+    if foreign_document_id is not None:
+        try:
+            await store.tag_document(foreign_document_id, [tag.id])
+        except ManiculeError:
+            pass
+        else:
+            _fail(
+                f"document {foreign_document_id!r} was tagged by a handle that cannot see it, "
+                f"which puts another workspace's document into this workspace's filters"
+            )
+
+    _require(
+        await store.untag_document(document_id, [tag.id]) == 1, "untag_document removed nothing"
+    )
+    _require(not await store.tags_for(document_id), "an untagged document still reports the tag")
+
+    await store.tag_document(document_id, [other.id])
+    await store.delete_tag(other.id)
+    _require(await store.get_tag(other.id) is None, "a deleted tag is still there")
+    _require(
+        not await store.tags_for(document_id),
+        "deleting a tag left its applications behind, so a document reports a label that no "
+        "longer exists",
+    )
+    survivor = await documents.get_document(document_id)
+    _require(
+        survivor is not None,
+        f"deleting a tag deleted document {document_id!r}. A tag labels documents; the "
+        f"cascade runs to the application rows and stops there",
+    )
+    await store.delete_tag(tag.id)
+
+
+async def assert_version_store_contract(
+    store: VersionStore, documents: DocStore, *, document: Document
+) -> None:
+    """Check that history is recorded on a change, and that a stale citation says so.
+
+    ``document`` is written twice, the second time with different bytes, so this needs a
+    document the caller is content to have superseded, whose id belongs to the workspace both
+    handles serve. Nothing in either protocol writes a version: history is recorded by the
+    store, inside the transaction that supersedes a document, which is why this suite reaches
+    it through ``upsert_document`` rather than through a verb of its own.
+
+    The part worth having is the last check. A citation into a superseded version must not
+    resolve to whatever replaced it: chunk ids are derived from their own text, so the old id
+    is *gone* rather than re-pointed, and a store that answered with the current chunk at that
+    position would be quoting text the source never had at that citation.
+
+    Raises:
+        AssertionError: Any promise is broken.
+    """
+    stored = await documents.upsert_document(document)
+    _require(
+        await store.current_version(stored.id) == 1,
+        "a document that has never been superseded is on version 1; versions count the states "
+        "it has left, and there are none",
+    )
+    _require(not await store.list_versions(stored.id), "a fresh document already has history")
+
+    superseded = await documents.upsert_document(
+        stored.model_copy(update={"content_hash": stored.content_hash + "-next"})
+    )
+    history = await store.list_versions(superseded.id)
+    _require(
+        len(history) == 1,
+        f"re-ingesting with different bytes recorded {len(history)} versions, not one. A "
+        f"document's history is the only record of what a citation used to point at",
+    )
+    _require(
+        history[0].content_hash == stored.content_hash,
+        "the version records the incoming content hash rather than the outgoing one. A "
+        "version row is the state the document *left*; recording the new one makes the "
+        "history describe the present twice and the past never",
+    )
+    _require(
+        await store.current_version(superseded.id) == _SECOND_VERSION,
+        "current_version did not advance after a supersession",
+    )
+    _require(
+        await store.get_version(superseded.id, 1) is not None,
+        "get_version could not fetch the version list_versions had just returned",
+    )
+
+    stale = await store.resolve_citation(superseded.id, "a-chunk-id-that-is-not-stored")
+    _require(
+        stale.state is CitationState.SUPERSEDED,
+        f"a citation into a superseded document resolved as {stale.state.value!r}. It must "
+        f"resolve to an absence that names itself: the chunk id was derived from text the "
+        f"document no longer contains, so there is nothing correct to return and offering the "
+        f"passage that replaced it would be a citation quoting text the source never had",
+    )
+    _require(stale.chunk is None, "a superseded citation came back carrying a chunk")
+    _require(stale.reason, "an unresolved citation must say why it did not resolve")
+
+    unknown = await store.resolve_citation("no-such-document", "no-such-chunk")
+    _require(
+        unknown.state is CitationState.UNKNOWN,
+        "a citation into a document this store cannot see must be 'unknown', not "
+        "'superseded' — the second sends somebody to read a history that does not exist",
+    )
+
+
+_SECOND_VERSION = 2
+"""One supersession recorded, so the state the document is in now is the second one."""
+
+
+async def assert_trash_store_contract(
+    store: TrashStore, documents: DocStore, *, document_id: str
+) -> None:
+    """Check that the trash hides a document, keeps it, and gives it back.
+
+    Raises:
+        AssertionError: Any promise is broken.
+    """
+    _require(
+        await documents.get_document(document_id) is not None,
+        f"document {document_id!r} must be live before it can be thrown away",
+    )
+
+    await store.soft_delete_document(document_id)
+    _require(
+        await documents.get_document(document_id) is None,
+        "a soft-deleted document is still visible to the document store, so retrieval will "
+        "serve it",
+    )
+
+    entries = {entry.document.id: entry for entry in await store.list_trash(grace_s=3600.0)}
+    entry = entries.get(document_id)
+    _require(entry is not None, f"document {document_id!r} is not in the trash after deleting it")
+    if entry is None:  # pragma: no cover - the requirement above has already failed
+        return
+    _require(
+        entry.restorable_until is not None and entry.restorable_until > entry.deleted_at,
+        "a trashed document inside its grace period must say when that period ends; the sweep "
+        "is what acts on it and a caller cannot see the sweep",
+    )
+
+    first_deleted_at = entry.deleted_at
+    await store.soft_delete_document(document_id)
+    again = {item.document.id: item for item in await store.list_trash(grace_s=3600.0)}
+    _require(
+        again[document_id].deleted_at == first_deleted_at,
+        "a second soft delete moved deleted_at. Reconciliation soft-deletes on every pass over "
+        "a source that no longer has the document, so restarting the clock means the grace "
+        "period never expires and the sweep never reclaims anything",
+    )
+
+    restored = await store.restore_document(document_id)
+    _require(restored.restored, f"restore_document refused: {restored.reason}")
+    _require(
+        not restored.needs_reparse,
+        "a restore inside the grace period reported that a re-parse is needed. The chunks were "
+        "never removed, so the work is a cleared timestamp and nothing else",
+    )
+    _require(
+        await documents.get_document(document_id) is not None,
+        "a restored document is still invisible to the document store",
+    )
+
+    twice = await store.restore_document(document_id)
+    _require(
+        not twice.restored and twice.reason,
+        "restoring a document that is not in the trash reported success; the caller cannot "
+        "then tell a real restore from a no-op",
+    )
+
+
+async def assert_chunk_relation_store_contract(
+    store: ChunkRelationStore,
+    *,
+    chunk_ids: Sequence[str],
+    foreign_chunk_id: str | None = None,
+) -> None:
+    """Check that an edge is written once and readable from both ends.
+
+    Args:
+        store: The implementation under test.
+        chunk_ids: At least two live chunk ids in this handle's workspace.
+        foreign_chunk_id: A chunk id this handle must not be able to touch.
+
+    Raises:
+        AssertionError: Any promise is broken.
+    """
+    _require(
+        len(chunk_ids) >= _RELATION_SAMPLE,
+        "assert_chunk_relation_store_contract needs at least two live chunk ids",
+    )
+    child, parent = chunk_ids[0], chunk_ids[1]
+
+    try:
+        await store.relate(child, child, ChunkRelationType.SIBLING)
+    except (ValueError, ManiculeError):
+        pass
+    else:
+        _fail("a chunk was related to itself, which the schema's CHECK constraint also forbids")
+
+    await store.relate(child, parent, ChunkRelationType.PARENT)
+    await store.relate(child, parent, ChunkRelationType.PARENT)
+
+    from_child = await store.related(child)
+    _require(
+        len(from_child) == 1,
+        f"the same edge written twice produced {len(from_child)} rows; relating is idempotent",
+    )
+    _require(
+        from_child[0].other_than(child) == parent and from_child[0].points_away_from(child),
+        "an edge read from its source end lost its direction. For a parent link the two "
+        "directions mean opposite things, and a set of neighbours cannot recover which",
+    )
+
+    from_parent = await store.related(parent)
+    _require(
+        len(from_parent) == 1 and not from_parent[0].points_away_from(parent),
+        "the edge was not found from its target end. It is stored once and the schema carries "
+        "an index on target_chunk_id for exactly this lookup; a store that only searches the "
+        "source column silently answers half the question",
+    )
+
+    _require(
+        not await store.related(child, types={ChunkRelationType.SIBLING}),
+        "filtering by relation type returned an edge of another type",
+    )
+    _require(
+        len(await store.related(child, types=frozenset())) == 1,
+        "an empty `types` matched nothing. Empty restricts nothing, the same as every "
+        "set-valued field on Filter — one spelling of 'no restriction', so a caller that "
+        "computed an empty set gets every edge rather than the exact opposite of what it asked "
+        "for",
+    )
+
+    if foreign_chunk_id is not None:
+        try:
+            await store.relate(child, foreign_chunk_id, ChunkRelationType.SIBLING)
+        except ManiculeError:
+            pass
+        else:
+            _fail(
+                f"an edge was written to chunk {foreign_chunk_id!r}, which this handle cannot "
+                f"see. chunk_relations has no workspace column, so a lookup from this side "
+                f"would hand back an identifier from a corpus the caller has no access to"
+            )
+
+    await store.unrelate(child, parent, ChunkRelationType.PARENT)
+    _require(not await store.related(child), "an unrelated edge is still there")
+    await store.unrelate(child, parent, ChunkRelationType.PARENT)
+
+
+_RELATION_SAMPLE = 2
+"""Two chunks: an edge needs two ends, and a self-edge is the thing being refused."""
+
+
 # --- configuration -------------------------------------------------------------------------
 
 
@@ -765,7 +1226,9 @@ def _problems_attributable_to_the_policy(settings: Settings) -> list[str]:
 
 
 __all__ = [
+    "assert_chunk_relation_store_contract",
     "assert_chunker_contract",
+    "assert_collection_store_contract",
     "assert_connector_contract",
     "assert_embedder_contract",
     "assert_local_only_policy_is_enforced",
@@ -775,7 +1238,10 @@ __all__ = [
     "assert_protocol_signatures",
     "assert_refuses_oversized_chunks",
     "assert_retrieval_stage_contract",
+    "assert_tag_store_contract",
+    "assert_trash_store_contract",
     "assert_vector_store_is_dimension_agnostic",
     "assert_vector_store_rejects_foreign_vectors",
+    "assert_version_store_contract",
     "closing",
 ]

@@ -183,6 +183,40 @@ async def repair(
     return report
 
 
+async def reindex_document(
+    document_id: str,
+    *,
+    store: IngestStore,
+    pipeline: IngestPipeline,
+    blobs: BlobSink,
+) -> ReindexReport:
+    """Re-parse one document from its retained bytes. Rung 3, for a single id.
+
+    The narrow end of :func:`re_parse`, and the verb that finishes a restore. A document
+    restored after the soft-delete grace period comes back holding no chunks — the sweep took
+    them, which is the trade ``docs/storage.md`` §8.2 makes for not diluting every vector
+    search — and :meth:`~manicule.core.protocols.TrashStore.restore_document` says so by
+    returning ``needs_reparse``. This is what to run next, and it touches neither the network
+    nor the source.
+
+    It resolves the id through the store rather than taking a
+    :class:`~manicule.core.content.Document`, and that is the whole reason it exists as a verb
+    of its own: the lookup is workspace-scoped and skips the trash, so an id from another
+    tenant, a mistyped one, and one still in the trash all come back named in the report rather
+    than as a document nobody can account for. **Restore first, then reindex** — the other
+    order finds nothing, because a soft-deleted document is not a document this lookup returns.
+    """
+    document = await store.get_document(document_id)
+    if document is None:
+        report = ReindexReport()
+        report.unrepairable.append(
+            f"{document_id}: no live document with that id in this workspace. A document in "
+            f"the trash has to be restored before it can be re-parsed."
+        )
+        return report
+    return await re_parse([document], pipeline=pipeline, blobs=blobs)
+
+
 async def re_parse(
     documents: Sequence[Document],
     *,
@@ -242,4 +276,4 @@ async def re_parse(
     return report
 
 
-__all__ = ["ReindexReport", "re_embed", "re_parse", "repair", "select"]
+__all__ = ["ReindexReport", "re_embed", "re_parse", "reindex_document", "repair", "select"]

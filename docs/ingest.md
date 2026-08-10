@@ -718,7 +718,8 @@ SELECT id FROM documents WHERE chunk_fp <> :current AND media_type IN (:code_typ
 
 `--re-parse` accepts the same selectors as `document list` — `--status`, `--connector`,
 `--media-type`, `--container`, `--chunk-fp` — so "re-parse everything that came out of the old
-PDF parser" is expressible without a bespoke flag.
+PDF parser" is expressible without a bespoke flag. It also takes a single document id, which is
+the narrow end of the same verb and the one a restore reaches for (§11.2).
 
 **Re-parse is subject to the same identity rules as first ingest.** It runs the current parser
 chain over the retained bytes, produces chunks, and reconciles them against the stored set by
@@ -785,6 +786,14 @@ owns when that sweep runs:
 
 A document that is restored inside the grace period needs no re-embed. Outside it, restore is a
 `--re-parse` from retained bytes — rung 3, still not a re-crawl.
+
+`manicule.ingest.reindex.reindex_document` is that re-parse for one id, and it is what
+`TrashStore.restore_document` points at when it reports `needs_reparse`. It resolves the id
+through the store rather than taking a `Document`, and the lookup is workspace-scoped and skips
+the trash — so **restore first, then reindex**. The other order finds nothing and says so,
+rather than reporting a repair that did nothing. A document whose bytes were never retained
+cannot take this path at all, and the restore says that too: for it, `sync --force` is the only
+option, which is the one rung that can fail.
 
 ---
 

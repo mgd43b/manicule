@@ -3,6 +3,14 @@
 SQLite is authoritative. The lexical index and the vector store are derived from it, which is
 what gives the two-store consistency problem a single answer — rebuild the derived side —
 rather than a reconciliation nobody can adjudicate.
+
+**One class, six protocols.** ``DocStore`` is documents, chunks, lexical search and sync
+state; the organisation surfaces — collections, tags, versions, the trash, chunk relations —
+arrive as protocols of their own and are implemented by the mixins in the sibling modules.
+They share :class:`~manicule.storage.scoped.WorkspaceScoped`, so there is one constructor, one
+session factory and one workspace however many contracts this class satisfies. Splitting the
+protocols and joining the implementation is deliberate in both directions: a caller declares
+the narrow surface it needs, and a tenancy check exists once.
 """
 
 from __future__ import annotations
@@ -12,27 +20,33 @@ from typing import TYPE_CHECKING, Any, Final, cast
 from pydantic import TypeAdapter
 from sqlalchemy import bindparam, delete, func, select
 from sqlalchemy import text as sql
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from manicule.core.anchors import Anchor
-from manicule.core.content import BlockKind, Document, DocumentStatus
+from manicule.core.content import Document, DocumentStatus
 from manicule.core.embedding import EmbedFingerprint, IndexFingerprints
-from manicule.core.errors import ManiculeError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import SourceId, Watermark
 from manicule.storage import models
-from manicule.storage.engine import session_factory
 from manicule.storage.fts import SEARCH_SQL, escape_match_query
+from manicule.storage.history import TrashMixin, VersionsMixin
+from manicule.storage.organisation import CollectionsMixin, TagsMixin
+from manicule.storage.relations import RelationsMixin
+from manicule.storage.rows import apply_document, from_chunk, to_chunk, to_document
+from manicule.storage.scoped import (
+    DEFAULT_WORKSPACE,
+    CrossWorkspaceCollisionError,
+    WorkspaceScoped,
+)
 from manicule.storage.types import UtcDateTime, utcnow
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Mapping, Sequence
     from datetime import datetime
 
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     from manicule.core.content import Chunk
 
-_ANCHOR: TypeAdapter[Anchor] = TypeAdapter(Anchor)
 _WATERMARK: TypeAdapter[Watermark] = TypeAdapter(Watermark)
 
 _INDEX_STATE_ID = 1
@@ -66,68 +80,34 @@ filter inline, before ``LIMIT`` (``docs/retrieval.md`` §3.3). Only ``collection
 reached.
 """
 
-DEFAULT_WORKSPACE = "default"
-"""Personal mode has one workspace and never says so out loud.
 
-The workspace is bound to the store handle rather than passed per call, so a query cannot
-forget it. Team mode supplies a real id; personal mode gets this one, and the isolation
-predicate is identical either way — which means the path that enforces tenancy is exercised
-by every test rather than only by the team-mode ones.
-"""
-
-
-class CrossWorkspaceCollisionError(ManiculeError):
-    """A document id was offered to a workspace that does not own it.
-
-    **This should be unreachable.** :func:`manicule.core.ids.document_id` takes the workspace
-    as the first component of its digest, so two tenants indexing the same upstream source
-    derive different ids by construction. What remains is a caller that built an id some other
-    way, or a workspace mismatch between the handle and the document it was handed.
-
-    Kept as a guard rather than deleted, because the failure it catches is silent: an id
-    computed without the workspace lands on another tenant's row, overwriting content its
-    author cannot read while its own document appears to vanish. An assertion that cannot fire
-    costs one comparison per write; the same bug without it costs a tenant's data.
-    """
-
-
-class SqliteDocStore:
-    """:class:`~manicule.core.protocols.DocStore` over SQLite.
+class SqliteDocStore(
+    CollectionsMixin,
+    TagsMixin,
+    VersionsMixin,
+    TrashMixin,
+    RelationsMixin,
+    WorkspaceScoped,
+):
+    """Every relational protocol manicule has, over SQLite.
 
     Bound to one workspace. Every read and write carries that scope, so tenancy is a property
     of the handle rather than a parameter each call site has to remember.
+
+    Satisfies :class:`~manicule.core.protocols.DocStore`,
+    :class:`~manicule.core.protocols.CollectionStore`,
+    :class:`~manicule.core.protocols.TagStore`,
+    :class:`~manicule.core.protocols.VersionStore`,
+    :class:`~manicule.core.protocols.TrashStore` and
+    :class:`~manicule.core.protocols.ChunkRelationStore`.
     """
-
-    def __init__(
-        self,
-        engine: AsyncEngine,
-        *,
-        workspace_id: str = DEFAULT_WORKSPACE,
-        sessions: async_sessionmaker[AsyncSession] | None = None,
-    ) -> None:
-        self._engine = engine
-        self._workspace_id = workspace_id
-        self._sessions = sessions or session_factory(engine)
-
-    @property
-    def workspace_id(self) -> str:
-        return self._workspace_id
-
-    async def ensure_workspace(self) -> None:
-        """Create this store's workspace row if it is absent. Idempotent."""
-        async with self._sessions.begin() as session:
-            existing = await session.get(models.Workspace, self._workspace_id)
-            if existing is None:
-                session.add(
-                    models.Workspace(id=self._workspace_id, name=self._workspace_id, settings={})
-                )
 
     # --- documents ------------------------------------------------------------------------
 
     async def get_document(self, document_id: str) -> Document | None:
         async with self._sessions() as session:
             row = await self._live_document(session, document_id)
-            return None if row is None else _to_document(row)
+            return None if row is None else to_document(row)
 
     async def find_document(self, source: str, source_id: SourceId) -> Document | None:
         """Look a document up by where it came from.
@@ -146,7 +126,7 @@ class SqliteDocStore:
                     )
                 )
             ).scalar_one_or_none()
-            return None if row is None else _to_document(row)
+            return None if row is None else to_document(row)
 
     async def upsert_document(self, document: Document) -> Document:
         async with self._sessions.begin() as session:
@@ -162,10 +142,18 @@ class SqliteDocStore:
             if row is None:
                 row = models.Document(id=document.id, workspace_id=self._workspace_id)
                 session.add(row)
-            _apply_document(row, document)
+            else:
+                # **History is written here or nowhere.** This is the one place both states of
+                # a document are visible at once, and it is inside the transaction that
+                # replaces one with the other — so the version and the change it explains
+                # either both land or neither does. A caller-driven "record a version" would
+                # be two transactions with a crash window between them, and the crash loses
+                # exactly the record that exists to explain the change.
+                await self._record_supersession(session, row, document)
+            apply_document(row, document)
             row.last_seen_at = utcnow()
             await session.flush()
-            return _to_document(row)
+            return to_document(row)
 
     async def set_status(self, document_id: str, status: DocumentStatus, detail: str = "") -> None:
         """Record an outcome, keeping ``failed_stage`` consistent with ``status``.
@@ -233,7 +221,7 @@ class SqliteDocStore:
                 statement = statement.where(models.Document.updated_at < filter.updated_before)
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
-            return [_to_document(row) for row in rows]
+            return [to_document(row) for row in rows]
 
     async def delete_document(self, document_id: str) -> None:
         """Hard-delete a document and everything hanging off it. Idempotent.
@@ -249,18 +237,6 @@ class SqliteDocStore:
                     models.Document.workspace_id == self._workspace_id,
                 )
             )
-
-    async def soft_delete_document(self, document_id: str) -> None:
-        """Mark a document deleted without touching the derived stores.
-
-        Chunks, vectors and FTS rows all stay. They become invisible at the join in
-        :meth:`search_lexical`, so restoring is clearing a timestamp — no re-embed, no
-        re-parse, no re-fetch.
-        """
-        async with self._sessions.begin() as session:
-            row = await session.get(models.Document, document_id)
-            if row is not None and row.workspace_id == self._workspace_id:
-                row.deleted_at = utcnow()
 
     # --- ingest bookkeeping -----------------------------------------------------------------
 
@@ -419,7 +395,7 @@ class SqliteDocStore:
             statement = statement.limit(limit)
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
-            return [_to_document(row) for row in rows]
+            return [to_document(row) for row in rows]
 
     # --- index state ------------------------------------------------------------------------
 
@@ -536,7 +512,7 @@ class SqliteDocStore:
                 delete(models.Chunk).where(models.Chunk.document_id == document_id)
             )
             for chunk in chunks:
-                session.add(_from_chunk(chunk, document_id))
+                session.add(from_chunk(chunk, document_id))
 
     async def get_chunks(self, chunk_ids: Sequence[str]) -> Sequence[Chunk]:
         if not chunk_ids:
@@ -551,7 +527,7 @@ class SqliteDocStore:
                 .scalars()
                 .all()
             )
-            by_id = {row.id: _to_chunk(row) for row in rows}
+            by_id = {row.id: to_chunk(row) for row in rows}
             return [by_id[cid] for cid in chunk_ids if cid in by_id]
 
     async def document_chunks(self, document_id: str) -> Sequence[Chunk]:
@@ -585,7 +561,7 @@ class SqliteDocStore:
                 .scalars()
                 .all()
             )
-            return [_to_chunk(row) for row in rows]
+            return [to_chunk(row) for row in rows]
 
     async def count_chunks(self, document_id: str | None = None) -> int:
         statement = select(func.count()).select_from(models.Chunk)
@@ -762,63 +738,6 @@ class SqliteDocStore:
 
     # --- internals ------------------------------------------------------------------------
 
-    def _require_honourable(
-        self,
-        filter: Filter | None,  # noqa: A002
-        honoured: frozenset[str],
-        operation: str,
-    ) -> None:
-        """Refuse a filter this query cannot apply in full.
-
-        Two refusals, and the order matters only in that both must happen before the
-        statement is built.
-
-        **A workspace this handle does not serve.** A subset check, because
-        :attr:`~manicule.core.retrieval.Filter.workspace_ids` is set-valued: cross-workspace
-        search is N scoped handles fanned out and merged (``docs/retrieval.md`` §3.2), so this
-        handle only ever sees its own workspace. A filter naming another one is a caller who
-        believes they are querying somewhere else, and answering the question they did not ask
-        is the shape a cross-tenant leak takes.
-
-        **A field this query has no column for.** Silently dropping it returns rows the filter
-        was written to exclude — a listing or a search that still looks like it worked. The
-        same rule as :func:`~manicule.storage.vectors.predicate_for`, applied here so that
-        "a store honours the whole filter or refuses" holds for both halves of storage.
-
-        Raises:
-            CrossWorkspaceCollisionError: The filter names another workspace.
-            ValueError: The filter sets a field this query cannot apply.
-        """
-        if filter is None:
-            return
-
-        outside = sorted(filter.workspace_ids - {self._workspace_id})
-        if outside:
-            named = ", ".join(repr(name) for name in outside)
-            msg = (
-                f"filter names workspace(s) {named} but this store serves "
-                f"{self._workspace_id!r}. Cross-workspace search is one store per workspace, "
-                f"merged — open a store for each."
-            )
-            raise CrossWorkspaceCollisionError(msg)
-
-        unhonoured = sorted(filter.restricting_fields - honoured)
-        if unhonoured:
-            msg = (
-                f"this store cannot {operation} by {', '.join(unhonoured)}. Resolve those "
-                f"fields into document_ids first; applying the rest and ignoring them would "
-                f"return rows the filter was written to exclude."
-            )
-            raise ValueError(msg)
-
-    async def _live_document(
-        self, session: AsyncSession, document_id: str
-    ) -> models.Document | None:
-        row = await session.get(models.Document, document_id)
-        if row is None or row.workspace_id != self._workspace_id or row.deleted_at is not None:
-            return None
-        return row
-
     async def _connector_row(
         self, session: AsyncSession, connector: str
     ) -> models.Connector | None:
@@ -836,82 +755,6 @@ class SqliteDocStore:
 def _bind_names(prefix: str, count: int) -> list[str]:
     """Named bind parameters, so a set never reaches SQL as interpolated text."""
     return [f"{prefix}_{index}" for index in range(count)]
-
-
-def _apply_document(row: models.Document, document: Document) -> None:
-    # Writing a document is asserting that it exists, so an upsert clears a soft delete. A
-    # document removed at the source and later restored there arrives through exactly this
-    # path, and leaving the timestamp would index it into a row nothing can see.
-    row.deleted_at = None
-    row.source = document.source
-    row.source_id = document.source_id
-    row.uri = document.uri
-    row.title = document.title
-    row.media_type = document.media_type
-    row.content_hash = document.content_hash
-    row.version_token = document.version_token
-    row.original_ref = document.original_ref
-    row.status = document.status
-    row.status_detail = document.status_detail
-    row.failed_stage = document.failed_stage
-    row.doc_metadata = cast("Any", dict(document.metadata))
-    if document.status is DocumentStatus.INDEXED:
-        row.indexed_at = utcnow()
-
-
-def _to_document(row: models.Document) -> Document:
-    return Document(
-        id=row.id,
-        source=row.source,
-        source_id=row.source_id,
-        uri=row.uri,
-        title=row.title,
-        content_hash=row.content_hash,
-        version_token=row.version_token,
-        original_ref=row.original_ref,
-        media_type=row.media_type,
-        status=row.status,
-        status_detail=row.status_detail,
-        failed_stage=row.failed_stage,
-        metadata=cast("Any", row.doc_metadata or {}),
-    )
-
-
-def _from_chunk(chunk: Chunk, document_id: str) -> models.Chunk:
-    return models.Chunk(
-        id=chunk.id,
-        document_id=document_id,
-        text=chunk.text,
-        embed_text=chunk.embed_text,
-        heading_text=" > ".join(chunk.heading_path),
-        heading_path=list(chunk.heading_path),
-        kind=chunk.kind,
-        # Promoted into a column so the lexical leg can filter on it, through the one
-        # accessor the Lance row also uses (`docs/retrieval.md` §3.3).
-        lang=chunk.lang,
-        position=chunk.position,
-        token_count=chunk.token_count,
-        anchor=chunk.anchor.model_dump(mode="json"),
-        chunk_metadata=cast("Any", dict(chunk.metadata)),
-    )
-
-
-def _to_chunk(row: models.Chunk) -> Chunk:
-    from manicule.core.content import Chunk as ChunkModel  # noqa: PLC0415 - avoids a cycle
-
-    heading_path = cast("list[str]", row.heading_path or [])
-    return ChunkModel(
-        id=row.id,
-        document_id=row.document_id,
-        text=row.text,
-        embed_text=row.embed_text,
-        anchor=_ANCHOR.validate_python(row.anchor),
-        heading_path=tuple(heading_path),
-        kind=BlockKind(row.kind),
-        position=row.position,
-        token_count=row.token_count,
-        metadata=cast("Any", row.chunk_metadata or {}),
-    )
 
 
 __all__ = [

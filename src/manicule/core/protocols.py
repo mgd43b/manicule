@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Sequence
 from collections.abc import Set as AbstractSet
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from manicule.core.anchors import Anchor
@@ -27,6 +28,17 @@ from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, 
 from manicule.core.embedding import EmbedFingerprint, TokenStates, Vector
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.generation import Token
+from manicule.core.organisation import (
+    ChunkEdge,
+    ChunkRelationType,
+    CitationResolution,
+    Collection,
+    CollectionRule,
+    DocumentVersion,
+    Restoration,
+    Tag,
+    TrashEntry,
+)
 from manicule.core.retrieval import Candidate, Context, Filter, Query
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
 
@@ -278,10 +290,16 @@ class VectorStore(Protocol):
 class DocStore(Protocol):
     """Relational storage: documents, chunks, lexical search, sync state.
 
-    Shaped by what ingest and retrieval need. Collections, tags, versions and conversations
-    are relational work belonging to the tickets that build those features, and they arrive
-    as protocols of their own — one class may implement several. Inventing their signatures
-    here would fix shapes before anything needs them.
+    Shaped by what ingest and retrieval need. Organisation on top of the corpus arrives as
+    protocols of its own — :class:`CollectionStore`, :class:`TagStore`, :class:`VersionStore`,
+    :class:`TrashStore` and :class:`ChunkRelationStore` — and **one class may implement
+    several**; :class:`manicule.storage.docstore.SqliteDocStore` implements all six. Splitting
+    them keeps a component's dependency honest: a retrieval stage that needs to resolve a
+    collection into document ids asks for a :class:`CollectionStore` and cannot reach a
+    document's chunks with the handle it was given.
+
+    Conversations are the one member of that list still absent, and belong to the ticket that
+    builds chat.
     """
 
     async def get_document(self, document_id: str) -> Document | None: ...
@@ -331,6 +349,309 @@ class DocStore(Protocol):
         """Every source id currently indexed for a connector.
 
         Reconciliation diffs this against what the source still reports.
+        """
+        ...
+
+
+# --- organisation --------------------------------------------------------------------------
+#
+# Five protocols rather than five more methods on DocStore, and the split is not cosmetic.
+# Every one of them is workspace-scoped in exactly the way DocStore is: the handle carries the
+# workspace, no method takes one, and anything naming a document from another tenant is
+# refused rather than ignored. A store that silently skipped a foreign document id would make
+# "add these forty documents to a collection" report success having added thirty-nine.
+
+
+@runtime_checkable
+class CollectionStore(Protocol):
+    """Named sets of documents: manual membership, rule-driven membership, or both.
+
+    **Membership is evaluated, not materialised.** A collection with a
+    :class:`~manicule.core.organisation.CollectionRule` reports the documents the rule selects
+    *now*, unioned with whatever was added by hand. Materialising the rule's answer at write
+    time would make the collection a snapshot with a name that promises otherwise, and there
+    would be nothing to notice it had gone stale.
+    """
+
+    async def create_collection(
+        self, name: str, *, description: str | None = None, rule: CollectionRule | None = None
+    ) -> Collection:
+        """Create a collection.
+
+        Raises:
+            NameInUseError: The workspace already has a collection with that name. Not an
+                upsert: a collection is a deliberate object, and quietly returning somebody
+                else's under the same name is how two people's sets become one.
+        """
+        ...
+
+    async def get_collection(self, collection_id: str) -> Collection | None: ...
+
+    async def find_collection(self, name: str) -> Collection | None:
+        """Look one up by name, which is unique within a workspace."""
+        ...
+
+    async def list_collections(self) -> Sequence[Collection]: ...
+
+    async def rename_collection(self, collection_id: str, name: str) -> Collection: ...
+
+    async def describe_collection(self, collection_id: str, description: str | None) -> Collection:
+        """Set or clear the description. ``None`` clears it."""
+        ...
+
+    async def set_collection_rule(
+        self, collection_id: str, rule: CollectionRule | None
+    ) -> Collection:
+        """Attach, replace or remove the membership rule. ``None`` removes it.
+
+        Three explicit verbs rather than one ``update`` taking optional fields, because an
+        optional field cannot express the difference between "leave this alone" and "set this
+        to nothing" — and for a rule those are the difference between a collection that keeps
+        growing and one that stops.
+        """
+        ...
+
+    async def delete_collection(self, collection_id: str) -> None:
+        """Remove the collection and its memberships. **Never the documents.** Idempotent."""
+        ...
+
+    async def add_to_collection(self, collection_id: str, document_ids: Sequence[str]) -> int:
+        """Add documents by hand, returning how many memberships were new.
+
+        Idempotent per document: adding one twice is not an error and does not double-count.
+
+        Raises:
+            ManiculeError: A document id belongs to another workspace or does not exist.
+                Refused as a whole rather than partially applied, so a caller cannot be told
+                a batch succeeded when part of it was dropped.
+        """
+        ...
+
+    async def remove_from_collection(self, collection_id: str, document_ids: Sequence[str]) -> int:
+        """Drop manual memberships, returning how many were removed.
+
+        A document the *rule* selects stays in the collection, and that is not a bug to route
+        around: the way to remove it is to change the rule.
+        """
+        ...
+
+    async def collection_documents(
+        self, collection_id: str, *, limit: int = 100, offset: int = 0
+    ) -> Sequence[Document]:
+        """Live members, manual and rule-selected together, newest first."""
+        ...
+
+    async def collections_for(self, document_id: str) -> Sequence[Collection]:
+        """Every collection this document is in, by hand or by rule."""
+        ...
+
+
+@runtime_checkable
+class TagStore(Protocol):
+    """Arbitrary labels on documents, unique by name within a workspace."""
+
+    async def ensure_tag(self, name: str, *, color: str | None = None) -> Tag:
+        """Return the tag with this name, creating it if it is new.
+
+        Idempotent, and the *only* way to make a tag. A separate strict ``create`` would exist
+        to raise on a name that is already taken, which for a label is never the outcome the
+        caller wanted — tagging is an operation people repeat.
+
+        An existing tag's colour is left alone. Overwriting it would make the last person to
+        type the name the one who decides how it looks everywhere; :meth:`set_tag_color` is
+        the deliberate way to change it.
+        """
+        ...
+
+    async def get_tag(self, tag_id: str) -> Tag | None: ...
+
+    async def find_tag(self, name: str) -> Tag | None: ...
+
+    async def list_tags(self) -> Sequence[Tag]: ...
+
+    async def rename_tag(self, tag_id: str, name: str) -> Tag:
+        """Raises:
+        NameInUseError: Another tag in this workspace already has that name. Merging the
+            two would silently move every document from one label to another.
+        """
+        ...
+
+    async def set_tag_color(self, tag_id: str, color: str | None) -> Tag: ...
+
+    async def delete_tag(self, tag_id: str) -> None:
+        """Remove the tag and every application of it. **Never the documents.** Idempotent."""
+        ...
+
+    async def tag_document(self, document_id: str, tag_ids: Sequence[str]) -> int:
+        """Apply tags, returning how many applications were new.
+
+        Raises:
+            ManiculeError: The document or a tag belongs to another workspace, or does not
+                exist.
+        """
+        ...
+
+    async def untag_document(self, document_id: str, tag_ids: Sequence[str]) -> int: ...
+
+    async def tags_for(self, document_id: str) -> Sequence[Tag]: ...
+
+    async def documents_with_tags(
+        self, tag_ids: Sequence[str], *, match_all: bool = False, limit: int = 100, offset: int = 0
+    ) -> Sequence[Document]:
+        """Live documents carrying any of these tags, or all of them when ``match_all``."""
+        ...
+
+
+@runtime_checkable
+class VersionStore(Protocol):
+    """A document's history across re-ingests, and what it means for a citation.
+
+    **Nothing here writes a version.** History is recorded by the store, inside the same
+    transaction that supersedes a document, because that is the only place both states are
+    visible at once and the only place the write cannot be forgotten. A public ``record``
+    would be a second author of the version sequence, and two authors of a monotonic counter
+    is one too many.
+    """
+
+    async def list_versions(self, document_id: str) -> Sequence[DocumentVersion]:
+        """Superseded states, oldest first. The current state is not among them."""
+        ...
+
+    async def get_version(self, document_id: str, version: int) -> DocumentVersion | None: ...
+
+    async def current_version(self, document_id: str) -> int:
+        """The ordinal of the state the document is in now: one past the highest stored row.
+
+        ``1`` for a document that has never been superseded, and ``0`` for one this store
+        cannot see.
+        """
+        ...
+
+    async def resolve_citation(self, document_id: str, chunk_id: str) -> CitationResolution:
+        """Say whether a stored citation still points at the text it named, and why not.
+
+        Takes the document as well as the chunk because a dangling chunk id is opaque: it is a
+        digest, it is not in ``chunks`` any more, and there is nothing to look it up against.
+        Every citation manicule stores carries both.
+
+        **A citation into a superseded version resolves to nothing, deliberately.** ``chunks.id``
+        is derived from ``(document_id, position, text)``, so a chunk that survived a re-parse
+        unchanged kept its id, and a chunk whose text changed did not — the id dangles instead
+        of re-pointing. Returning the passage that replaced it would be a location that is
+        plausible and wrong, which is the one outcome ``docs/contracts.md`` §1 rules out. What
+        this returns instead is the absence, labelled: superseded, deleted, or unknown.
+        """
+        ...
+
+    async def release_expired_versions(self, cutoff: datetime) -> int:
+        """Let go of retained bytes for versions superseded before ``cutoff``.
+
+        The history rows stay — they are a permanent record and cost almost nothing. What is
+        released is ``original_ref``, which is the *capability* attached to a version rather
+        than the record of it, and which pins a blob against garbage collection for as long as
+        it is set. Without this, recording a version would grow the blob store without bound
+        and quietly repeal the retention policy in ``docs/storage.md`` §7.
+
+        Returns:
+            How many versions let go of their bytes.
+        """
+        ...
+
+
+@runtime_checkable
+class TrashStore(Protocol):
+    """Soft deletion, and the two ways back.
+
+    Deletion is deferred, always (``docs/storage.md`` §8.2): soft-deleting sets a timestamp
+    and touches neither the chunks, the vectors nor the lexical rows, all of which become
+    invisible at the hydrating join. That is what makes a restore inside the grace period
+    free — and what makes the scheduled sweep, which purges content once the grace period has
+    passed, the thing a restore has to be designed around rather than against.
+    """
+
+    async def soft_delete_document(self, document_id: str) -> None:
+        """Move a document to the trash. Idempotent, and it does not re-start the clock.
+
+        A second soft delete of an already-deleted document leaves the original ``deleted_at``
+        in place. Refreshing it would let a caller postpone the sweep indefinitely by deleting
+        the same document repeatedly, which is a grace period that never expires.
+        """
+        ...
+
+    async def restore_document(self, document_id: str) -> Restoration:
+        """Take a document out of the trash, and say what that achieved.
+
+        Two outcomes, and the caller has to be able to tell them apart. Inside the grace
+        period the content is still there and clearing the timestamp puts the document back
+        into service. Once the sweep has purged it, the row comes back holding no text: the
+        result says so, and the repair is a single-document re-parse from retained bytes —
+        rung 3 of the ladder, still not a re-crawl.
+        """
+        ...
+
+    async def list_trash(
+        self, *, grace_s: float, limit: int = 100, offset: int = 0
+    ) -> Sequence[TrashEntry]:
+        """What is in the trash, longest-deleted first, with how long each has left.
+
+        ``grace_s`` is passed rather than known, because the sweep that will act on it takes
+        the same number from configuration and a second copy of a policy is a second thing to
+        get wrong.
+        """
+        ...
+
+    async def delete_document(self, document_id: str) -> None:
+        """Hard-delete a document and everything hanging off it. Idempotent.
+
+        The cascade reaches ``chunks``, whose delete trigger clears the lexical rows and
+        writes vector tombstones, so the derived stores are cleaned by the database rather
+        than by whichever caller remembered to.
+        """
+        ...
+
+
+@runtime_checkable
+class ChunkRelationStore(Protocol):
+    """Typed edges between chunks: parent links and sibling links.
+
+    Edges are stored **once and read from both ends**. ``docs/storage.md`` §4.4 indexes
+    ``target_chunk_id`` for exactly that reason — lookups are ``WHERE source = ? OR target = ?``
+    and a composite primary key leading with ``source`` cannot serve the second half — so a
+    mirror row would double the table to answer a query the schema already answers, and would
+    create a pair that can fall out of step.
+
+    Both columns are real foreign keys with ``ON DELETE CASCADE``, so an edge cannot outlive
+    either chunk. That is the payoff of chunks being a table rather than metadata inside a
+    vector store: orphan cleanup is the cascade, not a pattern match over formatted ids.
+    """
+
+    async def relate(
+        self, source_chunk_id: str, target_chunk_id: str, relation_type: ChunkRelationType
+    ) -> None:
+        """Record an edge. Idempotent — the same edge twice is one row.
+
+        Raises:
+            ManiculeError: Either chunk is outside this workspace or does not exist, or the
+                two are the same chunk. A cross-workspace edge is the sharper of the two: it
+                would let a lookup from one tenant's chunk return another tenant's chunk id.
+        """
+        ...
+
+    async def unrelate(
+        self, source_chunk_id: str, target_chunk_id: str, relation_type: ChunkRelationType
+    ) -> None:
+        """Remove an edge, in the direction it was written. Idempotent."""
+        ...
+
+    async def related(
+        self, chunk_id: str, *, types: AbstractSet[ChunkRelationType] = frozenset()
+    ) -> Sequence[ChunkEdge]:
+        """Every edge touching this chunk, from either end, optionally filtered by type.
+
+        An empty ``types`` restricts nothing, exactly as an empty field on
+        :class:`~manicule.core.retrieval.Filter` does. There is deliberately no ``None``
+        alongside it: two spellings of "no restriction" is one too many, and the second one is
+        always the one somebody reads as its opposite.
         """
         ...
 
@@ -562,7 +883,9 @@ class Middleware(Protocol):
 
 
 __all__ = [
+    "ChunkRelationStore",
     "Chunker",
+    "CollectionStore",
     "Connector",
     "DocStore",
     "Embedder",
@@ -571,8 +894,11 @@ __all__ = [
     "Parser",
     "Reranker",
     "RetrievalStage",
+    "TagStore",
     "TokenStateEmbedder",
+    "TrashStore",
     "VectorStore",
+    "VersionStore",
     "aclose",
     "parsing",
     "read_blocks",

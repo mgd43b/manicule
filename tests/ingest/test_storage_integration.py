@@ -18,7 +18,7 @@ from manicule.core.embedding import IndexFingerprints
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
 from manicule.ingest.recovery import requeue_interrupted
-from manicule.ingest.reindex import re_parse
+from manicule.ingest.reindex import re_parse, reindex_document
 from manicule.ingest.sweeps import sweep_vectors
 from manicule.ingest.workers import InProcessRunner
 from manicule.storage.blobs import BlobStore
@@ -279,3 +279,77 @@ async def test_the_blob_store_speaks_the_retention_vocabulary(
     assert kept.ref is not None
     assert refused.ref is None
     assert refused.omitted_reason is not None
+
+
+async def test_a_purged_document_comes_back_with_its_citations_intact(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Delete, purge, restore, reindex — the whole loop, on the real stores.
+
+    This is the claim the trash rests on. Inside the grace period a restore is free; outside
+    it the sweep has taken the chunks and the vectors, and the way back is a single-document
+    re-parse from retained bytes — rung 3, no network, and the source is never consulted.
+
+    The assertion that matters is the last one. ``chunks.id`` is derived from
+    ``(document_id, position, text)``, so re-parsing the same retained bytes reproduces the
+    same ids: every citation into this document survives a deletion it outlived. If the ids
+    moved, restoring a document would silently invalidate every answer that had ever quoted it,
+    and nothing would report that either.
+    """
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    blobs = BlobStore(engine, data_dir)
+    pipeline = _pipeline(store, vectors, blobs)
+    await pipeline.run(fakes.DictConnector({"a": "alpha\nbeta"}))
+
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    before = [chunk.id for chunk in await store.document_chunks(document.id)]
+    assert before, "the fixture must produce chunks, or this proves nothing about keeping them"
+
+    await store.soft_delete_document(document.id)
+    swept = await sweep_vectors(store, vectors, soft_delete_grace_s=-1.0)
+    assert swept.documents_purged == 1
+    assert await vectors.count() == 0
+
+    restoration = await store.restore_document(document.id)
+    assert restoration.restored
+    assert restoration.needs_reparse, "the sweep took the content, so the row came back empty"
+
+    report = await reindex_document(document.id, store=store, pipeline=pipeline, blobs=blobs)
+    assert report.unrepairable == []
+    assert report.failures == []
+    assert report.documents == 1
+
+    after = [chunk.id for chunk in await store.document_chunks(document.id)]
+    assert after == before, (
+        "a restored document must keep its chunk ids, or every citation into it now dangles"
+    )
+    served = await store.get_document(document.id)
+    assert served is not None
+    assert served.status is DocumentStatus.INDEXED
+
+
+async def test_a_single_document_reindex_refuses_an_id_that_is_still_in_the_trash(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Restore first, then reindex. The other order finds nothing and must say why.
+
+    The lookup is workspace-scoped and skips the trash, which is what makes a mistyped id, an
+    id from another tenant and a deleted one all arrive as the same reported outcome rather
+    than as a repair that quietly did nothing.
+    """
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    blobs = BlobStore(engine, data_dir)
+    pipeline = _pipeline(store, vectors, blobs)
+    await pipeline.run(fakes.DictConnector({"a": "alpha"}))
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    await store.soft_delete_document(document.id)
+
+    report = await reindex_document(document.id, store=store, pipeline=pipeline, blobs=blobs)
+
+    assert report.documents == 0
+    assert len(report.unrepairable) == 1
+    assert "restored before it can be re-parsed" in report.unrepairable[0]
