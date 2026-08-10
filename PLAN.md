@@ -71,9 +71,15 @@ Sixteen tables carry over unchanged in shape: `documents` `chunk_relations` `col
 | Migrations | hand-rolled runner over 8 `.sql` files | **Alembic** | **Gain.** Autogenerate, downgrade, branching |
 | Lexical | SQLite FTS5 | **SQLite FTS5** | |
 
-**Coupling:** BM25 comes from FTS5. Folding metadata into LanceDB to run a single store
-means moving BM25 to LanceDB's Tantivy index. One decision, not two. Start with SQLite —
-it is what works today.
+**Decided: SQLite plus LanceDB, and therefore FTS5 for BM25.**
+
+Sixteen tables of collections, tags, versions, workspaces, API keys and audit logs is
+relational work — joins, foreign keys, transactional updates. Expressing that in a
+columnar vector store is fighting the tool. FTS5 is mature and gives BM25 for free, where
+LanceDB's Tantivy index is newer and has had incremental-indexing limitations. And it is
+what the working reference implementation does.
+
+This closes the BM25 question with it — the two were one decision.
 
 ## 3. Plugin system
 
@@ -105,7 +111,7 @@ re-ingest against a pinned corpus a first-class operation rather than a re-crawl
 
 | Format | OpenDocuments | manicule | |
 |---|---|---|---|
-| **PDF** | `pdf-parse` | **pypdfium2** fast path; **docling** or **marker** optional | **Gain.** Real page and bbox provenance. Avoid PyMuPDF — AGPL, incompatible with MIT |
+| **PDF** | `pdf-parse` | **pypdfium2** fast path; **docling** or **marker** optional | **Gain.** Real page and bbox provenance. Avoid PyMuPDF — AGPL, incompatible with MIT. **No OCR in v1** — see below |
 | **Code** | pattern-matched functions/classes | **tree-sitter** | **Biggest gain.** Real ASTs, 40+ languages |
 | HTML | `node-html-parser` | **selectolax** structural; **trafilatura** for crawled pages only | Two different jobs — fidelity vs boilerplate removal |
 | DOCX | `mammoth` | **python-docx** | |
@@ -117,6 +123,17 @@ re-ingest against a pinned corpus a first-class operation rather than a re-crawl
 | Plain text | custom | stdlib | |
 | Structured | custom | stdlib `json`/`tomllib`, **PyYAML** | |
 | Archive | placeholder | **zipfile** + recurse into the parser chain | OpenDocuments never implemented this |
+
+### OCR — out of scope for v1
+
+v1 ingests Confluence, where content arrives as ADF text. OCR adds real weight, and the
+engine choice is worse than it looks: Apple Vision (via `ocrmac`) is Mac-only while
+RapidOCR runs anywhere, so the same document would chunk differently depending on where it
+was ingested — a corpus-consistency hazard, not just a dependency.
+
+**Out of scope must not mean silent.** A PDF yielding no extractable text gets a visible
+`no_extractable_text` document status, not an empty document that looks successfully
+indexed. Revisit when a real corpus contains scanned documents worth having.
 
 ## 6. Connectors — 8
 
@@ -362,9 +379,15 @@ Issue numbers match these steps exactly — step 4 is [#4](https://github.com/mg
 | 13 | [Team mode & security](https://github.com/mgd43b/manicule/issues/13) | Production | |
 | 14 | [Operations](https://github.com/mgd43b/manicule/issues/14) | Production | |
 
-**One ordering constraint that costs real money to get wrong:** #3 and #4 settle vector
-dimensionality and chunk size, and the schema in #2 fixes both. Changing either afterwards
-means re-embedding the entire corpus. Do them before #2's schema is created.
+**Not an ordering constraint — a runtime guardrail.** Vector dimensionality comes from the
+embedder's fingerprint at run time, and the vector table is created at first ingest, not
+when #2 is written. Chunk size does not touch the schema at all. So #2 can be built before
+#3 and #4 land, provided it takes `D` as a parameter and **refuses to run with a hardcoded
+value**.
+
+What is expensive is *indexing a real corpus* before both are settled, because changing
+either means re-embedding everything. That is a guard in the code, not a position in this
+table.
 
 Everything else can slip without penalty. #15 is deliberately early and never finishes —
 it is the gate on every deferred retrieval feature in #6.

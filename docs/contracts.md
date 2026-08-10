@@ -129,7 +129,17 @@ improvement" mechanically enforceable rather than a discipline to remember.
 ⚠️ **`RetrievalStage` is locked after the evaluation harness exists.** Widening it later
 invalidates every recorded result. Widen it now if at all.
 
-## 4. Deliberately absent
+## 4. Settled
+
+**Metadata store: SQLite plus LanceDB**, and therefore SQLite FTS5 for BM25. Sixteen
+relational tables belong in a relational store; a columnar vector store is the wrong tool
+for joins and transactional updates. See `PLAN.md` §2.
+
+**Vector dimensionality is a runtime parameter**, read from `Embedder.fingerprint` — never
+a constant. The vector table is created at first ingest, and ingest must refuse to start
+if the fingerprint does not match what the index was built with.
+
+## 5. Deliberately absent
 
 **No `permissions` field on plugins.** OpenDocuments ships one that is typed, tested, and
 enforced nowhere. Plugins run in-process with full privileges; the documentation says so.
@@ -142,13 +152,11 @@ there is no Anthropic type and no OpenAI type.
 
 ---
 
-## Open, and why they are open
+## 6. Open, and why they are open
 
-**Metadata store.** SQLite plus LanceDB, or LanceDB alone. This also decides where BM25
-comes from — SQLite FTS5 or LanceDB's Tantivy index. One decision, not two, and it wants
-contact with real data volumes.
-
-**`Filter` shape on `VectorStore.search`.** Depends on the store choice above.
+**`Filter` shape on `VectorStore.search`.** Now that the store is settled — SQLite plus
+LanceDB — this is a LanceDB predicate plus a metadata pre-filter, but the exact split
+between them wants contact with real data volumes.
 
 **Whether `Context` assembly is a `RetrievalStage`** or a distinct step. It behaves like
 one, but it emits a different type.
