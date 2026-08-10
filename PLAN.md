@@ -182,6 +182,35 @@ the chunk model with no markup parsing at all.
 
 ## 7. Model runtimes — onnxruntime and Ollama
 
+### The Apple-hardware principle
+
+> Optimise for Apple hardware where possible, but **not at the expense of correctness and
+> fidelity.**
+
+Sharpened into the form that decides cases: **optimise execution for Apple hardware freely;
+never let the platform change what ends up in the index.** Performance may vary by machine.
+Vectors, chunks, anchors and citations may not.
+
+This is not new — it is the unstated rule behind two decisions already made, and naming it
+stops a third from going the other way:
+
+- **OCR is out of scope** (§5) partly because Apple Vision is Mac-only, so the same document
+  would chunk differently depending on where it was ingested.
+- **tree-sitter grammars are pre-seeded and a missing one is refused** (§5), rather than
+  silently downloaded, for the same reason.
+
+Both rejected an environment-specific path because it made *output* depend on *where it
+ran*. The embedding runtime is the third case, and it is the one where the principle had to
+overrule a stated preference: `mlx-embeddings` would have constrained the **model** to seven
+architectures, and choosing a worse embedder because a library supports it is exactly the
+trade this principle forbids.
+
+**The enforcement mechanism is backend parity**, not good intentions: any two backends must
+produce vectors within a stated tolerance for the same text, model and pooling, asserted in
+tests ([`docs/embeddings.md`](docs/embeddings.md) §6.2). If two backends *cannot* be brought
+within tolerance, the index is not portable across machines and the principle is being
+violated by the architecture itself — which is a finding, not a tuning problem.
+
 Two runtimes, split by job. This is deliberate: the two have different requirements and
 neither is good at both.
 

@@ -48,26 +48,37 @@ limit and the configured limit are different numbers and the smaller one wins si
 | Model | Licence | Verdict |
 |---|---|---|
 | `jina-embeddings-v3` | **CC-BY-NC-4.0** | **Eliminated.** Non-commercial only |
-| `google/embeddinggemma-300m` | **Gemma Terms, gated** | **Eliminated** — see §1.3 |
+| `google/embeddinggemma-300m` | **Gemma Terms, gated** | **Eliminated** — see §1.4 |
 | everything else below | MIT or Apache-2.0 | passes |
 
-**Gate 3 — the backend can actually run it.** Verified by attempted load, not by assumption
-(§3.2). This removes several models that survive on paper:
+**Gate 3 — runnable in-process on the target machine.** Under onnxruntime (§3.3) this means
+*an ONNX export exists*, and **every surviving candidate has one**. So this gate eliminates
+nothing, and saying so is the point.
 
-| Eliminated | Architecture | Why |
-|---|---|---|
-| `nomic-embed-text-v1.5` | `nomic_bert` | custom architecture; also needs a `layer_norm` before truncation that is easy to miss |
-| `gte-Qwen2-1.5B-instruct` | `qwen2` | only `qwen3` is implemented |
-| `Alibaba-NLP/gte-base-en-v1.5`, `gte-large-en-v1.5` | `new` | not implemented |
+**The gate it is deliberately *not*.** `mlx-embeddings` implements seven text architectures,
+which would have disqualified `nomic-embed-text-v1.5` (`nomic_bert`),
+`gte-Qwen2-1.5B-instruct` (`qwen2`) and `Alibaba-NLP/gte-base-en-v1.5` / `gte-large-en-v1.5`
+(`new`). That is a constraint on **a backend**, and letting it silently become a constraint
+on **the model** would mean picking a worse embedder because a library happened to support
+it. An earlier draft of this section did exactly that. It is corrected here rather than
+quietly fixed, because the elimination looked principled and was not.
 
-Note this is **not** the same as `thenlper/gte-base` and `gte-large`, which are plain
-`BertModel` and remain candidates. Two families share a name and only one is disqualified.
+`onnxruntime` runs on Apple Silicon; it is not a non-Apple fallback. A model outside MLX's
+seven is still fully runnable locally on the target hardware. What is given up is
+Metal-native execution — throughput — **not** the platform, and not correctness. That is the
+trade named in §1.6 and the principle in `PLAN.md` §7.
+
+One naming trap, since it eliminated the wrong repository once already: `thenlper/gte-base`
+and `gte-large` are plain `BertModel`, while `Alibaba-NLP/gte-base-en-v1.5` is architecture
+`new`. Two families share a name and only one has the architecture issue — which, per the
+above, is no longer disqualifying anyway.
 
 **Gate 4 — retrieval quality per parameter.** What survives, with MTEB v1 English retrieval
 (mean nDCG@10 over the 15-dataset set, from each card's `model-index`):
 
 | Model | D | max_seq | Params | Licence | Retrieval |
 |---|---:|---:|---:|---|---:|
+| `gte-Qwen2-1.5B-instruct` | 1536 | 32768 | **1.78B** | Apache-2.0 | **58.29** |
 | **`gte-modernbert-base`** | **768** | **8192** | **149M** | **Apache-2.0** | **~54.8** ¹ |
 | `mxbai-embed-large-v1` | 1024 | 512 | 335M | Apache-2.0 | 54.39 |
 | `bge-large-en-v1.5` | 1024 | 512 | 335M | MIT | 54.29 |
@@ -78,6 +89,7 @@ Note this is **not** the same as `thenlper/gte-base` and `gte-large`, which are 
 | `e5-large-v2` | 1024 | 512 | 335M | MIT | 50.56 |
 | `e5-base-v2` | 768 | 512 | 110M | MIT | 50.29 |
 | `multilingual-e5-base` | 768 | 512 | 278M | MIT | 48.88 |
+| `nomic-embed-text-v1.5` | 768 | 8192 | 137M | Apache-2.0 | 53.01 |
 
 ¹ The card reports 55.33, but its BEIR table substitutes `CQADupstackAndroidRetrieval` — one
 easy subtask — for MTEB's 12-subforum `CQADupstack` aggregate. Correcting for that is worth
@@ -109,13 +121,45 @@ and three of its properties are worth more here than the score:
   works. The alternative, choosing BERT because its traps are milder, means shipping
   safeguards nothing tests.
 
+### 1.3 The one model that scores higher, and what rejecting it costs
+
+`gte-Qwen2-1.5B-instruct` leads the table at **58.29**, about **+3.5** over the chosen model —
+a far larger gap than anything else discussed here. It is Apache-2.0 and it passes gates 1
+and 2. It is rejected on **cost, stated explicitly rather than buried in an architecture
+gate**:
+
+| | `gte-modernbert-base` | `gte-Qwen2-1.5B-instruct` |
+|---|---:|---:|
+| Parameters | 149M | **1.78B** (12×) |
+| Dimensions | 768 | **1536** (2× storage) |
+| 1M chunks, fp32 | ~2.9 GiB | **~5.9 GiB** |
+| Retrieval | ~54.8 | 58.29 |
+
+Twelve times the parameters is twelve times the ingest compute for every chunk, in-process,
+on a laptop — and doubling `D` doubles vector storage and distance cost permanently, against
+§1.5's finding that dimension buys nothing on its own. A 1.78B-parameter model is also a
+different operational proposition: memory pressure during ingest becomes a real constraint
+rather than a rounding error.
+
+**This is a judgement, not a derivation, and it is the weakest link in this document.** +3.5
+nDCG is a real difference and someone optimising purely for retrieval quality would take it.
+It is declined because manicule is a self-hosted tool that must stay installable and
+ingestable on one machine, and because the +3.5 is an MTEB figure that has never been
+measured on the corpus this will actually index.
+
+**It is the first thing to re-examine under [#15](https://github.com/mgd43b/manicule/issues/15).**
+If measured retrieval on a real corpus shows the gap holding, the trade is worth revisiting
+with real ingest timings beside it. What must not happen is this model disappearing from
+consideration because a backend did not implement `qwen2` — which is what an earlier draft of
+§1.1 did.
+
 **Recorded alternative: `bge-base-en-v1.5`.** MIT rather than Apache-2.0, plain BERT, 1.5
 points lower. It is the right answer if ModernBERT's maturity becomes a problem or if a
 hand-written MLX encoder is ever needed (§3.4) — a BERT encoder is a few hundred well-
 understood lines; a ModernBERT encoder is rotary embeddings, alternating local/global
 attention, and GeGLU. Switching is a re-embed, priced by the fingerprint, not a redesign.
 
-### 1.3 Why not EmbeddingGemma, which is otherwise the strongest
+### 1.4 Why not EmbeddingGemma, which is otherwise the strongest
 
 It scores highest of anything considered, it is genuinely Matryoshka-trained, and it is
 eliminated on licence — so the reasoning is recorded rather than left implicit.
@@ -141,7 +185,7 @@ for consistency: a use-restricted licence with a mutable policy is a heavier obl
 either library this project has already declined, and taking it for a model while refusing it
 for a PDF library would make the rule arbitrary.
 
-### 1.4 Why 768 and not 1024
+### 1.5 Why 768 and not 1024
 
 The owner floated 1024 early. **The evidence says dimension is not a quality knob** — it is
 inherited from backbone width, and paying for it directly buys nothing.
@@ -187,7 +231,7 @@ retrieval retention of 95% at 512 but **67% at 128**, against ~95% at 128 for Em
 is no shrink-later option here, and pretending otherwise would be the sort of latent
 assumption that surfaces two years in.
 
-### 1.5 What would have to be true to change it
+### 1.6 What would have to be true to change it
 
 Changing the model means re-embedding the corpus, so both of these, not either:
 
@@ -490,6 +534,13 @@ Neither is verifiable by reading it. **Parity is what makes a second implementat
 admissible** — and it is the standing check on the first, since two independent
 implementations agreeing is evidence and one implementation running is not.
 
+**Parity is also the enforcement mechanism for the Apple-hardware principle**
+(`PLAN.md` §7): optimise execution for the platform freely, but never let the platform change
+what ends up in the index. A second backend is admissible only if it agrees with the first,
+which is what keeps "runs faster on a Mac" from quietly becoming "indexes differently on a
+Mac". If two backends cannot be brought within tolerance, the corpus is not portable across
+machines — and that is a finding for the architect, not a tolerance to widen.
+
 For every backend pair, over a fixture corpus spanning short, medium and full-budget inputs,
 single and batched, ASCII and astral-plane:
 
@@ -540,7 +591,7 @@ tokens from the *pooling average* — it does not restore truncation budget. The
 configuration that makes a prefix free. Moot for the chosen model, which has none, and
 recorded because it eliminated E5 (§1.2).
 
-**Truncating a non-MRL model falls off a cliff.** §1.4. `D` is fixed at 768 here.
+**Truncating a non-MRL model falls off a cliff.** §1.5. `D` is fixed at 768 here.
 
 ---
 
@@ -587,8 +638,8 @@ around it.
 | Ticket | What | Why not v1 |
 |---|---|---|
 | §3.4 | **MLX backend implemented against `mlx` directly** | Metal-native execution is worth having, but only without the GPL dependency, only with a measured speedup over onnxruntime with CoreML, and only under §6.2 parity |
-| §1.5 | **Multilingual model evaluation** | the chosen model is English-only; a Confluence instance with substantial non-English content needs `multilingual-e5-base` or `bge-m3`, and that is a corpus fact |
-| §1.5 | **Model quality measured on manicule's own corpus** | every figure here is MTEB, which is open-domain and English-heavy. Belongs to #15 |
+| §1.6 | **Multilingual model evaluation** | the chosen model is English-only; a Confluence instance with substantial non-English content needs `multilingual-e5-base` or `bge-m3`, and that is a corpus fact |
+| §1.6 | **Model quality measured on manicule's own corpus** | every figure here is MTEB, which is open-domain and English-heavy. Belongs to #15 |
 
 ---
 
@@ -605,4 +656,4 @@ around it.
 - **Model identity recorded alongside the index; a mismatch is a loud error** — §5, compared
   by `storage.md` §6.3.
 - **Embedding cache keyed by model identity** — §8, tightened to the full fingerprint.
-- **Fixes vector dimensionality** — **`D = 768`** (§1.4).
+- **Fixes vector dimensionality** — **`D = 768`** (§1.5).
