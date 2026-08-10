@@ -142,10 +142,16 @@ jobs:
       # environment fixture deletes everything in that namespace before each test, so an earlier
       # name for this switch was scrubbed before it was ever read — and the job went green having
       # skipped the parity check entirely.
+      #
+      # test_embedding_models.py is in the target list for one test in it: the one asserting
+      # that this variable survives into a test. Everywhere else it runs with the variable
+      # unset, where it passes trivially — here it runs with the variable set, which is the only
+      # place the mechanism can actually be shown to be armed. Without that, a green job and a
+      # job whose switch was scrubbed again look identical.
       - name: pytest (models required)
         env:
           REQUIRE_EMBEDDING_MODELS: BAAI/bge-small-en-v1.5
-        run: uv run pytest tests/test_embedding_backends.py -q -rs
+        run: uv run pytest tests/test_embedding_backends.py tests/test_embedding_models.py -q -rs
 
   # Runs on every pull request, including ones that touch no Python at all. The repository
   # is mostly cross-referenced design documents, and a heading renumbered in one file
