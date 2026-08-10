@@ -312,6 +312,14 @@ async def test_a_language_restriction_reaches_the_promoted_column(
 
     assert [candidate.chunk.id for candidate in found] == ["french"]
 
+    # A language tag is connector data like any other identifier, and reaches the predicate
+    # through the same escape. A filter that widened to the whole table would look like a
+    # working search.
+    hostile = await store.search(
+        spread(4, 0), k=5, filter=Filter(workspace_ids=SCOPE, langs=frozenset({"fr' OR '1'='1"}))
+    )
+    assert hostile == []
+
 
 # --- predicate safety --------------------------------------------------------------------
 
