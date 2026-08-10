@@ -135,6 +135,48 @@ async def test_nothing_is_requeued_when_nothing_is_stale(store: SqliteDocStore) 
     assert await requeue_interrupted(store, stale_after_s=3600) == 0
 
 
+async def test_chunks_are_read_within_a_workspace_and_not_across_one(
+    engine: AsyncEngine,
+) -> None:
+    """The repair verbs read by document id, and an id is not a scope.
+
+    ``chunks`` has no workspace column, so a query on ``document_id`` alone answers about any
+    tenant's document. Today's callers pass ids from scoped queries — but this is the read
+    behind ``reindex --re-embed``, and a repair verb that can be pointed at an id is exactly
+    where an unscoped read stops being theoretical.
+    """
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415 - local to this test
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
+
+    theirs = SqliteDocStore(engine, workspace_id="them")
+    await theirs.ensure_workspace()
+    document = await theirs.upsert_document(make_document(workspace_id="them"))
+    await theirs.replace_chunks(document.id, [make_chunk(document, 0, "theirs")])
+    assert await theirs.document_chunks(document.id), "the seed must exist to be excluded"
+
+    ours = SqliteDocStore(engine, workspace_id="us")
+    await ours.ensure_workspace()
+
+    assert await ours.document_chunks(document.id) == []
+
+
+async def test_a_failure_cannot_be_recorded_without_the_stage_that_caused_it(
+    store: SqliteDocStore,
+) -> None:
+    """The schema requires the pair, so the API must refuse the half of it that is not offered.
+
+    Without the guard the call reaches SQLite and returns an ``IntegrityError`` naming a check
+    constraint — the right outcome reached by luck, and a diagnosis that points at the schema
+    rather than at the missing argument.
+    """
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    document = await store.upsert_document(make_document())
+
+    with pytest.raises(ValueError, match="failed_stage"):
+        await store.set_status(document.id, DocumentStatus.FAILED, "boom")
+
+
 async def test_the_index_state_round_trips_both_fingerprints(store: SqliteDocStore) -> None:
     """One row, because a data directory holds one index."""
     fingerprint = HashEmbedder().fingerprint

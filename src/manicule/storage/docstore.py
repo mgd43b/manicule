@@ -144,15 +144,33 @@ class SqliteDocStore:
 
         A batch records failures and keeps going, so this never raises for an unknown
         document — a document deleted underneath a run is not an error in the run.
+
+        Raises:
+            ValueError: For :attr:`~manicule.core.content.DocumentStatus.FAILED`, which this
+                method cannot express: it takes no stage, and the schema's
+                ``failed_stage_iff_failed`` constraint requires one. Without this the call
+                reaches the database and comes back as an ``IntegrityError`` naming a
+                constraint rather than the missing argument — the right outcome by luck and the
+                wrong diagnosis. Write the whole document through :meth:`upsert_document`,
+                which carries the stage.
         """
+        if status is DocumentStatus.FAILED:
+            msg = (
+                "set_status cannot record 'failed': the schema requires a failed_stage with it "
+                "and this method takes none. Use upsert_document with status, status_detail and "
+                "failed_stage together."
+            )
+            raise ValueError(msg)
         async with self._sessions.begin() as session:
             row = await session.get(models.Document, document_id)
             if row is None:
                 return
             row.status = status
             row.status_detail = detail or None
-            if status is not DocumentStatus.FAILED:
-                row.failed_stage = None
+            # Unconditional, because the guard above has already refused the one status that
+            # may carry a stage. Leaving a stale `failed_stage` behind on a document that has
+            # since moved on would break the schema's own iff constraint on the next write.
+            row.failed_stage = None
             if status is DocumentStatus.INDEXED:
                 row.indexed_at = utcnow()
 
@@ -509,18 +527,30 @@ class SqliteDocStore:
             return [by_id[cid] for cid in chunk_ids if cid in by_id]
 
     async def document_chunks(self, document_id: str) -> Sequence[Chunk]:
-        """Every chunk of one document, in position order.
+        """Every live chunk of one document in this workspace, in position order.
 
         Returned whole rather than as ids because both readers — repair and re-embed — need
         ``embed_text`` and ``token_count``, and fetching ids only to fetch the rows again is a
         round trip for data already found.
+
+        **Joined to ``documents`` for the scope.** ``chunks`` carries no ``workspace_id`` of its
+        own, so a query on ``document_id`` alone answers about any tenant's document and about
+        soft-deleted ones. Today every caller passes an id that came from a scoped query, which
+        makes this an unguarded boundary rather than a leak — but this is the read that feeds
+        ``reindex --re-embed``, and a repair verb that can be pointed at an id is exactly where
+        an unscoped read stops being theoretical.
         """
         async with self._sessions() as session:
             rows = (
                 (
                     await session.execute(
                         select(models.Chunk)
-                        .where(models.Chunk.document_id == document_id)
+                        .join(models.Document, models.Document.id == models.Chunk.document_id)
+                        .where(
+                            models.Chunk.document_id == document_id,
+                            models.Document.workspace_id == self._workspace_id,
+                            models.Document.deleted_at.is_(None),
+                        )
                         .order_by(models.Chunk.position, models.Chunk.seq)
                     )
                 )
