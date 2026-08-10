@@ -173,7 +173,7 @@ on disk.
 
 **The alternative, recorded.** If the requirement is genuinely "this content must never be
 stored", redaction is the wrong tool — that is a *refusal to ingest*, filed as
-[#26](https://github.com/mgd43b/manicule/issues/26). Redacting on the way in and keeping the
+[#28](https://github.com/mgd43b/manicule/issues/28). Redacting on the way in and keeping the
 original beside it satisfies nobody.
 
 ---
@@ -739,7 +739,7 @@ Calls made in the absence of a stated position.
 
 | Ticket | What | Why not here |
 |---|---|---|
-| [#26](https://github.com/mgd43b/manicule/issues/26) | **Refuse-to-ingest content rules** (§3.4) | The coherent version of the requirement PII redaction was misfilling. Needs a policy language and a decision about what happens to already-ingested matches; neither is an ingest-pipeline question |
+| [#28](https://github.com/mgd43b/manicule/issues/28) | **Refuse-to-ingest content rules** (§3.4) | The coherent version of the requirement PII redaction was misfilling. Needs a policy language and a decision about what happens to already-ingested matches; neither is an ingest-pipeline question |
 
 ---
 
