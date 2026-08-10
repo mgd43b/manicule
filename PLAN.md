@@ -1,14 +1,26 @@
 # manicule
 
-A better copy of [OpenDocuments](https://github.com/joungminsung/OpenDocuments), in Python.
+Self-hosted document search and answers. Index documents from wherever they live — disk,
+git, Notion, Confluence, Drive, S3, the web — ask questions in natural language, and get
+answers with citations that resolve to a real location in a real document. Usable from the
+CLI, from a browser, and by AI assistants over MCP.
 
-OpenDocuments works and runs daily on real documents. The feature set is the target; the
-implementation is not. This document covers every subsystem: what OpenDocuments does, what
-manicule uses instead, and where the change is a real gain rather than a swap.
+## Prior art
 
-Source of truth is the OpenDocuments source, not its README, which overstates in places.
+[OpenDocuments](https://github.com/joungminsung/OpenDocuments) is the closest existing
+thing, and it works — it runs daily on real documents. That matters: it establishes the
+feature set is achievable and worth having, and its source is a detailed map of both what
+to build and what to do differently.
 
-**Scale being replaced:** ~33,000 lines of TypeScript, 5 packages, 21 plugins.
+This document references it constantly for that reason. It is a reference point, not a
+template. Roughly 33,000 lines of TypeScript, and several of its subsystems are worth
+improving on rather than reproducing — its PDF citations point at pages that do not exist,
+its Confluence extraction destroys every table and code block, its connectors re-enumerate
+entire sources on each sync, and its retrieval quality has never been measured because its
+evaluation harness scores at random chance.
+
+Where the design below says a subsystem carries over, that is a judgement that
+OpenDocuments got it right. Where it does not, the reason is stated.
 
 ---
 
@@ -124,7 +136,7 @@ Only GitHub has a real change token. Each connector below gets proper incrementa
 
 Plus local filesystem with watch mode (**watchfiles**, Rust-backed) and web upload.
 
-**The Confluence extraction is the worst of these.** OpenDocuments requests
+**Confluence is where the gap is widest.** OpenDocuments requests
 `body.storage` — Confluence's XHTML dialect with `<ac:structured-macro>` elements — then
 runs `html.replace(/<[^>]+>/g, ' ')`. Tables, code blocks, headings and macros collapse
 into a run of words. ADF gives a typed JSON document tree instead, mapping directly onto
@@ -276,7 +288,7 @@ Real, found in the source, worth not reproducing.
 | 12 | Web UI | |
 | 13 | Team mode | Auth, workspaces, audit, redaction |
 | 14 | Operations | Backup, export, doctor, telemetry, webhooks |
-| 15 | Parity check | Does it answer as well as the original, on the same corpus? |
+| 15 | Quality baseline | Measure retrieval quality on a real corpus. OpenDocuments is one baseline to beat; the point is knowing the number at all |
 
 Steps 3 and 4 land before 2 finishes: the schema fixes vector dimensionality and assumes a
 chunk size, and changing either later means re-embedding everything.
