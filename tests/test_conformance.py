@@ -30,6 +30,7 @@ from manicule.testing import (
 from tests.fakes import (
     AliasingStage,
     BlockChunker,
+    BlockRewritingMiddleware,
     FixedDimensionVectorStore,
     ForgetfulConnector,
     ForgetfulVectorStore,
@@ -309,3 +310,21 @@ async def test_middleware_contract_needs_a_chunk_to_have_an_opinion() -> None:
 
     with pytest.raises(AssertionError, match="at least one chunk"):
         await assert_middleware_contract(PassThroughMiddleware(), document, [])
+
+
+async def test_middleware_contract_catches_a_rewritten_block() -> None:
+    """after_parse can corrupt a citation exactly as after_chunk can, one hook earlier."""
+    document = make_document()
+    chunks = make_chunks(document)
+
+    with pytest.raises(AssertionError, match=r"rewrote ParsedBlock\.text"):
+        await assert_middleware_contract(
+            BlockRewritingMiddleware(), document, chunks, blocks=_blocks()
+        )
+
+
+async def test_middleware_contract_accepts_untouched_blocks() -> None:
+    document = make_document()
+    chunks = make_chunks(document)
+
+    await assert_middleware_contract(PassThroughMiddleware(), document, chunks, blocks=_blocks())

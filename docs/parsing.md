@@ -447,7 +447,8 @@ review.
 The obligation has a scope condition that no parser test can enforce from inside a parser, so
 it is stated first.
 
-> **`Chunk.text` may not be modified after the parser emits it. `embed_text` may.**
+> **`ParsedBlock.text` and `Chunk.text` may not be modified after the parser emits
+> them. `embed_text` may.**
 
 Every assertion below compares `chunk.text` against what `resolve` returns from the source
 bytes. Any stage that rewrites `text` afterwards breaks that correspondence **after every
@@ -461,8 +462,13 @@ augmentation both belong there — and it changes every vector, which is why a m
 does so declares `mutates_embedded_text` and is folded into the chunk fingerprint
 ([`ingest.md`](ingest.md) §3.3).
 
+Both hooks matter. Rewriting a block's text in `after_parse` is the same corruption one
+step earlier, since block text becomes chunk text while the block's anchor still points at
+source text that no longer matches.
+
 **Enforced, not asserted in prose.** `Middleware` states the rule and
-`manicule.testing.assert_middleware_contract` fails a middleware that breaks it — including
+`manicule.testing.assert_middleware_contract` fails a middleware that breaks it at either
+hook — including
 one that rewrites `embed_text` without declaring it, which corrupts no citation but produces
 a corpus no fingerprint describes. `contracts.md` §5 is explicit that an unenforced guarantee
 is worse than an absent one, and that is the reasoning that removed the `permissions` field;

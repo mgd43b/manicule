@@ -413,3 +413,18 @@ class UndeclaredEmbedMiddleware(PassThroughMiddleware):
             chunk.model_copy(update={"embed_text": chunk.embed_text + " extra context"})
             for chunk in chunks
         ]
+
+
+class BlockRewritingMiddleware(PassThroughMiddleware):
+    """Rewrites ``ParsedBlock.text`` in ``after_parse``.
+
+    The same corruption as rewriting ``Chunk.text``, one hook earlier: block text becomes
+    chunk text, and the block's anchor still points at source text that no longer matches.
+    """
+
+    name = "block-rewriting"
+    mutates_embedded_text = False
+
+    @override
+    async def after_parse(self, document: Document, blocks: list[ParsedBlock]) -> list[ParsedBlock]:
+        return [block.model_copy(update={"text": block.text.upper()}) for block in blocks]

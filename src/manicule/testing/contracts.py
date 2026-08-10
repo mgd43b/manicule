@@ -369,13 +369,17 @@ async def assert_connector_contract(connector: Connector) -> None:
 
 
 async def assert_middleware_contract(
-    middleware: Middleware, document: Document, chunks: Sequence[Chunk]
+    middleware: Middleware,
+    document: Document,
+    chunks: Sequence[Chunk],
+    blocks: Sequence[ParsedBlock] | None = None,
 ) -> list[Chunk]:
     """Check that a middleware leaves ``Chunk.text`` alone, and returns what it produced.
 
     This is the check no parser suite can perform. :func:`assert_parser_contract` verifies
     that resolving a chunk's anchor returns the text the chunk claims — but it runs against
-    the parser, before any middleware exists. A hook that rewrites ``text`` breaks that
+    the parser, before any middleware exists. A hook that rewrites ``text`` — on a block in
+    ``after_parse`` or a chunk in ``after_chunk``, which are the same corruption — breaks that
     correspondence *afterwards*, so every parser in the project still passes while the
     corpus grows citations quoting text no source document contains.
 
@@ -388,11 +392,26 @@ async def assert_middleware_contract(
         middleware: The implementation under test.
         document: Passed through to the hook.
         chunks: Input chunks. Give at least one with a non-trivial ``text``.
+        blocks: Input blocks for the ``after_parse`` hook. Optional only because a
+            middleware may not implement it; pass them whenever it does.
 
     Returns:
         The chunks the middleware returned, so a caller can make further assertions.
     """
     _require(chunks, "assert_middleware_contract needs at least one chunk to have an opinion")
+
+    if blocks:
+        before_blocks = [block.text for block in blocks]
+        returned_blocks = await middleware.after_parse(document, list(blocks))
+        for index, block in enumerate(returned_blocks):
+            if index < len(before_blocks) and block.text != before_blocks[index]:
+                _fail(
+                    f"middleware {middleware.name!r} rewrote ParsedBlock.text at index "
+                    f"{index}. Block text becomes chunk text, so this corrupts a citation "
+                    f"exactly as rewriting Chunk.text does — the block's anchor still points "
+                    f"at source text that no longer matches what the block claims. Reshape "
+                    f"embed_text in after_chunk instead"
+                )
 
     before = {chunk.id: chunk.text for chunk in chunks}
     before_embed = {chunk.id: chunk.embed_text for chunk in chunks}
