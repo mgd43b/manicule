@@ -35,6 +35,7 @@ per worker, amortised over the run.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import multiprocessing
 import os
 import time
@@ -191,9 +192,12 @@ class _Reply:
 
 @dataclass(frozen=True, slots=True)
 class _Ready:
-    """A worker's first message: it has imported everything and taken what limits it can."""
+    """A worker's first message: it has built its parsers and taken what limits it can."""
 
     address_space_limited: bool
+    error: str = ""
+    """Why this worker cannot serve, when it cannot. A worker that failed to build its parsers
+    says so here rather than dying silently and leaving every later document blame the pipe."""
 
 
 # --- the child -----------------------------------------------------------------------------
@@ -207,15 +211,27 @@ def _worker_main(connection: Connection, config: WorkerConfig) -> None:  # pragm
     can be exercised, since a worker that ran in this process would not be a worker.
     """
     limited = limit_address_space(config.memory_limit_bytes * ADDRESS_SPACE_HEADROOM)
+    # **Plugins are discovered before the parent is told this worker is ready**, and the order
+    # is load-bearing twice. The parent starts the per-attempt clock when it hears back, so
+    # saying "ready" first would spend a cold worker's whole plugin discovery against the first
+    # document's deadline — killing it for a delay it did not cause, and then paying the
+    # identical cost again in its replacement. And a configuration error in discovery is
+    # reported here, as a worker that never becomes ready, rather than as every subsequent
+    # document failing with "worker exited without replying" while the real cause is invisible.
+    try:
+        build = _parser_builder(config)
+    except BaseException as exc:  # noqa: BLE001 - reported across the pipe rather than lost
+        connection.send(_Ready(address_space_limited=limited, error=f"{type(exc).__name__}: {exc}"))
+        connection.close()
+        return
     connection.send(_Ready(address_space_limited=limited))
-    build = _parser_builder(config)
     try:
         while True:
             request = connection.recv()
             if not isinstance(request, _Request):
                 return
             connection.send(_attempt_in_child(build, request))
-    except (EOFError, KeyboardInterrupt):
+    except (EOFError, KeyboardInterrupt, BrokenPipeError):
         return
     finally:
         connection.close()
@@ -284,18 +300,45 @@ class _Worker:
     connection: Connection
     address_space_limited: bool = False
     documents: int = 0
+    retired: bool = False
 
     @property
     def pid(self) -> int:
         return self.process.pid or 0
 
+    def alive(self) -> bool:
+        """Whether this worker's process is still running, without ever raising.
+
+        Asked from the reply thread as well as the loop, and a ``Process`` that has been closed
+        raises from ``is_alive``. The honest answer for a closed handle is "no".
+        """
+        try:
+            return self.process.is_alive()
+        except (ValueError, OSError):
+            return False
+
     def terminate(self) -> None:
-        """Stop the worker, hard, and reap it so no zombie survives the run."""
-        if self.process.is_alive():
+        """Stop the worker, hard, and reap it. Idempotent, and never raises.
+
+        Every part of that matters. ``teardown`` and a concurrent replacement can both reach
+        the same worker, and ``Process.close`` raises on a second call *and* on a process that
+        is still running — a `join` that times out because the child is wedged in
+        uninterruptible I/O, which is precisely the process this pool exists to handle. Either
+        ``ValueError`` would otherwise escape into the ingest loop and end a batch, which is
+        the one outcome this module refuses. Failing to close a handle costs one file
+        descriptor; failing to ingest costs a corpus.
+        """
+        if self.retired:
+            return
+        self.retired = True
+        if self.alive():
             kill(self.pid)
-        self.process.join(timeout=5)
-        self.connection.close()
-        self.process.close()
+        with contextlib.suppress(ValueError, OSError, AssertionError):
+            self.process.join(timeout=5)
+        with contextlib.suppress(OSError):
+            self.connection.close()
+        with contextlib.suppress(ValueError, OSError):
+            self.process.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,7 +371,7 @@ class WorkerPool:
         self._poll_interval_s = poll_interval_s
         self._max_documents = max_documents
         self._context = multiprocessing.get_context("spawn")
-        self._idle: asyncio.Queue[_Worker] = asyncio.Queue()
+        self._idle: asyncio.Queue[_Worker | None] = asyncio.Queue()
         self._live: list[_Worker] = []
         self._kills: dict[str, int] = {}
         self._started = False
@@ -347,21 +390,34 @@ class WorkerPool:
         return dict(self._kills)
 
     async def setup(self) -> None:
-        """Start every worker. Idempotent, so the container may call it more than once."""
+        """Start the pool. Idempotent, so the container may call it more than once.
+
+        A slot that could not be filled becomes an empty permit rather than a missing one, and
+        the pool fills it on first use. The failure being avoided is a pool that silently
+        shrinks: with the obvious shape — spawn eagerly, propagate — a transient ``OSError``
+        would leave ``_started`` true and the queue short, and the *next* attempt would block
+        on an empty queue with no timeout, no error and no log. At one worker, which is what
+        ``default_worker_count`` returns on a two-core machine, that is a run that hangs
+        forever.
+        """
         if self._started:
             return
         self._started = True
         for _ in range(self._size):
-            await self._idle.put(await self._spawn())
+            await self._idle.put(await self._try_spawn())
 
     async def teardown(self) -> None:
         """Stop every worker, including ones still holding a document."""
         self._started = False
         while not self._idle.empty():
             self._idle.get_nowait()
-        for worker in self._live:
+        # Snapshotted and cleared before the first await. Iterating the live list while
+        # awaiting lets a concurrent replacement remove an element from under the index, which
+        # skips the next one — and `clear()` then drops the only reference to a worker nothing
+        # will ever kill, join or close.
+        live, self._live = self._live, []
+        for worker in live:
             await asyncio.to_thread(worker.terminate)
-        self._live.clear()
 
     async def __aenter__(self) -> Self:
         await self.setup()
@@ -380,19 +436,35 @@ class WorkerPool:
         decline: a chain of three timeouts must not end at ``unsupported_media_type``.
         """
         await self.setup()
-        worker = await self._idle.get()
+        worker = await self._acquire()
+        if worker is None:
+            self._kills["spawn failed"] = self._kills.get("spawn failed", 0) + 1
+            reason = "no parse worker could be started for this attempt"
+            return AttemptResult([], Attempt(parser=name, outcome=Outcome.FAILED, reason=reason))
         try:
             outcome = await self._dispatch(worker, _Request(parser=name, raw=raw))
+        except Exception as exc:  # noqa: BLE001 - see below; the guarantee needs the breadth
+            # **A broken pipe is one document's failure, not the run's.** A worker can die
+            # between being handed back as idle and being dispatched to — recycled by the OOM
+            # killer, or crashed on the previous document in a way that surfaced late — and
+            # `send` then raises `BrokenPipeError` here. Letting that propagate would put a
+            # process-level accident on the ingest loop's exception path and end the batch,
+            # which is exactly the guarantee this whole module exists to hold. So it is
+            # recorded against the document, the worker is replaced, and the run continues.
+            await self._replace(worker)
+            self._kills["dispatch failed"] = self._kills.get("dispatch failed", 0) + 1
+            reason = f"worker unreachable: {type(exc).__name__}: {exc}"
+            return AttemptResult([], Attempt(parser=name, outcome=Outcome.FAILED, reason=reason))
         except BaseException:
-            # A cancelled await leaves a worker whose state nobody knows. Replacing it is
+            # Cancellation and interpreter shutdown are *not* one document's problem, and
+            # swallowing them would make Ctrl-C wait for a corpus. The worker still has to go:
+            # a cancelled await leaves one whose state nobody knows, and replacing it is
             # cheaper than reasoning about what it was in the middle of.
-            await self._retire(worker)
-            await self._idle.put(await self._spawn())
+            await self._replace(worker)
             raise
         if isinstance(outcome, _Killed):
             self._kills[outcome.reason] = self._kills.get(outcome.reason, 0) + 1
-            await self._retire(worker)
-            await self._idle.put(await self._spawn())
+            await self._replace(worker)
             return AttemptResult(
                 [],
                 Attempt(
@@ -404,42 +476,105 @@ class WorkerPool:
 
         worker.documents += 1
         if worker.documents >= self._max_documents:
-            await self._retire(worker)
-            worker = await self._spawn()
-        await self._idle.put(worker)
+            await self._replace(worker)
+        else:
+            await self._idle.put(worker)
         return outcome.result
 
     # --- internals -------------------------------------------------------------------------
 
+    async def _acquire(self) -> _Worker | None:
+        """Take a permit from the queue, and a worker with it.
+
+        The queue holds *permits*, not workers: an entry may be ``None`` where a spawn has not
+        succeeded yet. That is what keeps the permit count equal to the pool size no matter how
+        many spawns have failed — the invariant whose loss turns a transient ``OSError`` into a
+        run that blocks forever on an empty queue.
+        """
+        permit = await self._idle.get()
+        if permit is not None:
+            return permit
+        worker = await self._try_spawn()
+        if worker is None:
+            # The permit goes back so the count is unchanged, and the next attempt tries again.
+            await self._idle.put(None)
+        return worker
+
     async def _dispatch(self, worker: _Worker, request: _Request) -> _Reply | _Killed:
-        worker.connection.send(request)
-        limit = self._config.memory_limit_bytes
+        """Send one request and wait for its reply, entirely off the event loop.
+
+        The *write* runs in the worker thread too, not only the wait. ``Connection.send``
+        pickles the whole document and blocks until the child drains it, and a document may be
+        up to ``ingest.max_fetch_bytes`` against a pipe buffer measured in kilobytes — so
+        sending on the loop stalls every other connector's fetches for the length of the
+        transfer, on exactly the documents that are already slow.
+        """
         return await asyncio.to_thread(
-            _await_reply,
-            worker.connection,
-            worker.pid,
+            _exchange,
+            worker,
+            request,
             self._timeout_s,
             self._poll_interval_s,
-            limit,
+            self._config.memory_limit_bytes,
         )
+
+    async def _try_spawn(self) -> _Worker | None:
+        """Start one worker, or return ``None`` if it could not be started.
+
+        Returning rather than raising because the caller's response is never to abort: the pool
+        keeps its permit, the document is failed on its own, and the next attempt tries again.
+        A machine briefly out of file descriptors should cost a document, not a corpus.
+        """
+        try:
+            return await self._spawn()
+        except Exception:  # noqa: BLE001 - a spawn failure is not this run's ending
+            return None
 
     async def _spawn(self) -> _Worker:
         parent, child = self._context.Pipe(duplex=True)
-        process = self._context.Process(
-            target=_worker_main, args=(child, self._config), daemon=True
-        )
-        process.start()
+        try:
+            process = self._context.Process(
+                target=_worker_main, args=(child, self._config), daemon=True
+            )
+            process.start()
+        except BaseException:
+            # Neither end is owned by a `_Worker` yet, so nothing else will ever close them.
+            with contextlib.suppress(OSError):
+                parent.close()
+            with contextlib.suppress(OSError):
+                child.close()
+            raise
         child.close()
         worker = _Worker(process=process, connection=parent)
         self._live.append(worker)
         ready = await asyncio.to_thread(_await_ready, parent)
-        worker.address_space_limited = ready.address_space_limited if ready else False
+        if ready is None or ready.error:
+            # A worker that never said hello has an unknown pipe state: its greeting may still
+            # be in flight, and the next reply read would return it instead of a result — a
+            # blameless document recorded as killed. One that said hello *and* reported an
+            # error cannot serve at all. Either way it is not a worker.
+            await self._retire(worker)
+            detail = ready.error if ready is not None else "it never reported itself ready"
+            msg = f"a parse worker could not start: {detail}"
+            raise RuntimeError(msg)
+        worker.address_space_limited = ready.address_space_limited
         return worker
 
     async def _retire(self, worker: _Worker) -> None:
         if worker in self._live:
             self._live.remove(worker)
         await asyncio.to_thread(worker.terminate)
+
+    async def _replace(self, worker: _Worker) -> None:
+        """Stop a worker and return its permit, with a fresh worker on it if one can be had.
+
+        One method rather than the pair repeated at four call sites, because the pair is only
+        correct together — and because the permit must go back *whatever* happens to the spawn.
+        Retiring without returning the permit shrinks the pool silently, and a pool that loses
+        a permit per failure ends a long run blocked on an empty queue with nothing said.
+        """
+        await self._retire(worker)
+        await self._idle.put(await self._try_spawn())
 
 
 def default_worker_count() -> int:
@@ -463,39 +598,65 @@ def _await_ready(connection: Connection, timeout: float = 60.0) -> _Ready | None
     return message if isinstance(message, _Ready) else None
 
 
-def _await_reply(
-    connection: Connection,
-    pid: int,
+def _exchange(
+    worker: _Worker,
+    request: _Request,
     timeout_s: float,
     poll_interval_s: float,
     memory_limit_bytes: int,
 ) -> _Reply | _Killed:
-    """Wait for one reply, killing the worker if it runs out of time or memory.
+    """Send one request and wait for its reply, killing the worker if it overruns.
 
-    Runs in a worker thread so that a blocking wait never occupies the event loop. The wait is
-    a poll loop rather than a single blocking read because the memory check has to happen
-    *while* the parser is running: by the time a runaway returns, it has already allocated.
+    Runs in a worker thread, so neither the blocking write nor the wait ever occupies the event
+    loop. The wait is a poll loop rather than a single blocking read because the memory check
+    has to happen *while* the parser is running: by the time a runaway returns, it has already
+    allocated.
+
+    **Every kill is gated on the worker still being ours.** The thread cannot be cancelled, so
+    when the awaiting task is cancelled the pool retires this worker and reaps it — and a
+    reaped pid is released to the operating system for reuse. Signalling a bare integer after
+    that point sends ``SIGKILL`` to whatever process now holds it, and the likeliest victim is
+    one of this pool's own replacements. Asking the ``Process`` object rather than trusting the
+    number is what makes that impossible.
     """
+    worker.connection.send(request)
     deadline = time.monotonic() + timeout_s
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            kill(pid)
+            # One last look before killing. A child that replied inside the final poll interval
+            # has its answer sitting in the pipe, and killing it now would record a document
+            # that parsed perfectly well as "worker killed: timeout".
+            if worker.connection.poll(0):
+                return _read_reply(worker.connection)
+            _stop(worker)
             return _Killed("timeout")
-        if connection.poll(min(poll_interval_s, remaining)):
-            try:
-                message = connection.recv()
-            except (EOFError, OSError):
-                return _Killed("worker exited without replying")
-            except Exception as exc:  # noqa: BLE001 - a corrupt reply is this attempt's failure
-                return _Killed(f"unreadable reply: {type(exc).__name__}")
-            if isinstance(message, _Reply):
-                return message
-            return _Killed(f"unexpected reply: {type(message).__name__}")
-        resident = resident_bytes(pid)
+        if worker.connection.poll(min(poll_interval_s, remaining)):
+            return _read_reply(worker.connection)
+        resident = resident_bytes(worker.pid) if worker.alive() else None
         if resident is not None and resident > memory_limit_bytes:
-            kill(pid)
+            _stop(worker)
             return _Killed("memory limit")
+
+
+def _stop(worker: _Worker) -> None:
+    """Kill a worker, but only while it is still this pool's to kill."""
+    if worker.retired or not worker.alive():
+        return
+    kill(worker.pid)
+
+
+def _read_reply(connection: Connection) -> _Reply | _Killed:
+    """Read one message, turning every way that can fail into this attempt's failure."""
+    try:
+        message = connection.recv()
+    except (EOFError, OSError):
+        return _Killed("worker exited without replying")
+    except Exception as exc:  # noqa: BLE001 - a corrupt reply is this attempt's failure
+        return _Killed(f"unreadable reply: {type(exc).__name__}")
+    if isinstance(message, _Reply):
+        return message
+    return _Killed(f"unexpected reply: {type(message).__name__}")
 
 
 def worker_config(settings: object) -> WorkerConfig:

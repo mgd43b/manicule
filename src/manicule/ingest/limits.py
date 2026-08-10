@@ -112,7 +112,9 @@ def _ps_rss(pid: int) -> int | None:
             [executable, "-o", "rss=", "-p", str(pid)],
             capture_output=True,
             text=True,
-            timeout=5,
+            # Bounded well under the default poll interval: a fallback that can take five
+            # seconds does not merely cost a fork, it stretches the deadline it is part of.
+            timeout=1,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):  # pragma: no cover - defensive
@@ -126,12 +128,18 @@ def _ps_rss(pid: int) -> int | None:
 def kill(pid: int) -> None:
     """``SIGKILL`` a process, ignoring one that has already gone.
 
+    A non-positive pid is refused rather than passed through: ``os.kill(0, ...)`` signals the
+    entire process group, which includes the parent. Nothing reaches here with one today, and
+    that is a property of a caller rather than of this function.
+
     ``SIGKILL`` rather than ``SIGTERM`` because the process being stopped is, by hypothesis,
     not responding: it is inside a native extension that observes no signal handler and
     returns no control to Python. It works identically on Darwin and Linux — verified, child
     exit code ``-9`` — which is what keeps the outcome the same even where the detection
     differs.
     """
+    if pid <= 0:
+        return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(pid, signal.SIGKILL)
 

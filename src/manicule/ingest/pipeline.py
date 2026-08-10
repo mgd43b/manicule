@@ -51,7 +51,14 @@ from manicule.core.ids import content_hash, document_id
 from manicule.ingest.embedding import embed_chunks
 from manicule.ingest.ports import SupportsWatermark
 from manicule.ingest.workers import AttemptResult
-from manicule.parsers.chain import Attempt, ChainResult, Outcome, container_result, run_chain
+from manicule.parsers.chain import (
+    Attempt,
+    ChainResult,
+    Outcome,
+    classify,
+    container_result,
+    run_chain,
+)
 from manicule.parsers.expansion import ExpandedMember, MemberFailure
 
 if TYPE_CHECKING:
@@ -278,7 +285,7 @@ class IngestPipeline:
         """
         if not isinstance(connector, SupportsWatermark):
             return
-        reached = connector.watermark()
+        reached = connector.watermark
         if reached is not None:
             await self._store.set_watermark(connector.name, reached)
 
@@ -541,7 +548,18 @@ class IngestPipeline:
             captured.append(result)
             return result.blocks, result.attempt  # pyright: ignore[reportReturnType]
 
-        result = await run_chain(chain, raw, attempt)  # pyright: ignore[reportArgumentType]
+        try:
+            result = await run_chain(chain, raw, attempt)  # pyright: ignore[reportArgumentType]
+        except Exception as exc:  # noqa: BLE001 - the guarantee is worth one broad catch
+            # The runner is a seam a plugin or a future backend sits behind, and a batch that
+            # ends because one of them raised somewhere unanticipated is the exact failure this
+            # pipeline promises not to have. A runner is *expected* to turn every parser
+            # problem into a hard-failed attempt; if one ever does not, the document still
+            # fails alone.
+            attempted = tuple(a.attempt for a in captured)
+            reason = f"{type(exc).__name__}: {exc}"
+            broken = (*attempted, Attempt(parser="", outcome=Outcome.FAILED, reason=reason))
+            return classify(raw, broken), ()
         won = captured[-1] if captured else None
         members = won.members if won is not None and won.attempt.outcome is Outcome.PARSED else ()
         return result, tuple(members)  # pyright: ignore[reportReturnType]
@@ -756,7 +774,17 @@ class IngestPipeline:
         from every listing, and invisible to any repair.
         """
         keep_status = self._keeps_status(existing, result.status)
-        metadata: Metadata = {**(existing.metadata if existing else {}), **result.metadata}
+        # **The connector's own metadata reaches the document, and it is not decoration.** The
+        # chunker builds its breadcrumb from `document.metadata["ancestors"]`, so a pipeline
+        # that dropped what the connector attached to the fetched bytes would leave every
+        # breadcrumb empty — and an empty breadcrumb is not a visible failure, it is a section
+        # called "Configuration" that nobody can retrieve. Lowest precedence, so what the parse
+        # stage concluded still wins over what the source guessed.
+        metadata: Metadata = {
+            **dict(raw.metadata),
+            **(existing.metadata if existing else {}),
+            **result.metadata,
+        }
         if keep_status:
             # The document keeps everything a reader can see, and the failure still goes on the
             # record. It simply does not cost anybody a document that was working.

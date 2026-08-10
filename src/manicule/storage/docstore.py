@@ -446,7 +446,17 @@ class SqliteDocStore:
             )
 
     async def soft_deleted_before(self, cutoff: datetime, *, limit: int = 1000) -> Sequence[str]:
-        """Documents whose grace period has expired, so the sweep may purge their chunks."""
+        """Documents whose grace period has expired and whose content is still present.
+
+        **Already-purged documents are excluded, and that is what makes the sweep terminate.**
+        Purging removes chunks and vectors; it does not touch ``deleted_at``, because the row is
+        retained so a citation can still explain itself. A selection keyed only on ``deleted_at``
+        would therefore return the same documents on every pass — re-deleting vectors that are
+        gone and re-emptying chunks that are already empty, forever — and, because the ``LIMIT``
+        is over an ordered query, would return the *same first thousand* every time, so nothing
+        past them would ever be purged at all. ``status = 'deleted'`` is what the sweep sets when
+        it is done with a document, so it is what this excludes.
+        """
         async with self._sessions() as session:
             rows = (
                 (
@@ -456,6 +466,7 @@ class SqliteDocStore:
                             models.Document.workspace_id == self._workspace_id,
                             models.Document.deleted_at.is_not(None),
                             models.Document.deleted_at < cutoff,
+                            models.Document.status != DocumentStatus.DELETED,
                         )
                         .order_by(models.Document.deleted_at, models.Document.id)
                         .limit(limit)

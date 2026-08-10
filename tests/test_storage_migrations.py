@@ -89,6 +89,94 @@ async def test_every_revision_downgrades_and_upgrades_back_to_the_same_schema(
         await engine.dispose()
 
 
+@pytest.mark.contract
+async def test_a_migration_over_a_populated_database_keeps_the_rows(data_dir: Path) -> None:
+    """Every revision runs over a database with content in it, not an empty one.
+
+    An empty database hides the failure mode that matters most on SQLite. A batch rebuild is
+    CREATE-temp, INSERT…SELECT, ``DROP TABLE``, RENAME — and with ``PRAGMA foreign_keys=ON``,
+    which this project sets on every connection, that ``DROP`` performs an implicit
+    ``DELETE FROM`` and fires every ``ON DELETE CASCADE`` pointing at the table. Children are
+    emptied and the migration reports success; where the cascade reaches ``chunks`` it also
+    trips the FTS trigger, and the half-finished rebuild leaves a temporary table that makes
+    every retry fail.
+
+    So this seeds one row in each table a cascade would reach, migrates to head and back, and
+    counts them. It is deliberately not a test of one revision: it is what stops the *next*
+    table rebuild shipping the same way.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision=_first_revision())
+        await _seed(engine)
+        before = await _row_counts(engine)
+        assert before["chunks"] == 2, "the seed must actually seed, or this test proves nothing"
+
+        await upgrade(engine)
+        assert await _row_counts(engine) == before, (
+            "a migration must not delete rows it was not asked to delete"
+        )
+
+        await downgrade(engine, _first_revision())
+        assert await _row_counts(engine) == before, "and neither must the downgrade"
+    finally:
+        await engine.dispose()
+
+
+def _first_revision() -> str:
+    script = ScriptDirectory.from_config(alembic_config())
+    return next(r.revision for r in script.walk_revisions() if r.down_revision is None)
+
+
+async def _seed(engine: AsyncEngine) -> None:
+    """One row in every table a cascade from ``documents`` would reach."""
+    statements = (
+        "INSERT INTO workspaces (id, name, mode, settings, created_at) "
+        "VALUES ('w', 'w', 'personal', '{}', '2026-01-01T00:00:00+00:00')",
+        "INSERT INTO documents (id, workspace_id, source, source_id, uri, title, media_type, "
+        "content_hash, status, metadata, created_at, updated_at) "
+        "VALUES ('d1', 'w', 'fs', 's1', 'file:///a.md', 'A', 'text/markdown', 'h', 'indexed', "
+        "'{}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+        "INSERT INTO chunks (id, document_id, text, embed_text, heading_text, heading_path, "
+        "kind, position, token_count, anchor, metadata, created_at) "
+        "VALUES ('c1', 'd1', 'one', 'one', '', '[]', 'prose', 0, 1, '{}', '{}', "
+        "'2026-01-01T00:00:00+00:00')",
+        "INSERT INTO chunks (id, document_id, text, embed_text, heading_text, heading_path, "
+        "kind, position, token_count, anchor, metadata, created_at) "
+        "VALUES ('c2', 'd1', 'two', 'two', '', '[]', 'prose', 1, 1, '{}', '{}', "
+        "'2026-01-01T00:00:00+00:00')",
+        "INSERT INTO document_versions (id, document_id, version, content_hash, created_at) "
+        "VALUES ('v1', 'd1', 1, 'h', '2026-01-01T00:00:00+00:00')",
+        "INSERT INTO tags (id, workspace_id, name) VALUES ('t1', 'w', 'tag')",
+        "INSERT INTO document_tags (document_id, tag_id) VALUES ('d1', 't1')",
+        "INSERT INTO collections (id, workspace_id, name, created_at) "
+        "VALUES ('k1', 'w', 'k', '2026-01-01T00:00:00+00:00')",
+        "INSERT INTO collection_documents (collection_id, document_id) VALUES ('k1', 'd1')",
+    )
+    async with engine.begin() as connection:
+        for statement in statements:
+            await connection.execute(text(statement))
+
+
+async def _row_counts(engine: AsyncEngine) -> dict[str, int]:
+    tables = (
+        "documents",
+        "chunks",
+        "document_versions",
+        "document_tags",
+        "collection_documents",
+    )
+    async with engine.connect() as connection:
+        return {
+            # S608: every name comes from the literal tuple above, and a table name cannot be
+            # a bind parameter.
+            table: (
+                await connection.execute(text(f"SELECT count(*) FROM {table}"))  # noqa: S608
+            ).scalar_one()
+            for table in tables
+        }
+
+
 async def test_downgrading_to_base_leaves_nothing_of_ours_behind(data_dir: Path) -> None:
     """A downgrade that leaves tables behind makes the next upgrade fail on a fresh start."""
     engine = create_engine(data_dir)

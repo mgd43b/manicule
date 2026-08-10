@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 
+from manicule.core.content import DocumentStatus
+
 if TYPE_CHECKING:
     from manicule.ingest.ports import IngestStore
 
@@ -108,6 +110,7 @@ async def sweep_vectors(
         return SweepResult(blocked_by=blocked)
 
     removed = 0
+    purged = 0
     tombstoned = await store.take_tombstones(batch)
     if tombstoned:
         await vectors.delete_chunks(list(tombstoned))
@@ -117,14 +120,34 @@ async def sweep_vectors(
     cutoff = datetime.now(UTC) - timedelta(seconds=soft_delete_grace_s)
     expired = await store.soft_deleted_before(cutoff, limit=batch)
     for document_id in expired:
+        blocked = gate.sweep_permitted() if gate is not None else ""
+        if blocked:
+            # Asked again inside the loop, not only at the top. A purge of a thousand documents
+            # is thousands of writes to the vector table, and a backup that starts halfway
+            # through is exactly what the gate exists to get out of the way of.
+            return SweepResult(vectors_removed=removed, documents_purged=purged, blocked_by=blocked)
         # Vectors first, chunks second, which is the same ordering as above and for the same
         # reason. Dropping the chunks writes tombstones for vectors that are already gone;
         # the next pass deletes nothing and clears them, which is an idempotent no-op. The
         # reverse order would leave live vectors with nothing recording that they should go.
         await vectors.delete_document(document_id)
         await store.replace_chunks(document_id, [])
+        # **And then the document says it has been purged.** Without this the sweep never
+        # terminates: `soft_deleted_before` selects on `deleted_at`, which purging does not
+        # change, so the same documents come back on every pass — re-deleting vectors that are
+        # already gone, re-emptying chunks that are already empty, and reporting the same
+        # `documents_purged` forever. Worse, the ordered `LIMIT` means the same first `batch`
+        # are re-selected every time, so anything past the first thousand is never purged at
+        # all. `deleted` is the status that already means exactly this: the row is retained so
+        # a citation can explain itself, and its content is gone.
+        await store.set_status(
+            document_id,
+            DocumentStatus.DELETED,
+            "soft-delete grace period expired; chunks and vectors purged",
+        )
+        purged += 1
 
-    return SweepResult(vectors_removed=removed, documents_purged=len(expired))
+    return SweepResult(vectors_removed=removed, documents_purged=purged)
 
 
 __all__ = ["SweepGate", "SweepResult", "VectorSweepTarget", "sweep_vectors"]

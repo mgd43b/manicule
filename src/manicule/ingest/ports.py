@@ -44,8 +44,17 @@ class SupportsWatermark(Protocol):
     forever.
     """
 
+    @property
     def watermark(self) -> Watermark | None:
-        """How far this connector got, or ``None`` if it cannot say."""
+        """How far this connector got, or ``None`` if it cannot say.
+
+        A property rather than a method, because it is state the connector already holds rather
+        than work it does on request — and because a connector may legitimately answer ``None``
+        until its ``discover`` has been drained to completion, which is the same guard the
+        pipeline applies from its side. Two independent checks on "was this run complete" is the
+        right number for a write whose failure mode is silently skipping every document a
+        partial run never reached.
+        """
         ...
 
 

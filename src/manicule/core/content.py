@@ -70,7 +70,7 @@ class DocumentStatus(StrEnum):
     """Discovered, or requeued by the recovery sweep; no stage has claimed it yet."""
 
     FETCHING = "fetching"
-    """A worker is fetching the source bytes."""
+    """The source bytes are being fetched, in the pipeline's own process."""
 
     PARSING = "parsing"
     """The parser chain is running, in a subprocess that may be killed."""

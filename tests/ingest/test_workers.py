@@ -97,7 +97,7 @@ async def test_a_chain_of_timeouts_is_failed_and_never_unsupported_media_type(
     assert [a.outcome for a in result.attempts] == [Outcome.FAILED, Outcome.FAILED]
 
 
-async def test_a_parser_that_allocates_without_bound_is_killed(
+async def test_a_parser_that_allocates_without_bound_is_stopped(
     tmp_path: Path, manicule_environment: Path
 ) -> None:
     """A memory bound the kernel will not enforce on the platform this is built for.
@@ -105,15 +105,24 @@ async def test_a_parser_that_allocates_without_bound_is_killed(
     ``RLIMIT_AS`` reports unlimited on Darwin and refuses to be set, so a design that relied on
     it would be correct on CI and inert on the machine where the malformed document gets opened
     first. The parent samples resident memory and sends ``SIGKILL``, which works identically
-    everywhere — so the outcome is the same on both platforms even though the mechanism is not.
+    everywhere.
+
+    **The assertion is about the outcome, not the mechanism, and deliberately so.** On Linux
+    the child may hit the ``RLIMIT_AS`` backstop and die of its own accord before the parent's
+    next sample; on Darwin only the parent can stop it. Asserting "the parent killed it" would
+    be asserting a platform, and this project's rule is that a document ingests identically
+    wherever it runs. What must be identical is this: the attempt is a hard failure, the run
+    survives, and the pool is still usable afterwards.
     """
     del manicule_environment
     config = _config(tmp_path, memory_limit_bytes=64 * MEGABYTE)
     async with WorkerPool(config, workers=1, timeout_s=60.0, poll_interval_s=0.05) as pool:
         result = await pool.run_attempt("greedy", _raw(GREEDY_MEDIA_TYPE))
+        after = await pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE))
 
     assert result.attempt.outcome is Outcome.FAILED
-    assert "worker killed" in result.attempt.reason
+    assert result.attempt.reason, "a hard failure must say what happened"
+    assert after.attempt.outcome is Outcome.PARSED, "the run survives, which is the whole point"
 
 
 async def test_a_parser_that_crashes_the_interpreter_is_attributed_to_its_document(
@@ -130,6 +139,33 @@ async def test_a_parser_that_crashes_the_interpreter_is_attributed_to_its_docume
 
     assert result.attempt.outcome is Outcome.FAILED
     assert "worker" in result.attempt.reason
+
+
+async def test_a_worker_that_died_between_documents_fails_one_and_not_the_run(
+    tmp_path: Path, manicule_environment: Path
+) -> None:
+    """A broken pipe is a process-level accident, and it must not reach the ingest loop.
+
+    A worker can die between being handed back as idle and being dispatched to — the OOM
+    killer, or a crash on the previous document that surfaced late — and the parent's ``send``
+    then raises. Letting that propagate would end a batch over one document, which is the one
+    thing this module exists to prevent. The worker is killed here to reproduce exactly that.
+    """
+    del manicule_environment
+    async with WorkerPool(_config(tmp_path), workers=1, timeout_s=5.0) as pool:
+        # Reaching the pipe is the only way to reproduce a broken one, and widening the pool's
+        # public surface so that a test can break something would be the worse trade.
+        idle = await pool._idle.get()  # pyright: ignore[reportPrivateUsage]
+        assert idle is not None
+        idle.connection.close()
+        await pool._idle.put(idle)  # pyright: ignore[reportPrivateUsage]
+
+        result = await pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE))
+        after = await pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE))
+
+    assert result.attempt.outcome is Outcome.FAILED
+    assert "worker unreachable" in result.attempt.reason
+    assert after.attempt.outcome is Outcome.PARSED, "the pool replaced it and the run continued"
 
 
 async def test_a_killed_worker_is_replaced_and_the_pool_keeps_working(
