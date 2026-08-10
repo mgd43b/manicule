@@ -46,7 +46,10 @@ specification."""
 
 _SOFT_HYPHEN = "­"
 _ZERO_WIDTH_SPACE = "\u200b"
-_NO_BREAK_SPACE = " "
+_NO_BREAK_SPACE = "\u00a0"
+"""Spelled by escape rather than typed. A no-break space is indistinguishable from a space
+in a source file, and a normalisation rule nobody can see in the code is not a
+specification."""
 
 _LIGATURE_TABLE = str.maketrans({**_LIGATURES, _SOFT_HYPHEN: ""})
 

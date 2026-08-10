@@ -28,14 +28,12 @@ from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass
 
 import pypdfium2 as pdfium
-from pydantic import BaseModel, Field
 
 from manicule.core.anchors import Anchor, PageAnchor, Rect
 from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.parsers.base import ParserProfile
-
-MEDIA_TYPES = frozenset({"application/pdf"})
+from manicule.parsers.config import PDF_MEDIA_TYPES, PdfConfig
 
 QUARTER_TURN, HALF_TURN, THREE_QUARTER_TURN = 90, 180, 270
 
@@ -53,23 +51,6 @@ pdfium normalises ``/Rotate`` into these four, so a malformed ``/Rotate 45`` arr
 costs one comparison and it means a future reader who reaches for the raw dictionary value
 does not silently produce rectangles rotated by a fraction of a turn.
 """
-
-
-class PdfConfig(BaseModel):
-    """Configuration for :class:`PdfParser`."""
-
-    outline_headings: bool = Field(
-        default=True,
-        description="Take heading paths from the document outline when the PDF has one. A "
-        "PDF has no heading semantics — only glyphs with font sizes — so this is the only "
-        "honest source; there is deliberately no font-size clustering behind it.",
-    )
-    max_pages: int = Field(
-        default=5000,
-        gt=0,
-        description="Pages beyond this are not parsed and the document is declined, so one "
-        "pathological file cannot occupy an ingest run indefinitely.",
-    )
 
 
 def normalise_rect(
@@ -239,7 +220,7 @@ class PdfParser:
     shape of the extracted text.
     """
 
-    media_types = MEDIA_TYPES
+    media_types = PDF_MEDIA_TYPES
     profile = ParserProfile(name="pdf", max_unlocated_ratio=0.00, max_pagelevel_ratio=0.10)
 
     def __init__(self, config: PdfConfig) -> None:
@@ -463,9 +444,9 @@ def outline_page_paths(raw: RawDocument) -> dict[int, tuple[str, ...]]:
 
 
 __all__ = [
-    "MEDIA_TYPES",
-    "QUARTER_TURNS",
     "BOX_MARGIN",
+    "PDF_MEDIA_TYPES",
+    "QUARTER_TURNS",
     "PdfConfig",
     "PdfParser",
     "denormalise_rect",

@@ -20,7 +20,7 @@ from manicule.core.anchors import Anchor, HeadingAnchor, PageAnchor, Unlocated
 from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.core.protocols import Parser, read_blocks
-from manicule.parsers.word import MEDIA_TYPE, WordConfig, WordParser
+from manicule.parsers.word import WORD_MEDIA_TYPE, WORD_MEDIA_TYPES, WordConfig, WordParser
 from manicule.testing import assert_round_trip
 from tests.parsers.support import check_corpus, check_fixture, raw_from, raw_of
 
@@ -54,7 +54,7 @@ def _parser(config: WordConfig | None = None) -> WordParser:
 
 
 async def _blocks(path: Path, config: WordConfig | None = None) -> list[ParsedBlock]:
-    return await read_blocks(_parser(config), raw_from(path, MEDIA_TYPE))
+    return await read_blocks(_parser(config), raw_from(path, WORD_MEDIA_TYPE))
 
 
 def _fragment_of(block: ParsedBlock) -> str | None:
@@ -63,7 +63,7 @@ def _fragment_of(block: ParsedBlock) -> str | None:
 
 
 async def _resolve(path: Path, anchor: Anchor) -> str | None:
-    return await _parser().resolve(anchor, raw_from(path, MEDIA_TYPE))
+    return await _parser().resolve(anchor, raw_from(path, WORD_MEDIA_TYPE))
 
 
 # --- no pages, ever ----------------------------------------------------------------------
@@ -97,7 +97,7 @@ async def test_the_corpus_round_trips_and_stays_inside_its_location_budget(
     Chunked as well as parsed, because a chunk's anchor is a merge of its blocks' anchors and a
     merge is exactly where a location widens without anything raising.
     """
-    raws = [raw_from(corpus / "word" / name, MEDIA_TYPE) for name in HARNESS_FIXTURES]
+    raws = [raw_from(corpus / "word" / name, WORD_MEDIA_TYPE) for name in HARNESS_FIXTURES]
     reports = await check_corpus(_parser(), raws, chunker=chunker, min_blocks=200)
     assert sum(report.chunks for report in reports) > 0
 
@@ -110,7 +110,7 @@ async def test_shifting_every_anchor_one_section_along_fails_the_round_trip(corp
     which is the failure mode the six assertions exist for, and the reason this suite has a
     parser that commits it on purpose.
     """
-    raw = raw_from(corpus / "word" / "word_typical.docx", MEDIA_TYPE)
+    raw = raw_from(corpus / "word" / "word_typical.docx", WORD_MEDIA_TYPE)
     with pytest.raises(AssertionError):
         await assert_round_trip(_ShiftedSectionParser(), raw, fixture="shifted")
 
@@ -209,7 +209,7 @@ async def test_content_before_the_first_heading_is_addressed_by_the_document_tit
     section nobody wrote.
     """
     path = corpus / "word" / "word_typical.docx"
-    raw = raw_of(path.read_bytes(), MEDIA_TYPE, uri=path.name)
+    raw = raw_of(path.read_bytes(), WORD_MEDIA_TYPE, uri=path.name)
     blocks = await read_blocks(_parser(), raw)
     preamble = blocks[0]
 
@@ -233,7 +233,7 @@ async def test_content_before_the_first_heading_is_unlocated_when_nothing_names_
     names both things the author could change.
     """
     path = corpus / "word" / "word_untitled_preamble.docx"
-    raw = raw_of(path.read_bytes(), MEDIA_TYPE, uri=path.name)
+    raw = raw_of(path.read_bytes(), WORD_MEDIA_TYPE, uri=path.name)
     blocks = await read_blocks(_parser(), raw)
 
     assert isinstance(blocks[0].anchor, Unlocated)
@@ -376,7 +376,7 @@ async def test_a_single_heading_is_a_section_of_one_block(
     same string — the tightest case there is, and the one where an off-by-one in the section
     boundary would show up as an empty resolve.
     """
-    raw = raw_from(corpus / "word" / "word_degenerate_heading_only.docx", MEDIA_TYPE)
+    raw = raw_from(corpus / "word" / "word_degenerate_heading_only.docx", WORD_MEDIA_TYPE)
     report = await check_fixture(_parser(), raw, chunker=chunker)
     assert report.blocks == 1
 
@@ -390,7 +390,7 @@ class _ShiftedSectionParser:
     discrimination assertion has to be the thing that catches it.
     """
 
-    media_types = frozenset({MEDIA_TYPE})
+    media_types = WORD_MEDIA_TYPES
     profile = WordParser.profile
 
     def __init__(self) -> None:

@@ -13,6 +13,7 @@ that a test which accidentally starts downloading fails loudly instead of passin
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from importlib.metadata import metadata
 from pathlib import Path
@@ -77,7 +78,7 @@ def test_the_key_for_c_sharp_is_csharp_and_the_error_says_so() -> None:
 
 
 def test_a_real_grammar_manicule_does_not_declare_is_refused_with_its_own_message() -> None:
-    """"Not a grammar" and "not one of ours" are different mistakes with different fixes.
+    """ "Not a grammar" and "not one of ours" are different mistakes with different fixes.
 
     Haskell is a real key in the pack's manifest. Declaring it is not a typo; it is asking
     for a language manicule routes no media type to, and saying "unknown key" would send
@@ -265,8 +266,6 @@ def test_the_manifest_override_is_removed_again_when_it_is_not_asked_for(
     and an environment variable is exactly the kind of state that outlives the thing that
     set it.
     """
-    import os
-
     del empty_cache
     assert os.environ[grammars.MANIFEST_URL_ENV] == UNREACHABLE_MANIFEST
 

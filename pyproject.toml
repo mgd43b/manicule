@@ -63,6 +63,12 @@ parsers = [
 generation = []    # #7  litellm
 serve = []         # #8, #11  Typer, Rich, FastMCP, FastAPI, uvicorn
 
+# The built-in parsers and the chunker register the same way a third-party plugin does, through
+# the public entry-point group. There is no shorter internal route, so the extension mechanism
+# is exercised by every installation rather than only by the people extending it.
+[project.entry-points."manicule.plugins"]
+parsing = "manicule.parsers.plugin:PLUGIN"
+
 [project.urls]
 Homepage = "https://github.com/mgd43b/manicule"
 Issues = "https://github.com/mgd43b/manicule/issues"

@@ -18,8 +18,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 
-from pydantic import BaseModel, Field
-
 from manicule.core.anchors import Anchor, LineAnchor
 from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
@@ -30,6 +28,7 @@ from manicule.parsers.base import (
     lines_of,
     resolve_lines,
 )
+from manicule.parsers.config import PLAINTEXT_MEDIA_TYPES, PlaintextConfig
 
 __all__ = [
     "PLAINTEXT_MEDIA_TYPES",
@@ -37,29 +36,6 @@ __all__ = [
     "PlaintextParser",
     "paragraph_spans",
 ]
-
-PLAINTEXT_MEDIA_TYPES = frozenset({"text/plain"})
-"""Declared narrowly. The global fallback tail routes by configuration, not by a parser
-claiming every media type for itself — a parser that claimed ``*`` would win documents a
-real parser was installed to handle."""
-
-
-class PlaintextConfig(BaseModel):
-    """Configuration for :class:`PlaintextParser`."""
-
-    max_block_lines: int = Field(
-        default=100,
-        ge=1,
-        description="Longest run of lines one block may span before it is split at a line "
-        "boundary into parts that each keep their own exact span.",
-    )
-    """Bounded because the chunker cannot narrow a line span.
-
-    When a block does not fit the chunk budget the chunker splits its text, and every part
-    keeps the *block's* anchor — so four chunks of one 900-line block all cite all 900 lines,
-    and each of them resolves to nine hundred lines to address a fifth of them. Splitting here
-    instead costs nothing and gives every part a line span that is exactly its own text.
-    """
 
 
 class PlaintextParser:

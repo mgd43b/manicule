@@ -74,8 +74,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, get_args
 
-from pydantic import BaseModel, Field
-
 from manicule.core.errors import ConfigError, ManiculeError
 
 if TYPE_CHECKING:
@@ -92,7 +90,6 @@ __all__ = [
     "DefinitionRule",
     "GrammarFetchError",
     "GrammarUnavailableError",
-    "SourceCodeConfig",
     "cache_directory",
     "configure_pack",
     "grammar_versions",
@@ -109,6 +106,7 @@ __all__ = [
 ]
 
 _SUPPORTED: frozenset[str] | None = None
+_DEFAULT_CACHE_DIR: str | None = None
 
 MANIFEST_URL_ENV: Final = "TREE_SITTER_LANGUAGE_PACK_MANIFEST_URL"
 """Environment variable the pack reads to locate the grammar manifest.
@@ -119,10 +117,23 @@ from :func:`configure_pack` keeps that fact in one place instead of in every dep
 shell profile.
 """
 
+PACK_DISTRIBUTION: Final = "tree-sitter-language-pack"
+"""The installed distribution the grammars come from."""
+
+
 def pack_version() -> str:
-    """The installed grammar pack release. See :func:`grammar_versions`."""
-    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
-    return pack.__version__
+    """The installed grammar pack release. See :func:`grammar_versions`.
+
+    Read from the distribution's metadata rather than from ``pack.__version__``, which is the
+    same string — the suite asserts that rather than assuming it. Reading the metadata answers
+    without importing the pack, so recording a grammar version costs no native extension load
+    on a machine whose corpus contains no code. It also answers on a machine where the native
+    extension cannot be loaded at all, which is the honest behaviour: a version is a fact about
+    what is installed, not about what has been initialised.
+    """
+    from importlib.metadata import version  # noqa: PLC0415 - see docstring
+
+    return version(PACK_DISTRIBUTION)
 
 
 MEDIA_TYPES: Final[Mapping[str, str]] = {
@@ -268,43 +279,6 @@ Java annotations and C# attributes all sit *inside* the declaration node.
 """
 
 
-class SourceCodeConfig(BaseModel):
-    """Configuration for :class:`~manicule.parsers.sourcecode.SourceCodeParser`.
-
-    Set under ``plugins.config."parser.sourcecode"``. It lives here rather than beside the
-    parser because what it configures is this module: the declared language set decides what
-    routes to the parser at all and what the corpus fingerprint records, and the two grammar
-    overrides are what a container image and an air-gapped site respectively need in order to
-    pre-seed. Keeping it here also keeps it importable without the C extension, so plugin
-    registration can validate settings for a parser nobody has built yet.
-    """
-
-    languages: tuple[str, ...] = DECLARED_LANGUAGES
-    """The declared language set. Validated against the grammar manifest when the parser is
-    built, so a typo — ``c_sharp`` for ``csharp`` — fails at startup with the near misses
-    listed, rather than becoming a document that mysteriously never parses."""
-
-    grammar_cache_dir: Path | None = None
-    """Where grammars live. ``None`` uses the per-user cache. A container image sets this so
-    the grammars pre-seeded at build time are the ones the running process finds."""
-
-    grammar_manifest_url: str | None = None
-    """Where the grammar manifest is fetched from. ``None`` uses the public one; a site with
-    no route to it points this at an internal mirror."""
-
-    max_block_chars: int = Field(default=1536, gt=0)
-    """When a block's source is longer than this, it is split at the next node boundary down.
-
-    Measured in characters rather than tokens because a parser runs before an embedder is
-    bound, and a token count is only meaningful with the embedder's own vocabulary
-    (``manicule.chunking.tokens``). 1536 is a 512-token budget at three characters per token,
-    which is conservative for code — identifiers, punctuation and indentation all tokenize
-    densely — so a block under this bound is comfortably under the budget the chunker later
-    enforces with the real tokenizer. It is a *pre*-split threshold, not a guarantee: the
-    chunker still measures, and this only decides which boundaries it is offered.
-    """
-
-
 class GrammarUnavailableError(ManiculeError):
     """A declared language's grammar is not in the cache, so the document is refused.
 
@@ -369,13 +343,10 @@ def validate_languages(languages: Sequence[str]) -> tuple[str, ...]:
         )
         raise ConfigError(msg)
 
-    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
     known = _supported_names()
     unknown = sorted({language for language in languages if language not in known})
     if unknown:
-        hints = {
-            language: difflib.get_close_matches(language, known, n=3) for language in unknown
-        }
+        hints = {language: difflib.get_close_matches(language, known, n=3) for language in unknown}
         detail = "; ".join(
             f"{language!r} (did you mean {matches}?)" if matches else repr(language)
             for language, matches in hints.items()
@@ -422,7 +393,25 @@ def scope_separator(language: str) -> str:
 def cache_directory() -> Path:
     """Where the pack keeps grammars for the running configuration."""
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
     return Path(pack.cache_dir())
+
+
+def _remember_default_cache_directory() -> str:
+    """The pack's own per-user cache directory, read once while it is still in force.
+
+    Read rather than recomputed. The path carries the pack release and the platform's cache
+    convention, so deriving it here would duplicate upstream's rules and go wrong on the
+    release that changes them. Reading it on the first call is safe because every override
+    manicule applies goes through :func:`configure_pack`, so the pack is still on its default
+    the first time this runs.
+    """
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
+    global _DEFAULT_CACHE_DIR  # noqa: PLW0603 - a one-shot cache of an immutable value
+    if _DEFAULT_CACHE_DIR is None:
+        _DEFAULT_CACHE_DIR = pack.cache_dir()
+    return _DEFAULT_CACHE_DIR
 
 
 def configure_pack(
@@ -447,13 +436,20 @@ def configure_pack(
             one.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
+    default_cache = _remember_default_cache_directory()
     if manifest_url is None:
         os.environ.pop(MANIFEST_URL_ENV, None)
     else:
         os.environ[MANIFEST_URL_ENV] = manifest_url
     pack.configure(
         pack.PackConfig(
-            cache_dir=str(cache_dir) if cache_dir is not None else None,
+            # The default is passed back explicitly rather than as ``None``. The pack reads
+            # an absent ``cache_dir`` as "keep whatever is already in force", so a call
+            # meaning "go back to the default" would silently keep the previous override —
+            # and every later call would then report the languages of a directory nobody
+            # asked for. Verified against the installed pack, not assumed.
+            cache_dir=str(cache_dir) if cache_dir is not None else default_cache,
             languages=list(languages),
         )
     )
@@ -467,6 +463,7 @@ def configure_pack(
 def is_available(language: str) -> bool:
     """Whether ``language``'s grammar is in the cache, checked without any network access."""
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
     return language in set(pack.downloaded_languages())
 
 
@@ -476,6 +473,7 @@ def missing_grammars(languages: Sequence[str]) -> tuple[str, ...]:
     What ``manicule doctor`` reports and what :func:`prefetch` acts on.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
     present = set(pack.downloaded_languages())
     return tuple(sorted(language for language in languages if language not in present))
 
@@ -500,6 +498,7 @@ def prefetch(languages: Sequence[str]) -> tuple[str, ...]:
             not have it, a checksum mismatch.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
     wanted = validate_languages(languages)
     absent = missing_grammars(wanted)
     if not absent:
@@ -555,7 +554,7 @@ def grammar_versions(languages: Sequence[str]) -> dict[str, str]:
         fingerprint depend on cache state, which is the hazard this module exists to close.
     """
     version = pack_version()
-    return {language: version for language in validate_languages(languages)}
+    return dict.fromkeys(validate_languages(languages), version)
 
 
 _PARSERS: dict[str, Parser] = {}
@@ -577,6 +576,7 @@ def load_parser(language: str) -> Parser:
             corpus-consistency hazard arriving through the back door.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
     cached = _PARSERS.get(language)
     if cached is not None:
         return cached
@@ -595,6 +595,7 @@ def tags_query_source(language: str) -> str | None:
     declared language set closes.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
     return pack.get_tags_query(language)
 
 
@@ -608,9 +609,8 @@ def tags_query(language: str) -> Query | None:
         GrammarUnavailableError: The grammar is not cached. A query compiles against a
             language, so this cannot answer before :func:`load_parser` would have refused.
     """
-    from tree_sitter import Query  # noqa: PLC0415 - lazy, see module docstring
-
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+    from tree_sitter import Query  # noqa: PLC0415 - lazy, see module docstring
 
     if language in _QUERIES:
         return _QUERIES[language]

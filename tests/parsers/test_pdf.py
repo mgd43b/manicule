@@ -347,9 +347,7 @@ async def test_page_numbers_count_from_one_as_a_reader_does(corpus: Path) -> Non
     """
     raw = raw_from(corpus / "pdf" / "typical.pdf", MEDIA_TYPE)
     pages = {
-        block.anchor.page
-        for block in await _blocks(raw)
-        if isinstance(block.anchor, PageAnchor)
+        block.anchor.page for block in await _blocks(raw) if isinstance(block.anchor, PageAnchor)
     }
     assert pages == {1, 2, 3}
 

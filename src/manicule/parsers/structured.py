@@ -46,7 +46,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import cast
 
-from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.error import YAMLError
@@ -55,6 +54,7 @@ from manicule.core.anchors import Anchor, LineAnchor, Unlocated
 from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.parsers.base import ParserProfile, decode, is_probably_text, lines_of, resolve_lines
+from manicule.parsers.config import STRUCTURED_MEDIA_TYPES, StructuredConfig
 
 __all__ = [
     "NO_JSON_POSITIONS",
@@ -70,21 +70,6 @@ NO_JSON_POSITIONS = "JSON source positions unavailable"
 Named because it is asserted in tests and reported by ``doctor``: a file that indexes fine and
 loses its anchors is invisible unless the reason has a name.
 """
-
-STRUCTURED_MEDIA_TYPES = frozenset(
-    {
-        "application/json",
-        "application/toml",
-        "application/x-yaml",
-        "application/yaml",
-        "text/toml",
-        "text/x-yaml",
-        "text/yaml",
-    }
-)
-"""Declared narrowly, and deliberately without ``application/json;profile=atlas-doc-format``:
-Confluence's document format is JSON-shaped but is a document tree, and indexing it as a
-configuration file would cite key paths where a reader expects sections."""
 
 
 class _Format(StrEnum):
@@ -103,6 +88,13 @@ _FORMATS: dict[str, _Format] = {
     "text/yaml": _Format.YAML,
 }
 
+_DIVIDED = 2
+"""How many parts a split has to produce before it counts as having divided anything.
+
+One part is the span back again, so recursing on it would not terminate; the caller falls
+back to splitting by lines instead.
+"""
+
 _MAX_SYMBOL_DEPTH = 16
 """How far a split may deepen a key path before it divides by lines instead.
 
@@ -115,24 +107,6 @@ input.
 _BARE_TOML_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 _TOML_TABLE_HEADER = re.compile(r"^[ \t]*(\[\[?)([^\[\]]+)(\]\]?)[ \t]*(?:#.*)?$")
 _TOML_KEY_LINE = re.compile(r"^[ \t]*([^=\[\]#]+?)[ \t]*=")
-
-
-class StructuredConfig(BaseModel):
-    """Configuration for :class:`StructuredParser`."""
-
-    max_block_lines: int = Field(
-        default=100,
-        ge=1,
-        description="Longest run of lines one block may span before it is split at the next "
-        "level of the document's own structure, and finally at line boundaries.",
-    )
-    """Bounded because the chunker cannot narrow a line span.
-
-    When a block does not fit the chunk budget the chunker splits its text and every part
-    keeps the *block's* anchor, so each part resolves to the whole block to address a fraction
-    of it. Splitting here uses the document's own structure instead, which costs nothing and
-    deepens ``symbol`` on the way down (``docs/parsing.md`` §11).
-    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,9 +183,7 @@ class StructuredParser:
 
     # --- per format ----------------------------------------------------------------------
 
-    def _spans(
-        self, form: _Format, text: str, lines: Sequence[str], uri: str
-    ) -> Iterator[_Span]:
+    def _spans(self, form: _Format, text: str, lines: Sequence[str], uri: str) -> Iterator[_Span]:
         last = _last_content_line(lines)
         if last == 0:
             return
@@ -223,9 +195,7 @@ class StructuredParser:
             return
         yield from self._mapping_spans(_load_yaml(text, uri), lines, last)
 
-    def _json_spans(  # noqa: PLR0911 - four ways for positions to be unavailable, each named
-        self, text: str, lines: Sequence[str], last: int, uri: str
-    ) -> Iterator[_Span]:
+    def _json_spans(self, text: str, lines: Sequence[str], last: int, uri: str) -> Iterator[_Span]:
         """Validate with the standard library, then take positions from the YAML reader.
 
         The order is the point. ``json`` decides whether the document is valid and what its
@@ -268,9 +238,7 @@ class StructuredParser:
         for span in _partition(marks, first=1, last=last, prefix=None, lines=lines):
             yield from self._divide(span, lines, depth=1)
 
-    def _toml_spans(
-        self, text: str, lines: Sequence[str], last: int, uri: str
-    ) -> Iterator[_Span]:
+    def _toml_spans(self, text: str, lines: Sequence[str], last: int, uri: str) -> Iterator[_Span]:
         try:
             values = tomllib.loads(text)
         except tomllib.TOMLDecodeError as exc:
@@ -300,8 +268,10 @@ class StructuredParser:
         table = _toml_table_at(values, span.symbol)
         keys = frozenset(table) if table is not None else frozenset[str]()
         marks = _scan(lines, span.start + 1, span.end, _toml_key_reader(keys))
-        divided = _partition(marks, first=span.start, last=span.end, prefix=span.symbol, lines=lines)
-        if len(divided) < 2:
+        divided = _partition(
+            marks, first=span.start, last=span.end, prefix=span.symbol, lines=lines
+        )
+        if len(divided) < _DIVIDED:
             yield from _by_lines(span, self._config.max_block_lines, lines)
             return
         for part in divided:
@@ -313,9 +283,13 @@ class StructuredParser:
             yield from _by_lines(span, self._config.max_block_lines, lines)
             return
         children = _partition(
-            _children_of(span.value), first=span.start, last=span.end, prefix=span.symbol, lines=lines
+            _children_of(span.value),
+            first=span.start,
+            last=span.end,
+            prefix=span.symbol,
+            lines=lines,
         )
-        if len(children) < 2:
+        if len(children) < _DIVIDED:
             yield from _by_lines(span, self._config.max_block_lines, lines)
             return
         for child in children:

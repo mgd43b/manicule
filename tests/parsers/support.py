@@ -21,6 +21,14 @@ from manicule.testing import (
     assert_round_trip,
 )
 
+WORKSPACE_ID = "fixtures"
+"""The workspace these fixture documents belong to.
+
+Part of a document's identity rather than a filter applied afterwards, so it has to be
+supplied here too — a suite that invented an id without one would exercise a shape the real
+ingest path cannot produce.
+"""
+
 TOKENIZER_ID = "test/whitespace"
 """Identity of the counter below.
 
@@ -85,7 +93,7 @@ def document_for(raw: RawDocument, *, title: str = "") -> Document:
     """The stored record a parser's blocks would be chunked against."""
     resolved = title or _title_of(raw)
     return Document(
-        id=document_id("fixtures", raw.source_id),
+        id=document_id(WORKSPACE_ID, "fixtures", raw.source_id),
         source="fixtures",
         source_id=raw.source_id,
         uri=raw.uri,
@@ -152,6 +160,7 @@ def _profile_of(parser: Parser) -> ParserProfile:
 
 __all__ = [
     "TOKENIZER_ID",
+    "WORKSPACE_ID",
     "check_corpus",
     "check_fixture",
     "count_tokens",

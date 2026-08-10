@@ -28,7 +28,10 @@ HARD_WRAPPED = "\n".join(
         "A single paragraph hard-wrapped across many short lines, which is what a text file",
         "written in an editor with a fixed margin actually looks like, and which is the case",
         "where a parser that split on blank lines alone would emit one enormous block.",
-        *(f"Line {number:03d} of the wrapped run, carrying its own distinct words." for number in range(1, 61)),
+        *(
+            f"Line {number:03d} of the wrapped run, carrying its own distinct words."
+            for number in range(1, 61)
+        ),
         "The run ends here, still with no blank line anywhere inside it.",
     ]
 )

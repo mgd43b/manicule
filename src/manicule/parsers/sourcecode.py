@@ -46,7 +46,6 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from tree_sitter import Node, QueryCursor, Tree
 
@@ -55,10 +54,10 @@ from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.parsers import grammars
 from manicule.parsers.base import ParserProfile, decode, lines_of, resolve_lines
-from manicule.parsers.grammars import SourceCodeConfig
+from manicule.parsers.config import SourceCodeConfig
 
 __all__ = ["SourceCodeConfig", "SourceCodeParser"]
-"""``SourceCodeConfig`` is re-exported from :mod:`manicule.parsers.grammars`, where it is
+"""``SourceCodeConfig`` is re-exported from :mod:`manicule.parsers.config`, where it is
 defined so that plugin registration can validate settings without importing a C extension."""
 
 
@@ -134,7 +133,9 @@ class SourceCodeParser:
             first = max(span.first, claimed + 1)
             if first > span.last:
                 continue
-            block = _block(span, first, lines, language, separator, wrappers)
+            block = _block(
+                span, first, lines, language=language, separator=separator, wrappers=wrappers
+            )
             if block is None:
                 continue
             claimed = span.last
@@ -528,6 +529,7 @@ def _block(
     span: _Span,
     first: int,
     lines: _Lines,
+    *,
     language: str,
     separator: str,
     wrappers: frozenset[str],

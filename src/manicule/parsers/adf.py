@@ -27,18 +27,13 @@ from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import cast
 
-from pydantic import BaseModel, Field
-
 from manicule.core.anchors import Anchor, HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, Metadata, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.parsers.base import HeadingStack, ParserProfile, decode
+from manicule.parsers.config import ADF_MEDIA_TYPE, ADF_MEDIA_TYPES, ADFConfig
 
 __all__ = ["ADF_MEDIA_TYPE", "ADFConfig", "ADFParser"]
-
-ADF_MEDIA_TYPE = "application/json;profile=atlas-doc-format"
-"""ADF is not a file type. It is the body format the Confluence Cloud API returns, and it
-registers under the profile parameter the API itself uses."""
 
 _INLINE_TYPES = frozenset(
     {
@@ -61,18 +56,6 @@ _INDENT = "  "
 
 _WHITESPACE = re.compile(r"\s+")
 _NOT_IN_ANCHOR = re.compile(r"[^\w-]+", re.UNICODE)
-
-
-class ADFConfig(BaseModel):
-    """Configuration for :class:`ADFParser`."""
-
-    keep_card_links: bool = Field(
-        default=True,
-        description="Emit the target of a block or inline card as text.",
-    )
-    """Cards are links to other pages, which is a cross-reference graph worth keeping
-    (``confluence.md`` §5). A corpus where every page links to a dozen others may prefer the
-    prose without them, since a URL contributes little to a sentence's meaning."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +92,7 @@ class _Reading:
 class ADFParser:
     """Parses an Atlassian Document Format body into blocks anchored to its headings."""
 
-    media_types = frozenset({ADF_MEDIA_TYPE})
+    media_types = ADF_MEDIA_TYPES
     profile = ParserProfile(
         name="confluence-adf", max_unlocated_ratio=0.00, max_pagelevel_ratio=None
     )

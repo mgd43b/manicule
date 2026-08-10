@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import JsonValue
 from python_calamine import (
     CalamineError,
     CalamineWorkbook,
@@ -54,6 +54,12 @@ from manicule.core.anchors import Anchor, CellAnchor
 from manicule.core.content import BlockKind, Metadata, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.parsers.base import ParserProfile, decode
+from manicule.parsers.config import (
+    CSV_MEDIA_TYPE,
+    SPREADSHEET_MEDIA_TYPES,
+    XLSX_MEDIA_TYPE,
+    SpreadsheetConfig,
+)
 
 __all__ = [
     "CSV_MEDIA_TYPE",
@@ -61,9 +67,6 @@ __all__ = [
     "SpreadsheetConfig",
     "SpreadsheetParser",
 ]
-
-XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-CSV_MEDIA_TYPE = "text/csv"
 
 _CELL_SEPARATOR = "\t"
 _ROW_SEPARATOR = "\n"
@@ -74,33 +77,6 @@ _AREA = re.compile(
 
 _CellValue = int | float | str | bool | dt.time | dt.date | dt.datetime | dt.timedelta
 """What calamine hands back per cell. Spelled out so the renderer below is exhaustive."""
-
-
-class SpreadsheetConfig(BaseModel):
-    """Configuration for :class:`SpreadsheetParser`."""
-
-    header_rows: int = Field(
-        default=1,
-        ge=0,
-        description="How many leading rows of a used range are header rows. The chunker repeats "
-        "them into every part of a table too large for one chunk (docs/parsing.md §4.2). "
-        "Declared rather than detected: the alternative is inferring a header from the first "
-        "row being bold, which that section forbids because formatting is not structure.",
-    )
-    csv_delimiter: str = Field(
-        default=",",
-        min_length=1,
-        max_length=1,
-        description="Field separator for CSV. Declared, not sniffed: sniffing reads a sample "
-        "and guesses, so the same export could be split into different columns on two "
-        "machines, and every cell reference in the corpus would depend on which.",
-    )
-    include_hidden_sheets: bool = Field(
-        default=False,
-        description="Index sheets the workbook marks hidden. Off by default because a hidden "
-        "sheet is usually working data the author chose not to show; on when it is the "
-        "reference table everything else looks up.",
-    )
 
 
 def _column_letters(index: int) -> str:
@@ -402,7 +378,7 @@ class SpreadsheetParser:
     unlocated one.
     """
 
-    media_types = frozenset({XLSX_MEDIA_TYPE, CSV_MEDIA_TYPE})
+    media_types = SPREADSHEET_MEDIA_TYPES
     profile = ParserProfile(name="spreadsheet", max_unlocated_ratio=0.0, max_pagelevel_ratio=None)
 
     def __init__(self, config: SpreadsheetConfig) -> None:

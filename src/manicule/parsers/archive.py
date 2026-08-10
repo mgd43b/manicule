@@ -43,16 +43,14 @@ import io
 import zipfile
 from collections.abc import AsyncIterator
 
-from pydantic import BaseModel, Field
-
 from manicule.core.anchors import Anchor
 from manicule.core.content import DocumentStatus, Metadata, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.core.ids import content_hash
 from manicule.parsers.base import ParserProfile
+from manicule.parsers.config import ARCHIVE_MEDIA_TYPES, ArchiveConfig
 from manicule.parsers.expansion import (
     CONTAINER_DEPTH,
-    MAX_DEPTH,
     PATH_HASHES,
     TREE_BYTES,
     TREE_MEMBERS,
@@ -76,11 +74,6 @@ __all__ = [
     "ArchiveConfig",
     "ArchiveParser",
 ]
-
-ARCHIVE_MEDIA_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
-"""Declared narrowly, which is half of the defence in §9.4. The other half is media type
-resolution running before parser dispatch, so a ``.docx`` with a correct extension or a
-correct declared type never reaches this parser at all."""
 
 ARCHIVE_SCHEME = "zip"
 """The scheme a member address carries: ``zip:<container-uri>!/reports/2026-q1.pdf``."""
@@ -112,47 +105,7 @@ _UNIX_FILE_TYPE = 0o170000
 _ENCRYPTED_FLAG = 0x1
 
 
-class ArchiveConfig(BaseModel):
-    """The four zip-bomb limits, the nesting limit, and nothing else.
-
-    Every default is from ``docs/parsing.md`` §9.3. They are configuration rather than
-    constants because the right numbers depend on the corpus — an archive of scanned tiffs is
-    legitimately large — and because a test can then exercise the streaming path at a size
-    that keeps a suite fast instead of at a gigabyte.
-    """
-
-    max_total_bytes: int = Field(
-        default=1024**3,
-        gt=0,
-        description="Uncompressed bytes across the whole container tree. Counted while "
-        "streaming, never taken from a member's declared size.",
-    )
-    max_member_bytes: int = Field(
-        default=64 * 1024**2,
-        gt=0,
-        description="Uncompressed bytes for one member, so a single member cannot exhaust "
-        "the tree budget on its own.",
-    )
-    max_compression_ratio: float = Field(
-        default=100.0,
-        gt=0.0,
-        description="Uncompressed bytes per compressed byte, measured on what was actually "
-        "read. Catches the classic single-file bomb.",
-    )
-    max_members: int = Field(
-        default=10_000,
-        gt=0,
-        description="Members across the whole container tree. Catches the many-tiny-files "
-        "variant, which every byte limit passes.",
-    )
-    max_depth: int = Field(
-        default=MAX_DEPTH,
-        ge=1,
-        description="How far containers may nest, counted from the top-level document.",
-    )
-
-
-class _Refusal(Exception):
+class _RefusalError(Exception):
     """A limit a member hit, carrying whether the rest of the archive can continue.
 
     An exception rather than a return value because it is raised from inside the read loop,
@@ -244,7 +197,14 @@ class ArchiveParser:
                     continue
                 used_members += 1
                 outcome, stop = self._member(
-                    raw, archive, info, path, depth, hashes, used_bytes, used_members
+                    raw,
+                    archive,
+                    info,
+                    path=path,
+                    depth=depth,
+                    hashes=hashes,
+                    used_bytes=used_bytes,
+                    used_members=used_members,
                 )
                 if isinstance(outcome, ExpandedMember):
                     used_bytes += len(outcome.raw.as_bytes())
@@ -259,6 +219,7 @@ class ArchiveParser:
         raw: RawDocument,
         archive: zipfile.ZipFile,
         info: zipfile.ZipInfo,
+        *,
         path: str,
         depth: int,
         hashes: tuple[str, ...],
@@ -302,7 +263,7 @@ class ArchiveParser:
 
         try:
             content = self._read(archive, info, used_bytes)
-        except _Refusal as refusal:
+        except _RefusalError as refusal:
             return (
                 _refusal(raw, path, depth, refusal.reason, DocumentStatus.FAILED),
                 refusal.fatal,
@@ -353,7 +314,7 @@ class ArchiveParser:
         """Stream a member through a counter that stops it, whatever its header says.
 
         Raises:
-            _Refusal: A limit was reached. The tree budget is fatal to the archive, because
+            _RefusalError: A limit was reached. The tree budget is fatal to the archive, because
                 every remaining member would hit the same wall; the per-member limits are not.
         """
         member_ceiling = self._config.max_member_bytes
@@ -372,21 +333,21 @@ class ArchiveParser:
                         f"archive member exceeded the {member_ceiling}-byte per-member limit "
                         f"while streaming; it declared {info.file_size} bytes."
                     )
-                    raise _Refusal(msg)
+                    raise _RefusalError(msg)
                 if read > ratio_ceiling:
                     msg = (
                         f"archive member expanded past {self._config.max_compression_ratio:g}:1 "
                         f"while streaming — {read} bytes out of {info.compress_size} "
                         f"compressed. This is what a zip bomb looks like."
                     )
-                    raise _Refusal(msg)
+                    raise _RefusalError(msg)
                 if read > tree_ceiling:
                     msg = (
                         f"archive tree exceeded the {self._config.max_total_bytes}-byte total "
                         f"while streaming this member. Members already expanded keep their "
                         f"documents; the rest of this archive is not read."
                     )
-                    raise _Refusal(msg, fatal=True)
+                    raise _RefusalError(msg, fatal=True)
                 parts.append(block)
         return b"".join(parts)
 

@@ -38,9 +38,6 @@ from dataclasses import dataclass
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
-from importlib.metadata import version
-
-from pydantic import BaseModel, Field
 
 from manicule.core.anchors import Anchor, LineAnchor
 from manicule.core.content import (
@@ -53,9 +50,9 @@ from manicule.core.content import (
 from manicule.core.errors import ParseError
 from manicule.core.ids import content_hash
 from manicule.parsers.base import ParserProfile, lines_of, resolve_lines
+from manicule.parsers.config import MAIL_MEDIA_TYPES, MailConfig, html_text_version
 from manicule.parsers.expansion import (
     CONTAINER_DEPTH,
-    MAX_DEPTH,
     OCTET_STREAM,
     PATH_HASHES,
     TREE_BYTES,
@@ -76,32 +73,14 @@ from manicule.parsers.plaintext import paragraph_spans
 from manicule.parsers.web import WebConfig, WebParser
 
 __all__ = [
-    "HTML_TO_TEXT_VERSION",
     "MAIL_MEDIA_TYPES",
     "MAIL_SCHEME",
     "MailConfig",
     "MailParser",
 ]
 
-MAIL_MEDIA_TYPES = frozenset({"message/rfc822"})
-"""``.eml`` only. ``.msg`` is a MAPI compound file rather than a message, its route through
-permissively-licensed libraries is specified in ``docs/parsing.md`` §10, and it is
-[#21](https://github.com/mgd43b/manicule/issues/21) rather than part of v1."""
-
 MAIL_SCHEME = "mail"
 """The scheme a member address carries: ``mail:<message-uri>!/report.pdf``."""
-
-HTML_TO_TEXT_VERSION = f"web-blocks/1+selectolax/{version('selectolax')}"
-"""Identity of the pinned HTML-to-text conversion an HTML-only body's anchors address.
-
-Two components, because either can move the line numbers. ``web-blocks/1`` is this module's
-own rule — take the blocks :class:`~manicule.parsers.web.WebParser` yields and join them with
-a blank line — and the second is the engine underneath it, whose text extraction is the other
-half of the answer. The installed version is read rather than written down so that an upgrade
-cannot pass unnoticed; the price is that a ``selectolax`` release makes the chunk fingerprint
-differ and ingest say so, which is exactly the explicit, priced operation §1.7 asks for
-instead of silent drift.
-"""
 
 HEADER_FIELDS = ("From", "To", "Cc", "Date", "Subject")
 """The headers the canonical text renders, in this order, present ones only.
@@ -115,34 +94,6 @@ _FOLD = re.compile(r"\r\n[ \t]+|\r[ \t]+|\n[ \t]+|[\r\n]+")
 """Line breaks inside a header value. A header is logically one line however it was folded for
 transport, and a value spanning two lines would put the anchors of the whole message half a
 line out."""
-
-
-class MailConfig(BaseModel):
-    """Configuration for :class:`MailParser`."""
-
-    max_block_lines: int = Field(
-        default=100,
-        ge=1,
-        description="Longest run of lines one body block may span before it is split at a "
-        "line boundary into parts that each keep their own exact span.",
-    )
-    """Bounded for the same reason as every other line-anchored parser: when a block does not
-    fit the chunk budget the chunker splits its text and each part keeps the block's anchor, so
-    every part would resolve to the whole block to address a fraction of it."""
-
-    expand_attachments: bool = Field(
-        default=True,
-        description="Whether attachments become documents of their own.",
-    )
-    """Turning this off does not make attachments disappear quietly: each one is reported as a
-    failed member naming the setting, because "the message had three attachments and the index
-    has none" is not something anyone would otherwise discover."""
-
-    max_depth: int = Field(
-        default=MAX_DEPTH,
-        ge=1,
-        description="How far containers may nest, counted from the top-level document.",
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,9 +271,7 @@ class MailParser:
             if part.get_content_maintype() == "multipart" or _is_attachment(part):
                 continue
             if part.get_content_type() == "text/plain":
-                return _Body(
-                    text=_text_payload(part, uri), part_path=path, media_type="text/plain"
-                )
+                return _Body(text=_text_payload(part, uri), part_path=path, media_type="text/plain")
             if html is None and part.get_content_type() == "text/html":
                 html = (path, part)
         if html is None:
@@ -339,7 +288,7 @@ class MailParser:
         if canonical.body is not None:
             metadata["body_media_type"] = canonical.body.media_type
             if canonical.body.media_type == "text/html":
-                metadata["html_to_text_version"] = HTML_TO_TEXT_VERSION
+                metadata["html_to_text_version"] = html_text_version()
         return metadata
 
     def _member_metadata(
@@ -522,5 +471,3 @@ def _member_media_type(part: EmailMessage, name: str) -> str:
     if declared and declared != OCTET_STREAM:
         return declared
     return media_type_for(name)
-
-

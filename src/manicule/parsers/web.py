@@ -26,16 +26,14 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from pydantic import BaseModel, Field
 from selectolax.lexbor import LexborHTMLParser, LexborNode
 
 from manicule.core.anchors import Anchor, HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, Metadata, ParsedBlock, RawDocument
 from manicule.parsers.base import HeadingStack, ParserProfile, decode
+from manicule.parsers.config import WEB_MEDIA_TYPES, WebConfig
 
 __all__ = ["WEB_MEDIA_TYPES", "WebConfig", "WebParser"]
-
-WEB_MEDIA_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 
 _HEADING_LEVELS: Mapping[str, int] = {f"h{level}": level for level in range(1, 7)}
 
@@ -68,17 +66,6 @@ collected rather than starting a block, so ``<p>`` is not split at every ``<stro
 _INDENT = "  "
 
 _TEXT_NODE = "-text"
-
-
-class WebConfig(BaseModel):
-    """Configuration for :class:`WebParser`."""
-
-    drop_tags: frozenset[str] = Field(
-        default=frozenset({"script", "style", "noscript", "template"}),
-        description="Elements removed, with their contents, before any text is extracted.",
-    )
-    """These carry no prose. Indexing a script body puts identifiers and punctuation into the
-    vector, where they match queries by accident and cite a line no reader ever saw."""
 
 
 @dataclass(frozen=True, slots=True)

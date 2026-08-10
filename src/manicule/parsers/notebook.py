@@ -38,16 +38,18 @@ from nbformat import NBFormatError
 from nbformat import reader as nbreader
 from nbformat.reader import NotJSONError
 from nbformat.validator import ValidationError
-from pydantic import BaseModel, Field
 
 from manicule.core.anchors import Anchor, HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, Metadata, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.parsers.base import HeadingStack, ParserProfile, decode
+from manicule.parsers.config import (
+    NOTEBOOK_MEDIA_TYPE,
+    NOTEBOOK_MEDIA_TYPES,
+    NotebookConfig,
+)
 
-__all__ = ["MEDIA_TYPE", "NotebookConfig", "NotebookParser"]
-
-MEDIA_TYPE = "application/x-ipynb+json"
+__all__ = ["NOTEBOOK_MEDIA_TYPE", "NOTEBOOK_MEDIA_TYPES", "NotebookConfig", "NotebookParser"]
 
 CELL_ID_MINOR = 5
 """The nbformat minor version that introduced cell ids. Below it, fragments are ``None``."""
@@ -57,22 +59,6 @@ _SUPPORTED_MAJOR = 4
 _ATX_HEADING = re.compile(r"^(#{1,6})[ \t]+(.*)$")
 _CLOSING_HASHES = re.compile(r"[ \t]+#+[ \t]*$")
 _FENCE = re.compile(r"^\s*(?:```|~~~)")
-
-
-class NotebookConfig(BaseModel):
-    """Configuration for :class:`NotebookParser`."""
-
-    include_outputs: bool = Field(
-        default=True,
-        description="Index text outputs — stream output, text/plain results, error messages — "
-        "as prose under their cell. On by default because the output is often the only place "
-        "the answer appears; off for notebooks whose outputs are megabytes of logging.",
-    )
-    include_raw_cells: bool = Field(
-        default=True,
-        description="Index raw cells. They hold content a conversion step consumes — LaTeX, "
-        "reStructuredText, nbconvert directives — which is prose to a reader and to a query.",
-    )
 
 
 def _is_object(value: object) -> TypeGuard[dict[str, object]]:
@@ -380,7 +366,7 @@ class NotebookParser:
     heading path repeats, and cells before the first heading in a notebook with no title.
     """
 
-    media_types = frozenset({MEDIA_TYPE})
+    media_types = NOTEBOOK_MEDIA_TYPES
     profile = ParserProfile(name="notebook", max_unlocated_ratio=0.05, max_pagelevel_ratio=None)
 
     def __init__(self, config: NotebookConfig) -> None:

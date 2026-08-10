@@ -33,7 +33,6 @@ from dataclasses import dataclass, field
 
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
-from pydantic import BaseModel, Field
 
 from manicule.core.anchors import Anchor, HeadingAnchor, LineAnchor, Unlocated
 from manicule.core.content import BlockKind, Metadata, ParsedBlock, RawDocument
@@ -45,12 +44,9 @@ from manicule.parsers.base import (
     lines_of,
     resolve_lines,
 )
+from manicule.parsers.config import MARKDOWN_MEDIA_TYPES, MarkdownConfig
 
 __all__ = ["MARKDOWN_MEDIA_TYPES", "MarkdownConfig", "MarkdownParser"]
-
-MARKDOWN_MEDIA_TYPES = frozenset({"text/markdown", "text/x-markdown", "text/mdx"})
-"""What routes here. ``text/mdx`` is unregistered but is what the extension map resolves
-``.mdx`` to, and MDX is Markdown with components rather than a format of its own."""
 
 _BLOCK_KINDS: Mapping[str, BlockKind] = {
     "paragraph_open": BlockKind.PROSE,
@@ -81,26 +77,6 @@ _MAX_BLOCK_INDENT = 3
 """Indent past which CommonMark stops seeing a block start and starts seeing code."""
 
 _HEADING_LEVELS: Mapping[str, int] = {f"h{level}": level for level in range(1, 7)}
-
-
-class MarkdownConfig(BaseModel):
-    """Configuration for :class:`MarkdownParser`."""
-
-    front_matter: bool = Field(
-        default=True,
-        description="Treat a leading ``---`` fenced block as metadata rather than content.",
-    )
-    """Front matter left in place is not inert. CommonMark reads ``title: Something`` followed
-    by ``---`` as a setext heading, so the document acquires a top-level heading nobody wrote
-    and every heading path below it hangs off it."""
-
-    jsx_media_types: frozenset[str] = Field(
-        default=frozenset({"text/mdx"}),
-        description="Media types whose documents may contain JSX component tags.",
-    )
-    """Declared rather than sniffed from the body: a ``.md`` file containing a line that looks
-    like a component tag is a Markdown file containing that text, and guessing otherwise would
-    drop it from the index."""
 
 
 @dataclass(frozen=True, slots=True)

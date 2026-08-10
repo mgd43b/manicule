@@ -145,7 +145,7 @@ export function openSession(id: string, clock: () => number): Session {
 """
 
 
-_NESTED_CLASSES = '''"""Deliberately nested definitions, to check the symbol chain reaches the bottom."""
+_NESTED_CLASSES = '''"""Nested definitions, to check the symbol chain reaches the bottom."""
 
 
 class Outer:
@@ -190,14 +190,14 @@ def _oversized_function() -> str:
         "    summary: dict[str, int] = {}",
     ]
     body = [
-        f"    summary[\"reading_{index:03d}\"] = readings[{index}] * {index + 2} "
+        f'    summary["reading_{index:03d}"] = readings[{index}] * {index + 2} '
         f"if len(readings) > {index} else {index}"
         for index in range(48)
     ]
     return "\n".join([*header, *body, "    return summary", ""])
 
 
-_DECORATED = '''"""Decorator-heavy definitions: the block covers a node that is not itself a definition."""
+_DECORATED = '''"""Decorators: the block covers a node that is not itself a definition."""
 
 import functools
 
@@ -268,7 +268,7 @@ _COMMENTS_ONLY = """# This file holds nothing but commentary.
 """
 
 
-_NO_TRAILING_NEWLINE = '''"""No newline closes this file, which is where line counting usually breaks."""
+_NO_TRAILING_NEWLINE = '''"""No closing newline, which is where line counting breaks."""
 
 FIRST_CONSTANT = 1
 
@@ -364,7 +364,7 @@ def _large_module() -> str:
         for step in range(28):
             parts.append(
                 f'    result_{index:03d}["step_{index:03d}_{step:02d}"] = '
-                f"payload.get(\"seed\", {step}) * {index * 31 + step + 1}"
+                f'payload.get("seed", {step}) * {index * 31 + step + 1}'
             )
         parts.append(f"    return result_{index:03d}")
         parts.append("")
@@ -386,7 +386,9 @@ _TEXT_FIXTURES: dict[str, str] = {
     "hostile-astral.py": _ASTRAL,
 }
 
-MALFORMED_UTF8 = b'"""Latin-1 in a file declared as UTF-8."""\n\n\ndef caf\xe9() -> int:\n    return 1\n'
+MALFORMED_UTF8 = (
+    b'"""Latin-1 in a file declared as UTF-8."""\n\n\ndef caf\xe9() -> int:\n    return 1\n'
+)
 """A byte sequence no UTF-8 decoder accepts. ``0xE9`` opens a three-byte sequence that never
 arrives, so this cannot be mistaken for an encoding the parser should have guessed."""
 

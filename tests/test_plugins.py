@@ -56,8 +56,9 @@ def test_the_example_plugin_registers_through_the_public_path() -> None:
 
 def test_a_disabled_plugin_is_not_loaded() -> None:
     found = discover(disabled=frozenset({"example"}))
-    assert found.names == ()
+    assert "example" not in found.names
     assert found.disabled == ("example",)
+    assert not found.registry.has(ComponentKind.PARSER, "example")
 
 
 def test_an_allow_list_filters_what_was_discovered() -> None:

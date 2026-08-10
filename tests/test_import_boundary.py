@@ -74,6 +74,52 @@ MANICULE_PACKAGES = (
 )
 
 
+PARSING_LIBRARIES = (
+    "pypdfium2",
+    "tree_sitter",
+    "tree_sitter_language_pack",
+    "selectolax",
+    "docx",
+    "pptx",
+    "nbformat",
+    "markdown_it",
+    "python_calamine",
+    "ruamel",
+    "tiktoken",
+)
+"""The libraries the built-in parsers are built on.
+
+Listed separately from :data:`IMPLEMENTATION_MODULES` because the claim about them is
+stronger: these *are* installed in this environment and importable, so the check below is not
+"a missing package stays missing" but "an installed package is not loaded until something
+needs it".
+"""
+
+
+def _modules_added_by_discovery() -> set[str]:
+    """Run plugin discovery in a fresh interpreter and report what it loaded.
+
+    In a subprocess for the same reason as the checks below, and one step further: by the time
+    the suite reaches this module every parser has already been imported by some other test,
+    so an in-process check would report nothing at all.
+    """
+    script = (
+        "import json, sys\n"
+        "before = set(sys.modules)\n"
+        "from manicule.plugins import discover\n"
+        "discover()\n"
+        "print(json.dumps(sorted(set(sys.modules) - before)))\n"
+    )
+    completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    added: list[str] = json.loads(completed.stdout)
+    return set(added)
+
+
 def _modules_added_by_importing(*packages: str) -> set[str]:
     """Import ``packages`` in a fresh interpreter and report what *they* loaded.
 
@@ -128,6 +174,45 @@ def test_core_alone_needs_nothing_but_pydantic() -> None:
         "typing_extensions",
         "typing_inspection",
     }, f"manicule.core imported {sorted(third_party)}"
+
+
+@pytest.mark.contract
+def test_registering_the_built_in_parsers_loads_no_parsing_library() -> None:
+    """Discovery runs before configuration is read, in every process that starts.
+
+    Registration needs two things about a parser: the media types it claims, so a document can
+    be routed without building every installed parser, and its configuration model, so settings
+    written for it are validated rather than ignored. Both live in ``manicule.parsers.config``,
+    which imports nothing heavier than pydantic. Without that separation, an installation whose
+    corpus is entirely Markdown would load pdfium, tree-sitter, python-docx, python-pptx,
+    selectolax, nbformat, calamine and ruamel.yaml at startup — including for ``manicule
+    doctor``, which is not going to parse anything at all.
+    """
+    loaded = _modules_added_by_discovery()
+    leaked = sorted(
+        name
+        for name in PARSING_LIBRARIES
+        if any(module == name or module.startswith(f"{name}.") for module in loaded)
+    )
+    assert leaked == [], (
+        f"plugin discovery loaded {', '.join(leaked)}. A parser's library belongs inside the "
+        f"factory that builds the parser; what registration needs eagerly — media types and a "
+        f"config model — belongs in manicule.parsers.config"
+    )
+
+
+@pytest.mark.contract
+def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
+    """The built-in parsers take the same route a third-party plugin takes.
+
+    If they had a shorter internal route, the extension mechanism could stop working while
+    every built-in parser still ran, and nobody would find out until somebody wrote a plugin.
+    """
+    from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points  # noqa: PLC0415
+
+    found = {point.name: point.value for point in installed_entry_points(ENTRY_POINT_GROUP)}
+
+    assert found.get("parsing") == "manicule.parsers.plugin:PLUGIN"
 
 
 @pytest.mark.contract

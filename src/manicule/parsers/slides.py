@@ -49,16 +49,14 @@ from pptx.shapes.graphfrm import GraphicFrame
 from pptx.shapes.group import GroupShape
 from pptx.slide import Slide
 from pptx.table import Table
-from pydantic import BaseModel, Field
 
 from manicule.core.anchors import Anchor, PageAnchor, Rect
 from manicule.core.content import BlockKind, Metadata, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.parsers.base import ParserProfile
+from manicule.parsers.config import SLIDES_MEDIA_TYPE, SLIDES_MEDIA_TYPES, SlidesConfig
 
-__all__ = ["MEDIA_TYPE", "SlidesConfig", "SlidesParser"]
-
-MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+__all__ = ["SLIDES_MEDIA_TYPE", "SLIDES_MEDIA_TYPES", "SlidesConfig", "SlidesParser"]
 
 _CELL_SEPARATOR = "\t"
 _ROW_SEPARATOR = "\n"
@@ -72,17 +70,6 @@ last-bit difference in a stored-and-reloaded float cannot make an anchor stop re
 three orders of magnitude tighter than :data:`~manicule.core.anchors.EDGE_TOLERANCE`, which
 absorbs transform noise — this one only absorbs round-tripping.
 """
-
-
-class SlidesConfig(BaseModel):
-    """Configuration for :class:`SlidesParser`."""
-
-    include_speaker_notes: bool = Field(
-        default=True,
-        description="Index speaker notes as prose on their slide. On by default because the "
-        "notes frequently carry the sentence the slide only gestures at; off for decks whose "
-        "notes are a rehearsal script nobody should retrieve.",
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,7 +281,7 @@ class SlidesParser:
     working — the citation still names the right slide, so nothing else would say.
     """
 
-    media_types = frozenset({MEDIA_TYPE})
+    media_types = SLIDES_MEDIA_TYPES
     profile = ParserProfile(name="slides", max_unlocated_ratio=0.0, max_pagelevel_ratio=0.20)
 
     def __init__(self, config: SlidesConfig) -> None:

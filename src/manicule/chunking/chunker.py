@@ -402,13 +402,14 @@ class StructuralChunker:
         running = 0
         opens_section = True
 
-        for unit in units:
-            if unit.kind is BlockKind.HEADING:
+        for original in units:
+            if original.kind is BlockKind.HEADING:
                 if current:
                     groups.append(current)
                 current, running = [], 0
                 opens_section = True
                 continue
+            unit = original
             if not current and opens_section:
                 # Remembered on the chunk's first unit so the minimum-size merge below can
                 # see a heading boundary it must not cross.

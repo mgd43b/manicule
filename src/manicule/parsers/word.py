@@ -26,10 +26,9 @@ introduction quote the whole chapter.
 from __future__ import annotations
 
 import io
-import re
 import zipfile
 from collections import Counter
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass, field
 
 import docx
@@ -37,84 +36,17 @@ from docx.document import Document as DocxDocument
 from docx.opc.exceptions import PackageNotFoundError
 from docx.table import Table
 from docx.text.paragraph import Paragraph
-from pydantic import BaseModel, Field
 
 from manicule.core.anchors import Anchor, HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, Metadata, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.parsers.base import HeadingStack, ParserProfile, SlugAllocator
+from manicule.parsers.config import WORD_MEDIA_TYPE, WORD_MEDIA_TYPES, WordConfig
 
-__all__ = ["MEDIA_TYPE", "WordConfig", "WordParser"]
-
-MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-
-_HEADING_STYLE = re.compile(r"^heading([1-9])$")
-"""Word's built-in heading styles, matched against a style key with spaces removed.
-
-The style **id** is matched first because Word localises style names but not ids: a document
-authored in German carries ``Heading1`` as the id and ``Überschrift 1`` as the name, and a
-parser matching only the name finds no headings at all in it.
-"""
-
-_LIST_STYLES: tuple[str, ...] = ("List Bullet", "List Number", "List Paragraph", "List Continue")
+__all__ = ["WORD_MEDIA_TYPE", "WORD_MEDIA_TYPES", "WordConfig", "WordParser"]
 
 _CELL_SEPARATOR = "\t"
 _ROW_SEPARATOR = "\n"
-
-
-class WordConfig(BaseModel):
-    """Configuration for :class:`WordParser`."""
-
-    extra_heading_styles: dict[str, int] = Field(
-        default_factory=dict[str, int],
-        description="Style name or id to heading level, for templates that define their own "
-        "heading styles. Word's built-in Heading 1-9 are always recognised; a house template "
-        "calling its top level 'Chapter Title' has no heading structure without this.",
-    )
-    list_style_prefixes: tuple[str, ...] = Field(
-        default=_LIST_STYLES,
-        description="Paragraph styles whose paragraphs are list items. A trailing digit is the "
-        "nesting level, matching Word's 'List Bullet 2'. Configurable because the depth a "
-        "template supports is a template decision.",
-    )
-    table_header_rows: int = Field(
-        default=1,
-        ge=0,
-        description="How many leading rows of a table are header rows. The chunker repeats "
-        "them into every part of a table too large for one chunk (docs/parsing.md §4.2). "
-        "Declared here because WordprocessingML records a repeating header row in a place "
-        "python-docx does not expose, and the alternative — reading it off the first row being "
-        "bold — is the guess that section forbids.",
-    )
-
-    def heading_level(self, keys: Sequence[str]) -> int | None:
-        """The heading level a paragraph's style keys imply, or ``None`` if it is not one."""
-        for key in keys:
-            declared = self.extra_heading_styles.get(key)
-            if declared is not None:
-                return min(max(declared, 1), 9)
-        for key in keys:
-            match = _HEADING_STYLE.match(_flatten(key))
-            if match is not None:
-                return int(match.group(1))
-        return None
-
-    def list_level(self, keys: Sequence[str]) -> int | None:
-        """The list nesting level a paragraph's style keys imply, or ``None``."""
-        for key in keys:
-            flat = _flatten(key)
-            for prefix in self.list_style_prefixes:
-                base = _flatten(prefix)
-                if flat == base:
-                    return 1
-                if flat.startswith(base) and flat[len(base) :].isdigit():
-                    return int(flat[len(base) :])
-        return None
-
-
-def _flatten(key: str) -> str:
-    """A style key with spacing and case removed, so an id and a name compare equal."""
-    return key.replace(" ", "").lower()
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,7 +262,7 @@ class WordParser:
     never emits a :class:`~manicule.core.anchors.PageAnchor` — a DOCX has no pages to number.
     """
 
-    media_types = frozenset({MEDIA_TYPE})
+    media_types = WORD_MEDIA_TYPES
     profile = ParserProfile(name="word", max_unlocated_ratio=0.05, max_pagelevel_ratio=None)
 
     def __init__(self, config: WordConfig) -> None:

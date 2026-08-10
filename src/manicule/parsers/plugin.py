@@ -33,6 +33,15 @@ if TYPE_CHECKING:
 
 CHUNKER_NAME = "structural"
 
+SOURCE_CODE_NAME = "sourcecode"
+"""The registered name of the code parser.
+
+Named once because two things reach for it: the registration below, and the chunker factory,
+which reads the code parser's declared language set out of configuration in order to record a
+grammar version per language. Two spellings of one name would make the fingerprint silently
+fall back to the default language set the moment somebody renamed the parser.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class _Registration:
@@ -56,7 +65,7 @@ PARSERS: tuple[_Registration, ...] = (
         summary="Page and rectangle provenance from pdfium character boxes.",
     ),
     _Registration(
-        name="sourcecode",
+        name=SOURCE_CODE_NAME,
         module="manicule.parsers.sourcecode",
         factory="SourceCodeParser",
         config_model=parser_config.SourceCodeConfig,
@@ -82,8 +91,8 @@ PARSERS: tuple[_Registration, ...] = (
     _Registration(
         name="adf",
         module="manicule.parsers.adf",
-        factory="AdfParser",
-        config_model=parser_config.AdfConfig,
+        factory="ADFParser",
+        config_model=parser_config.ADFConfig,
         media_types=parser_config.ADF_MEDIA_TYPES,
         summary="Confluence Atlassian Document Format, with the source's own anchors.",
     ),
@@ -208,17 +217,30 @@ def _build_chunker(context: BuildContext) -> StructuralChunker:
 def _grammar_versions(context: BuildContext) -> dict[str, str]:
     """Grammar version by language, for ``ChunkFingerprint.grammars``.
 
-    Empty when the code parser is not installed or its grammars have not been fetched. That
-    is honest rather than convenient: a fingerprint claiming a grammar version the machine
-    does not have would let a corpus built without tree-sitter pass a comparison against one
-    built with it.
+    Read from **configuration**, not from the cache and not from a constructed parser.
+
+    Not the cache, because a map that shrank when a grammar was missing would make the
+    fingerprint depend on cache state — a freshly installed machine and a warmed one would
+    declare their corpora incompatible for no reason at all, and an air-gapped install with no
+    route to the grammar mirror could not build a chunker at all. Recording a grammar version
+    must never require the network, and here it does not: the language set is configuration and
+    the version is distribution metadata.
+
+    Not a constructed parser, because building the code parser would also configure the
+    grammar pack's process-global registry — pointing it at a cache directory and a manifest
+    mirror — as a side effect of asking a question about configuration.
+
+    The declared set is validated here rather than trusted. That does import the grammar pack,
+    to check the keys against the names it ships; validating late instead would let a typo
+    become a fingerprint recording a language that does not exist, on a corpus that happens to
+    contain no code and so never builds the parser that would have caught it.
     """
-    del context
-    try:
-        from manicule.parsers.grammars import grammar_versions  # noqa: PLC0415 - optional
-    except ImportError:  # pragma: no cover - tree-sitter is a declared dependency
-        return {}
-    return dict(grammar_versions())
+    from manicule.parsers.config import SourceCodeConfig  # noqa: PLC0415 - see module docstring
+    from manicule.parsers.grammars import grammar_versions  # noqa: PLC0415
+
+    declared = context.settings.component_config("parser", SOURCE_CODE_NAME)
+    config = SourceCodeConfig.model_validate(dict(declared))
+    return dict(grammar_versions(config.languages))
 
 
 def _pinned_versions() -> dict[str, str]:
@@ -229,7 +251,7 @@ def _pinned_versions() -> dict[str, str]:
     in every HTML email — round-tripping today and pointing at the wrong paragraph after a
     dependency bump, with no test failing in between.
     """
-    return {"html_text": parser_config.HTML_TEXT_VERSION}
+    return {"html_text": parser_config.html_text_version()}
 
 
 class ParsingPlugin:
@@ -277,4 +299,4 @@ PLUGIN = ParsingPlugin()
 # the protocol every installation loads it through.
 _plugin: Plugin = PLUGIN
 
-__all__ = ["CHUNKER_NAME", "PARSERS", "PLUGIN", "ParsingPlugin"]
+__all__ = ["CHUNKER_NAME", "PARSERS", "PLUGIN", "SOURCE_CODE_NAME", "ParsingPlugin"]
