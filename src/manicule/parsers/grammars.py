@@ -424,9 +424,13 @@ def configure_pack(
 
     Both overrides exist for deployments rather than for taste: a container image wants the
     cache inside the image, and an air-gapped site wants the manifest on its own mirror.
-    Passing ``None`` for either restores the pack's default, so a later call cannot leave a
-    previous call's override in force — which matters because the pack keeps one registry
-    per process.
+
+    Passing ``None`` for either restores the pack's default, and doing so takes explicit
+    work: the pack's own configuration call is **additive**, so handing it a null cache
+    directory leaves the previous override in force rather than clearing it. "The default"
+    therefore means the directory the pack reported before this module changed anything,
+    captured once. It matters because the pack keeps one registry per process, so a call
+    that meant to reset would otherwise silently inherit whatever ran before it.
 
     Args:
         languages: The declared set, recorded with the pack so its own prefetch entry points
@@ -495,7 +499,8 @@ def prefetch(languages: Sequence[str]) -> tuple[str, ...]:
     Raises:
         ConfigError: A declared key is not in the manifest.
         GrammarFetchError: The fetch failed — no route to the manifest, a mirror that does
-            not have it, a checksum mismatch.
+            not have it, a checksum mismatch — **or it reported success and the grammar is
+            still not in the cache**, which is checked rather than assumed. See below.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
 
@@ -509,15 +514,32 @@ def prefetch(languages: Sequence[str]) -> tuple[str, ...]:
         # RuntimeError is in this tuple because the native layer maps some download failures
         # to the pack's own exception hierarchy and others to a bare RuntimeError; catching
         # only the former would let an unreachable mirror surface as an unhandled crash.
-        url = os.environ.get(MANIFEST_URL_ENV, "the pack's default manifest URL")
-        msg = (
-            f"could not fetch grammars for {list(absent)} from {url} into "
-            f"{cache_directory()}: {exc}. Set {MANIFEST_URL_ENV} to an internal mirror if "
-            f"this host has no route to the public manifest, or narrow the declared "
-            f"language set."
+        raise GrammarFetchError(_fetch_failure(absent, str(exc))) from exc
+
+    # The pack's own prefetch returns without error for a language it has already loaded into
+    # its process-global registry, **even when the configured cache does not contain it** —
+    # observed, not assumed. So a container build that loads one Python file and then
+    # pre-seeds into an image directory is told it succeeded and ships an image with no
+    # grammars in it, and the failure surfaces on an air-gapped host as a refusal to parse
+    # code that worked on the machine that built it. Asking the cache afterwards costs a
+    # directory listing and turns that into an error where it can still be acted on.
+    still_missing = missing_grammars(absent)
+    if still_missing:
+        detail = (
+            f"the grammar pack reported success but {list(still_missing)} is still not in the cache"
         )
-        raise GrammarFetchError(msg) from exc
+        raise GrammarFetchError(_fetch_failure(still_missing, detail))
     return absent
+
+
+def _fetch_failure(languages: Sequence[str], detail: str) -> str:
+    """One message for both ways a pre-seed can fail, naming the mirror it tried."""
+    url = os.environ.get(MANIFEST_URL_ENV, "the pack's default manifest URL")
+    return (
+        f"could not fetch grammars for {list(languages)} from {url} into "
+        f"{cache_directory()}: {detail}. Set {MANIFEST_URL_ENV} to an internal mirror if "
+        f"this host has no route to the public manifest, or narrow the declared language set."
+    )
 
 
 def grammar_versions(languages: Sequence[str]) -> dict[str, str]:

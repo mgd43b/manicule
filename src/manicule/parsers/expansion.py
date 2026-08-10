@@ -28,7 +28,8 @@ files and we indexed 197" is not a fact anyone would ever discover.
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -47,12 +48,15 @@ __all__ = [
     "MemberFailure",
     "MemberOutcome",
     "SupportsExpansion",
+    "aclose_members",
     "container_depth_of",
+    "expanding",
     "inner_path",
     "media_type_for",
     "member_source_id",
     "member_uri",
     "path_hashes_of",
+    "read_members",
     "tree_bytes_of",
     "tree_members_of",
 ]
@@ -238,6 +242,54 @@ class SupportsExpansion(Protocol):
                 fallback chain gets a turn.
         """
         ...
+
+
+@asynccontextmanager
+async def expanding(
+    container: SupportsExpansion, raw: RawDocument
+) -> AsyncGenerator[AsyncIterator[MemberOutcome]]:
+    """Iterate a container's members, closing the stream on **every** exit path.
+
+    :meth:`SupportsExpansion.expand` is an async generator like :meth:`Parser.parse
+    <manicule.core.protocols.Parser.parse>`, and it holds more: an archive expansion is
+    suspended at the ``yield`` holding an open :class:`zipfile.ZipFile` and a decompression
+    stream. A consumer that stops after one member — a pipeline with a member budget, an
+    assertion failing between two members — strands all of it until CPython finalises the
+    generator through the loop that created it, which by then may have closed.
+
+    So iteration goes through here::
+
+        async with expanding(parser, raw) as members:
+            async for member in members:
+                ...
+    """
+    stream = container.expand(raw)
+    try:
+        yield stream
+    finally:
+        await aclose_members(stream)
+
+
+async def aclose_members(stream: AsyncIterator[MemberOutcome]) -> None:
+    """Close a member stream if it is a generator, and do nothing if it is not.
+
+    :meth:`SupportsExpansion.expand` promises an ``AsyncIterator``, which is weaker than an
+    async generator and has no ``aclose``, so this asks rather than assumes.
+    """
+    closer = getattr(stream, "aclose", None)
+    if closer is None:
+        return
+    await closer()
+
+
+async def read_members(container: SupportsExpansion, raw: RawDocument) -> list[MemberOutcome]:
+    """Every outcome a container produces, with the stream closed afterwards.
+
+    The ordinary full drain. Use :func:`expanding` when the members are wanted one at a time
+    or the loop may stop early.
+    """
+    async with expanding(container, raw) as members:
+        return [member async for member in members]
 
 
 def container_depth_of(raw: RawDocument) -> int:

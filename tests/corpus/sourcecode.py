@@ -197,7 +197,35 @@ def _oversized_function() -> str:
     return "\n".join([*header, *body, "    return summary", ""])
 
 
-_DECORATED = '''"""Decorators: the block covers a node that is not itself a definition."""
+def _long_string() -> str:
+    """A function whose body is one enormous string literal.
+
+    The descent has to stop at it. Python's grammar gives a string children, and some of
+    them begin on lines of their own, so a splitter that simply took the next node boundary
+    down would cut the literal in half — producing two blocks that are each syntactically
+    nothing and a citation quoting a fragment with no opening quote.
+    """
+    lines = [
+        '"""A function whose body is one very long literal."""',
+        "",
+        "",
+        "def banner() -> str:",
+        '    """Return a block of text that has to survive splitting intact."""',
+        '    return """',
+    ]
+    # Every second line carries an escape sequence, which the grammar makes a child node of
+    # the string with a line of its own. Without them the literal has no interior boundary at
+    # all and a splitter that descended into strings would look correct here by luck.
+    lines += [
+        f"    line {index:03d} of the banner, distinct from every other line"
+        + (r" \t tabbed" if index % 2 else "")
+        for index in range(24)
+    ]
+    lines += ['    """', ""]
+    return "\n".join(lines)
+
+
+_DECORATED = '''"""Decorator-heavy definitions, where a block covers a node that is not one."""
 
 import functools
 
@@ -268,7 +296,7 @@ _COMMENTS_ONLY = """# This file holds nothing but commentary.
 """
 
 
-_NO_TRAILING_NEWLINE = '''"""No closing newline, which is where line counting breaks."""
+_NO_TRAILING_NEWLINE = '''"""No newline closes this file, which is where line counting breaks."""
 
 FIRST_CONSTANT = 1
 
@@ -401,6 +429,7 @@ def build(dest: Path) -> None:
         (dest / name).write_text(content, encoding="utf-8")
 
     (dest / "hard-oversized-function.py").write_text(_oversized_function(), encoding="utf-8")
+    (dest / "hard-long-string.py").write_text(_long_string(), encoding="utf-8")
     # The one deliberate exception to the corpus size cap, named so the intent is visible in
     # the directory listing rather than only in the generator.
     (dest / "module-large.py").write_text(_large_module(), encoding="utf-8")

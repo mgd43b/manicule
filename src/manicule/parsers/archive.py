@@ -171,6 +171,12 @@ class ArchiveParser:
         reporting it as a failed one would fill diagnostics with entries nobody can act on.
         Everything that could have been a document produces either a member or a reason.
 
+        The archive is held open by a ``with`` that **encloses every** ``yield``. A consumer
+        that stops after one member throws ``GeneratorExit`` in at the suspension point, and
+        only a ``finally`` runs after that — so a close placed after the loop would leave a
+        ``ZipFile`` and its decompression stream suspended, to be finalised later from a loop
+        that may already have gone. That is a crash inside the allocator rather than a warning.
+
         Raises:
             ParseError: The bytes are not a zip, or are a document container (§9.4).
         """
@@ -183,6 +189,10 @@ class ArchiveParser:
             for info in archive.infolist():
                 if info.is_dir():
                     continue
+                # Counted before the name is judged, because a rejected member still becomes a
+                # stored document with a reason. Counting only the readable ones would let an
+                # archive of ten thousand hostile names spend no budget at all.
+                used_members += 1
                 path = inner_path(info.filename)
                 if path is None:
                     yield _refusal(
@@ -195,7 +205,6 @@ class ArchiveParser:
                         DocumentStatus.FAILED,
                     )
                     continue
-                used_members += 1
                 outcome, stop = self._member(
                     raw,
                     archive,

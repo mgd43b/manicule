@@ -74,6 +74,19 @@ class _Unit:
     starts_section: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _Overlap:
+    """An overlap window: the text carried forward, and where it came from.
+
+    The units travel with the text because the next chunk's anchor has to cover them. Text
+    alone would leave the caller reconstructing provenance by counting characters, which is
+    the kind of arithmetic that is right until a separator changes.
+    """
+
+    text: str = ""
+    units: tuple[_Unit, ...] = ()
+
+
 class StructuralChunker:
     """Groups blocks into retrievable chunks, respecting the structure the parser found.
 
@@ -464,12 +477,16 @@ class StructuralChunker:
         for position, group in enumerate(groups):
             text = BLOCK_SEPARATOR.join(unit.text for unit in group)
             overlap = self._overlap_from(previous, group)
-            if overlap:
-                text = f"{overlap}{BLOCK_SEPARATOR}{text}"
+            if overlap.text:
+                text = f"{overlap.text}{BLOCK_SEPARATOR}{text}"
             heading_path = group[0].heading_path
             crumb = self._breadcrumb(document, heading_path)
             embed_text = f"{crumb}{BLOCK_SEPARATOR}{text}" if crumb else text
-            anchor = _merge_anchors([unit.anchor for unit in group])
+            # The overlap window extends the anchor with it (docs/parsing.md §4.3). A chunk
+            # that opens with the previous chunk's last sentences and names only its own lines
+            # quotes from outside the place it cites — and it reads correctly while doing so,
+            # which is why only the round-trip check finds it.
+            anchor = _merge_anchors([unit.anchor for unit in (*overlap.units, *group)])
             chunks.append(
                 Chunk(
                     id=chunk_id(document.id, position, text),
@@ -487,40 +504,70 @@ class StructuralChunker:
             previous = group
         return chunks
 
-    def _overlap_from(self, previous: Sequence[_Unit] | None, group: Sequence[_Unit]) -> str:
-        """Whole trailing sentences of the previous chunk, when overlap applies.
+    def _overlap_from(self, previous: Sequence[_Unit] | None, group: Sequence[_Unit]) -> _Overlap:
+        """Whole trailing sentences of the previous chunk, and the units they came from.
 
-        Taken in whole units, never mid-sentence: a window that cuts mid-sentence produces a
-        chunk starting on a fragment, which is what the overlap existed to avoid.
+        Taken in whole sentences, never mid-sentence: a window that cuts mid-sentence produces
+        a chunk starting on a fragment, which is what the overlap existed to avoid.
 
         Capped at **half** the preceding chunk. The overlap window and the minimum chunk size
         are the same number, so an uncapped window would make a minimum-sized chunk's
         successor open with an exact copy of the whole thing — two chunks, one entirely
         contained in the other, both matching the same query.
+
+        The contributing units are returned as well as the text, because the anchor has to
+        cover them (``docs/parsing.md`` §4.3). Sentences are taken per unit rather than from
+        the joined text so that provenance is exact rather than reconstructed by counting
+        characters — a sentence never spans two blocks, so nothing is lost by it.
         """
         if previous is None or self._overlap_tokens <= 0:
-            return ""
+            return _Overlap()
         if _dominant_kind(previous) not in OVERLAPPING_KINDS:
-            return ""
+            return _Overlap()
         if _dominant_kind(group) not in OVERLAPPING_KINDS:
-            return ""
+            return _Overlap()
         if not _mergeable(previous[-1].anchor, group[0].anchor):
             # The overlap would be text the next chunk's anchor does not cover, which is a
             # citation quoting from outside the place it names.
-            return ""
+            return _Overlap()
         source = BLOCK_SEPARATOR.join(unit.text for unit in previous)
         cap = min(self._overlap_tokens, max(1, self._counter(source) // 2))
+
         taken: list[str] = []
+        used: list[_Unit] = []
         running = 0
-        for sentence in reversed(sentences(source) or [source]):
-            tokens = self._counter(sentence)
-            if taken and running + tokens > cap:
+        for unit in reversed(previous):
+            # A unit the next chunk's anchor already covers may be cut into: taking part of it
+            # widens nothing, because the anchor is the same one either way. That is the case
+            # whenever an oversized block was split across chunks, which is where overlap
+            # matters most. Any other unit is taken whole or not at all — a partial take would
+            # leave the anchor covering lines the chunk does not quote, and a line anchor is
+            # meant to *be* the text it addresses.
+            free = unit.anchor == group[0].anchor
+            unit_sentences = list(reversed(sentences(unit.text) or [unit.text]))
+            if not free:
+                unit_tokens = sum(self._counter(sentence) for sentence in unit_sentences)
+                if running + unit_tokens > cap:
+                    break
+                taken[0:0] = list(reversed(unit_sentences))
+                used.insert(0, unit)
+                running += unit_tokens
+                continue
+            stopped = False
+            contributed = False
+            for sentence in unit_sentences:
+                tokens = self._counter(sentence)
+                if running + tokens > cap:
+                    stopped = True
+                    break
+                taken.insert(0, sentence)
+                running += tokens
+                contributed = True
+            if contributed:
+                used.insert(0, unit)
+            if stopped:
                 break
-            if not taken and tokens > cap:
-                return ""
-            taken.insert(0, sentence)
-            running += tokens
-        return " ".join(taken)
+        return _Overlap(" ".join(taken), tuple(used))
 
     def _breadcrumb(self, document: Document, heading_path: Sequence[str]) -> str:
         parts = breadcrumb.elements(
@@ -574,6 +621,14 @@ def _merge_anchors(anchors: Sequence[Anchor]) -> Anchor:
         )
     if isinstance(first, PageAnchor):
         pages = [anchor for anchor in anchors if isinstance(anchor, PageAnchor)]
+        # An empty `rects` means "this page, no finer location" — a slide's speaker notes are
+        # on the slide but not on its surface. Unioning rectangles across a group containing
+        # one of those would produce an anchor covering only the blocks that *had* rectangles,
+        # so the chunk would resolve to text that does not contain what it claims. Page-level
+        # is the coarser answer and the only correct one: it is what every member of the
+        # group can honestly be said to be inside.
+        if any(not anchor.rects for anchor in pages):
+            return PageAnchor(page=first.page)
         rects: list[Rect] = []
         for anchor in pages:
             rects.extend(anchor.rects)

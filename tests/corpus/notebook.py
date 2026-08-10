@@ -107,7 +107,7 @@ def _structurally_hard() -> _Json:
                     _error("OverflowError", "horizon beyond the fitted range", ["Traceback line"])
                 ],
             ),
-            _raw("front-matter", "title: Capacity model\nauthor: platform team\n"),
+            _raw("front-matter", "subtitle: headroom projection\nauthor: platform team\n"),
         ],
     )
 
@@ -149,19 +149,24 @@ def _no_cell_ids() -> _Json:
 
 
 def _repeated_path() -> _Json:
-    """nbformat 4.4 with the same heading twice: no fragment, and an ambiguous path.
+    """nbformat 4.4 whose heading path repeats **non-contiguously**, which is the ambiguous case.
 
-    Deliberately outside the six-assertion harness. Identical heading text means one section's
+    Two adjacent cells under one heading are one section and are addressed perfectly well by its
+    path. The address only becomes ambiguous when the same path opens twice with something else
+    in between, because then it names two places — so the fixture puts a section between them.
+
+    Deliberately outside the six-assertion harness: identical heading text means one section's
     resolved span contains the other's whole heading block, which assertion 3 of
-    ``docs/parsing.md`` §3.3 cannot distinguish from a misplaced anchor, and every block here is
-    ``Unlocated`` anyway. ``tests/parsers/test_notebook.py`` asserts the reason directly.
+    ``docs/parsing.md`` §3.3 cannot distinguish from a misplaced anchor.
+    ``tests/parsers/test_notebook.py`` asserts the reason directly instead.
     """
     return _notebook(
         4,
         4,
         [
-            _markdown(None, "## Setup\n\nFirst setup section.\n"),
-            _markdown(None, "## Setup\n\nSecond setup section, same path.\n"),
+            _markdown(None, "## Setup\n\nFirst installation walkthrough.\n"),
+            _markdown(None, "## Teardown\n\nHow to remove it again.\n"),
+            _markdown(None, "## Setup\n\nSecond installation walkthrough.\n"),
         ],
     )
 
@@ -176,7 +181,10 @@ def _large() -> _Json:
     cells: list[_Json] = [_markdown("start", "# Long run log\n\nOne section per hour.\n")]
     for hour in range(1, 41):
         cells.append(
-            _markdown(f"hour-{hour:02d}", f"## Hour {hour:02d}\n\nWhat the window covered.\n")
+            _markdown(
+                f"hour-{hour:02d}",
+                f"## Hour {hour:02d}\n\nWhat window {hour:02d} covered, in one line.\n",
+            )
         )
         cells.append(
             _code(

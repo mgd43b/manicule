@@ -37,7 +37,7 @@ end, which is the change in the second commit.
 HTML_BODY = """<html>
   <head><title>Ignored, because the subject is the document's title</title></head>
   <body>
-    <h1>Quarterly platform review</h1>
+    <h1>Where the first quarter went</h1>
     <p>Ingest throughput rose by a fifth over the quarter, with no change to the chunk
        budget and therefore no re-embedding.</p>
     <h2>What moved</h2>
@@ -50,6 +50,14 @@ HTML_BODY = """<html>
   </body>
 </html>
 """
+"""An HTML-only body, whose ``<h1>`` deliberately does not repeat the subject.
+
+Real HTML mail very often opens with a heading identical to its subject, and the round-trip
+suite compares *text*: the subject is inside the header block, so an identical heading in the
+body would make resolving the header return the heading block's text and fail assertion 3
+against a parser that is behaving perfectly. The realistic collision belongs in a test of the
+assertion, not in a fixture whose job is to exercise the pinned HTML conversion.
+"""
 
 ATTACHMENT_TEXT = """Rollout checklist
 
@@ -59,6 +67,22 @@ ATTACHMENT_TEXT = """Rollout checklist
 """
 
 ATTACHMENT_JSON = '{"window": "2026-Q1", "documents": 4821, "failed": 3}\n'
+
+BROKEN_CHARSET = (
+    b"From: Ada Okoye <ada@example.invalid>\r\n"
+    b"To: Bo Lindqvist <bo@example.invalid>\r\n"
+    b"Date: Tue, 03 Feb 2026 09:14:00 +0000\r\n"
+    b"Subject: A body that is not the character set it claims\r\n"
+    b'Content-Type: text/plain; charset="utf-8"\r\n'
+    b"\r\n"
+    b"Caf\xe9 written in Latin-1 under a header that says UTF-8.\r\n"
+)
+"""A message whose body declares one character set and is encoded in another.
+
+What a mail client that mislabels its output produces. Decoding it with replacement characters
+would put text into the index that no message contains, under a citation saying it is a
+quotation, so the parser fails rather than guessing a second encoding.
+"""
 
 
 def build(dest: Path) -> None:
@@ -71,6 +95,21 @@ def build(dest: Path) -> None:
     (dest / "not-a-message.eml").write_bytes(
         b"This file has no header fields at all.\nIt is a note somebody renamed.\n"
     )
+    (dest / "empty.eml").write_bytes(b"")
+    (dest / "broken-charset.eml").write_bytes(BROKEN_CHARSET)
+
+
+def _pinned(message: EmailMessage) -> bytes:
+    """Serialise with fixed MIME boundaries, so two runs produce identical bytes.
+
+    :mod:`email` mints a random boundary for every multipart part, which would give the same
+    fixture a different ``content_hash`` on every build — and a corpus that churns on every
+    run cannot be used to assert that a parser does not.
+    """
+    for index, part in enumerate(message.walk()):
+        if part.get_content_maintype() == "multipart":
+            part.set_boundary(f"fixture-boundary-{index:02d}")
+    return message.as_bytes(policy=SMTP)
 
 
 def _base(subject: str) -> EmailMessage:
@@ -89,7 +128,7 @@ def _typical() -> bytes:
     message["In-Reply-To"] = "<fixture-0000@example.invalid>"
     message["References"] = f"<fixture-0000@example.invalid> ({_REPLIED})"
     message.set_content(TYPICAL_BODY)
-    return message.as_bytes(policy=SMTP)
+    return _pinned(message)
 
 
 def _multipart() -> bytes:
@@ -117,19 +156,19 @@ def _multipart() -> bytes:
         subtype="json",
         filename="counts.json",
     )
-    return message.as_bytes(policy=SMTP)
+    return _pinned(message)
 
 
 def _html_only() -> bytes:
     message = _base("Quarterly platform review")
     message.set_content(HTML_BODY, subtype="html")
-    return message.as_bytes(policy=SMTP)
+    return _pinned(message)
 
 
 def _headers_only() -> bytes:
     """Headers and nothing else, which is a real shape: a calendar decline, a bounce stub."""
     message = _base("No body, only headers")
-    return message.as_bytes(policy=SMTP)
+    return _pinned(message)
 
 
 def _duplicate_attachments() -> bytes:
@@ -148,4 +187,4 @@ def _duplicate_attachments() -> bytes:
         subtype="plain",
         filename="report.txt",
     )
-    return message.as_bytes(policy=SMTP)
+    return _pinned(message)

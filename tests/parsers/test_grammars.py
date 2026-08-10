@@ -211,6 +211,41 @@ def test_an_unreachable_manifest_is_reported_with_the_url_it_tried(empty_cache: 
     assert grammars.MANIFEST_URL_ENV in str(raised.value)
 
 
+def test_a_prefetch_that_wrote_nothing_is_a_failure_however_it_reported_itself(
+    tmp_path: Path,
+) -> None:
+    """The pre-seed that succeeds and leaves the cache empty.
+
+    The grammar pack keeps a process-global registry, and its own ``prefetch`` returns
+    without error for a language already in that registry **even when the configured cache
+    directory does not contain it**. A container build that parses one Python file and then
+    pre-seeds into the image directory is therefore told it succeeded, and ships an image
+    with no grammars in it — which surfaces on an air-gapped host as a refusal to parse code
+    that worked on the machine that built the image.
+
+    The load happens first and against the real cache, because that is the order the hazard
+    occurs in and the reason it is not caught by the fixtures elsewhere in this file. Nothing
+    here reaches the network: the manifest is pointed at the discard port, and the failure
+    being guarded against is a *silent success* rather than a download.
+    """
+    if not grammars.is_available("python"):
+        pytest.skip("no python grammar cached, so the pack cannot be warmed without a fetch")
+    grammars.load_parser("python")
+
+    empty = tmp_path / "grammars"
+    empty.mkdir()
+    grammars.configure_pack(
+        grammars.DECLARED_LANGUAGES, cache_dir=empty, manifest_url=UNREACHABLE_MANIFEST
+    )
+
+    with pytest.raises(grammars.GrammarFetchError) as raised:
+        grammars.prefetch(["python"])
+
+    assert "still not in the cache" in str(raised.value)
+    assert str(empty) in str(raised.value)
+    assert not grammars.is_available("python")
+
+
 def test_prefetch_does_nothing_when_every_declared_grammar_is_already_cached() -> None:
     """Pre-seeding is meant to be run on every start.
 

@@ -49,6 +49,7 @@ from manicule.core.content import (
 )
 from manicule.core.errors import ParseError
 from manicule.core.ids import content_hash
+from manicule.core.protocols import read_blocks
 from manicule.parsers.base import ParserProfile, lines_of, resolve_lines
 from manicule.parsers.config import MAIL_MEDIA_TYPES, MailConfig, html_text_version
 from manicule.parsers.expansion import (
@@ -427,8 +428,11 @@ async def _html_to_text(html: str, uri: str) -> str:
     source = RawDocument(
         source_id=uri, uri=f"{uri}#html-body", media_type="text/html", content=html
     )
-    parser = WebParser(WebConfig())
-    return "\n\n".join([block.text async for block in parser.parse(source)])
+    # Drained through ``read_blocks`` rather than a comprehension over ``parse``: a stream
+    # abandoned part-way stays suspended holding whatever it had open at the ``yield``, and
+    # CPython finalises it late, from a loop that may already be closed.
+    blocks = await read_blocks(WebParser(WebConfig()), source)
+    return "\n\n".join(block.text for block in blocks)
 
 
 def _unfolded(value: str) -> str:

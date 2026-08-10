@@ -24,6 +24,16 @@ emitted whole and over budget rather than cut somewhere unsafe.
 would hand the file to the plain-text parser and line-split it — the very outcome the
 declared language set exists to prevent. See :mod:`manicule.parsers.grammars`.
 
+**No native object is alive at a ``yield``.** ``parse`` is an async generator, and one
+abandoned part-way stays suspended holding everything in its frame until CPython finalises it
+through the event loop that created it — which, if that loop has closed, means running a
+native destructor against a torn-down runtime. The usual answer is a ``try``/``finally``
+around the ``yield``, and it is the right answer when a generator must hold a handle open.
+This one need not: the grammar's parser and the tree it produces are locals of
+:func:`_read_tree`, which returns plain data, so by the time the first block is yielded there
+is nothing native left to strand. That is stronger than releasing in a ``finally``, because a
+``finally`` still depends on somebody closing the stream.
+
 **Line numbers come from byte offsets, and the parse tree is copied before anything walks
 it.** This is the one decision here made for the library's sake rather than the document's,
 so it is worth being exact about. ``tree_sitter`` also reports a row and column per node, and
@@ -114,13 +124,16 @@ class SourceCodeParser:
             raise ParseError(msg)
 
         text = decode(raw)
-        parser = grammars.load_parser(language)
         # Parse the *decoded* text re-encoded as UTF-8 rather than the original bytes: node
         # rows then index the same lines `lines_of` produces, which is what lets a row become
         # a LineAnchor without a second, differently-encoded view of the document.
         data = text.encode("utf-8")
         lines = _Lines.of(text, data)
-        root = _mirror(parser.parse(data), language, data, lines)
+        # Every native object lives and dies inside this call, so nothing below holds one
+        # across a `yield`. See the module docstring: that is a requirement here, not a
+        # by-product, and `test_the_parse_tree_is_gone_before_the_first_block_is_yielded`
+        # is what keeps it true.
+        root = _read_tree(language, data, lines)
         separator = grammars.scope_separator(language)
         wrappers = grammars.DEFINITION_WRAPPERS.get(language, frozenset())
 
@@ -183,6 +196,19 @@ class _Item:
         return self.last > self.first
 
     @property
+    def atomic(self) -> bool:
+        """Whether this node must never be descended into.
+
+        A string and a comment are single tokens as far as a citation is concerned, and some
+        grammars give them children — escape sequences, interpolations, content runs — that
+        sit on different lines and would therefore look like safe boundaries. Splitting there
+        cuts a literal in half: the two parts are each syntactically nothing, and the quote a
+        citation shows is missing its opening delimiter. ``docs/parsing.md`` §4.2 forbids it
+        outright, and this is where the ban is enforced rather than hoped for.
+        """
+        return self.is_comment or "string" in self.type
+
+    @property
     def is_comment(self) -> bool:
         """Whether this is a comment, by the grammar's own name for it.
 
@@ -196,6 +222,20 @@ class _Item:
 _Raw = tuple[str, bool, int, int, int, int, str | None, int]
 """One node reduced to primitives: type, named, first line, last line, start byte, end byte,
 definition name, index of its parent (``-1`` for the root)."""
+
+
+def _read_tree(language: str, data: bytes, lines: _Lines) -> _Item:
+    """Parse ``data`` and return the tree as plain data, holding no native object afterwards.
+
+    A separate function so that the grammar's ``Parser`` and the ``Tree`` it produces are
+    locals *here* rather than in the generator frame of :meth:`SourceCodeParser.parse`. An
+    async generator abandoned part-way stays suspended holding everything in its frame, and
+    CPython finalises it later through the loop that created it — against a torn-down runtime
+    if that loop has closed, which surfaces as a crash inside the interpreter rather than as
+    anything nameable. Releasing in a ``finally`` would answer the abandoned case; keeping
+    the native objects out of the frame entirely answers it and the never-closed case too.
+    """
+    return _mirror(grammars.load_parser(language).parse(data), language, data, lines)
 
 
 def _mirror(tree: Tree, language: str, data: bytes, lines: _Lines) -> _Item:
@@ -471,7 +511,7 @@ def _expand(items: tuple[_Item, ...], lines: _Lines) -> tuple[_Item, ...] | None
     widest: _Item | None = None
     index = 0
     for position, item in enumerate(items):
-        if not item.children:
+        if not item.children or item.atomic:
             continue
         if widest is None or lines.length(item.first, item.last) > lines.length(
             widest.first, widest.last

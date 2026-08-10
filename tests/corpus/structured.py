@@ -84,12 +84,20 @@ kind: ConfigMap
 metadata:
   name: ingest-settings
 ---
-apiVersion: v1
+apiVersion: apps/v1beta1
 kind: Secret
 metadata:
   name: ingest-credentials
 stringData:
   token: placeholder-value-for-a-fixture
+"""
+"""Two documents in one stream, whose marks are absolute within it.
+
+The two ``apiVersion`` lines say different things on purpose, and neither is a prefix of the
+other. Assertion 3 asks that resolving one anchor does not return another block's text, and
+``apiVersion: v1`` is contained in ``apiVersion: v1beta1`` — so even *nearly* identical blocks
+would fail a parser that is behaving perfectly, and the tempting repair is to weaken the
+assertion that catches off-by-one line numbers.
 """
 
 UNTERMINATED_QUOTE_YAML = """summary: "a quoted scalar that is never closed, in the way a

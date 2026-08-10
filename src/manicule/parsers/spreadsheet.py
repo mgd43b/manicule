@@ -258,7 +258,9 @@ def _csv_regions(raw: RawDocument, config: SpreadsheetConfig) -> list[_Region]:
     text = decode(raw)
     reader = csv.reader(io.StringIO(text, newline=""), delimiter=config.csv_delimiter)
     try:
-        rows = [list(row) for row in reader]
+        # Flattened per field for the same reason a workbook cell is: a quoted field may hold
+        # a newline, and one row has to be one line because that is where a row split cuts.
+        rows = [[" ".join(field.split()) for field in row] for row in reader]
     except csv.Error as exc:
         msg = (
             f"{raw.uri}: unreadable as CSV ({exc}). Expected delimiter-separated rows with "
@@ -343,29 +345,33 @@ def _xlsx_regions(raw: RawDocument, config: SpreadsheetConfig) -> list[_Region]:
         raise ParseError(msg) from exc
 
     regions: list[_Region] = []
-    for index, metadata in enumerate(workbook.sheets_metadata, start=1):
-        hidden = metadata.visible is not SheetVisibleEnum.Visible
-        if hidden and not config.include_hidden_sheets:
-            continue
-        sheet = workbook.get_sheet_by_name(metadata.name)
-        start = sheet.start
-        values = sheet.to_python()
-        if start is None or not values:
-            continue
-        first_row, first_column = start[0] + 1, start[1] + 1
-        grid = [[_render_cell(cell) for cell in row] for row in values]
-        merged = sheet.merged_cell_ranges or []
-        _fill_merged(grid, merged, first_row, first_column)
-        regions.append(
-            _Region(
-                sheet=metadata.name,
-                index=index,
-                first_row=first_row,
-                first_column=first_column,
-                rows=_rectangular(grid),
-                merged=_merged_refs(merged, first_row, first_column),
+    # Closed here rather than left to the collector: the workbook holds a Rust-side structure,
+    # and every region is materialised before this returns, so there is nothing to keep it open
+    # for. Nothing is held across a yield — the caller iterates regions, not sheets.
+    with workbook:
+        for index, metadata in enumerate(workbook.sheets_metadata, start=1):
+            hidden = metadata.visible is not SheetVisibleEnum.Visible
+            if hidden and not config.include_hidden_sheets:
+                continue
+            sheet = workbook.get_sheet_by_name(metadata.name)
+            start = sheet.start
+            values = sheet.to_python()
+            if start is None or not values:
+                continue
+            first_row, first_column = start[0] + 1, start[1] + 1
+            grid = [[_render_cell(cell) for cell in row] for row in values]
+            merged = sheet.merged_cell_ranges or []
+            _fill_merged(grid, merged, first_row, first_column)
+            regions.append(
+                _Region(
+                    sheet=metadata.name,
+                    index=index,
+                    first_row=first_row,
+                    first_column=first_column,
+                    rows=_rectangular(grid),
+                    merged=_merged_refs(merged, first_row, first_column),
+                )
             )
-        )
     return regions
 
 

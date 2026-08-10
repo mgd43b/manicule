@@ -104,6 +104,13 @@ it further would buy a symbol nobody reads at the cost of unbounded recursion on
 input.
 """
 
+_DIVIDES_NOTHING = 2
+"""Fewer parts than this and a partition has returned the span it was given.
+
+Recursing on it would not terminate, and dividing by lines is the honest next step: the
+document published no finer structure here.
+"""
+
 _BARE_TOML_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 _TOML_TABLE_HEADER = re.compile(r"^[ \t]*(\[\[?)([^\[\]]+)(\]\]?)[ \t]*(?:#.*)?$")
 _TOML_KEY_LINE = re.compile(r"^[ \t]*([^=\[\]#]+?)[ \t]*=")
@@ -186,6 +193,10 @@ class StructuredParser:
     def _spans(self, form: _Format, text: str, lines: Sequence[str], uri: str) -> Iterator[_Span]:
         last = _last_content_line(lines)
         if last == 0:
+            # A document with nothing on any line yields no blocks and is not validated. Zero
+            # bytes is not valid JSON, and raising here would make an empty file ``failed`` —
+            # which says the tooling broke, when in fact it worked and there was nothing to
+            # find. That distinction is ``no_extractable_text`` (``docs/parsing.md`` §6.5).
             return
         if form is _Format.TOML:
             yield from self._toml_spans(text, lines, last, uri)
@@ -249,7 +260,15 @@ class StructuredParser:
             raise ParseError(msg) from exc
         tables = _toml_tables(values)
         marks = _scan(lines, 1, last, _toml_header_reader(tables))
-        for span in _partition(marks, first=1, last=last, prefix=None, lines=lines):
+        # The lines before the first header are the root table's own key-value pairs —
+        # content in their own right, so they get a block of their own rather than being
+        # folded into the first table, whose symbol would then claim them. JSON and YAML are
+        # the other way round: what precedes their first key is the document's opening
+        # punctuation and its header comment, which belong with the key that follows.
+        first = marks[0].line if marks else 1
+        if first > 1:
+            yield from _trimmed([_Span(start=1, end=first - 1, symbol=None)], lines)
+        for span in _partition(marks, first=first, last=last, prefix=None, lines=lines):
             yield from self._divide_toml(span, values, lines)
 
     def _divide_toml(
@@ -582,12 +601,16 @@ def _format_of(raw: RawDocument) -> _Format:
     Raises:
         ParseError: The media type is not one of them.
     """
-    declared = raw.media_type.split(";", 1)[0].strip().lower()
-    form = _FORMATS.get(declared)
+    base, *parameters = (part.strip().lower() for part in raw.media_type.split(";"))
+    # A ``profile`` parameter names a different document format carried in the same syntax
+    # (RFC 6906), which is how Confluence's document tree registers as JSON. Every other
+    # parameter — ``charset`` above all — describes the same format and is ignored.
+    profiled = any(parameter.startswith("profile=") for parameter in parameters)
+    form = None if profiled else _FORMATS.get(base)
     if form is None:
         msg = (
             f"{raw.uri}: declining — {raw.media_type!r} is not structured data this parser "
-            f"reads. It reads {', '.join(sorted(STRUCTURED_MEDIA_TYPES))}."
+            f"reads. It reads {', '.join(sorted(STRUCTURED_MEDIA_TYPES))}, without a profile."
         )
         raise ParseError(msg)
     return form

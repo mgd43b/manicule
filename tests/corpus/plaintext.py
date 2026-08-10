@@ -36,6 +36,25 @@ HARD_WRAPPED = "\n".join(
     ]
 )
 
+CHANGELOG = "\n\n".join(
+    [
+        "Changelog, newest first. Every entry is one paragraph.",
+        "0.9.4 — the reconciler runs on its own schedule instead of at the end of a sync.",
+        "0.9.3 — attachments over the size limit are recorded with a reason rather than skipped.",
+        "0.9.2 — citations into archives use the container separator, so they survive a paste.",
+        "0.9.1 — the watermark is written per page, so an interrupted run resumes where it was.",
+        "0.9.0 — first release with the chunk fingerprint refusal at startup.",
+        "0.8.7 — a page title containing a slash no longer produces an unreadable address.",
+        "0.8.6 — the embedder's own tokenizer counts the budget, replacing the estimator.",
+        "0.8.5 — empty parses are reported as no extractable text rather than as failures.",
+        "0.8.4 — the fallback chain is keyed by media type and records what it attempted.",
+        "0.8.3 — heading fragments come from the source where the source publishes one.",
+        "0.8.2 — rectangles are stored per line instead of merged into one envelope.",
+        "0.8.1 — page indices are converted to one-based at the parser boundary, once.",
+        "0.8.0 — first release that stores the source bytes, so re-parsing never re-fetches.",
+    ]
+)
+
 DEGENERATE_NO_NEWLINE = (
     "This file ends without a trailing newline.\n\nThe final paragraph is the last line, and "
     "there is no empty element after it."
@@ -58,6 +77,7 @@ def build(dest: Path) -> None:
     """Write this format's fixtures into ``dest``."""
     (dest / "typical.txt").write_text(TYPICAL, encoding="utf-8")
     (dest / "hard-wrapped.txt").write_text(HARD_WRAPPED + "\n", encoding="utf-8")
+    (dest / "changelog.txt").write_text(CHANGELOG + "\n", encoding="utf-8")
     (dest / "no-trailing-newline.txt").write_text(DEGENERATE_NO_NEWLINE, encoding="utf-8")
     (dest / "whitespace-only.txt").write_text(WHITESPACE_ONLY, encoding="utf-8")
     (dest / "empty.txt").write_bytes(b"")
