@@ -439,8 +439,22 @@ class SpreadsheetParser:
         and the header repeated into it.
         """
         area = region.area
-        rendered = (region.text(_row_area(area, number)) for number in _numbers(area))
-        rows: list[JsonValue] = [row for row in rendered if row is not None]
+        # Built without filtering, and paired with the refs by construction. Dropping a
+        # ``None`` here while ``row_refs`` kept every row would shift the two lists relative to
+        # one another, and the chunker pairs them by index — so every split part of the table
+        # would carry a CellAnchor for rows it does not contain, which reads perfectly and is
+        # wrong. A full-width row area is always inside the region it came from, so a ``None``
+        # is a bug in this module rather than an input the caller can produce.
+        rows: list[JsonValue] = []
+        for number in _numbers(area):
+            rendered = region.text(_row_area(area, number))
+            if rendered is None:  # pragma: no cover - unreachable, see above
+                msg = (
+                    f"{region.sheet}: row {number} of the used range rendered as nothing, so "
+                    f"its text and its cell reference can no longer be paired by index"
+                )
+                raise ParseError(msg)
+            rows.append(rendered)
         return {
             "sheet": region.sheet,
             "sheet_index": region.index,

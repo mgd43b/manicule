@@ -464,6 +464,20 @@ class MailConfig(BaseModel):
         description="How far containers may nest, counted from the top-level document.",
     )
 
+    max_members: int = Field(
+        default=1000,
+        gt=0,
+        description="Attachments across the whole container tree, past which the rest are "
+        "reported rather than expanded.",
+    )
+    """A message is a container, so it needs the limit every container needs.
+
+    The archive parser has counted members since it was written (``docs/parsing.md`` §9.3);
+    mail expanded attachments with no ceiling at all, which makes a message with a hundred
+    thousand parts a hundred thousand documents. Lower than the archive's ten thousand because
+    a message with a thousand attachments is already not a message anybody sent.
+    """
+
 
 class PlaintextConfig(BaseModel):
     """Configuration for :class:`~manicule.parsers.plaintext.PlaintextParser`."""

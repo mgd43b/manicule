@@ -280,6 +280,27 @@ async def test_a_tree_budget_already_spent_upstream_is_honoured(
 # --- names, links, secrets and depth ---------------------------------------------------------
 
 
+async def test_members_whose_names_collide_get_one_address_each(corpus: Path) -> None:
+    """An archive contributes as many documents as it has members, or says why not.
+
+    Three of these entries normalise to one name — a literal duplicate, which appending to a
+    zip produces, and a ``./``-prefixed spelling — and two hostile names normalise to none.
+    Storage reconciles members by ``source_id``, which is derived from the normalised name, so
+    a collision is not an error anybody sees: the later member overwrites the earlier one and
+    the archive quietly contributes fewer documents than it contains. Counting the addresses
+    is the only way that shows up.
+    """
+    outcomes = await _expand(ArchiveParser(ArchiveConfig()), _raw(corpus, "colliding.zip"))
+
+    assert len(outcomes) == 5, "five members, five outcomes"
+    addresses = [outcome.source_id for outcome in outcomes]
+    assert len(set(addresses)) == 5, f"members share an address: {addresses}"
+
+    bodies = [member.raw.as_bytes() for member in _members(outcomes)]
+    assert len(bodies) == 3
+    assert len({bytes(body) for body in bodies}) == 3, "a colliding member's content was lost"
+
+
 async def test_a_member_named_to_escape_the_archive_root_is_rejected_and_never_rewritten(
     parser: ArchiveParser, corpus: Path
 ) -> None:

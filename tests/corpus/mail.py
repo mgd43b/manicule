@@ -85,6 +85,40 @@ quotation, so the parser fails rather than guessing a second encoding.
 """
 
 
+DIGEST = (
+    b"From: Platform list <list@example.invalid>\r\n"
+    b"To: Subscribers <subscribers@example.invalid>\r\n"
+    b"Subject: Weekly digest\r\n"
+    b"Date: Tue, 03 Feb 2026 09:14:00 +0000\r\n"
+    b"MIME-Version: 1.0\r\n"
+    b'Content-Type: multipart/digest; boundary="fixture-digest"\r\n'
+    b"\r\n"
+    b"--fixture-digest\r\n"
+    b"\r\n"
+    b"From: Ada Okoye <ada@example.invalid>\r\n"
+    b"Subject: Retention window\r\n"
+    b"Content-Type: text/plain\r\n"
+    b"\r\n"
+    b"The retention window moves to ninety days at the end of the quarter.\r\n"
+    b"--fixture-digest\r\n"
+    b"\r\n"
+    b"From: Bo Lindqvist <bo@example.invalid>\r\n"
+    b"Subject: Reconciler schedule\r\n"
+    b"Content-Type: text/plain\r\n"
+    b"\r\n"
+    b"The reconciler now runs on its own schedule rather than after ingest.\r\n"
+    b"--fixture-digest--\r\n"
+)
+"""A ``multipart/digest``, whose enclosed messages carry no filename and no disposition.
+
+Written out by hand rather than built with :mod:`email`, because what makes it a useful
+fixture is precisely the shape a builder normalises away: each part is a bare
+``message/rfc822`` with nothing marking it as an attachment. A parser that looks only for a
+disposition or a filename finds nothing to expand and nothing to fail, and the digest indexes
+as a header block with every enclosed message silently absent.
+"""
+
+
 def build(dest: Path) -> None:
     """Write this format's fixtures into ``dest``."""
     (dest / "typical.eml").write_bytes(_typical())
@@ -95,6 +129,7 @@ def build(dest: Path) -> None:
     (dest / "not-a-message.eml").write_bytes(
         b"This file has no header fields at all.\nIt is a note somebody renamed.\n"
     )
+    (dest / "digest.eml").write_bytes(DIGEST)
     (dest / "empty.eml").write_bytes(b"")
     (dest / "broken-charset.eml").write_bytes(BROKEN_CHARSET)
 

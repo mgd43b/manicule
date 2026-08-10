@@ -1535,17 +1535,29 @@ The nesting is what makes the member findable when its own filename is generic.
   contain itself, but self-referential nesting via identical content is trivial to
   construct, and it costs nothing to defend: keep the set of member content hashes on the
   current path and stop when one repeats, with a reason.
-- **Recursion is breadth-first with a global member budget**, so a wide archive cannot
-  starve the rest of an ingest batch by depth-first descent into one branch.
+- **Recursion is breadth-first with a member budget carried in metadata**, so a wide
+  archive cannot starve the rest of an ingest batch by depth-first descent into one
+  branch.
+
+  **The budget is per container *path*, not per tree**, and the difference is worth
+  being exact about because it is a security control. A parser expands one level and
+  yields its members for the pipeline to queue; the running totals travel with each
+  member in metadata, which is the only channel a stateless parser has. A metadata
+  counter can therefore only ever bound the chain of containers a member is *inside* —
+  two sibling subtrees each start from what their shared parent had spent, and neither
+  sees the other. A tree-wide bound needs a counter owned by the thing that walks the
+  tree, which is the ingest pipeline
+  ([#5](https://github.com/mgd43b/manicule/issues/5)), not the parser. Stated here rather
+  than described as though it existed.
 
 ### 9.3 Zip-bomb defence — four limits, because any one is bypassable
 
 | Limit | Default | What it catches |
 |---|---:|---|
-| Total uncompressed bytes, whole tree | 1 GiB | the general case |
+| Total uncompressed bytes, per container path | 1 GiB | the general case |
 | Per-member compression ratio | 100:1 | the classic single-file bomb |
-| Member count, whole tree | 10 000 | the many-tiny-files variant |
-| Per-member uncompressed bytes | 64 MiB | one member exhausting the tree budget alone |
+| Member count, per container path | 10 000 | the many-tiny-files variant |
+| Per-member uncompressed bytes | 64 MiB | one member exhausting the budget alone |
 
 **The total-bytes limit is enforced while streaming, never from the header.**
 `ZipInfo.file_size` is a field in the archive, which is to say it is attacker-controlled. A

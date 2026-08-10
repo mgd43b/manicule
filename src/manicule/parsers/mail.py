@@ -199,6 +199,21 @@ class MailParser:
             name = _attachment_path(part, path, used)
             used.add(name)
             members += 1
+            if members > self._config.max_members:
+                # A message is a container, and every other container here counts its members.
+                # Without this a message with a hundred thousand parts becomes a hundred
+                # thousand documents, and an archive → message → archive chain has no member
+                # ceiling on the middle hop.
+                yield self._refused(
+                    raw,
+                    name,
+                    depth,
+                    f"attachment count exceeded: {members} across this container tree, and "
+                    f"the limit is {self._config.max_members}. Raise maxMembers to index the "
+                    f"rest.",
+                    DocumentStatus.FAILED,
+                )
+                return
             if not self._config.expand_attachments:
                 yield self._refused(
                     raw,
@@ -387,12 +402,38 @@ def _is_attachment(part: EmailMessage) -> bool:
     A ``text/plain`` part with a filename is a file someone attached, not the message they
     wrote, and treating it as the body would make the canonical text depend on what was
     attached to the message.
+
+    **An enclosed message counts, whatever it is labelled.** A ``message/rfc822`` part
+    frequently carries neither a disposition nor a filename — ``multipart/digest`` never does,
+    and inline forwards from several mail clients do not either. Without this it satisfies no
+    branch anywhere: :func:`_body_of` skips it because it is not ``text/*``, :func:`_walk`
+    does not descend into it because it is not ``multipart``, and it is not an attachment — so
+    a digest of twenty messages indexes as a header block and nothing else, reporting no
+    failure. ``expansion.py`` is explicit that failure is an outcome and never an omission,
+    and this is the one place that was quietly an omission.
     """
-    return part.get_content_disposition() == "attachment" or part.get_filename() is not None
+    return (
+        part.get_content_disposition() == "attachment"
+        or part.get_filename() is not None
+        or part.get_content_maintype() == "message"
+    )
 
 
 def _payload_of(part: EmailMessage) -> bytes:
-    """A part's bytes with its transfer encoding removed."""
+    """A part's bytes with its transfer encoding removed.
+
+    An enclosed message is the exception: its payload is a parsed message rather than an
+    encoded octet stream, so ``get_payload(decode=True)`` returns ``None`` for it. Serialising
+    the enclosed message is what makes it a document the chain can parse — and it has to be
+    the *enclosed* message rather than the part, or the member would carry the wrapper's
+    headers as well as its own.
+    """
+    if part.get_content_maintype() == "message":
+        enclosed = part.get_payload()
+        if isinstance(enclosed, list) and enclosed:
+            first = enclosed[0]
+            if isinstance(first, EmailMessage):
+                return first.as_bytes()
     payload = part.get_payload(decode=True)
     return payload if isinstance(payload, bytes) else b""
 

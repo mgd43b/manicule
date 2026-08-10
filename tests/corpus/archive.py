@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import struct
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -54,6 +55,7 @@ def build(dest: Path) -> None:
     (dest / "wide.zip").write_bytes(_wide())
     (dest / "bomb.zip").write_bytes(_bomb())
     (dest / "traversal.zip").write_bytes(_traversal())
+    (dest / "colliding.zip").write_bytes(_colliding())
     (dest / "symlink.zip").write_bytes(_symlink())
     (dest / "encrypted.zip").write_bytes(_encrypted())
     (dest / "ooxml.zip").write_bytes(_ooxml())
@@ -128,6 +130,38 @@ def _traversal() -> bytes:
     )
 
 
+def _colliding() -> bytes:
+    """Three members that normalise to two names, plus two that normalise to none.
+
+    A zip may hold two entries with the same name — appending to an archive produces exactly
+    that — and ``a/b.txt`` and ``./a/b.txt`` normalise to one name as well. Storage reconciles
+    members by ``source_id``, which is derived from the normalised name, so a collision is not
+    an error anybody sees: the later member overwrites the earlier one and the archive quietly
+    contributes fewer documents than it contains.
+
+    Built by hand rather than through ``_archive`` because a dict cannot hold a duplicate key,
+    which is the whole shape being tested.
+    """
+    entries = [
+        ("reports/q1.txt", "The first quarter, written once.\n"),
+        ("./reports/q1.txt", "The first quarter again, under a name that normalises the same.\n"),
+        ("reports/q1.txt", "The first quarter a third time, under a literally identical name.\n"),
+        ("../escape-one.txt", "One member whose name climbs out of the root.\n"),
+        ("../escape-two.txt", "Another, so a shared placeholder would collide.\n"),
+    ]
+    buffer = io.BytesIO()
+    with warnings.catch_warnings(), zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        # zipfile warns on a duplicate member name, and the suite turns warnings into errors.
+        # A duplicate name is precisely what this fixture is, so the warning is suppressed here
+        # rather than globally — an unexpected duplicate anywhere else must still fail.
+        warnings.filterwarnings("ignore", message="Duplicate name", category=UserWarning)
+        for name, body in entries:
+            info = zipfile.ZipInfo(name, date_time=(2026, 2, 3, 9, 14, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, body)
+    return buffer.getvalue()
+
+
 def _symlink() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -174,8 +208,17 @@ def _ebook() -> bytes:
         first = zipfile.ZipInfo("mimetype", date_time=(2026, 2, 3, 9, 14, 0))
         first.compress_type = zipfile.ZIP_STORED
         archive.writestr(first, "application/epub+zip")
-        archive.writestr("META-INF/container.xml", '<?xml version="1.0"?><container/>')
-        archive.writestr("OEBPS/chapter-1.xhtml", "<html><body><p>One.</p></body></html>")
+        # Every remaining member goes in with an explicit ZipInfo too. Handed a bare name,
+        # zipfile stamps the current clock — which two builds inside the same two-second
+        # window agree on and two builds either side of one do not, so the corpus was
+        # reproducible most of the time and that is the worst kind.
+        for name, body in (
+            ("META-INF/container.xml", '<?xml version="1.0"?><container/>'),
+            ("OEBPS/chapter-1.xhtml", "<html><body><p>One.</p></body></html>"),
+        ):
+            entry = zipfile.ZipInfo(name, date_time=(2026, 2, 3, 9, 14, 0))
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(entry, body)
     return buffer.getvalue()
 
 

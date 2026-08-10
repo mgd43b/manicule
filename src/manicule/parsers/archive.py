@@ -185,14 +185,32 @@ class ArchiveParser:
         used_bytes = tree_bytes_of(raw)
         used_members = tree_members_of(raw)
 
+        seen: set[str] = set()
+
         with self._opened(raw) as archive:
-            for info in archive.infolist():
+            for ordinal, info in enumerate(archive.infolist()):
                 if info.is_dir():
                     continue
                 # Counted before the name is judged, because a rejected member still becomes a
                 # stored document with a reason. Counting only the readable ones would let an
                 # archive of ten thousand hostile names spend no budget at all.
                 used_members += 1
+                if used_members > self._config.max_members:
+                    # Checked here rather than only inside `_member`, which the refusal branch
+                    # below never reaches: an archive whose members *all* have hostile names
+                    # would otherwise spend the budget the comment above says it spends and
+                    # never be stopped by it.
+                    yield _refusal(
+                        raw,
+                        info.filename,
+                        depth,
+                        f"archive member count exceeded: {used_members} members across this "
+                        f"container tree, and the limit is {self._config.max_members}. Split "
+                        f"the archive, or raise maxMembers.",
+                        DocumentStatus.FAILED,
+                        address=_unique(inner_path(info.filename) or "member", ordinal, seen),
+                    )
+                    return
                 path = inner_path(info.filename)
                 if path is None:
                     yield _refusal(
@@ -203,8 +221,14 @@ class ArchiveParser:
                         f"{info.filename!r}. Names are normalised and never rewritten into a "
                         f"plausible one, so this member is reported rather than extracted.",
                         DocumentStatus.FAILED,
+                        # Unique by position in the central directory. A constant placeholder
+                        # would give every escaping member one `source_id`, which storage
+                        # reconciles by — so twenty rejected names would collapse into one
+                        # document and nineteen refusals would vanish.
+                        address=_unique("member", ordinal, seen),
                     )
                     continue
+                path = _unique(path, ordinal, seen)
                 outcome, stop = self._member(
                     raw,
                     archive,
@@ -426,17 +450,46 @@ def _modified(info: zipfile.ZipInfo) -> str:
     return f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}"
 
 
+def _unique(path: str, ordinal: int, seen: set[str]) -> str:
+    """``path``, qualified by its position in the archive if that name is already taken.
+
+    A zip may hold two entries with the same name — appending to an archive produces exactly
+    that, and so does a crafted one — and after normalisation ``a/b.txt`` and ``./a/b.txt``
+    are also the same name. Storage reconciles members by ``source_id``, which is derived from
+    this, so a collision is not an error anybody sees: the second member overwrites the first,
+    and the archive quietly contributes fewer documents than it contains.
+
+    The qualifier is the central-directory ordinal, which is positional and therefore stable
+    for a given archive — the same disambiguation, and the same reason for it, as two mail
+    attachments sharing a filename.
+    """
+    if path not in seen:
+        seen.add(path)
+        return path
+    qualified = f"{path}#{ordinal}"
+    seen.add(qualified)
+    return qualified
+
+
 def _refusal(
-    raw: RawDocument, path: str, depth: int, reason: str, status: DocumentStatus
+    raw: RawDocument,
+    path: str,
+    depth: int,
+    reason: str,
+    status: DocumentStatus,
+    *,
+    address: str | None = None,
 ) -> MemberFailure:
     """A member that will not become a document, addressed so a person can find it.
 
     The address is built from the *normalised* path where there is one. A member rejected for
-    escaping the archive root has no usable path by definition, so its address falls back to a
-    placeholder and its real name goes in metadata — putting ``../../etc/passwd`` into a
-    ``uri`` would reproduce the attack in the index and in every diagnostic that prints it.
+    escaping the archive root has no usable path by definition, so the caller supplies one
+    that is unique within the archive and its real name goes in metadata — putting
+    ``../../etc/passwd`` into a ``uri`` would reproduce the attack in the index and in every
+    diagnostic that prints it, and a shared placeholder would give every rejected member one
+    ``source_id``, which storage reconciles by.
     """
-    safe = inner_path(path) or "member"
+    safe = address or inner_path(path) or "member"
     return MemberFailure(
         source_id=member_source_id(raw.source_id, safe, scheme=ARCHIVE_SCHEME),
         uri=member_uri(raw.uri, safe, scheme=ARCHIVE_SCHEME),

@@ -253,6 +253,74 @@ async def test_two_attachments_with_one_name_get_two_addresses(
     assert len(addresses) == len(set(addresses)) == 2
 
 
+async def test_an_enclosed_message_with_no_filename_is_still_expanded(
+    parser: MailParser, corpus: Path
+) -> None:
+    """A ``multipart/digest``, which is where "attachment" stops meaning what it looks like.
+
+    Its parts are bare ``message/rfc822`` with no disposition and no filename, so a check for
+    either finds nothing. Before this, such a part satisfied no branch anywhere — not the
+    body, because it is not ``text/*``; not the walk, because it is not ``multipart``; not an
+    attachment — and a digest of twenty messages indexed as a header block with every enclosed
+    message absent and **no failure reported**. That is the omission ``expansion.py`` says
+    must never happen, and the only reason it was ever visible is that somebody counted.
+    """
+    raw = _raw(corpus, "digest.eml")
+
+    members = [
+        member for member in await read_members(parser, raw) if isinstance(member, ExpandedMember)
+    ]
+
+    assert len(members) == 2, "a two-message digest must expand into two documents"
+    assert all(member.raw.media_type == "message/rfc822" for member in members)
+    recovered = b"".join(member.raw.as_bytes() for member in members)
+    assert b"The retention window moves to ninety days" in recovered
+    assert b"The reconciler now runs on its own schedule" in recovered
+
+
+async def test_the_enclosed_messages_of_a_digest_are_not_also_indexed_as_body(
+    parser: MailParser, corpus: Path
+) -> None:
+    """Expanded once, not twice.
+
+    The complement of the test above, and the reason the fix is "treat it as an attachment"
+    rather than "walk into it": a part that becomes a member must not also contribute to the
+    containing message's canonical text, or the same sentence is indexed under two documents
+    and both cite it.
+    """
+    raw = _raw(corpus, "digest.eml")
+
+    blocks = await read_blocks(parser, raw)
+    text = "\n".join(block.text for block in blocks)
+
+    assert "Weekly digest" in text, "the digest's own headers are still indexed"
+    assert "The retention window moves to ninety days" not in text
+    assert "The reconciler now runs on its own schedule" not in text
+
+
+async def test_a_message_with_more_attachments_than_the_limit_stops_and_says_so(
+    corpus: Path,
+) -> None:
+    """A message is a container, so it needs the ceiling every container needs.
+
+    Mail expanded attachments with no member limit at all while the archive parser had counted
+    them since it was written, so a message with a hundred thousand parts became a hundred
+    thousand documents — and an archive containing a message containing an archive had no
+    member ceiling on the middle hop. The limit is set to one here so the fixture corpus does
+    not have to contain a hostile message to exercise it.
+    """
+    parser = MailParser(MailConfig(max_members=1))
+
+    outcomes = await read_members(parser, _raw(corpus, "multipart.eml"))
+
+    expanded = [member for member in outcomes if isinstance(member, ExpandedMember)]
+    refused = [member for member in outcomes if isinstance(member, MemberFailure)]
+    assert len(expanded) == 1, "the limit is one, so exactly one attachment may expand"
+    assert refused, "the attachments past the limit must be reported, never dropped"
+    assert "attachment count exceeded" in refused[0].reason
+    assert "the limit is 1" in refused[0].reason
+
+
 async def test_the_body_part_is_never_also_expanded_as_an_attachment(
     parser: MailParser, corpus: Path
 ) -> None:
