@@ -356,7 +356,7 @@ re-parsing and re-embedding it entirely.
 
 **`status`** is a `CHECK`-constrained enum owned by
 [#1](https://github.com/mgd43b/manicule/issues/1). Storage requires only that it includes
-the terminal no-content states — `no_extractable_text`, `parse_failed`,
+the terminal no-content states — `no_extractable_text`, `failed`,
 `unsupported_media_type`, `container` — because **a document with zero chunks is a normal,
 valid, round-trippable row**, not an error. This is a second reason there is no
 `chunk_count` column: `0` cannot distinguish "not indexed yet" from "nothing to index", and
@@ -795,7 +795,7 @@ spaces. Byte equality catches the field nobody anticipated; a hand-written compa
 only the fields its author thought of.
 
 A `ChunkFingerprint` — chunk budget, overlap, breadcrumb budget, chunker version, tokenizer
-ID, grammar-pack version — sits beside it in the same row, on the same terms. Changing it
+ID, and a per-language tree-sitter grammar map ([`parsing.md`](parsing.md) §1.7) — sits beside it in the same row, on the same terms. Changing it
 means re-chunk *and* re-embed, so it is a strictly larger invalidation than the embedding
 fingerprint and gets the same refusal.
 

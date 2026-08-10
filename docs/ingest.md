@@ -74,15 +74,19 @@ single place to read it from, since the value set is `CHECK`-constrained and ext
 means an Alembic batch rebuild (`storage.md` §3.4).
 
 ```
-pending ──> fetching ──> parsing ──> parsed ──> embedding ──> indexed
-   ^            │            │          │           │            │
-   └── §6.4 sweep, from any non-terminal state      │            │
-                │            │          │           │            │
-                v            v          v           v            v
-          fetch_failed   parse_failed  middleware_failed    (stays indexed
-                         no_extractable_text                 on a failed
-                         unsupported_media_type              re-ingest, §9)
-                         container
+        ┌──────────────── §6.4 sweep, from any in-flight state ───────────────┐
+        │                                                                     │
+        v                                                                     │
+     pending ──> fetching ──> parsing ──> parsed ──> embedding ──> indexed    │
+                     │            │                      │           │        │
+                     └────────────┴──────────────────────┘           │        │
+                                  │                                  │        │
+                                  v                    (a failed re-ingest    │
+                            failed + failed_stage       leaves this alone,    │
+                            no_extractable_text         §9)                   │
+                            unsupported_media_type                            │
+                            container ────────────────────────────────────────┘
+                                                        (never swept, §2.2)
 ```
 
 | Member | Set by | Terminal | Servable |
@@ -91,14 +95,29 @@ pending ──> fetching ──> parsing ──> parsed ──> embedding ──
 | `fetching` `parsing` `embedding` | the pipeline, in flight | no | no |
 | `parsed` | parse stage, ≥ 1 chunk (`parsing.md` §6.4) | no | no |
 | `indexed` | store stage, last write (`storage.md` §8.2 I3) | yes | **yes** |
-| `no_extractable_text` `parse_failed` `unsupported_media_type` `container` | parse stage (`parsing.md` §6.4) | yes | no |
-| `fetch_failed` | fetch stage | yes | no |
-| `middleware_failed` | any hook that raises (§3.2) | yes | no |
+| `failed` + `failed_stage` | **any** stage (`parsing.md` §6.4) | yes | no |
+| `no_extractable_text` `unsupported_media_type` `container` | parse stage (`parsing.md` §6.4) | yes | no |
 
-Three of these are asserted by this document and by nothing else — `fetching`, `embedding` and
-`middleware_failed` — along with `fetch_failed`. They are named here rather than assumed
-because §6.4's recovery sweep selects on the non-terminal ones by name, and a sweep whose
-`WHERE` clause disagrees with the enum silently recovers nothing.
+**Failure is one member plus a stage, not a member per stage.** `parsing.md` §6.4 carries
+`failed` with a `failed_stage: PipelineStage` discriminator, which is the right shape and
+resolves the concern that prompted this section: fetch, parse and middleware failures do not
+each mint an enum member, so the `CHECK`-constrained set does not grow every time a stage is
+added. This document contributes only `fetching` and `embedding` — two in-flight states — and
+`failed_stage` values for the stages it owns.
+
+**Two terminal states are easy to sweep by mistake, and must not be.** `container` has zero
+chunks *by design* — an archive whose members became their own documents has nothing of its own
+to embed — and `no_extractable_text` has zero chunks because there was nothing to find. Both
+look like "stopped before embedding" to a careless `WHERE` clause. The sweep in §6.4 therefore
+selects the in-flight states **by name** rather than selecting everything that is not `indexed`,
+which is the formulation that would swallow both:
+
+```sql
+WHERE status IN ('fetching', 'parsing', 'embedding')   -- never NOT IN (...)
+```
+
+An allowlist fails closed: a status added later is not swept until someone adds it. A denylist
+fails open, and the failure is a terminal document being requeued forever.
 
 **Only `indexed` is servable**, and that is enforced by the join in `storage.md` §6.2 rather
 than by anything here. Every other state is invisible to retrieval whatever exists in the
@@ -143,7 +162,7 @@ the middleware implementation is `value = await hook.run(value)`.
 > idiomatic style the signature advertises.
 
 **A returned value is validated, not trusted.** A hook that returns the wrong type, or `None`,
-fails the document with `middleware_failed` and names the hook. Silently substituting the
+fails the document with `failed` / `failed_stage=middleware` and names the hook. Silently substituting the
 original input would resurrect exactly the bug above.
 
 ### 3.2 What a middleware may and may not do
@@ -154,8 +173,8 @@ original input would resurrect exactly the bug above.
 | Read configuration | Write to either store directly |
 | Emit events and metrics | Mutate another document |
 | Annotate `Document.metadata` / `Chunk.metadata` | Set or alter an `Anchor` |
-| Skip a document by raising `SkipDocument(reason)` | Alter `chunks.id`, or anything it derives from |
-| Declare itself a text mutator (§3.3) | Perform network I/O without a declared timeout |
+| Skip a document by raising `SkipDocument(reason)` | **Alter `Chunk.text` — ever (§3.3)** |
+| Rewrite `embed_text`, having declared it (§3.3) | Perform network I/O without a declared timeout |
 
 **No store handle** is the important one. A middleware that writes to the stores bypasses the
 write ordering in `storage.md` §8.2, and the ordering is what makes crash recovery possible.
@@ -165,7 +184,7 @@ Middleware operates on values in flight; the pipeline alone commits.
 middleware that adjusts them invalidates stored citations with no record of having done so.
 
 **Failure semantics.** A middleware that raises fails *that document*, with status
-`middleware_failed` and the hook name in `metadata`. It does not abort the batch and it does not
+`failed`, `failed_stage=middleware`, and the hook name in `metadata`. It does not abort the batch and it does not
 disable the hook — a hook that fails on one document is usually a document problem, and
 auto-disabling would make the corpus depend on ingest order.
 
@@ -198,6 +217,50 @@ where text can still reach the embedder — `after:parse`, `before:chunk`, `afte
 `before:embed` is the most direct case of the four and the easiest to overlook: it operates on
 chunks that are about to be embedded, so a rewrite there reaches `embed_text` with nothing
 downstream to normalise it away.
+
+### 3.3.1 `text` is immutable after parse — forbidden, not fingerprinted
+
+`embed_text` is mutable and fingerprinted. **`text` is neither.** It cannot be changed by any
+middleware at any hook, and no declaration makes it permissible.
+
+The asymmetry is not stylistic. `text` is what a citation displays and what `Parser.resolve`
+must reproduce: [`parsing.md`](parsing.md) §3.3 makes round-tripping a per-parser test
+obligation — resolving a chunk's anchor returns the text the chunk claims. A middleware
+rewriting `text` breaks that invariant *after every parser test has passed*, producing a corpus
+that is internally consistent and whose citations quote text the source document does not
+contain. No fingerprint repairs that, because a fingerprint records which pipeline produced the
+corpus and this corpus is wrong in a way no version of the pipeline makes right. It is also the
+precise defect class this project exists not to reproduce (`PLAN.md` defect #1).
+
+So the capability boundary is expressed in the type rather than in prose. `Chunk.text` carries
+`Field(frozen=True)`, so it can be set at construction and assignment afterwards raises:
+
+```python
+class Chunk(BaseModel):
+    text:       str = Field(frozen=True)   # citable; immutable after parse
+    embed_text: str                        # mutable, and a fingerprint input
+```
+
+That stops in-place mutation. It does not stop a middleware constructing replacement `Chunk`
+objects, so the pipeline adds a check across the hook chain — one digest over the ordered
+`text` values before the first hook and after the last:
+
+```python
+before = sha256(b"\0".join(c.text.encode() for c in chunks)).digest()
+...
+if sha256(...) != before:
+    raise MiddlewareViolation(hook, "Chunk.text was modified")
+```
+
+One hash over data already in memory, once per document per hook chain. Cheap enough that it
+runs always rather than under a debug flag — a check that runs only when someone suspects a
+problem does not catch the problem nobody suspected.
+
+**Where this belongs.** Stated here because the pipeline is what enforces it, and asserted from
+the parsing side as an invariant of the round-trip contract. If [#1](https://github.com/mgd43b/manicule/issues/1)
+can express it in the middleware protocol — a hook receiving a `text`-readonly view — that is
+strictly better than either, and both statements become descriptions of a thing the type system
+already guarantees.
 
 ### 3.4 PII redaction, decided
 
@@ -295,14 +358,19 @@ limits are per *attempt*, not per document: a chain of three parsers on a 30-sec
 legitimately take 90 seconds before the document fails. A per-document limit would make the
 last parser in a chain fail for reasons belonging to the first.
 
-**3. A parser that is killed is a hard failure, not a lost document.** This is §6.
+**3. A parser that is killed is a hard failure, not a lost document.** This is §6. It is
+specifically *not* a decline in the sense of `parsing.md` §6.3 — a parser that declined
+inspected the input and reported that it is not its kind, which is information, whereas a
+parser the pipeline killed reported nothing at all. Collapsing the two would let a chain of
+timeouts end at `unsupported_media_type`, which reads as "manicule does not handle this format"
+when the truth is "every parser that handles this format ran out of time".
 
 > **Prior art.** `parseWithFallback` wraps each attempt in `try/catch` and advances on a thrown
 > exception or empty output. There is no time limit and no memory limit, so the two failure
 > modes that actually take down an ingest run — a parser that hangs and a parser that
 > allocates without bound — are not failures at all: they are the process stopping. And when
 > every parser has been tried it throws `No parser found`, which the outer handler turns into
-> status `error`, so `no_extractable_text`, `unsupported_media_type` and `parse_failed` all
+> status `error`, so `no_extractable_text`, `unsupported_media_type` and a genuine parse failure all
 > collapse into one bucket. `parsing.md` §6.4 separates them; this is where that separation
 > has to survive contact with a real chain.
 
@@ -391,8 +459,8 @@ parse_memory_limit   default: 1 GiB per worker
 
 ### 6.4 Attributing a death to a document
 
-When a worker dies, the parent knows which document it dispatched, marks it `parse_failed` with
-`reason="worker killed: timeout"` or `"worker killed: memory limit"`, and continues. The batch
+When a worker dies, the parent knows which document it dispatched, marks it `failed` with
+`failed_stage=parse` and `reason="worker killed: timeout"` or `"worker killed: memory limit"`, and continues. The batch
 is unaffected because the batch was never a unit.
 
 **When the parent dies**, in-flight documents are left in a non-terminal status. Recovery is a
