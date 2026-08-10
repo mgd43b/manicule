@@ -155,11 +155,30 @@ there is no Anthropic type and no OpenAI type.
 
 ---
 
-## 6. Open, and why they are open
+## 6. Formerly open, now settled
 
-**`Filter` shape on `VectorStore.search`.** Now that the store is settled — SQLite plus
-LanceDB — this is a LanceDB predicate plus a metadata pre-filter, but the exact split
-between them wants contact with real data volumes.
+Both remaining questions were retrieval questions, and
+[`retrieval.md`](retrieval.md) settles them.
 
-**Whether `Context` assembly is a `RetrievalStage`** or a distinct step. It behaves like
-one, but it emits a different type.
+**`Filter` shape on `VectorStore.search` — settled in [`retrieval.md`](retrieval.md) §3.**
+The field list is fixed, and `workspace_ids` is **required, non-empty and set-valued**: it is
+a security boundary rather than a performance question, and a boundary you can forget to pass
+is not a boundary. The split that was waiting on data volumes is settled as a *rule* rather
+than a constant — fields with a promoted Lance column push down, fields needing a join resolve
+in SQLite into a document-id set first, and which of the two plans runs is decided per query by
+a derived over-fetch factor and a configurable id-list threshold. Both inputs to that decision
+are recorded on every query, so the threshold gets set from measurement instead of argument.
+`workspace_ids` alone pushes down to neither store: it is enforced by the hydrating join inside
+the dense stage, which is also what stops soft-deleted and cross-workspace rows consuming
+top-`k` slots. The shape that shipped in `manicule.core.retrieval` predates this and is
+reconciled by [#36](https://github.com/mgd43b/manicule/issues/36).
+
+**`Context` assembly is not a `RetrievalStage` — settled in [`retrieval.md`](retrieval.md)
+§7.1.** It emits `Context` rather than `list[Candidate]`, and keeping the two types distinct is
+precisely what lets the stage list be reordered freely while this step is not. A stage that
+emitted a different type would make every stage's signature a union.
+
+**`RetrievalStage` was reconsidered and deliberately not widened** — [`retrieval.md`](retrieval.md)
+§2.3 re-argues the three widenings #1 rejected against a working design, and answers the one new
+pressure that building it surfaced (per-stage diagnostics) without touching the signature. The
+⚠️ in §3 stands: it is locked from the moment the evaluation harness records its first result.
