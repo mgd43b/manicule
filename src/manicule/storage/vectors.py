@@ -350,6 +350,22 @@ class LanceVectorStore:
             return
         await table.delete(f"document_id = {quote(document_id)}")
 
+    async def delete_chunks(self, chunk_ids: Sequence[str]) -> None:
+        """Remove named vectors. Idempotent, and what the tombstone sweep calls.
+
+        By id, from a list the sweep was handed — never by anti-joining the whole table against
+        ``chunks``. That comparison races concurrent ingest: an id written after the scan began
+        looks like an orphan, and the sweep deletes a live vector. Tombstones exist so this
+        method can only ever name something that was deleted.
+        """
+        if not chunk_ids:
+            return
+        table = await self._existing_table()
+        if table is None:
+            return
+        listed = ", ".join(quote(chunk_id) for chunk_id in sorted(set(chunk_ids)))
+        await table.delete(f"{ID_COLUMN} IN ({listed})")
+
     # --- reading -------------------------------------------------------------------------
 
     async def search(

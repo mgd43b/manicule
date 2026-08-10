@@ -157,4 +157,41 @@ async def _schema_snapshot(engine: AsyncEngine) -> list[tuple[str, str]]:
                 )
             )
         ).all()
-    return [(f"{row[0]}:{row[1]}", " ".join(str(row[2]).split())) for row in rows]
+    return [(f"{row[0]}:{row[1]}", _canonical_ddl(str(row[2]))) for row in rows]
+
+
+def _canonical_ddl(sql: str) -> str:
+    """DDL with its table-level constraints sorted, and everything else left alone.
+
+    Constraint *order* in a ``CREATE TABLE`` carries no meaning, and SQLAlchemy's batch
+    rebuild does not preserve it: the constraints of a reflected table live in a set, so two
+    runs of the same migration can emit the two foreign keys either way round. Comparing raw
+    text would make every batch migration's round trip fail intermittently — a flaky test,
+    which is a bug in the test.
+
+    Sorting is the narrowest possible relaxation. Column definitions keep their order, every
+    constraint still has to be present, and its text still has to match character for
+    character — so a rebuild that drops a ``CHECK``, widens a column or loses a cascade is
+    caught exactly as before.
+    """
+    collapsed = " ".join(sql.split())
+    opened = collapsed.find("(")
+    if not collapsed.upper().startswith("CREATE TABLE") or opened < 0:
+        return collapsed
+    head, body = collapsed[:opened], collapsed[opened + 1 : collapsed.rfind(")")]
+
+    clauses: list[str] = []
+    depth = 0
+    current = ""
+    for character in body:
+        if character == "," and depth == 0:
+            clauses.append(current.strip())
+            current = ""
+            continue
+        depth += (character == "(") - (character == ")")
+        current += character
+    clauses.append(current.strip())
+
+    columns = [clause for clause in clauses if not clause.upper().startswith("CONSTRAINT")]
+    constraints = sorted(clause for clause in clauses if clause.upper().startswith("CONSTRAINT"))
+    return f"{head}( {', '.join([*columns, *constraints])} )"

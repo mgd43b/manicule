@@ -16,7 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from manicule.core.anchors import Anchor
 from manicule.core.content import BlockKind, Document, DocumentStatus
+from manicule.core.embedding import EmbedFingerprint, IndexFingerprints
 from manicule.core.errors import ManiculeError
+from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import SourceId, Watermark
 from manicule.storage import models
@@ -25,12 +27,16 @@ from manicule.storage.fts import SEARCH_SQL, escape_match_query
 from manicule.storage.types import utcnow
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Collection, Mapping, Sequence
+    from datetime import datetime
 
     from manicule.core.content import Chunk
 
 _ANCHOR: TypeAdapter[Anchor] = TypeAdapter(Anchor)
 _WATERMARK: TypeAdapter[Watermark] = TypeAdapter(Watermark)
+
+_INDEX_STATE_ID = 1
+"""``index_state`` holds one row, because a data directory holds one index."""
 
 DEFAULT_WORKSPACE = "default"
 """Personal mode has one workspace and never says so out loud.
@@ -210,6 +216,256 @@ class SqliteDocStore:
             if row is not None and row.workspace_id == self._workspace_id:
                 row.deleted_at = utcnow()
 
+    # --- ingest bookkeeping -----------------------------------------------------------------
+
+    async def record_seen(self, document_id: str, *, version_token: str | None = None) -> None:
+        """Mark a document as still present at the source. The write a skip must not omit.
+
+        Without ``last_seen_at`` a skip and a deletion are indistinguishable to reconciliation.
+        Without advancing the token when the *bytes* were unchanged, a source that touches its
+        modification date on every save is fetched again on every sync, forever.
+        """
+        async with self._sessions.begin() as session:
+            row = await self._live_document(session, document_id)
+            if row is None:
+                return
+            row.last_seen_at = utcnow()
+            if version_token is not None:
+                row.version_token = version_token
+
+    async def annotate(self, document_id: str, updates: Mapping[str, Any]) -> None:
+        """Merge keys into a document's metadata, leaving everything else alone.
+
+        A whole-object replace would lose whatever a middleware annotated a moment earlier, and
+        lose it silently — the two writers are in different stages and neither can see the
+        other.
+        """
+        async with self._sessions.begin() as session:
+            row = await self._live_document(session, document_id)
+            if row is None:
+                return
+            merged: dict[str, Any] = dict(cast("Any", row.doc_metadata) or {})
+            merged.update(updates)
+            row.doc_metadata = cast("Any", merged)
+
+    async def set_lineage(
+        self, document_id: str, *, chunk_fp: str | None, embed_fp: str | None
+    ) -> None:
+        """Record which fingerprints this document was last built with.
+
+        ``None`` leaves a lineage unchanged rather than clearing it: re-embedding moves only the
+        embedding lineage, and clearing the chunk one would make "which documents need
+        re-chunking" answer "none" about documents that do.
+        """
+        async with self._sessions.begin() as session:
+            row = await self._live_document(session, document_id)
+            if row is None:
+                return
+            if chunk_fp is not None:
+                row.chunk_fp = chunk_fp
+            if embed_fp is not None:
+                row.embed_fp = embed_fp
+
+    async def set_original(
+        self, document_id: str, *, ref: str | None, omitted_reason: str | None
+    ) -> None:
+        """Point a document at its retained bytes, or record why it has none."""
+        async with self._sessions.begin() as session:
+            row = await self._live_document(session, document_id)
+            if row is None:
+                return
+            row.original_ref = ref
+            row.original_omitted_reason = omitted_reason
+
+    async def requeue_stale(
+        self,
+        statuses: Collection[DocumentStatus],
+        older_than: datetime,
+        *,
+        detail: str = "",
+    ) -> int:
+        """Return documents stuck in ``statuses`` to ``pending``, and say how many.
+
+        ``statuses`` is used exactly as given — an allowlist the caller chose. It is never
+        inverted here, because a denylist would requeue terminal documents forever: a
+        ``container`` has zero chunks by design, and so does a document that yielded no text.
+        """
+        wanted = list(statuses)
+        if not wanted:
+            return 0
+        async with self._sessions.begin() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(models.Document).where(
+                            models.Document.workspace_id == self._workspace_id,
+                            models.Document.deleted_at.is_(None),
+                            models.Document.status.in_(wanted),
+                            models.Document.updated_at < older_than,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                row.status = DocumentStatus.PENDING
+                row.status_detail = detail or None
+                row.failed_stage = None
+            return len(rows)
+
+    async def count_documents(
+        self,
+        *,
+        source: str | None = None,
+        statuses: Collection[DocumentStatus] | None = None,
+    ) -> int:
+        statement = (
+            select(func.count())
+            .select_from(models.Document)
+            .where(
+                models.Document.workspace_id == self._workspace_id,
+                models.Document.deleted_at.is_(None),
+            )
+        )
+        if source is not None:
+            statement = statement.where(models.Document.source == source)
+        if statuses is not None:
+            statement = statement.where(models.Document.status.in_(list(statuses)))
+        async with self._sessions() as session:
+            return (await session.execute(statement)).scalar_one()
+
+    async def select_documents(
+        self,
+        *,
+        source: str | None = None,
+        statuses: Collection[DocumentStatus] | None = None,
+        media_types: Collection[str] | None = None,
+        chunk_fp_other_than: str | None = None,
+        limit: int | None = None,
+    ) -> Sequence[Document]:
+        """The selection a repair verb runs over. A query, never a scan.
+
+        ``chunk_fp_other_than`` is what makes invalidation set-valued: "everything a different
+        chunker built" is one indexed predicate, so a grammar upgrade repairs the documents in
+        that language and leaves the corpus alone.
+        """
+        statement = (
+            select(models.Document)
+            .where(
+                models.Document.workspace_id == self._workspace_id,
+                models.Document.deleted_at.is_(None),
+            )
+            .order_by(models.Document.created_at, models.Document.id)
+        )
+        if source is not None:
+            statement = statement.where(models.Document.source == source)
+        if statuses is not None:
+            statement = statement.where(models.Document.status.in_(list(statuses)))
+        if media_types is not None:
+            statement = statement.where(models.Document.media_type.in_(list(media_types)))
+        if chunk_fp_other_than is not None:
+            statement = statement.where(
+                (models.Document.chunk_fp.is_(None))
+                | (models.Document.chunk_fp != chunk_fp_other_than)
+            )
+        if limit is not None:
+            statement = statement.limit(limit)
+        async with self._sessions() as session:
+            rows = (await session.execute(statement)).scalars().all()
+            return [_to_document(row) for row in rows]
+
+    # --- index state ------------------------------------------------------------------------
+
+    async def index_fingerprints(self) -> IndexFingerprints:
+        """What this index says it was built with, or an empty answer if it has said nothing."""
+        async with self._sessions() as session:
+            row = await session.get(models.IndexState, _INDEX_STATE_ID)
+            if row is None:
+                return IndexFingerprints()
+            return IndexFingerprints(
+                embed=(
+                    EmbedFingerprint.model_validate_json(row.embed_fingerprint)
+                    if row.embed_fingerprint
+                    else None
+                ),
+                chunk=(
+                    ChunkFingerprint.model_validate_json(row.chunk_fingerprint)
+                    if row.chunk_fingerprint
+                    else None
+                ),
+                vector_table=row.vector_table,
+            )
+
+    async def record_index_fingerprints(self, state: IndexFingerprints) -> None:
+        """Commit the index to a shape. One row, because there is one index."""
+        async with self._sessions.begin() as session:
+            row = await session.get(models.IndexState, _INDEX_STATE_ID)
+            if row is None:
+                row = models.IndexState(id=_INDEX_STATE_ID)
+                session.add(row)
+            row.embed_fingerprint = state.embed.model_dump_json() if state.embed else None
+            row.chunk_fingerprint = state.chunk.model_dump_json() if state.chunk else None
+            row.vector_table = state.vector_table
+
+    # --- the vector sweep ---------------------------------------------------------------------
+
+    async def take_tombstones(self, limit: int) -> Sequence[str]:
+        """Chunk ids whose vectors have not yet been swept, oldest first.
+
+        Read, never deleted here. The vectors go first and the tombstones are cleared second,
+        so a crash between the two leaves a tombstone for a vector that is already gone — which
+        the next pass handles as a no-op. The reverse order would leave a live vector with
+        nothing left to record that it should go.
+        """
+        async with self._sessions() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(models.VectorTombstone.chunk_id)
+                        .order_by(
+                            models.VectorTombstone.deleted_at, models.VectorTombstone.chunk_id
+                        )
+                        .limit(limit)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return list(rows)
+
+    async def clear_tombstones(self, chunk_ids: Sequence[str]) -> None:
+        """Retire tombstones whose vectors are gone. Idempotent."""
+        if not chunk_ids:
+            return
+        async with self._sessions.begin() as session:
+            await session.execute(
+                delete(models.VectorTombstone).where(
+                    models.VectorTombstone.chunk_id.in_(list(chunk_ids))
+                )
+            )
+
+    async def soft_deleted_before(self, cutoff: datetime, *, limit: int = 1000) -> Sequence[str]:
+        """Documents whose grace period has expired, so the sweep may purge their chunks."""
+        async with self._sessions() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(models.Document.id)
+                        .where(
+                            models.Document.workspace_id == self._workspace_id,
+                            models.Document.deleted_at.is_not(None),
+                            models.Document.deleted_at < cutoff,
+                        )
+                        .order_by(models.Document.deleted_at, models.Document.id)
+                        .limit(limit)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return list(rows)
+
     # --- chunks ---------------------------------------------------------------------------
 
     async def replace_chunks(self, document_id: str, chunks: Sequence[Chunk]) -> None:
@@ -240,6 +496,27 @@ class SqliteDocStore:
             )
             by_id = {row.id: _to_chunk(row) for row in rows}
             return [by_id[cid] for cid in chunk_ids if cid in by_id]
+
+    async def document_chunks(self, document_id: str) -> Sequence[Chunk]:
+        """Every chunk of one document, in position order.
+
+        Returned whole rather than as ids because both readers — repair and re-embed — need
+        ``embed_text`` and ``token_count``, and fetching ids only to fetch the rows again is a
+        round trip for data already found.
+        """
+        async with self._sessions() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(models.Chunk)
+                        .where(models.Chunk.document_id == document_id)
+                        .order_by(models.Chunk.position, models.Chunk.seq)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return [_to_chunk(row) for row in rows]
 
     async def count_chunks(self, document_id: str | None = None) -> int:
         statement = select(func.count()).select_from(models.Chunk)
@@ -338,6 +615,41 @@ class SqliteDocStore:
             row.watermark = watermark.model_dump(mode="json")
             row.last_synced_at = utcnow()
 
+    async def connector_metadata(self, connector: str) -> dict[str, Any]:
+        """A connector's diagnostic state: last run's counters, last clean reconcile."""
+        async with self._sessions() as session:
+            row = await self._connector_row(session, connector)
+            if row is None:
+                return {}
+            return dict(cast("Any", row.run_metadata) or {})
+
+    async def record_connector_metadata(self, connector: str, updates: Mapping[str, Any]) -> None:
+        """Merge keys into a connector's metadata, dropping any set to ``None``.
+
+        Overwritten rather than accumulated: run history is diagnostic, not relational, and a
+        table that only ever grows needs a retention policy nobody has asked for. Dropping on
+        ``None`` is what lets a confirmed proposal be *removed* rather than left as a null that
+        every reader then has to interpret.
+        """
+        async with self._sessions.begin() as session:
+            row = await self._connector_row(session, connector)
+            if row is None:
+                row = models.Connector(
+                    id=f"{self._workspace_id}:{connector}",
+                    workspace_id=self._workspace_id,
+                    name=connector,
+                    type=connector,
+                    config={},
+                )
+                session.add(row)
+            merged: dict[str, Any] = dict(cast("Any", row.run_metadata) or {})
+            for key, value in updates.items():
+                if value is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
+            row.run_metadata = cast("Any", merged)
+
     async def known_source_ids(self, connector: str) -> AsyncIterator[SourceId]:
         """Every source id currently indexed for a connector.
 
@@ -408,6 +720,10 @@ def _bind_names(prefix: str, count: int) -> list[str]:
 
 
 def _apply_document(row: models.Document, document: Document) -> None:
+    # Writing a document is asserting that it exists, so an upsert clears a soft delete. A
+    # document removed at the source and later restored there arrives through exactly this
+    # path, and leaving the timestamp would index it into a row nothing can see.
+    row.deleted_at = None
     row.source = document.source
     row.source_id = document.source_id
     row.uri = document.uri

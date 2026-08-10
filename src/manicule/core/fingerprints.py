@@ -26,6 +26,7 @@ A mismatch raises, always
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import ClassVar, Self, override
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -106,6 +107,7 @@ class ChunkFingerprint(Fingerprint):
         "overlap_tokens",
         "tokenizer_id",
         "grammars",
+        "embed_text_middleware",
     )
 
     chunker: str = Field(min_length=1, description="Registered chunker that produced the chunks.")
@@ -134,12 +136,36 @@ class ChunkFingerprint(Fingerprint):
         "``{'python': '0.21.0'}``. Recorded per language so that upgrading one grammar "
         "invalidates the documents in that language and leaves the rest alone.",
     )
+    embed_text_middleware: tuple[str, ...] = Field(
+        default=(),
+        description="Sorted ``name@version`` for every middleware declaring "
+        "``mutates_embedded_text``. Empty on a chunker's own fingerprint; the ingest "
+        "pipeline folds the configured set in before comparing. Without it, two instances "
+        "with identical configuration and different middleware produce different vectors "
+        "from identical source bytes and **neither fingerprint refusal notices**, because "
+        "neither otherwise knows middleware exists. Adding, removing or upgrading one is "
+        "then exactly as loud as changing the chunk budget, which is what it is.",
+    )
+
+    def with_middleware(self, declarations: Sequence[str]) -> ChunkFingerprint:
+        """This fingerprint, with ``declarations`` folded into its identity.
+
+        Sorted and de-duplicated here rather than at every call site, so the identity does
+        not depend on the order configuration happened to list middleware in — which is a
+        legitimate thing to change without changing a single vector.
+        """
+        return self.model_copy(update={"embed_text_middleware": tuple(sorted(set(declarations)))})
 
     @override
     def describe(self) -> str:
+        mutating = (
+            f", mutated by {', '.join(self.embed_text_middleware)}"
+            if self.embed_text_middleware
+            else ""
+        )
         return (
             f"{self.chunker} {self.version} ({self.max_tokens}+{self.overlap_tokens} tokens, "
-            f"{self.tokenizer_id})"
+            f"{self.tokenizer_id}{mutating})"
         )
 
 

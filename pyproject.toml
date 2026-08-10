@@ -60,6 +60,14 @@ embeddings = [     # #3
   # where CI runs.
   "mlx-embeddings>=0.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+ingest = [         # #5
+  # Both are optional on purpose, and neither changes what gets indexed. `psutil` reads a
+  # worker's resident memory; without it the same reading costs a fork of `ps` per poll.
+  # `watchfiles` backs directory watching; without it, sync still works and only `watch` is
+  # unavailable. A dependency that changed a document's *content* would not be optional.
+  "watchfiles>=0.24",
+  "psutil>=6.0",
+]
 parsers = [
   # Every one of these is permissively licensed; docs/parsing.md §12 records the rejections
   # (PyMuPDF, extract-msg) and why a copyleft dependency is refused at selection time.
@@ -112,6 +120,9 @@ dev = [
   # Installed so that entry-point discovery is exercised against a real distribution rather
   # than a mock. See packages/manicule-plugin-example.
   "manicule-plugin-example",
+  # Parsers that hang, allocate and crash on purpose, so that "one bad document never
+  # aborts a batch" is demonstrated rather than asserted. Not published.
+  "manicule-plugin-hostile",
   # The parser stack, so `uv sync --all-groups` — what CI runs — can execute the parser
   # suites. Declared as an extra of this project rather than as loose dependencies, so there
   # is one list of what parsing needs and `tests/test_import_boundary.py` still sees them as
@@ -132,6 +143,7 @@ members = ["packages/*"]
 [tool.uv.sources]
 manicule = { workspace = true }
 manicule-plugin-example = { workspace = true }
+manicule-plugin-hostile = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/manicule"]
@@ -248,6 +260,7 @@ asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra --strict-markers --strict-config"
 markers = [
   "contract: protocol conformance suites that every implementation must pass",
+  "slow: starts real subprocesses; the only way to test what a process boundary buys",
 ]
 filterwarnings = ["error"]
 

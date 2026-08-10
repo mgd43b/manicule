@@ -8,7 +8,9 @@ from pydantic import ValidationError
 from manicule.core.anchors import LineAnchor
 from manicule.core.content import (
     CHUNKLESS_BY_DESIGN,
+    IN_FLIGHT,
     NEEDS_ATTENTION,
+    SETTLED,
     Chunk,
     Document,
     DocumentStatus,
@@ -82,9 +84,34 @@ def test_failed_documents_name_the_stage_and_others_do_not() -> None:
         _document(status=DocumentStatus.INDEXED, failed_stage=PipelineStage.EMBED)
 
 
-def test_indexed_is_the_only_status_expected_to_carry_chunks() -> None:
+def test_only_a_document_on_its_way_to_being_indexed_may_carry_chunks() -> None:
+    """Every other status stores zero chunks and zero vectors.
+
+    The in-flight states belong here rather than in ``CHUNKLESS_BY_DESIGN`` because chunks are
+    written *before* vectors and before the commit: a document in ``embedding`` legitimately
+    has chunks and is not yet servable. Being chunkless "by design" is a statement about a
+    settled document, not about one that is mid-flight.
+    """
     carrying = {status for status in DocumentStatus if status not in CHUNKLESS_BY_DESIGN}
-    assert carrying == {DocumentStatus.PENDING, DocumentStatus.PARSED, DocumentStatus.INDEXED}
+    assert carrying == {
+        DocumentStatus.PENDING,
+        DocumentStatus.FETCHING,
+        DocumentStatus.PARSING,
+        DocumentStatus.EMBEDDING,
+        DocumentStatus.PARSED,
+        DocumentStatus.INDEXED,
+    }
+
+
+def test_every_status_is_either_settled_or_on_its_way_somewhere() -> None:
+    """No status may be missing from both sets, or a document in it is swept by nothing.
+
+    The recovery sweep reads :data:`IN_FLIGHT` and change detection reads :data:`SETTLED`.
+    A member in neither is a document that is never requeued *and* never skipped — quietly
+    re-ingested from scratch on every run, forever.
+    """
+    accounted = IN_FLIGHT | SETTLED | {DocumentStatus.PENDING, DocumentStatus.PARSED}
+    assert accounted | {DocumentStatus.DELETED} == set(DocumentStatus)
 
 
 def test_raw_documents_decode_either_way() -> None:
@@ -123,6 +150,12 @@ def test_embed_text_is_separate_from_the_text_that_gets_cited() -> None:
 
 
 def test_pipeline_stages_are_in_ingest_order() -> None:
+    """The six stages, in order — and ``middleware`` after them, because it is not one.
+
+    Hooks run *between* stages. A hook that raises is a plugin problem, and recording it under
+    the stage it happened to bound would send an operator to read a parser that worked
+    perfectly, so it gets a value of its own. Placing it last is what keeps the six in order.
+    """
     assert list(PipelineStage) == [
         PipelineStage.DISCOVER,
         PipelineStage.FETCH,
@@ -130,4 +163,5 @@ def test_pipeline_stages_are_in_ingest_order() -> None:
         PipelineStage.CHUNK,
         PipelineStage.EMBED,
         PipelineStage.STORE,
+        PipelineStage.MIDDLEWARE,
     ]

@@ -57,6 +57,9 @@ IMPLEMENTATION_MODULES = (
     "mcp",
     "fastmcp",
     "jinja2",
+    # ingest (#5) — optional even there: neither changes what gets indexed
+    "watchfiles",
+    "psutil",
     # networking and scheduling (#9, #14)
     "httpx",
     "aiohttp",
@@ -69,6 +72,11 @@ IMPLEMENTATION_MODULES = (
 MANICULE_PACKAGES = (
     "manicule",
     "manicule.core",
+    # The ingest pipeline is not core, and it still pulls in no database, no model runtime
+    # and no file watcher. It talks to storage through protocols and imports its optional
+    # extras inside the functions that need them, so an installation that never watches a
+    # directory never pays for `watchfiles`.
+    "manicule.ingest",
     "manicule.config",
     "manicule.plugins",
     "manicule.container",

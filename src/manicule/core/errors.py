@@ -91,6 +91,50 @@ class ChunkingError(ManiculeError):
     """A chunker could not produce chunks from a document's blocks."""
 
 
+class MiddlewareViolationError(ManiculeError):
+    """A middleware hook did something the contract forbids.
+
+    Three shapes, all of them the same defect — a hook whose effect the pipeline cannot
+    describe: returning the wrong type or ``None`` where a value was required, rewriting
+    ``ParsedBlock.text`` or ``Chunk.text``, or rewriting ``embed_text`` after declaring it
+    would not.
+
+    Fatal to the document, never to the batch. A hook that fails on one document is usually
+    a document problem, and disabling the hook would make the corpus depend on ingest order.
+    """
+
+
+class WorkerKilledError(ManiculeError):
+    """A parse worker was killed for exceeding a limit, rather than failing on its own.
+
+    Deliberately **not** a decline. A parser that declined inspected the input and reported
+    that it is not its kind, which is information; a parser the pipeline killed reported
+    nothing at all. Collapsing the two lets a chain of timeouts end at
+    ``unsupported_media_type``, which reads as "manicule does not handle this format" when
+    the truth is "every parser that handles this format ran out of time" — and sends whoever
+    reads it to write a parser that already exists.
+    """
+
+
+class ReconciliationRefusedError(ManiculeError):
+    """A reconciliation pass proposed more deletion than its ceiling allows.
+
+    Not a failure of the source and not a failure of the diff: a genuine bulk deletion is
+    rare and worth a human, and a bug that looks like one is not rare at all. The proposal is
+    recorded so it can be confirmed rather than recomputed.
+    """
+
+
+class InstanceLockedError(ManiculeError):
+    """Another manicule process already holds this data directory.
+
+    The recovery sweep, the tombstone sweep and the blob GC all assume a single writer. WAL
+    permits several, so the assumption is enforced here rather than hoped for: a second
+    instance that started anyway would requeue the first one's in-flight documents out from
+    under it.
+    """
+
+
 class ContextOverflowError(ManiculeError):
     """Text was offered to an embedder that attends to less of it than was sent.
 
@@ -130,12 +174,16 @@ __all__ = [
     "DuplicateComponentError",
     "FingerprintMismatchError",
     "IncompatiblePluginError",
+    "InstanceLockedError",
     "ManiculeError",
+    "MiddlewareViolationError",
     "ParseError",
     "PluginDependencyError",
     "PluginError",
     "PluginLoadError",
     "PolicyError",
+    "ReconciliationRefusedError",
     "TokenStateError",
     "UnknownComponentError",
+    "WorkerKilledError",
 ]

@@ -182,6 +182,32 @@ class EmbedFingerprint(Fingerprint):
         return f"{self.model_id}{revision} ({self.dimension}d, {self.pooling.value}, {norm})"
 
 
+class IndexFingerprints(BaseModel):
+    """What an index says it was built with.
+
+    One row, read before a run and written when a run commits to a shape. Every field is
+    optional because an empty index has committed to nothing yet, and ``None`` is the honest
+    answer — it accepts whatever the first ingest brings, which is the one moment at which no
+    comparison is possible and none is needed.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    embed: EmbedFingerprint | None = None
+    chunk: ChunkFingerprint | None = None
+    vector_table: str | None = Field(
+        default=None,
+        description="Which vector table holds the vectors. A pointer rather than a constant, "
+        "because a re-embed builds its replacement alongside the live one and there is a "
+        "window in which the index is neither the old thing nor the new one.",
+    )
+
+    @property
+    def is_empty(self) -> bool:
+        """Whether this index has committed to nothing, so anything is acceptable."""
+        return self.embed is None and self.chunk is None
+
+
 def require_within_context(
     chunks: Sequence[Chunk],
     fingerprint: EmbedFingerprint,
@@ -253,6 +279,7 @@ def require_within_context(
 
 __all__ = [
     "EmbedFingerprint",
+    "IndexFingerprints",
     "NDArrayLike",
     "Pooling",
     "TokenStates",
