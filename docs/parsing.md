@@ -56,7 +56,7 @@ architecture limits gets this wrong.
 So the mechanism is not "512 is safe everywhere". It is:
 
 > The chunker reads the **effective** sequence length from `Embedder.fingerprint` and
-> **refuses to start** when `budget_tokens` exceeds it.
+> **refuses to start** when `max_tokens` exceeds it.
 
 512 is the default because it clears the entire realistic candidate set bar one, and the
 one it does not clear produces a loud startup error naming both numbers, not a silently
@@ -120,7 +120,7 @@ below). The embedder sees `embed_text`. Therefore the model limit applies to `em
 and a budget measured on `text` overflows by exactly the breadcrumb length.
 
 ```
-budget_tokens (512)  =  breadcrumb_budget_tokens (64)  +  text budget (448)
+max_tokens (512)  =  breadcrumb budget (64)  +  text budget (448)
 ```
 
 The breadcrumb budget is reserved unconditionally, whether or not a given chunk has a
@@ -190,8 +190,8 @@ follow that it needs no persisted state. Changing it means re-chunk *and* re-emb
 gets the same mechanical treatment `Embedder.fingerprint` gets for dimensionality:
 
 ```
-ChunkFingerprint  budget_tokens, overlap_tokens, breadcrumb_budget_tokens,
-                  min_tokens, chunker_version, tokenizer_id, grammar_pack_version
+ChunkFingerprint  chunker, version, max_tokens, overlap_tokens,
+                  tokenizer_id, grammars: {language: version}
 ```
 
 Recorded at first ingest alongside the embedder fingerprint, in the same index-identity row
@@ -206,9 +206,10 @@ Two of the fields are less obvious than they look:
 - **`tokenizer_id`** — the same budget measured with a different tokenizer produces
   different boundaries. A model swap that keeps the dimension but changes the vocabulary
   would otherwise pass the embedder check and quietly re-chunk.
-- **`grammar_pack_version`** — a tree-sitter grammar upgrade changes parse trees, which
-  changes code chunk boundaries (§8.3). It invalidates *only* code documents, so this field
-  supports a partial re-parse rather than a full one.
+- **`grammars` is a per-language map, not one pack version.** A tree-sitter grammar upgrade
+  changes parse trees, which changes code chunk boundaries (§8.3). Recording it per language
+  means a Python grammar bump invalidates Python documents and nothing else — `changed_fields()`
+  names exactly what moved.
 
 ### 1.8 What would have to be true to change it
 
@@ -883,16 +884,16 @@ attempt.
 **Declined — advance, and tracked separately.** The parser inspected the input and declared
 it unsupported without attempting to parse: the plaintext parser handed a JPEG, the archive
 parser handed an OOXML container (§9.4). This is distinct from a hard failure for the same
-reason `no_extractable_text` is distinct from `parse_failed` — a parser that *declined* is
+reason `no_extractable_text` is distinct from `failed` — a parser that *declined* is
 reporting that the document is not its kind, which is information, whereas one that *raised*
 is reporting that something broke. If every parser in the chain declined, the document is
-`unsupported_media_type`; if any raised, it is `parse_failed`.
+`unsupported_media_type`; if any raised, it is `failed` at stage `parse`.
 
 **Empty output — advance, and remember that it happened.** The parser returned zero
 text-bearing blocks without raising. This *must* advance the chain, because that is the
 entire purpose of putting `docling` behind `pypdfium2`. It is tracked separately from hard
 failure because if *every* parser in the chain comes back empty, the document is
-`no_extractable_text`, not `parse_failed` — see §6.5.
+`no_extractable_text`, not `failed` — see §6.5.
 
 **Degraded output — does not advance.** A parser that produced text but only `Unlocated`
 anchors, or only page-level ones, **has succeeded.** Falling back on quality grounds makes
@@ -909,13 +910,13 @@ parse stage produces, and each is load-bearing.
 |---|---|---:|
 | `parsed` | a parser returned ≥ 1 chunk | ≥ 1 |
 | `no_extractable_text` | chain completed, nothing hard-failed, every parser returned zero text | 0 |
-| `parse_failed` | every parser in the chain hard-failed | 0 |
+| `failed` + `failed_stage=parse` | every parser in the chain hard-failed | 0 |
 | `unsupported_media_type` | no chain matched, or every parser in it declined (§6.3) | 0 |
 | `container` | an archive whose members were expanded into their own documents (§9) | 0 |
 
 **The mixed case, stated because it is the one an implementation guesses at.** A chain where
 one parser hard-failed and another returned empty, with no parser producing text, is
-`parse_failed` — **not** `no_extractable_text`. A parser that broke leaves us genuinely not
+`failed` — **not** `no_extractable_text`. A parser that broke leaves us genuinely not
 knowing whether text was there, and `no_extractable_text` means something specific: the
 tooling worked and there was nothing to find. Widening it to cover "something broke and the
 rest found nothing" would make the 5% warning in §6.5 fire on library bugs and stop meaning
@@ -965,7 +966,7 @@ status carries `metadata.reason` distinguishing them:
 `"no text layer"`, `"document contains no text runs"`, `"all slides are images and no
 speaker notes are present"`.
 
-**Distinct from `parse_failed`, and the distinction is the deliverable.** `parse_failed`
+**Distinct from `failed`, and the distinction is the deliverable.** A parse `failed`
 means the tooling broke and the document may well contain text. `no_extractable_text` means
 the tooling worked and there is nothing there to extract. They call for different actions —
 one is a bug report, the other is a scanning-and-OCR question — and collapsing them into
@@ -990,7 +991,7 @@ not fail an ingest run. It is a normal outcome, counted and reported.
 
 `doctor` reports, per source and per media type:
 
-- document counts by status, with `no_extractable_text`, `parse_failed` and
+- document counts by status, with `no_extractable_text`, `failed` (by stage) and
   `unsupported_media_type` broken out by reason;
 - **fallback rate** — the share of documents where the primary parser did not produce the
   result. A rising fallback rate is the early signal of a library regression or a change at
@@ -1040,7 +1041,7 @@ as they come (rule 3, §2.1).
 - **Page index origin.** pdfium is 0-based; `PageAnchor.page` is **1-based** (§2.1, rule 6).
   Converted once, at the boundary, and asserted by the discrimination test (§3.3,
   assertion 3), which is the test that catches an off-by-one.
-- **Encrypted PDFs.** A PDF with a user password cannot be read; status `parse_failed` with
+- **Encrypted PDFs.** A PDF with a user password cannot be read; status `failed` with
   `reason="encrypted"`. A PDF with only an owner password *can* be read by pdfium and is
   parsed normally — the distinction matters because owner-password PDFs are common and
   refusing them would drop real content.
@@ -1097,7 +1098,7 @@ guardrail. So it is closed in three moves:
    and re-indexable the moment the grammar arrives.
 
 The declared set, the pack version, and the resolved grammar versions all feed
-`grammar_pack_version` in `ChunkFingerprint` (§8.3), so "which grammars built this corpus"
+`ChunkFingerprint.grammars` (§8.3), so "which grammars built this corpus"
 is recorded rather than inferred from a cache directory.
 
 **Licences are settled, not an open audit.** The pack's stated policy is that every included
@@ -1178,10 +1179,10 @@ A grammar upgrade changes parse trees. Changed trees mean changed split points (
 mean changed chunk boundaries, which mean stored embeddings that no longer correspond to the
 chunks that would be produced today.
 
-`grammar_pack_version` is therefore in `ChunkFingerprint` (§1.7). Because it can only affect
+The grammar version is therefore in `ChunkFingerprint.grammars`, per language (§1.7). Because it can only affect
 code documents, a mismatch on this field alone permits a **partial** re-parse — re-chunk and
 re-embed the code documents, leave everything else — rather than the full re-index a
-`budget_tokens` change demands.
+`max_tokens` change demands.
 
 The global fingerprint on its own cannot express that, since it is one value for the whole
 index. What makes it actionable is that each document also records the fingerprints it was
@@ -1307,10 +1308,10 @@ Two more, which are about names rather than sizes:
   future extraction path being added without remembering.
 
 Exceeding a limit **fails that member, or that archive, and never the batch.** The container
-gets `parse_failed` with the limit that tripped; members already extracted keep their
+gets `failed` with the limit that tripped; members already extracted keep their
 documents. An archive limit is a bound on damage, not a reason to lose the run.
 
-**Encrypted members** yield a member document with status `parse_failed` and
+**Encrypted members** yield a member document with status `failed` and
 `reason="encrypted archive member"`. The archive keeps going.
 
 ### 9.4 The trap: OOXML files are zips
