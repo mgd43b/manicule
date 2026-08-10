@@ -73,4 +73,16 @@ uv run ruff check . && uv run pyright
 
 ## Licence
 
-MIT. See [`LICENSE`](LICENSE).
+**GPL-3.0-or-later.** See [`LICENSE`](LICENSE).
+
+The embedding runtime decided this. `mlx-embeddings` is GPL-3.0, and running embeddings
+in-process on Apple Silicon is what keeps `uv tool install manicule` a single command with no
+server to operate alongside it. Changing the licence was chosen over changing the dependency.
+
+**This reaches plugins.** They load in-process, in the same address space, through
+`importlib.metadata` entry points — not over a socket or a subprocess boundary. A plugin
+distributed to others is very likely a derivative work under the GPL, which was not true when
+this project was MIT. That is a real consequence for the community registry
+([#8](https://github.com/mgd43b/manicule/issues/8)) and it is stated here rather than
+discovered by whoever publishes the first one. Nothing in this repository decides it for you:
+take advice if you intend to distribute a plugin under other terms.

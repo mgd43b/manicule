@@ -12,7 +12,7 @@ from manicule.core.protocols import DocStore
 from manicule.core.retrieval import Filter
 from manicule.core.sources import Watermark
 from manicule.storage.docstore import CrossWorkspaceCollisionError, SqliteDocStore
-from manicule.testing import assert_protocol_signatures
+from manicule.testing import assert_protocol_signatures, closing
 from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
@@ -254,7 +254,8 @@ async def test_known_source_ids_yields_what_reconciliation_diffs_against(
     await store.upsert_document(make_document(source="confluence", source_id="2"))
     await store.upsert_document(make_document(source="fs", source_id="3"))
 
-    seen = {source_id async for source_id in store.known_source_ids("confluence")}
+    async with closing(store.known_source_ids("confluence")) as ids:
+        seen = {source_id async for source_id in ids}
     assert seen == {"1", "2"}
 
 
@@ -265,7 +266,8 @@ async def test_a_soft_deleted_document_is_absent_from_reconciliation(
     document = make_document(source="confluence", source_id="1")
     await store.upsert_document(document)
     await store.soft_delete_document(document.id)
-    assert [source_id async for source_id in store.known_source_ids("confluence")] == []
+    async with closing(store.known_source_ids("confluence")) as ids:
+        assert [source_id async for source_id in ids] == []
 
 
 async def test_two_workspaces_cannot_see_each_others_documents(engine: AsyncEngine) -> None:

@@ -33,7 +33,7 @@ OpenDocuments got it right. Where it does not, the reason is stated.
 | Vectors | LanceDB |
 | Metadata | SQLite · SQLAlchemy 2.0 async · Alembic |
 | Lexical search | SQLite FTS5 |
-| Embeddings | **MLX**, in-process · onnxruntime fallback |
+| Embeddings | **BGE-M3** on **MLX**, in-process · **onnxruntime** for parity and portability |
 | Generation | **Ollama** locally, via **litellm** · any hosted provider through the same call |
 | Reranking | sentence-transformers CrossEncoder |
 | HTTP | FastAPI · uvicorn |
@@ -111,7 +111,7 @@ re-ingest against a pinned corpus a first-class operation rather than a re-crawl
 
 | Format | OpenDocuments | manicule | |
 |---|---|---|---|
-| **PDF** | `pdf-parse` | **pypdfium2** fast path; **docling** or **marker** optional | **Gain.** Real page and bbox provenance. Avoid PyMuPDF — AGPL, incompatible with MIT. **No OCR in v1** — see below |
+| **PDF** | `pdf-parse` | **pypdfium2** fast path; **docling** or **marker** optional | **Gain.** Real page and bbox provenance. `pypdfium2` is BSD/Apache. PyMuPDF stays rejected — see the licence note below. **No OCR in v1** — see below |
 | **Code** | pattern-matched functions/classes | **tree-sitter** | **Biggest gain.** Real ASTs, 40+ languages |
 | HTML | `node-html-parser` | **selectolax** structural; **trafilatura** for crawled pages only | Two different jobs — fidelity vs boilerplate removal |
 | DOCX | `mammoth` | **python-docx** | |
@@ -123,6 +123,22 @@ re-ingest against a pinned corpus a first-class operation rather than a re-crawl
 | Plain text | custom | stdlib | |
 | Structured | custom | stdlib `json`/`tomllib`, **PyYAML** | |
 | Archive | placeholder | **zipfile** + recurse into the parser chain | OpenDocuments never implemented this |
+
+### What the GPL-3.0 relicence changed here, and what it did not
+
+The project is GPL-3.0-or-later (`LICENSE`), so copyleft dependencies are no longer excluded
+by default. Two parsing decisions were made on licence grounds and they move in opposite
+directions:
+
+- **`extract-msg` (GPL-3.0) is cleanly unblocked.** GPL-3.0 code in a GPL-3.0 project carries
+  no additional obligation. [#21](https://github.com/mgd43b/manicule/issues/21) gets much
+  simpler: it becomes a dependency, not a hand-written MAPI property reader.
+- **PyMuPDF (AGPL-3.0) is *not* simply unblocked, and the PDF decision does not change.**
+  GPLv3 §13 permits combining with AGPLv3 code, but the combination then carries AGPL §13:
+  anyone who *runs* it as a network service owes source to its users. manicule ships an HTTP
+  API and a web UI, so that is a live obligation in team mode rather than a formality.
+  `pypdfium2` is permissively licensed and already delivers page and bbox provenance, so
+  taking on a network-copyleft obligation to swap it out buys nothing.
 
 ### OCR — out of scope for v1
 
@@ -168,26 +184,46 @@ the chunk model with no markup parsing at all.
 Two runtimes, split by job. This is deliberate: the two have different requirements and
 neither is good at both.
 
-### Embeddings — MLX, in-process
+### Embeddings — `BAAI/bge-m3` on MLX, in-process
 
 | | OpenDocuments | manicule | |
 |---|---|---|---|
-| Runtime | Ollama / cloud HTTP | **MLX** (`mlx-embeddings`) | **No server process.** Runs inside the application, which is what keeps `uv tool install manicule` a single command with nothing to operate alongside it |
-| Fallback | — | **onnxruntime** | Anywhere that is not Apple Silicon |
-| Pooling | whatever the provider does | **ours, in numpy** | **Gain.** See below |
-| Caching | in-memory L2 | same, keyed by model identity | A model change is a loud error with a re-embed path, never quietly worse results |
+| Model | provider default | **`BAAI/bge-m3`** — 1024d, 8192 tokens, MIT, multilingual | Configuration, not a constant. See [`docs/embeddings.md`](docs/embeddings.md) |
+| Runtime | Ollama / cloud HTTP | **MLX** (`mlx-embeddings`) | **No server process.** What keeps `uv tool install manicule` a single command with nothing to operate alongside it |
+| Second backend | — | **onnxruntime** | Not a fallback — the parity check. Also the path off Apple Silicon |
+| Pooling | whatever the provider does | **ours, in numpy** | **Gain.** BGE-M3 pools with CLS, and the MLX convenience field mean-pools. See below |
+| Caching | in-memory L2 | keyed by the full `EmbedFingerprint` | A model change is a loud error with a re-embed path, never quietly worse results |
 
 **Why not speed.** An earlier draft justified MLX with "~50% faster than llama.cpp on
 embeddings." That figure has no traceable primary measurement and should not be repeated.
 The argument for MLX is that it runs in-process; benchmark it during #3 if the number
 matters.
 
-**Why pooling is ours.** `mlx-embeddings` binds `last_hidden_state` to the *pooled*
-vector — token states are one attribute below, on the inner encoder. Anyone trusting the
-field name gets pooled output and never knows. On the target model, CLS versus mean
-pooling differs by **0.856 cosine**: plausible vectors, materially worse retrieval, no
-error raised. So manicule reads token states and pools in its own numpy, driven by the
-model's declared pooling.
+**onnxruntime is the enforcement mechanism, not the fallback.** `mlx-embeddings` is version
+0.1.0 and assigns `last_hidden_state` different meanings on different architectures. So the
+same text, through the same model, under both backends, must produce vectors within a stated
+tolerance — asserted in tests, not assumed. That is the Apple-hardware principle in its
+operative form: **optimise execution for Apple hardware freely; never let the platform change
+what ends up in the index.** Throughput may vary by machine. Vectors may not.
+
+**The model is switchable, and switching is a priced operation.** There is a known-good set,
+one is active at a time, and changing it means a full re-embed — bounded, resumable, and
+loud rather than silent, because `EmbedFingerprint` refuses a mismatched index. Citations
+survive it: `chunks.id` derives from content, not from the model.
+
+**Why pooling is ours.** `mlx-embeddings` offers a convenience field, and on the chosen
+model it is the wrong pooling. `BAAI/bge-m3` pools with **CLS**; the library's XLM-RoBERTa
+implementation computes `text_embeds` with **mean pooling, unconditionally**. Anyone
+trusting the obviously-named field gets correctly-shaped, normalised vectors from the wrong
+reduction, with no error raised.
+
+The same library also gives `last_hidden_state` different meanings on different
+architectures — genuine token states on `xlm_roberta` and `bert`, the *pooled* vector on
+`modernbert` — so neither field can be trusted by name. manicule reads token states and
+pools them in its own numpy, driven by the model's declared configuration. CLS and mean
+diverge more the longer the chunk, so at the 512-token budget the gap is at its widest.
+Full detail, with what was measured and what still must be, in
+[`docs/embeddings.md`](docs/embeddings.md) §4.
 
 ### Ollama is not an embedding backend
 

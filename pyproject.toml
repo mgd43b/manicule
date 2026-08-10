@@ -7,14 +7,13 @@ name = "manicule"
 version = "0.1.0"
 description = "Self-hosted document search and answers, with citations that resolve."
 readme = "README.md"
-license = "MIT"
+license = "GPL-3.0-or-later"
 requires-python = ">=3.12"
 authors = [{ name = "manicule contributors" }]
 keywords = ["rag", "search", "documents", "citations", "self-hosted"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Topic :: Text Processing :: Indexing",

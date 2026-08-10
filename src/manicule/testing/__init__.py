@@ -13,6 +13,7 @@ from manicule.testing.contracts import (
     assert_retrieval_stage_contract,
     assert_vector_store_is_dimension_agnostic,
     assert_vector_store_rejects_foreign_vectors,
+    closing,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "assert_retrieval_stage_contract",
     "assert_vector_store_is_dimension_agnostic",
     "assert_vector_store_rejects_foreign_vectors",
+    "closing",
 ]
