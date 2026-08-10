@@ -386,9 +386,9 @@ variant, where the location physically comes from, and whether provenance is rea
 | **XLSX / CSV** | `.xlsx` `.csv` | `CellAnchor(sheet, ref)` | sheet name + the row/column range the block covers, as `Sheet1!B4:D12`. A CSV has no sheet, so `sheet` is the file stem | **Exact** |
 | **PPTX** | `.pptx` | `PageAnchor(page, rects)` | slide index (1-based, presentation order); shape geometry → `Rect` | **Exact** |
 | **Jupyter** | `.ipynb` | `HeadingAnchor(path, "cell-<id>")` | markdown-cell heading tree; fragment is the nbformat cell `id` | **Exact** for nbformat ≥ 4.5; see §2.5 below |
-| **Email** | `.eml` `.msg` | `LineAnchor(start, end, None)` | line span within the canonical body part (§10) | **Exact**, given the part-selection rule |
+| **Email** | `.eml` `.msg` | `LineAnchor(start, end, None)` | line span within the canonical text — headers, blank line, body (§10) | **Exact**, given the part-selection rule |
 | **Plain text** | `.txt` | `LineAnchor(start, end, None)` | source line numbers | **Exact** |
-| **Structured** | `.json` `.yaml` `.yml` `.toml` | `LineAnchor(start, end, symbol)` | source line span; `symbol` is the JSON Pointer / dotted key | **Exact** where positions exist (§11) |
+| **Structured** | `.json` `.yaml` `.yml` `.toml` | `LineAnchor(start, end, symbol)` | source line span; `symbol` is the dotted key path, with `[n]` for an array index | **Exact** where positions exist (§11) |
 | **Archive** | `.zip` | *(none — emits no chunks)* | members become their own documents with their own anchors (§9) | N/A |
 
 Twelve parsers over eighteen extensions, matching `PLAN.md` §5 and the `CAPABILITIES.md`
@@ -1610,8 +1610,14 @@ Two defences, both required, because either alone fails:
 `LineAnchor` addresses a line span and a multipart message has several candidate bodies:
 
 > The canonical body is the **first `text/plain` part in depth-first order**; failing that,
-> the **first `text/html` part**, run through the HTML parser. Line numbers address the
-> decoded, transfer-decoding-removed text of that part.
+> the **first `text/html` part**, run through the HTML parser, with transfer decoding removed.
+
+**Line numbers address the canonical *text*, not the body part alone.** That text is the
+rendered header block, a blank line, and then the body — so the headers occupy lines 1 to *n*
+and the body begins at *n* + 2. One coordinate space rather than two, because a message has
+one citation space: an anchor of "lines 3-4" has to mean one thing whether it lands in the
+headers or in the body, and two spaces would make every body anchor ambiguous with a header
+anchor of the same number.
 
 For an HTML-only body the line numbers address the *converted* text rather than the source
 bytes, so **the HTML-to-text conversion is pinned and its version is part of

@@ -437,7 +437,11 @@ def _open(raw: RawDocument) -> tuple[dict[str, object], tuple[int, int]]:
     text = decode(raw)
     try:
         document = _read_json(text)
-    except (NotJSONError, ValidationError, NBFormatError, AttributeError, ValueError) as exc:
+    # ``AttributeError`` is deliberately absent: it would turn a bug in this module, or in
+    # nbformat, into a polite decline and hand the notebook to the plaintext tail.
+    # ``NotJSONError`` is a ``ValueError`` subclass and is named anyway, because which
+    # failures are expected here is the point of the tuple.
+    except (NotJSONError, ValidationError, NBFormatError, ValueError) as exc:
         msg = (
             f"{raw.uri}: not a readable notebook ({type(exc).__name__}: {exc}). Expected "
             f"nbformat JSON with a 'cells' array. Open and re-save it in Jupyter, or route this "
@@ -456,5 +460,12 @@ def _open(raw: RawDocument) -> tuple[dict[str, object], tuple[int, int]]:
             f"here would generate cell ids the file does not contain, so every citation into it "
             f"would point at an address invented on the machine that ran the conversion"
         )
+        # A ``ParseError`` — a decline — where a missing grammar is a refusal, and the
+        # difference is the kind of fact each one is. An nbformat 3 file is a property of the
+        # *document*: it will be nbformat 3 on every machine, and the JSON parser genuinely can
+        # index it with honest key-path anchors, so letting the chain continue is a better
+        # outcome than refusing. A missing grammar is a property of the *machine*, identical
+        # documents chunking two ways depending on what a cache happens to hold, which is why
+        # ``manicule.parsers.grammars`` refuses instead of declining.
         raise ParseError(msg)
     return notebook, (major, minor)
