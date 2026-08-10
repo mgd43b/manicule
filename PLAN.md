@@ -33,8 +33,8 @@ OpenDocuments got it right. Where it does not, the reason is stated.
 | Vectors | LanceDB |
 | Metadata | SQLite · SQLAlchemy 2.0 async · Alembic |
 | Lexical search | SQLite FTS5 |
-| Embeddings | MLX on Apple Silicon · onnxruntime fallback |
-| Generation | litellm |
+| Embeddings | **MLX**, in-process · onnxruntime fallback |
+| Generation | **Ollama** locally, via **litellm** · any hosted provider through the same call |
 | Reranking | sentence-transformers CrossEncoder |
 | HTTP | FastAPI · uvicorn |
 | MCP | FastMCP |
@@ -146,14 +146,57 @@ runs `html.replace(/<[^>]+>/g, ' ')`. Tables, code blocks, headings and macros c
 into a run of words. ADF gives a typed JSON document tree instead, mapping directly onto
 the chunk model with no markup parsing at all.
 
-## 7. Embeddings
+## 7. Model runtimes — MLX and Ollama
+
+Two runtimes, split by job. This is deliberate: the two have different requirements and
+neither is good at both.
+
+### Embeddings — MLX, in-process
 
 | | OpenDocuments | manicule | |
 |---|---|---|---|
-| Runtime | Ollama / cloud HTTP | **MLX** (`mlx-embeddings`) | Native Apple Silicon |
-| Fallback | — | **onnxruntime** | Anywhere not Apple Silicon |
-| Pooling | whatever the provider does | **ours, in numpy** | **Gain.** `mlx-embeddings`' `last_hidden_state` returns the *pooled* vector; token states are one attribute down. CLS vs mean pooling on the target model differs by **0.856 cosine** — silently |
-| Caching | in-memory L2 | same, keyed by model identity | Model identity recorded in the index; a mismatch is a loud error with a re-embed path |
+| Runtime | Ollama / cloud HTTP | **MLX** (`mlx-embeddings`) | **No server process.** Runs inside the application, which is what keeps `uv tool install manicule` a single command with nothing to operate alongside it |
+| Fallback | — | **onnxruntime** | Anywhere that is not Apple Silicon |
+| Pooling | whatever the provider does | **ours, in numpy** | **Gain.** See below |
+| Caching | in-memory L2 | same, keyed by model identity | A model change is a loud error with a re-embed path, never quietly worse results |
+
+**Why not speed.** An earlier draft justified MLX with "~50% faster than llama.cpp on
+embeddings." That figure has no traceable primary measurement and should not be repeated.
+The argument for MLX is that it runs in-process; benchmark it during #3 if the number
+matters.
+
+**Why pooling is ours.** `mlx-embeddings` binds `last_hidden_state` to the *pooled*
+vector — token states are one attribute below, on the inner encoder. Anyone trusting the
+field name gets pooled output and never knows. On the target model, CLS versus mean
+pooling differs by **0.856 cosine**: plausible vectors, materially worse retrieval, no
+error raised. So manicule reads token states and pools in its own numpy, driven by the
+model's declared pooling.
+
+### Ollama is not an embedding backend
+
+Settled, not a preference. `/api/embed` returns pooled, already-normalised vectors
+regardless of input, and **no configuration changes that** — setting `LLAMA_ARG_POOLING`
+reaches the engine and then breaks the endpoint for every input. Without token states
+there is no pooling control, and the failure above becomes unavoidable.
+
+### Generation — Ollama, through litellm
+
+| | OpenDocuments | manicule | |
+|---|---|---|---|
+| Local | one of five hand-written clients | **Ollama** | Model management MLX lacks — pull, serve, swap |
+| Hosted | four more hand-written clients | **litellm** | **Gain.** One dependency covers Ollama, OpenAI, Anthropic, Google, xAI and any OpenAI-compatible endpoint |
+| Switching | provider plugin per vendor | a `base_url` | Local and hosted are the same code path |
+
+Ollama is the local default and is **optional** — litellm will point at a hosted model
+instead, so the install does not require it.
+
+### The alternative, recorded
+
+`llama-server` can do both: embeddings with `--pooling none` and OpenAI-compatible
+generation, from one process and one model format, portable off Apple Silicon. Rejected
+because it makes embeddings a server dependency rather than an in-process call, and gives
+up Metal-native execution on the machine this is built for. Defensible if operating one
+runtime ever matters more than those two things.
 
 ## 8. Retrieval
 
