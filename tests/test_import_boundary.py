@@ -95,6 +95,10 @@ MANICULE_PACKAGES = (
     "manicule.plugins",
     "manicule.container",
     "manicule.testing",
+    # Generation is not core either, and it still pulls in no provider library. The litellm
+    # import lives inside the factory that builds the generator, so an installation that
+    # never asks a question never pays for it — and `manicule doctor` does not load it at all.
+    "manicule.generation",
 )
 
 
@@ -283,6 +287,15 @@ torch. Neither has any business being loaded by discovery, which runs in every p
 starts — including one whose profile is ``fast`` and will never construct a reranker at all.
 """
 
+GENERATION_LIBRARIES = ("litellm", "openai", "anthropic", "httpx", "tiktoken")
+"""What the built-in generator is built on.
+
+Installed in this environment, so the claim is "an installed package is not loaded until
+something needs it" rather than "a missing package stays missing". litellm is the expensive
+one: importing it costs seconds and pulls in several HTTP clients, which has no business
+happening in a process that is only searching an index.
+"""
+
 
 @pytest.mark.contract
 def test_registering_the_retrieval_stages_loads_no_tokenizer_or_cross_encoder() -> None:
@@ -305,6 +318,27 @@ def test_registering_the_retrieval_stages_loads_no_tokenizer_or_cross_encoder() 
 
 
 @pytest.mark.contract
+def test_registering_the_built_in_generator_loads_no_provider_library() -> None:
+    """Discovery runs before configuration is read, in every process that starts.
+
+    Registration needs one thing about the generator: its configuration model, so settings
+    written for it are validated rather than ignored. That lives in
+    ``manicule.generation.config``, which imports nothing heavier than pydantic.
+    """
+    loaded = _modules_added_by_discovery()
+    leaked = sorted(
+        name
+        for name in GENERATION_LIBRARIES
+        if any(module == name or module.startswith(f"{name}.") for module in loaded)
+    )
+    assert leaked == [], (
+        f"plugin discovery loaded {', '.join(leaked)}. The provider library belongs inside "
+        f"the factory that builds the generator; what registration needs eagerly — a config "
+        f"model — belongs in manicule.generation.config"
+    )
+
+
+@pytest.mark.contract
 def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
     """The built-in parsers take the same route a third-party plugin takes.
 
@@ -318,6 +352,7 @@ def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
     assert found.get("parsing") == "manicule.parsers.plugin:PLUGIN", STALE_INSTALL
     assert found.get("embedding") == "manicule.embedding.plugin:PLUGIN", STALE_INSTALL
     assert found.get("retrieval") == "manicule.retrieval.plugin:PLUGIN", STALE_INSTALL
+    assert found.get("generation") == "manicule.generation.plugin:PLUGIN", STALE_INSTALL
 
 
 @pytest.mark.contract

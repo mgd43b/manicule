@@ -151,6 +151,14 @@ architectures and to genuine token states on others. Both produce well-shaped, n
 vectors and raise nothing. Tier B backends are therefore admitted only by measurement, since
 they cannot be verified by inspection. See [`embeddings.md`](embeddings.md) §3.2 and §4.1.
 
+**`Generator.generate` is iterated through `generating()`**, the sibling of `parsing()` in
+`manicule.core.protocols`, for the reason [#35](https://github.com/mgd43b/manicule/pull/35)
+established and one that is worse here: an abandoned generation stream holds an open HTTP
+response to a model that is still working — billed tokens nobody will read on a hosted provider,
+and on a local one the only model on the machine, occupied until it finishes. Its close carries a
+hard deadline, because a shutdown that can block indefinitely on a misbehaving remote server is a
+worse failure than a leaked socket.
+
 **`Generator.context_window` is the window that will be *served*, not the model's trained
 maximum.** Ollama applies a runtime `num_ctx` that defaults far below what modern models are
 trained for, and a prompt over it is truncated from the front rather than refused — discarding

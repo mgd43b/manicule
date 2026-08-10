@@ -35,7 +35,7 @@ from typing import NoReturn
 from manicule.core.anchors import Anchor, HeadingAnchor, PageAnchor, Unlocated
 from manicule.core.content import BlockKind, Chunk, Document, ParsedBlock, RawDocument
 from manicule.core.protocols import Chunker, Parser, read_blocks
-from manicule.testing.normalise import normalise
+from manicule.testing.normalise import contains_claimed_text, normalise
 
 TIGHTNESS: dict[str, float] = {
     "line": 1.0,
@@ -209,7 +209,9 @@ def _assert_containment(items: Sequence[_Located], resolved: dict[str, str | Non
             f"resolve is a citation nobody can check; emit Unlocated instead",
         )
         _require(
-            normalise(item.text) in normalise(text or ""),
+            # The same call citation verification makes at answer time. See
+            # `contains_claimed_text` for why there is one of these and not two.
+            contains_claimed_text(text, item.text),
             f"{item.where}: the anchor resolves to text this does not claim.\n"
             f"  claimed:  {item.text[:160]!r}\n"
             f"  resolved: {(text or '')[:160]!r}",

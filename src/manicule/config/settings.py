@@ -190,6 +190,26 @@ class RedactionMethod(StrEnum):
     REMOVE = "remove"
 
 
+class RedactionScope(StrEnum):
+    """How much of what a model is given gets redacted."""
+
+    REMOTE = "remote"
+    """Only when the resolved endpoint leaves this machine.
+
+    The point of the feature: what leaves is redacted, what stays is not, so a fully local
+    install pays nothing for a threat it does not have.
+    """
+
+    ALWAYS = "always"
+    """Regardless of egress.
+
+    For the one case classification cannot see — a proxy on loopback that forwards to a
+    hosted provider (:class:`~manicule.config.providers.Egress`) — and for operators who want
+    the model's *input* uniform, which is also the only way a local and a hosted deployment
+    produce comparable answers.
+    """
+
+
 class RedactionSettings(Section):
     """Personal-data redaction.
 
@@ -197,15 +217,44 @@ class RedactionSettings(Section):
     and leaves the index intact. Redacting at ingest would destroy the stored document
     permanently while doing nothing about what the model later sees, which is the opposite of
     what the setting's name promises.
+
+    Off by default, and that is a decision with a stated cost rather than an oversight.
+    Detectors are recall-oriented and will fire on things that are not personal data — a
+    version string that looks like a phone number, an internal identifier that looks like a
+    card — and a model that cannot see the address cannot answer a question about it.
     """
 
     enabled: bool = False
+    scope: RedactionScope = RedactionScope.REMOTE
     patterns: tuple[str, ...] = Field(
         default=(),
-        description="Named detectors, e.g. ``email``, ``phone``, ``credit-card``.",
+        description="Named detectors, e.g. ``email``, ``phone``, ``credit-card``, "
+        "``ip-address``. Named rather than written as raw regexes so that a config file is a "
+        "policy rather than a program, and so the detectors can be tested and improved.",
+    )
+    custom_patterns: tuple[str, ...] = Field(
+        default=(),
+        description="Additional regexes, compiled at startup. One that does not compile is a "
+        "refusal naming the pattern and the error — a silently dropped pattern makes "
+        "redaction weaker than the configuration says it is.",
     )
     method: RedactionMethod = RedactionMethod.REPLACE
     replacement: str = "[REDACTED]"
+    hash_salt: SecretStr | None = Field(
+        default=None,
+        description="Per-installation secret for ``method = 'hash'``, generated on first use "
+        "and never sent anywhere. An *unsalted* digest of an email address is reversible by "
+        "anyone with a word list, so sending one instead of the value would be privacy "
+        "theatre that costs answer quality and buys nothing.",
+    )
+    timeout_s: float = Field(
+        default=5.0,
+        gt=0,
+        description="Wall clock for redacting one request. A regex over 32k tokens of "
+        "context with operator-supplied patterns is a denial-of-service surface and Python's "
+        "``re`` cannot be interrupted, so this runs in a worker thread under a deadline. "
+        "**Exceeding it fails the query** — the fail-safe direction is refuse-to-send.",
+    )
 
 
 class SourceRestrictions(Section):
@@ -299,12 +348,34 @@ class AtRestSettings(Section):
     redact_logs_content: bool = Field(default=True, description="Keep document text out of logs.")
 
 
+class SharingSettings(Section):
+    """Shared conversation links.
+
+    A share link is a **bearer capability for an unauthenticated URL**, so every setting here
+    bounds one: whether links can be minted at all, and how long a minted one lives.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="One switch rather than a per-field disclosure policy nobody configures "
+        "correctly. A document *title* can itself be sensitive, and an anonymous viewer sees "
+        "titles, so a deployment that cannot disclose those turns sharing off entirely.",
+    )
+    link_ttl_s: int = Field(
+        default=30 * 24 * 3600,
+        gt=0,
+        description="How long a share link stays valid. A capability with no expiry "
+        "accumulates forever and the set of live ones becomes unknowable.",
+    )
+
+
 class SecuritySettings(Section):
     auth: AuthSettings = Field(default_factory=AuthSettings)
     transport: TransportSettings = Field(default_factory=TransportSettings)
     data_policy: DataPolicySettings = Field(default_factory=DataPolicySettings)
     audit: AuditSettings = Field(default_factory=AuditSettings)
     storage: AtRestSettings = Field(default_factory=AtRestSettings)
+    sharing: SharingSettings = Field(default_factory=SharingSettings)
 
 
 class WebhookSettings(Section):
@@ -477,14 +548,100 @@ class EmbeddingSettings(Section):
 
 
 class LlmSettings(Section):
-    """The generation runtime. Local and hosted differ by ``base_url`` and nothing else."""
+    """The generation runtime. Local and hosted differ by ``base_url`` and nothing else.
+
+    **There are three timeouts, because one covers the wrong interval.** A single budget
+    around the call that returns a stream bounds time-to-first-byte and nothing after it, so
+    a provider that opens a stream and then stops sending blocks forever and is
+    indistinguishable from a slow answer.
+    """
 
     provider: str = Field(default="ollama", min_length=1)
     model: str = Field(default="qwen2.5:14b", min_length=1)
     base_url: str | None = None
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=1024, ge=1)
-    timeout_s: float = Field(default=120.0, gt=0)
+    max_tokens: int = Field(
+        default=1024,
+        ge=1,
+        description="What the model may produce **and** the ``generation_reserve`` term of "
+        "the startup window cross-check. Deliberately one number: two numbers for one "
+        "quantity disagree by default, and then ``finish_reason='length'`` stops meaning "
+        "anything precise.",
+    )
+    timeout_s: float = Field(
+        default=120.0, gt=0, description="Total wall clock for one generation."
+    )
+    first_token_timeout_s: float = Field(
+        default=60.0,
+        gt=0,
+        description="Connect, queue, prompt evaluation and model load. Generous because a "
+        "cold local model is loaded into memory first, which is a real multi-second cost the "
+        "first time.",
+    )
+    stream_idle_timeout_s: float = Field(
+        default=30.0,
+        gt=0,
+        description="The gap between two tokens. This is what turns a hung provider into an "
+        "error rather than an answer that never finishes.",
+    )
+    max_retries: int = Field(
+        default=2,
+        ge=0,
+        description="Retries — not attempts — of the *connection*, before the first token. "
+        "After the first token a failure is terminal: restarting makes the reader watch the "
+        "answer rewind, and continuing splices two independently-sampled answers into text "
+        "no single generation produced.",
+    )
+    keep_alive: str = Field(
+        default="10m",
+        description="How long a served local model stays resident. A pure throughput knob: "
+        "Ollama unloads an idle model after five minutes and the next question then pays a "
+        "multi-second load from disk. It changes nothing about any answer.",
+    )
+    context_window: int | None = Field(
+        default=None,
+        ge=1,
+        description="Override for the window that will actually be **served**. Normally "
+        "determined from the runtime — Ollama's ``/api/show`` combined with the ``num_ctx`` "
+        "manicule sets, or the library's model metadata for a hosted provider. Set this only "
+        "for an endpoint whose model neither can describe, such as an OpenAI-compatible "
+        "server with a private model name; without it such a configuration is refused at "
+        "startup rather than left to discover the limit by exceeding it.",
+    )
+    citation_verify_timeout_s: float = Field(
+        default=5.0,
+        gt=0,
+        description="Budget for verifying citations, measured from the start of the answer. "
+        "Generous because the work starts before the first token. A marker whose "
+        "verification has not finished when it must be emitted is **dropped**, with its own "
+        "reason: sending an unverified citation under a design whose whole claim is "
+        "verification is the unacceptable half of that trade.",
+    )
+    token_safety_factor: float = Field(
+        default=1.15,
+        ge=1.0,
+        description="How much the prompt estimate is inflated. Biased toward overcounting "
+        "because the errors are not symmetric: undercounting overflows the window and gets "
+        "the context truncated by the server, which is the silent failure, while "
+        "overcounting costs a passage. **Never auto-tuned** — an estimator that adapts makes "
+        "two runs non-comparable, and it adapts in the unsafe direction after a run of short "
+        "answers. A diagnostic recommends a value; a human sets it.",
+    )
+    token_drift_tolerance: float = Field(
+        default=0.15,
+        ge=0.0,
+        description="Relative disagreement between the estimate and the provider's true "
+        "prompt count that is treated as ordinary tokenizer drift. Beyond it, an error-level "
+        "event naming both numbers and the model.",
+    )
+    system_prompt_extra: str = Field(
+        default="",
+        description="Instructions appended to the system prompt. Appended, never "
+        "substituted: the citation protocol is not configurable, because the binder's "
+        "guarantees assume the model was told it. Counted into the startup window "
+        "cross-check, so a long custom prompt is refused rather than silently displacing "
+        "passages.",
+    )
 
 
 class QueryCacheSettings(Section):
@@ -853,6 +1010,9 @@ class Settings(BaseSettings):
                 f"is readable by anyone who can reach it. Bind 127.0.0.1, or enable auth."
             )
 
+        problems.extend(self._redaction_problems())
+        problems.extend(self._source_restriction_problems())
+
         if self.security.auth.mode is AuthMode.OAUTH and not self.security.auth.providers:
             problems.append("security.auth.mode is 'oauth' but no OAuth providers are configured")
 
@@ -860,6 +1020,53 @@ class Settings(BaseSettings):
             problems.append("security.audit.destination is 'webhook' but events.webhooks is empty")
 
         return problems
+
+    def _redaction_problems(self) -> list[str]:
+        """Redaction settings that cannot do what they say.
+
+        A custom pattern that does not compile is the case worth naming: swallowed, it makes
+        redaction quietly weaker than the configuration claims, which is precisely the
+        "appears to be in force and silently is not" failure this project refuses.
+        """
+        import re  # noqa: PLC0415 - only this check needs it
+
+        redaction = self.security.data_policy.auto_redact
+        problems: list[str] = []
+        for pattern in redaction.custom_patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                problems.append(
+                    f"security.data_policy.auto_redact.custom_patterns contains "
+                    f"{pattern!r}, which is not a valid regular expression: {exc}. Fix it or "
+                    f"remove it; a pattern that does not compile cannot redact anything, and "
+                    f"dropping it silently would make redaction weaker than this file says."
+                )
+        if redaction.enabled and not (redaction.patterns or redaction.custom_patterns):
+            problems.append(
+                "security.data_policy.auto_redact.enabled is true with no patterns and no "
+                "custom_patterns, so nothing would be redacted while the setting reads as on. "
+                "Name at least one detector, or set enabled = false."
+            )
+        return problems
+
+    def _source_restriction_problems(self) -> list[str]:
+        """Per-source policies that contradict each other.
+
+        ``local_only`` is a floor and ``cloud_allowed`` is an exemption, so a source named in
+        both asks for two incompatible things. Resolving it silently — either way — means one
+        of the two settings is not in force and nothing says which.
+        """
+        restrictions = self.security.data_policy.source_restrictions
+        both = sorted(set(restrictions.local_only) & set(restrictions.cloud_allowed))
+        if not both:
+            return []
+        return [
+            f"security.data_policy.source_restrictions names {', '.join(both)} in both "
+            f"local_only and cloud_allowed. local_only is a floor that no exemption releases, "
+            f"so one of the two settings would not be in force. Remove the source from "
+            f"whichever list is wrong."
+        ]
 
     def require_valid(self) -> Self:
         """Raise if this configuration cannot be run.
@@ -921,11 +1128,13 @@ __all__ = [
     "QueryCacheSettings",
     "RagSettings",
     "RedactionMethod",
+    "RedactionScope",
     "RedactionSettings",
     "Role",
     "RouterSettings",
     "SecuritySettings",
     "Settings",
+    "SharingSettings",
     "SourceRestrictions",
     "StorageSettings",
     "TelemetrySettings",

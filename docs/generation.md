@@ -112,6 +112,17 @@ wrong on the default runtime.
 
 It is additive and it is not `RetrievalStage` or `Anchor`, so it carries neither lock.
 
+**And one thing implementation found that this section did not anticipate.** The protocol fixes
+two inputs, and conversation history (§8) is a third the seam has no channel for. Widening
+`generate` again — days after #45 landed `context_window`, against three tickets building on it
+— is not worth a keyword. So history travels as an **optional keyword argument**, which
+`assert_protocol_signatures` already sanctions ("an implementation may add parameters the
+protocol does not have, provided they have defaults"): a caller working from the protocol never
+passes it, `generating(..., extra=...)` forwards it to a generator that declares it, and one
+that does not is **recorded in the trace as not having it**. That last part is the point. A
+plugin generator silently receiving no history looks exactly like a model with a short memory,
+and the failure this project keeps refusing is the one nobody can see.
+
 ---
 
 ## 3. Citations
@@ -332,9 +343,17 @@ be mistaken for the passage.
 
 ### 3.7 Where verification runs, and what it actually costs
 
-**Per distinct document, not per citation.** One parse of a document serves every anchor in
-it. With `final_top_k` between 3 and 10 and passages frequently sharing a document, the usual
-answer needs one to three parses.
+**Per distinct document, not per citation** — for the parts that can be. The blob read, the
+`RawDocument` around it and the choice of parser happen once per document, so with
+`final_top_k` between 3 and 10 and passages frequently sharing a document the usual answer
+performs one to three blob reads.
+
+*Corrected during implementation.* This section originally said "one parse of a document
+serves every anchor in it", and the merged `Parser.resolve(anchor, raw)` signature does not
+offer that: each call is independent, so the parse is per **anchor**. Sharing it would mean a
+parser-side handle type — a real change to a protocol three tickets are built against — for a
+saving the cache already makes irrelevant, since a verified anchor stays verified until its
+document changes.
 
 **Cached on `(chunk_id, document.version_token)`.** Chunk ids are content-derived and
 `version_token` changes whenever the document does, so the key is exact and can never go
@@ -358,6 +377,12 @@ draws between `exhausted_budget` and `exhausted_corpus`.
 
 **When the bytes are not retained.** `StorageSettings.retain_source_bytes` may be off, which
 is legitimate and documented as making every re-index a re-crawl. Level 2 is then impossible.
+
+Note the distinction implementation made explicit: the *setting* lowers the ceiling for every
+citation, and is knowable at startup. **One missing blob under a configuration that retains is
+a drop**, with reason `unresolvable` — it is a defect in that document's storage, not a
+property of the deployment, and reporting it as a weaker verification level would hide a lost
+file behind a word.
 The response says so: verification degrades to the strongest level available and **names the
 level it reached**, rather than silently reporting the same word for two different amounts of
 checking. Because the setting is startup configuration, the degradation is knowable at
@@ -503,8 +528,17 @@ auto-growth turns a budgeting mistake into an OOM on a new one. The fix is the s
 and it is to stop leaving the number to the runtime:
 
 - **`Generator.context_window` means the window that will actually be served**, not the model's
-  trained maximum. For Ollama it is read from `/api/show` and combined with what manicule
-  itself sets.
+  trained maximum. For Ollama it is read from `/api/show`; for a hosted provider it comes from
+  the library's model metadata.
+
+  Implementation had to make one thing precise that "combined with what manicule itself sets"
+  leaves ambiguous. The attribute is the **ceiling the runtime will serve if manicule asks for
+  its budget** — the model's trained length — and `num_ctx` is what manicule then demands, which
+  is the profile total. Reporting the *demanded* number here instead would make the cross-check
+  circular: it would be comparing the budget against a number derived from the budget, and it
+  would pass for every profile. A model neither route can describe — an OpenAI-compatible server
+  with a private model name — has `llm.context_window` as an explicit escape hatch, and without
+  it startup refuses rather than guessing.
 - **manicule sets `num_ctx` explicitly on every Ollama call**, derived from the profile
   arithmetic above. Derived rather than configured, so it cannot disagree with the budget it
   exists to satisfy — and so the served window stops varying with the host's VRAM.
@@ -819,6 +853,15 @@ The persisted message carries its finish reason (`stop`, `length`, `content_filt
 and its citation accounting, so a truncated or abandoned answer is a first-class stored object
 that can be read, shared and rated rather than a gap in the record.
 
+**One thing implementation added, because the paragraph above is not self-executing.** The
+answer wrapper is itself an async generator, so its `finally` runs when something *finalises*
+it — and a cancelled consumer abandons it rather than closing it. A `finally` that only runs at
+garbage-collection time is precisely the "persistence that silently did not happen" this
+section exists to prevent, on exactly the answer that most needs to be ratable. So there is an
+`answering()` context manager, `generating()`'s sibling one layer up, and consuming an answer
+goes through it. Its close deadline is deliberately wider than the persist deadline; the other
+way round, the close would cut short the write it exists to guarantee.
+
 ### 5.4 One use, and honest backpressure
 
 **The iterator `generate` returns is single-use.** Restarting it means a second provider call
@@ -886,9 +929,11 @@ silently displacing passages.
   will see it. Slots are small integers precisely so that the worst thing a leak can look like
   is a stray number.
 - **Marker syntax inside the body is escaped** (§3.2).
-- **Slots are per-answer ordinals**, not identifiers. They are persisted as the position of a
-  citation record in `messages.sources`, which is what lets a stored answer's surviving markers
-  still mean something a year later.
+- **Slots are per-answer ordinals**, not identifiers. They are what lets a stored answer's
+  surviving markers still mean something a year later. Implementation stores each citation
+  record in `messages.sources` **carrying its own `slot`**, rather than relying on its position
+  in the list: a slot whose citation was dropped has no record, so a positional list would
+  either need holes or would silently renumber every marker after the first drop.
 - `Context.truncated` — passages dropped by assembly to fit the budget
   ([`retrieval.md`](retrieval.md) §7.3) — is surfaced on the answer, because an answer built
   from a truncated context is a weaker claim and the `Context` type already says so.
@@ -1057,8 +1102,13 @@ than a free precaution.
 
 **A regex over 32k tokens of context on every query, with operator-supplied patterns, is a
 denial-of-service surface.** Python's `re` cannot be interrupted, so redaction runs in a worker
-thread with a wall-clock deadline (`redaction_timeout_s`, default 5.0). **Exceeding it fails
-the query.** The fail-safe direction is refuse-to-send; there is no path in this design where a
+thread with a wall-clock deadline (`security.data_policy.auto_redact.timeout_s`, default 5.0).
+**Exceeding it fails the query.**
+
+The thread is a **daemon**, which is not a style choice. `asyncio.to_thread` uses the default
+executor, whose threads are non-daemon and are joined at interpreter exit — so a runaway
+pattern would not merely leak a thread, it would hang the process's shutdown, turning a bad
+regex into a server that will not stop. The fail-safe direction is refuse-to-send; there is no path in this design where a
 timeout, an exception or a mistake results in unredacted text going to a remote model. Custom
 patterns are the operator's risk, catastrophic backtracking is the named hazard, and the
 built-in detectors are the supported surface.
@@ -1353,6 +1403,12 @@ AnswerEnvelope
 **An interface must not render a single blended percentage from these.** That is not a
 suggestion about visual design; it is the requirement that makes both numbers mean anything,
 and it is the specific failure recorded above.
+
+The envelope arrives as the final element of the answer stream. The `GenerationTrace` (§14) is
+**not** on it: an async generator cannot also return a value, and putting a diagnostic record on
+every event would make each consumer carry something it mostly does not want. It is filled into
+an `AnswerResult` the caller passes in, which is also where the persisted message id and any
+token drift end up.
 
 ### 10.3 Generation never modifies confidence
 
@@ -1753,7 +1809,7 @@ Places this design had to decide something no merged document had a position on.
 | Ticket | What | Why not here |
 |---|---|---|
 | [#41](https://github.com/mgd43b/manicule/issues/41) | **Add `context_window` to the `Generator` protocol** (§2.3, §4.3) | It changes `docs/contracts.md` and `manicule.core.protocols`, which three implementation tickets are building against right now. Additive, and neither `Anchor` nor `RetrievalStage`, so it carries no lock — but it is a seam change and belongs in its own reviewable commit |
-| [#42](https://github.com/mgd43b/manicule/issues/42) | **Conversation schema for sharing and feedback** (§11.1, §11.4, §12.1) — hash `share_token`, add `share_expires_at` and `shared_at`, add `messages.feedback`, `messages.feedback_reason`, `messages.query_log_id`, `messages.finish_reason` | It is an additive Alembic migration against tables merged under [#2](https://github.com/mgd43b/manicule/issues/2), and [#11](https://github.com/mgd43b/manicule/issues/11) and [#13](https://github.com/mgd43b/manicule/issues/13) both depend on the result. Worth landing as its own change for the same reason [#36](https://github.com/mgd43b/manicule/issues/36) was: it moves a security boundary |
+| [#42](https://github.com/mgd43b/manicule/issues/42) | **Conversation schema for sharing and feedback** (§11.1, §11.4, §12.1) — hash `share_token`, add `share_expires_at` and `shared_at`, add `messages.feedback`, `messages.feedback_reason`, `messages.query_log_id`, `messages.finish_reason` | **Landed with #7 rather than separately.** The separation was worth having while this was a documentation-only change; once #7 was writing conversations there was nothing left to decouple, and a share link whose token was still stored in plaintext for one more merge is a security boundary left open for no benefit. `query_logs.feedback` is dropped rather than kept, because two homes for one fact is the thing the change exists to remove |
 | [#44](https://github.com/mgd43b/manicule/issues/44) | **Fix `is_local` so egress is decided by the resolved endpoint** (§7.1) | It changes `manicule.config`, merged under [#1](https://github.com/mgd43b/manicule/issues/1), and it moves a security boundary. #7's implementation depends on the result, since the egress class is what selects the redaction path |
 
 [#28](https://github.com/mgd43b/manicule/issues/28) — refuse-to-ingest rules — stays where

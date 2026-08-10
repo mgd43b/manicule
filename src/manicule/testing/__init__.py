@@ -22,7 +22,7 @@ from manicule.testing.contracts import (
     assert_version_store_contract,
     closing,
 )
-from manicule.testing.normalise import NORMALISER_VERSION, normalise
+from manicule.testing.normalise import NORMALISER_VERSION, contains_claimed_text, normalise
 from manicule.testing.roundtrip import (
     ParserProfile,
     RoundTripReport,
@@ -54,5 +54,6 @@ __all__ = [
     "assert_vector_store_rejects_foreign_vectors",
     "assert_version_store_contract",
     "closing",
+    "contains_claimed_text",
     "normalise",
 ]

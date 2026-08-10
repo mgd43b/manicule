@@ -81,4 +81,37 @@ def normalise(text: str) -> str:
     return _WHITESPACE_RUN.sub(" ", joined).strip()
 
 
-__all__ = ["NORMALISER_VERSION", "normalise"]
+def contains_claimed_text(resolved: str | None, claimed: str) -> bool:
+    """Whether the text at a location contains what a chunk or block claims came from there.
+
+    **The containment predicate, and there is exactly one of it.** The parser conformance
+    suite asks this question of every fixture at test time
+    (:func:`manicule.testing.assert_parser_contract`); citation verification asks the same
+    question of a single anchor at answer time (``docs/generation.md`` §3.3, level 2). Two
+    notions of "this anchor resolves" would drift, and the drift would surface as citations
+    that pass CI and fail in production, or the reverse — so the runtime check and the
+    test-suite check are the same call, not a copy of it.
+
+    That matters more than it looks. The usual repair for a comparison that fails — loosening
+    it until the suite passes — leaves no assertion at all, and a second, runtime-only
+    comparison is that repair arriving by another route: nothing would fail, and the
+    verification the whole design rests on would quietly be checking less than the tests do.
+
+    ``resolved`` is ``None`` when the anchor addresses no text at all, which is what
+    :meth:`~manicule.core.protocols.Parser.resolve` returns for
+    :class:`~manicule.core.anchors.Unlocated` and for a located anchor that no longer fits
+    these bytes. Both are failures of containment, not empty successes.
+
+    Args:
+        resolved: What the anchor resolves to over the source bytes, or ``None``.
+        claimed: The text the chunk or block says is at that location.
+
+    Returns:
+        Whether ``claimed`` is present in ``resolved``, both under :func:`normalise`.
+    """
+    if resolved is None:
+        return False
+    return normalise(claimed) in normalise(resolved)
+
+
+__all__ = ["NORMALISER_VERSION", "contains_claimed_text", "normalise"]
