@@ -944,42 +944,38 @@ new one.
 > connector and re-run indexing — a full re-crawl, rung 4, because there is no stored chunk
 > text to re-embed from and no retained bytes to re-parse from.
 
-### 6.6 `Filter` — proposed, not settled
+### 6.6 `Filter` — settled elsewhere, and what storage owes it
 
-`docs/contracts.md` §6 leaves the `Filter` shape open, narrowed to "a LanceDB predicate plus
-a metadata pre-filter, with the exact split wanting contact with real data volumes."
-**This section proposes a shape; it does not close the question.**
+**This section proposed a shape and declined to close the question.
+[`retrieval.md`](retrieval.md) §3 closes it, and the settled shape is what
+[#36](https://github.com/mgd43b/manicule/issues/36) built.** What this section proposed and
+what shipped differ in three places worth naming, because a superseded proposal that still
+reads as current is how a design document becomes a liability:
 
-```python
-class Filter(BaseModel):
-    workspace_ids:  frozenset[str]                      # required
-    document_ids:   frozenset[str] | None = None
-    connector_ids:  frozenset[str] | None = None
-    collection_ids: frozenset[str] | None = None
-    tag_ids:        frozenset[str] | None = None
-    kinds:          frozenset[BlockKind] | None = None
-    langs:          frozenset[str] | None = None
-    updated_after:  datetime | None = None
-    updated_before: datetime | None = None
-```
+- **`connector_ids` is `sources`.** The name follows the merged column vocabulary —
+  `documents.source`, `DocStore.find_document(source, source_id)` — because a filter field
+  that does not match the column it filters is a field people get wrong.
+- **Set-valued fields default to an empty set, not `None`.** Two spellings of "no
+  restriction" on the type that carries a security boundary is one too many.
+- **`workspace_ids` does not push down to a Lance predicate.** It pushes down to *neither*
+  store. That is the correction that matters and §4.2 of `retrieval.md` owns it: promoting a
+  workspace column into the vector table would create a value that can disagree with SQLite,
+  for the same reason §6.2 keeps `deleted_at` and `status` out of it. The scope is applied by
+  the hydrating join instead, and `manicule.storage.vectors.EXEMPT_FILTER_FIELDS` names the
+  omission with its reason rather than leaving it to look like an oversight.
 
-**`workspace_ids` is required and is not optional.** Workspace isolation is a security
-boundary enforced on every query (`PLAN.md` §14), and a boundary you can forget to pass is
-not a boundary. It is a set rather than a single value because `PLAN.md` §16 has admin
-cross-workspace search, which is otherwise the exact pressure that turns a required field
-back into an optional one. `filter=None` in the protocol therefore means "no *additional*
-constraint" — the workspace scope arrives with the store handle.
+Unchanged, and still storage's own: **`workspace_ids` is required and is not optional.**
+Workspace isolation is a security boundary enforced on every query (`PLAN.md` §14), and a
+boundary you can forget to pass is not a boundary. It is a set rather than a single value
+because `PLAN.md` §16 has admin cross-workspace search, which is otherwise the exact pressure
+that turns a required field back into an optional one. `filter=None` in the protocol therefore
+means "no *additional* constraint" — the workspace scope arrives with the store handle, and
+`SqliteDocStore` refuses a filter reaching past the workspace its handle serves.
 
-**The split.** Fields backed by a promoted Lance column (`workspace_ids`, `document_ids`,
-`connector_ids`, `kinds`, `langs`) push down as a Lance predicate. Fields requiring a join
-(`collection_ids`, `tag_ids`, `updated_*`) resolve in SQLite first into a set of document IDs
-and push down as an `IN` list.
-
-That works while the resolved set is small. Above some size the `IN` list stops being a
-useful predicate and the better plan inverts: search unfiltered with an inflated `k` and
-post-filter through the SQLite join. The threshold — `prefilter_id_limit` — is genuinely
-unknown, depends on whether an ANN index exists (§6.2), and is exactly what "contact with
-real data volumes" means.
+The split between a pushed-down `IN` list and an over-fetch-and-post-filter plan is settled as
+a decision procedure rather than as a constant in [`retrieval.md`](retrieval.md) §3.3, with
+`prefilter_id_limit` starting at 1000 and every query recording the two inputs that will set
+it from measurement.
 
 **One correctness trap regardless of which regime wins.** Over-fetching `k' > k` and
 post-filtering does *not* guarantee `k` survivors. The implementation must either expand and
@@ -1349,7 +1345,7 @@ one.
 | Fingerprints persisted in three places and all three compared | §6.3 |
 | Per-document `chunk_fp` / `embed_fp` lineage for partial invalidation | §6.4 |
 | `index_state.vector_table` is a pointer; re-embed builds alongside and swaps | §6.5 |
-| `Filter.workspace_ids` required and set-valued | §6.6 — **the rest of `Filter` stays open** |
+| `Filter.workspace_ids` required and set-valued | §6.6 — the rest of `Filter` settled later in [`retrieval.md`](retrieval.md) §3 |
 | Blob retention: current version forever, prior versions 30 days; 256 MiB cap | §7 |
 | `<data_dir>` is `0700`/`0600`; `doctor` fails on a looser mode; backup refuses a world-readable target | §7.1 |
 | Deletion from derived stores is always deferred to a sweep | §8.2 |
@@ -1367,5 +1363,7 @@ one.
   design behind it, and belongs to [#13](https://github.com/mgd43b/manicule/issues/13) /
   [#19](https://github.com/mgd43b/manicule/issues/19).
 - **Any store other than SQLite.** Settled in `PLAN.md` §2 and not reopened here.
-- **The full `Filter` shape.** Still open per `docs/contracts.md` §6. §6.6 proposes; it does
-  not decide.
+- **The full `Filter` shape.** Open when this was written; settled since, in
+  [`retrieval.md`](retrieval.md) §3 and built by
+  [#36](https://github.com/mgd43b/manicule/issues/36). §6.6 records where the proposal here
+  and the settled shape differ.

@@ -70,6 +70,14 @@ class _Unit:
     anchor: Anchor
     heading_path: tuple[str, ...]
     tokens: int
+    lang: str | None = None
+    """Carried from :attr:`ParsedBlock.lang`, so that a chunk can say what language it is in.
+
+    Travels on the unit rather than in ``metadata`` because splitting and overlap both build
+    new units from old ones, and a field survives ``dataclasses.replace`` while a metadata key
+    survives only where somebody remembered to copy it.
+    """
+
     metadata: Metadata = field(default_factory=Metadata)
     starts_section: bool = False
 
@@ -209,6 +217,7 @@ class StructuralChunker:
                     anchor=block.anchor,
                     heading_path=block.heading_path,
                     tokens=tokens,
+                    lang=block.lang,
                     metadata=dict(block.metadata),
                     starts_section=True,
                 )
@@ -221,6 +230,7 @@ class StructuralChunker:
                     anchor=block.anchor,
                     heading_path=block.heading_path,
                     tokens=tokens,
+                    lang=block.lang,
                     metadata=dict(block.metadata),
                 )
             ]
@@ -241,6 +251,7 @@ class StructuralChunker:
             anchor=block.anchor,
             heading_path=block.heading_path,
             tokens=self._counter(text),
+            lang=block.lang,
             metadata=metadata,
         )
 
@@ -735,10 +746,28 @@ def _group_metadata(units: Sequence[_Unit], *, provisional: bool) -> Metadata:
             if key in unit.metadata:
                 carried[key] = unit.metadata[key]
                 break
+    lang = _shared_lang(units)
+    if lang is not None:
+        # Promoted into a column by both stores, so `Filter.langs` resolves the same way in
+        # the lexical leg and the dense one (`docs/retrieval.md` §3.3).
+        carried["lang"] = lang
     if provisional:
         # Counted without the model that will embed these, so ingest must refuse them.
         carried["provisional"] = True
     return carried
+
+
+def _shared_lang(units: Sequence[_Unit]) -> str | None:
+    """The language every unit agrees on, or ``None`` when they do not.
+
+    A chunk may hold a paragraph and the code block it introduces, and ``ParsedBlock.lang``
+    means a code language on one and a natural language on the other. Naming either as the
+    chunk's language would make a ``langs`` filter return the other one, so disagreement is
+    undetermined — which is what ``None`` already means everywhere else it appears, rather
+    than a stand-in for English.
+    """
+    langs = {unit.lang for unit in units}
+    return langs.pop() if len(langs) == 1 else None
 
 
 def _string_list(value: object) -> list[str] | None:

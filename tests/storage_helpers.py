@@ -86,6 +86,7 @@ def make_chunk(
     heading_path: tuple[str, ...] = ("Auth", "Tokens"),
     kind: BlockKind = BlockKind.PROSE,
     located: bool = True,
+    lang: str | None = None,
 ) -> Chunk:
     """A chunk whose id is derived exactly as ingest would derive it."""
     breadcrumb = " > ".join(heading_path)
@@ -105,6 +106,7 @@ def make_chunk(
         kind=kind,
         position=position,
         token_count=max(1, len(text.split())),
+        metadata={"lang": lang} if lang is not None else {},
     )
 
 

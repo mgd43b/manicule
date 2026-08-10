@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import UTC, datetime
 from typing import override
 
+from manicule.config.settings import Settings
 from manicule.core.anchors import Anchor, LineAnchor, Unlocated
 from manicule.core.content import (
     BlockKind,
@@ -28,6 +29,7 @@ from manicule.core.errors import FingerprintMismatchError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.core.lifecycle import HealthReport, Metric
+from manicule.core.protocols import DocStore
 from manicule.core.retrieval import Candidate, Filter, Query
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
 
@@ -308,6 +310,53 @@ class AliasingStage:
         return candidates
 
 
+class RawVectorStage:
+    """Returns every candidate it was built with, exactly as a vector index would.
+
+    The dense leg's raw half: Lance holds ``id``, ``vector``, ``document_id``, ``kind``,
+    ``lang`` and ``position`` and nothing about tenancy or liveness, so a search against it
+    returns rows of which an unknown number are invisible. A stage that stops here has
+    performed a scoped query as an unscoped one and cannot tell.
+    """
+
+    name = "raw_vector"
+
+    def __init__(self, chunks: Sequence[Chunk]) -> None:
+        self._chunks = list(chunks)
+
+    async def run(self, query: Query, candidates: list[Candidate]) -> list[Candidate]:
+        del query
+        found = [
+            Candidate(chunk=chunk, score=1.0, scores={self.name: 1.0}) for chunk in self._chunks
+        ]
+        return [*candidates, *found]
+
+
+class HydratingStage(RawVectorStage):
+    """The same search, joined back through the document store before it returns.
+
+    Workspace, soft-deletion and status live on ``documents`` in the authoritative store, so
+    this is the only place they can be applied — which is why the join is inside the stage
+    rather than beside it.
+    """
+
+    name = "hydrated_vector"
+
+    def __init__(self, chunks: Sequence[Chunk], docstore: DocStore) -> None:
+        super().__init__(chunks)
+        self._docstore = docstore
+
+    @override
+    async def run(self, query: Query, candidates: list[Candidate]) -> list[Candidate]:
+        found = await super().run(query, candidates)
+        live: list[Candidate] = []
+        for candidate in found:
+            document = await self._docstore.get_document(candidate.chunk.document_id)
+            if document is not None and document.status is DocumentStatus.INDEXED:
+                live.append(candidate)
+        return live
+
+
 class MemoryConnector:
     """A connector over a dictionary."""
 
@@ -459,3 +508,76 @@ class BlockRewritingMiddleware(PassThroughMiddleware):
     @override
     async def after_parse(self, document: Document, blocks: list[ParsedBlock]) -> list[ParsedBlock]:
         return [block.model_copy(update={"text": block.text.upper()}) for block in blocks]
+
+
+# --- configurations ------------------------------------------------------------------------
+#
+# The thing under test here is a configuration rather than a component: a local-only data
+# policy is a promise about where content goes, and it is kept or broken by what the endpoints
+# resolve to. The two ``Unenforced``/``Banning`` subclasses are the ``Broken*`` convention
+# applied to a policy gate — a check that has only ever passed proves nothing.
+
+
+class UnenforcedLocalOnly(Settings):
+    """Settings whose local-only policy is typed, documented, and enforced nowhere.
+
+    Exactly the failure ``docs/contracts.md`` §5 names as worse than an absent guarantee. The
+    endpoints still say where they point; the gate simply does not act on it, which is what a
+    later edit weakening ``policy_problems`` would look like.
+    """
+
+    @override
+    def policy_problems(self) -> list[str]:
+        return [problem for problem in super().policy_problems() if "cloud_allowed" not in problem]
+
+
+class BanningLocalOnly(Settings):
+    """Settings that refuse every endpoint, including the ones on this machine.
+
+    The other direction, and not a hypothetical: classifying by provider name refused an
+    OpenAI-compatible server on ``127.0.0.1``, so the safe configuration was the one that
+    failed. A policy that rejects the deployment it exists to permit gets switched off.
+    """
+
+    @override
+    def policy_problems(self) -> list[str]:
+        return [
+            *super().policy_problems(),
+            *(
+                f"security.data_policy.cloud_allowed is false, but the {endpoint.describe()} "
+                f"is not on this machine."
+                for endpoint in self.selected_endpoints
+            ),
+        ]
+
+
+def local_only(llm: dict[str, str], model: type[Settings] = Settings) -> Settings:
+    """Settings forbidding cloud processing, with ``llm`` as the generation provider."""
+    return model(
+        llm=llm,  # pyright: ignore[reportArgumentType] - a settings section, validated on the way in
+        security={"data_policy": {"cloud_allowed": False}},  # pyright: ignore[reportArgumentType]
+    )
+
+
+LOOPBACK_OLLAMA = {"provider": "ollama", "base_url": "http://127.0.0.1:11434"}
+LAN_OLLAMA = {"provider": "ollama", "base_url": "http://gpu-box.lan:11434"}
+
+
+def loopback_ollama(model: type[Settings] = Settings) -> Settings:
+    """An Ollama on this machine under a local-only policy. The legitimate case.
+
+    It must start. A predicate that refuses this is not enforcing a policy, it is banning a
+    supported deployment, and the way round it is to turn the policy off.
+    """
+    return local_only(LOOPBACK_OLLAMA, model)
+
+
+def lan_ollama(model: type[Settings] = Settings) -> Settings:
+    """An Ollama on another machine under a local-only policy. The defect.
+
+    The provider name is on the local list, so the classification that read the name said
+    "nothing leaves" whatever ``base_url`` was set to: this configuration started cleanly
+    while every prompt, every retrieved passage and every question crossed the network to
+    another host — under the one setting that exists to prevent exactly that.
+    """
+    return local_only(LAN_OLLAMA, model)

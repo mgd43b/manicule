@@ -29,6 +29,7 @@ from manicule.core.embedding import EmbedFingerprint, Pooling
 from manicule.core.errors import FingerprintMismatchError
 from manicule.core.retrieval import Filter
 from manicule.storage.vectors import (
+    EXEMPT_FILTER_FIELDS,
     META_TABLE,
     LanceVectorStore,
     VectorStoreStateError,
@@ -49,6 +50,15 @@ if TYPE_CHECKING:
     from manicule.core.protocols import VectorStore
 
 
+SCOPE = frozenset({"default"})
+"""The workspace every filter here is built for.
+
+``Filter.workspace_ids`` is required and this store is not the thing that enforces it — see
+``EXEMPT_FILTER_FIELDS`` — so every filter below carries a scope and none of them expects a
+predicate to come out of it.
+"""
+
+
 def fingerprint(dimension: int = 4, model_id: str = "test/model") -> EmbedFingerprint:
     """An embedder identity at ``dimension``. Nothing in the tests assumes the number."""
     return EmbedFingerprint(
@@ -67,6 +77,7 @@ def chunk(
     *,
     kind: BlockKind = BlockKind.PROSE,
     position: int = 0,
+    lang: str = "en",
 ) -> Chunk:
     """A chunk carrying a located anchor, so the round trip has something to lose."""
     return Chunk(
@@ -79,7 +90,7 @@ def chunk(
         kind=kind,
         position=position,
         token_count=7,
-        metadata={"lang": "en"},
+        metadata={"lang": lang},
     )
 
 
@@ -217,7 +228,9 @@ async def test_a_document_filter_excludes_the_chunks_of_every_other_document(
         [spread(4, 0), spread(4, 0)],
     )
 
-    found = await store.search(spread(4, 0), k=10, filter=Filter(document_ids=frozenset({"doc-1"})))
+    found = await store.search(
+        spread(4, 0), k=10, filter=Filter(workspace_ids=SCOPE, document_ids=frozenset({"doc-1"}))
+    )
 
     assert [candidate.chunk.id for candidate in found] == ["wanted"]
 
@@ -232,7 +245,9 @@ async def test_a_kind_filter_excludes_the_kinds_it_does_not_name(
         [spread(4, 0), spread(4, 0)],
     )
 
-    found = await store.search(spread(4, 0), k=10, filter=Filter(kinds=frozenset({BlockKind.CODE})))
+    found = await store.search(
+        spread(4, 0), k=10, filter=Filter(workspace_ids=SCOPE, kinds=frozenset({BlockKind.CODE}))
+    )
 
     assert [candidate.chunk.id for candidate in found] == ["code"]
 
@@ -252,21 +267,50 @@ async def test_a_filter_narrows_the_search_before_k_is_applied(
         [spread(4, 0), [0.9, 0.1, 0.0, 0.0], spread(4, 3)],
     )
 
-    found = await store.search(spread(4, 0), k=1, filter=Filter(document_ids=frozenset({"doc-2"})))
+    found = await store.search(
+        spread(4, 0), k=1, filter=Filter(workspace_ids=SCOPE, document_ids=frozenset({"doc-2"}))
+    )
 
     assert [candidate.chunk.id for candidate in found] == ["furthest"]
 
 
 async def test_a_filter_field_the_vector_table_cannot_answer_is_refused_not_ignored() -> None:
-    """``workspace_id`` is a tenancy boundary; dropping it silently is a cross-tenant search."""
-    with pytest.raises(ValueError, match="workspace_id"):
-        predicate_for(Filter(workspace_id="team-a"))
+    """Applying part of a filter and dropping the rest returns rows it was written to exclude."""
+    with pytest.raises(ValueError, match="collection_ids"):
+        predicate_for(Filter(workspace_ids=SCOPE, collection_ids=frozenset({"c1"})))
 
 
-async def test_an_empty_filter_restricts_nothing() -> None:
-    """A default ``Filter`` arrives on every unfiltered query and must not become a predicate."""
-    assert predicate_for(Filter()) is None
+async def test_the_workspace_scope_is_exempt_by_name_rather_than_by_omission() -> None:
+    """The one field this store drops on purpose, because its enforcement moved.
+
+    Tenancy has no Lance column and will not get one; the hydrating join in the dense stage
+    applies it instead (``docs/retrieval.md`` §4.2). What makes that safe rather than merely
+    stated is ``assert_pipeline_enforces_scope``, and what stops it looking like an oversight
+    is that the field is named in ``EXEMPT_FILTER_FIELDS`` rather than missing from a loop.
+    """
+    assert "workspace_ids" in EXEMPT_FILTER_FIELDS
+    assert predicate_for(Filter(workspace_ids=SCOPE)) is None
     assert predicate_for(None) is None
+
+
+async def test_a_language_restriction_reaches_the_promoted_column(
+    store: LanceVectorStore,
+) -> None:
+    """The Lance table promotes ``lang``; before #36 no filter field could name it."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert(
+        [
+            chunk("english", document_id="doc-1"),
+            chunk("french", document_id="doc-2", position=1, lang="fr"),
+        ],
+        [spread(4, 0), spread(4, 1)],
+    )
+
+    found = await store.search(
+        spread(4, 0), k=5, filter=Filter(workspace_ids=SCOPE, langs=frozenset({"fr"}))
+    )
+
+    assert [candidate.chunk.id for candidate in found] == ["french"]
 
 
 # --- predicate safety --------------------------------------------------------------------
@@ -301,7 +345,9 @@ async def test_a_chunk_id_containing_a_quote_survives_storage_and_retrieval(
     await store.upsert([awkward], [spread(4, 0)])
 
     found = await store.search(
-        spread(4, 0), k=1, filter=Filter(document_ids=frozenset({"it's a doc"}))
+        spread(4, 0),
+        k=1,
+        filter=Filter(workspace_ids=SCOPE, document_ids=frozenset({"it's a doc"})),
     )
 
     assert [candidate.chunk.id for candidate in found] == ["it's a chunk"]
@@ -538,7 +584,9 @@ async def test_a_query_with_no_direction_still_honours_the_filter(
     )
 
     found = await store.search(
-        [0.0, 0.0, 0.0, 0.0], k=5, filter=Filter(document_ids=frozenset({"doc-1"}))
+        [0.0, 0.0, 0.0, 0.0],
+        k=5,
+        filter=Filter(workspace_ids=SCOPE, document_ids=frozenset({"doc-1"})),
     )
 
     assert [candidate.chunk.id for candidate in found] == ["wanted"]

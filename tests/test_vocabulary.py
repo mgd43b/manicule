@@ -30,15 +30,53 @@ def test_a_query_carries_no_scratch_space() -> None:
     assert set(Query.model_fields) == {"text", "limit", "filter", "profile", "metadata"}
 
 
-def test_an_empty_filter_restricts_nothing() -> None:
-    assert Filter().is_empty
-    assert not Filter(workspace_id="w").is_empty
+def test_a_query_cannot_be_built_without_a_scope() -> None:
+    """The filter carries the workspace, so a defaulted one is an unscoped query."""
+    with pytest.raises(ValidationError, match="filter"):
+        Query(text="q")  # pyright: ignore[reportCallIssue] - the omission is the thing under test
+
+
+def test_a_filter_cannot_be_built_without_a_workspace() -> None:
+    """A boundary you can forget to pass is not a boundary.
+
+    Optionality here is not a convenience: it is a default meaning "every workspace", and
+    workspace isolation is an invariant of every query rather than something each call site
+    remembers.
+    """
+    with pytest.raises(ValidationError, match="workspace_ids"):
+        Filter()  # pyright: ignore[reportCallIssue] - the omission is the thing under test
+
+
+def test_an_empty_workspace_set_is_refused_rather_than_read_two_ways() -> None:
+    """``frozenset()`` reads as "no restriction" and means "match nothing".
+
+    Both readings are catastrophic in opposite directions, so the type refuses it and the
+    caller has to say which they meant.
+    """
+    with pytest.raises(ValidationError, match="workspace_ids"):
+        Filter(workspace_ids=frozenset())
+
+
+def test_a_filter_reports_the_fields_it_restricts_on() -> None:
+    """What lets a store refuse the fields it cannot honour instead of dropping them.
+
+    Compared against each field's declared default, because there is no empty ``Filter`` to
+    compare against any more.
+    """
+    plain = Filter(workspace_ids=frozenset({"w"}))
+    narrowed = plain.model_copy(update={"langs": frozenset({"fr"})})
+
+    assert plain.restricting_fields == {"workspace_ids"}
+    assert narrowed.restricting_fields == {"workspace_ids", "langs"}
 
 
 def test_filters_reject_a_timestamp_with_no_timezone() -> None:
     """A naive timestamp has no defined meaning, and two machines will disagree about it."""
     with pytest.raises(ValidationError, match="timezone-aware"):
-        Filter(updated_after=datetime(2026, 1, 1))  # noqa: DTZ001
+        Filter(
+            workspace_ids=frozenset({"w"}),
+            updated_after=datetime(2026, 1, 1),  # noqa: DTZ001
+        )
 
 
 def test_a_candidate_records_what_each_stage_thought() -> None:
@@ -57,7 +95,7 @@ def test_a_truncated_context_says_so() -> None:
     """An answer built from a truncated context is a weaker claim, and the caller should know."""
     document = make_document()
     context = Context(
-        query=Query(text="q"),
+        query=Query(text="q", filter=Filter(workspace_ids=frozenset({"w"}))),
         passages=tuple(
             Candidate(chunk=chunk, score=1.0) for chunk in make_chunks(document, count=2)
         ),

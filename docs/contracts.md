@@ -99,6 +99,8 @@ RetrievalStage
     run(query: Query, candidates: list[Candidate]) -> list[Candidate]
 
 Generator
+    model_id: str
+    context_window: int                          # served, not advertised
     generate(query: Query, context: Context) -> AsyncIterator[Token]
 
 Connector
@@ -119,6 +121,14 @@ model pools with CLS, and it binds `last_hidden_state` to the *pooled* vector on
 architectures and to genuine token states on others. Both produce well-shaped, normalised
 vectors and raise nothing. Tier B backends are therefore admitted only by measurement, since
 they cannot be verified by inspection. See [`embeddings.md`](embeddings.md) §3.2 and §4.1.
+
+**`Generator.context_window` is the window that will be *served*, not the model's trained
+maximum.** Ollama applies a runtime `num_ctx` that defaults far below what modern models are
+trained for, and a prompt over it is truncated from the front rather than refused — discarding
+the system prompt and the citation protocol, and presenting as a model that ignores
+instructions. The attribute exists so that the startup cross-check in
+[`retrieval.md`](retrieval.md) §7.4 has something to read: an assembled context that cannot fit
+is a refusal naming both numbers, not a runtime truncation.
 
 **`Connector.discover` takes a watermark and `reconcile` exists separately.** Incremental
 sync tells you what changed; it cannot tell you what was deleted, because a deleted page

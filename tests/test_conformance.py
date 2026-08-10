@@ -7,21 +7,25 @@ defect it was written for, which is what makes it worth the later tickets' time.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import pytest
 
 from manicule.core.anchors import LineAnchor
-from manicule.core.content import BlockKind, Chunk, ParsedBlock
+from manicule.core.content import BlockKind, Chunk, DocumentStatus, ParsedBlock
 from manicule.core.embedding import Vector, require_within_context
 from manicule.core.errors import ContextOverflowError
 from manicule.core.ids import chunk_id
-from manicule.core.retrieval import Candidate, Query
+from manicule.core.retrieval import Candidate, Filter, Query
+from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
 from manicule.testing import (
     assert_chunker_contract,
     assert_connector_contract,
     assert_embedder_contract,
+    assert_local_only_policy_is_enforced,
     assert_middleware_contract,
     assert_parser_contract,
+    assert_pipeline_enforces_scope,
     assert_refuses_oversized_chunks,
     assert_retrieval_stage_contract,
     assert_vector_store_is_dimension_agnostic,
@@ -30,6 +34,7 @@ from manicule.testing import (
 )
 from tests.fakes import (
     AliasingStage,
+    BanningLocalOnly,
     BlockChunker,
     BlockRewritingMiddleware,
     EagerWatermarkConnector,
@@ -37,22 +42,32 @@ from tests.fakes import (
     ForgetfulConnector,
     ForgetfulVectorStore,
     HashEmbedder,
+    HydratingStage,
     LineParser,
     LyingParser,
     MemoryConnector,
     MemoryVectorStore,
     MutatingStage,
     PassThroughMiddleware,
+    RawVectorStage,
     RedactingMiddleware,
     SilentParser,
     TextRewritingMiddleware,
     TopKStage,
     TruncatingEmbedder,
     UndeclaredEmbedMiddleware,
+    UnenforcedLocalOnly,
+    lan_ollama,
+    loopback_ollama,
     make_chunks,
     make_document,
     make_raw,
 )
+from tests.storage_helpers import make_chunk as make_stored_chunk
+from tests.storage_helpers import make_document as make_stored_document
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
 # --- parsers ---------------------------------------------------------------------------
 
@@ -218,7 +233,7 @@ async def test_a_store_that_only_checks_the_dimension_is_caught() -> None:
 
 
 async def test_a_well_behaved_stage_passes() -> None:
-    query = Query(text="anything")
+    query = _query()
     candidates = _candidates()
     kept = await assert_retrieval_stage_contract(TopKStage(k=2), query, candidates)
     assert len(kept) == 2
@@ -228,13 +243,17 @@ async def test_a_well_behaved_stage_passes() -> None:
 async def test_a_stage_that_mutates_its_input_is_caught() -> None:
     """An order-dependent pipeline cannot be compared with another one."""
     with pytest.raises(AssertionError, match="mutated"):
-        await assert_retrieval_stage_contract(MutatingStage(), Query(text="q"), _candidates())
+        await assert_retrieval_stage_contract(MutatingStage(), _query(), _candidates())
 
 
 async def test_a_stage_that_hands_back_the_same_list_is_caught() -> None:
     """Aliasing means a later stage's mutation rewrites an earlier stage's record."""
     with pytest.raises(AssertionError, match="the very list"):
-        await assert_retrieval_stage_contract(AliasingStage(), Query(text="q"), _candidates())
+        await assert_retrieval_stage_contract(AliasingStage(), _query(), _candidates())
+
+
+def _query(text: str = "anything") -> Query:
+    return Query(text=text, filter=Filter(workspace_ids=frozenset({DEFAULT_WORKSPACE})))
 
 
 def _candidates() -> list[Candidate]:
@@ -353,3 +372,130 @@ async def test_middleware_contract_accepts_untouched_blocks() -> None:
     chunks = make_chunks(document)
 
     await assert_middleware_contract(PassThroughMiddleware(), document, chunks, blocks=_blocks())
+
+
+# --- the workspace boundary --------------------------------------------------------------
+
+
+async def _scoped_fixture(store: SqliteDocStore, engine: AsyncEngine) -> tuple[list[Chunk], Chunk]:
+    """A corpus holding one live chunk and three a search must never return.
+
+    Soft-deleted, ``pending``, and another workspace's — the three things the Lance table
+    cannot distinguish, because none of them is a column it has.
+    """
+    visible: list[Chunk] = []
+    for source_id, status in (
+        ("live", DocumentStatus.INDEXED),
+        ("removed", DocumentStatus.INDEXED),
+        ("waiting", DocumentStatus.PENDING),
+    ):
+        document = make_stored_document(source_id=source_id, status=status)
+        await store.upsert_document(document)
+        chunk = make_stored_chunk(document, 0, f"authentication {source_id}")
+        await store.replace_chunks(document.id, [chunk])
+        if source_id == "removed":
+            await store.soft_delete_document(document.id)
+        visible.append(chunk)
+
+    other = SqliteDocStore(engine, workspace_id="beta")
+    await other.ensure_workspace()
+    foreign_document = make_stored_document(source_id="theirs", workspace_id="beta")
+    await other.upsert_document(foreign_document)
+    foreign = make_stored_chunk(foreign_document, 0, "authentication theirs")
+    await other.replace_chunks(foreign_document.id, [foreign])
+
+    return [*visible, foreign], visible[0]
+
+
+@pytest.mark.contract
+async def test_a_pipeline_that_hydrates_through_the_document_store_passes(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """The check must admit the stage the design actually calls for."""
+    everything, live = await _scoped_fixture(store, engine)
+
+    kept = await assert_pipeline_enforces_scope(
+        [HydratingStage(everything, store)], store, _query()
+    )
+
+    assert [candidate.chunk.id for candidate in kept] == [live.id]
+
+
+@pytest.mark.contract
+async def test_a_dense_stage_that_skipped_the_hydrating_join_is_caught(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """The defect the exemption in ``predicate_for`` would otherwise make invisible.
+
+    Every returned row is well-formed, ranked and plausible; three of the four belong to
+    documents this query must not see, and nothing downstream can tell.
+    """
+    everything, _ = await _scoped_fixture(store, engine)
+
+    with pytest.raises(AssertionError, match="another workspace or has been soft-deleted"):
+        await assert_pipeline_enforces_scope([RawVectorStage(everything)], store, _query())
+
+
+@pytest.mark.contract
+async def test_a_pipeline_returning_a_pending_document_is_caught(
+    store: SqliteDocStore,
+) -> None:
+    """A document mid-ingest has chunks whose vectors and text need not agree yet."""
+    document = make_stored_document(source_id="waiting", status=DocumentStatus.PENDING)
+    await store.upsert_document(document)
+    chunk = make_stored_chunk(document, 0, "authentication waiting")
+    await store.replace_chunks(document.id, [chunk])
+
+    with pytest.raises(AssertionError, match="rather than 'indexed'"):
+        await assert_pipeline_enforces_scope([RawVectorStage([chunk])], store, _query())
+
+
+@pytest.mark.contract
+async def test_a_pipeline_that_returns_nothing_is_not_evidence(store: SqliteDocStore) -> None:
+    """A check that has never seen a candidate has not checked anything.
+
+    Off by default is wrong here and right for the runtime assertion, where an empty result
+    is an ordinary outcome rather than a fixture that proves nothing.
+    """
+    with pytest.raises(AssertionError, match="without seeing one"):
+        await assert_pipeline_enforces_scope([RawVectorStage([])], store, _query())
+
+    await assert_pipeline_enforces_scope(
+        [RawVectorStage([])], store, _query(), expect_results=False
+    )
+
+
+# --- the local-only data policy ------------------------------------------------------------
+
+
+@pytest.mark.contract
+def test_a_loopback_ollama_is_admitted_under_a_local_only_policy() -> None:
+    """A check that rejects the legitimate case is a ban, not a policy."""
+    assert_local_only_policy_is_enforced(loopback_ollama())
+
+
+@pytest.mark.contract
+def test_a_lan_ollama_is_refused_under_a_local_only_policy() -> None:
+    """The provider is spelled the same; the endpoint is on another machine."""
+    settings = lan_ollama()
+
+    assert settings.cloud_providers_in_use == frozenset({"ollama"})
+    assert_local_only_policy_is_enforced(settings)
+
+
+@pytest.mark.contract
+def test_a_policy_that_admits_the_lan_case_is_caught() -> None:
+    """The defect itself: the endpoint is off the machine and the gate says nothing.
+
+    Without this, the check would be one that has only ever passed against code that happens
+    to be right, which is not evidence about the next edit.
+    """
+    with pytest.raises(AssertionError, match="admitted anyway"):
+        assert_local_only_policy_is_enforced(lan_ollama(UnenforcedLocalOnly))
+
+
+@pytest.mark.contract
+def test_a_policy_that_refuses_the_loopback_case_is_caught_too() -> None:
+    """Both directions, because a check that only refuses is a ban with a policy's name."""
+    with pytest.raises(AssertionError, match="not a policy, it is a ban"):
+        assert_local_only_policy_is_enforced(loopback_ollama(BanningLocalOnly))
