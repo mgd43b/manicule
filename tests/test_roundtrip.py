@@ -8,6 +8,7 @@ nothing — it would pass just as well against a harness whose checks had been d
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import override
 
 import pytest
 
@@ -85,6 +86,7 @@ async def test_a_parser_whose_anchors_resolve_passes_every_assertion() -> None:
 class InventingParser(SectionParser):
     """Claims text the source does not contain."""
 
+    @override
     async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
         async for block in super().parse(raw):
             yield block.model_copy(update={"text": block.text + " Approved by legal."})
@@ -102,6 +104,7 @@ async def test_a_block_claiming_text_the_source_lacks_is_caught() -> None:
 class WholeDocumentParser(SectionParser):
     """Every anchor addresses the entire document — which passes containment."""
 
+    @override
     async def resolve(self, anchor: Anchor, raw: RawDocument) -> str | None:
         return raw.as_text() if isinstance(anchor, HeadingAnchor) else None
 
@@ -125,6 +128,7 @@ async def test_several_chunks_sharing_one_anchor_are_measured_as_a_group() -> No
     """
 
     class SplitParser(SectionParser):
+        @override
         async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
             async for block in super().parse(raw):
                 words = block.text.split()
@@ -142,6 +146,7 @@ async def test_several_chunks_sharing_one_anchor_are_measured_as_a_group() -> No
 class ShiftedSectionParser(SectionParser):
     """Every block carries the *next* section's anchor — the classic off-by-one."""
 
+    @override
     async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
         titles = [title for title, _ in _sections(raw.as_text())]
         index = 0
@@ -236,6 +241,7 @@ class DriftingParser(SectionParser):
     def __init__(self) -> None:
         self._calls = 0
 
+    @override
     async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
         self._calls += 1
         blocks = [block async for block in super().parse(raw)]

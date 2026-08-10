@@ -105,8 +105,8 @@ __all__ = [
     "validate_languages",
 ]
 
-_SUPPORTED: frozenset[str] | None = None
-_DEFAULT_CACHE_DIR: str | None = None
+_supported: frozenset[str] | None = None
+_default_cache_dir: str | None = None
 
 MANIFEST_URL_ENV: Final = "TREE_SITTER_LANGUAGE_PACK_MANIFEST_URL"
 """Environment variable the pack reads to locate the grammar manifest.
@@ -374,10 +374,10 @@ def _supported_names() -> frozenset[str]:
     """Every grammar name the installed pack knows, read offline from the wheel."""
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
 
-    global _SUPPORTED  # noqa: PLW0603 - a one-shot cache of an immutable value
-    if _SUPPORTED is None:
-        _SUPPORTED = frozenset(get_args(pack.SupportedLanguage))
-    return _SUPPORTED
+    global _supported  # noqa: PLW0603 - a one-shot cache of an immutable value
+    if _supported is None:
+        _supported = frozenset(get_args(pack.SupportedLanguage))
+    return _supported
 
 
 def language_for_media_type(media_type: str) -> str | None:
@@ -408,10 +408,10 @@ def _remember_default_cache_directory() -> str:
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
 
-    global _DEFAULT_CACHE_DIR  # noqa: PLW0603 - a one-shot cache of an immutable value
-    if _DEFAULT_CACHE_DIR is None:
-        _DEFAULT_CACHE_DIR = pack.cache_dir()
-    return _DEFAULT_CACHE_DIR
+    global _default_cache_dir  # noqa: PLW0603 - a one-shot cache of an immutable value
+    if _default_cache_dir is None:
+        _default_cache_dir = pack.cache_dir()
+    return _default_cache_dir
 
 
 def configure_pack(

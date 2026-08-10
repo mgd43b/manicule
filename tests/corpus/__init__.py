@@ -28,7 +28,7 @@ MAX_FIXTURE_BYTES = 256 * 1024
 exercises the streaming path. Named ``*-large.*`` so the check below can see the intent."""
 
 
-def generators() -> Iterator[tuple[str, Callable[[Path], None]]]:
+def generators() -> Iterator[tuple[str, Callable[..., object]]]:
     """Every ``build(dest)`` in this package, in a stable order.
 
     Discovered rather than listed, so adding a parser's fixtures is adding one module. A
@@ -43,7 +43,7 @@ def generators() -> Iterator[tuple[str, Callable[[Path], None]]]:
         if not callable(build):
             msg = f"tests/corpus/{info.name}.py has no build(dest: Path) function"
             raise TypeError(msg)
-        yield info.name, build  # pyright: ignore[reportUnknownVariableType] - checked callable above
+        yield info.name, build
 
 
 def build_all(dest: Path) -> Path:

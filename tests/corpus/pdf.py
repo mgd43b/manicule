@@ -15,7 +15,7 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
-import pypdfium2 as pdfium
+import pypdfium2 as pdfium  # pyright: ignore[reportMissingTypeStubs] - no stubs upstream
 from reportlab.lib import pdfencrypt
 from reportlab.pdfgen import canvas as rl_canvas
 
@@ -64,18 +64,21 @@ def _reshape(
     hide the very thing these fixtures exist to expose: a portrait MediaBox displayed
     landscape. Applying it afterwards leaves the MediaBox alone.
     """
+    # pypdfium2 ships no type information for its page geometry setters, so every call below
+    # is partially unknown to the checker. The suppression is on the block rather than on each
+    # line because the cause is one fact about upstream, not four separate judgements.
     document = pdfium.PdfDocument(data)
     try:
         page = document[0]
         if mediabox is not None:
-            page.set_mediabox(*mediabox)
+            page.set_mediabox(*mediabox)  # pyright: ignore[reportUnknownMemberType]
         if cropbox is not None:
-            page.set_cropbox(*cropbox)
+            page.set_cropbox(*cropbox)  # pyright: ignore[reportUnknownMemberType]
         if rotation is not None:
-            page.set_rotation(rotation)
+            page.set_rotation(rotation)  # pyright: ignore[reportUnknownMemberType]
         page.gen_content()
         out = io.BytesIO()
-        document.save(out)
+        document.save(out)  # pyright: ignore[reportUnknownMemberType]
         return out.getvalue()
     finally:
         document.close()

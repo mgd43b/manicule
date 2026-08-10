@@ -9,6 +9,7 @@ an error makes a corpus of scanned documents look like an indexing outage.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import override
 
 import pytest
 
@@ -32,20 +33,21 @@ class Working:
     def __init__(self, text: str = "real content") -> None:
         self._text = text
 
-    async def parse(self, document: RawDocument) -> AsyncIterator[ParsedBlock]:
-        del document
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        del raw
         yield ParsedBlock(kind=BlockKind.PROSE, text=self._text, anchor=LineAnchor(start=1, end=1))
 
-    async def resolve(self, anchor: Anchor, document: RawDocument) -> str | None:
-        del anchor, document
+    async def resolve(self, anchor: Anchor, raw: RawDocument) -> str | None:
+        del anchor, raw
         return self._text
 
 
 class Empty(Working):
     """Returns zero text-bearing blocks without raising — a scanned page, an empty file."""
 
-    async def parse(self, document: RawDocument) -> AsyncIterator[ParsedBlock]:
-        del document
+    @override
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        del raw
         return
         yield  # pragma: no cover - unreachable, and what makes this an async generator
 
@@ -53,16 +55,18 @@ class Empty(Working):
 class Whitespace(Working):
     """Produces blocks with nothing in them but whitespace, which is not text."""
 
-    async def parse(self, document: RawDocument) -> AsyncIterator[ParsedBlock]:
-        del document
+    @override
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        del raw
         yield ParsedBlock(kind=BlockKind.PROSE, text="  \n\f ", anchor=LineAnchor(start=1, end=1))
 
 
 class Declining(Working):
     """Inspected the input and reported that it is not its kind."""
 
-    async def parse(self, document: RawDocument) -> AsyncIterator[ParsedBlock]:
-        msg = f"{document.uri}: not a PDF"
+    @override
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        msg = f"{raw.uri}: not a PDF"
         raise ParseError(msg)
         yield  # pragma: no cover - unreachable, and what makes this an async generator
 
@@ -70,8 +74,9 @@ class Declining(Working):
 class Broken(Working):
     """Raised something that is not a decline — a bug, not a judgement."""
 
-    async def parse(self, document: RawDocument) -> AsyncIterator[ParsedBlock]:
-        del document
+    @override
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        del raw
         msg = "index out of range"
         raise IndexError(msg)
         yield  # pragma: no cover - unreachable, and what makes this an async generator
@@ -80,8 +85,9 @@ class Broken(Working):
 class Degraded(Working):
     """Produces text with no usable location at all — and has still succeeded."""
 
-    async def parse(self, document: RawDocument) -> AsyncIterator[ParsedBlock]:
-        del document
+    @override
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        del raw
         yield ParsedBlock(
             kind=BlockKind.PROSE,
             text="text with a coarse location",

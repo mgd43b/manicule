@@ -420,7 +420,7 @@ def _read_json(text: str) -> object:
     ``reader.reads`` unannotated, so the checker is right about upstream rather than about this
     code; the result is narrowed to JSON types by the helpers above before anything reads it.
     """
-    return nbreader.reads(text)  # pyright: ignore[reportUnknownMemberType] - unannotated upstream
+    return nbreader.reads(text)
 
 
 def _open(raw: RawDocument) -> tuple[dict[str, object], tuple[int, int]]:

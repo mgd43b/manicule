@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import override
 
 import pytest
 
@@ -70,6 +71,7 @@ class TidyParser:
 class LeakyParser(TidyParser):
     """Releases only after its last block — which an early close never reaches."""
 
+    @override
     async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
         self._ledger.opened += 1
         for number, line in enumerate(raw.as_text().splitlines(), start=1):

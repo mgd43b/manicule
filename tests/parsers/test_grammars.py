@@ -31,7 +31,7 @@ PERMISSIVE_LICENCES = frozenset({"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Cla
 
 
 @pytest.fixture(autouse=True)
-def _restore_pack_configuration() -> Iterator[None]:
+def restore_pack_configuration() -> Iterator[None]:
     """Put the pack back on its default cache and manifest after every test.
 
     The pack keeps one registry per process, so a test that points it at a temporary

@@ -344,7 +344,7 @@ def _message_of(raw: RawDocument) -> EmailMessage:
         )
         raise ParseError(msg)
     message = BytesParser(policy=policy.default).parsebytes(data)
-    if not isinstance(message, EmailMessage) or not message.keys():
+    if not message.keys():
         msg = (
             f"{raw.uri}: declining — no RFC 5322 header fields were found, so this is not a "
             f"message. Check the media type it was routed with."
@@ -375,7 +375,7 @@ def _descend(part: EmailMessage, path: str) -> Iterator[tuple[str, EmailMessage]
     payload = part.get_payload()
     if not isinstance(payload, list):
         return
-    for index, child in enumerate(payload, start=1):  # pyright: ignore[reportUnknownVariableType] - narrowed below
+    for index, child in enumerate(payload, start=1):
         if isinstance(child, EmailMessage):
             yield from _descend(child, f"{path}.{index}")
 

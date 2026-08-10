@@ -18,7 +18,7 @@ from manicule.chunking.breadcrumb import render
 from manicule.chunking.sentences import sentences
 from manicule.core.anchors import CellAnchor, LineAnchor, PageAnchor
 from manicule.core.content import BlockKind, Document, DocumentStatus, Metadata, ParsedBlock
-from manicule.core.embedding import EmbedFingerprint, Pooling
+from manicule.core.embedding import EmbedFingerprint, Pooling, Vector
 from manicule.core.errors import ContextOverflowError
 from manicule.testing import assert_chunker_contract
 
@@ -74,6 +74,15 @@ class _Embedder:
 
     def count_tokens(self, text: str) -> int:
         return len(text.split())
+
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        """A vector per input, so this double satisfies the protocol rather than half of it.
+
+        The values are arbitrary and nothing here reads them; what matters is that the
+        conformance suite is handed a real ``Embedder`` and not something that happens to
+        carry the two attributes the budget check reads.
+        """
+        return [[float(len(text))] * self.fingerprint.dimension for text in texts]
 
 
 # --- the budget refusal --------------------------------------------------------------------
@@ -163,11 +172,12 @@ def test_an_oversized_table_splits_by_rows_and_repeats_the_header() -> None:
     """
     rows = ["Region | Value", *[f"Region-{index} | {index}" for index in range(200)]]
     refs = [f"A{index + 1}:B{index + 1}" for index in range(len(rows))]
+    carried: Metadata = {"rows": [*rows], "header_rows": 1, "row_refs": [*refs]}
     table = ParsedBlock(
         kind=BlockKind.TABLE,
         text="\n".join(rows),
         anchor=CellAnchor(sheet="Regional", ref="A1:B201"),
-        metadata={"rows": rows, "header_rows": 1, "row_refs": refs},
+        metadata=carried,
     )
     chunks = make_chunker().chunk(document(), [table])
     assert len(chunks) > 1

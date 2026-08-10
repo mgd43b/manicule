@@ -333,7 +333,7 @@ def _children_of(value: object) -> list[_Mark]:
     only place in this module where that conversion happens.
     """
     if isinstance(value, CommentedMap):
-        mapping = cast("CommentedMap", value)
+        mapping = value
         marks = cast("dict[object, Sequence[int]]", mapping.lc.data or {})
         return [
             _Mark(line=marks[key][0] + 1, symbol=str(key), value=mapping[key])
@@ -341,7 +341,7 @@ def _children_of(value: object) -> list[_Mark]:
             if key in marks
         ]
     if isinstance(value, CommentedSeq):
-        sequence = cast("CommentedSeq", value)
+        sequence = value
         entries = cast("dict[int, Sequence[int]]", sequence.lc.data or {})
         return [
             _Mark(line=entries[index][0] + 1, symbol=f"[{index}]", value=sequence[index])
@@ -384,7 +384,7 @@ def _toml_table_at(values: dict[str, object], symbol: str | None) -> dict[str, o
         name = part if index is None else part[: part.index("[")]
         if not isinstance(node, dict):
             return None
-        node = cast("dict[str, object]", node).get(name)
+        node = node.get(name)
         if index is not None:
             if not isinstance(node, list) or index >= len(cast("list[object]", node)):
                 return None
