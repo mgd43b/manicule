@@ -66,7 +66,7 @@ quietly fixed, because the elimination looked principled and was not.
 `onnxruntime` runs on Apple Silicon; it is not a non-Apple fallback. A model outside MLX's
 seven is still fully runnable locally on the target hardware. What is given up is
 Metal-native execution — throughput — **not** the platform, and not correctness. That is the
-trade named in §1.6 and the principle in `PLAN.md` §7.
+trade named in §1.3 and the principle in `PLAN.md` §7.
 
 One naming trap, since it eliminated the wrong repository once already: `thenlper/gte-base`
 and `gte-large` are plain `BertModel`, while `Alibaba-NLP/gte-base-en-v1.5` is architecture
@@ -99,8 +99,9 @@ benchmark tables mislead.
 
 ### 1.2 Why this one
 
-It leads the permissive field at **a third to a half the parameters** of everything near it,
-and three of its properties are worth more here than the score:
+It is the best retrieval score available **at a size that fits a self-hosted tool** — a third
+to a half the parameters of everything within a point of it, and a twelfth of the one model
+that scores higher (§1.3). Three of its properties matter more here than the score:
 
 - **8192 max sequence length against a 512-token budget** removes an entire class of
   arithmetic. No special-token accounting, no prefix headroom, no truncation risk under any
@@ -132,7 +133,7 @@ gate**:
 |---|---:|---:|
 | Parameters | 149M | **1.78B** (12×) |
 | Dimensions | 768 | **1536** (2× storage) |
-| 1M chunks, fp32 | ~2.9 GiB | **~5.9 GiB** |
+| 1M chunks, fp32 | ~2.9 GiB | **~5.7 GiB** |
 | Retrieval | ~54.8 | 58.29 |
 
 Twelve times the parameters is twelve times the ingest compute for every chunk, in-process,
@@ -508,7 +509,7 @@ Same intended value, two arrival paths, two different `fp8`s, two different vect
 names, and a spurious refusal. Anything fractional is carried as a string.
 
 This function lives here because the fields are an embeddings concern; `storage.md` §4.6
-persists the bytes it returns, and §6.3 compares them. One definition, two consumers.
+persists the bytes it returns, and its §6.3 compares them. One definition, two consumers.
 
 ---
 
@@ -643,9 +644,9 @@ around it.
 
 | Ticket | What | Why not v1 |
 |---|---|---|
-| §3.4 | **MLX backend implemented against `mlx` directly** | Metal-native execution is worth having, but only without the GPL dependency, only with a measured speedup over onnxruntime with CoreML, and only under §6.2 parity |
-| §1.6 | **Multilingual model evaluation** | the chosen model is English-only; a Confluence instance with substantial non-English content needs `multilingual-e5-base` or `bge-m3`, and that is a corpus fact |
-| §1.6 | **Model quality measured on manicule's own corpus** | every figure here is MTEB, which is open-domain and English-heavy. Belongs to #15 |
+| [#30](https://github.com/mgd43b/manicule/issues/30) | **MLX backend implemented against `mlx` directly** (§3.4) | Metal-native execution is worth having, but only without the GPL dependency, only with a measured speedup over onnxruntime with CoreML, and only under §6.2 parity |
+| [#31](https://github.com/mgd43b/manicule/issues/31) | **Multilingual model evaluation** (§1.6) | the chosen model is English-only; a Confluence instance with substantial non-English content needs `multilingual-e5-base` or `bge-m3`, and that is a corpus fact |
+| [#15](https://github.com/mgd43b/manicule/issues/15) | **Model quality measured on manicule's own corpus** (§1.6) | every figure here is MTEB, which is open-domain and English-heavy. Belongs to #15 |
 
 ---
 
