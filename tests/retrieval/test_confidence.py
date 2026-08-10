@@ -171,3 +171,16 @@ def test_the_fused_score_and_bm25_are_not_admissible() -> None:
     without = score_confidence([passage(FIRST, 0, dense=0.5, lexical=1.0)], rerank_stage=None)
 
     assert with_noise.score == without.score
+
+
+def test_a_pipeline_that_declares_no_legs_suppresses_similarity_rather_than_zeroing_it() -> None:
+    """The same rule once more, for the shape a pipeline with no fusion produces.
+
+    Nothing here has a similarity to average, so a zero would report weak evidence for what is
+    a property of the pipeline rather than of the corpus.
+    """
+    confidence = score_confidence([passage(FIRST, 0, rerank=4.0)], legs=(), rerank_stage="rerank")
+
+    assert SIMILARITY in confidence.suppressed
+    assert SIMILARITY not in confidence.components
+    assert confidence.ceiling < 1.0

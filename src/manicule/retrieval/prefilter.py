@@ -90,6 +90,25 @@ def _restrict(source: Filter, fields: frozenset[str]) -> Filter:
     return Filter(workspace_ids=source.workspace_ids, **kept)
 
 
+def join_filter(source: Filter) -> Filter:
+    """The document-level half of ``source``: what a hydrating join can apply.
+
+    Everything a *document* is restricted by, and nothing a *chunk* is. ``kinds`` and ``langs``
+    are chunk properties with no meaning in a query over ``documents``, so a store asked to
+    apply them refuses — correctly, because silently dropping a restriction returns rows the
+    filter was written to exclude.
+
+    They are not dropped here either, and the distinction matters. On the dense leg they go to
+    the vector store, which has a column for each. On a cache hit they were **already applied**
+    when the ranking was computed, and a chunk id is derived from its content — so the chunk
+    behind a cached id is the same chunk, of the same kind, in the same language. What can have
+    changed since is exactly the document-level half: a soft delete, a status, a workspace, a
+    source, an ``updated_at``. That is what this filter re-applies, and it is why re-applying
+    only this half is complete rather than partial.
+    """
+    return _restrict(source, frozenset({"document_ids"}) | JOIN_REQUIRING_FIELDS)
+
+
 async def resolve(
     query_filter: Filter, docstore: DocStore, *, prefilter_id_limit: int
 ) -> Resolution:
@@ -113,7 +132,7 @@ async def resolve(
             rather than dropped: a silently ignored restriction returns rows the filter was
             written to exclude, and the search still looks like it worked.
     """
-    join = _restrict(query_filter, frozenset({"document_ids"}) | JOIN_REQUIRING_FIELDS)
+    join = join_filter(query_filter)
     requested = frozenset(query_filter.restricting_fields)
 
     if not (requested & JOIN_REQUIRING_FIELDS):
@@ -164,5 +183,6 @@ __all__ = [
     "PUSHED_DOWN_FIELDS",
     "WORKSPACE_FIELD",
     "Resolution",
+    "join_filter",
     "resolve",
 ]

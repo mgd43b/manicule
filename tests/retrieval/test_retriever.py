@@ -6,9 +6,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from manicule.config.settings import RagSettings, Settings
+from manicule.config.settings import QueryCacheSettings, RagSettings, Settings
 from manicule.container import keys
 from manicule.container.container import Container, check_wiring
+from manicule.core.content import BlockKind
 from manicule.core.errors import ConfigError
 from manicule.core.retrieval import ConfidenceBand, Filter, Query
 from manicule.plugins.registry import ComponentRegistry
@@ -20,7 +21,7 @@ from manicule.retrieval.lexical import LexicalStage
 from manicule.retrieval.plugin import PLUGIN
 from manicule.retrieval.profile import Profiles
 from manicule.retrieval.rerank import CrossEncoderReranker
-from manicule.retrieval.retriever import Retriever
+from manicule.retrieval.retriever import Retriever, build_retriever
 from manicule.retrieval.router import QueryRouter, UtilityKind
 from manicule.retrieval.runner import PipelineRunner
 from manicule.retrieval.tokens import ContextTokenCounter
@@ -32,6 +33,8 @@ from tests.retrieval.fakes import SCOPE, FixedScorer, ListVectorStore, a_query
 from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from sqlalchemy.ext.asyncio import AsyncEngine
 
     from manicule.core.content import Chunk
@@ -188,6 +191,31 @@ async def test_a_second_identical_query_is_served_from_the_cache(
     assert [c.chunk.id for c in second.candidates] == [c.chunk.id for c in first.candidates]
 
 
+async def test_a_chunk_level_filter_behaves_the_same_on_a_hit_as_on_a_miss(
+    store: SqliteDocStore,
+) -> None:
+    """The same query and the same corpus must not depend on cache state.
+
+    ``kinds`` reaches the vector store, which has a column for it, and the lexical statement,
+    which does too — but a document listing has neither, so re-applying the *whole* filter on a
+    hit turns a working query into an error the second time it is asked.
+    """
+    chunks = await _corpus(store)
+    cache = L1QueryCache(entries=8)
+    retriever = _retriever(store, chunks, cache=cache)
+    query = Query(
+        text="authentication",
+        limit=3,
+        filter=Filter(workspace_ids=SCOPE, kinds=frozenset({BlockKind.PROSE})),
+    )
+
+    first = await retriever.retrieve(query)
+    second = await retriever.retrieve(query)
+
+    assert second.trace.cached
+    assert [c.chunk.id for c in second.candidates] == [c.chunk.id for c in first.candidates]
+
+
 async def test_a_cache_hit_is_never_counted_as_a_measurement(store: SqliteDocStore) -> None:
     """Its latency is the cache's, and a quality metric from one is one sample counted twice."""
     chunks = await _corpus(store)
@@ -338,3 +366,55 @@ def test_a_pipeline_naming_one_stage_twice_is_refused_before_construction() -> N
 def test_an_unknown_stage_is_refused_with_the_alternatives_listed() -> None:
     problems = check_wiring(_settings(pipeline=("dense", "sparse", "rrf")), _registry())
     assert any("sparse" in problem and "Available" in problem for problem in problems)
+
+
+async def test_the_composition_root_assembles_a_working_retriever(
+    store: SqliteDocStore, tmp_path: Path
+) -> None:
+    """Everything wired from configuration and what plugins registered.
+
+    The subsystem has to be assemblable by whoever serves a query without that caller knowing
+    which stage does the fusing or which model reranks — both are read off the built pipeline
+    rather than off configuration, so a recorded result names what actually ran.
+    """
+    chunks = await _corpus(store)
+    registry = _registry()
+    registry.add(keys.EMBEDDER.named("fake"), lambda _: HashEmbedder())
+    registry.add(keys.VECTOR_STORE.named("memory"), lambda _: ListVectorStore(chunks))
+    registry.add(keys.DOC_STORE.named("bound"), lambda _: store)
+    settings = _settings(overrides={"candidates": 3, "final_top_k": 3})
+    settings.embedding.provider = "fake"
+    settings.storage.vector_db = "memory"  # pyright: ignore[reportAttributeAccessIssue]
+    settings.storage.db = "bound"  # pyright: ignore[reportAttributeAccessIssue]
+    settings.data_dir = tmp_path
+
+    async with Container(settings, registry) as container:
+        retriever = await build_retriever(container)
+        result = await retriever.retrieve(a_query("authentication"))
+
+    assert [span.name for span in result.trace.stages] == ["dense", "lexical", "rrf"]
+    assert result.trace.pipeline.rrf_k == 60
+    assert result.trace.pipeline.embed_fingerprint
+    assert result.context.passages
+    assert retriever.cache_available
+
+
+async def test_the_composition_root_honours_the_cache_switch(
+    store: SqliteDocStore, tmp_path: Path
+) -> None:
+    """An evaluation run turns the cache off by configuration, never by a code path."""
+    chunks = await _corpus(store)
+    registry = _registry()
+    registry.add(keys.EMBEDDER.named("fake"), lambda _: HashEmbedder())
+    registry.add(keys.VECTOR_STORE.named("memory"), lambda _: ListVectorStore(chunks))
+    registry.add(keys.DOC_STORE.named("bound"), lambda _: store)
+    settings = _settings(cache=QueryCacheSettings(enabled=False))
+    settings.embedding.provider = "fake"
+    settings.storage.vector_db = "memory"  # pyright: ignore[reportAttributeAccessIssue]
+    settings.storage.db = "bound"  # pyright: ignore[reportAttributeAccessIssue]
+    settings.data_dir = tmp_path
+
+    async with Container(settings, registry) as container:
+        retriever = await build_retriever(container)
+
+    assert not retriever.cache_available

@@ -1376,6 +1376,13 @@ did, each fixed above rather than noted:
 | §7.3, §12.1 | The token budgets were inherited, unreachable by a factor of three to five, and `precise` failed its own startup cross-check against the model this project ships with. They are now derived from what each profile can hold |
 | §8.2 | The suppression rule is about the **cause**, not about one named term: a degraded dense leg has to suppress the similarity component for exactly the reason a degraded lexical leg suppresses agreement |
 | §10.3 | "Bump on the write paths in the document store" is still a list. The counter counts **committed transactions**, which a write cannot avoid and a read cannot reach |
+| §10.1 | A cache hit re-applies the **document-level** half of the filter, not the whole of it. `kinds` and `langs` are chunk properties with no column in a query over `documents`, so passing them made a query that worked on a miss raise on a hit. Nothing is dropped by narrowing it: those fields were applied when the ranking was computed, and a chunk id is content-derived, so the chunk behind a cached id is the same chunk of the same kind — what can have changed is exactly the document-level half |
+
+Two more that are additions rather than corrections. `manicule.retrieval.assembly.window_problem`
+is the shared predicate for §7.4's cross-check, so #7's enforcement point and this document's
+requirement cannot drift apart; and `build_retriever` is the subsystem's composition root, which
+reads the fusion constant and the reranker's model id **off the built pipeline** rather than off
+configuration, so a recorded result names what actually ran.
 
 ## Appendix D: checklist against ticket #6
 

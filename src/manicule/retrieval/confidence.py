@@ -143,15 +143,20 @@ def score_confidence(
     suppressed: dict[str, str] = {}
 
     dense_leg = legs[0] if legs else None
-    if dense_leg is not None and dense_leg in degraded_legs:
+    if dense_leg is None:
+        # A pipeline with no fusion names no legs, so nothing here has a similarity to average.
+        # Suppressed rather than scored zero, for the same reason a degraded leg is: a zero
+        # would report weak evidence for what is a property of the pipeline.
+        suppressed[SIMILARITY] = (
+            "this pipeline declares no retrieval legs to read a similarity from"
+        )
+    elif dense_leg in degraded_legs:
         suppressed[SIMILARITY] = (
             f"the {dense_leg!r} leg contributed nothing, so no passage carries a similarity "
             f"this run could average"
         )
     else:
-        similarities = [
-            max(candidate.scores.get(dense_leg or "", 0.0), 0.0) for candidate in passages
-        ]
+        similarities = [max(candidate.scores.get(dense_leg, 0.0), 0.0) for candidate in passages]
         components[SIMILARITY] = _mean(similarities)
 
     if len(healthy) < len(legs) or len(legs) < 2:  # noqa: PLR2004 - agreement needs two legs

@@ -44,7 +44,7 @@ from manicule.retrieval.ports import (
 from manicule.retrieval.prefilter import Resolution, resolve
 from manicule.retrieval.profile import Profiles, retrieval_depth
 from manicule.retrieval.rerank import CrossEncoderReranker, PairScorer
-from manicule.retrieval.retriever import RetrievalResult, Retriever
+from manicule.retrieval.retriever import RetrievalResult, Retriever, build_retriever
 from manicule.retrieval.router import QueryRouter, Routing, UtilityKind
 from manicule.retrieval.runner import PipelineRun, PipelineRunner
 from manicule.retrieval.tokens import ContextTokenCounter, ContextTokenDriftError
@@ -88,6 +88,7 @@ __all__ = [
     "UtilityAnswer",
     "UtilityKind",
     "band_for",
+    "build_retriever",
     "cache_key",
     "derive_over_fetch",
     "handlers_for",

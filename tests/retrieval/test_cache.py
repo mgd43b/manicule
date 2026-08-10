@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from manicule.core.content import BlockKind
 from manicule.core.retrieval import Candidate, Filter, PipelineIdentity, Query, SupportsGeneration
 from manicule.retrieval.cache import L1QueryCache, cache_key, rehydrate
+from manicule.retrieval.prefilter import join_filter
 from manicule.storage.docstore import SqliteDocStore
 from tests.retrieval.fakes import SCOPE, a_query
 from tests.storage_helpers import make_chunk, make_document
@@ -142,6 +144,32 @@ async def test_a_hit_is_rehydrated_through_the_store(store: SqliteDocStore) -> N
     assert rebuilt is not None
     assert [candidate.chunk.id for candidate in rebuilt] == [chunk.id for chunk in chunks]
     assert rebuilt[0].scores == {"rrf": 0.03}
+
+
+async def test_a_chunk_level_restriction_does_not_break_rehydration(
+    store: SqliteDocStore,
+) -> None:
+    """A hit re-applies the *document-level* half of the filter, and only that half.
+
+    ``kinds`` and ``langs`` are chunk properties; a query over ``documents`` has no column for
+    either and the store refuses to pretend otherwise. Passing the whole filter here would make
+    a query that works on a miss raise on a hit — the same query, the same corpus, a different
+    outcome depending on cache state.
+
+    Nothing is dropped by narrowing it. Those fields were applied when the ranking was computed,
+    and a chunk id is derived from its content, so the chunk behind a cached id is the same
+    chunk of the same kind. What can have changed is exactly the document-level half.
+    """
+    chunks = await _live(store)
+    entry = L1QueryCache.record(
+        [Candidate(chunk=chunk, score=0.9, scores={"rrf": 0.03}) for chunk in chunks], IDENTITY
+    )
+    narrowed = Filter(workspace_ids=SCOPE, kinds=frozenset({BlockKind.PROSE}))
+
+    rebuilt = await rehydrate(entry, store, join_filter(narrowed))
+
+    assert rebuilt is not None
+    assert len(rebuilt) == len(chunks)
 
 
 async def test_a_hit_cannot_serve_a_soft_deleted_chunk(store: SqliteDocStore) -> None:

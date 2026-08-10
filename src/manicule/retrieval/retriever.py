@@ -24,6 +24,7 @@ from manicule.core.retrieval import (
 from manicule.retrieval import trace as tracing
 from manicule.retrieval.cache import L1QueryCache, cache_key, rehydrate
 from manicule.retrieval.confidence import score_confidence
+from manicule.retrieval.prefilter import join_filter
 from manicule.retrieval.router import QueryRouter, Routing, UtilityKind
 from manicule.retrieval.runner import PipelineRunner
 from manicule.retrieval.trace import RetrievalTrace, Route
@@ -32,6 +33,7 @@ from manicule.retrieval.utility import UtilityAnswer, handlers_for
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from manicule.container.container import Container
     from manicule.core.protocols import DocStore
     from manicule.core.retrieval import Query
     from manicule.retrieval.assembly import ContextAssembler
@@ -225,7 +227,7 @@ class Retriever:
         entry = self._cache.get(key)
         if entry is None:
             return None
-        candidates = await rehydrate(entry, self._docstore, query.filter)
+        candidates = await rehydrate(entry, self._docstore, join_filter(query.filter))
         if candidates is None:
             # Anything dropped means the ranking was computed over a candidate set that no
             # longer exists. A shortened list would be a correct answer to a different question.
@@ -277,4 +279,67 @@ def _exhausted_budget(spans: Sequence[tracing.StageSpan]) -> bool:
     )
 
 
-__all__ = ["CACHED_RUN", "CACHE_UNAVAILABLE", "RetrievalResult", "Retriever"]
+async def build_retriever(container: Container) -> Retriever:
+    """Assemble the whole of retrieval from configuration and what plugins registered.
+
+    The composition root for this subsystem, and it lives here rather than as a branch in the
+    container for the reason the container's own docstring gives: adding a component means
+    writing a plugin, not editing a startup routine. What it does is read configuration and
+    resolve components — nothing here decides anything a reader cannot find in ``rag``.
+
+    Two values are read off the built pipeline rather than off configuration, because
+    configuration names components and these are properties of the objects: the fusion
+    constant and the legs it fuses come from whichever stage is doing the fusing, and the
+    reranker's model id comes from the reranker. Both go into the run's identity, so a
+    recorded result names what actually ran rather than what was asked for.
+    """
+    from manicule.container import keys  # noqa: PLC0415 - avoids a package-level import cycle
+    from manicule.core.protocols import Reranker  # noqa: PLC0415
+    from manicule.retrieval.assembly import ContextAssembler  # noqa: PLC0415
+    from manicule.retrieval.fusion import RRFStage  # noqa: PLC0415
+    from manicule.retrieval.profile import Profiles  # noqa: PLC0415
+    from manicule.retrieval.tokens import ContextTokenCounter  # noqa: PLC0415
+
+    settings = container.settings
+    rag = settings.rag
+    profiles = Profiles(rag.overrides)
+    stages = await container.retrieval_pipeline()
+    docstore = await container.aget(keys.DOC_STORE)
+    embedder = await container.aget(keys.EMBEDDER)
+
+    fusion = next((stage for stage in stages if isinstance(stage, RRFStage)), None)
+    reranker = next((stage for stage in stages if isinstance(stage, Reranker)), None)
+    handlers = handlers_for(docstore)
+
+    return Retriever(
+        runner=PipelineRunner(stages, docstore=docstore, assert_scope=rag.assert_scope),
+        docstore=docstore,
+        assembler=ContextAssembler(
+            counter=ContextTokenCounter(
+                encoding=rag.context.encoding,
+                safety_factor=rag.context.safety_factor,
+                drift_tolerance=rag.context.drift_tolerance,
+            ),
+            profiles=profiles,
+        ),
+        profiles=profiles,
+        router=QueryRouter(rag.router, available=handlers) if rag.router.enabled else None,
+        cache=L1QueryCache(
+            entries=rag.cache.entries if rag.cache.enabled else 0, ttl_s=rag.cache.ttl_s
+        ),
+        legs=fusion.legs if fusion else (),
+        rerank_stage=reranker.name if reranker else None,
+        rrf_k=fusion.k if fusion else None,
+        embed_fingerprint=embedder.fingerprint.canonical(),
+        reranker_model_id=reranker.model_id if reranker else None,
+        utility_handlers=handlers,
+    )
+
+
+__all__ = [
+    "CACHED_RUN",
+    "CACHE_UNAVAILABLE",
+    "RetrievalResult",
+    "Retriever",
+    "build_retriever",
+]
