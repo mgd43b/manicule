@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from manicule.container import keys
-from manicule.core.errors import UnknownComponentError
+from manicule.core.errors import ConfigError, UnknownComponentError
 from manicule.parsers import config as parser_config
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
 from manicule.plugins.registry import Factory
@@ -169,12 +169,25 @@ def _build_parser(registration: _Registration, context: BuildContext) -> Parser:
     The import happens here rather than at module level so that installing the parsing
     plugin costs nothing until a document of that type is routed to it — which for a corpus
     of Markdown means never loading pdfium, tree-sitter, or the Office readers at all.
+
+    Raises:
+        ConfigError: The context carries configuration of some other type. The container
+            validates against the registered model before calling a factory, so this can only
+            be reached by a caller building the parser some other way — and substituting
+            defaults there would build a parser whose settings appear to be in force and are
+            not, which is the failure configuration validation exists to prevent.
     """
     module = import_module(registration.module)
     parser_type = getattr(module, registration.factory)
     settings = context.config
     if not isinstance(settings, registration.config_model):
-        settings = registration.config_model()
+        msg = (
+            f"parser {registration.name!r} was built with {type(settings).__name__} where it "
+            f"declares {registration.config_model.__name__}. Configuration reaching a factory "
+            f"is validated against the model the component registered; a factory called "
+            f"outside the container has to supply that model itself."
+        )
+        raise ConfigError(msg)
     built: Parser = parser_type(settings)
     return built
 

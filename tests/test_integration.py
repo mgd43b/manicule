@@ -15,10 +15,16 @@ from manicule_plugin_example import MEDIA_TYPE
 from manicule.config.settings import Settings
 from manicule.container import build_container, keys
 from manicule.core.content import Document, DocumentStatus, RawDocument
-from manicule.core.errors import PolicyError
+from manicule.core.errors import ConfigError, PolicyError, UnknownComponentError
 from manicule.core.ids import content_hash, document_id
 from manicule.core.protocols import Chunker, Parser
-from manicule.plugins import ComponentKind, ComponentRegistry, discover
+from manicule.plugins import (
+    BuildContext,
+    ComponentKey,
+    ComponentKind,
+    ComponentRegistry,
+    discover,
+)
 from manicule.testing import assert_parser_contract, closing
 from tests.fakes import HashEmbedder, make_raw
 
@@ -181,6 +187,43 @@ async def test_an_anchor_from_the_container_still_resolves_to_its_own_text(
             resolved = await parser.resolve(block.anchor, raw)
             assert resolved is not None
             assert block.text in resolved
+
+
+def test_building_a_parser_with_the_wrong_configuration_model_is_refused() -> None:
+    """The guard on a factory called outside the container.
+
+    The container validates configuration against the model a component registered before it
+    calls the factory, so a mistyped config cannot arrive by that route. A factory called any
+    other way could hand a parser someone else's settings — and substituting defaults instead,
+    which is what this used to do, builds a parser whose configuration appears to be in force
+    and is not. That is the failure validation exists to prevent, so it is an error.
+    """
+    from manicule.parsers.config import PdfConfig  # noqa: PLC0415 - a parsing extra
+
+    # Through the registered factory, which is the object the container calls — so this
+    # exercises the real route rather than a private function that happens to be behind it.
+    factory = discover().registry.record(keys.PARSER.named("markdown")).factory
+    context = BuildContext(
+        settings=Settings(),
+        config=PdfConfig(),
+        data_dir=Path(),
+        cache_dir=Path(),
+        components=_NoComponents(),
+    )
+
+    with pytest.raises(ConfigError) as caught:
+        factory(context)
+
+    assert "MarkdownConfig" in str(caught.value)
+    assert "PdfConfig" in str(caught.value)
+
+
+class _NoComponents:
+    """A resolver that provides nothing, for a factory that asks it for nothing."""
+
+    def get[T](self, key: ComponentKey[T]) -> T:
+        msg = f"nothing provides {key}"
+        raise UnknownComponentError(msg)
 
 
 def _document_for(raw: RawDocument) -> Document:

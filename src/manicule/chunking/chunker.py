@@ -635,9 +635,17 @@ def _merge_anchors(anchors: Sequence[Anchor]) -> Anchor:
         return PageAnchor(page=first.page, rects=tuple(rects))
     if isinstance(first, CellAnchor):
         cells = [anchor for anchor in anchors if isinstance(anchor, CellAnchor)]
+        # Deduplicated against a set rather than by scanning the list being built: extending a
+        # list from a generator that tests membership in that same list happens to work, and
+        # is the kind of thing a later reader reasonably rewrites into something that does
+        # not. Source order is kept, because a multi-area ref reads as the header rows first.
         areas: list[str] = []
+        seen: set[str] = set()
         for anchor in cells:
-            areas.extend(part for part in anchor.ref.split(",") if part not in areas)
+            for part in anchor.ref.split(","):
+                if part not in seen:
+                    seen.add(part)
+                    areas.append(part)
         return CellAnchor(sheet=first.sheet, ref=",".join(areas))
     return first
 
