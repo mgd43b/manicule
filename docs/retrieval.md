@@ -1,0 +1,1229 @@
+# Retrieval
+
+Design for the retrieval pipeline: two legs, a fusion, a rerank, and a context assembled
+inside a token budget. Ticket [#6](https://github.com/mgd43b/manicule/issues/6).
+
+The stores are settled and built ([`storage.md`](storage.md)), the embedder is settled
+([`embeddings.md`](embeddings.md)), and the seam every stage is written against is settled
+([`contracts.md`](contracts.md) §3). This document starts above all of them: given a query
+and those stores, what runs, in what order, what each step is allowed to see, and what the
+result is allowed to claim.
+
+> **Prior art.** OpenDocuments is referenced in clearly-marked callouts like this one, where
+> the comparison carries design information. Everything outside these callouts stands on its
+> own.
+
+---
+
+## 1. The whole design in five sentences
+
+**A pipeline is a declared list of uniform stages. Every stage's output is already live,
+in-workspace and visible. Fusion sees ranks and never scores. Confidence describes the
+retrieval, not the answer. Nothing new ships without a measured improvement on
+[#15](https://github.com/mgd43b/manicule/issues/15).**
+
+Everything below follows from those five, and the reason they are five rather than four is
+the second one. It would have been cheaper to enforce the workspace and soft-delete boundary
+once, at the end, just before results reach a caller. That design has a failure mode that
+this project has already hit once in the lexical leg and measured: the filtering happens
+*after* the ranking, the excluded rows have already consumed the top-`k` slots, and the query
+returns a well-formed empty list ([`storage.md`](storage.md) §6.1). Enforcing at the end is
+correct and useless. Enforcing at every stage boundary makes it an invariant that can be
+asserted at any point in the pipeline, which is what turns "we filtered" into something a test
+can fail on.
+
+---
+
+## 2. The pipeline
+
+### 2.1 The shape
+
+```
+              Query
+                │
+        ┌───────▼────────┐
+        │ router         │   deterministic; greetings and utility queries stop here
+        └───────┬────────┘
+                │ RETRIEVE
+        ┌───────▼────────┐
+        │ L1 cache       │   ranked chunk ids, keyed by generation; hit → hydrate → done
+        └───────┬────────┘
+                │ miss
+   ─────────────┼─────────────────────────────  declared stages, in configuration order
+        ┌───────▼────────┐
+        │ dense          │   embed → LanceDB k′ → hydrating join → k live candidates
+        ├────────────────┤
+        │ lexical        │   FTS5 BM25, one joined statement, merged into the list
+        ├────────────────┤
+        │ rrf            │   per-leg rank ladders → reciprocal rank fusion
+        ├────────────────┤
+        │ rerank         │   cross-encoder over the head; profile-gated
+        └───────┬────────┘
+   ─────────────┼─────────────────────────────
+        ┌───────▼────────┐
+        │ assembly       │   token budget, whole passages only → Context
+        ├────────────────┤
+        │ confidence     │   a statement about the retrieval
+        └───────┬────────┘
+                ▼
+        Context + Confidence + RetrievalTrace
+```
+
+The declared part is `rag.pipeline`, which ships as `("dense", "lexical", "rrf")` with the
+reranker appended when the profile asks for one and configuration names one
+(`manicule.container.Container.retrieval_pipeline`). Everything outside the fenced region is
+not a stage, and §2.4 says why that is not a loophole.
+
+### 2.2 A stage is a fold, and the runner is the only thing that times it
+
+`RetrievalStage.run(query, candidates) -> list[Candidate]` is a fold over a list. The runner
+holds the accumulator, calls each stage in declared order, and does three things no stage can
+do for itself:
+
+1. **Times it**, with `time.perf_counter()` around the `await`.
+2. **Counts** what went in and what came out.
+3. **Records** the stage's declared configuration, so a recorded result names the thing it
+   measured.
+
+Timing from outside is not merely convenient. A stage that reports its own latency reports the
+time it thinks it spent, which excludes the time the event loop spent elsewhere inside its own
+`await` — the component of latency a user actually experiences. It is also a number the stage
+could be wrong about while everything still looks fine, which is the failure profile this
+project spends its effort on.
+
+**Stages run sequentially.** The dense and lexical legs touch different stores and could run
+concurrently, and the saving is real but small: the lexical leg is one SQLite statement, and
+the dense leg contains an embedding forward pass that dominates it by an order of magnitude,
+against a reranker that dominates both. Concurrency would buy a few milliseconds and cost
+unambiguous per-stage attribution — overlapping wall times do not sum to a pipeline latency,
+and the whole point of recording them is that #15 can subtract. If #15 ever shows leg latency
+matters, the shape to reach for is a combinator stage that runs children concurrently and
+marks their spans as overlapping in the trace. That is a stage, so it needs no widening.
+
+**Stage names are unique within a pipeline, and the container refuses a duplicate.**
+`Candidate.scores` is keyed by stage name; two stages sharing one means the second silently
+overwrites the first's record, and the fused ranking is then computed from a ladder that is
+missing half its rungs.
+
+### 2.3 `RetrievalStage` is not widened
+
+Ticket #1 widened it once, from sync to async, and rejected three further widenings. This
+document re-argues all three against a working design and adds the one new pressure that
+building the design surfaced. **The conclusion is that it stays exactly as it is:**
+
+```
+RetrievalStage
+    name: str
+    async def run(query: Query, candidates: list[Candidate]) -> list[Candidate]
+```
+
+**Shared state between stages, for the query embedding.** Still rejected. Both the dense stage
+and any future stage needing the query vector call the embedder; the embedding cache is keyed
+by the canonical fingerprint and the exact text ([`embeddings.md`](embeddings.md) §8), so the
+second call is a dictionary lookup. The cost of the alternative is that stage *n* depends on
+stage *n−1* having populated something, and a pipeline whose stages cannot be reordered or
+removed independently is not a pipeline #15 can attribute anything to.
+
+**Timing and diagnostics on the return value.** Still rejected for timing — §2.2 — but the
+*diagnostics* half is where a real pressure appeared, and it deserves a straight answer rather
+than a restatement. The dense stage genuinely knows things the runner cannot infer: how many
+rows it over-fetched, how many survived the join, how many expansions it needed, whether it
+exhausted the table. Those are exactly the numbers §4.4 needs recorded. Three ways to get
+them out:
+
+| Option | Why not |
+|---|---|
+| Widen the return to `(candidates, StageReport)` | Every stage now returns a tuple to serve the two that have anything to say, and every recorded result predating the change is unreplayable. This is the widening the warning in `contracts.md` §3 exists to prevent |
+| An optional `drain_report()` on the stage | Stages are container singletons shared across concurrent queries. Per-run state on a shared object is a race, and the failure is two queries swapping diagnostics — plausible-looking numbers attached to the wrong run |
+| A `contextvars.ContextVar` trace frame, installed by the runner | **Chosen.** Per-task by construction, so concurrent queries cannot cross; invisible to stages that ignore it; no signature changes |
+
+The contextvar is implicit coupling and that is a real cost, paid down by one rule and one
+test: **nothing in the pipeline's behaviour may depend on the trace frame**, and the
+conformance suite runs every stage with no frame installed. A stage that changes what it
+returns based on whether anyone is recording fails.
+
+**A stage context object.** Still rejected, and the reasoning is unchanged: this is the
+widening that never gets narrowed again. Everything proposed for it in this design has landed
+somewhere better — the filter is on `Query`, the profile is on `Query`, per-leg scores are on
+`Candidate.scores`, and diagnostics go to the trace frame.
+
+**One thing the narrow signature forced, and it turned out to be an improvement.** Fusion needs
+each leg's *rank ladder*, and a flat `list[Candidate]` does not obviously carry one. §5.2 shows
+it does. Working that out produced a fusion stage that is configured with the names of the legs
+it fuses rather than hardcoding `"dense"` and `"bm25"` — which is precisely what lets the
+learned-sparse leg (§13) be measured against BM25 by editing configuration.
+
+### 2.4 What "independently switchable" means, and the two things that are not stages
+
+#15's whole method is comparing two pipelines that differ in exactly one place. That requires
+switching to be *declarative*: `rag.pipeline` is a tuple of names in configuration, the
+reranker is a name or `None`, and every numeric knob lives in `ProfileConfig` with per-field
+overrides. No comparison in #15 should ever require editing code, and if one does, that is a
+defect in this design rather than in the harness.
+
+Three things are deliberately **not** switchable, and calling them stages would have made them
+look switchable:
+
+- **The hydrating join is inside the dense stage, not beside it.** It is not a quality feature;
+  it is the workspace, soft-delete and status boundary (§4.2). A pipeline that could be
+  configured without it is a pipeline that can be configured into a cross-tenant leak, and
+  configuration is not where a security boundary should live. Folding it into the leg also buys
+  the §1 invariant: *every* stage's output is already scoped, so the assertion holds everywhere
+  rather than at one privileged point.
+- **Context assembly is not a stage.** It emits `Context`, not `list[Candidate]`. This closes
+  the second question in `contracts.md` §6 the same way the merged `Context` docstring already
+  leans: keeping the types distinct is exactly why a stage list is freely reorderable and this
+  step is not. A stage that emitted a different type would make every stage's signature a union.
+- **Confidence is not a stage.** It reads the assembled context and the trace and produces
+  neither candidates nor context. It is a report on the run.
+
+---
+
+## 3. `Filter` — settled
+
+`contracts.md` §6 has carried this as open since #1: *"a LanceDB predicate plus a metadata
+pre-filter, but the exact split between them wants contact with real data volumes."*
+[`storage.md`](storage.md) §6.6 proposed a shape and explicitly declined to close it. Storage
+is now built and merged, and the shape that shipped in `manicule.core.retrieval` differs from
+both. **This section closes it.**
+
+### 3.1 The settled shape
+
+```python
+class Filter(BaseModel):
+    """A restriction on which chunks a search may return."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    workspace_ids:  frozenset[str]                        # required, non-empty
+    document_ids:   frozenset[str] = frozenset()
+    sources:        frozenset[str] = frozenset()
+    collection_ids: frozenset[str] = frozenset()
+    tag_ids:        frozenset[str] = frozenset()
+    media_types:    frozenset[str] = frozenset()
+    kinds:          frozenset[BlockKind] = frozenset()
+    langs:          frozenset[str] = frozenset()
+    updated_after:  datetime | None = None
+    updated_before: datetime | None = None
+```
+
+Every field is a conjunct; within a field, membership is a disjunction; an unset field
+restricts nothing. That part is unchanged from what shipped. Four things change.
+
+**`workspace_id: str | None` becomes `workspace_ids: frozenset[str]`, required and non-empty.**
+§3.2.
+
+**`source: str | None` becomes `sources: frozenset[str]`.** A scalar among nine set-valued
+fields is a drafting accident, and "these two connectors" is an ordinary query. The name follows
+the merged vocabulary — `Document.source`, `DocStore.find_document(source, source_id)` — rather
+than `storage.md` §6.6's `connector_ids`, because a filter field that does not match the column
+it filters is a field people get wrong.
+
+**`langs` is added.** The Lance table already promotes a `lang` column
+([`storage.md`](storage.md) §6.2) that no filter field can currently reach. A promoted column
+nothing can name is dead weight in every row of the index, and language is a real query
+restriction on a corpus the embedder was chosen to handle in 100+ languages.
+
+**`extra: dict[str, JsonValue]` is removed.** It shipped so that "a store can accept a predicate
+this type cannot yet express without anyone widening it prematurely." With the shape settled it
+has no remaining job, and it should go rather than linger, for three reasons that compound:
+
+- It is an untyped predicate channel on the type that carries a security boundary. A field whose
+  meaning is whatever the store decides cannot be reviewed, and this is the one type where a
+  reviewer must be able to see the whole restriction.
+- It is unusable today anyway. `predicate_for` in `manicule.storage.vectors` treats any
+  non-default field outside its pushdown set as unhonourable and raises, so a populated `extra`
+  is not a flexible escape hatch — it is an exception.
+- It is the same shape as the stage context object rejected in §2.3, and for the same reason:
+  an escape hatch on a type this central never narrows again.
+
+**`is_empty` goes with it.** With `workspace_ids` required, a filter is never empty, and the
+property currently exists to let `predicate_for` short-circuit.
+
+### 3.2 `workspace_ids` is a security boundary, not a performance question
+
+This is the part of the shape that is not negotiable, and the reason is not about vector stores
+at all.
+
+**Required, because a boundary you can forget to pass is not a boundary.** Optionality here is
+not a convenience; it is a default that silently means "every workspace". `PLAN.md` §14 makes
+workspace isolation an invariant of every query, and an invariant expressed as an optional
+parameter is an invariant enforced by everyone remembering.
+
+**Non-empty, because an empty set is worse than a missing one.** `frozenset()` reads at a
+glance as "no restriction" and means "match nothing". Both readings are catastrophic in
+opposite directions, so the type refuses it and the caller has to say which they meant.
+
+**Set-valued, because the single-value version is the one that gets made optional.**
+`PLAN.md` §16 has admin cross-workspace search. With a scalar field, that feature arrives and
+the only way to express it is `None`, which turns the required field straight back into an
+optional one and undoes the paragraph above. Making it a set means the cross-workspace case is
+`{"a", "b"}` — the same field, more members, nothing weakened.
+
+**Where it comes from, and how it survives contact with the merged store.** `SqliteDocStore` is
+constructed for one workspace and refuses a filter naming a different one. That is a good
+property and this design does not change it. Instead:
+
+> **Cross-workspace search is N scoped queries merged, never one unscoped query.**
+
+The retrieval layer fans `workspace_ids` out to one store handle per workspace and merges. Three
+consequences worth stating:
+
+- The store keeps its "one query, one workspace" property, so the leak stays impossible by
+  construction rather than by a predicate somebody wrote correctly.
+- Results stay attributable per workspace, which is what an admin running a cross-workspace
+  search actually wants to see.
+- **The merge across workspaces is not RRF.** A chunk lives in exactly one workspace, so no
+  chunk appears in two ladders and reciprocal rank fusion degenerates into "whichever workspace
+  had the shorter result list wins". Merge on cosine similarity instead, which *is* comparable
+  across workspaces because every vector came from one model in one space
+  ([`storage.md`](storage.md) §6.2) — and, when a reranker ran, on the reranker score, which is
+  comparable for the same reason. **BM25 is not comparable across workspaces**, because IDF is
+  computed over the whole `chunks_fts` index while relevance is being judged per workspace;
+  merging on it would rank the workspaces against each other rather than the chunks.
+
+N is bounded by configuration and the feature is gated on team mode.
+
+### 3.3 The split, settled as a rule rather than as a constant
+
+`storage.md` §6.6 named the honest difficulty: pushing a resolved id list down works while the
+list is small, and above some size the better plan inverts to over-fetch-and-post-filter. It
+called the threshold "genuinely unknown" and it still is. **What this section settles is not the
+number — it is the decision procedure, and the fact that every query records the two inputs that
+set it.**
+
+| Filter field | Resolved by | Why |
+|---|---|---|
+| `document_ids`, `kinds`, `langs` | Lance predicate | A promoted column exists ([`storage.md`](storage.md) §6.2) |
+| `workspace_ids` | **Neither.** The hydrating join (§4.2) | No Lance column, deliberately: promoting it creates a value that can disagree with SQLite |
+| `sources`, `media_types`, `collection_ids`, `tag_ids`, `updated_*` | SQLite, into `document_ids`, then pushed down | Each needs a join the vector table has no columns for |
+
+The lexical leg needs none of this: it is one SQL statement against the authoritative store and
+applies the whole filter inline, before `LIMIT` ([`storage.md`](storage.md) §6.1).
+
+The dense leg has two regimes and the rule that picks between them is:
+
+```
+1.  Resolve the join-requiring fields in SQLite into a document-id set.
+2.  If that set is non-empty and |set| <= prefilter_id_limit:
+        push it down as document_ids. Selectivity is now the store's problem.
+3.  Otherwise:
+        push down only what has a column, over-fetch (§4.3), and let the
+        hydrating join do the rest.
+```
+
+`prefilter_id_limit` starts at **1000** and is configuration, not a constant. It is a starting
+value and this document says so plainly rather than dressing it up: an `IN` list of a thousand
+string literals is a predicate LanceDB can still plan usefully, and beyond that the predicate
+starts costing more than the over-fetch it saves.
+
+**What makes it settleable rather than a guess forever:** every query's trace records
+`resolved_id_count` and the derived over-fetch factor (§4.3). #15's runs therefore carry the
+distribution of both across a real corpus, and the threshold gets set from that distribution
+instead of from an argument. That is what "contact with real data volumes" was waiting for, and
+this design produces the contact as a side effect of running.
+
+**The escape hatch, with its trigger stated.** One regime fails both tests: a workspace that is
+a small slice of a large corpus *and* has more documents than `prefilter_id_limit`. Then the
+pre-filter list is too big and the derived over-fetch exceeds its cap, and neither plan is good.
+The condition is precise —
+
+```
+derived_overfetch > overfetch_max · k   AND   resolved_id_count > prefilter_id_limit
+```
+
+— and the answer if it is ever observed is a `workspace_id` column promoted into the Lance table,
+which [`storage.md`](storage.md) §6.2 rejects today for a good reason (a value that can disagree
+with SQLite) that would then have to be traded against a worse one. It is a storage change and it
+becomes a storage ticket when the trace shows the condition occurring, not before. Nothing about
+correctness depends on it: the post-filter plan is always correct, only slower.
+
+### 3.4 What this costs in already-merged code
+
+The shape above is not what shipped, so closing the question has a bill, and it is a small one.
+Filed as [#36](https://github.com/mgd43b/manicule/issues/36) rather than done here, because this
+document owns no code and two implementation tickets are in flight. The mechanical consequences,
+so the ticket is actionable:
+
+- `Filter()` no longer constructs. `predicate_for` uses `default = Filter()` as a comparison
+  sentinel and `filter.is_empty` as a short-circuit; both need replacing with a comparison
+  against declared field defaults.
+- `PUSHED_DOWN_FILTER_FIELDS` gains `langs`, and needs a companion set naming `workspace_ids` as
+  **deliberately not pushed down**. This is the delicate one: the current code raises on any
+  field it cannot honour, and that refusal is doing real work. It must keep raising for
+  everything except the one field whose enforcement moved somewhere stronger, and the exemption
+  has to be a named constant with the reason attached, not an omission.
+- `SqliteDocStore._require_same_workspace` compares a scalar; it becomes a subset check, and the
+  fan-out in §3.2 means it will only ever see its own workspace.
+- The exemption above is the one place a security field is knowingly dropped by a store, so it
+  gets a structural guard rather than a comment: `manicule.testing` grows
+  `assert_pipeline_enforces_scope(pipeline, docstore, query)`, which runs a pipeline against a
+  fixture holding soft-deleted, `pending` and foreign-workspace chunks and asserts that **no
+  stage's output** contains one. A dense stage that skipped the join fails it. The same check is
+  available as an opt-in runtime assertion in the pipeline runner, off by default.
+
+---
+
+## 4. The two legs
+
+### 4.1 Lexical
+
+The statement is settled and built ([`storage.md`](storage.md) §6.1): one joined query over
+`chunks_fts`, `chunks` and `documents`, filters inline, `LIMIT` last, `ORDER BY bm25(...)`
+ascending. Retrieval adds three things and changes none of it.
+
+**It re-keys the score.** `DocStore.search_lexical` returns candidates carrying
+`scores["bm25"]`. The stage is named `lexical`, and `Candidate.scores` is keyed by *stage* name,
+so the stage records its own name. Fusion reads the names it was configured with (§5.2) and never
+a key some store happened to write — which is what lets the lexical leg be swapped for a
+learned-sparse one without touching the fusion stage.
+
+**It merges rather than replaces.** The lexical stage receives whatever the dense stage produced
+and returns the union: a chunk both legs found carries both scores, via `Candidate.scored_by`,
+which returns a copy. This is why the conformance suite forbids returning the input list — a
+merge is the natural place to accidentally mutate in place.
+
+**Zero results is an event, not a warning.** An empty match is legitimate: an all-stopword query,
+a query that tokenizes to nothing after `escape_match_query`. It is also what an FTS5 failure
+looks like. Either way the pipeline continues with one leg and the ranking it produces is
+well-formed, so the trace records `matched: 0` and the run is marked single-leg. §5.3 says what
+#15 must do with that.
+
+> **Prior art.** `retriever.ts` wraps the FTS5 call in `try/catch` and, on failure, logs
+> `console.warn('[retriever] FTS5 search failed, using dense-only')` and continues. The query
+> succeeds, the answer looks normal, and the pipeline that produced it is not the pipeline the
+> configuration describes. An evaluation harness cannot see the difference, which is the specific
+> reason a degraded leg has to be part of a run's recorded identity rather than a line on
+> someone's terminal.
+
+### 4.2 Dense, and the top-`k` trap on the other side
+
+The trap was found in the lexical leg and measured there: with `k = 5`, three matching live
+chunks, five in a soft-deleted document and five in another workspace, `MATCH`-then-hydrate
+returned **zero** live in-workspace results — a total loss of recall, silently, with a
+well-formed empty result set. The lexical leg fixed it by filtering inside the statement, before
+`LIMIT`.
+
+**The dense leg cannot do that, and the reason is structural rather than an oversight.** The
+Lance table holds `id`, `vector`, `document_id`, `kind`, `lang`, `position` and `chunk_json`. It
+holds no `deleted_at`, no `status`, and no `workspace_id`, and it holds none of them
+deliberately: liveness and tenancy live on `documents`, in the authoritative store, and copying
+them into a derived one creates a value that can disagree. So `VectorStore.search(v, k)` returns
+`k` rows of which an unknown number are invisible, and the join that removes them necessarily
+runs afterwards.
+
+The dense stage is therefore three operations that are one stage:
+
+```
+embed(query)                                  # cached by fingerprint + text
+  → VectorStore.search(v, k′, pushdown)       # k′ > k, see §4.3
+  → hydrating join through documents          # workspace, deleted_at, status
+  → k live candidates, scored by cosine
+```
+
+The join is the one from `storage.md` §6.2 — `WHERE c.id IN (…) AND d.deleted_at IS NULL AND
+d.status = 'indexed'`, plus `d.workspace_id`. It is inside the stage rather than beside it for
+the reason in §2.4: a boundary that configuration can omit is not a boundary.
+
+**The join also re-reads the chunk.** Lance returns `chunk_json`, which is a second copy of the
+chunk text carried so the store can satisfy the protocol on its own
+([`storage.md`](storage.md) §6.2). Retrieval uses the SQLite row, because SQLite is
+authoritative and a divergence between the two copies must resolve toward the truth rather than
+toward whichever one the query happened to read. The Lance copy is what makes
+`assert_vector_store_is_dimension_agnostic` pass with no relational store behind it; it is not
+what gets cited.
+
+### 4.3 The over-fetch factor is derived, not constant
+
+A constant multiplier is wrong in both directions: 2× is too little for a fifty-workspace
+deployment and 20× is wasteful for a personal one, and neither knows which it is in. The factor
+is computed from a quantity the system can measure about itself, on the same principle as the
+embed batch size in [`ingest.md`](ingest.md) §8.2.
+
+```
+live_fraction = chunks of live, indexed, in-scope documents
+                ─────────────────────────────────────────────
+                        rows in the vector table
+
+k′ = ceil(k / clamp(live_fraction, 0.05, 1.0))
+k′ = max(k′, overfetch_min · k)
+k′ = min(k′, overfetch_max · k, absolute_row_cap)
+```
+
+| Knob | Default | Why that value |
+|---|---|---|
+| `overfetch_min` | 3 | A healthy single-workspace index still loses rows to the soft-delete grace window, in-flight documents and unswept tombstones. 3× removes the retry from the common path, and over an exhaustive search below the ANN threshold it is not measurable |
+| `overfetch_max` | 20 | Past this the plan should have inverted to the pre-filter regime (§3.3); the cap is what makes that visible in the trace rather than absorbed as latency |
+| `absolute_row_cap` | 2000 | Every over-fetched row is a `chunk_json` decode. The cap bounds the work independently of the multiplier |
+
+**The denominator is the vector table's row count, not the chunk count.** Unswept tombstones are
+still rows in Lance and still consume top-`k` slots; a fraction computed against SQLite's chunk
+count would call an index clean while it was full of pending deletions.
+
+**It is computed once per generation, not per query.** Two counts — one SQLite aggregate, one
+`VectorStore.count()` — cached against the same generation counter that invalidates the L1 cache
+(§10.3), so ingest, re-embed, delete and restore all refresh it for free.
+
+**What the numbers mean in practice.** A personal deployment with one workspace and a few
+percent of soft-deleted content lands at the floor: `k′ = 3k`, and for the balanced profile that
+is 60 rows fetched to keep 20. A fifty-workspace team deployment where each workspace holds 2%
+of the corpus computes `live_fraction ≈ 0.02` and asks for 50×, hits `overfetch_max`, and the
+cap firing *is the signal* that this deployment should be running the pre-filter plan. The
+derived factor is not only a number; it is the detector for which regime you are in.
+
+### 4.4 When the over-fetch is insufficient
+
+Over-fetching does not guarantee `k` survivors and cannot be made to. What happens next is
+specified rather than left to whoever implements it:
+
+1. **Expand and retry**, at most twice, each time `k′ ← min(4·k′, absolute_row_cap)`. Four
+   because a factor that failed is usually wrong by more than a little, and two expansions
+   because a third would cost more than the query is worth.
+2. **Stop when the leg has seen everything.** If `k′` reaches the vector table's row count, every
+   candidate the store holds has been examined and there is nothing left to expand into.
+3. **Report, in the trace**: `requested`, `fetched`, `survived`, `expansions`, and one of
+   `satisfied | exhausted_corpus | exhausted_budget`.
+
+The three outcomes are not interchangeable and collapsing them is the actual bug:
+
+| Outcome | Means | Is it a defect? |
+|---|---|---|
+| `satisfied` | `survived >= k` | No |
+| `exhausted_corpus` | The store holds no more matching rows | No. The corpus genuinely has that much |
+| `exhausted_budget` | The caps stopped the search before the store did | **Yes.** The result is a floor, not an answer |
+
+**It never quietly returns fewer than `k` and lets the caller assume the corpus had no more.**
+That is the requirement `storage.md` §6.6 stated and this is the shape that satisfies it. An
+`exhausted_budget` leg is surfaced to the caller alongside the results, counts against
+confidence (§8.2), and — the part that matters for #15 — makes the run non-comparable to one that
+was satisfied, because the two ran different amounts of search.
+
+### 4.5 `min_score` belongs to the dense leg and to nothing else
+
+`ProfileConfig.min_score` ships as 0.5 / 0.3 / 0.15 with a `ge=0.0, le=1.0` bound and the
+description "floor below which a candidate drops". Where it is applied is the whole question,
+and two of the three plausible places are arithmetically broken.
+
+**Not on the fused score.** With two legs and `K = 60`, the maximum reachable RRF score is
+`2/61 ≈ 0.033`. A floor of 0.3 applied there discards every candidate, in every profile, and
+returns an empty result set that looks exactly like a corpus with nothing in it. This is not a
+tuning question; a fused score and a `[0,1]` floor are not on the same scale and never will be.
+
+**Not on BM25.** `bm25()` is corpus-relative and unbounded; it has no absolute scale for a floor
+to mean anything against. The best lexical match in a small corpus and a mediocre one in a large
+corpus can produce the same magnitude.
+
+**On the dense leg's cosine similarity, inside the dense stage, before fusion.** Vectors are
+L2-normalised and the metric is cosine, so the score really is a cosine similarity in `[-1, 1]`
+([`storage.md`](storage.md) §6.2) — the one number in the pipeline with an absolute meaning that
+survives leaving the run it was computed in. Negative similarities clamp to 0 before comparison.
+
+**And the shipped values are inherited, not measured.** 0.5 / 0.3 / 0.15 came across from prior
+art. BGE-M3's cosine similarities are not centred on zero for unrelated text, so a 0.5 floor on
+`fast` may be discarding relevant passages and a 0.15 floor on `precise` may be doing nothing at
+all. Calibrating them is a #15 measurement — sweep the floor against recall on the fixed query
+set — and until it runs, the honest statement is that the numbers are placeholders in the right
+place rather than tuned values.
+
+**Interaction with over-fetch:** the floor is applied *after* the hydrating join, so a discarded
+low-similarity candidate does not count as a survivor, and the retry in §4.4 can be triggered by
+the floor rather than by exclusions. That is correct — the leg's job is to produce `k` candidates
+worth fusing — and the trace distinguishes `dropped_by_join` from `dropped_by_min_score`, because
+one of those means the index is dirty and the other means the query is hard.
+
+---
+
+## 5. Fusion
+
+### 5.1 RRF takes ranks, and only ranks
+
+```
+rrf_score(d) = Σ over legs where d appears:  1 / (K + rank_leg(d))       K = 60, ranks 1-based
+```
+
+**The entire reason to use RRF is that it does not need the legs' scores to be comparable**, and
+they are not: cosine similarity is a bounded, absolute, model-defined quantity, and BM25 is an
+unbounded, corpus-relative one whose sign is negative and whose better values are more negative.
+There is no scaling that makes them commensurable across corpora. Discarding the magnitudes and
+keeping the order is not an approximation — it is the point.
+
+So: **no score weighting, no per-leg weighting, no normalisation step.** A leg contributes rank
+positions and nothing else.
+
+> **Prior art, and what happens when the magnitudes come back in.** `reciprocalRankFusion` takes
+> a `scoreWeighted` flag that multiplies `1/(k + rank + 1)` by the item's own score, and the
+> retriever passes `true`. What the lexical leg's score is at that point:
+> `searchFTS` returns `1 / (1 + Math.abs(row.rank))`, where `row.rank` is FTS5's `bm25()`. That
+> value is negative, and a *better* match is more negative — so taking its absolute value and
+> inverting maps the best lexical hit to the **smallest** score. The rows arrive in the right
+> order, `ORDER BY rank`, and are then multiplied by a weight that is largest for the worst of
+> them. The rank signal and the score weighting actively fight, the output is still a plausible
+> ranked list, and nothing raises. `storage.md` §6.1 already names taking `bm25()`'s absolute
+> value as a way to flatten or invert a ranking; this is that mistake compounded by
+> reintroducing the very magnitudes RRF exists to discard.
+
+### 5.2 Recovering each leg's rank ladder from a flat list
+
+Fusion receives `list[Candidate]`, not a list per leg. The ladders are still there:
+
+```
+for each configured leg name L:
+    ladder = [c for c in candidates if L in c.scores]
+    ladder.sort(key=lambda c: c.scores[L], reverse=True)
+    rank_L(c) = index in ladder, 1-based
+```
+
+This is exact, not approximate, because each leg's score is monotone within that leg: cosine
+descending is the dense order, and `search_lexical` already negates `bm25()` so higher is better
+there too. A candidate absent from a leg has no key for it and contributes nothing from it.
+
+**The legs are configured, not hardcoded.** `RRFStage(name="rrf", legs=("dense", "lexical"),
+k=60)`. Three consequences, and the second is the one that matters:
+
+- Replacing the lexical leg with a learned-sparse one (§13) is a configuration edit.
+- **A named leg that is not present earlier in the declared pipeline is a startup refusal.** A
+  typo would otherwise turn two-leg fusion into one-leg fusion silently, which is the §4.1
+  failure with a different cause and the same signature. Checked when the container assembles the
+  pipeline, not on the first query.
+- Three legs is expressible without a code change, which is what makes "is three legs better
+  than two" a #15 question rather than a rewrite.
+
+### 5.3 What RRF does when a leg comes back short
+
+**A missing candidate contributes zero from that leg. It is not imputed a worst rank and not
+penalised.** The consequences are worth being explicit about, because they look like bugs and are
+not:
+
+- A candidate ranked 1st in one leg and absent from the other scores `1/61 ≈ 0.0164`.
+- A candidate ranked 3rd and 4th in *both* scores `1/63 + 1/64 ≈ 0.0315`, and outranks it.
+
+That is RRF working as designed: **cross-leg agreement beats a single strong opinion.** It is
+also why a floor on the fused score is meaningless (§4.5) and why a reranker after fusion earns
+its place (§6).
+
+**A short leg shortens its ladder, and that needs no correction.** If lexical returns 6
+candidates and dense returns 20, the lexical ladder has 6 rungs. Nothing should pad it to 20 with
+imputed ranks; the fused ordering for the tail is then determined by the dense leg alone, which is
+the correct answer to "only one leg had an opinion about these".
+
+**A leg returning zero silently becomes a single-leg pipeline.** The output is well-formed and
+correctly ordered — by one leg. The rule:
+
+> A degraded run is part of that run's recorded identity. #15 must refuse to compare a run whose
+> trace shows a leg returned zero against one where both legs ran, and the harness fails the
+> comparison rather than averaging over it.
+
+This is the difference between a metric that can move because the corpus is hard and a metric that
+moved because FTS5 threw. Both are legitimate outcomes of a query and only one is a legitimate
+input to a measurement.
+
+### 5.4 `K = 60`, and what `K` is actually doing
+
+60 is the value from the original RRF paper and the near-universal default, and it stays — but
+it is configuration and it is recorded in the trace, because changing it changes every number
+#15 has ever written down.
+
+What is worth understanding before anyone tunes it: **RRF is a consensus operator, not a ranking
+operator.** With `K = 60` and 20 candidates per leg, a rank-20 candidate scores `61/80 ≈ 76%` of
+what a rank-1 candidate scores from the same leg. Within-leg ordering is compressed almost flat
+on purpose, so that appearing in both legs dominates appearing high in one. At `candidates = 50`
+(`precise`) the bottom of the ladder is still at `61/110 ≈ 55%` of the top — flatter still,
+because the ladder is longer.
+
+Two things follow. Lowering `K` sharpens within-leg ranking and weakens the consensus effect,
+which is the *opposite* of why RRF was chosen. And the fused list is a good candidate set and a
+mediocre final ordering, which is exactly the job description for a cross-encoder.
+
+---
+
+## 6. Rerank
+
+### 6.1 A cross-encoder, not a language model asked for a number
+
+`PLAN.md` §8 says `sentence-transformers CrossEncoder`, and the distinction is not pedantic. A
+cross-encoder encodes `(query, passage)` jointly and emits one relevance logit from a model
+trained for exactly that. It is deterministic, it is cheap relative to generation, and its output
+is a scalar on a fixed scale for a fixed model.
+
+> **Prior art.** `cross-encoder.ts` is not one. It prompts the *generation* model with "Rate how
+> well the passage answers the query. Respond with a single integer from 0 to 10", one call per
+> candidate, `maxTokens: 8`, and parses the first integer out of the reply with a regex —
+> returning **0** when nothing parses, which is indistinguishable from a genuine "irrelevant".
+> The reranked head is then concatenated with an unreranked tail whose scores are still RRF
+> values around 0.016 while the head's are 0.0–1.0, so one list carries two scales. And on any
+> exception the function returns the input unchanged, so a failed rerank is a silent no-op that
+> the profile still reports as reranked. Four separate ways for the ranking to be wrong without
+> anything raising, in 62 lines.
+
+Three rules follow directly:
+
+- **The reranker's failure is the query's failure.** It raises; it does not return the input. A
+  profile that says `rerank: true` and produced an unreranked list has lied to #15 about which
+  pipeline ran.
+- **The reranker truncates to what it scored.** It rescores the head — `profile.candidates`
+  entries — and returns only those. No mixed-scale tail. The container refuses a profile where
+  `final_top_k > candidates`, since that is the only configuration in which the tail would have
+  been needed.
+- **`Reranker.model_id` is recorded on every run.** The protocol already requires it, for exactly
+  this: a recorded result that cannot name its reranker cannot be reproduced.
+
+### 6.2 The model
+
+**`BAAI/bge-reranker-v2-m3`**, configurable, lazily loaded, never loaded under `fast`.
+
+It is the family pair for the embedder settled in `embeddings.md` §1, and the reason to pick a
+matched pair here is not brand tidiness: bge-m3 was chosen substantially because it is
+multilingual in one space, which closed [#31](https://github.com/mgd43b/manicule/issues/31). A
+monolingual English reranker placed after it would take a correctly-retrieved non-English passage
+and rank it down — undoing the property the embedder was chosen for, at the last stage before the
+answer, where it is least visible.
+
+Honest costs:
+
+- It is an XLM-RoBERTa-large-sized model, meaningfully larger than the small English rerankers it
+  would be compared against. On a corpus that is entirely English, a smaller monolingual reranker
+  is very likely a better trade, and the configuration knob exists so an operator can make that
+  choice — but the *default* has to be the one that does not silently break multilingual
+  retrieval.
+- `sentence-transformers` brings torch, which is why it belongs behind its own extra rather than
+  in the storage or embeddings stack. `fast` never loads it.
+- Its scores are unbounded logits, model-specific, and comparable only within one model's
+  rankings. Never mix them with cosine similarities, and never compare a confidence computed
+  under one reranker to one computed under another (§8.2).
+
+### 6.3 Cost is linear in `candidates`, which is what the profiles are actually buying
+
+The reranker scores `profile.candidates` pairs: 20 on `balanced`, 50 on `precise`, none on
+`fast`. Cost is linear in that count and dominates the rest of the pipeline by a wide margin —
+the two legs are one forward pass over a short query plus two indexed lookups, while this is
+`candidates` forward passes over full-length passages. So the three profiles are not three
+settings; they are "no second model", "a second model over 20 passages", and "a second model over
+50". #15 records the constant; this document records which term dominates.
+
+---
+
+## 7. Context assembly
+
+### 7.1 Not a stage, and what it emits
+
+Assembly consumes the pipeline's output and produces `Context`: the passages, their token count,
+and whether anything was dropped. `contracts.md` §6 lists "whether `Context` assembly is a
+`RetrievalStage`" as open; this document closes it as **no**, on the grounds the merged `Context`
+docstring already gives — it emits a different type, and keeping the types distinct is exactly
+what makes the stage list freely reorderable while this step is not.
+
+### 7.2 Two token counters, and using the wrong one is a category error
+
+There are two token budgets in manicule and they are measured with different tokenizers, for
+different models, to protect against different failures.
+
+| Budget | Tokenizer | Protects against |
+|---|---|---|
+| Chunk size, 512 | The **embedder's**, on the exact string it will see ([`parsing.md`](parsing.md) §1.2) | Silent truncation inside the embedder, producing a vector claiming text it never saw |
+| Context window | The **generator's** | An assembled context larger than the window, truncated by the server |
+
+**`Chunk.token_count` is the first of those, and using it for the second is the category error
+this section exists to prevent.** It is measured in XLM-RoBERTa SentencePiece units for a model
+that is not generating anything. It is sitting right there on every candidate, it is a plausible
+number, and it is wrong for this purpose by an unknown factor.
+
+**`tiktoken` is a stand-in for the second, and it is named as one.** `PLAN.md` §16 and #6's
+comment both settle it, and the reason to keep it is that it is a real BPE implementation rather
+than a character heuristic. But the generator is Ollama-hosted (`PLAN.md` §7), running Llama or
+Qwen or Mistral vocabularies, none of which are tiktoken's. So:
+
+- Use `tiktoken.get_encoding("o200k_base")`, **not** `encoding_for_model("gpt-4o")`. Naming a
+  model that is not being used makes the estimate look authoritative. The encoding name goes in
+  the trace.
+- Apply a per-model safety factor, in the direction that matters. Undercounting overflows the
+  window and gets the context truncated by the server, which is the silent failure; overcounting
+  wastes budget, which costs a passage. Same reasoning and the same direction as
+  `PROVISIONAL_SAFETY_FACTOR` in `manicule.chunking.tokens`.
+- **Never sample and extrapolate.** [`parsing.md`](parsing.md) §1.2 already rejects it for the
+  chunk budget; it is worse here, because the fitter's entire job is not to overflow and
+  extrapolation turns a bounded error into an unbounded one on precisely the longest inputs.
+- **Then stop guessing.** Ollama's generate response carries `prompt_eval_count` — the true token
+  count, from the model that counts. The fitter's estimate is compared against it after the first
+  call and the drift is recorded per model; drift beyond tolerance is an error worth surfacing,
+  not a rounding difference. Measuring once beats a safety factor forever, and #7 owns the call
+  that makes it available.
+- Counts are cached by `chunk.id`. Chunk ids are content-derived, so the cache is exact and can
+  never go stale.
+
+### 7.3 Whole passages only — a truncated citation is a broken citation
+
+**Assembly includes a candidate entirely or not at all.** It never trims a passage to fit.
+
+This is not a style preference. `contracts.md` §1 puts a round-trip obligation on every anchor:
+resolving it returns the text the chunk claims, and it is a test obligation on every parser. A
+`PageAnchor`'s rects, a `CellAnchor`'s range and a `LineAnchor`'s span all describe the *whole*
+chunk. Trim the text and the anchor now points at more than the passage says, which is the exact
+class of defect the `Anchor` type was designed to make impossible — and PR #32 tightened the
+middleware contract to forbid rewriting cited text for the same reason. Assembly is downstream of
+both and does not get an exemption.
+
+> **Prior art.** `fitToContextWindow` truncates the first non-fitting chunk to the remaining
+> space, walks back to a sentence boundary, appends `'...'`, and stops. The cited text then
+> differs from the source, and the citation points at a span the reader will not find. The
+> character budget is estimated from tokens via a CJK ratio and a `charsPerToken` of 4 or 1.5,
+> so how much gets cut is itself an approximation.
+
+**Skip and continue, do not stop.** A non-fitting candidate is skipped and the next one is tried.
+Chunking keeps tables and code blocks whole ([`contracts.md`](contracts.md) §2), so one large
+passage in the middle of the ranking is normal, and stopping there would discard every good
+passage behind it. Order is never changed — only membership. `Context.truncated` is set, and the
+trace lists which candidates were dropped and how large they were.
+
+**The budget is a rail, not the selection mechanism, and saying so is more useful than implying
+otherwise.** A passage is bounded by the 512-token chunk budget, and the 64 tokens reserved for
+the breadcrumb come out of that budget rather than adding to it — and the breadcrumb never
+appears in `text` anyway ([`parsing.md`](parsing.md) §5.1, §5.2), so what reaches the context is
+smaller still. `fast` allows 3 passages against 8192 context tokens; `precise` allows 10 against
+32768. Selection is done by `final_top_k` in every shipped profile and the fitter never binds. It
+exists for the configurations that do not ship — a raised chunk budget, a raised `final_top_k`, a
+long history — and it asserts rather than handles the case where even the top-ranked passage does
+not fit, because the shipped budgets make that arithmetically impossible.
+
+One caveat that keeps the rail honest: those bounds are in the *embedder's* tokenizer and the
+budget is in the *generator's* (§7.2). The margin is wide enough that no plausible ratio between
+two vocabularies closes it, which is why this is a rail and not a calculation.
+
+### 7.4 The window cross-check is a startup refusal
+
+`context_tokens` and `history_tokens` are budgets for *manicule's* content. The generator's
+context window is a property of a model configured somewhere else. Nothing currently compares
+them, and the `balanced` profile's 16384 + 1024 against an 8k-window local model is an assembled
+context twice the size of the window on every query.
+
+**So it is checked once, at startup, when the generator is bound:**
+
+```
+context_tokens + history_tokens + system_prompt_tokens + generation_reserve
+        must fit the configured generator's context window
+```
+
+A profile that does not fit is a refusal with both numbers named, not a runtime truncation. This
+is the same discipline as [`ingest.md`](ingest.md) §7's budget/context cross-check, run in the
+same place and for the same reason: a limit that can only be discovered by exceeding it gets
+discovered in production. #7 owns the generator and therefore owns the enforcement point; this
+document owns the requirement.
+
+---
+
+## 8. Confidence
+
+### 8.1 What it is not
+
+**It is not a probability that the answer is correct.** Nothing in this pipeline is calibrated
+against anything, and presenting an uncalibrated score as a probability is the kind of claim that
+gets believed.
+
+**It is not about the answer at all.** It is computed before generation, from the retrieval. It
+says how much supporting evidence was found and how strongly the two independent methods of
+finding it agreed. An answer can be wrong with high confidence — the evidence was there and the
+model misread it — and that is not a bug in this number.
+
+**It is not comparable across configurations.** A confidence computed under `precise` with one
+reranker and one under `fast` with none are different measurements. The value therefore travels
+with the pipeline identity that produced it, and #15 never compares two of them across
+configurations.
+
+The honest one-line description, and the one the UI should use: **how well-supported this answer
+is by the corpus.**
+
+### 8.2 What goes in, and what cannot
+
+Only quantities with a defined scale are admissible.
+
+| Component | Weight | Source |
+|---|---|---|
+| Similarity | 0.40 | Mean of `scores["dense"]` over the passages that reached the context, negatives clamped to 0 |
+| Cross-leg agreement | 0.15 | Fraction of context passages carrying **both** leg scores |
+| Support breadth | 0.15 | `min(distinct document count / 3, 1.0)` |
+| Reranker | 0.30 | Mean `sigmoid(logit)` over the context passages — **present only when a reranker ran** |
+
+What is excluded, and why:
+
+- **The fused RRF score.** A rank artefact bounded by `2/61`; it has no absolute meaning (§4.5).
+- **BM25.** Corpus-relative and unbounded.
+- **Keyword coverage.** Replaced by cross-leg agreement, which is the same idea done properly.
+  Substring matching of query keywords against passage text does no stemming and no IDF
+  weighting, so a query for `authenticate` scores zero coverage against a passage containing
+  `authentication` — the precise failure `storage.md` §6.1 records as the reason the FTS5
+  tokenizer is `porter`. The lexical leg already solved this; the confidence score should ask the
+  lexical leg rather than re-implement a worse version of it.
+
+**Two states that are not "low".** No retrieval attempted (the router answered directly, §9)
+yields confidence **absent** — not 0.0. Retrieval attempted and nothing found yields the `none`
+band with a reason. The distinction is the one `contracts.md` §1 makes for `Unlocated`: "we did
+not look" and "we looked and there is nothing" are different claims, and a single zero conflates
+them.
+
+**An `exhausted_budget` leg (§4.4) caps confidence at `medium`,** because the retrieval is known
+to be a floor rather than a result.
+
+### 8.3 No fallback term, and why `fast` cannot report high confidence
+
+When no reranker ran, the reranker term **contributes zero and the remaining weights are not
+renormalised.** The arithmetic maximum under `fast` is therefore 0.70.
+
+> **Prior art, and the bug this rule exists to avoid.** `calculateConfidence` computes
+> `avgRerank = rerankScores.length > 0 ? average(rerankScores) : avgRetrieval` — when no reranker
+> ran, the retrieval average is substituted into the reranker's slot. Retrieval then counts for
+> `0.4 + 0.3 = 0.7` instead of 0.4, and **turning the reranker off raises the reported
+> confidence** for identical retrieval. The weaker pipeline claims more. Renormalising the
+> remaining weights would have the same effect by a more respectable route.
+
+Bands, applied to that single absolute scale:
+
+| Band | Score | Reachable under |
+|---|---|---|
+| `high` | ≥ 0.75 | `balanced`, `precise` |
+| `medium` | ≥ 0.45 | all |
+| `low` | ≥ 0.20 | all |
+| `none` | < 0.20, or nothing retrieved | all |
+
+**`fast` topping out at `medium` is the intended behaviour, not an artefact.** `fast` is the
+profile that skips the verification step; it should not be able to claim it verified. This is
+also the most concrete difference between the profiles that a user ever sees, which makes the
+cost of choosing `fast` visible at the moment it matters.
+
+**The scalar is never reported alone.** `Confidence` carries the band, the components that
+produced it, and the pipeline identity. A number that cannot say why it is 0.62 is a number
+nobody can act on, and one that cannot say what produced it is one #15 cannot compare.
+
+---
+
+## 9. The query router
+
+### 9.1 Deterministic, and only the routes that exist
+
+A pure function over the query text, no model call, running before the cache and before any
+store is touched. `PLAN.md` §16 keeps it because trivial input should not consume an LLM call,
+and that is reason enough.
+
+```
+Route = RETRIEVE | GREETING | UTILITY(kind)
+```
+
+**A route nothing returns is not a route.** The prior art declares four (`rag`, `direct`,
+`web_only`, `rag_web`) and `routeQuery` can only ever return two of them; the other two are a
+type that documents a feature the function does not have. Each `UTILITY` kind here names a
+handler that exists — document count, document list, index status — and the container fails to
+start if a declared kind has none.
+
+### 9.2 Full match, never prefix, and tuned for precision
+
+**A greeting route requires the entire input to be a greeting**, modulo surrounding punctuation
+and whitespace, under a short length bound. Not a prefix match.
+
+The prefix version is not a small imprecision. `/^(hi|hello|hey|howdy|yo|sup|greetings)\b/i`
+routes **"yo-yo manufacturing tolerances"** away from the corpus, because `-` is a non-word
+character and the boundary matches. `/^(thanks|thank\s+you)\b/i` routes **"thanks for the memory
+dump — what does it say?"** to a canned reply. Both are ordinary queries against a technical
+corpus, and both get an answer that never touched the index. Anchoring at both ends deletes the
+entire class.
+
+The governing rule, which also settles how much effort the pattern list deserves:
+
+> **The router is tuned for precision, not recall.** A missed greeting costs one retrieval, which
+> is harmless. A false greeting costs a wrong answer to a real question, which is not. When in
+> doubt, retrieve.
+
+That rule is also the answer to multilingualism. The corpus is multilingual by design
+([`embeddings.md`](embeddings.md) §1.2) and any greeting list will be incomplete; the pattern list
+is configuration, ships small, and being incomplete costs only latency.
+
+### 9.3 A direct answer has no citations, and says so
+
+The router is a retrieval bypass, which makes it the one path where an answer legitimately has no
+sources. It must therefore be visibly different rather than quietly identical:
+
+- The response carries **no citations**, and states that the corpus was not consulted.
+- Confidence is **absent**, not 1.0 and not 0.0 (§8.2).
+- Directly-routed queries are **not cached** (§10). They are already cheap, and the utility ones
+  answer with live counts that a cache would staleness-bug for no gain.
+- The route taken is in the trace, so #15 can see that a query in its set never reached retrieval
+  — which would otherwise show up as a mysterious zero.
+
+---
+
+## 10. The L1 query-result cache
+
+`PLAN.md` §16 has three caches. **This document owns L1 only.** L2, the embedding cache, is
+settled in [`embeddings.md`](embeddings.md) §8, keyed on the canonical fingerprint and the
+post-middleware `embed_text`. L3 is a web-search cache and belongs to whichever ticket adds a
+web-search connector; it is not a retrieval-pipeline cache.
+
+### 10.1 It caches decisions, not content
+
+The cached value is the ranked list of **chunk ids with their per-stage scores** — the decision
+the pipeline reached — and never the chunk text. On a hit, the ids are re-hydrated through the
+same join the dense leg uses (§4.2).
+
+This is not a memory optimisation. It is what makes the cache incapable of the failure a
+content-caching version invites:
+
+- **A cache hit cannot serve a soft-deleted, unindexed or foreign-workspace chunk**, because it
+  holds no chunks. The boundary is re-enforced on every hit rather than snapshotted at the moment
+  of the miss.
+- Re-hydration costs one indexed `IN` query against SQLite, against a full pipeline that includes
+  an embedding forward pass and possibly a cross-encoder.
+
+**If hydration drops anything, the entry is stale: evict it and run the pipeline.** Returning a
+shortened list would be correct but misleading — the ranking was computed over a candidate set
+that no longer exists, and the replacement for the dropped candidate was never considered.
+
+### 10.2 The key
+
+A hash over the canonical form of, in order:
+
+```
+generation counter
+workspace_ids (sorted)          the rest of the Filter (canonical JSON)
+profile name + overrides        pipeline declaration (stage names, in order)
+reranker model_id or null       RRF K
+query text (trimmed, otherwise exact)
+```
+
+Notes on three of those:
+
+- **The whole `Filter`, not just the workspace.** Two filters produce two different rankings; a
+  key that omits one is a cache that answers a different question.
+- **The pipeline declaration and the reranker id.** Comparing two pipelines is #15's entire
+  method, and a cache that cannot tell them apart would serve pipeline A's ranking as pipeline
+  B's result. #15 also runs with the cache **disabled**, which is a configuration flag rather
+  than a code path.
+- **Conversation history is *not* in the key.** Retrieval runs on the query text; nothing in this
+  pipeline reads history. Including it would guarantee a miss on every turn of a conversation —
+  the one place a user actually repeats themselves. If a history-conditioned query rewrite ever
+  ships (§13), history joins the key in the same commit.
+
+> **Prior art.** `buildCacheKey(query, profile, conversationHistory)` includes the history and
+> omits the workspace, the filter and the index generation. It caches the full `QueryResult`,
+> answer text and source content included, which is why the history is in there: it is an *answer*
+> cache wearing a retrieval cache's name. manicule's L1 caches retrieval only. Caching a generated
+> answer is a different feature with different invalidation, and it belongs to
+> [#7](https://github.com/mgd43b/manicule/issues/7) if it belongs anywhere.
+
+### 10.3 Invalidation is a generation counter, and re-embed is why
+
+An in-memory counter, bumped by any commit that changes what a query could return: document
+upsert, `replace_chunks`, soft delete, hard delete, reconcile-driven deletion, and the
+`vector_table` swap at the end of `reindex --re-embed`. The counter is in the key, so a bump
+invalidates everything at once with no eviction pass and no per-entry bookkeeping.
+
+**An in-process counter is sufficient, and the reason is a property this project already
+enforces:** exactly one instance per data directory, held by an exclusive lock for the process
+lifetime ([`ingest.md`](ingest.md) §6.5). The writer and the reader are the same process, so
+there is no cross-process invalidation problem to solve. A design that assumed otherwise would be
+solving a problem the lock file already removed.
+
+**Why the counter and not the embedding fingerprint.** The fingerprint looks like the natural key
+and is not sufficient. A mismatch causes the store to refuse to open for retrieval as well as
+ingest ([`storage.md`](storage.md) §6.3), so an ordinary model change cannot happen under a
+running process — but `reindex --re-embed` builds the new table alongside the old one and moves
+`index_state.vector_table` in a single transaction *without restarting*
+([`storage.md`](storage.md) §6.5). That is a fingerprint change under a live cache, and the
+generation counter covers it because the swap bumps it. The same counter also refreshes the
+cached `live_fraction` behind the over-fetch factor (§4.3).
+
+A TTL sits underneath as a bound on staleness from anything the counter was not taught about —
+five minutes, configuration, and belt-and-braces rather than the mechanism.
+
+### 10.4 What a hit may not do
+
+A cache hit is not a retrieval run. Its trace records `cached: true` and carries the identity of
+the run that populated it, and **#15 never counts a hit as a measurement**. Latency measured on a
+hit is the cache's latency, and a quality metric computed from one is a metric computed twice
+from the same sample.
+
+---
+
+## 11. Per-stage latency and the retrieval trace
+
+### 11.1 What is recorded
+
+One `RetrievalTrace` per query, assembled by the runner:
+
+| Scope | Fields |
+|---|---|
+| Run | route, profile + effective overrides, pipeline declaration, RRF `K`, reranker `model_id`, embed fingerprint, cached, total wall time |
+| Every stage | name, wall time, candidates in, candidates out |
+| `dense` | `k`, derived `k′`, `live_fraction`, fetched, dropped by join, dropped by `min_score`, survived, expansions, outcome (§4.4), `resolved_id_count`, regime (pre-filter or post-filter) |
+| `lexical` | escaped match string, rows matched |
+| `rrf` | legs fused, per-leg candidate counts, overlap count, degraded flag |
+| `rerank` | pairs scored, model id |
+| Assembly | tokens used, tokens available, tokenizer identity, passages dropped and their sizes |
+
+Per-stage latency is what makes #15's attribution possible at all: a quality difference between
+two runs is attributable to a stage only if you can see which stage's cost and output changed.
+The `dense` row is longer than the others because §3.3 and §4.3 both said the same thing — the
+thresholds that are currently guesses get set from these fields once they have run against a real
+corpus.
+
+### 11.2 A trace is part of a run's identity
+
+The trace exists so that two recorded results can be compared honestly, which means it has to
+carry the things that make two runs *not* comparable:
+
+- A degraded leg (§5.3).
+- An `exhausted_budget` dense leg (§4.4).
+- A cache hit (§10.4).
+- A different pipeline declaration, `K`, reranker, profile, or embedding fingerprint.
+
+#15 refuses the comparison when any of these differ, rather than averaging across them. That
+refusal is the mechanism behind "no retrieval feature without a measured improvement": without it,
+the rule is a slogan, because any two numbers can be subtracted.
+
+**Where it lives.** The trace is a return value, surfaced through `--json` and the API, and
+consumed by #15's harness, which writes its own versioned result artefacts. It does **not** go
+into `query_logs` — that table's `response_time_ms` is whole-query product telemetry, and a
+per-stage trace there would be a schema change in service of a consumer that keeps its results in
+the repository anyway. If operations later wants per-stage latency persisted
+([#14](https://github.com/mgd43b/manicule/issues/14)), it is one JSON column and a rung-0
+migration.
+
+---
+
+## 12. The three profiles, concretely
+
+Named settings are only useful if the names mean something specific. What actually differs:
+
+| | `fast` | `balanced` | `precise` |
+|---|---|---|---|
+| Candidates per leg | 10 | 20 | 50 |
+| Dense rows fetched (floor, §4.3) | 30 | 60 | 150 |
+| `min_score` on the dense leg | 0.5 | 0.3 | 0.15 |
+| Fused set, before rerank | ≤ 20 | ≤ 40 | ≤ 100 |
+| Cross-encoder | **not loaded** | 20 pairs | 50 pairs |
+| Passages into context | 3 | 5 | 10 |
+| Context / history tokens | 8192 / 512 | 16384 / 1024 | 32768 / 2048 |
+| Model loads on the query path | 1 (embedder) | 2 | 2 |
+| Confidence ceiling (§8.3) | **0.70 — cannot reach `high`** | 1.0 | 1.0 |
+
+The differences that matter are the last three rows. `fast` is the profile where the second model
+is never loaded — that is the latency difference, and everything else is a rounding error beside
+it. `precise` is `balanced` with 2.5× the reranker cost and a much lower similarity floor, which
+is a bet that the cross-encoder can rescue passages the dense leg nearly discarded. Whether that
+bet pays is a #15 measurement and one of the first worth running, because it is the cheapest
+change to make if it does not.
+
+Every knob is overridable per field (`ProfileConfig` + `rag.overrides`), and overrides start from
+the named profile so changing one cannot silently move another.
+
+---
+
+## 13. Deliberately deferred, and the measurement that would un-defer each
+
+Ticket #6 lists nine features carried by the prior art, plus the learned-sparse leg recorded
+against #6 separately. **None of them is known to help**, because the harness that would know
+scores at random chance — its test embedder is `sin(sum of character codes)`. That is a statement
+about the evidence, not about the features.
+
+The rule is `PLAN.md` §8's: each ships with a measured improvement on #15's fixed query set, or
+does not ship. A rule is only enforceable if it says what would count, so:
+
+| Feature | What would have to be measured, on #15's fixed query set |
+|---|---|
+| **HyDE** | nDCG@10 of the fused list, on and off, restricted to the regime it claims — queries where the dense leg's top-1 cosine is below a floor. Report added p50 latency in the same table: it costs a generation call per query, so a small win that doubles latency does not ship |
+| **Multi-query expansion** | recall@50 of the union of legs, N=3 against N=1 — **at equal total candidate budget**. Compared against simply raising `candidates` by 3×, or it is buying recall with fetch rather than with expansion |
+| **Query decomposition** | Only meaningful on multi-hop questions, and #15's query set has no labelled multi-hop subset. Building that subset is the first deliverable; then nDCG@10 on it alone, since averaging it into the full set will hide the effect either way |
+| **Intent classification** | Its only proposed consumer is per-intent context allocation, which does not change retrieval at all — the same passages are retrieved and the window is divided differently. Needs an *answer*-quality metric, which #15 does not have yet. Nothing to measure it with today, and that is the finding |
+| **Cross-lingual expansion** | The null hypothesis is that it adds nothing, because bge-m3 is already one multilingual space ([`embeddings.md`](embeddings.md) §1.2). recall@20 on query-in-A / gold-passage-in-B pairs. A likely outcome is that this measurement retires the feature rather than admitting it |
+| **Parent-document retrieval** | nDCG@`final_top_k` with parents substituted for chunks, **plus a citation check**: the anchor must still resolve to the quoted span. A parent that widens the citation is a regression at any nDCG, because `contracts.md` §1 does not trade accuracy of location for relevance |
+| **Propositions** | Changes what is indexed and therefore the `ChunkFingerprint`, so adopting it costs a full re-chunk and re-embed (rungs 3 and 4 of the ladder). recall@10 has to improve by enough to justify that, and it changes what a citation points at — same anchor obligation as above |
+| **Prompt compression** | Not a retrieval feature: it changes what the generator sees. Answer quality at fixed context tokens, and a hard check that no cited span was rewritten — PR #32 forbids middleware rewriting cited text and compression is the same act at the other end of the pipeline |
+| **Hallucination guard** | Precision *and* recall of the guard itself against a labelled set of grounded and ungrounded answers. Recall alone is the trap: a guard that suppresses correct answers is worse than no guard, and only precision shows it |
+| **BGE-M3 learned-sparse leg** | Recorded against #6 already. nDCG@10 with learned-sparse replacing the FTS5 BM25 leg — **on a multilingual corpus first**, where Porter stemming is English-only and the current lexical leg is at its weakest. Also a runtime change: neither installed backend exposes the head ([`embeddings.md`](embeddings.md) §1.4) |
+
+Two structural notes. Every one of these is a stage or a leg, so measuring it is a configuration
+change and a run — which is the property §2.4 exists to protect. And the fusion stage taking its
+leg names from configuration (§5.2) is what makes the last row a two-line config edit rather than
+a rewrite of the fusion code.
+
+---
+
+## Appendix A: decisions this document made
+
+Calls made in the absence of a stated position.
+
+| Decision | Where |
+|---|---|
+| `RetrievalStage` is **not** widened; the three #1 rejections re-argued against a working design | §2.3 |
+| Per-stage diagnostics travel by `contextvars` trace frame, with a no-frame conformance run | §2.3 |
+| Stages run sequentially; concurrency deliberately declined for measurement clarity | §2.2 |
+| Stage names unique within a pipeline; the container refuses duplicates | §2.2 |
+| `Filter` settled: `workspace_ids` required/non-empty, `sources` and `langs` set-valued, `extra` removed | §3.1 |
+| Cross-workspace search is N scoped queries merged on cosine, never one unscoped query, never RRF | §3.2 |
+| The pre-filter/post-filter split is a rule with recorded inputs, not a constant | §3.3 |
+| The hydrating join lives *inside* the dense stage, so scope is a per-stage invariant | §2.4, §4.2 |
+| Over-fetch is derived from a measured `live_fraction`, with floor, cap and row cap | §4.3 |
+| Three distinct shortfall outcomes; `exhausted_budget` is a defect and the others are not | §4.4 |
+| `min_score` applies to dense cosine only, and the shipped values are placeholders | §4.5 |
+| RRF is rank-only: no score weighting, no leg weighting, no normalisation | §5.1 |
+| Per-leg ranks are recovered from `Candidate.scores`; the fusion stage is configured with leg names | §5.2 |
+| A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |
+| The reranker raises rather than passing through, and truncates to what it scored | §6.1 |
+| `bge-reranker-v2-m3` by default, because a monolingual reranker would undo the embedder's choice | §6.2 |
+| Context assembly is not a `RetrievalStage` — closes the second open item in `contracts.md` §6 | §2.4, §7.1 |
+| Two token counters, named; `Chunk.token_count` must never be used for context fitting | §7.2 |
+| `tiktoken` by encoding name, no sampling, safety factor, then calibrated against `prompt_eval_count` | §7.2 |
+| Assembly includes whole passages or none; skip-and-continue, never truncate | §7.3 |
+| Profile-versus-generator window is a startup refusal | §7.4 |
+| Confidence is a retrieval-support score with named components, no fallback term | §8.2, §8.3 |
+| `fast` cannot reach `high` confidence, by arithmetic and on purpose | §8.3 |
+| Router: full-match only, tuned for precision, no citations and absent confidence on a direct route | §9 |
+| L1 caches ranked ids, not content, so a hit cannot leak a deleted or foreign chunk | §10.1 |
+| L1 key excludes conversation history and includes the generation counter and pipeline identity | §10.2 |
+| Invalidation by in-process generation counter, justified by the one-instance lock; re-embed is the case that forces it | §10.3 |
+| The trace is a return value, not a `query_logs` column | §11.2 |
+| `Query.limit` bounds what is returned to a caller; `final_top_k` bounds what enters the context | Appendix B |
+
+## Appendix B: what the merged documents did not cover
+
+Places this design had to decide something no merged document had a position on. Each is called
+out here because a reader of the other documents will not have seen it coming.
+
+- **`Query.limit` versus `ProfileConfig.final_top_k`.** Both shipped, both mean "how many
+  candidates come out", and neither document reconciles them. Settled as two different consumers:
+  `limit` is what a `search` call returns to a human, `final_top_k` is what an `ask` call puts in
+  the model's context. Retrieval depth is `max(limit, final_top_k)`. Neither type changes.
+- **Where `min_score` is applied.** `ProfileConfig` defines the value and nothing said what it is
+  a floor *on*. Two of the three candidate answers return an empty result set for every query
+  (§4.5).
+- **The profile/context-window cross-check.** Nothing compared manicule's token budgets against
+  the generator's window (§7.4).
+- **`contracts.md` §6's second open item**, whether `Context` assembly is a stage. Settled here
+  as "not a stage" (§7.1). Both of §6's remaining questions were retrieval questions, so §6 is
+  now a record of what settled them rather than a list of what is open.
+- **`storage.md` §6.6 is superseded, not contradicted.** It proposed a `Filter` shape and said
+  plainly that it was not closing the question; §3 closes it with a different shape and gives the
+  reasoning for each difference. The section keeps its value as the record of what was considered
+  before storage was built, which is the same relationship `embeddings.md` §3.1 has to its own
+  earlier draft.
+
+## Appendix C: filed, not deferred
+
+| Ticket | What | Why not here |
+|---|---|---|
+| [#36](https://github.com/mgd43b/manicule/issues/36) | **Reshape `Filter` to the settled form** (§3.1, §3.4), and add `assert_pipeline_enforces_scope` | It changes `manicule.core.retrieval` and both stores — merged code owned by #1 and #2 — while two implementation tickets are in flight. It is also worth landing as its own reviewable change, because it moves a security boundary |
+
+## Appendix D: checklist against ticket #6
+
+- **Dense + BM25 → RRF → cross-encoder → context assembly** — §4, §5, §6, §7, with the top-`k`
+  trap closed on the dense side (§4.2–§4.4).
+- **Each stage independently switchable, so #15 can attribute differences** — §2.4: pipelines are
+  declared in configuration, the fusion stage takes its legs by name, and the three non-switchable
+  steps are named with the reason each is not a quality feature.
+- **Per-stage latency recorded** — §2.2 for who measures it, §11 for what is recorded and what
+  makes two runs non-comparable.
+- **Confidence scoring** — §8, defined as a statement about retrieval, with the components that
+  are admissible and the ones that are not.
+- **Three profiles** — §12, differing concretely rather than by name.
+- **Caching, routing and token counting** (the audit addition on #6) — §10, §9, §7.2. L1 only; L2
+  is settled in `embeddings.md` §8 and L3 belongs to a web-search connector.
+- **The deferred features, each with its measurement** — §13, including the learned-sparse leg
+  recorded against this ticket.
+- **`RetrievalStage` locked without widening** — §2.3.
+- **`Filter` closed** — §3, and `contracts.md` §6 updated.
