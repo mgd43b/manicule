@@ -42,11 +42,8 @@ from manicule.generation.binder import CitationBinder
 from manicule.generation.budget import (
     GENERATION_ENCODING,
     TokenEstimator,
-    WindowBudget,
     drift_problem,
     usable_prompt_tokens,
-    window_budget,
-    window_problem,
 )
 from manicule.generation.config import GENERATOR_NAME, GeneratorConfig
 from manicule.generation.history import HistoryPlan, Turn, fit_history, neutralise_markers
@@ -133,7 +130,6 @@ __all__ = [
     "UnverifiableSource",
     "Verification",
     "VerificationRun",
-    "WindowBudget",
     "accepted_extras",
     "answering",
     "build_messages",
@@ -151,6 +147,4 @@ __all__ = [
     "require_sharing_enabled",
     "tokens_match",
     "usable_prompt_tokens",
-    "window_budget",
-    "window_problem",
 ]

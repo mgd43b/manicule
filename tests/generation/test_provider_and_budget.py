@@ -33,8 +33,6 @@ from manicule.generation.budget import (
     TokenEstimator,
     drift_problem,
     usable_prompt_tokens,
-    window_budget,
-    window_problem,
 )
 from manicule.generation.provider import (
     LitellmGenerator,
@@ -42,6 +40,7 @@ from manicule.generation.provider import (
     error_table,
     map_error,
 )
+from manicule.retrieval.assembly import window_problem
 from tests.generation.fakes import chunk as make_chunk
 
 
@@ -143,14 +142,12 @@ def test_the_composed_ollama_string_is_one_the_library_actually_routes() -> None
 async def test_ollama_gets_an_explicit_window_and_a_keep_alive() -> None:
     """``num_ctx`` is derived from the profile budget, so the served window stops varying
     with the host's available memory."""
-    budget = window_budget(
-        PROFILES[RetrievalProfile.FAST], system_prompt_tokens=400, max_tokens=1024
-    )
-    gen, calls = generator(budget=budget)
+    profile = PROFILES[RetrievalProfile.FAST]
+    gen, calls = generator(profile=profile, system_prompt_tokens=400)
 
     await drain(gen.stream([{"role": "user", "content": "hi"}]))
 
-    assert calls[0]["num_ctx"] == budget.total
+    assert calls[0]["num_ctx"] == profile.context_tokens + profile.history_tokens + 400 + 1024
     assert calls[0]["keep_alive"] == "10m"
     assert calls[0]["stream_options"] == {"include_usage": True}
 
@@ -366,44 +363,57 @@ def test_drift_beyond_tolerance_is_reported_with_both_numbers_and_never_auto_tun
 # --- the window cross-check ---------------------------------------------------------------------
 
 
-def test_the_shipped_precise_profile_does_not_fit_the_shipped_default_model() -> None:
-    """A real finding, not a rounding issue: ``qwen2.5:14b`` on Ollama is 32768 native, and
-    ``precise`` asks for 32768 context plus history plus a system prompt plus the reserve."""
-    budget = window_budget(
-        PROFILES[RetrievalProfile.PRECISE], system_prompt_tokens=400, max_tokens=1024
-    )
+def test_a_profile_that_does_not_fit_is_refused_with_both_numbers_named() -> None:
+    """The predicate belongs to retrieval; this ticket owns the enforcement point.
 
+    Deliberately not a second copy of the rule. One rule stated twice is two rules that will
+    disagree, and the one that disagrees silently is the one that lets a prompt overflow.
+    """
     problem = window_problem(
-        budget, context_window=32768, model="ollama_chat/qwen2.5:14b", profile="precise"
+        PROFILES[RetrievalProfile.PRECISE],
+        context_window=8192,
+        model_id="ollama_chat/qwen2.5:14b",
+        system_prompt_tokens=400,
+        generation_reserve=1024,
     )
 
-    assert problem
-    assert str(budget.total) in problem
-    assert "32768" in problem
+    assert problem is not None
+    assert "8192" in problem
     assert "longer window" in problem
     assert "context_tokens" in problem
-    assert "profile" in problem
 
 
-@pytest.mark.parametrize("profile", [RetrievalProfile.FAST, RetrievalProfile.BALANCED])
-def test_the_other_shipped_profiles_do_fit(profile: RetrievalProfile) -> None:
-    budget = window_budget(PROFILES[profile], system_prompt_tokens=400, max_tokens=1024)
-
-    assert window_problem(budget, context_window=32768, model="m", profile=profile.value) == ""
-
-
-async def test_a_generator_whose_budget_does_not_fit_refuses_at_startup() -> None:
-    budget = window_budget(
-        PROFILES[RetrievalProfile.PRECISE], system_prompt_tokens=400, max_tokens=1024
+@pytest.mark.parametrize(
+    "profile", [RetrievalProfile.FAST, RetrievalProfile.BALANCED, RetrievalProfile.PRECISE]
+)
+def test_every_shipped_profile_fits_a_sixteen_thousand_token_window(
+    profile: RetrievalProfile,
+) -> None:
+    """The budgets are derived from what each ``final_top_k`` can actually hold, so a profile
+    that cannot fit any plausible model is now a configuration question rather than an
+    arithmetic impossibility."""
+    assert (
+        window_problem(
+            PROFILES[profile],
+            context_window=16384,
+            model_id="m",
+            system_prompt_tokens=400,
+            generation_reserve=1024,
+        )
+        is None
     )
+
+
+async def test_a_generator_whose_profile_does_not_fit_refuses_at_startup() -> None:
+    """The enforcement point is here because this is where the served window becomes known."""
     gen, _ = generator(
-        settings={"provider": "openai", "model": "gpt-4o-mini", "context_window": 8192},
+        settings={"provider": "openai", "model": "gpt-4o-mini", "context_window": 4096},
         api_key="k",
-        budget=budget,
-        profile_name="precise",
+        profile=PROFILES[RetrievalProfile.PRECISE],
+        system_prompt_tokens=400,
     )
 
-    with pytest.raises(ConfigError, match="precise"):
+    with pytest.raises(ConfigError, match="4096"):
         await gen.setup()
 
 

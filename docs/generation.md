@@ -546,25 +546,32 @@ and it is to stop leaving the number to the runtime:
   catches a server that trimmed on an older build: the true count comes back pinned at the
   window rather than tracking the estimate.
 
-**The shipped defaults do not all fit, and this document says so rather than leaving it to be
-discovered.** `LlmSettings.model` defaults to `qwen2.5:14b`, which on Ollama is the Instruct
-model — 32768 native, and 131072 only with opt-in YaRN scaling that Ollama does not apply by
-default. Against a system prompt of roughly 400 tokens:
+**When this was written the shipped defaults did not all fit, and saying so was the point.**
+Against the budgets of the day, `precise` asked for 32768 context tokens plus history plus a
+system prompt plus the reserve — more than the default `qwen2.5:14b`'s own 32768-token native
+window, before `num_ctx` was even considered.
 
-| Profile | context | history | system | reserve (`max_tokens`) | total | fits 32768? |
+[#6](https://github.com/mgd43b/manicule/issues/6) has since re-derived the budgets from what
+each `final_top_k` can actually hold, and they are now 4096 / 5632 / 12288. Against a system
+prompt of roughly 400 tokens and a 1024-token reserve:
+
+| Profile | context | history | system | reserve | total | fits 16384? |
 |---|---|---|---|---|---|---|
-| `fast` | 8192 | 512 | ~400 | 1024 | ~10128 | yes |
-| `balanced` | 16384 | 1024 | ~400 | 1024 | ~18832 | yes |
-| `precise` | 32768 | 2048 | ~400 | 1024 | ~36240 | **no** |
+| `fast` | 4096 | 512 | ~400 | 1024 | ~6032 | yes |
+| `balanced` | 5632 | 1024 | ~400 | 1024 | ~8080 | yes |
+| `precise` | 12288 | 2048 | ~400 | 1024 | ~15760 | yes |
 
-`precise` does not fit the default model's own native window, before `num_ctx` is even
-considered.
-That is a real finding, not a rounding issue, and the honest response is the one the rule
-already prescribes: **it is refused at startup, with both numbers named and the three fixes
-listed** — a model with a longer window, a lower `context_tokens` override, or a different
-profile. The profile numbers belong to
-[#6](https://github.com/mgd43b/manicule/issues/6)/[#1](https://github.com/mgd43b/manicule/issues/1)
-and are not changed here. What is not acceptable is shipping a profile that silently truncates.
+So the arithmetic impossibility is gone and the *rule* is unchanged and still load-bearing:
+a profile that does not fit **is refused at startup, with both numbers named and the fixes
+listed** — a model with a longer window, a lower `context_tokens` override, a lower
+`max_tokens`, or a different profile. What is not acceptable is shipping a profile that
+silently truncates.
+
+**The predicate lives in retrieval, and this ticket calls it.** `retrieval.assembly.window_problem`
+states the rule because `context_tokens` and `history_tokens` are retrieval's budgets;
+`Generator.setup` enforces it because that is where the served window becomes known. One rule
+stated twice is two rules that will disagree, and the one that disagrees silently is the one
+that lets a prompt overflow.
 
 ### 4.4 Startup refusals
 

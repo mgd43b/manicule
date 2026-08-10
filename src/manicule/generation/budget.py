@@ -15,6 +15,12 @@ the longest inputs.
 **Then it stops guessing.** The provider returns a true prompt count, and the estimate is
 compared against it after every call. That comparison is only worth anything if the "true"
 number is true — see :func:`usable_prompt_tokens`.
+
+**The window cross-check is not here.** It is
+:func:`manicule.retrieval.assembly.window_problem`, because retrieval owns the requirement and
+one predicate stated twice is two predicates that will disagree. Generation owns the
+*enforcement point* — :meth:`~manicule.generation.provider.LitellmGenerator.setup` — because
+that is where the served window becomes known.
 """
 
 from __future__ import annotations
@@ -22,7 +28,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
-from manicule.config.profiles import ProfileConfig
 from manicule.core.content import Chunk
 from manicule.core.generation import Usage
 
@@ -82,73 +87,6 @@ def _tiktoken_counter(encoding_name: str) -> Callable[[str], int]:
     return lambda text: len(encoding.encode(text, disallowed_special=()))
 
 
-@dataclass(frozen=True, slots=True)
-class WindowBudget:
-    """The four terms of the startup cross-check, and their total."""
-
-    context_tokens: int
-    history_tokens: int
-    system_prompt_tokens: int
-    generation_reserve: int
-
-    @property
-    def total(self) -> int:
-        return (
-            self.context_tokens
-            + self.history_tokens
-            + self.system_prompt_tokens
-            + self.generation_reserve
-        )
-
-    def describe(self) -> str:
-        return (
-            f"{self.context_tokens} context + {self.history_tokens} history + "
-            f"{self.system_prompt_tokens} system prompt + {self.generation_reserve} reserved "
-            f"for the answer = {self.total}"
-        )
-
-
-def window_budget(
-    profile: ProfileConfig, *, system_prompt_tokens: int, max_tokens: int
-) -> WindowBudget:
-    """The budget a profile demands of a generator's window.
-
-    ``max_tokens`` appears once, as both the output cap and the reserve. Two numbers for one
-    quantity disagree by default — and then a ``length`` finish reason stops meaning "the
-    answer hit the budget reserved for it".
-    """
-    return WindowBudget(
-        context_tokens=profile.context_tokens,
-        history_tokens=profile.history_tokens,
-        system_prompt_tokens=system_prompt_tokens,
-        generation_reserve=max_tokens,
-    )
-
-
-def window_problem(budget: WindowBudget, *, context_window: int, model: str, profile: str) -> str:
-    """The refusal when a profile does not fit, or ``""`` when it does.
-
-    A refusal at startup rather than a truncation at run time, because on the default local
-    runtime neither overflow behaviour is acceptable to rely on: older builds truncate the
-    prompt **from the front**, silently discarding the system prompt and the citation
-    protocol and presenting as a model that ignores instructions, while current builds *grow*
-    the context to hold the prompt, which on unified memory is a spill to CPU or an outright
-    failure to allocate.
-
-    Both alternatives to naming it are worse than the arithmetic being wrong, which is why
-    this reports both totals and the three things that fix it.
-    """
-    if budget.total <= context_window:
-        return ""
-    return (
-        f"the {profile!r} profile needs {budget.total} tokens ({budget.describe()}) but "
-        f"{model} will serve a window of {context_window}. A prompt over the window is "
-        f"truncated or grown by the runtime rather than refused, so this is checked here "
-        f"instead of being discovered in production. Choose a model with a longer window, "
-        f"lower rag.overrides.context_tokens, or select a smaller profile."
-    )
-
-
 def usable_prompt_tokens(usage: Usage | None, estimate: int) -> int | None:
     """The provider's prompt count, or ``None`` when it cannot be trusted as a measurement.
 
@@ -197,9 +135,6 @@ def drift_problem(*, estimate: int, measured: int | None, tolerance: float, mode
 __all__ = [
     "GENERATION_ENCODING",
     "TokenEstimator",
-    "WindowBudget",
     "drift_problem",
     "usable_prompt_tokens",
-    "window_budget",
-    "window_problem",
 ]

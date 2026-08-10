@@ -22,6 +22,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from typing import Any, Protocol, cast
 
+from manicule.config.profiles import ProfileConfig
 from manicule.config.providers import Egress
 from manicule.config.settings import LlmSettings
 from manicule.core.content import Document
@@ -40,7 +41,6 @@ from manicule.core.generation import FinishReason, Token, Usage
 from manicule.core.lifecycle import HealthReport
 from manicule.core.protocols import CLOSE_DEADLINE_S
 from manicule.core.retrieval import Context, Query
-from manicule.generation.budget import WindowBudget, window_problem
 from manicule.generation.prompt import ChatMessage, build_messages
 
 OLLAMA_PROVIDER = "ollama"
@@ -159,8 +159,8 @@ class LitellmGenerator:
         base_url: str | None = None,
         egress: Egress = Egress.LOOPBACK,
         completion: CompletionCall | None = None,
-        budget: WindowBudget | None = None,
-        profile_name: str = "",
+        profile: ProfileConfig | None = None,
+        system_prompt_tokens: int = 0,
         extra_params: Mapping[str, Any] | None = None,
     ) -> None:
         self._settings = settings
@@ -168,13 +168,20 @@ class LitellmGenerator:
         self._base_url = base_url
         self._egress = egress
         self._completion = completion
-        self._budget = budget
-        self._profile_name = profile_name
+        self._profile = profile
+        self._system_prompt_tokens = system_prompt_tokens
         self._extra_params = dict(extra_params or {})
         # Derived from the profile arithmetic, never configured, so the window manicule
         # demands cannot disagree with the budget it exists to satisfy — and so the served
         # window stops varying with the host's available memory.
-        self._num_ctx = budget.total if budget is not None else None
+        self._num_ctx = (
+            None
+            if profile is None
+            else profile.context_tokens
+            + profile.history_tokens
+            + system_prompt_tokens
+            + settings.max_tokens
+        )
         self.model_id = compose_model(settings.provider, settings.model)
         self.context_window = settings.context_window or 0
 
@@ -233,17 +240,24 @@ class LitellmGenerator:
     def _require_budget_fits(self) -> None:
         """The startup window cross-check, at the one place that knows both numbers.
 
-        The retrieval design owns the requirement and assigns the enforcement point here,
-        because this is where the served window is finally known. A profile that does not fit
-        is a refusal naming both totals, not a runtime truncation.
+        **The predicate is retrieval's**, not a second copy of the rule. Retrieval owns the
+        requirement — ``context_tokens`` and ``history_tokens`` are its budgets — and assigns
+        the enforcement point here, because this is where the served window finally becomes
+        known. Two statements of one rule are two rules that will disagree, and the one that
+        disagrees silently is the one that lets a prompt overflow.
         """
-        if self._budget is None:
+        if self._profile is None:
             return
+        # Deferred: retrieval's assembly module reaches for the tokenizer machinery, and
+        # registration must stay free of it.
+        from manicule.retrieval.assembly import window_problem  # noqa: PLC0415
+
         problem = window_problem(
-            self._budget,
+            self._profile,
             context_window=self.context_window,
-            model=self.model_id,
-            profile=self._profile_name or "configured",
+            model_id=self.model_id,
+            system_prompt_tokens=self._system_prompt_tokens,
+            generation_reserve=self._settings.max_tokens,
         )
         if problem:
             raise ConfigError(problem)

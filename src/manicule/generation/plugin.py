@@ -27,7 +27,7 @@ def _build(context: BuildContext) -> Generator:
     # reaches for tiktoken.
     from manicule.config.profiles import profile_config  # noqa: PLC0415
     from manicule.config.providers import ModelRole  # noqa: PLC0415
-    from manicule.generation.budget import TokenEstimator, window_budget  # noqa: PLC0415
+    from manicule.generation.budget import TokenEstimator  # noqa: PLC0415
     from manicule.generation.prompt import system_message  # noqa: PLC0415
     from manicule.generation.provider import LitellmGenerator  # noqa: PLC0415
 
@@ -47,19 +47,15 @@ def _build(context: BuildContext) -> Generator:
     endpoint = next(point for point in settings.selected_endpoints if point.role is ModelRole.LLM)
     profile = profile_config(settings.rag.profile, settings.rag.overrides)
     estimator = TokenEstimator(safety_factor=llm.token_safety_factor)
-    budget = window_budget(
-        profile,
-        system_prompt_tokens=estimator.count(system_message(llm.system_prompt_extra)["content"]),
-        max_tokens=llm.max_tokens,
-    )
+    system_prompt_tokens = estimator.count(system_message(llm.system_prompt_extra)["content"])
     secret = settings.provider(provider).api_key
     return LitellmGenerator(
         llm,
         api_key=secret.get_secret_value() if secret else None,
         base_url=endpoint.base_url,
         egress=endpoint.egress,
-        budget=budget,
-        profile_name=settings.rag.profile.value,
+        profile=profile,
+        system_prompt_tokens=system_prompt_tokens,
         extra_params=dict(config.extra_params),
     )
 
