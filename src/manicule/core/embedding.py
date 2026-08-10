@@ -19,7 +19,9 @@ from typing import ClassVar, Protocol, override, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from manicule.core.fingerprints import Fingerprint
+from manicule.core.content import Chunk
+from manicule.core.errors import ContextOverflowError
+from manicule.core.fingerprints import ChunkFingerprint, Fingerprint
 
 type Vector = Sequence[float]
 """A finished embedding.
@@ -87,12 +89,27 @@ class EmbedFingerprint(Fingerprint):
 
     Persisted alongside an index and compared before every write.
 
-    Two fields are recorded and excluded from identity, for the same reason in both cases:
-    they describe how the vectors were made without changing whether they are comparable.
-    :attr:`backend` is the runtime, and the same model under two runtimes produces
-    interchangeable vectors. :attr:`max_sequence_length` constrains what text can be
-    embedded, which is the chunker's problem and belongs to
-    :class:`~manicule.core.fingerprints.ChunkFingerprint`.
+    Two fields are recorded and excluded from identity. Both exclusions are deliberate, and
+    each rests on something that has to stay true.
+
+    **:attr:`max_sequence_length` is excluded because the invariant it protects is checked
+    directly.** Including it would force a full re-embed whenever the limit *rises*, which
+    changes nothing about the vectors already stored. What matters is not whether the number
+    changed but whether any text was truncated, and :func:`require_within_context` answers
+    that question about the actual batch. Every path that embeds stored chunks must call it
+    — in particular the re-embed path, which reads stored ``embed_text`` without re-chunking
+    and therefore never runs the chunker's own budget check. That is the one route by which
+    a lowered limit could otherwise truncate a whole corpus in silence.
+
+    **:attr:`backend` is excluded on the assumption that runtimes agree.** The same model
+    under MLX and under ONNX is taken to produce interchangeable vectors, which keeps a
+    corpus portable between machines instead of demanding a re-embed on arrival. That is an
+    assumption, not a measurement: the parity test belongs to the embeddings work and has
+    not yet been run. ``docs/contracts.md`` §3 already sets the precedent that a backend is
+    "admitted only by measurement". **If parity cannot be brought within tolerance, this
+    exclusion is the decision to revisit** — moving ``backend`` into ``IDENTITY_FIELDS``
+    makes a runtime change a loud error with a re-embed path, which is the correct
+    behaviour if the vectors really do differ.
     """
 
     IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = (
@@ -123,17 +140,21 @@ class EmbedFingerprint(Fingerprint):
     max_sequence_length: int = Field(
         gt=0,
         description="The most tokens this model will actually attend to. **Required**, and "
-        "the value the chunk budget is checked against: beyond it the input is truncated "
-        "with no error raised, so an over-budget chunk is indexed as its opening tokens "
-        "while still claiming all of its text — a citation quoting words the index never saw. "
+        "the value every batch is checked against by ``require_within_context``: beyond it "
+        "the input is truncated with no error raised, so an over-budget chunk is indexed as "
+        "its opening tokens while still claiming all of its text — a citation quoting words "
+        "the index never saw. "
         "Note this is the *effective* limit, which is not always the positional-embedding "
         "limit: some widely used models ship configured well below what their architecture "
-        "allows, so it must be read from the loaded model rather than assumed.",
+        "allows, so it must be read from the loaded model rather than assumed. "
+        "Excluded from identity — see the class docstring for why that is safe.",
     )
 
     backend: str = Field(
         default="",
-        description="Which runtime produced the vectors, e.g. ``mlx`` or ``onnx``.",
+        description="Which runtime produced the vectors, e.g. ``mlx`` or ``onnx``. "
+        "Excluded from identity — see the class docstring, which records what that "
+        "exclusion is betting on.",
     )
 
     @override
@@ -144,10 +165,80 @@ class EmbedFingerprint(Fingerprint):
         return f"{self.model_id}{revision} ({self.dimension}d, {self.pooling.value}, {norm})"
 
 
+def require_within_context(
+    chunks: Sequence[Chunk],
+    fingerprint: EmbedFingerprint,
+    chunk_fingerprint: ChunkFingerprint | None = None,
+) -> None:
+    """Raise unless every chunk fits in what the embedder will actually read.
+
+    **Every path that embeds chunks must call this**, and one path in particular: re-embed.
+    Re-embedding reads stored ``embed_text`` and does not re-chunk, so the chunker's own
+    budget refusal never runs. A model reconfigured to a shorter sequence length — a
+    different checkpoint, an edited config, a changed backend default — leaves the
+    embedding fingerprint identical, so no comparison fires, and every oversized chunk is
+    quietly truncated and stored as a vector claiming text it never saw. This function is
+    what stands between that and the index.
+
+    It checks the property rather than a proxy for it, which is why
+    :attr:`EmbedFingerprint.max_sequence_length` can stay out of identity: a limit that
+    rises harms nothing, and a limit that falls is caught here on the batch it would have
+    damaged.
+
+    Args:
+        chunks: What is about to be embedded. ``token_count`` is trusted, which is only
+            sound if it was measured with the embedder's tokenizer — hence the next
+            argument.
+        fingerprint: The embedder about to receive them.
+        chunk_fingerprint: The chunker that produced them, when it is known. Supplying it
+            adds a tokenizer check, because a token count taken under a different
+            vocabulary is not a measurement of anything relevant.
+
+    Raises:
+        ContextOverflowError: Any chunk exceeds the limit, or the token counts were taken
+            with a different tokenizer. The message names the worst offenders rather than
+            only the first, so one run fixes the batch.
+    """
+    mismatched_tokenizer = (
+        chunk_fingerprint is not None
+        and bool(fingerprint.tokenizer_id)
+        and chunk_fingerprint.tokenizer_id != fingerprint.tokenizer_id
+    )
+    if mismatched_tokenizer and chunk_fingerprint is not None:
+        msg = (
+            f"chunks were counted with {chunk_fingerprint.tokenizer_id!r} but "
+            f"{fingerprint.model_id} tokenizes with {fingerprint.tokenizer_id!r}. "
+            f"Token counts taken under a different vocabulary cannot be checked against "
+            f"this model's limit; re-chunk with the matching tokenizer."
+        )
+        raise ContextOverflowError(msg)
+
+    limit = fingerprint.max_sequence_length
+    oversized = sorted(
+        (chunk for chunk in chunks if chunk.token_count > limit),
+        key=lambda chunk: chunk.token_count,
+        reverse=True,
+    )
+    if not oversized:
+        return
+
+    worst = oversized[:3]
+    listed = ", ".join(f"{chunk.id} ({chunk.token_count} tokens)" for chunk in worst)
+    more = f" and {len(oversized) - len(worst)} more" if len(oversized) > len(worst) else ""
+    msg = (
+        f"{len(oversized)} chunk(s) exceed the {limit}-token limit of "
+        f"{fingerprint.describe()}: {listed}{more}. Embedding them would truncate the text "
+        f"without an error and store vectors that describe less than the chunks claim. "
+        f"Re-chunk against this model's limit, or embed with a model that fits the corpus."
+    )
+    raise ContextOverflowError(msg)
+
+
 __all__ = [
     "EmbedFingerprint",
     "NDArrayLike",
     "Pooling",
     "TokenStates",
     "Vector",
+    "require_within_context",
 ]

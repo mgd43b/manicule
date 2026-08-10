@@ -9,6 +9,7 @@ enforced by a test rather than by convention.
 from __future__ import annotations
 
 from manicule.core.anchors import (
+    EDGE_TOLERANCE,
     Anchor,
     CellAnchor,
     HeadingAnchor,
@@ -36,6 +37,7 @@ from manicule.core.embedding import (
     Pooling,
     TokenStates,
     Vector,
+    require_within_context,
 )
 from manicule.core.errors import (
     ChunkingError,
@@ -43,6 +45,7 @@ from manicule.core.errors import (
     ConfigError,
     ContainerError,
     ContainerStateError,
+    ContextOverflowError,
     DuplicateComponentError,
     FingerprintMismatchError,
     IncompatiblePluginError,
@@ -89,6 +92,7 @@ from manicule.core.version import CORE_VERSION
 __all__ = [
     "CHUNKLESS_BY_DESIGN",
     "CORE_VERSION",
+    "EDGE_TOLERANCE",
     "NEEDS_ATTENTION",
     "Anchor",
     "BlockKind",
@@ -104,6 +108,7 @@ __all__ = [
     "ContainerError",
     "ContainerStateError",
     "Context",
+    "ContextOverflowError",
     "DiscoveredDoc",
     "DocRef",
     "DocStore",
@@ -163,5 +168,6 @@ __all__ = [
     "content_hash",
     "document_id",
     "is_located",
+    "require_within_context",
     "worst_state",
 ]

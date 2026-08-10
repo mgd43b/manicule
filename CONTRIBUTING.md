@@ -69,6 +69,13 @@ page that does not exist looks exactly like one that does.
 and `assert_vector_store_rejects_foreign_vectors`, which checks it refuses a *different model
 of the same size*. A dimension check alone passes that case and ruins the index.
 
+**Nothing embeds text the model will not read.** Every path that embeds stored chunks calls
+`require_within_context` first, and must pass `assert_refuses_oversized_chunks`. This is
+aimed at re-embed, which reads stored `embed_text` without re-chunking, so the chunker's own
+budget refusal never runs — and the embedding fingerprint is unchanged by a sequence limit
+that *fell*, so nothing else fires either. Past the limit the input is dropped silently, and
+the stored vector describes an opening fragment while the chunk still claims all of its text.
+
 **Retrieval stages are uniform and pure.** Candidates in, candidates out, input untouched, a
 new list returned. `assert_retrieval_stage_contract` checks all four. A stage that mutates
 its input makes the pipeline order-dependent, and an order-dependent pipeline cannot be

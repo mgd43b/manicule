@@ -142,6 +142,15 @@ class Embedder(Protocol):
         """Embed ``texts``, returning one vector per input, in order.
 
         Every returned vector has length ``fingerprint.dimension``.
+
+        **Callers embedding stored chunks must first call**
+        :func:`~manicule.core.embedding.require_within_context`. Text beyond
+        ``fingerprint.max_sequence_length`` is dropped by the model with no error raised, so
+        an oversized chunk becomes a vector describing its opening while the chunk still
+        claims all of its text. The chunker refuses to exceed the limit when it runs — but
+        re-embed does not re-chunk, and the fingerprint is unchanged by a limit that fell,
+        so that path has no other guard. :func:`manicule.testing.assert_refuses_oversized_chunks`
+        holds an implementation to it.
         """
         ...
 

@@ -81,6 +81,35 @@ def test_rectangles_are_normalised_and_ordered() -> None:
         Rect(x0=0.8, y0=0.0, x1=0.2, y1=1.0)
 
 
+def test_a_quote_at_the_very_edge_of_the_page_is_not_rejected() -> None:
+    """Composing a rotation with a crop offset lands the last bits of a float outside 1.0.
+
+    Refusing that would fail a legitimate citation for being exactly where the reader can
+    see it is.
+    """
+    rect = Rect(x0=-1e-9, y0=0.5, x1=1.0 + 1e-9, y1=0.6)
+    assert rect.x0 == 0.0
+    assert rect.x1 == 1.0
+
+
+def test_a_transform_that_is_actually_wrong_still_fails() -> None:
+    """The tolerance absorbs float noise, not a mistake. A wrong box is wrong by percentages."""
+    with pytest.raises(ValidationError):
+        Rect(x0=0.0, y0=0.0, x1=1.01, y1=1.0)
+    with pytest.raises(ValidationError):
+        Rect(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+
+
+def test_a_zero_width_run_of_glyphs_does_not_fail_on_reversed_corners() -> None:
+    rect = Rect(x0=0.25, y0=0.4, x1=0.25 - 1e-9, y1=0.45)
+    assert rect.x1 == rect.x0
+
+
+def test_the_tolerance_does_not_hide_a_genuinely_reversed_rectangle() -> None:
+    with pytest.raises(ValidationError, match="out of order"):
+        Rect(x0=0.6, y0=0.1, x1=0.5, y1=0.2)
+
+
 def test_line_ranges_are_inclusive_and_ordered() -> None:
     assert LineAnchor(start=7, end=7).end == 7
     with pytest.raises(ValidationError, match="ends before it starts"):

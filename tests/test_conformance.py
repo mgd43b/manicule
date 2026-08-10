@@ -6,10 +6,14 @@ defect it was written for, which is what makes it worth the later tickets' time.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
 
 from manicule.core.anchors import LineAnchor
-from manicule.core.content import BlockKind, ParsedBlock
+from manicule.core.content import BlockKind, Chunk, ParsedBlock
+from manicule.core.embedding import Vector, require_within_context
+from manicule.core.errors import ContextOverflowError
 from manicule.core.ids import chunk_id
 from manicule.core.retrieval import Candidate, Query
 from manicule.testing import (
@@ -17,6 +21,7 @@ from manicule.testing import (
     assert_connector_contract,
     assert_embedder_contract,
     assert_parser_contract,
+    assert_refuses_oversized_chunks,
     assert_retrieval_stage_contract,
     assert_vector_store_is_dimension_agnostic,
     assert_vector_store_rejects_foreign_vectors,
@@ -106,6 +111,74 @@ async def test_an_embedder_passes_at_any_dimension_it_declares(dimension: int) -
 async def test_vectors_that_disagree_with_the_fingerprint_are_caught() -> None:
     with pytest.raises(AssertionError, match="the fingerprint says"):
         await assert_embedder_contract(TruncatingEmbedder(dimension=8))
+
+
+# --- the re-embed path -----------------------------------------------------------------
+
+
+async def test_a_re_embed_path_that_checks_its_batch_passes() -> None:
+    embedder = HashEmbedder(dimension=4)
+
+    async def embed_batch(chunks: Sequence[Chunk]) -> list[Vector]:
+        require_within_context(chunks, embedder.fingerprint)
+        return await embedder.embed([chunk.embed_text for chunk in chunks])
+
+    await assert_refuses_oversized_chunks(embed_batch, embedder)
+
+
+async def test_a_re_embed_path_that_trusts_the_fingerprint_is_caught() -> None:
+    """The hole the chunker's own guard cannot cover.
+
+    Re-embedding does not re-chunk, so a model reconfigured to a shorter sequence length
+    truncates every oversized chunk with an unchanged fingerprint and no error anywhere.
+    """
+    embedder = HashEmbedder(dimension=4)
+
+    async def embed_batch(chunks: Sequence[Chunk]) -> list[Vector]:
+        return await embedder.embed([chunk.embed_text for chunk in chunks])
+
+    with pytest.raises(AssertionError, match="require_within_context"):
+        await assert_refuses_oversized_chunks(embed_batch, embedder)
+
+
+def test_the_guard_names_the_chunks_that_do_not_fit() -> None:
+    document = make_document()
+    chunks = [
+        chunk.model_copy(update={"token_count": count})
+        for chunk, count in zip(make_chunks(document, count=3), (10, 5000, 9000), strict=True)
+    ]
+    fingerprint = HashEmbedder().fingerprint
+
+    with pytest.raises(ContextOverflowError) as caught:
+        require_within_context(chunks, fingerprint)
+
+    message = str(caught.value)
+    assert "2 chunk(s)" in message
+    assert "9000 tokens" in message
+    assert str(fingerprint.max_sequence_length) in message
+
+
+def test_the_guard_passes_a_batch_that_fits() -> None:
+    document = make_document()
+    require_within_context(make_chunks(document), HashEmbedder().fingerprint)
+
+
+def test_token_counts_from_the_wrong_tokenizer_are_refused() -> None:
+    """A count taken under a different vocabulary is not a measurement of anything relevant."""
+    document = make_document()
+    chunker = BlockChunker()
+    foreign = chunker.fingerprint.model_copy(update={"tokenizer_id": "some/other-tokenizer"})
+
+    with pytest.raises(ContextOverflowError, match="different vocabulary"):
+        require_within_context(make_chunks(document), HashEmbedder().fingerprint, foreign)
+
+
+def test_a_raised_sequence_limit_does_not_invalidate_anything() -> None:
+    """Why the limit stays out of identity: growing it harms nothing already stored."""
+    document = make_document()
+    generous = HashEmbedder().fingerprint.model_copy(update={"max_sequence_length": 100_000})
+    require_within_context(make_chunks(document), generous)
+    assert generous.matches(HashEmbedder().fingerprint)
 
 
 # --- vector stores ---------------------------------------------------------------------

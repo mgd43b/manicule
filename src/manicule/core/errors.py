@@ -91,12 +91,26 @@ class ChunkingError(ManiculeError):
     """A chunker could not produce chunks from a document's blocks."""
 
 
+class ContextOverflowError(ManiculeError):
+    """Text was offered to an embedder that attends to less of it than was sent.
+
+    Beyond a model's sequence length the input is dropped with no error raised, so the
+    resulting vector describes the opening of a chunk while the chunk still claims all of
+    its text — a citation quoting words the index never saw.
+
+    Always fatal to the operation that raised it. There is no partial-credit answer here:
+    an embedding of the first half of a passage is not a worse embedding of the passage, it
+    is an embedding of something else.
+    """
+
+
 __all__ = [
     "ChunkingError",
     "CircularDependencyError",
     "ConfigError",
     "ContainerError",
     "ContainerStateError",
+    "ContextOverflowError",
     "DuplicateComponentError",
     "FingerprintMismatchError",
     "IncompatiblePluginError",

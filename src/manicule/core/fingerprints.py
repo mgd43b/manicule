@@ -116,7 +116,9 @@ class ChunkFingerprint(Fingerprint):
         description="Token budget per chunk, measured on ``embed_text``. Must not exceed the "
         "embedder's ``max_sequence_length``: past that limit the text is truncated with no "
         "error, and the chunk is indexed as its first N tokens while still claiming all of "
-        "its text — a citation that quotes words the index never saw.",
+        "its text — a citation that quotes words the index never saw. The chunker enforces "
+        "this when it runs; re-embed does not re-chunk, so that path enforces it with "
+        "``require_within_context`` instead.",
     )
     overlap_tokens: int = Field(
         default=0, ge=0, description="Tokens repeated between adjacent chunks."

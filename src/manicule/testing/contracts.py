@@ -13,12 +13,12 @@ working under ``python -O``.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, ParsedBlock, RawDocument
 from manicule.core.embedding import EmbedFingerprint, Pooling, Vector
-from manicule.core.errors import FingerprintMismatchError
+from manicule.core.errors import ContextOverflowError, FingerprintMismatchError
 from manicule.core.protocols import (
     Chunker,
     Connector,
@@ -181,6 +181,49 @@ async def assert_embedder_contract(embedder: Embedder, texts: Sequence[str] | No
     _require(list(empty) == [], "embed([]) must return an empty list, not a batch of nothing")
 
 
+async def assert_refuses_oversized_chunks(
+    embed_batch: Callable[[Sequence[Chunk]], Awaitable[object]], embedder: Embedder
+) -> None:
+    """Check that a path which embeds stored chunks refuses ones the model cannot read.
+
+    Aimed squarely at **re-embed**, which is where this goes wrong. Re-embedding reads
+    stored ``embed_text`` and does not re-chunk, so the chunker's own budget refusal never
+    runs. If the model is later reconfigured to a shorter sequence length — a different
+    checkpoint, an edited config, a changed backend default — the embedding fingerprint is
+    unchanged, no comparison fires, and every oversized chunk is silently truncated into a
+    vector claiming text it never saw. Across a corpus, in one command, with no error.
+
+    Pass the function that embeds a batch of stored chunks. It must call
+    :func:`manicule.core.embedding.require_within_context` — or do the equivalent check
+    itself — before handing anything to the model.
+
+    Args:
+        embed_batch: The path under test. Called with one chunk that does not fit.
+        embedder: Whose ``max_sequence_length`` the chunk is built to exceed.
+    """
+    limit = embedder.fingerprint.max_sequence_length
+    oversized = Chunk(
+        id="oversized-by-one",
+        document_id="doc",
+        text="x",
+        embed_text="x",
+        anchor=Unlocated(reason="synthetic chunk for a contract check"),
+        position=0,
+        token_count=limit + 1,
+    )
+
+    try:
+        await embed_batch([oversized])
+    except ContextOverflowError:
+        return
+    _fail(
+        f"a chunk of {limit + 1} tokens was embedded by a model that reads {limit}. "
+        f"Everything past the limit is dropped without an error, so the stored vector "
+        f"describes an opening fragment while the chunk still claims all of its text. "
+        f"Call require_within_context() before embedding stored chunks"
+    )
+
+
 # --- vector stores ---------------------------------------------------------------------
 
 
@@ -326,6 +369,7 @@ __all__ = [
     "assert_connector_contract",
     "assert_embedder_contract",
     "assert_parser_contract",
+    "assert_refuses_oversized_chunks",
     "assert_retrieval_stage_contract",
     "assert_vector_store_is_dimension_agnostic",
     "assert_vector_store_rejects_foreign_vectors",
