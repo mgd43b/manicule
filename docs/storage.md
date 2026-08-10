@@ -446,8 +446,8 @@ A singleton. One row, enforced.
 ```python
 id:                Mapped[int] = mapped_column(primary_key=True)  # CHECK (id = 1)
 vector_table:      Mapped[str]                # e.g. "chunks__7f3a91c2"
-embed_fingerprint: Mapped[dict] = mapped_column(JSON)
-chunk_fingerprint: Mapped[dict] = mapped_column(JSON)
+embed_fingerprint: Mapped[str] = mapped_column(Text)   # canonical bytes, verbatim
+chunk_fingerprint: Mapped[str] = mapped_column(Text)
 fts_tokenizer:     Mapped[str]                # "porter unicode61 remove_diacritics 2"
 created_at / updated_at
 ```
@@ -455,6 +455,35 @@ created_at / updated_at
 **`vector_table` is a pointer, not a constant.** This is what makes the re-embed path in
 §6.5 crash-safe: a new table is built alongside the old one and the pointer is moved in a
 single SQLite transaction.
+
+**The fingerprints are `Text` holding canonical bytes, not `JSON` holding a dict.** §6.3
+compares them for byte equality, and a `JSON` column cannot support that: SQLAlchemy's default
+serialiser does not sort keys, so the stored bytes depend on the insertion order of the dict
+that was passed in. Verified — the same fingerprint built in two field orders produces two
+different stored values, which would either false-mismatch or silently rely on
+re-canonicalising at every read. Storing the canonical bytes makes the comparison literal.
+SQLite's `json_extract` still works on that text, so `doctor`'s field-by-field diff loses
+nothing.
+
+**The canonical form, pinned.** One function produces fingerprint bytes and nothing else may:
+
+```python
+def canonical(fp: Mapping[str, object]) -> bytes:
+    return json.dumps(fp, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode("ascii")
+
+fp8 = hashlib.sha256(canonical(fp)).hexdigest()[:8]   # the §6.5 table-name suffix
+```
+
+`sort_keys` makes it order-independent; `separators` pins whitespace rather than describing it;
+`ensure_ascii` keeps the output pure ASCII so encoding and Unicode normalisation never enter a
+comparison; `allow_nan=False` rejects the two values that are not JSON.
+
+**Fingerprint values are `str | int | bool | None`, or nested containers of those — never
+floats**, enforced at construction. A float's text form depends on how it was computed:
+`0.1 + 0.2` serialises as `0.30000000000000004` and `0.3` as `0.3`, so the same intended
+setting arriving by two routes yields two different table names and a spurious refusal.
+Anything fractional is carried as a string.
 
 ### 4.7 The other twelve, and what changed
 
@@ -727,9 +756,16 @@ keys on model identity:
 - `bge-large-en-v1.5` and `e5-large-v2` are both 1024-dimensional. Swapping one for the
   other passes any dimension check, and every stored vector becomes noise relative to every
   new query. Retrieval degrades toward random with no error raised anywhere.
-- The same weights with CLS pooling versus mean pooling differ by **0.856 cosine**
-  (`PLAN.md` §7) — identical dimension, incompatible space, and pooling is a parameter
-  manicule itself chooses.
+- The same weights with CLS pooling versus mean pooling diverge to **0.69 cosine at a
+  450-token chunk** (`PLAN.md` §7) — identical dimension, incompatible space, and pooling is a
+  parameter manicule itself chooses. The divergence is a length-dependent curve rather than a
+  constant, and it widens with chunk length, so at the 512-token budget
+  ([`parsing.md`](parsing.md) §1) the two poolings are at their furthest apart.
+- **And that divergence is architecture-dependent, which is the sharper point.** The same
+  comparison stays at 0.87–0.96 on BERT while reaching 0.69 on ModernBERT. A fingerprint that
+  omitted `pooling` would pass every test on a BERT checkpoint and corrupt the space on a
+  ModernBERT one. A field that only matters on some architectures is exactly the field someone
+  leaves out.
 - E5 and BGE expect an instruction prefix on queries (`"query: "`, `"Represent this
   sentence…"`). Same weights, same pooling, different prefix convention, different space in
   practice.
@@ -737,13 +773,21 @@ keys on model identity:
 > **Prior art.** `ensureCollection(name, dimensions)` compares `existingDimensions !== dimensions`
 > and nothing else. All three cases above pass it.
 
-**What is compared.** The full `EmbedFingerprint`, canonically serialised — sorted keys, no
-whitespace — and compared for byte equality. Not field-by-field, so a field added to the type
-later cannot be silently ignored by a comparison that predates it. The type belongs to
+**What is compared.** The full `EmbedFingerprint`, in the canonical form pinned in §4.6, and
+compared for byte equality. Not field-by-field, so a field added to the type later cannot be
+silently ignored by a comparison that predates it. The type belongs to
 [#1](https://github.com/mgd43b/manicule/issues/1); storage requires only that it is
 sufficient to determine vector-space compatibility, which means at minimum: model repository
-and revision or file digest, dtype/quantisation, pooling strategy, normalisation, maximum
-sequence length, any query/document instruction prefix, and dimension.
+and revision or file digest, **architecture**, dtype/quantisation, pooling strategy,
+normalisation, `max_sequence_length`, any query/document instruction prefix, and dimension.
+
+**`architecture` is in that list for a concrete reason**, and it is a second instance of why
+the comparison is by bytes. `mlx-embeddings` binds `last_hidden_state` to the *pooled* vector
+only on some architectures and not others, so architecture determines which tensor the
+extraction path even reads — upstream of pooling rather than beside it. Two checkpoints
+agreeing on model id, revision, dtype, pooling and dimension can still land in different
+spaces. Byte equality catches the field nobody anticipated; a hand-written comparison catches
+only the fields its author thought of.
 
 A `ChunkFingerprint` — chunk budget, overlap, breadcrumb budget, chunker version, tokenizer
 ID, grammar-pack version — sits beside it in the same row, on the same terms. Changing it
