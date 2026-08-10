@@ -177,6 +177,12 @@ the same `kind` and the merge stays within budget**. Otherwise it stands alone. 
 dropped — dropping is data loss, and silent data loss is the thing this document is mostly
 about.
 
+**`min_tokens` equals the overlap window, which needs one guard.** A 64-token prose chunk
+followed by a 64-token overlap window would make the next chunk begin as an exact duplicate
+of the whole previous one — two chunks, one of them entirely contained in the other, both
+matching the same query. So **the overlap window is capped at half the preceding chunk**,
+which makes the degenerate case impossible without special-casing it.
+
 ### 1.7 `ChunkFingerprint` — the guardrail, in code
 
 `PLAN.md`'s build-order note is right that chunk size does not touch the schema. It does not
@@ -462,13 +468,26 @@ this ask has been raised there.
 Exact string equality is the wrong assertion. PDF extraction reintroduces ligatures and
 hyphenation, HTML collapses whitespace differently from its source, and DOCX splits a
 sentence across runs. So both sides of every comparison pass through one normaliser, and it
-is defined here rather than per-parser:
+is defined here rather than per-parser.
+
+**Order is load-bearing** — step 3 needs the line breaks that step 4 destroys, so running
+them the other way round silently disables de-hyphenation and nothing fails to indicate it.
 
 1. Unicode NFC.
-2. Replace all whitespace runs (including ` `, `​`, `\f`) with a single space.
-3. Remove soft hyphens (`­`); join words split by `-` immediately before a line break.
-4. Map the ligatures `ﬁ ﬂ ﬀ ﬃ ﬄ` to their letter sequences.
+2. Map the ligatures `U+FB00`–`U+FB04` (`ff`, `fi`, `fl`, `ffi`, `ffl`) to their letter
+   sequences, and remove soft hyphens (`U+00AD`).
+3. **While line breaks still exist:** join words split by `-` immediately before a newline.
+4. Replace every whitespace run — including `U+00A0` no-break space, `U+200B` zero-width
+   space, `\t`, `\f` and newlines — with a single space.
 5. Strip leading and trailing whitespace.
+
+Codepoints are named rather than written literally because several of them are invisible. A
+normalisation rule an implementer cannot see on the page is not a specification.
+
+**NFC rather than NFKC**, deliberately. NFKC would fold the ligatures for free, but it also
+rewrites `½`, superscripts and full-width forms — changes to text that a citation is supposed
+to reproduce verbatim. Folding five ligatures explicitly is the narrow fix; NFKC is a wide one
+that would quietly alter quoted content.
 
 The normaliser is versioned and its version is part of `chunker_version` (§1.7). It is used
 by the tests and by nothing else — stored `text` is never normalised, because `text` is what
@@ -487,8 +506,14 @@ gets shown.
    four. For each group:
 
    ```
-   len(normalize(resolved))  <=  k * sum(len(normalize(c.text)) for c in group)
+   len(normalize(resolved))  <=  k * len(normalize(union_of_source_spans(group)))
    ```
+
+   **The denominator is the union of the group's source spans, not the sum of their text
+   lengths.** Summing double-counts overlap (§1.5): four chunks sharing 64-token windows sum
+   to more characters than the section actually contains, which inflates the right-hand side
+   and makes the bound *easier* to pass the more overlap there is. That is backwards — it
+   weakens the assertion exactly where chunking is densest.
 
    | Anchor | `k` | Why |
    |---|---:|---|
@@ -572,6 +597,10 @@ improvement; raising one requires a note in the PR saying which fixture forced i
 | DOCX, HTML, Jupyter | 0.05 | — |
 | Email | 0.05 | — |
 | Structured | 0.10 | — |
+
+Archive is absent because it emits no chunks (§9.1), so it has nothing to budget. Both
+ratios are asserted per parser against its own fixture corpus, never pooled across parsers —
+pooling would let a well-behaved parser's fixtures pay for a badly-behaved one's.
 
 PDF is `0.00` unlocated and `0.10` page-level because pdfium reports a page index for every
 page — a PDF chunk is never *unlocated*, at worst it is *page-level* when box extraction
@@ -826,6 +855,13 @@ One of the 40 settings. **Keyed by media type**, value an ordered list of parser
   removes a whole class of question about how the two interact.
 - **`"*"` supplies a global tail**, appended to every chain. Shipping `["plaintext"]` there
   means an unknown text-ish file is indexed with real `LineAnchor`s rather than skipped.
+
+  **This only works because the plaintext parser refuses non-text bytes.** It declares the
+  input unsupported when the bytes contain a NUL or do not decode as UTF-8 (or a confidently
+  detected text encoding). Without that refusal a shipped `"*"` tail would index every
+  unrecognised binary as mojibake — a JPEG becoming a page of replacement characters that
+  matches queries by accident — and would make `unsupported_media_type` unreachable, since
+  some parser would always claim every document.
 - User configuration **replaces** the chain for a media type rather than merging into it.
   Merging produces chains nobody can predict from reading the config.
 - **A named parser that is not installed is a startup error**, not a silent skip. A chain
@@ -840,9 +876,17 @@ One of the 40 settings. **Keyed by media type**, value an ordered list of parser
 Chains rot when "failure" is fuzzy. Three categories, and only two of them advance the
 chain:
 
-**Hard failure — advance.** The parser raises; declares the input unsupported; produces
-structurally invalid blocks; exceeds its per-parser time limit; or exceeds its per-parser
-memory limit. The reason is recorded per attempt.
+**Hard failure — advance.** The parser raises; produces structurally invalid blocks; exceeds
+its per-parser time limit; or exceeds its per-parser memory limit. The reason is recorded per
+attempt.
+
+**Declined — advance, and tracked separately.** The parser inspected the input and declared
+it unsupported without attempting to parse: the plaintext parser handed a JPEG, the archive
+parser handed an OOXML container (§9.4). This is distinct from a hard failure for the same
+reason `no_extractable_text` is distinct from `parse_failed` — a parser that *declined* is
+reporting that the document is not its kind, which is information, whereas one that *raised*
+is reporting that something broke. If every parser in the chain declined, the document is
+`unsupported_media_type`; if any raised, it is `parse_failed`.
 
 **Empty output — advance, and remember that it happened.** The parser returned zero
 text-bearing blocks without raising. This *must* advance the chain, because that is the
@@ -866,7 +910,7 @@ parse stage produces, and each is load-bearing.
 | `parsed` | a parser returned ≥ 1 chunk | ≥ 1 |
 | `no_extractable_text` | chain completed, nothing hard-failed, every parser returned zero text | 0 |
 | `parse_failed` | every parser in the chain hard-failed | 0 |
-| `unsupported_media_type` | no chain matched and no `"*"` tail applied | 0 |
+| `unsupported_media_type` | no chain matched, or every parser in it declined (§6.3) | 0 |
 | `container` | an archive whose members were expanded into their own documents (§9) | 0 |
 
 **The mixed case, stated because it is the one an implementation guesses at.** A chain where
@@ -1359,6 +1403,14 @@ the source, produces anchors that drift the moment formatting differs.
 
 - **YAML** — `ruamel.yaml` in round-trip mode carries line and column marks on mappings and
   sequences. Blocks split at top-level keys; `symbol` is the dotted key path.
+
+  **This deviates from `PLAN.md` §5, which names PyYAML**, and the reason is not
+  convenience. PyYAML implements **YAML 1.1**; `ruamel.yaml` implements **1.2**. Two
+  consequences, both load-bearing here: 1.2 is the version that is very nearly a JSON
+  superset, which is the whole basis of the JSON position strategy below — and 1.1 has the
+  Norway problem, parsing unquoted `no`, `off` and `yes` as booleans, so a config file
+  documenting a country code would be indexed with `False` where the source says `no`. That
+  is a citation reproducing something the document does not say.
 - **JSON** — YAML 1.2 is very nearly a superset of JSON, so the same mark-bearing parser
   gives positions for JSON files, including compact one-line objects with no space after the
   colon. It is *nearly*, not exactly, and the two divergences are both real:
