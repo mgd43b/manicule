@@ -272,23 +272,29 @@ Real, found in the source, worth not reproducing.
 
 ## Build order
 
-| | | |
-|---|---|---|
-| 1 | Protocols, container, config | Everything plugs in here |
-| 2 | Storage and data model | 16 tables, Alembic, LanceDB |
-| 3 | Embeddings | Fixes vector dimensionality — settle before the schema exists |
-| 4 | Parsers and chunking | The largest upgrade |
-| 5 | Ingest pipeline | Middleware, fallbacks, dedup, retention |
-| 6 | Retrieval | Dense + BM25 + RRF + rerank |
-| 7 | Generation and chat | litellm, streaming, citations, multi-turn |
-| 8 | **MCP and CLI** | Ship early — daily use finds what tests do not |
-| 9 | Connectors | All eight, with real incremental sync |
-| 10 | Document management | Collections, tags, versions, chunk relations |
-| 11 | HTTP API | |
-| 12 | Web UI | |
-| 13 | Team mode | Auth, workspaces, audit, redaction |
-| 14 | Operations | Backup, export, doctor, telemetry, webhooks |
-| 15 | Quality baseline | Measure retrieval quality on a real corpus. OpenDocuments is one baseline to beat; the point is knowing the number at all |
+Issue numbers match these steps exactly — step 4 is [#4](https://github.com/mgd43b/manicule/issues/4).
 
-Steps 3 and 4 land before 2 finishes: the schema fixes vector dimensionality and assumes a
-chunk size, and changing either later means re-embedding everything.
+| | Ticket | Phase | |
+|---|---|---|---|
+| 1 | [Protocols, container & config](https://github.com/mgd43b/manicule/issues/1) | Core | Everything plugs in here |
+| 2 | [Storage & data model](https://github.com/mgd43b/manicule/issues/2) | Core | 16 tables, Alembic, LanceDB |
+| 3 | [Embeddings](https://github.com/mgd43b/manicule/issues/3) | Core | ⚠️ fixes vector dimensionality |
+| 4 | [Parsers & chunking](https://github.com/mgd43b/manicule/issues/4) | Core | ⚠️ fixes chunk size. The largest upgrade |
+| 5 | [Ingest pipeline](https://github.com/mgd43b/manicule/issues/5) | Core | |
+| 6 | [Retrieval](https://github.com/mgd43b/manicule/issues/6) | Core | |
+| 7 | [Generation & chat](https://github.com/mgd43b/manicule/issues/7) | Usable | |
+| 8 | [MCP server & CLI](https://github.com/mgd43b/manicule/issues/8) | Usable | **Ship early** — daily use finds what tests do not |
+| 15 | [Retrieval quality baseline](https://github.com/mgd43b/manicule/issues/15) | Usable | Starts here, continues forever |
+| 9 | [Connectors](https://github.com/mgd43b/manicule/issues/9) | Reach | All eight, with real incremental sync |
+| 10 | [Document management](https://github.com/mgd43b/manicule/issues/10) | Reach | |
+| 11 | [HTTP API](https://github.com/mgd43b/manicule/issues/11) | Interfaces | |
+| 12 | [Web UI](https://github.com/mgd43b/manicule/issues/12) | Interfaces | |
+| 13 | [Team mode & security](https://github.com/mgd43b/manicule/issues/13) | Production | |
+| 14 | [Operations](https://github.com/mgd43b/manicule/issues/14) | Production | |
+
+**One ordering constraint that costs real money to get wrong:** #3 and #4 settle vector
+dimensionality and chunk size, and the schema in #2 fixes both. Changing either afterwards
+means re-embedding the entire corpus. Do them before #2's schema is created.
+
+Everything else can slip without penalty. #15 is deliberately early and never finishes —
+it is the gate on every deferred retrieval feature in #6.
