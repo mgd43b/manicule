@@ -480,6 +480,15 @@ class DictConnector:
         self.reconcile_fails_after: int | None = None
         self.hidden: set[str] = set()
 
+    @property
+    def watermark(self) -> Watermark | None:
+        """Nothing: a dictionary has no change signal to report a position from.
+
+        The honest answer for a source with no native watermark, and the one that keeps the
+        pipeline re-enumerating rather than believing an invented position.
+        """
+        return None
+
     async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
         del watermark
         for source_id, text in sorted(self.documents.items()):

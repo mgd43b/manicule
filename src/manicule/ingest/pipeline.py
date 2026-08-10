@@ -49,7 +49,6 @@ from manicule.core.errors import (
 )
 from manicule.core.ids import content_hash, document_id
 from manicule.ingest.embedding import embed_chunks
-from manicule.ingest.ports import SupportsWatermark
 from manicule.ingest.workers import AttemptResult
 from manicule.parsers.chain import (
     Attempt,
@@ -276,15 +275,18 @@ class IngestPipeline:
         recovery sweep requeues anything caught in flight. So resume is: run it again. There is
         no checkpoint file, no resume token, and nothing to corrupt.
 
-        The position is asked for rather than required, on the same principle as the lifecycle
-        hooks in :mod:`manicule.core.lifecycle`: a connector that has one implements
-        :class:`~manicule.ingest.ports.SupportsWatermark` and a connector that does not writes
-        nothing. Forcing it onto the ``Connector`` protocol would make every source invent a
-        position, and a source with no change signal inventing one is worse than a source that
-        re-enumerates — the invented one is believed.
+        ``Connector.watermark`` is the other half of ``discover``, which consumes a position and
+        for a while had nowhere to produce the next one. A connector with no change signal
+        answers ``None`` and nothing is written — which is the honest outcome, because a source
+        that cannot say where it got to re-enumerating is cheaper than one that invents a
+        position and is believed.
+
+        **Two independent checks guard the same write, and that is the right number.** The
+        connector answers ``None`` until its own enumeration completed;
+        :func:`manicule.testing.assert_connector_contract` holds it to that. This end refuses on
+        a run that did not finish. Persisting a partly-advanced position does not delay the
+        documents it skipped — it makes them permanently invisible, with nothing raised.
         """
-        if not isinstance(connector, SupportsWatermark):
-            return
         reached = connector.watermark
         if reached is not None:
             await self._store.set_watermark(connector.name, reached)

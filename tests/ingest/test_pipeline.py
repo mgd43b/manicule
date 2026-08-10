@@ -571,6 +571,7 @@ class _Positioned(fakes.DictConnector):
         self.fail_discovery = False
 
     @property
+    @override
     def watermark(self) -> Watermark:
         return Watermark(value=self.position, observed_at=datetime.now(UTC))
 

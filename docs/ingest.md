@@ -866,13 +866,19 @@ corrupt. The only cost is re-enumeration, which is exactly the cost the watermar
 bound.
 
 **Where the new watermark comes from, which this document did not say.** `Connector.discover`
-*takes* a position and nothing in `contracts.md` §3 *returns* one, so a pipeline written to the
-protocol alone can never advance it — and "the watermark advances only on a clean run" would be
-a rule about a write that never happens. A connector with a native change signal therefore
-implements `SupportsWatermark` (`manicule.ingest.ports`), one method, detected separately on the
-same principle as the lifecycle hooks: a source that has a position reports it, a source that
-does not writes nothing and re-enumerates. Widening `Connector` itself would make every source
-invent one, and an invented position is worse than none, because it is believed.
+*took* a position and nothing returned one, so a pipeline written to the protocol alone could
+never advance it — and "the watermark advances only on a clean run" was a rule about a write
+that never happened. Two workers found the same hole from opposite ends, and it is now
+`Connector.watermark` in `contracts.md` §3: a read-only property answering how far the last
+*completed* enumeration got, `None` when the source has no change signal or the enumeration did
+not finish.
+
+**Two independent checks guard that write, which is the right number.** The connector answers
+`None` until its own enumeration completed, and `assert_connector_contract` holds every
+connector to it by abandoning a stream after one document and requiring the position has not
+moved. The pipeline refuses on a run that did not finish. Persisting a partly-advanced position
+does not *delay* the documents it skipped — it makes them permanently invisible, with nothing
+raised, which is why one check is not enough.
 
 **The exception, stated:** a connector whose `discover` is not restartable from a watermark
 re-enumerates fully. That is a connector property, not a pipeline one, and it is visible in
@@ -959,7 +965,7 @@ Decisions the implementation added, each argued where it appears:
 | In-flight statuses are written only for a document with nothing servable to lose | §9 |
 | Container expansion is a parse attempt, decided in the worker that holds the parser | §2 |
 | `middleware` is a `failed_stage` value, positioned after the six stages | §2.2 |
-| A connector reports its position through an optional `SupportsWatermark`, asked only on a clean run | §13.2 |
+| A connector reports its position through `Connector.watermark`, asked only on a clean run | §13.2 |
 | Retention happens before any hook, so retained bytes are the connector's and `content_hash` describes them | §4.2 |
 | Members of a container are counted apart from discovered documents, so one archive cannot exhaust a `--limit` | §13.1 |
 
