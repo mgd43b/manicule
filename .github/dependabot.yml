@@ -1,0 +1,219 @@
+# Dependency update automation.
+#
+# The organising idea is that not every bump costs the same. Most of them risk a regression,
+# which CI catches. A few of them change what is *in the index* — the stored vectors, the
+# chunk boundaries, or the text a document was reduced to — and the cost of accepting one is
+# re-ingesting the corpus, which no test can pay on a maintainer's behalf. Those are grouped
+# under an `index-affecting-` prefix so the pull request title says so before it is opened.
+#
+# What Dependabot does not do is check licences. This project is GPL-3.0-or-later and has
+# rejected dependencies on licence grounds; a bump that changes a dependency's licence is a
+# real event and nothing here will catch it. CONTRIBUTING.md, "Reviewing a dependency
+# update", says what to do about that.
+
+version: 2
+
+updates:
+  # ----------------------------------------------------------------------------------------
+  # GitHub Actions
+  # ----------------------------------------------------------------------------------------
+  # `/` is the documented value for this ecosystem and does not mean the repository root in
+  # the usual sense: Dependabot searches `.github/workflows/` plus a root `action.yml`. There
+  # are no composite actions here, so `/` is the whole surface.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      # One pull request for the lot. These are pinned by major tag, they move together, and
+      # a failure is immediate and total rather than subtle — CI either runs or it does not.
+      github-actions:
+        patterns: ["*"]
+
+  # ----------------------------------------------------------------------------------------
+  # Python — one uv workspace, one lockfile
+  # ----------------------------------------------------------------------------------------
+  # `directory: "/"` covers the workspace *including* `packages/manicule-plugin-example` and
+  # `packages/manicule-plugin-hostile`. There is exactly one `uv.lock`, at the root, and its
+  # `[manifest] members` table names all three projects; Dependabot's uv ecosystem reads the
+  # workspace from there. Adding `directories: ["/", "/packages/*"]` would be wrong, not
+  # merely redundant: each member directory holds a `pyproject.toml` with no lockfile beside
+  # it, whose only dependency is `manicule` itself, which is resolved through
+  # `[tool.uv.sources]` and is not published to PyPI. Pointing Dependabot at them asks it to
+  # resolve a package that does not exist on any index.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    # Five groups, and headroom. The default of 5 would sit exactly on the boundary, and the
+    # failure mode is silent: Dependabot stops opening pull requests rather than reporting
+    # that it wanted to. The headroom is for the weeks when a group cannot be updated as one
+    # — a member with an incompatible constraint is raised on its own — which is precisely
+    # when the queue is longest and least worth truncating.
+    open-pull-requests-limit: 10
+    # Security updates are deliberately left alone by everything above. They are not subject
+    # to `open-pull-requests-limit`, they do not wait for Monday, and `groups` defaults to
+    # `applies-to: version-updates`, so an advisory produces its own pull request the day it
+    # lands rather than joining a batch. That is the intended behaviour and the reason no
+    # group below sets `applies-to`.
+    #
+    # `commit-message` is deliberately unset on both blocks. Its default is to follow the
+    # patterns already in the repository, which produces "Bump x from 1 to 2" — imperative,
+    # which is what CONTRIBUTING.md asks for. A `prefix` would replace that with a
+    # conventional-commit form this repository does not otherwise use.
+    #
+    # Every dependency in this project is declared with a bare `>=` floor, which reads as
+    # "the oldest version we have tested" rather than as a resolution. The default strategy
+    # tries to guess whether a project is an app or a library and, for a library, *widens* —
+    # which would start writing upper bounds into pyproject.toml that nobody chose.
+    # `increase-if-necessary` leaves a floor alone whenever the new release already satisfies
+    # it, so the ordinary bump moves uv.lock and touches nothing else.
+    versioning-strategy: "increase-if-necessary"
+    ignore:
+      # The three workspace members. They resolve through `[tool.uv.sources]`, never from an
+      # index, and none of them is published. Without this, a package registered on PyPI
+      # under one of these names could be offered as an "update" to a local path dependency.
+      - dependency-name: "manicule"
+      - dependency-name: "manicule-plugin-example"
+      - dependency-name: "manicule-plugin-hostile"
+
+    # Group order is meaningful: a dependency joins the first group it matches. The
+    # `index-affecting-*` groups are therefore first, and `runtime` — the only group with a
+    # wildcard — repeats their patterns under `exclude-patterns` as well. That duplication is
+    # deliberate. Relying on ordering alone would mean one wildcard away from `mlx-embeddings`
+    # arriving in a pull request titled "the runtime group", which is exactly the outcome all
+    # of this exists to prevent.
+    #
+    # Note that these groups cannot carry their own labels — `labels` is a property of the
+    # update block, not of a group — so the group identifier is the signal. It is the text
+    # Dependabot puts in the branch name and the pull request title.
+    groups:
+      # --- index-affecting: the stored vectors ------------------------------------------
+      # A bump here can change the numbers written into the vector index. `EmbedFingerprint`
+      # exists to refuse an index built with something else, and the macOS backend parity job
+      # compares MLX against ONNX within a stated tolerance, so a genuinely divergent bump
+      # should go red rather than merge — but red is a signal, not a fix. Accepting one of
+      # these means re-embedding the corpus.
+      #
+      # `mlx-embeddings` is the sharp edge: it is at 0.1.0 and binds `last_hidden_state` to
+      # different meanings on different architectures, so a patch release can move vectors
+      # without changing an API. `tokenizers` is worse than it looks — `tokenizer_id` is an
+      # identity field of *both* fingerprints, so a vocabulary change invalidates the chunk
+      # boundaries as well as the vectors. `numpy` is here because pooling and normalisation
+      # are done in manicule's own numpy rather than taken from a backend's convenience
+      # output, which puts it in the path that decides what a vector is.
+      #
+      # The patterns reach past the declared extra on purpose. `mlx` and `mlx-metal` are the
+      # array framework and the Metal kernels underneath `mlx-embeddings` — the arithmetic
+      # that produces the vectors is theirs, not its. `transformers` loads the model and
+      # tokenizer configuration, `sentencepiece` is the tokenizer implementation the bge
+      # models actually use, and `safetensors` is the format the executed weights arrive in;
+      # a corpus is only portable between backends because those agree.
+      #
+      # The line is drawn at libraries that decide what a vector *is*. It is not drawn at
+      # every transitive beneath them — `regex`, `protobuf` and `flatbuffers` are also in
+      # the path, and at that point the group stops distinguishing anything.
+      index-affecting-embedding:
+        patterns:
+          - "mlx"
+          - "mlx-*"
+          - "onnxruntime"
+          - "onnxruntime-*"
+          - "tokenizers"
+          - "sentencepiece"
+          - "transformers"
+          - "safetensors"
+          - "huggingface-hub"
+          - "numpy"
+
+      # --- index-affecting: where chunks begin and end ----------------------------------
+      # `ChunkFingerprint` records grammar versions per language, so a
+      # `tree-sitter-language-pack` bump invalidates the code documents in the languages it
+      # moved and leaves the rest alone. That selectivity is the whole reason the field is a
+      # mapping, and it is why this is a cheaper event than an embedding bump — but it is
+      # still a re-chunk and therefore a re-embed of what it touches.
+      #
+      # `tiktoken` is in this group for a reason worth stating, because it is the one case
+      # the fingerprints do not catch. It backs the *provisional* token counter, which
+      # records `tokenizer_id` as the literal string "provisional". That string does not
+      # change when tiktoken's vocabulary does, so a bump can move chunk boundaries under a
+      # fingerprint that still matches. This grouping is the only warning there is.
+      index-affecting-chunking:
+        patterns:
+          - "tiktoken"
+          - "tree-sitter"
+          - "tree-sitter-*"
+
+      # --- index-affecting: what a document was reduced to -------------------------------
+      # These decide the text that ends up in the corpus, and unlike the two groups above
+      # nothing refuses on their behalf: no fingerprint records a parser version. A bump
+      # changes what the same bytes parse to, so a document ingested before it and a document
+      # ingested after it disagree, and the corpus is quietly inconsistent rather than
+      # loudly wrong. Anchors are the other half of it — `assert_parser_contract` checks that
+      # every anchor still resolves to the text its block claims, which is what would catch a
+      # library that changed its coordinate or offset conventions.
+      #
+      # `lxml` is here rather than in `runtime` because it is what `python-docx` and
+      # `python-pptx` read OOXML *with*: the XML parse is the extraction step, and neither
+      # library would notice it changing. `ruamel*` is a wildcard because the declared name
+      # is `ruamel.yaml` and the resolved name is `ruamel-yaml` — package names normalise
+      # under PEP 503, and a literal `ruamel.yaml` pattern would match neither the lockfile
+      # entry nor the accelerator `ruamel-yaml-clib` beneath it.
+      index-affecting-extraction:
+        patterns:
+          - "pypdfium2"
+          - "selectolax"
+          - "lxml"
+          - "python-docx"
+          - "python-pptx"
+          - "python-calamine"
+          - "nbformat"
+          - "markdown-it-py"
+          - "ruamel*"
+
+      # --- routine ----------------------------------------------------------------------
+      # Development tooling. A bump here can fail the build; it cannot change a stored byte.
+      # `groups.dependency-type` would have expressed this directly, but it is documented as
+      # supported for `bundler`, `composer`, `mix`, `maven`, `npm` and `pip` only — not for
+      # `uv` — so the split is by name instead.
+      dev-tooling:
+        patterns:
+          - "pytest"
+          - "pytest-*"
+          - "ruff"
+          - "pyright"
+          - "reportlab"
+          - "openpyxl"
+
+      # Everything else, and anything transitive that Dependabot surfaces from uv.lock.
+      # Storage, HTTP, config and the reranker live here. `sentence-transformers` — and
+      # `torch`, `scikit-learn` and `scipy` under it — is deliberately *not* index-affecting:
+      # the cross-encoder runs at query time and reorders results, so a bump changes answers
+      # rather than the corpus, and no re-ingest follows from it.
+      runtime:
+        patterns: ["*"]
+        exclude-patterns:
+          - "mlx"
+          - "mlx-*"
+          - "onnxruntime"
+          - "onnxruntime-*"
+          - "tokenizers"
+          - "sentencepiece"
+          - "transformers"
+          - "safetensors"
+          - "huggingface-hub"
+          - "numpy"
+          - "tiktoken"
+          - "tree-sitter"
+          - "tree-sitter-*"
+          - "pypdfium2"
+          - "selectolax"
+          - "lxml"
+          - "python-docx"
+          - "python-pptx"
+          - "python-calamine"
+          - "nbformat"
+          - "markdown-it-py"
+          - "ruamel*"
