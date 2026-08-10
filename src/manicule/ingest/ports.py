@@ -24,7 +24,29 @@ if TYPE_CHECKING:
     from manicule.core.content import Chunk, Document, DocumentStatus, Metadata
     from manicule.core.embedding import IndexFingerprints
     from manicule.core.retrieval import Filter
-    from manicule.core.sources import SourceId, Watermark
+    from manicule.core.sources import SourceId
+
+from manicule.core.sources import Watermark
+
+
+@runtime_checkable
+class SupportsWatermark(Protocol):
+    """A connector that can say how far a run got.
+
+    Optional, and detected separately — the same shape as the lifecycle hooks in
+    :mod:`manicule.core.lifecycle`, and for the same reason. A source with a native change
+    signal (a Confluence ``lastmodified``, a Drive page token, a commit SHA) has a position
+    worth storing; a source without one has nothing to report, and an invented position is
+    worse than none because it gets believed on the next run.
+
+    The pipeline asks only after a **clean** run. A cancelled or failed run is an incomplete
+    run, and advancing past documents it never reached is how a sync silently skips them
+    forever.
+    """
+
+    def watermark(self) -> Watermark | None:
+        """How far this connector got, or ``None`` if it cannot say."""
+        ...
 
 
 @runtime_checkable
@@ -193,4 +215,4 @@ class IngestStore(Protocol):
         ...
 
 
-__all__ = ["IngestStore"]
+__all__ = ["IngestStore", "SupportsWatermark"]

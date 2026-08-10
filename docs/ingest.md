@@ -865,6 +865,15 @@ So resume is: run it again. There is no checkpoint file, no resume token, and no
 corrupt. The only cost is re-enumeration, which is exactly the cost the watermark exists to
 bound.
 
+**Where the new watermark comes from, which this document did not say.** `Connector.discover`
+*takes* a position and nothing in `contracts.md` §3 *returns* one, so a pipeline written to the
+protocol alone can never advance it — and "the watermark advances only on a clean run" would be
+a rule about a write that never happens. A connector with a native change signal therefore
+implements `SupportsWatermark` (`manicule.ingest.ports`), one method, detected separately on the
+same principle as the lifecycle hooks: a source that has a position reports it, a source that
+does not writes nothing and re-enumerates. Widening `Connector` itself would make every source
+invent one, and an invented position is worse than none, because it is believed.
+
 **The exception, stated:** a connector whose `discover` is not restartable from a watermark
 re-enumerates fully. That is a connector property, not a pipeline one, and it is visible in
 `doctor` rather than hidden.
@@ -950,6 +959,9 @@ Decisions the implementation added, each argued where it appears:
 | In-flight statuses are written only for a document with nothing servable to lose | §9 |
 | Container expansion is a parse attempt, decided in the worker that holds the parser | §2 |
 | `middleware` is a `failed_stage` value, positioned after the six stages | §2.2 |
+| A connector reports its position through an optional `SupportsWatermark`, asked only on a clean run | §13.2 |
+| Retention happens before any hook, so retained bytes are the connector's and `content_hash` describes them | §4.2 |
+| Members of a container are counted apart from discovered documents, so one archive cannot exhaust a `--limit` | §13.1 |
 
 ## Appendix B: filed, not deferred
 

@@ -49,6 +49,7 @@ from manicule.core.errors import (
 )
 from manicule.core.ids import content_hash, document_id
 from manicule.ingest.embedding import embed_chunks
+from manicule.ingest.ports import SupportsWatermark
 from manicule.ingest.workers import AttemptResult
 from manicule.parsers.chain import Attempt, ChainResult, Outcome, container_result, run_chain
 from manicule.parsers.expansion import ExpandedMember, MemberFailure
@@ -141,6 +142,13 @@ class RunReport:
 
     connector: str = ""
     discovered: int = 0
+    """Documents the connector reported. Members found inside them are counted separately."""
+
+    expanded: int = 0
+    """Documents found *inside* others. Kept apart from ``discovered`` because they are not
+    what the source enumerated — and because ``discovered`` is what a ``--limit`` bounds, and
+    one archive of five hundred members must not consume a limit of ten."""
+
     skipped_version: int = 0
     skipped_hash: int = 0
     by_status: dict[str, int] = field(default_factory=dict[str, int])
@@ -155,8 +163,11 @@ class RunReport:
         """Whether the run finished. Only a clean run advances a watermark."""
         return not self.error
 
-    def record(self, outcome: DocumentOutcome) -> None:
-        self.discovered += 1
+    def record(self, outcome: DocumentOutcome, *, expanded: bool = False) -> None:
+        if expanded:
+            self.expanded += 1
+        else:
+            self.discovered += 1
         if outcome.skipped == "version":
             self.skipped_version += 1
             return
@@ -170,6 +181,7 @@ class RunReport:
         return {
             "last_run": {
                 "discovered": self.discovered,
+                "expanded": self.expanded,
                 "skipped_version": self.skipped_version,
                 "skipped_hash": self.skipped_hash,
                 "by_status": dict(self.by_status),
@@ -231,8 +243,10 @@ class IngestPipeline:
         stream = connector.discover(watermark)
         try:
             async for discovered in stream:
-                for outcome in await self.ingest(connector, discovered):
-                    report.record(outcome)
+                for position, outcome in enumerate(await self.ingest(connector, discovered)):
+                    # The first outcome is the discovered document; anything after it came out
+                    # of the inside of it.
+                    report.record(outcome, expanded=position > 0)
                 if limit is not None and report.discovered >= limit:
                     break
         except Exception as exc:  # noqa: BLE001 - an enumeration failure is not a crash
@@ -241,8 +255,32 @@ class IngestPipeline:
             closer = getattr(stream, "aclose", None)
             if closer is not None:
                 await closer()
+        if report.clean:
+            await self._advance_watermark(connector)
         await self._store.record_connector_metadata(connector.name, report.as_metadata())
         return report
+
+    async def _advance_watermark(self, connector: Connector) -> None:
+        """Record how far a clean run got, if the connector can say.
+
+        **Only on a clean run**, and that is the whole of resumability. An interrupted sync
+        re-enumerates from the last good point; change detection (§4) makes re-enumeration
+        cheap, because already-ingested documents skip at level 1 without a fetch; and the
+        recovery sweep requeues anything caught in flight. So resume is: run it again. There is
+        no checkpoint file, no resume token, and nothing to corrupt.
+
+        The position is asked for rather than required, on the same principle as the lifecycle
+        hooks in :mod:`manicule.core.lifecycle`: a connector that has one implements
+        :class:`~manicule.ingest.ports.SupportsWatermark` and a connector that does not writes
+        nothing. Forcing it onto the ``Connector`` protocol would make every source invent a
+        position, and a source with no change signal inventing one is worse than a source that
+        re-enumerates — the invented one is believed.
+        """
+        if not isinstance(connector, SupportsWatermark):
+            return
+        reached = connector.watermark()
+        if reached is not None:
+            await self._store.set_watermark(connector.name, reached)
 
     async def ingest(
         self, connector: Connector, discovered: DiscoveredDoc
@@ -347,7 +385,8 @@ class IngestPipeline:
         force: bool = False,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """One document, and whatever it turned out to contain."""
-        digest = content_hash(raw.as_bytes())
+        source_bytes = raw.as_bytes()
+        digest = content_hash(source_bytes)
         if existing is None:
             existing = await self._store.find_document(source, raw.source_id)
 
@@ -366,6 +405,15 @@ class IngestPipeline:
         identifier = (
             existing.id if existing else document_id(self._workspace, source, raw.source_id)
         )
+
+        # Retention happens **before** any hook runs, and that ordering is load-bearing twice
+        # over. `documents.content_hash` is the hash of what the connector returned
+        # (`storage.md` §4.2), so retaining post-hook bytes would leave the reference and the
+        # hash describing different content. And re-parse feeds retained bytes back through
+        # this same path, hooks included — so retaining the transformed bytes would apply
+        # `before_parse` twice, and a hook that is not idempotent would compound on every
+        # repair. What is kept is the original, exactly as fetched.
+        retention = await self._retain(raw, source_bytes)
 
         try:
             transformed = await self._middleware.before_parse(raw)
@@ -400,7 +448,6 @@ class IngestPipeline:
             return skipped, ()
         raw = transformed
 
-        retention = await self._retain(raw)
         await self._advance(existing, DocumentStatus.PARSING)
 
         result, members = await self._parse(raw)
@@ -676,9 +723,15 @@ class IngestPipeline:
 
     # --- records ---------------------------------------------------------------------------
 
-    async def _retain(self, raw: RawDocument) -> Retention:
+    async def _retain(self, raw: RawDocument, source_bytes: bytes) -> Retention:
+        """Keep the connector's bytes, or record why they were not kept.
+
+        Failing to retain never fails a document: the document is still indexable, and what is
+        lost is a repair option rather than content. The reason is recorded so the set of
+        documents for which a re-crawl is the only repair stays a query.
+        """
         try:
-            return await self._blobs.retain(raw.as_bytes(), raw.media_type)
+            return await self._blobs.retain(source_bytes, raw.media_type)
         except Exception as exc:  # noqa: BLE001 - failing to keep bytes must not fail a document
             return Retention(omitted_reason=f"retention failed: {type(exc).__name__}: {exc}")
 

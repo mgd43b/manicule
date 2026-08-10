@@ -6,6 +6,7 @@ surviving failure is certified by nothing if only its happy path is exercised.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, override
 
 import pytest
@@ -493,6 +494,102 @@ async def test_a_document_larger_than_the_fetch_cap_fails_at_fetch() -> None:
 
 
 # --- run counters ------------------------------------------------------------------------------
+
+
+async def test_the_watermark_advances_only_on_a_clean_run() -> None:
+    """The whole of resumability: an interrupted sync re-enumerates from the last good point.
+
+    Advancing after a run that failed part-way would skip every document the run never
+    reached, on every future sync, silently — which is the opposite of resuming.
+    """
+    pipeline, store, _ = build()
+    connector = _Positioned({"a": "alpha"})
+
+    await pipeline.run(connector)
+    assert store.watermarks["memory"].value == "position-1"
+
+    connector.fail_discovery = True
+    connector.position = "position-2"
+    await pipeline.run(connector)
+
+    assert store.watermarks["memory"].value == "position-1", (
+        "a run that did not finish is not a run whose position may be believed"
+    )
+
+
+async def test_a_connector_that_cannot_report_a_position_writes_no_watermark() -> None:
+    """A source with no change signal has nothing to report, and an invented one gets believed."""
+    pipeline, store, _ = build()
+
+    await pipeline.run(fakes.DictConnector({"a": "alpha"}))
+
+    assert store.watermarks == {}
+
+
+async def test_the_bytes_that_are_retained_are_the_ones_the_connector_returned() -> None:
+    """Retention happens before any hook, and both halves of that matter.
+
+    ``content_hash`` is the hash of what the connector returned, so retaining post-hook bytes
+    would leave the reference and the hash describing different content. And re-parse feeds
+    retained bytes back through this same path — hooks included — so retaining transformed
+    bytes would apply ``before_parse`` twice, compounding on every repair.
+    """
+    blobs = fakes.MemoryBlobs()
+    pipeline, store, _ = build(blobs=blobs, middleware=(_Prefixing(),))
+
+    await pipeline.run(fakes.DictConnector({"a": "alpha"}))
+
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert document.original_ref == document.content_hash, (
+        "storage.md §4.2: original_ref is the same value as content_hash when retention worked"
+    )
+    assert blobs.data[document.content_hash] == b"alpha"
+
+
+async def test_members_of_a_container_do_not_consume_a_discovery_limit() -> None:
+    """One archive of five hundred members must not exhaust a limit of ten."""
+    pipeline, _, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=beta\nthree=gamma"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+
+    report = await pipeline.run(connector)
+
+    assert report.discovered == 1
+    assert report.expanded == 3
+
+
+class _Positioned(fakes.DictConnector):
+    """A connector that can say how far it got, and can fail part-way through saying it."""
+
+    def __init__(self, documents: Mapping[str, str]) -> None:
+        super().__init__(documents)
+        self.position = "position-1"
+        self.fail_discovery = False
+
+    def watermark(self) -> Watermark:
+        return Watermark(value=self.position, observed_at=datetime.now(UTC))
+
+    @override
+    async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+        async for found in super().discover(watermark):
+            yield found
+        if self.fail_discovery:
+            msg = "the search cursor expired"
+            raise RuntimeError(msg)
+
+
+class _Prefixing(fakes.PassThrough):
+    """Rewrites the fetched bytes before parsing, which a hook is allowed to do."""
+
+    name = "prefixing"
+
+    @override
+    async def before_parse(self, raw: RawDocument) -> RawDocument | None:
+        return raw.model_copy(update={"content": f"# header\n{raw.as_text()}"})
 
 
 async def test_run_counters_land_on_the_connector_row() -> None:
