@@ -27,7 +27,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --all-groups
+      - run: uv sync --all-groups --all-extras
       - name: ruff check
         run: uv run ruff check .
       - name: ruff format
@@ -43,7 +43,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --all-groups
+      - run: uv sync --all-groups --all-extras
       - name: pyright (strict)
         run: uv run pyright
 
@@ -59,9 +59,31 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --all-groups --python ${{ matrix.python }}
+      - run: uv sync --all-groups --all-extras --python ${{ matrix.python }}
       - name: pytest
         run: uv run --python ${{ matrix.python }} pytest --cov --cov-report=term-missing
+
+  # A model edited without a migration and a downgrade that has never run both look exactly
+  # like a healthy repository. Its own job so a drifted schema is distinguishable from a
+  # failing test at a glance. Closes #18.
+  migrations:
+    name: migrations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --all-extras
+      - name: alembic check (models match migrations)
+        # `check` compares the models against a live database, so one has to exist at head
+        # first. The scratch database is created in the runner's working directory and
+        # discarded with it.
+        run: |
+          uv run alembic upgrade head
+          uv run alembic check
+      - name: downgrade round trip
+        run: uv run pytest tests/test_storage_migrations.py -q
 
   # Runs on every pull request, including ones that touch no Python at all. The repository
   # is mostly cross-referenced design documents, and a heading renumbered in one file

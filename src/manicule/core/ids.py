@@ -28,9 +28,23 @@ def content_hash(data: bytes | str) -> str:
     return _digest(data)
 
 
-def document_id(source: str, source_id: str) -> str:
-    """A document's id: stable across re-ingest, unique across connectors."""
-    return _digest("document", source, source_id)
+def document_id(workspace_id: str, source: str, source_id: str) -> str:
+    """A document's id: stable across re-ingest, unique across workspaces and connectors.
+
+    **``workspace_id`` is part of the identity, not a filter applied afterwards.** Two
+    workspaces indexing the same upstream source are two documents. Deriving the id from
+    ``(source, source_id)`` alone makes them one, and the consequence is not a clash anybody
+    notices: the second workspace's write lands on the first workspace's row, overwriting
+    content its author cannot read, while its own document appears to vanish because the row
+    belongs to somebody else. Workspace isolation is enforced on every query, and an identity
+    that ignores the workspace defeats it before any query runs.
+
+    The cost is honest and small. The same source synced into two workspaces produces two
+    documents, two chunk sets and two sets of vectors — which is what isolation *means*. It
+    does not duplicate the corpus itself: retained bytes are content-addressed, so both
+    workspaces reference one blob.
+    """
+    return _digest("document", workspace_id, source, source_id)
 
 
 def chunk_id(document_id_: str, position: int, text: str) -> str:
