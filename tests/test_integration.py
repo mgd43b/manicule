@@ -14,17 +14,29 @@ from manicule_plugin_example import MEDIA_TYPE
 
 from manicule.config.settings import Settings
 from manicule.container import build_container, keys
-from manicule.core.errors import PolicyError
-from manicule.core.protocols import Parser
-from manicule.plugins import ComponentKind, ComponentRegistry, discover
-from manicule.testing import assert_parser_contract
-from tests.fakes import BlockChunker, HashEmbedder, make_raw
+from manicule.core.content import Document, DocumentStatus, RawDocument
+from manicule.core.errors import ConfigError, PolicyError, UnknownComponentError
+from manicule.core.ids import content_hash, document_id
+from manicule.core.protocols import Chunker, Parser
+from manicule.plugins import (
+    BuildContext,
+    ComponentKey,
+    ComponentKind,
+    ComponentRegistry,
+    discover,
+)
+from manicule.testing import assert_parser_contract, closing
+from tests.fakes import HashEmbedder, make_raw
 
 
 def _install_the_rest(registry: ComponentRegistry) -> None:
-    """Stand in for the components the other core tickets will provide as plugins."""
+    """Stand in for the components the other core tickets will provide as plugins.
+
+    The chunker is deliberately absent: the built-in parsing plugin registers ``structural``
+    through the same entry point every other plugin uses, so a stand-in here would both clash
+    with it and hide it. What is left is the components no plugin provides yet.
+    """
     registry.add(keys.EMBEDDER.named("mlx"), lambda _: HashEmbedder())
-    registry.add(keys.CHUNKER.named("structural"), lambda _: BlockChunker())
     registry.add(keys.GENERATOR.named("ollama"), lambda _: object())
     registry.add(keys.VECTOR_STORE.named("lancedb"), lambda _: object())
     registry.add(keys.DOC_STORE.named("sqlite"), lambda _: object())
@@ -81,6 +93,151 @@ async def test_a_component_is_set_up_before_it_is_used(manicule_environment: Pat
         parser = await container.aget(keys.PARSER.named("example"))
         assert isinstance(parser, Parser)
     assert container.describe() == []
+
+
+MARKDOWN = """\
+# Release notes
+
+The scheduler now retries a failed job three times before giving up.
+
+## Known issues
+
+Large exports still time out on the reporting endpoint.
+"""
+
+
+async def test_a_document_parses_and_chunks_through_the_container(
+    manicule_environment: Path,
+) -> None:
+    """A built-in parser and the built-in chunker, reached only through discovery.
+
+    The point of the route rather than the result: nothing here imports a parser module, names
+    a class, or constructs a chunker. A document is routed by media type to whatever the
+    registry says owns it, and chunked by whatever ``rag.chunker`` names. If the built-in
+    parsers ever stopped registering through the public entry point — an internal shortcut, a
+    missing entry-point declaration in ``pyproject.toml`` — every one of these lookups would
+    fail, and nothing else in the suite would notice, because every other test constructs its
+    parser directly.
+    """
+    del manicule_environment
+
+    found = discover()
+    _install_the_rest(found.registry.bind("test-harness"))
+    container = build_container(
+        Settings(rag={"pipeline": ("passthrough",), "chunker": "structural"}),  # pyright: ignore[reportArgumentType]
+        discovery=found,
+    )
+
+    async with container:
+        parsers = await container.parser_chain("text/markdown")
+        assert [type(parser).__name__ for parser in parsers] == ["MarkdownParser"]
+        parser = parsers[0]
+
+        raw = RawDocument(
+            source_id="release-notes.md",
+            uri="release-notes.md",
+            media_type="text/markdown",
+            content=MARKDOWN,
+            metadata={"title": "Release notes"},
+        )
+        blocks = await assert_parser_contract(parser, raw)
+        assert blocks[0].text == "# Release notes"
+
+        chunker = await container.aget(keys.CHUNKER.named("structural"))
+        assert isinstance(chunker, Chunker)
+        chunks = chunker.chunk(_document_for(raw), blocks)
+
+    assert chunks, "a document with two sections produced no chunks"
+    assert [chunk.position for chunk in chunks] == list(range(len(chunks)))
+    assert any("scheduler" in chunk.text for chunk in chunks)
+
+
+async def test_an_anchor_from_the_container_still_resolves_to_its_own_text(
+    manicule_environment: Path,
+) -> None:
+    """The obligation that survives the whole path, not just the parser in isolation.
+
+    A citation is produced by a parser reached through discovery and resolved by the same
+    instance the container handed out. Checking it here as well as in the parser's own suite
+    is what catches a container that hands back a *differently configured* parser — one built
+    from settings that were validated against a config model nobody registered, whose anchors
+    are measured against a document the resolver never sees the same way.
+    """
+    del manicule_environment
+
+    found = discover()
+    _install_the_rest(found.registry.bind("test-harness"))
+    settings = Settings(rag={"pipeline": ("passthrough",)})  # pyright: ignore[reportArgumentType]
+    container = build_container(settings, discovery=found)
+
+    async with container:
+        parser = (await container.parser_chain("text/markdown"))[0]
+        raw = RawDocument(
+            source_id="release-notes.md",
+            uri="release-notes.md",
+            media_type="text/markdown",
+            content=MARKDOWN,
+        )
+        async with closing(parser.parse(raw)) as stream:
+            blocks = [block async for block in stream]
+
+        located = [block for block in blocks if block.anchor.kind != "unlocated"]
+        assert located, "every block gave up its location, so the check below proves nothing"
+        for block in located:
+            resolved = await parser.resolve(block.anchor, raw)
+            assert resolved is not None
+            assert block.text in resolved
+
+
+def test_building_a_parser_with_the_wrong_configuration_model_is_refused() -> None:
+    """The guard on a factory called outside the container.
+
+    The container validates configuration against the model a component registered before it
+    calls the factory, so a mistyped config cannot arrive by that route. A factory called any
+    other way could hand a parser someone else's settings — and substituting defaults instead,
+    which is what this used to do, builds a parser whose configuration appears to be in force
+    and is not. That is the failure validation exists to prevent, so it is an error.
+    """
+    from manicule.parsers.config import PdfConfig  # noqa: PLC0415 - a parsing extra
+
+    # Through the registered factory, which is the object the container calls — so this
+    # exercises the real route rather than a private function that happens to be behind it.
+    factory = discover().registry.record(keys.PARSER.named("markdown")).factory
+    context = BuildContext(
+        settings=Settings(),
+        config=PdfConfig(),
+        data_dir=Path(),
+        cache_dir=Path(),
+        components=_NoComponents(),
+    )
+
+    with pytest.raises(ConfigError) as caught:
+        factory(context)
+
+    assert "MarkdownConfig" in str(caught.value)
+    assert "PdfConfig" in str(caught.value)
+
+
+class _NoComponents:
+    """A resolver that provides nothing, for a factory that asks it for nothing."""
+
+    def get[T](self, key: ComponentKey[T]) -> T:
+        msg = f"nothing provides {key}"
+        raise UnknownComponentError(msg)
+
+
+def _document_for(raw: RawDocument) -> Document:
+    """The stored record the chunker writes chunk ids against."""
+    return Document(
+        id=document_id("integration", "fixtures", raw.source_id),
+        source="fixtures",
+        source_id=raw.source_id,
+        uri=raw.uri,
+        title="Release notes",
+        content_hash=content_hash(raw.as_bytes()),
+        media_type=raw.media_type,
+        status=DocumentStatus.PARSED,
+    )
 
 
 def test_per_component_configuration_reaches_the_component(

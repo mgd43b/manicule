@@ -45,9 +45,29 @@ storage = [        # #2
   "pyarrow>=18.0",
 ]
 embeddings = []    # #3  mlx-embeddings, onnxruntime, numpy
-parsers = []       # #4  pypdfium2, tree-sitter, selectolax, python-docx, ...
+parsers = [
+  # Every one of these is permissively licensed; docs/parsing.md §12 records the rejections
+  # (PyMuPDF, extract-msg) and why a copyleft dependency is refused at selection time.
+  "pypdfium2>=4.30",
+  "tree-sitter>=0.23",
+  "tree-sitter-language-pack>=0.7",
+  "selectolax>=0.3.21",
+  "python-docx>=1.1",
+  "python-calamine>=0.2",
+  "python-pptx>=1.0",
+  "nbformat>=5.10",
+  "markdown-it-py>=3.0",
+  "ruamel.yaml>=0.18",
+  "tiktoken>=0.8",
+]
 generation = []    # #7  litellm
 serve = []         # #8, #11  Typer, Rich, FastMCP, FastAPI, uvicorn
+
+# The built-in parsers and the chunker register the same way a third-party plugin does, through
+# the public entry-point group. There is no shorter internal route, so the extension mechanism
+# is exercised by every installation rather than only by the people extending it.
+[project.entry-points."manicule.plugins"]
+parsing = "manicule.parsers.plugin:PLUGIN"
 
 [project.urls]
 Homepage = "https://github.com/mgd43b/manicule"
@@ -60,9 +80,19 @@ dev = [
   "pytest-cov>=6.0",
   "ruff>=0.8",
   "pyright>=1.1.390",
+  # Fixture generation (docs/parsing.md §3.5): fixtures are built by a checked-in script
+  # wherever generation is possible, so their structure is reviewable as code rather than as
+  # an opaque binary, and the hostile ones need never be committed at all.
+  "reportlab>=4.2",
+  "openpyxl>=3.1",
   # Installed so that entry-point discovery is exercised against a real distribution rather
   # than a mock. See packages/manicule-plugin-example.
   "manicule-plugin-example",
+  # The parser stack, so `uv sync --all-groups` — what CI runs — can execute the parser
+  # suites. Declared as an extra of this project rather than as loose dependencies, so there
+  # is one list of what parsing needs and `tests/test_import_boundary.py` still sees them as
+  # optional rather than as something an `import manicule` pulls in.
+  "manicule[parsers]",
 ]
 
 [tool.uv.workspace]
@@ -138,6 +168,23 @@ reportUnnecessaryTypeIgnoreComment = "error"
 reportImplicitOverride = "error"
 venvPath = "."
 venv = ".venv"
+
+# Every parsing library is a binding over a C or Rust extension and none of them ships type
+# information: pypdfium2, tree-sitter, selectolax, python-docx, python-pptx, python-calamine.
+# Under strict mode that turns each of their calls into an Unknown, and the Unknown spreads
+# to every expression downstream of it — thousands of errors that say nothing about this
+# code. Only the four rules that report *that* are relaxed, and only under `parsers/`.
+# `reportUnknownParameterType`, `reportMissingParameterType` and `reportMissingTypeArgument`
+# stay on, so manicule's own signatures are still fully typed; what is permitted is a value
+# whose type a third party declined to state. Hand-written stubs for six C extensions were
+# the alternative, and a stub that drifts from its library is worse than none, because it
+# type-checks confidently against an API that no longer exists.
+[[tool.pyright.executionEnvironments]]
+root = "src/manicule/parsers"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
 
 [tool.pytest.ini_options]
 minversion = "8.0"

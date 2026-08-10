@@ -41,8 +41,11 @@ from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-# Sheet-relative A1 reference: a single cell (``B4``) or a range (``B4:D12``).
-_A1_REFERENCE = re.compile(r"^[A-Z]{1,3}[1-9][0-9]{0,6}(:[A-Z]{1,3}[1-9][0-9]{0,6})?$")
+# Sheet-relative A1 reference: one or more comma-separated areas, each a single cell (``B4``)
+# or a range (``B4:D12``). Multiple areas are Excel's own multi-area syntax and are what a
+# split table needs — see :class:`CellAnchor`.
+_A1_AREA = r"[A-Z]{1,3}[1-9][0-9]{0,6}(?::[A-Z]{1,3}[1-9][0-9]{0,6})?"
+_A1_REFERENCE = re.compile(rf"^{_A1_AREA}(?:,{_A1_AREA})*$")
 
 
 class _AnchorBase(BaseModel):
@@ -188,6 +191,12 @@ class CellAnchor(_AnchorBase):
 
     ``sheet`` and ``ref`` are stored apart so a consumer can filter by sheet without
     parsing. :attr:`a1` recombines them into the form a spreadsheet application accepts.
+
+    ``ref`` accepts **several comma-separated areas** — ``A1:D1,A25:D48`` — because a table
+    too large for one chunk is split by rows with its header repeated into every part, so the
+    part addresses its own rows *and* the header rows, which are not adjacent to them. One
+    range spanning both would claim every row in between. Comma-separated areas are Excel's
+    own multi-area syntax, so the reference a citation shows is one a spreadsheet accepts.
     """
 
     kind: Literal["cell"] = "cell"

@@ -60,6 +60,27 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-groups --all-extras --python ${{ matrix.python }}
+      # tree-sitter grammars are fetched from a release bundle rather than shipped in the
+      # wheel, so a fresh runner has none. The code parser's suite skips precisely when a
+      # grammar is absent — which is the right behaviour for a developer's machine and the
+      # wrong outcome for CI, where it would mean the parser is never exercised and the
+      # suite still reports green. Pre-seeding is the same step an operator runs, so this
+      # also checks that `prefetch` works on a machine that has never had a grammar.
+      - name: cache tree-sitter grammars
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: grammars-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      # The assertion after the fetch is the point of the step, not the fetch: a skipped
+      # conformance suite certifies nothing, so if the pre-seed ever silently stops working
+      # this fails the job here rather than going green with the code parser never run.
+      - name: pre-seed grammars
+        run: >-
+          uv run --python ${{ matrix.python }} python -c
+          "from manicule.parsers import grammars;
+          print('fetched:', grammars.prefetch(grammars.DECLARED_LANGUAGES));
+          missing = grammars.missing_grammars(grammars.DECLARED_LANGUAGES);
+          assert not missing, f'grammars still missing after pre-seed: {missing}'"
       - name: pytest
         run: uv run --python ${{ matrix.python }} pytest --cov --cov-report=term-missing
 

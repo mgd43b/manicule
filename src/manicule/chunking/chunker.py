@@ -1,0 +1,772 @@
+"""The structure-aware chunker.
+
+Boundaries come from blocks, never from prose. The chunker consumes
+:class:`~manicule.core.content.ParsedBlock` and treats ``kind`` and ``heading_path`` as
+facts. It does not look at the text to decide whether something is a heading, a table or
+code — structure was discovered once, by the parser that could still see the markup, and
+re-deriving it here both duplicates the work and does it worse: the parser had the ``<h2>``
+element, this would have a line that starts with a capital letter.
+
+Two numbers are expensive to change once a corpus is indexed, and both are in
+:class:`~manicule.core.fingerprints.ChunkFingerprint` rather than in a comment:
+
+- **512 tokens on ``embed_text``**, of which 64 are reserved for the breadcrumb. The binding
+  constraint is the embedder's sequence length: past it every library in the stack truncates
+  **silently**, so a 900-token chunk handed to a 512-token model produces a vector describing
+  the first 512 tokens while the stored chunk still claims all 900. The chunker reads the
+  effective limit from the embedder and refuses to start when its budget exceeds it.
+- **64 tokens of overlap**, on prose and lists only.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import cast
+
+from manicule.chunking import breadcrumb
+from manicule.chunking.sentences import paragraphs, sentences
+from manicule.chunking.tokens import SupportsTokenCount, TokenCounter
+from manicule.core.anchors import Anchor, CellAnchor, LineAnchor, PageAnchor, Rect
+from manicule.core.content import BlockKind, Chunk, Document, Metadata, ParsedBlock
+from manicule.core.errors import ChunkingError, ContextOverflowError
+from manicule.core.fingerprints import ChunkFingerprint
+from manicule.core.ids import chunk_id
+
+CHUNKER_NAME = "structural"
+CHUNKER_VERSION = "1"
+
+MAX_TOKENS = 512
+OVERLAP_TOKENS = 64
+MIN_TOKENS = 64
+BREADCRUMB_TOKENS = 64
+
+BLOCK_SEPARATOR = "\n\n"
+
+OVERLAPPING_KINDS = frozenset({BlockKind.PROSE, BlockKind.LIST})
+"""Kinds that may overlap.
+
+Never ``code``, ``table``, ``panel``, ``heading`` or ``media``. Overlapping a table means
+half a table appears twice with a repeated header and no way to tell the copies apart;
+overlapping code emits a fragment whose :class:`LineAnchor` duplicates another chunk's lines,
+which is indistinguishable from an anchor that is simply wrong.
+"""
+
+ATOMIC_KINDS = frozenset({BlockKind.TABLE, BlockKind.CODE})
+"""Kinds that are never *partially* included in a chunk with other blocks.
+
+A paragraph introducing a table belongs with it, so blocks of different kinds may share a
+chunk. What may not happen is half a table joining a paragraph and the other half starting
+the next chunk.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class _Unit:
+    """A piece of a document that is small enough to be placed whole."""
+
+    text: str
+    kind: BlockKind
+    anchor: Anchor
+    heading_path: tuple[str, ...]
+    tokens: int
+    metadata: Metadata = field(default_factory=Metadata)
+    starts_section: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Overlap:
+    """An overlap window: the text carried forward, and where it came from.
+
+    The units travel with the text because the next chunk's anchor has to cover them. Text
+    alone would leave the caller reconstructing provenance by counting characters, which is
+    the kind of arithmetic that is right until a separator changes.
+    """
+
+    text: str = ""
+    units: tuple[_Unit, ...] = ()
+
+
+class StructuralChunker:
+    """Groups blocks into retrievable chunks, respecting the structure the parser found.
+
+    Args:
+        counter: How tokens are counted. Comes from the bound embedder, so the budget is
+            measured with the tokenizer that enforces it.
+        embedder: The embedder the chunks will be sent to, when one is bound. Resolved as a
+            construction dependency so :meth:`setup` can refuse a budget the model cannot
+            read — the check has to happen before ingest, not after, because past the limit
+            the input is dropped without an error and the chunk is indexed as its opening
+            tokens while still claiming all of its text.
+        grammars: Grammar version by language, for
+            :attr:`~manicule.core.fingerprints.ChunkFingerprint.grammars`. Per language, so a
+            Python grammar bump invalidates Python documents and leaves the rest alone.
+        version_components: Other pinned versions that move chunk boundaries or anchors — the
+            HTML-to-text conversion that email line numbers address, for instance. Folded
+            into the fingerprint's ``version``, because a converter upgrade that shifts every
+            anchor in every HTML email must not pass unnoticed.
+    """
+
+    def __init__(
+        self,
+        counter: TokenCounter,
+        *,
+        embedder: SupportsTokenCount | None = None,
+        max_tokens: int = MAX_TOKENS,
+        overlap_tokens: int = OVERLAP_TOKENS,
+        min_tokens: int = MIN_TOKENS,
+        breadcrumb_tokens: int = BREADCRUMB_TOKENS,
+        grammars: Mapping[str, str] | None = None,
+        version_components: Mapping[str, str] | None = None,
+    ) -> None:
+        if breadcrumb_tokens >= max_tokens:
+            msg = (
+                f"the breadcrumb reserve ({breadcrumb_tokens}) leaves no room for text in a "
+                f"{max_tokens}-token budget. Lower the reserve or raise the budget."
+            )
+            raise ChunkingError(msg)
+        self._counter = counter
+        self._embedder = embedder
+        self._max_tokens = max_tokens
+        self._overlap_tokens = overlap_tokens
+        self._min_tokens = min_tokens
+        self._breadcrumb_tokens = breadcrumb_tokens
+        self._text_budget = max_tokens - breadcrumb_tokens
+        components = dict(version_components or {})
+        suffix = "".join(f";{name}={value}" for name, value in sorted(components.items()))
+        self.fingerprint = ChunkFingerprint(
+            chunker=CHUNKER_NAME,
+            version=f"{CHUNKER_VERSION}{suffix}",
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+            tokenizer_id=counter.tokenizer_id,
+            grammars=dict(grammars or {}),
+        )
+
+    @property
+    def provisional(self) -> bool:
+        """Whether these chunks were counted without the model that will embed them.
+
+        Provisional chunks are refused by ingest. A count taken with a stand-in vocabulary
+        can undercount by an unknown margin, and undercounting is the direction that
+        truncates.
+        """
+        return self._counter.provisional
+
+    async def setup(self) -> None:
+        """Refuse a budget the bound embedder cannot read.
+
+        Raises:
+            ContextOverflowError: The chunk budget exceeds the embedder's effective sequence
+                length. Everything past that limit is dropped without an error, so the check
+                belongs here — before a corpus exists — rather than at the first query that
+                returns half a passage.
+        """
+        if self._embedder is None:
+            return
+        limit = self._embedder.fingerprint.max_sequence_length
+        if self._max_tokens > limit:
+            msg = (
+                f"the chunk budget is {self._max_tokens} tokens but "
+                f"{self._embedder.fingerprint.describe()} attends to {limit}. Text past the "
+                f"limit is dropped with no error raised, so every oversized chunk would be "
+                f"indexed as its opening tokens while still claiming all of its text. "
+                f"Set rag.chunk.maxTokens to {limit} or lower, or choose a model with a "
+                f"longer sequence length."
+            )
+            raise ContextOverflowError(msg)
+
+    # --- the algorithm -------------------------------------------------------------------
+
+    def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+        """Produce chunks in document order."""
+        block_list = [block for block in blocks if block.text]
+        if not block_list:
+            return []
+        block_list = _promote_headings_when_that_is_all_there_is(block_list)
+
+        units: list[_Unit] = []
+        for block in block_list:
+            units.extend(self._to_units(block))
+        if not units:
+            return []
+
+        groups = self._accumulate(units)
+        groups = self._merge_short_tail(groups)
+        return self._render(document, groups)
+
+    # --- step 1: blocks to units ---------------------------------------------------------
+
+    def _to_units(self, block: ParsedBlock) -> list[_Unit]:
+        """One unit per block, unless the block does not fit and has to be split (§4.2)."""
+        tokens = self._counter(block.text)
+        if block.kind is BlockKind.HEADING:
+            # A heading is a boundary and a breadcrumb component, not content.
+            return [
+                _Unit(
+                    text=block.text,
+                    kind=block.kind,
+                    anchor=block.anchor,
+                    heading_path=block.heading_path,
+                    tokens=tokens,
+                    metadata=dict(block.metadata),
+                    starts_section=True,
+                )
+            ]
+        if tokens <= self._text_budget:
+            return [
+                _Unit(
+                    text=block.text,
+                    kind=block.kind,
+                    anchor=block.anchor,
+                    heading_path=block.heading_path,
+                    tokens=tokens,
+                    metadata=dict(block.metadata),
+                )
+            ]
+        if block.kind is BlockKind.TABLE:
+            return self._split_table(block)
+        if block.kind is BlockKind.CODE:
+            return self._split_lines(block)
+        return self._split_prose(block)
+
+    def _unit(self, block: ParsedBlock, text: str, **extra: object) -> _Unit:
+        metadata: Metadata = dict(block.metadata)
+        for key, value in extra.items():
+            # Metadata is JSON-shaped; every value passed here is a str, int, bool or list.
+            metadata[key] = value  # pyright: ignore[reportArgumentType] - JsonValue by construction
+        return _Unit(
+            text=text,
+            kind=block.kind,
+            anchor=block.anchor,
+            heading_path=block.heading_path,
+            tokens=self._counter(text),
+            metadata=metadata,
+        )
+
+    def _split_table(self, block: ParsedBlock) -> list[_Unit]:
+        """Split by rows, repeating the header into every part.
+
+        A table part without its header is a grid of numbers; with it, each part is
+        independently meaningful and independently retrievable. Header rows are known from
+        the parser, never guessed from the first row being bold — a guess would silently
+        promote a data row on every table that does not have one.
+        """
+        rows = _string_list(block.metadata.get("rows"))
+        if rows is None:
+            # The parser did not describe the table's rows, so there is no row boundary to
+            # split at that is not a guess about the rendering. Prose splitting keeps the
+            # text whole and is honest about having no better structure.
+            return self._split_prose(block)
+        header_rows = _non_negative_int(block.metadata.get("header_rows"))
+        refs = _string_list(block.metadata.get("row_refs"))
+        header = rows[:header_rows]
+        header_text = "\n".join(header)
+        header_tokens = self._counter(header_text) if header else 0
+
+        parts: list[list[int]] = []
+        current: list[int] = []
+        running = header_tokens
+        for index in range(header_rows, len(rows)):
+            row_tokens = self._counter(rows[index])
+            if current and running + row_tokens > self._text_budget:
+                parts.append(current)
+                current = []
+                running = header_tokens
+            current.append(index)
+            running += row_tokens
+        if current:
+            parts.append(current)
+
+        units: list[_Unit] = []
+        for part_index, indices in enumerate(parts, start=1):
+            text = "\n".join([*header, *(rows[i] for i in indices)])
+            unit = self._unit(
+                block,
+                text,
+                table_part=[part_index, len(parts)],
+                rows=[indices[0] + 1, indices[-1] + 1],
+            )
+            anchor = _narrow_cell_anchor(block.anchor, refs, header_rows, indices)
+            units.append(replace(unit, anchor=anchor))
+        if any(unit.tokens > self._text_budget for unit in units):
+            # A single row does not fit. Splitting it further is a cell-level operation the
+            # parser's rendering does not expose, so the row is treated as prose: it is
+            # still split, still whole, and still carries the row's own anchor.
+            return [
+                split
+                for unit in units
+                for split in (
+                    [unit]
+                    if unit.tokens <= self._text_budget
+                    else self._split_text(unit.text, unit, hard_split_kind="row")
+                )
+            ]
+        return units
+
+    def _split_lines(self, block: ParsedBlock) -> list[_Unit]:
+        """Last-resort split for a code block the parser could not divide further.
+
+        Code boundaries belong to the parse tree, which the parser owns; this runs only when
+        a single leaf — one very long function, a generated file with no interior structure —
+        still exceeds the budget. It cuts at blank-line runs and then at line ends, never
+        mid-token, mid-string or mid-comment, and lines mean the same thing on every machine.
+        """
+        blocks = [part for part in block.text.split("\n\n") if part.strip()]
+        units: list[_Unit] = []
+        for part in blocks:
+            if self._counter(part) <= self._text_budget:
+                units.append(self._unit(block, part))
+                continue
+            units.extend(self._pack(part.split("\n"), "\n", block))
+        return units or [self._unit(block, block.text)]
+
+    def _split_prose(self, block: ParsedBlock) -> list[_Unit]:
+        """Paragraph, then sentence, then — only for a single oversized sentence — tokens."""
+        return self._split_text(block.text, self._unit(block, block.text), hard_split_kind="token")
+
+    def _split_text(self, text: str, template: _Unit, *, hard_split_kind: str) -> list[_Unit]:
+        units: list[_Unit] = []
+        for paragraph in paragraphs(text) or [text]:
+            if self._counter(paragraph) <= self._text_budget:
+                units.append(replace(template, text=paragraph, tokens=self._counter(paragraph)))
+                continue
+            pieces = sentences(paragraph) or [paragraph]
+            for packed in self._pack(pieces, " ", None, template=template):
+                if packed.tokens <= self._text_budget:
+                    units.append(packed)
+                    continue
+                units.extend(self._hard_split(packed, hard_split_kind))
+        return units
+
+    def _pack(
+        self,
+        pieces: Sequence[str],
+        joiner: str,
+        block: ParsedBlock | None,
+        *,
+        template: _Unit | None = None,
+    ) -> list[_Unit]:
+        """Greedily fill units with whole ``pieces``, never cutting one in half."""
+        units: list[_Unit] = []
+        current: list[str] = []
+        running = 0
+        for piece in pieces:
+            tokens = self._counter(piece)
+            if current and running + tokens > self._text_budget:
+                units.append(self._materialise(joiner.join(current), block, template))
+                current = []
+                running = 0
+            current.append(piece)
+            running += tokens
+        if current:
+            units.append(self._materialise(joiner.join(current), block, template))
+        return units
+
+    def _materialise(self, text: str, block: ParsedBlock | None, template: _Unit | None) -> _Unit:
+        if block is not None:
+            return self._unit(block, text)
+        if template is None:  # pragma: no cover - one of the two is always supplied
+            msg = "a unit needs either a block or a template to inherit from"
+            raise ChunkingError(msg)
+        return replace(template, text=text, tokens=self._counter(text))
+
+    def _hard_split(self, unit: _Unit, kind: str) -> list[_Unit]:
+        """Cut a single oversized piece at a token boundary, and record that it happened.
+
+        Only a sentence longer than the whole budget reaches here — a minified line, a base64
+        blob pasted into a page. ``metadata.hard_split`` makes those countable, because a
+        document full of them is a document that will retrieve badly and the operator should
+        be able to find out.
+        """
+        pieces: list[_Unit] = []
+        remaining = unit.text
+        while remaining:
+            cut = self._longest_prefix_within_budget(remaining)
+            head, remaining = remaining[:cut], remaining[cut:]
+            metadata: Metadata = {**unit.metadata, "hard_split": True, "hard_split_at": kind}
+            pieces.append(replace(unit, text=head, tokens=self._counter(head), metadata=metadata))
+        return pieces
+
+    def _longest_prefix_within_budget(self, text: str) -> int:
+        """How many characters of ``text`` fit the budget, by bisection on the counter.
+
+        Bisection rather than decoding token ids back to text: the counter is the only thing
+        the embedder guarantees, and a chunker that reconstructed text from token ids would
+        produce different cuts under a tokenizer that round-trips imperfectly.
+        """
+        low, high = 1, len(text)
+        best = 1
+        while low <= high:
+            middle = (low + high) // 2
+            if self._counter(text[:middle]) <= self._text_budget:
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
+    # --- step 2: units to groups ---------------------------------------------------------
+
+    def _accumulate(self, units: Sequence[_Unit]) -> list[list[_Unit]]:
+        """Fill chunks with consecutive units, closing at headings and at the budget."""
+        groups: list[list[_Unit]] = []
+        current: list[_Unit] = []
+        running = 0
+        opens_section = True
+
+        for original in units:
+            if original.kind is BlockKind.HEADING:
+                if current:
+                    groups.append(current)
+                current, running = [], 0
+                opens_section = True
+                continue
+            unit = original
+            if not current and opens_section:
+                # Remembered on the chunk's first unit so the minimum-size merge below can
+                # see a heading boundary it must not cross.
+                unit = replace(unit, starts_section=True)
+                opens_section = False
+            closes = bool(current) and (
+                running + unit.tokens > self._text_budget
+                or not _mergeable(current[-1].anchor, unit.anchor)
+                or (unit.kind in ATOMIC_KINDS and running + unit.tokens > self._text_budget)
+            )
+            if closes:
+                groups.append(current)
+                current, running = [], 0
+            current.append(unit)
+            running += unit.tokens
+        if current:
+            groups.append(current)
+        return groups
+
+    def _merge_short_tail(self, groups: list[list[_Unit]]) -> list[list[_Unit]]:
+        """Merge a sub-minimum chunk backwards, when that is possible without loss.
+
+        A trailing eight-token chunk is retrieval noise: a short text produces a vector
+        dominated by its few tokens and wins queries it should lose. It is never *dropped* —
+        dropping is data loss, and silent data loss is what this design is mostly about — so
+        a chunk that cannot merge stands alone.
+        """
+        merged: list[list[_Unit]] = []
+        for group in groups:
+            tokens = sum(unit.tokens for unit in group)
+            # A heading is a hard boundary. Merging across one would give the combined chunk
+            # the earlier section's heading path, so the later section would be embedded and
+            # cited under a heading it does not belong to.
+            if not merged or tokens >= self._min_tokens or group[0].starts_section:
+                merged.append(group)
+                continue
+            previous = merged[-1]
+            same_kind = _dominant_kind(previous) is _dominant_kind(group)
+            fits = sum(unit.tokens for unit in previous) + tokens <= self._text_budget
+            joins = _mergeable(previous[-1].anchor, group[0].anchor)
+            if same_kind and fits and joins:
+                merged[-1] = [*previous, *group]
+            else:
+                merged.append(group)
+        return merged
+
+    # --- step 3: groups to chunks --------------------------------------------------------
+
+    def _render(self, document: Document, groups: Sequence[Sequence[_Unit]]) -> list[Chunk]:
+        chunks: list[Chunk] = []
+        previous: Sequence[_Unit] | None = None
+        for position, group in enumerate(groups):
+            text = BLOCK_SEPARATOR.join(unit.text for unit in group)
+            overlap = self._overlap_from(previous, group)
+            if overlap.text:
+                text = f"{overlap.text}{BLOCK_SEPARATOR}{text}"
+            heading_path = group[0].heading_path
+            crumb = self._breadcrumb(document, heading_path)
+            embed_text = f"{crumb}{BLOCK_SEPARATOR}{text}" if crumb else text
+            # The overlap window extends the anchor with it (docs/parsing.md §4.3). A chunk
+            # that opens with the previous chunk's last sentences and names only its own lines
+            # quotes from outside the place it cites — and it reads correctly while doing so,
+            # which is why only the round-trip check finds it.
+            anchor = _merge_anchors([unit.anchor for unit in (*overlap.units, *group)])
+            chunks.append(
+                Chunk(
+                    id=chunk_id(document.id, position, text),
+                    document_id=document.id,
+                    text=text,
+                    embed_text=embed_text,
+                    anchor=anchor,
+                    heading_path=heading_path,
+                    kind=_dominant_kind(group),
+                    position=position,
+                    token_count=self._counter(embed_text),
+                    metadata=_group_metadata(group, provisional=self._counter.provisional),
+                )
+            )
+            previous = group
+        return chunks
+
+    def _overlap_from(self, previous: Sequence[_Unit] | None, group: Sequence[_Unit]) -> _Overlap:
+        """Whole trailing sentences of the previous chunk, and the units they came from.
+
+        Taken in whole sentences, never mid-sentence: a window that cuts mid-sentence produces
+        a chunk starting on a fragment, which is what the overlap existed to avoid.
+
+        Capped at **half** the preceding chunk. The overlap window and the minimum chunk size
+        are the same number, so an uncapped window would make a minimum-sized chunk's
+        successor open with an exact copy of the whole thing — two chunks, one entirely
+        contained in the other, both matching the same query.
+
+        The contributing units are returned as well as the text, because the anchor has to
+        cover them (``docs/parsing.md`` §4.3). Sentences are taken per unit rather than from
+        the joined text so that provenance is exact rather than reconstructed by counting
+        characters — a sentence never spans two blocks, so nothing is lost by it.
+        """
+        if previous is None or self._overlap_tokens <= 0:
+            return _Overlap()
+        if _dominant_kind(previous) not in OVERLAPPING_KINDS:
+            return _Overlap()
+        if _dominant_kind(group) not in OVERLAPPING_KINDS:
+            return _Overlap()
+        if not _mergeable(previous[-1].anchor, group[0].anchor):
+            # The overlap would be text the next chunk's anchor does not cover, which is a
+            # citation quoting from outside the place it names.
+            return _Overlap()
+        source = BLOCK_SEPARATOR.join(unit.text for unit in previous)
+        cap = min(self._overlap_tokens, max(1, self._counter(source) // 2))
+
+        taken: list[str] = []
+        used: list[_Unit] = []
+        running = 0
+        for unit in reversed(previous):
+            # A unit the next chunk's anchor already covers may be cut into: taking part of it
+            # widens nothing, because the anchor is the same one either way. That is the case
+            # whenever an oversized block was split across chunks, which is where overlap
+            # matters most. Any other unit is taken whole or not at all — a partial take would
+            # leave the anchor covering lines the chunk does not quote, and a line anchor is
+            # meant to *be* the text it addresses.
+            free = unit.anchor == group[0].anchor
+            unit_sentences = list(reversed(sentences(unit.text) or [unit.text]))
+            if not free:
+                unit_tokens = sum(self._counter(sentence) for sentence in unit_sentences)
+                if running + unit_tokens > cap:
+                    break
+                taken[0:0] = list(reversed(unit_sentences))
+                used.insert(0, unit)
+                running += unit_tokens
+                continue
+            stopped = False
+            contributed = False
+            for sentence in unit_sentences:
+                tokens = self._counter(sentence)
+                if running + tokens > cap:
+                    stopped = True
+                    break
+                taken.insert(0, sentence)
+                running += tokens
+                contributed = True
+            if contributed:
+                used.insert(0, unit)
+            if stopped:
+                break
+        return _Overlap(" ".join(taken), tuple(used))
+
+    def _breadcrumb(self, document: Document, heading_path: Sequence[str]) -> str:
+        parts = breadcrumb.elements(
+            _string_list(document.metadata.get("breadcrumb_prefix")) or (),
+            _string_list(document.metadata.get("ancestors")) or (),
+            (document.title,),
+            heading_path,
+        )
+        return breadcrumb.render(parts, self._counter, self._breadcrumb_tokens)
+
+
+# --- anchor merging ----------------------------------------------------------------------
+
+
+def _mergeable(left: Anchor, right: Anchor) -> bool:
+    """Whether two blocks may share a chunk, judged by whether their anchors can combine.
+
+    This is what stops a chunk spanning a page break: a chunk whose anchor names one page
+    while half its text is on the next is a citation that reads correctly and points at the
+    wrong place. Where the anchors cannot combine, the chunk closes.
+    """
+    if left == right:
+        return True
+    if isinstance(left, LineAnchor) and isinstance(right, LineAnchor):
+        return True
+    if isinstance(left, PageAnchor) and isinstance(right, PageAnchor):
+        return left.page == right.page
+    if isinstance(left, CellAnchor) and isinstance(right, CellAnchor):
+        return left.sheet == right.sheet
+    return False
+
+
+def _merge_anchors(anchors: Sequence[Anchor]) -> Anchor:
+    """The one anchor that covers all of ``anchors``.
+
+    Only combinations :func:`_mergeable` admitted can arrive here, so every case below is
+    reachable and none of them widens a location beyond what the blocks actually occupied.
+    """
+    first = anchors[0]
+    if all(anchor == first for anchor in anchors):
+        return first
+    if isinstance(first, LineAnchor):
+        lines = [anchor for anchor in anchors if isinstance(anchor, LineAnchor)]
+        symbols = {anchor.symbol for anchor in lines}
+        return LineAnchor(
+            start=min(anchor.start for anchor in lines),
+            end=max(anchor.end for anchor in lines),
+            # A chunk covering two definitions belongs to neither, and naming one of them
+            # would put a wrong symbol into the breadcrumb, which reaches the embedder.
+            symbol=symbols.pop() if len(symbols) == 1 else None,
+        )
+    if isinstance(first, PageAnchor):
+        pages = [anchor for anchor in anchors if isinstance(anchor, PageAnchor)]
+        # An empty `rects` means "this page, no finer location" — a slide's speaker notes are
+        # on the slide but not on its surface. Unioning rectangles across a group containing
+        # one of those would produce an anchor covering only the blocks that *had* rectangles,
+        # so the chunk would resolve to text that does not contain what it claims. Page-level
+        # is the coarser answer and the only correct one: it is what every member of the
+        # group can honestly be said to be inside.
+        if any(not anchor.rects for anchor in pages):
+            return PageAnchor(page=first.page)
+        rects: list[Rect] = []
+        for anchor in pages:
+            rects.extend(anchor.rects)
+        return PageAnchor(page=first.page, rects=tuple(rects))
+    if isinstance(first, CellAnchor):
+        cells = [anchor for anchor in anchors if isinstance(anchor, CellAnchor)]
+        # Deduplicated against a set rather than by scanning the list being built: extending a
+        # list from a generator that tests membership in that same list happens to work, and
+        # is the kind of thing a later reader reasonably rewrites into something that does
+        # not. Source order is kept, because a multi-area ref reads as the header rows first.
+        areas: list[str] = []
+        seen: set[str] = set()
+        for anchor in cells:
+            for part in anchor.ref.split(","):
+                if part not in seen:
+                    seen.add(part)
+                    areas.append(part)
+        return CellAnchor(sheet=first.sheet, ref=",".join(areas))
+    return first
+
+
+def _narrow_cell_anchor(
+    anchor: Anchor, refs: Sequence[str] | None, header_rows: int, indices: Sequence[int]
+) -> Anchor:
+    """A table part's own anchor, covering its rows *and* the header repeated into it.
+
+    Splitting a spreadsheet table improves provenance rather than costing it: each part
+    addresses exactly its own rows, where a whole-table anchor would resolve to every row and
+    fail the tightness bound.
+    """
+    if not isinstance(anchor, CellAnchor) or refs is None:
+        return anchor
+    wanted = [*range(header_rows), *indices]
+    areas = [refs[i] for i in wanted if 0 <= i < len(refs)]
+    if not areas:
+        return anchor
+    return CellAnchor(sheet=anchor.sheet, ref=",".join(_collapse_areas(areas)))
+
+
+def _collapse_areas(areas: Sequence[str]) -> list[str]:
+    """Join runs of adjacent single-row areas into ranges, keeping the order given."""
+    collapsed: list[str] = []
+    for area in areas:
+        if collapsed and _adjacent(collapsed[-1], area):
+            collapsed[-1] = f"{collapsed[-1].split(':')[0]}:{area.split(':')[-1]}"
+            continue
+        collapsed.append(area)
+    return collapsed
+
+
+def _adjacent(left: str, right: str) -> bool:
+    """Whether ``right`` is the row immediately after ``left`` over the same columns."""
+    left_end, right_start = left.rsplit(":", maxsplit=1)[-1], right.split(":", maxsplit=1)[0]
+    left_columns, left_row = _split_reference(left_end)
+    right_columns, right_row = _split_reference(right_start)
+    if left_columns != right_columns or left_row is None or right_row is None:
+        return False
+    return right_row == left_row + 1
+
+
+def _split_reference(reference: str) -> tuple[str, int | None]:
+    digits = "".join(character for character in reference if character.isdigit())
+    letters = reference[: len(reference) - len(digits)]
+    return letters, int(digits) if digits else None
+
+
+# --- small helpers -----------------------------------------------------------------------
+
+
+def _promote_headings_when_that_is_all_there_is(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
+    """Emit headings as prose for a document that is *only* headings.
+
+    A stub page or a table of contents would otherwise produce zero chunks and be
+    indistinguishable from a document with no extractable text — which would put it in the
+    bucket that triggers the scanned-corpus warning it has nothing to do with.
+    """
+    if not blocks or any(block.kind is not BlockKind.HEADING for block in blocks):
+        return blocks
+    return [
+        block.model_copy(
+            update={"kind": BlockKind.PROSE, "metadata": {**block.metadata, "headings_only": True}}
+        )
+        for block in blocks
+    ]
+
+
+def _dominant_kind(units: Sequence[_Unit]) -> BlockKind:
+    """The kind of the majority of a chunk's tokens, ties going to the first unit."""
+    totals: dict[BlockKind, int] = {}
+    for unit in units:
+        totals[unit.kind] = totals.get(unit.kind, 0) + unit.tokens
+    best = max(totals.values())
+    for unit in units:
+        if totals[unit.kind] == best:
+            return unit.kind
+    return units[0].kind  # pragma: no cover - the loop above always returns
+
+
+def _group_metadata(units: Sequence[_Unit], *, provisional: bool) -> Metadata:
+    """Metadata a chunk inherits from its units, without the parser's per-block detail."""
+    carried: Metadata = {}
+    for key in ("table_part", "rows", "hard_split", "hard_split_at", "severity", "cell"):
+        for unit in units:
+            if key in unit.metadata:
+                carried[key] = unit.metadata[key]
+                break
+    if provisional:
+        # Counted without the model that will embed these, so ingest must refuse them.
+        carried["provisional"] = True
+    return carried
+
+
+def _string_list(value: object) -> list[str] | None:
+    """A metadata value as a list of strings, or ``None`` when it is anything else.
+
+    Metadata arrives as JSON, so a parser can put anything there. A malformed value means
+    the chunker has no structure to split on, which is a fallback rather than a crash.
+    """
+    if not isinstance(value, list):
+        return None
+    items = cast("list[object]", value)
+    if not all(isinstance(item, str) for item in items):
+        return None
+    return [item for item in items if isinstance(item, str)]
+
+
+def _non_negative_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+__all__ = [
+    "ATOMIC_KINDS",
+    "BREADCRUMB_TOKENS",
+    "CHUNKER_NAME",
+    "CHUNKER_VERSION",
+    "MAX_TOKENS",
+    "MIN_TOKENS",
+    "OVERLAPPING_KINDS",
+    "OVERLAP_TOKENS",
+    "StructuralChunker",
+]
