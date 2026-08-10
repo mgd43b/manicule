@@ -1,0 +1,573 @@
+"""What the LanceDB vector store promises, and the guards that keep it honest.
+
+Two failures drive most of this file, and neither raises on its own. Vectors from a second
+model of the same dimension mix in silently and every later answer is drawn from a space the
+query does not live in; and a document id interpolated into a predicate unescaped is a
+predicate the connector's data gets to write. The conformance suites cover the first at the
+protocol level, and the tests here cover both at the level where the mistake is actually
+made.
+"""
+
+# pyright: reportUnknownMemberType=false
+#
+# Two tests below tamper with `_manicule_meta` through lancedb directly, which is the only
+# way to produce a directory that describes itself twice. lancedb annotates its surface in
+# terms of `pyarrow`, which ships no type information, so those call sites are "partially
+# unknown" — see the same note in `manicule.storage.vectors`. Nothing else in this file is
+# affected; strict checking otherwise applies.
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import lancedb
+import pytest
+
+from manicule.core.anchors import HeadingAnchor, Unlocated
+from manicule.core.content import BlockKind, Chunk
+from manicule.core.embedding import EmbedFingerprint, Pooling
+from manicule.core.errors import FingerprintMismatchError
+from manicule.core.retrieval import Filter
+from manicule.storage.vectors import (
+    META_TABLE,
+    LanceVectorStore,
+    VectorStoreStateError,
+    predicate_for,
+    quote,
+    table_name,
+    unit,
+)
+from manicule.testing import (
+    assert_vector_store_is_dimension_agnostic,
+    assert_vector_store_rejects_foreign_vectors,
+)
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from manicule.core.embedding import Vector
+    from manicule.core.protocols import VectorStore
+
+
+def fingerprint(dimension: int = 4, model_id: str = "test/model") -> EmbedFingerprint:
+    """An embedder identity at ``dimension``. Nothing in the tests assumes the number."""
+    return EmbedFingerprint(
+        model_id=model_id,
+        dimension=dimension,
+        pooling=Pooling.MEAN,
+        normalized=True,
+        tokenizer_id="test/tokenizer",
+        max_sequence_length=512,
+    )
+
+
+def chunk(
+    chunk_id: str,
+    document_id: str = "doc-1",
+    *,
+    kind: BlockKind = BlockKind.PROSE,
+    position: int = 0,
+) -> Chunk:
+    """A chunk carrying a located anchor, so the round trip has something to lose."""
+    return Chunk(
+        id=chunk_id,
+        document_id=document_id,
+        text=f"the text of {chunk_id}",
+        embed_text=f"Section > the text of {chunk_id}",
+        anchor=HeadingAnchor(path=("Section",), fragment="section"),
+        heading_path=("Section",),
+        kind=kind,
+        position=position,
+        token_count=7,
+        metadata={"lang": "en"},
+    )
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> LanceVectorStore:
+    """A store on an empty directory that does not exist yet."""
+    return LanceVectorStore(tmp_path / "vectors")
+
+
+async def prepared(directory: Path, dimension: int = 4) -> LanceVectorStore:
+    """A store that has been through ``ensure_ready`` at ``dimension``."""
+    store = LanceVectorStore(directory)
+    await store.ensure_ready(fingerprint(dimension))
+    return store
+
+
+def spread(dimension: int, index: int) -> list[float]:
+    """A one-hot vector, so similarity between two of them is decided by ``index``."""
+    return [1.0 if position == index % dimension else 0.0 for position in range(dimension)]
+
+
+# --- conformance -------------------------------------------------------------------------
+
+
+@pytest.mark.contract
+async def test_the_store_works_at_whatever_dimension_the_embedder_reports(
+    tmp_path: Path,
+) -> None:
+    """A hardcoded dimension anywhere — schema, buffer, assertion — fails one of these."""
+    made: list[LanceVectorStore] = []
+
+    def make_store() -> VectorStore:
+        store = LanceVectorStore(tmp_path / f"vectors-{len(made)}")
+        made.append(store)
+        return store
+
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
+    await assert_vector_store_is_dimension_agnostic(make_store, chunks)
+
+
+@pytest.mark.contract
+async def test_the_store_refuses_vectors_from_a_second_model_of_the_same_size(
+    tmp_path: Path,
+) -> None:
+    """A size check passes this case, and every answer afterwards is quietly meaningless."""
+    made: list[LanceVectorStore] = []
+
+    def make_store() -> VectorStore:
+        store = LanceVectorStore(tmp_path / f"vectors-{len(made)}")
+        made.append(store)
+        return store
+
+    await assert_vector_store_rejects_foreign_vectors(make_store)
+
+
+# --- round trip --------------------------------------------------------------------------
+
+
+async def test_a_chunk_comes_back_from_search_with_everything_it_went_in_with(
+    store: LanceVectorStore,
+) -> None:
+    """A stage after the first scores the text and cites the anchor; an id is not enough."""
+    await store.ensure_ready(fingerprint())
+    original = chunk("chunk-a")
+    await store.upsert([original], [spread(4, 0)])
+
+    found = await store.search(spread(4, 0), k=1)
+
+    assert [candidate.chunk for candidate in found] == [original]
+
+
+async def test_the_score_of_an_identical_vector_is_a_cosine_similarity_of_one(
+    store: LanceVectorStore,
+) -> None:
+    """``score`` is compared against a threshold downstream, so its scale has to be real."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert([chunk("chunk-a")], [[3.0, 0.0, 0.0, 0.0]])
+
+    found = await store.search([9.0, 0.0, 0.0, 0.0], k=1)
+
+    assert found[0].score == pytest.approx(1.0)
+
+
+async def test_an_orthogonal_vector_scores_zero_and_ranks_below_a_parallel_one(
+    store: LanceVectorStore,
+) -> None:
+    """Ordering and scale come from the same number; a transform that keeps one loses the other."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert(
+        [chunk("parallel"), chunk("orthogonal", position=1)],
+        [spread(4, 0), spread(4, 1)],
+    )
+
+    found = await store.search(spread(4, 0), k=2)
+
+    assert [candidate.chunk.id for candidate in found] == ["parallel", "orthogonal"]
+    assert found[1].score == pytest.approx(0.0)
+
+
+async def test_upserting_a_chunk_again_replaces_it_rather_than_storing_it_twice(
+    store: LanceVectorStore,
+) -> None:
+    """Re-ingest is not additive: a chunk indexed twice is a duplicate citation."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert([chunk("chunk-a")], [spread(4, 0)])
+    await store.upsert([chunk("chunk-a", document_id="doc-2")], [spread(4, 1)])
+
+    assert await store.count() == 1
+    found = await store.search(spread(4, 1), k=1)
+    assert found[0].chunk.document_id == "doc-2"
+
+
+async def test_a_stored_vector_is_normalised_whatever_length_it_arrived_at(
+    store: LanceVectorStore,
+) -> None:
+    """Cosine as ``1 - distance`` holds only for unit vectors, so normalising is not optional."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert([chunk("chunk-a")], [[0.0, 40.0, 0.0, 0.0]])
+
+    found = await store.search([0.0, 0.25, 0.0, 0.0], k=1)
+
+    assert found[0].score == pytest.approx(1.0)
+
+
+# --- filters -----------------------------------------------------------------------------
+
+
+async def test_a_document_filter_excludes_the_chunks_of_every_other_document(
+    store: LanceVectorStore,
+) -> None:
+    """The filter is the tenancy and scoping mechanism; one that does not exclude is decoration."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert(
+        [chunk("wanted", document_id="doc-1"), chunk("unwanted", document_id="doc-2")],
+        [spread(4, 0), spread(4, 0)],
+    )
+
+    found = await store.search(spread(4, 0), k=10, filter=Filter(document_ids=frozenset({"doc-1"})))
+
+    assert [candidate.chunk.id for candidate in found] == ["wanted"]
+
+
+async def test_a_kind_filter_excludes_the_kinds_it_does_not_name(
+    store: LanceVectorStore,
+) -> None:
+    """``kind`` is promoted to its own column precisely so this does not need a join."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert(
+        [chunk("prose"), chunk("code", kind=BlockKind.CODE, position=1)],
+        [spread(4, 0), spread(4, 0)],
+    )
+
+    found = await store.search(spread(4, 0), k=10, filter=Filter(kinds=frozenset({BlockKind.CODE})))
+
+    assert [candidate.chunk.id for candidate in found] == ["code"]
+
+
+async def test_a_filter_narrows_the_search_before_k_is_applied(
+    store: LanceVectorStore,
+) -> None:
+    """Filtering the top ``k`` afterwards returns fewer than ``k``, and the caller reads that
+    as a corpus with nothing more in it (``docs/storage.md`` §6.6)."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert(
+        [
+            chunk("nearest", document_id="doc-1"),
+            chunk("near", document_id="doc-1", position=1),
+            chunk("furthest", document_id="doc-2", position=2),
+        ],
+        [spread(4, 0), [0.9, 0.1, 0.0, 0.0], spread(4, 3)],
+    )
+
+    found = await store.search(spread(4, 0), k=1, filter=Filter(document_ids=frozenset({"doc-2"})))
+
+    assert [candidate.chunk.id for candidate in found] == ["furthest"]
+
+
+async def test_a_filter_field_the_vector_table_cannot_answer_is_refused_not_ignored() -> None:
+    """``workspace_id`` is a tenancy boundary; dropping it silently is a cross-tenant search."""
+    with pytest.raises(ValueError, match="workspace_id"):
+        predicate_for(Filter(workspace_id="team-a"))
+
+
+async def test_an_empty_filter_restricts_nothing() -> None:
+    """A default ``Filter`` arrives on every unfiltered query and must not become a predicate."""
+    assert predicate_for(Filter()) is None
+    assert predicate_for(None) is None
+
+
+# --- predicate safety --------------------------------------------------------------------
+
+
+async def test_a_quote_in_an_identifier_cannot_close_the_literal_it_sits_in() -> None:
+    """Document ids are connector data — a page title, a path — and go straight into SQL."""
+    assert quote("d1' OR '1'='1") == "'d1'' OR ''1''=''1'"
+
+
+async def test_an_identifier_shaped_like_a_predicate_deletes_only_itself(
+    store: LanceVectorStore,
+) -> None:
+    """The injection that matters here is a delete that widens to the whole table."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert(
+        [chunk("kept", document_id="doc-1"), chunk("also-kept", document_id="doc-2", position=1)],
+        [spread(4, 0), spread(4, 1)],
+    )
+
+    await store.delete_document("doc-1' OR '1'='1")
+
+    assert await store.count() == 2
+
+
+async def test_a_chunk_id_containing_a_quote_survives_storage_and_retrieval(
+    store: LanceVectorStore,
+) -> None:
+    """An id that breaks the query is an id that silently never comes back."""
+    await store.ensure_ready(fingerprint())
+    awkward = chunk("it's a chunk", document_id="it's a doc")
+    await store.upsert([awkward], [spread(4, 0)])
+
+    found = await store.search(
+        spread(4, 0), k=1, filter=Filter(document_ids=frozenset({"it's a doc"}))
+    )
+
+    assert [candidate.chunk.id for candidate in found] == ["it's a chunk"]
+
+
+# --- deletion ----------------------------------------------------------------------------
+
+
+async def test_deleting_a_document_twice_leaves_the_store_as_the_first_delete_did(
+    store: LanceVectorStore,
+) -> None:
+    """Reconciliation re-deletes what a crashed run already deleted, and must not raise."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert(
+        [chunk("gone", document_id="doc-1"), chunk("stays", document_id="doc-2", position=1)],
+        [spread(4, 0), spread(4, 1)],
+    )
+
+    await store.delete_document("doc-1")
+    await store.delete_document("doc-1")
+
+    assert await store.count() == 1
+    assert [candidate.chunk.id for candidate in await store.search(spread(4, 1), k=5)] == ["stays"]
+
+
+async def test_deleting_from_a_directory_that_holds_nothing_is_not_an_error(
+    store: LanceVectorStore,
+) -> None:
+    """Deletion runs during recovery, when the store may never have been written to."""
+    await store.delete_document("doc-1")
+
+    assert await store.count() == 0
+
+
+# --- fingerprints and persistence --------------------------------------------------------
+
+
+async def test_a_store_that_holds_nothing_reports_no_fingerprint(
+    store: LanceVectorStore,
+) -> None:
+    """``None`` is how a caller tells a fresh index from one built by another model."""
+    assert await store.fingerprint() is None
+
+
+async def test_a_second_store_on_the_same_directory_reads_what_is_there(
+    tmp_path: Path,
+) -> None:
+    """The meta table exists so a directory describes itself to a process that did not write it."""
+    directory = tmp_path / "vectors"
+    written = await prepared(directory)
+    await written.upsert([chunk("chunk-a")], [spread(4, 0)])
+    await written.teardown()
+
+    reopened = LanceVectorStore(directory)
+
+    stored = await reopened.fingerprint()
+    assert stored is not None
+    assert stored.matches(fingerprint())
+    assert await reopened.count() == 1
+
+
+async def test_the_vector_table_is_named_after_the_fingerprint_it_holds(
+    tmp_path: Path,
+) -> None:
+    """Two spaces cannot share a table name, so a rebuild can run beside the live one (§6.5)."""
+    directory = tmp_path / "vectors"
+    await prepared(directory)
+
+    written = {path.stem for path in directory.iterdir()}
+
+    assert written == {META_TABLE, table_name(fingerprint())}
+
+
+async def test_the_same_fingerprint_offered_twice_is_accepted(tmp_path: Path) -> None:
+    """Every run calls ``ensure_ready``; refusing the unchanged case would refuse every restart."""
+    directory = tmp_path / "vectors"
+    first = await prepared(directory)
+    await first.upsert([chunk("chunk-a")], [spread(4, 0)])
+    await first.teardown()
+
+    second = LanceVectorStore(directory)
+    await second.ensure_ready(fingerprint())
+
+    assert await second.count() == 1
+
+
+async def test_a_model_that_differs_only_in_pooling_is_refused(tmp_path: Path) -> None:
+    """Pooling is chosen by manicule and changes the space; the dimension does not move."""
+    store = await prepared(tmp_path / "vectors")
+    other = fingerprint().model_copy(update={"pooling": Pooling.CLS})
+
+    with pytest.raises(FingerprintMismatchError, match="pooling"):
+        await store.ensure_ready(other)
+
+
+async def test_a_meta_table_that_describes_two_indexes_is_refused(tmp_path: Path) -> None:
+    """Picking a winner from a contradictory directory is how half a backup gets trusted."""
+    directory = tmp_path / "vectors"
+    store = await prepared(directory)
+    await store.teardown()
+
+    connection = await lancedb.connect_async(directory)
+    meta = await connection.open_table(META_TABLE)
+    duplicate = fingerprint(model_id="other/model")
+    await meta.add(
+        [
+            {
+                "embed_fingerprint": duplicate.model_dump_json(),
+                "canonical": duplicate.canonical(),
+            }
+        ]
+    )
+
+    with pytest.raises(VectorStoreStateError, match="2 rows"):
+        await LanceVectorStore(directory).fingerprint()
+
+
+async def test_a_meta_row_that_contradicts_itself_is_refused(tmp_path: Path) -> None:
+    """The canonical column is what a repair tool compares; a row where they disagree is edited."""
+    directory = tmp_path / "vectors"
+    store = await prepared(directory)
+    await store.teardown()
+
+    connection = await lancedb.connect_async(directory)
+    await connection.drop_table(META_TABLE)
+    tampered = await connection.create_table(
+        META_TABLE,
+        data=[
+            {
+                "embed_fingerprint": fingerprint().model_dump_json(),
+                "canonical": fingerprint(model_id="other/model").canonical(),
+            }
+        ],
+    )
+    assert await tampered.count_rows() == 1
+
+    with pytest.raises(VectorStoreStateError, match="contradicts itself"):
+        await LanceVectorStore(directory).fingerprint()
+
+
+# --- refusals ----------------------------------------------------------------------------
+
+
+async def test_searching_before_the_store_is_prepared_is_refused(
+    store: LanceVectorStore,
+) -> None:
+    """Retrieval refuses too, not only ingest: an unopened index cannot name its space (§6.3)."""
+    with pytest.raises(VectorStoreStateError, match="ensure_ready"):
+        await store.search([0.0, 1.0, 0.0, 0.0], k=1)
+
+
+async def test_writing_before_the_store_is_prepared_is_refused(
+    store: LanceVectorStore,
+) -> None:
+    """Without a fingerprint there is no dimension to build a table at, and no space to claim."""
+    with pytest.raises(VectorStoreStateError, match="ensure_ready"):
+        await store.upsert([chunk("chunk-a")], [[0.0, 1.0, 0.0, 0.0]])
+
+
+async def test_a_vector_of_the_wrong_dimension_is_refused_on_the_way_in(
+    store: LanceVectorStore,
+) -> None:
+    """Two embedders in one pipeline; the store is the last place it can be seen."""
+    await store.ensure_ready(fingerprint())
+
+    with pytest.raises(ValueError, match="index was built for 4"):
+        await store.upsert([chunk("chunk-a")], [[1.0, 0.0]])
+
+
+async def test_a_query_of_the_wrong_dimension_is_refused(store: LanceVectorStore) -> None:
+    """A query from another model does not merely rank badly; it ranks meaninglessly."""
+    await store.ensure_ready(fingerprint())
+
+    with pytest.raises(ValueError, match="2-dimension query"):
+        await store.search([1.0, 0.0], k=1)
+
+
+async def test_chunks_and_vectors_of_different_lengths_are_refused(
+    store: LanceVectorStore,
+) -> None:
+    """They are positional: a mismatch stores some chunk against another chunk's vector."""
+    await store.ensure_ready(fingerprint())
+
+    with pytest.raises(ValueError, match="2 chunk"):
+        await store.upsert([chunk("a"), chunk("b", position=1)], [spread(4, 0)])
+
+
+async def test_upserting_nothing_stores_nothing(store: LanceVectorStore) -> None:
+    """A document that produced no chunks reaches here; it must not become an empty write."""
+    await store.ensure_ready(fingerprint())
+    empty_chunks: list[Chunk] = []
+    empty_vectors: list[Vector] = []
+
+    await store.upsert(empty_chunks, empty_vectors)
+
+    assert await store.count() == 0
+
+
+# --- degenerate vectors ------------------------------------------------------------------
+
+
+async def test_a_vector_with_no_direction_is_left_alone_by_normalisation() -> None:
+    """There is no unit vector to scale it to, and inventing one would fabricate a direction."""
+    assert unit([0.0, 0.0, 0.0]) == [0.0, 0.0, 0.0]
+
+
+async def test_a_query_with_no_direction_returns_candidates_it_does_not_claim_to_rank(
+    store: LanceVectorStore,
+) -> None:
+    """Cosine against the zero vector is undefined.
+
+    Returning an empty list would claim the corpus is empty, which is a different answer.
+    """
+    await store.ensure_ready(fingerprint())
+    await store.upsert(
+        [chunk("chunk-a"), chunk("chunk-b", position=1)],
+        [spread(4, 0), spread(4, 1)],
+    )
+
+    found = await store.search([0.0, 0.0, 0.0, 0.0], k=2)
+
+    assert len(found) == 2
+    assert {candidate.score for candidate in found} == {0.0}
+
+
+async def test_a_query_with_no_direction_still_honours_the_filter(
+    store: LanceVectorStore,
+) -> None:
+    """The unrankable path is a second route to the rows, and skips no scoping on the way."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert(
+        [chunk("wanted", document_id="doc-1"), chunk("unwanted", document_id="doc-2", position=1)],
+        [spread(4, 0), spread(4, 1)],
+    )
+
+    found = await store.search(
+        [0.0, 0.0, 0.0, 0.0], k=5, filter=Filter(document_ids=frozenset({"doc-1"}))
+    )
+
+    assert [candidate.chunk.id for candidate in found] == ["wanted"]
+
+
+async def test_asking_for_no_candidates_returns_none_of_them(store: LanceVectorStore) -> None:
+    """Lance rejects a limit of zero, and a caller that wants nothing is not an error."""
+    await store.ensure_ready(fingerprint())
+    await store.upsert([chunk("chunk-a")], [spread(4, 0)])
+
+    assert await store.search(spread(4, 0), k=0) == []
+
+
+async def test_a_chunk_without_a_location_round_trips_as_unlocated(
+    store: LanceVectorStore,
+) -> None:
+    """``Unlocated`` is a member with a reason; flattening it to a guess is the whole failure."""
+    await store.ensure_ready(fingerprint())
+    unplaced = Chunk(
+        id="unplaced",
+        document_id="doc-1",
+        text="text with nowhere to point",
+        embed_text="text with nowhere to point",
+        anchor=Unlocated(reason="the parser could not place it"),
+        position=0,
+        token_count=5,
+    )
+    await store.upsert([unplaced], [spread(4, 0)])
+
+    found = await store.search(spread(4, 0), k=1)
+
+    assert found[0].chunk.anchor == unplaced.anchor

@@ -16,6 +16,12 @@ dist/
 .coverage.*
 htmlcov/
 
+# Scratch databases. `alembic` used by hand, and the `alembic check` CI step, both write one
+# into the working directory; the real database lives in the data directory, not here.
+manicule.db
+manicule.db-wal
+manicule.db-shm
+
 # uv.lock is deliberately committed: CI installs with --frozen, so a build here is the
 # build that runs there.
 

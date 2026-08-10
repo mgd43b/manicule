@@ -112,38 +112,33 @@ platform provides, and a build without FTS5 fails at the first query rather than
 
 - **Entity IDs are `uuid4` in canonical dashed form, stored as `TEXT`.** Opaque, safe in a
   URL, no coordination.
-- **`chunks.id` is content-derived**: `sha256(document_id || "\0" || embed_text)`, hex,
-  truncated to 32 characters, with a `:n` suffix disambiguating byte-identical chunks within
-  one document. `n` is assigned by ascending `position` among the colliding set.
+- **`chunks.id` is content-derived**, from `manicule.core.ids.chunk_id` — a length-prefixed
+  blake2b digest over `document_id`, `position` and `text`.
 
-  This is worth the deviation from a positional scheme. A chunk's identity is its
-  content-in-context, so re-parsing a document that changed in one paragraph produces the
-  same IDs for every unchanged chunk — their vectors survive and only the changed chunk is
-  re-embedded. It also makes a stale citation *dangle* rather than silently re-point: if the
-  text a citation named no longer exists, its ID no longer exists either. That is the same
-  rule `docs/contracts.md` §1 states for anchors — a location is correct, or it is absent.
+  A chunk's identity is its content-in-context, so **editing one paragraph of a document
+  leaves every other chunk's id unchanged** — their vectors survive the re-parse and only the
+  edited chunk is re-embedded. It also makes a stale citation *dangle* rather than silently
+  re-point: if the text a citation named no longer exists, its id no longer exists either.
+  That is the rule `docs/contracts.md` §1 states for anchors — a location is correct, or it
+  is absent.
 
-  **The `:n` suffix is the one exception to that stability, and it is a real one.** Because
-  `n` is an enumeration, it depends on how many duplicates precede a chunk — not only on the
-  chunk itself. A document with three byte-identical chunks yields `…:0`, `…:1`, `…:2`;
-  delete the first and the survivors renumber. Two chunks that did not change have new IDs,
-  their vectors are re-embedded for nothing, and citations to text that still exists dangle.
-  So: **duplicate churn within a single document is the one case where an unchanged chunk
-  can change ID.** Anyone implementing against this should not assume more.
+  **`position` is part of the digest, and the trade that makes is worth stating.** An earlier
+  draft of this document derived the id from content alone and disambiguated byte-identical
+  chunks with a `:n` suffix. The shipped scheme is simpler and has no suffix, because
+  position already separates duplicates — but it moves the churn rather than removing it:
 
-  Two things make it acceptable rather than a defect. The scope is narrow — the hash covers
-  `embed_text`, which carries the heading breadcrumb, so a collision needs byte-identical
-  text under an identical heading path, not merely a repeated sentence. And the failure runs
-  in the conservative direction: a needless re-embed and a false dangle, never a citation
-  silently re-pointed at different text.
+  | | id includes `position` (shipped) | content-only with a `:n` suffix (rejected) |
+  |---|---|---|
+  | Edit one paragraph in place | only that chunk changes id | only that chunk changes id |
+  | **Insert** a paragraph | every later chunk changes id | unaffected |
+  | Delete one of several byte-identical chunks | unaffected | the survivors renumber |
 
-  **The alternative, recorded.** Fold `position` into the hash and every ID is unique with no
-  suffix. Rejected because it trades a rare failure for a universal one: inserting a paragraph
-  shifts every downstream position, so *every* subsequent chunk gets a new ID, is re-embedded,
-  and drops its citations — on every edit, to every document. The suffix confines that
-  behaviour to duplicate sets. A stable suffix assigned on first sight and carried forward
-  would avoid both, but it requires matching old chunks to new ones, which is the state this
-  scheme exists to avoid keeping.
+  So an insertion re-embeds the tail of the document. That is the cost, it is real, and it is
+  paid on a re-parse rather than on a query. It was accepted because the failure runs in the
+  conservative direction in both schemes — a needless re-embed and a dangling citation, never
+  a citation silently re-pointed at different text — and because a positional digest has no
+  enumeration step, so there is no case where an id depends on how many *other* chunks
+  happen to share its content.
 
   > **Prior art.** OpenDocuments builds chunk IDs as `${documentId}_chunk_${i}` and then
   > parses them back out with `/^(.+)_chunk_(\d+)$/` to find neighbours, and deletes FTS rows
@@ -718,15 +713,29 @@ The Lance table holds the minimum needed to find a chunk and to filter before fi
 |---|---|---|
 | `id` | `string` | `chunks.id`; the join key |
 | `vector` | `fixed_size_list<float32, D>` | `D` from the fingerprint, never a literal |
-| `workspace_id` | `string` | isolation, always filtered |
 | `document_id` | `string` | pushdown filter, and delete-by-document |
-| `connector_id` | `string` | pushdown filter |
 | `kind` | `string` | pushdown filter |
 | `lang` | `string` | pushdown filter |
-| `position` | `int32` | pushdown filter |
+| `position` | `int64` | pushdown filter |
+| `chunk_json` | `string` | the chunk itself — see below |
 
-**No `text`. No `metadata_json`.** Text and metadata live in `chunks`. A search returns
-`(id, distance)` pairs, and one SQLite query hydrates them:
+**`chunk_json` is a departure from the original design, forced by the protocol.** An earlier
+draft of this section said the Lance row holds no text: a search would return `(id, distance)`
+and SQLite would hydrate. That is not implementable against the merged contract.
+`VectorStore.search` returns `Candidate`, which carries a whole `Chunk`, and
+`assert_vector_store_is_dimension_agnostic` in `manicule.testing` exercises a store with no
+relational database behind it and requires the returned chunks to carry their text. A vector
+store that cannot answer on its own does not satisfy the protocol.
+
+So the chunk travels with the vector, as one canonical JSON column rather than a spread of
+typed columns — `Chunk.model_dump_json` and its inverse round-trip whatever the type has
+*now*, whereas a hand-written column mapping is a second place to remember when the type
+gains a field, and the field nobody remembers is the one that goes missing in silence.
+
+**The hydrating join still exists and is still the enforcement point** (§8) — it is simply
+downstream of the vector store rather than inside it. Retrieval joins candidates to
+`documents`, so a vector whose chunk row is gone, or whose document is soft-deleted or not yet
+`indexed`, is invisible whatever Lance returns:
 
 ```sql
 SELECT c.*, d.uri, d.title
@@ -734,9 +743,12 @@ FROM chunks c JOIN documents d ON d.id = c.document_id
 WHERE c.id IN (…) AND d.deleted_at IS NULL AND d.status = 'indexed'
 ```
 
-That **inner join is the enforcement point for the entire consistency model** (§8). A vector
-with no chunk row is invisible. A chunk whose document is soft-deleted or not yet indexed is
-invisible. Nothing needs to be deleted from LanceDB for a result to stop being served.
+Nothing needs to be deleted from LanceDB for a result to stop being served. The cost of
+`chunk_json` is a second copy of the corpus text, and the honest accounting is that the
+protocol bought self-sufficiency with duplication.
+
+**No `workspace_id` column.** Workspace lives on `documents`, and the join above applies it.
+Promoting it into Lance would make it a value that can disagree with SQLite.
 
 **Vectors are L2-normalised and the metric is cosine**, so `score = 1 - _distance` is an
 actual cosine similarity in `[-1, 1]`. `PLAN.md` §8 has confidence scoring, and a confidence
@@ -778,13 +790,30 @@ keys on model identity:
 > **Prior art.** `ensureCollection(name, dimensions)` compares `existingDimensions !== dimensions`
 > and nothing else. All three cases above pass it.
 
-**What is compared.** The full `EmbedFingerprint`, in the canonical form pinned in §4.6, and
-compared for byte equality. Not field-by-field, so a field added to the type later cannot be
-silently ignored by a comparison that predates it. The type belongs to
-[#1](https://github.com/mgd43b/manicule/issues/1); storage requires only that it is
-sufficient to determine vector-space compatibility, which means at minimum: model repository
-and revision or file digest, **architecture**, dtype/quantisation, pooling strategy,
-normalisation, `max_sequence_length`, any query/document instruction prefix, and dimension.
+**What is compared.** `EmbedFingerprint.identity()` — the declared subset of fields that
+decide comparability — in the canonical form pinned in §4.6, compared for byte equality. Not
+field-by-field, so a field added to that subset later cannot be silently ignored by a
+comparison that predates it. As shipped in `manicule.core.embedding`, identity is `model_id`,
+`revision`, `dimension`, `pooling`, `normalized` and `tokenizer_id`.
+
+**Two fields are recorded but deliberately excluded, and the second is a bet.**
+`max_sequence_length` is out because including it would force a full re-embed whenever the
+limit *rises*, which changes nothing about the stored vectors; what matters is whether any
+text was truncated, and `require_within_context` checks that against the actual batch — in
+particular on the re-embed path, which reads stored `embed_text` without re-chunking and so
+never runs the chunker's own budget refusal. `backend` is out on the assumption that the same
+model under MLX and under ONNX produces interchangeable vectors, which keeps a corpus portable
+between machines. That assumption has not been measured. **If parity cannot be brought within
+tolerance, moving `backend` into the identity set is the correction** — it makes a runtime
+change a loud error with a re-embed path, which is right if the vectors really do differ.
+
+**`architecture` is not currently an identity field, and there is an argument that it should
+be.** `mlx-embeddings` binds `last_hidden_state` to the *pooled* vector on some architectures
+and not others, so architecture determines which tensor the extraction path reads — upstream
+of pooling rather than beside it. Two checkpoints agreeing on model id, revision, dtype,
+pooling and dimension could still land in different spaces. It is left to
+[#3](https://github.com/mgd43b/manicule/issues/3), which owns the type and the measurement;
+recorded here because storage is what would fail to notice.
 
 **`architecture` is in that list for a concrete reason**, and it is a second instance of why
 the comparison is by bytes. `mlx-embeddings` binds `last_hidden_state` to the *pooled* vector
@@ -1272,7 +1301,7 @@ one.
 | Decision | Rationale in |
 |---|---|
 | Four tables added beyond the sixteen: `chunks`, `blobs`, `index_state`, `vector_tombstones` | §4.1 |
-| `chunks.id` is content-derived, not positional | §3.2 |
+| `chunks.id` is content-derived; `position` is part of the digest, and the trade is stated | §3.2 |
 | `documents.source_id` added; identity keyed on it rather than on the URI | §4.2 |
 | `documents.connector_id` is `NOT NULL`; filesystem and upload are connectors | §4.2 |
 | `documents.container_id` self-referential cascade for archive members | §4.2 |
@@ -1283,6 +1312,7 @@ one.
 | `audit_logs` deliberately has no foreign keys; `query_logs` deliberately cascades | §4.7 |
 | Column renames to match `docs/contracts.md` §2: `source_type`→`source`, `source_path`→`uri`, `file_type`→`media_type`, `source_version`→`version_token`, `parser_used`→`parser` | §4.2 |
 | FTS5 is external-content over `chunks` and trigger-maintained | §6.1 |
+| The vector row carries the chunk as `chunk_json`, because the protocol requires a self-sufficient store | §6.2 |
 | The lexical query is one joined statement so `LIMIT` applies after filtering | §6.1 |
 | The sweep collects soft-deleted documents after a grace period, trading free restore against vector top-`k` dilution | §8.2 |
 | Two FTS columns with BM25 weights `1.0 / 0.4` | §6.1 |
