@@ -374,9 +374,17 @@ The ADF node walk is **not** here: it is `manicule/parsers/adf.py`, reached thro
 chain like any other format, and so are attachments. The connector's job ends at handing over
 bytes and saying honestly what they are.
 
-**One seam the `Connector` protocol does not name.** `discover` takes a watermark; nothing in
-the protocol returns the next one. `ConfluenceConnector.watermark` is a read-only property
-carrying what to persist if the run completed cleanly — an addition on the implementation, not
-a widening of the protocol, since a caller working from `Connector` never sees it. The ingest
-pipeline reads it after a clean run ([`ingest.md`](../ingest.md) §13.1 records the watermark
-before and after a run, and §13.2 makes advancing it conditional on the run being clean).
+**`Connector.watermark` was added to the protocol for this connector**, in
+[#9](https://github.com/mgd43b/manicule/issues/9). `discover` consumed a watermark and nothing
+produced one, so `connectors.watermark` (`storage.md` §4.7) could not be filled by anything
+working through the protocol. It is read-only and reflects the last **completed** enumeration:
+a consumer that abandoned discovery part-way is offered nothing at all, because a watermark
+advanced by a walk that did not finish is a position past documents nobody received, and the
+next sync starts there and never sees them again. `assert_connector_contract` checks it, with
+a fake that advances on yield to prove the check fires. `contracts.md` §3 carries the full
+statement; the caller's half — persist it only once what the run produced is stored — is
+[`ingest.md`](../ingest.md) §13.2.
+
+The five-minute overlap in §2 is what makes the remaining race survivable rather than
+theoretical: a run interrupted between yielding a document and committing it re-enumerates that
+document next time, and change detection skips it if it did land.

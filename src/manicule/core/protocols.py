@@ -406,6 +406,42 @@ class Connector(Protocol):
 
     name: str
 
+    @property
+    def watermark(self) -> Watermark | None:
+        """How far the **last completed** enumeration got, or ``None`` if none has.
+
+        The other half of :meth:`discover`, which consumes a watermark and — without this —
+        had nowhere to produce the next one, leaving ``connectors.watermark``
+        (``storage.md`` §4.7) unfillable by anything working through this protocol.
+
+        **It is safe to persist if and only if every document ``discover`` has yielded has
+        been durably committed.** That is a condition on the caller, not on the connector: the
+        connector promises only that this reflects a *complete* enumeration, never a partial
+        one, and the caller must not store it until what that enumeration produced is stored
+        too. Read it after a clean run and not otherwise.
+
+        Read-only, so an implementation is free to expose a stored value or a computed one.
+
+        .. warning::
+
+           **Persisting a watermark for work that was not committed loses documents
+           permanently.** The next sync starts from the stored position, so anything the
+           interrupted run enumerated but did not store is never enumerated again. Not
+           delayed — invisible, with nothing raised and nothing to notice, until somebody
+           searches for a document that has been in the source all along and is not in the
+           index. It is the same class of failure as a citation pointing at a page that does
+           not exist: internally consistent, quietly wrong, and undetectable from the inside.
+
+        The race between "yielded" and "committed" is real and is deliberately not eliminated.
+        It is made survivable instead, by connectors that overlap their queries slightly rather
+        than resuming exactly — the Confluence connector reaches five minutes back before its
+        stored position (``docs/connectors/confluence.md`` §2), because re-enumerating a small
+        overlap costs a version comparison that change detection was going to make anyway and
+        content-hash dedup absorbs the rest. Pretending the race is not there is what turns it
+        into lost documents.
+        """
+        ...
+
     def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
         """Yield documents created or changed since ``watermark``.
 

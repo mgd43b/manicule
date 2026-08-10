@@ -314,15 +314,24 @@ class MemoryConnector:
     def __init__(self, documents: dict[SourceId, str] | None = None) -> None:
         self.name = "memory"
         self._documents = documents or {"a": "alpha", "b": "beta"}
+        self._watermark: Watermark | None = None
+
+    @property
+    def watermark(self) -> Watermark | None:
+        return self._watermark
 
     async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
         del watermark
+        seen: list[str] = []
         for source_id, text in sorted(self._documents.items()):
             yield DiscoveredDoc(
                 ref=DocRef(source_id=source_id, uri=f"memory://{source_id}"),
                 version_token=content_hash(text),
                 media_type=MEDIA_TYPE,
             )
+            seen.append(source_id)
+        # After the loop, so an abandoned enumeration leaves the watermark where it was.
+        self._watermark = Watermark(value=seen[-1], observed_at=now()) if seen else None
 
     async def fetch(self, ref: DocRef) -> RawDocument:
         return RawDocument(
@@ -344,6 +353,28 @@ class ForgetfulConnector(MemoryConnector):
     async def reconcile(self) -> AsyncIterator[SourceId]:
         return
         yield  # pragma: no cover - unreachable, present to make this an async generator
+
+
+class EagerWatermarkConnector(MemoryConnector):
+    """Advances its watermark as it yields, rather than when the walk finishes.
+
+    Nothing about this looks wrong: every document is correct, the position is real, and an
+    uninterrupted run behaves identically to a correct connector. It goes wrong only when a
+    run is interrupted — and then the stored position is *past* documents nobody received, so
+    the next sync starts after them and they are never enumerated again. No error, nothing to
+    notice, and no later sync fixes it.
+    """
+
+    @override
+    async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+        del watermark
+        for source_id, text in sorted(self._documents.items()):
+            self._watermark = Watermark(value=source_id, observed_at=now())
+            yield DiscoveredDoc(
+                ref=DocRef(source_id=source_id, uri=f"memory://{source_id}"),
+                version_token=content_hash(text),
+                media_type=MEDIA_TYPE,
+            )
 
 
 def now() -> datetime:
