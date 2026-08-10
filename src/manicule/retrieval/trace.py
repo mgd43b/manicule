@@ -42,7 +42,7 @@ from manicule.core.content import Metadata
 from manicule.core.retrieval import PipelineIdentity
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping, Sequence
+    from collections.abc import Iterable, Mapping
 
 
 class Route(StrEnum):
@@ -359,11 +359,6 @@ class installed:  # noqa: N801 - a context manager used as a verb, like `context
             self._token = None
 
 
-def spans_of(frame: TraceFrame) -> Iterator[StageSpan]:
-    """Every span the frame holds, in the order the stages ran."""
-    yield from frame.spans
-
-
 def _as_json(values: Mapping[str, object]) -> Metadata:
     """Coerce recorded diagnostics into JSON-shaped values.
 
@@ -389,11 +384,6 @@ def _json_value(value: object) -> JsonValue:
     return repr(value)
 
 
-def sequence_of(spans: Sequence[StageSpan]) -> tuple[str, ...]:
-    """The stage names, in order. The pipeline declaration a run actually executed."""
-    return tuple(span.name for span in spans)
-
-
 __all__ = [
     "AssemblyReport",
     "DenseReport",
@@ -411,6 +401,4 @@ __all__ = [
     "not_comparable",
     "record",
     "record_assembly",
-    "sequence_of",
-    "spans_of",
 ]

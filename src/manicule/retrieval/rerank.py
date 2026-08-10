@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from manicule.retrieval.profile import retrieval_depth
 from manicule.retrieval.trace import RerankReport, record
 
 if TYPE_CHECKING:
@@ -101,7 +102,7 @@ class CrossEncoderReranker:
         *findable* and would otherwise be judged as though it were part of the answer.
         """
         profile = self._profiles.for_query(query)
-        head_size = max(profile.candidates, query.limit)
+        head_size = retrieval_depth(profile, query)
         head = candidates[:head_size]
         if not head:
             record(RerankReport(model_id=self.model_id, pairs=0, truncated_from=len(candidates)))

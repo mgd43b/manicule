@@ -6,7 +6,10 @@ and in one direction only:
 
 - Without :class:`SupportsLiveChunkCount`, the dense leg cannot measure how dilute the vector
   table is, so it starts at its over-fetch floor and lets the retry in ``docs/retrieval.md``
-  §4.4 make up the difference. **More round trips, identical candidates.**
+  §4.4 make up the difference. **More round trips, identical candidates.** (Only the numerator
+  of that fraction is optional: every vector store reports its row count, because the protocol
+  requires it — and it is the vector table's row count rather than the chunk count on purpose,
+  since unswept tombstones are still rows and still consume top-``k`` slots.)
 - Without :class:`~manicule.core.retrieval.SupportsGeneration`, the L1 cache has no
   invalidation signal, so the retriever refuses to enable it and says why. **A cold cache,
   never a stale one.**
@@ -41,21 +44,6 @@ class SupportsLiveChunkCount(Protocol):
 
 
 @runtime_checkable
-class SupportsVectorCount(Protocol):
-    """A vector store that can report its row count.
-
-    The *denominator* of the over-fetch factor, and it is the vector table's row count rather
-    than the chunk count on purpose: unswept tombstones are still rows and still consume
-    top-``k`` slots, so a fraction computed against SQLite's chunk count would call an index
-    clean while it was full of pending deletions.
-    """
-
-    async def count(self) -> int:
-        """How many vectors are stored."""
-        ...
-
-
-@runtime_checkable
 class SupportsDocumentCount(Protocol):
     """A store that can count its documents without listing them."""
 
@@ -77,5 +65,4 @@ __all__ = [
     "SupportsDocumentCount",
     "SupportsIndexState",
     "SupportsLiveChunkCount",
-    "SupportsVectorCount",
 ]

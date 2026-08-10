@@ -39,7 +39,6 @@ from manicule.retrieval.ports import (
     SupportsDocumentCount,
     SupportsIndexState,
     SupportsLiveChunkCount,
-    SupportsVectorCount,
 )
 from manicule.retrieval.prefilter import Resolution, resolve
 from manicule.retrieval.profile import Profiles, retrieval_depth
@@ -84,7 +83,6 @@ __all__ = [
     "SupportsDocumentCount",
     "SupportsIndexState",
     "SupportsLiveChunkCount",
-    "SupportsVectorCount",
     "UtilityAnswer",
     "UtilityKind",
     "band_for",

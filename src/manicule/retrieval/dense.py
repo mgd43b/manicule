@@ -30,6 +30,7 @@ from manicule.retrieval.config import DenseConfig
 from manicule.retrieval.hydration import visible_documents
 from manicule.retrieval.merging import union_scored
 from manicule.retrieval.ports import SupportsLiveChunkCount
+from manicule.retrieval.profile import retrieval_depth
 from manicule.retrieval.trace import DenseReport, Regime, Shortfall, record
 
 if TYPE_CHECKING:
@@ -100,7 +101,7 @@ class DenseStage:
     async def run(self, query: Query, candidates: list[Candidate]) -> list[Candidate]:
         """Search, scope, floor, and merge into ``candidates`` without touching it."""
         profile = self._profiles.for_query(query)
-        k = max(profile.candidates, query.limit)
+        k = retrieval_depth(profile, query)
         config = self._config
 
         split = await prefilter.resolve(

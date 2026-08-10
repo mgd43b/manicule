@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from manicule.retrieval.merging import union_scored
+from manicule.retrieval.profile import retrieval_depth
 from manicule.retrieval.trace import LexicalReport, not_comparable, record
 
 if TYPE_CHECKING:
@@ -63,7 +64,7 @@ class LexicalStage:
         filter names, so the restriction is applied before ``LIMIT`` rather than around it.
         """
         profile = self._profiles.for_query(query)
-        k = max(profile.candidates, query.limit)
+        k = retrieval_depth(profile, query)
 
         found = await self._docstore.search_lexical(query.text, k, query.filter)
         degraded = not found
