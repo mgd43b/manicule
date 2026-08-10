@@ -539,10 +539,22 @@ gets shown.
    "a citation carries a correct location, or none" is trivially satisfiable by never
    carrying one.
 
-6. **Idempotence across a re-ingest.** Re-parsing an unchanged document produces chunk ids
-   identical to the stored ones, so an unchanged document costs zero re-embedding. Chunk
-   ids are therefore derived deterministically from `(document_id, position, hash(text))`
-   and never from a counter, a UUID, or a timestamp.
+6. **Idempotence across a re-ingest.** Re-parsing an unchanged document produces the same
+   chunk sequence, so an unchanged document costs zero re-embedding.
+
+   The parser's obligation is the *sequence* — same texts, same order, same anchors. The
+   **chunk ID scheme is storage's** ([`storage.md`](storage.md) §3.2), derived from content
+   rather than from a counter, a UUID, or a timestamp. This assertion checks that the parser
+   gives it a stable input; it does not re-specify the derivation.
+
+   **One documented exception, inherited rather than introduced here:** IDs are content-
+   derived, so byte-identical chunks within a document collide and are disambiguated by a
+   suffix assigned in position order. Deleting one of several duplicates therefore renumbers
+   the survivors and changes IDs that did not "really" change. It is narrow — a collision
+   needs identical text under an identical heading path — and it fails safe, producing a
+   dangling reference rather than a silent re-point. The harness asserts idempotence on
+   *unchanged* input, which is the case that matters; it does not assert stability across
+   edits, because that does not hold.
 
 Assertions 1–4 and 6 are per-fixture; assertion 5 is per-corpus and runs once at the end of
 each parser's suite.
@@ -1164,13 +1176,17 @@ The `!/` separator is the long-standing convention for addressing inside a conta
 survives being pasted into a bug report.
 
 **The member's `source_id` comes from the container walk, not from the connector.** Document
-identity is `(workspace_id, connector_id, source_id)` and `uri` is citable display data that
-is expected to change ([`storage.md`](storage.md) §4.2) — a Confluence URL carries a
-title-derived slug, so a rename would mint a duplicate if identity rested on the URI. A
-connector knows nothing about what is inside an archive it fetched, so the parse stage
-assigns member `source_id`s, and it must do so from the inner path rather than from anything
-positional: a member that moves within the archive keeps its identity, and one that is
-inserted ahead of another does not steal it.
+identity is `(workspace_id, connector_id, source_id)`, and `uri` is citable display data
+([`storage.md`](storage.md) §4.2) — a string chosen for a human to read, which nothing
+obliges a source to keep fixed. Identity has to rest on what a connector can *promise* is
+stable, which is how it addresses a document rather than how it displays one: Confluence
+fetches and versions by page ID ([`confluence.md`](connectors/confluence.md) §2, §4), and for
+a filesystem source a renamed file is self-evidently the same file.
+
+A connector knows nothing about what is inside an archive it fetched, so the parse stage
+assigns member `source_id`s. It must do so from the inner path rather than from anything
+positional: a member that moves within the archive keeps its identity, and one inserted ahead
+of another does not steal it.
 
 `container_id` and `container_depth` are **real columns rather than metadata**, because the
 cascade in §9.1 is a foreign key and a foreign key cannot point into a JSON field. Depth is
