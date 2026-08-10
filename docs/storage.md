@@ -794,8 +794,8 @@ agreeing on model id, revision, dtype, pooling and dimension can still land in d
 spaces. Byte equality catches the field nobody anticipated; a hand-written comparison catches
 only the fields its author thought of.
 
-A `ChunkFingerprint` — chunk budget, overlap, breadcrumb budget, chunker version, tokenizer
-ID, and a per-language tree-sitter grammar map ([`parsing.md`](parsing.md) §1.7) — sits beside it in the same row, on the same terms. Changing it
+A `ChunkFingerprint` — chunker, version, `max_tokens`, `overlap_tokens`, `tokenizer_id` and a
+per-language tree-sitter grammar map ([`parsing.md`](parsing.md) §1.7) — sits beside it in the same row, on the same terms. Changing it
 means re-chunk *and* re-embed, so it is a strictly larger invalidation than the embedding
 fingerprint and gets the same refusal.
 
