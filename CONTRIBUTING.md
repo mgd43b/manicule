@@ -152,6 +152,47 @@ nothing enforces is worse than an absent one, because it gets believed.
 
 Install plugins you would be willing to run as yourself, because that is what happens.
 
+## Reviewing a dependency update
+
+Dependabot is configured in [`.github/dependabot.yml`](.github/dependabot.yml). Two things
+about its pull requests are not obvious from the diff.
+
+**A group name beginning `index-affecting-` means the cost is a re-ingest, not a review.**
+Most bumps risk a regression and CI catches them. These change what is *in* the corpus:
+
+| Group | What moves | What it costs |
+|---|---|---|
+| `index-affecting-embedding` | The stored vectors | Re-embed everything |
+| `index-affecting-chunking` | Where chunks begin and end | Re-chunk and re-embed what it touches |
+| `index-affecting-extraction` | The text a document was reduced to | Re-parse the affected documents |
+
+There is machinery here — `EmbedFingerprint` and `ChunkFingerprint` refuse an index built
+with something else, and the macOS backend parity job compares MLX against ONNX within a
+stated tolerance — so a genuinely divergent bump should turn CI red. Red is the signal that
+the corpus needs rebuilding, not a reason to widen a tolerance. Two cases have no guard at
+all and are grouped precisely because of it: no fingerprint records a parser version, and
+the provisional token counter records `tokenizer_id` as the literal string `"provisional"`,
+which does not change when `tiktoken`'s vocabulary does.
+
+**Nothing here checks licences, and this project has rejected dependencies over them.**
+manicule is GPL-3.0-or-later. Dependabot reports versions; it says nothing about the terms
+a new version ships under, and a relicence lands in a routine-looking bump. So the licence
+is checked by a person, at selection time, and again if a bump crosses a major version.
+
+The two decisions on record show why it is not a lookup ([`docs/parsing.md`](docs/parsing.md)
+§12 has the full reasoning):
+
+- **`extract-msg` is GPL-3.0 and became admissible** when this project relicensed. GPL-3.0
+  inside a GPL-3.0 work carries no additional obligation.
+- **PyMuPDF is AGPL-3.0 and stayed rejected**, relicence or not. GPLv3 §13 permits the
+  combination, but the AGPL portion keeps its network clause — so the obligation lands on
+  anyone who *runs* manicule rather than on us. A condition we would be imposing on
+  operators is not ours to accept on their behalf, and `pypdfium2` is permissive and
+  already does the job.
+
+GPL is ordinary here. AGPL is not, and neither is a term that reaches past this repository
+to the people deploying it.
+
 ## Commit and pull request conventions
 
 - Branch from `origin/main`. Never push to `main`, never self-merge.
