@@ -120,6 +120,10 @@ re-ingest against a pinned corpus a first-class operation rather than a re-crawl
 
 ## 6. Connectors — 8
 
+**v1 ships Confluence only** ([#9](https://github.com/mgd43b/manicule/issues/9)); the other seven follow once the
+protocol is proven against a real implementation. Full Confluence design in
+[`docs/connectors/confluence.md`](docs/connectors/confluence.md).
+
 OpenDocuments re-enumerates nearly everything on every sync and dedups by content hash.
 Only GitHub has a real change token. Each connector below gets proper incremental sync.
 
