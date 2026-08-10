@@ -106,18 +106,97 @@ and conflict declarations, config schemas, and a scaffolding command.
 
 ---
 
-## What changes
+## The stack
 
-| | OpenDocuments | manicule | Why |
-|---|---|---|---|
-| Language | TypeScript | Python | The retrieval and document ecosystem lives here |
-| PDF parsing | `pdf-parse` | layout-aware parser | `pdf-parse` gives a text blob with no real page boundaries — the cause of the citation bug below |
-| Embeddings | Ollama / cloud | MLX on Apple Silicon | Native, fast, local |
-| Vectors | LanceDB | LanceDB | Already the right choice |
-| Metadata | SQLite | SQLite, or fold into LanceDB | Open — decide when building storage |
-| Plugins | npm packages | Python entry points | Same model, native packaging |
+Python 3.12+. Where a choice is a like-for-like swap it is marked *equivalent*; where the
+Python option is genuinely better than what OpenDocuments has, the gain is stated.
 
----
+### Foundation
+
+| | Choice | Why |
+|---|---|---|
+| Packaging | **uv** | One tool for env, lockfile, and `uv tool install` for distribution — a single command install with no container. Also gives PEP 723 inline metadata for standalone scripts |
+| Lint / format | **ruff** | Replaces black, isort and flake8 with one fast tool |
+| Types | **pyright**, strict | Closest thing to the TypeScript strictness being left behind |
+| Config & validation | **Pydantic v2** + pydantic-settings | **Gain.** OpenDocuments hand-rolls config validation. One declarative layer covers config, API models and plugin manifests |
+| Tests | **pytest** + pytest-asyncio | *equivalent* |
+
+### Storage
+
+| | Choice | Why |
+|---|---|---|
+| Vectors | **LanceDB** | Keep it. Embedded, no server, ACID, versioned, same Rust core as the TypeScript binding. It was already the right call |
+| Metadata | **SQLite** via SQLAlchemy 2.0 | *equivalent* — but see the coupling below |
+| Migrations | **Alembic** | **Gain.** OpenDocuments hand-rolls a migration runner over eight numbered `.sql` files |
+| Lexical search | **SQLite FTS5** | What OpenDocuments already uses for the BM25 leg |
+
+**The coupling worth knowing:** the BM25 half of hybrid retrieval comes from SQLite's
+FTS5. Folding metadata into LanceDB to run one store means moving BM25 to LanceDB's
+Tantivy index instead. Both work; they are one decision, not two.
+
+### Document parsing — the largest upgrade
+
+This is where TypeScript was weakest and where the citation bug comes from.
+
+| Format | Choice | Why |
+|---|---|---|
+| PDF | **pypdfium2** fast path, **docling** or **marker** optional | Real page and bounding-box provenance instead of a text blob. **Avoid PyMuPDF** — it is AGPL, which is a problem for an MIT project |
+| Code | **tree-sitter** | **Biggest single gain.** Real ASTs for 40+ languages, replacing OpenDocuments' pattern-matched function and class splitting |
+| DOCX | python-docx | *equivalent* |
+| XLSX | **python-calamine** | Rust-backed, much faster than openpyxl |
+| PPTX | python-pptx | *equivalent* |
+| HTML | **trafilatura** | Built for content extraction — strips navigation and boilerplate properly |
+| Jupyter | nbformat | *equivalent* |
+| Email | stdlib `email` | *equivalent* |
+| Markdown | markdown-it-py | *equivalent* |
+| Structured | stdlib json / tomllib, PyYAML | *equivalent* |
+
+### Models
+
+| | Choice | Why |
+|---|---|---|
+| Embeddings | **MLX** (`mlx-embeddings`) | Native Apple Silicon. Read token states from the inner encoder and pool in our own numpy — the library's `last_hidden_state` field returns the *pooled* vector, and getting that wrong costs 0.856 cosine silently |
+| Embedding fallback | onnxruntime | For anywhere that is not Apple Silicon |
+| Generation | **litellm** | **Gain.** One dependency replaces five hand-written provider clients. Ollama, OpenAI, Anthropic, Google, xAI and OpenAI-compatible endpoints behind one call |
+| Reranking | sentence-transformers CrossEncoder | *equivalent* |
+
+### Surfaces
+
+| | Choice | Why |
+|---|---|---|
+| HTTP | **FastAPI** | Async, OpenAPI generated from types, native SSE streaming, Pydantic-native |
+| MCP | **FastMCP** / official `mcp` SDK | **Gain.** OpenDocuments hand-rolls a 500-line MCP server; this is decorators over functions |
+| CLI | **Typer** + **Rich** | **Gain.** Typer derives the CLI from type hints. Rich replaces hand-rolled progress output and log formatting |
+| Web UI | **HTMX + Jinja2 + Tailwind standalone** | **Gain.** Deletes an entire Node toolchain. The surface is search, streaming chat, and lists — Tailwind ships standalone binaries needing no npm. Alternative: keep a React SPA if the chat UX needs it |
+| Auth | **authlib** + itsdangerous | *equivalent* — OAuth for Google/GitHub, signed session cookies |
+| Scheduling | **apscheduler** | Connector sync polling. No broker, unlike Celery |
+
+### What this deletes
+
+Eight subsystems OpenDocuments wrote by hand that become dependencies or decorators:
+
+- five model provider clients → **litellm**
+- a migration runner → **Alembic**
+- config schema validation → **Pydantic**
+- an MCP protocol server → **FastMCP**
+- CLI argument parsing and terminal formatting → **Typer + Rich**
+- pattern-based code chunking → **tree-sitter**
+- a React build toolchain → **HTMX**
+- PDF text reconstruction → **pypdfium2** page provenance
+
+That is most of the difference between 33,000 lines and something considerably smaller.
+
+### Open
+
+**Metadata store.** SQLite + LanceDB, or LanceDB alone. Decide when building storage —
+it also decides where BM25 comes from.
+
+**PDF parser.** pypdfium2 alone may be enough; docling and marker score better on layout
+benchmarks but pull in torch and downloaded weights. Decide against real documents from
+your corpus, not benchmarks.
+
+**Web UI.** HTMX is the smaller path. A React SPA is the known-good one, since
+OpenDocuments already has it working.
 
 ## Defects to fix on the way
 
