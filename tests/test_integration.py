@@ -28,27 +28,50 @@ from manicule.plugins import (
 from manicule.testing import assert_parser_contract, closing
 from tests.fakes import HashEmbedder, make_raw
 
+EMBEDDER_NAME = "local"
+"""The stand-in embedder these tests select.
+
+Registered under a name of its own rather than shadowing ``mlx``, because the built-in
+embedding plugin now provides ``mlx`` for real — and a stand-in registered over it would both
+clash with it and hide it, exactly as a stand-in chunker would hide ``structural``. Selecting
+this one instead keeps the integration tests hermetic: building the real embedder would
+download a model, which is not something a test suite should do.
+
+``local`` rather than an invented name, because provider names are also what the credential
+policy reads: anything outside ``LOCAL_PROVIDERS`` is required to carry an API key, and a
+stand-in that tripped that check would be testing the wrong thing.
+"""
+
 
 def _install_the_rest(registry: ComponentRegistry) -> None:
     """Stand in for the components the other core tickets will provide as plugins.
 
-    The chunker is deliberately absent: the built-in parsing plugin registers ``structural``
-    through the same entry point every other plugin uses, so a stand-in here would both clash
-    with it and hide it. What is left is the components no plugin provides yet.
+    The chunker and the embedder are deliberately absent: the built-in parsing and embedding
+    plugins register ``structural``, ``mlx`` and ``onnx`` through the same entry point every
+    other plugin uses. What is left is the components no plugin provides yet.
     """
-    registry.add(keys.EMBEDDER.named("mlx"), lambda _: HashEmbedder())
+    registry.add(keys.EMBEDDER.named(EMBEDDER_NAME), lambda _: HashEmbedder())
     registry.add(keys.GENERATOR.named("ollama"), lambda _: object())
     registry.add(keys.VECTOR_STORE.named("lancedb"), lambda _: object())
     registry.add(keys.DOC_STORE.named("sqlite"), lambda _: object())
 
 
 def test_a_configuration_naming_nothing_installed_refuses_to_start() -> None:
-    """The whole failure at once, before a single component is constructed."""
+    """The whole failure at once, before a single component is constructed.
+
+    The embedder is no longer among the missing, and that is the point of the second
+    assertion: ``embedding.provider`` defaults to ``mlx``, the built-in embedding plugin
+    registers it through the public entry point, and so a default installation validates it
+    rather than reporting it absent. If that assertion ever starts failing, the plugin has
+    stopped being discovered — which nothing else in the suite would notice, because every
+    other test registers its own embedder.
+    """
     with pytest.raises(PolicyError) as caught:
         build_container(Settings())
     message = str(caught.value)
-    assert "embedding.provider" in message
+    assert "embedding.provider" not in message
     assert "storage.db" in message
+    assert "llm.provider" in message
 
 
 async def test_the_example_plugin_works_through_the_container(
@@ -61,6 +84,7 @@ async def test_the_example_plugin_works_through_the_container(
     _install_the_rest(found.registry.bind("test-harness"))
 
     settings = Settings(
+        embedding={"provider": EMBEDDER_NAME},  # pyright: ignore[reportArgumentType]
         rag={"pipeline": ("passthrough",), "chunker": "structural"},  # pyright: ignore[reportArgumentType]
         plugins={"middleware": ("trim",)},  # pyright: ignore[reportArgumentType]
     )
@@ -86,7 +110,10 @@ async def test_a_component_is_set_up_before_it_is_used(manicule_environment: Pat
     found = discover()
     _install_the_rest(found.registry.bind("test-harness"))
 
-    settings = Settings(rag={"pipeline": ("passthrough",)})  # pyright: ignore[reportArgumentType]
+    settings = Settings(
+        embedding={"provider": EMBEDDER_NAME},  # pyright: ignore[reportArgumentType]
+        rag={"pipeline": ("passthrough",)},  # pyright: ignore[reportArgumentType]
+    )
     container = build_container(settings, discovery=found)
 
     async with container:
@@ -124,7 +151,10 @@ async def test_a_document_parses_and_chunks_through_the_container(
     found = discover()
     _install_the_rest(found.registry.bind("test-harness"))
     container = build_container(
-        Settings(rag={"pipeline": ("passthrough",), "chunker": "structural"}),  # pyright: ignore[reportArgumentType]
+        Settings(
+            embedding={"provider": EMBEDDER_NAME},  # pyright: ignore[reportArgumentType]
+            rag={"pipeline": ("passthrough",), "chunker": "structural"},  # pyright: ignore[reportArgumentType]
+        ),
         discovery=found,
     )
 
@@ -167,7 +197,10 @@ async def test_an_anchor_from_the_container_still_resolves_to_its_own_text(
 
     found = discover()
     _install_the_rest(found.registry.bind("test-harness"))
-    settings = Settings(rag={"pipeline": ("passthrough",)})  # pyright: ignore[reportArgumentType]
+    settings = Settings(
+        embedding={"provider": EMBEDDER_NAME},  # pyright: ignore[reportArgumentType]
+        rag={"pipeline": ("passthrough",)},  # pyright: ignore[reportArgumentType]
+    )
     container = build_container(settings, discovery=found)
 
     async with container:

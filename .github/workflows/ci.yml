@@ -106,6 +106,41 @@ jobs:
       - name: downgrade round trip
         run: uv run pytest tests/test_storage_migrations.py -q
 
+  # Its own job, on macOS, because it is the only place the claim can be checked: MLX is Apple
+  # Silicon only, so the ubuntu matrix above has one backend and cannot compare two.
+  #
+  # What is being defended is `EmbedFingerprint` excluding `backend` from identity — the
+  # property that lets a corpus move between machines without a re-embed. That exclusion is a
+  # claim about numbers, and this job is where the numbers are checked. If it ever goes red,
+  # the fix is to move `backend` into IDENTITY_FIELDS, not to widen a tolerance.
+  embeddings:
+    name: backend parity (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --all-extras
+      # Weights are fetched here rather than by the tests. A test that downloads on first run
+      # is a test that fails when the network does, and one that downloads several hundred
+      # megabytes per case is a test nobody runs twice.
+      - name: cache model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: models-${{ runner.os }}-${{ hashFiles('tools/prefetch_embedding_models.py') }}
+      - name: pre-seed models
+        run: uv run tools/prefetch_embedding_models.py --mlx
+      # The whole point of the job is the assertion, not the fetch. The embedding suites skip
+      # what is not downloaded — right on a developer's machine, and worthless here, where a
+      # broken pre-seed would leave the parity check unrun and the job green.
+      # MANICULE_REQUIRE_EMBEDDING_MODELS turns every one of those skips into a failure.
+      - name: pytest (models required)
+        env:
+          MANICULE_REQUIRE_EMBEDDING_MODELS: "1"
+        run: uv run pytest tests/test_embedding_backends.py -q
+
   # Runs on every pull request, including ones that touch no Python at all. The repository
   # is mostly cross-referenced design documents, and a heading renumbered in one file
   # silently invalidates every inbound reference to it. Nothing else catches that.

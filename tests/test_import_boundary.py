@@ -33,6 +33,8 @@ IMPLEMENTATION_MODULES = (
     "sentence_transformers",
     "numpy",
     "tiktoken",
+    "tokenizers",
+    "huggingface_hub",
     # parsing (#4)
     "pypdfium2",
     "tree_sitter",
@@ -93,6 +95,24 @@ Listed separately from :data:`IMPLEMENTATION_MODULES` because the claim about th
 stronger: these *are* installed in this environment and importable, so the check below is not
 "a missing package stays missing" but "an installed package is not loaded until something
 needs it".
+"""
+
+
+EMBEDDING_LIBRARIES = (
+    "numpy",
+    "tokenizers",
+    "huggingface_hub",
+    "onnxruntime",
+    "mlx",
+    "mlx_embeddings",
+    "transformers",
+)
+"""The libraries the built-in embedders are built on.
+
+Installed in this environment on at least one platform, so — like
+:data:`PARSING_LIBRARIES` — the claim is "an installed package is not loaded until something
+needs it" rather than "a missing package stays missing". ``mlx`` and ``mlx_embeddings`` are
+Apple-only and absent elsewhere; the check is the same either way.
 """
 
 
@@ -202,6 +222,33 @@ def test_registering_the_built_in_parsers_loads_no_parsing_library() -> None:
 
 
 @pytest.mark.contract
+def test_registering_the_built_in_embedders_loads_no_model_runtime() -> None:
+    """Discovery runs in every process that starts, and a model runtime is not a cheap import.
+
+    numpy, tokenizers and huggingface-hub are tens of megabytes between them, onnxruntime pulls
+    in a native library, and MLX initialises Metal. None of that has any business happening for
+    ``manicule doctor``, or on a machine whose corpus is already indexed and is only being
+    searched by a process that never embeds a query.
+
+    What registration needs eagerly is the configuration model, so that settings written for an
+    embedder are validated rather than ignored, and it lives in ``manicule.embedding.config``,
+    which imports nothing heavier than pydantic. The rest — including
+    ``manicule.embedding.cards``, which reaches for a tokenizer — waits for the factory.
+    """
+    loaded = _modules_added_by_discovery()
+    leaked = sorted(
+        name
+        for name in EMBEDDING_LIBRARIES
+        if any(module == name or module.startswith(f"{name}.") for module in loaded)
+    )
+    assert leaked == [], (
+        f"plugin discovery loaded {', '.join(leaked)}. A backend's runtime belongs inside the "
+        f"factory that builds the backend; what registration needs eagerly — a config model — "
+        f"belongs in manicule.embedding.config"
+    )
+
+
+@pytest.mark.contract
 def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
     """The built-in parsers take the same route a third-party plugin takes.
 
@@ -213,6 +260,7 @@ def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
     found = {point.name: point.value for point in installed_entry_points(ENTRY_POINT_GROUP)}
 
     assert found.get("parsing") == "manicule.parsers.plugin:PLUGIN"
+    assert found.get("embedding") == "manicule.embedding.plugin:PLUGIN"
 
 
 @pytest.mark.contract
@@ -226,5 +274,16 @@ def test_the_installed_distribution_declares_no_implementation_dependency() -> N
         for line in declared
         if "extra ==" not in line
     }
-    forbidden = {"lancedb", "sqlalchemy", "litellm", "fastapi", "typer", "httpx", "numpy"}
+    forbidden = {
+        "lancedb",
+        "sqlalchemy",
+        "litellm",
+        "fastapi",
+        "typer",
+        "httpx",
+        "numpy",
+        "onnxruntime",
+        "mlx-embeddings",
+        "tokenizers",
+    }
     assert not names & forbidden, f"manicule requires {sorted(names & forbidden)}"

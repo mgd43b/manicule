@@ -44,7 +44,22 @@ storage = [        # #2
   "lancedb>=0.17",
   "pyarrow>=18.0",
 ]
-embeddings = []    # #3  mlx-embeddings, onnxruntime, numpy
+embeddings = [     # #3
+  # Pooling happens in our own numpy, from token states the backend hands back, because a
+  # backend's convenience output is not reliably the model's own pooling. docs/embeddings.md §4.
+  "numpy>=2.0",
+  # We tokenize rather than letting the backend do it: the embedding call does not surface
+  # attention masks, and mean pooling without a mask averages in the padding. `tokenizers` is
+  # the Rust implementation on its own, so this does not drag in a training framework.
+  "tokenizers>=0.20",
+  "huggingface-hub>=0.26",
+  # The parity backend, and the only one off Apple Silicon. MIT.
+  "onnxruntime>=1.20",
+  # GPL-3.0, which is ordinary now that manicule is GPL-3.0-or-later (docs/embeddings.md §1.1),
+  # and Apple-only by construction. Marked rather than left to fail at install time on Linux,
+  # where CI runs.
+  "mlx-embeddings>=0.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 parsers = [
   # Every one of these is permissively licensed; docs/parsing.md §12 records the rejections
   # (PyMuPDF, extract-msg) and why a copyleft dependency is refused at selection time.
@@ -68,6 +83,7 @@ serve = []         # #8, #11  Typer, Rich, FastMCP, FastAPI, uvicorn
 # is exercised by every installation rather than only by the people extending it.
 [project.entry-points."manicule.plugins"]
 parsing = "manicule.parsers.plugin:PLUGIN"
+embedding = "manicule.embedding.plugin:PLUGIN"
 
 [project.urls]
 Homepage = "https://github.com/mgd43b/manicule"
@@ -93,6 +109,10 @@ dev = [
   # is one list of what parsing needs and `tests/test_import_boundary.py` still sees them as
   # optional rather than as something an `import manicule` pulls in.
   "manicule[parsers]",
+  # The embedding stack, for the same reason: `uv sync --all-groups` has to be able to run the
+  # backend parity suite. On Linux this resolves to onnxruntime alone, which is exactly what
+  # the parity test's skip logic is written against.
+  "manicule[embeddings]",
 ]
 
 [tool.uv.workspace]
@@ -181,6 +201,22 @@ venv = ".venv"
 # type-checks confidently against an API that no longer exists.
 [[tool.pyright.executionEnvironments]]
 root = "src/manicule/parsers"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+
+# Same relaxation, same reasoning, and deliberately narrower. Four embedding dependencies ship
+# no type information or only partial stubs — mlx-embeddings, onnxruntime, tokenizers,
+# huggingface-hub — and every call into them yields an Unknown that spreads. Only
+# `embedding/runtimes/` is relaxed, and it exists to be the one place they are touched: the
+# modules that decide what a vector *is* — embedding/pooling.py, embedding/cards.py,
+# embedding/base.py — reach these libraries through the small typed functions there and stay
+# fully checked themselves. That split matters more here than for parsers, because
+# mlx-embeddings is version 0.1.0 and binds one attribute to different meanings on different
+# architectures: a hand-written stub would be confidently wrong rather than merely absent.
+[[tool.pyright.executionEnvironments]]
+root = "src/manicule/embedding/runtimes"
 reportMissingTypeStubs = "none"
 reportUnknownMemberType = "none"
 reportUnknownVariableType = "none"

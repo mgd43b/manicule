@@ -28,6 +28,18 @@ uv run pyright
 uv run pytest
 ```
 
+Two suites need a machine resource that is not in the repository, and both **skip** without it
+rather than failing — right on a laptop, wrong in CI, so CI pre-seeds and then requires them:
+
+```bash
+uv run python -c "from manicule.parsers import grammars; grammars.prefetch(grammars.DECLARED_LANGUAGES)"
+uv run tools/prefetch_embedding_models.py --mlx   # add --full for BAAI/bge-m3, ~4.6 GB
+```
+
+Set `MANICULE_REQUIRE_EMBEDDING_MODELS=1` to turn a missing model into a failure, which is what
+CI does. If you are touching embeddings, run it that way at least once: a skipped conformance
+suite reports green while checking nothing.
+
 ## Nothing is deferred
 
 **Everything in scope happens in this change.** Adjacent bugs, dead code, stale
