@@ -901,7 +901,7 @@ requires-dist = [
     { name = "ruamel-yaml", marker = "extra == 'parsers'", specifier = ">=0.18" },
     { name = "selectolax", marker = "extra == 'parsers'", specifier = ">=0.3.21" },
     { name = "sentence-transformers", marker = "extra == 'rerank'", specifier = ">=3.0" },
-    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'storage'", specifier = ">=2.0.36" },
+    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'storage'", specifier = ">=2.0.51" },
     { name = "tiktoken", marker = "extra == 'parsers'", specifier = ">=0.8" },
     { name = "tiktoken", marker = "extra == 'retrieval'", specifier = ">=0.8" },
     { name = "tokenizers", marker = "extra == 'embeddings'", specifier = ">=0.20" },
