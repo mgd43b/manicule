@@ -1055,14 +1055,22 @@ licence problem discovered later.
 
 **Two sources, in order.**
 
-**First, the pack's own tags queries.** Unlike the grammars, the `.scm` query files *are*
-compiled into the wheel and resolve **offline**, with no download — which is what makes them
-usable here at all, since a query set that varied by machine would be the §8.1 hazard again.
-`get_tags_query()` covers **71 of the 371 manifest languages**, including every one that
-matters for a code corpus: python, javascript, typescript, tsx, go, rust, java, c, cpp,
-ruby, php, kotlin, swift, scala, lua, r, elixir, dart. Using them means symbol extraction
-matches what the wider tree-sitter ecosystem produces for the same file, which is worth more
-than anything hand-written.
+**First, the pack's own tags queries.** These resolve **offline**, with no download — which
+is what makes them usable here at all, since a query set that varied by machine would be the
+§8.1 hazard again.
+
+The mechanism is worth stating exactly, because the obvious check misleads. There are **no
+`.scm` files in the wheel** — someone looking for them will find none and conclude this is
+wrong. The query patterns are **compiled into the native library** (the same ~4.6 MB
+`_native.abi3.so` that contains no grammars), as query-pattern strings baked into the binary,
+and are reached through `get_tags_query()`. That is precisely *why* they survive an offline
+install when the grammars do not: they were never separate files to fetch.
+
+Coverage is **71 of the 371 manifest languages** — a minority of the manifest, but it
+includes every language that matters for a code corpus: python, javascript, typescript, tsx,
+go, rust, java, c, cpp, ruby, php, kotlin, swift, scala, lua, r, elixir, dart. Using them
+means symbol extraction matches what the wider tree-sitter ecosystem produces for the same
+file, which is worth more than anything hand-written.
 
 **Second, an in-repo node-type table**, for declared languages with no tags query — bash,
 sql, html, css and similar. Its shape:
@@ -1313,8 +1321,8 @@ There the shim synthesises headers from `PR_SUBJECT`, the sender properties and 
 recipient table. The synthesised path is a required fixture (§3.5).
 
 Because this is a MAPI property reader rather than a library call, it is sized as its own
-unit of work and filed separately (§14). `.eml` ships in v1 regardless; `.msg` is not
-blocking.
+unit of work and filed as [#21](https://github.com/mgd43b/manicule/issues/21). `.eml` ships
+in v1 regardless; `.msg` is not blocking.
 
 ---
 
@@ -1406,15 +1414,16 @@ quietly skipped.
 
 ## 14. Filed, not deferred
 
-Real tickets, because "later" is how these disappear.
+Real tickets, because "later" is how these disappear. Each carries its own reasoning, so
+none of them depends on this document having been read.
 
-| What | Why it is not in v1 |
-|---|---|
-| **`.msg` support** (§10) | either a BSD-licensed higher-level reader works, or it is a hand-written MAPI property reader — not a library call either way. `.eml` covers the common case. The route is specified; only the work is out of scope |
-| **Offline grammar bundle** (§8.1) | the grammar pack fetches grammars from GitHub on first use, so an air-gapped install cannot parse code until someone mirrors them. Pre-seeding covers the normal case; a vendored bundle is the real fix |
-| **OCR** (`PLAN.md` §5) | settled. `no_extractable_text` and the 5% `doctor` warning (§6.5) are the trigger for revisiting |
-| **`docling` / `marker` in the default PDF chain** (§7) | layout models are heavy and unmeasured; they belong behind #15 like every other quality change |
-| **PDF reading-order recovery for multi-column layouts** (§7) | any heuristic here risks emitting text that never appeared contiguously; needs the measured baseline first |
+| Ticket | What | Why it is not in v1 |
+|---|---|---|
+| [#21](https://github.com/mgd43b/manicule/issues/21) | **`.msg` support** (§10) | either a BSD-licensed higher-level reader works, or it is a hand-written MAPI property reader — not a library call either way. `.eml` covers the common case. The route is specified; only the work is out of scope |
+| [#22](https://github.com/mgd43b/manicule/issues/22) | **Offline grammar bundle** (§8.1) | the grammar pack fetches grammars from GitHub on first use, so an air-gapped install cannot parse code until someone mirrors them. Pre-seeding covers the normal case; a vendored bundle is the real fix |
+| [#23](https://github.com/mgd43b/manicule/issues/23) | **OCR** (`PLAN.md` §5) | settled. `no_extractable_text` and the 5% `doctor` warning (§6.5) are the trigger for revisiting |
+| [#24](https://github.com/mgd43b/manicule/issues/24) | **`docling` / `marker` in the default PDF chain** (§7) | layout models are heavy and unmeasured; they belong behind #15 like every other quality change |
+| [#25](https://github.com/mgd43b/manicule/issues/25) | **PDF reading-order recovery for multi-column layouts** (§7) | any heuristic here risks emitting text that never appeared contiguously; needs the measured baseline first |
 
 ---
 
