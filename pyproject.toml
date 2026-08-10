@@ -1,0 +1,157 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manicule"
+version = "0.1.0"
+description = "Self-hosted document search and answers, with citations that resolve."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [{ name = "manicule contributors" }]
+keywords = ["rag", "search", "documents", "citations", "self-hosted"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Text Processing :: Indexing",
+  "Typing :: Typed",
+]
+
+# Core carries no implementation dependencies. Every entry here is pure Python with no
+# native extensions and no network clients. LanceDB, SQLAlchemy, MLX, litellm, FastAPI and
+# friends arrive through the extras below, declared by the tickets that implement them, and
+# `tests/test_import_boundary.py` fails the build if any of them leak into an import of
+# `manicule`.
+dependencies = [
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "packaging>=24.0",
+  "python-dotenv>=1.0",
+  "tomli-w>=1.0",
+]
+
+[project.optional-dependencies]
+# Implementation stacks. Each is owned by the ticket that builds it; they are declared here
+# (empty until then) so that the boundary between core and implementations is visible in one
+# place rather than discovered by accident.
+storage = []       # #2  SQLAlchemy 2.0 async, aiosqlite, Alembic, LanceDB
+embeddings = []    # #3  mlx-embeddings, onnxruntime, numpy
+parsers = []       # #4  pypdfium2, tree-sitter, selectolax, python-docx, ...
+generation = []    # #7  litellm
+serve = []         # #8, #11  Typer, Rich, FastMCP, FastAPI, uvicorn
+
+[project.urls]
+Homepage = "https://github.com/mgd43b/manicule"
+Issues = "https://github.com/mgd43b/manicule/issues"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=6.0",
+  "ruff>=0.8",
+  "pyright>=1.1.390",
+  # Installed so that entry-point discovery is exercised against a real distribution rather
+  # than a mock. See packages/manicule-plugin-example.
+  "manicule-plugin-example",
+]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+manicule = { workspace = true }
+manicule-plugin-example = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manicule"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",    # pycodestyle
+  "F",         # pyflakes
+  "I",         # isort
+  "N",         # pep8-naming
+  "UP",        # pyupgrade
+  "B",         # bugbear
+  "A",         # builtin shadowing
+  "C4",        # comprehensions
+  "DTZ",       # naive datetimes
+  "T20",       # print
+  "PT",        # pytest style
+  "RET",       # return
+  "SIM",       # simplify
+  "TID",       # tidy imports
+  "PTH",       # pathlib
+  "ERA",       # commented-out code
+  "PL",        # pylint
+  "TRY",       # tryceratops
+  "RUF",       # ruff
+  "ANN",       # annotations
+  "ASYNC",     # async correctness
+  "S",         # bandit
+  "BLE",       # blind except
+  "SLF",       # private member access
+  "FIX",       # no TODO/FIXME left behind
+  "TD",
+]
+ignore = [
+  "TD002",   # author on TODO — TODOs are banned outright, see FIX
+  "TD003",   # issue link on TODO — same
+  "TRY003",  # long messages outside exception class: we want readable errors
+  "PLR0913", # many arguments: config models legitimately have many fields
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "ANN401", "SLF001"]
+"packages/*/tests/**" = ["S101", "PLR2004", "SLF001"]
+# A generator script for CAPABILITIES.md. Printing is its output, and it is owned by the
+# docs it produces rather than by the application's lint policy.
+"tools/**" = ["T201", "PLW2901", "PLR2004"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pyright]
+include = ["src", "tests", "packages"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
+reportImplicitOverride = "error"
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests", "packages"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+  "contract: protocol conformance suites that every implementation must pass",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["src/manicule"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "\\.\\.\\.$",
+  "raise NotImplementedError",
+]
