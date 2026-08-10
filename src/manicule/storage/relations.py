@@ -95,13 +95,17 @@ class RelationsMixin(WorkspaceScoped):
             )
 
     async def related(
-        self, chunk_id: str, *, types: AbstractSet[ChunkRelationType] | None = None
+        self, chunk_id: str, *, types: AbstractSet[ChunkRelationType] = frozenset()
     ) -> Sequence[ChunkEdge]:
         """Every edge touching this chunk, from either end.
 
         ``WHERE source = ? OR target = ?`` is the predicate the schema's second index exists
         for, and it is written that way rather than as two queries unioned so the planner sees
         one statement.
+
+        An empty ``types`` restricts nothing, following the same convention as
+        :class:`~manicule.core.retrieval.Filter`: one spelling of "no restriction", so a caller
+        that computed an empty set gets every edge rather than none of them.
 
         Edges whose far end is not visible to this handle are dropped — another workspace's
         chunk, or one belonging to a soft-deleted document. The first cannot be written through
@@ -118,7 +122,7 @@ class RelationsMixin(WorkspaceScoped):
                     models.ChunkRelation.target_chunk_id == chunk_id,
                 )
             )
-            if types is not None:
+            if types:
                 statement = statement.where(
                     models.ChunkRelation.relation_type.in_(
                         sorted(relation.value for relation in types)

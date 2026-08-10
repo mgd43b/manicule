@@ -644,9 +644,15 @@ class ChunkRelationStore(Protocol):
         ...
 
     async def related(
-        self, chunk_id: str, *, types: AbstractSet[ChunkRelationType] | None = None
+        self, chunk_id: str, *, types: AbstractSet[ChunkRelationType] = frozenset()
     ) -> Sequence[ChunkEdge]:
-        """Every edge touching this chunk, from either end, optionally filtered by type."""
+        """Every edge touching this chunk, from either end, optionally filtered by type.
+
+        An empty ``types`` restricts nothing, exactly as an empty field on
+        :class:`~manicule.core.retrieval.Filter` does. There is deliberately no ``None``
+        alongside it: two spellings of "no restriction" is one too many, and the second one is
+        always the one somebody reads as its opposite.
+        """
         ...
 
 

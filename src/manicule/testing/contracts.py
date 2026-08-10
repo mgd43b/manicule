@@ -1130,6 +1130,13 @@ async def assert_chunk_relation_store_contract(
         not await store.related(child, types={ChunkRelationType.SIBLING}),
         "filtering by relation type returned an edge of another type",
     )
+    _require(
+        len(await store.related(child, types=frozenset())) == 1,
+        "an empty `types` matched nothing. Empty restricts nothing, the same as every "
+        "set-valued field on Filter — one spelling of 'no restriction', so a caller that "
+        "computed an empty set gets every edge rather than the exact opposite of what it asked "
+        "for",
+    )
 
     if foreign_chunk_id is not None:
         try:
