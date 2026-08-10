@@ -1083,16 +1083,27 @@ class Settings(BaseSettings):
         # A workspace override is only ever consulted by exact name, so a key naming no
         # workspace is a restriction that reads as in force and is not — and the direction it
         # fails in is permissive.
+        # Every workspace that can actually ask a question — this installation's own, and
+        # any an OAuth provider places its users in. Checking against the former alone made a
+        # shipped multi-workspace configuration unrunnable, and the refusal's own premise
+        # ("a workspace that never asks a question") was false in exactly that setup.
+        reachable = {self.workspace.strip().lower()} | {
+            provider.workspace.strip().lower()
+            for provider in self.security.auth.providers
+            if provider.workspace
+        }
         stray = sorted(
             name
             for name in self.security.data_policy.workspace_overrides
-            if name.strip().lower() != self.workspace.strip().lower()
+            if name.strip().lower() not in reachable
         )
         if stray:
+            known = ", ".join(sorted(reachable))
             problems.append(
-                f"security.data_policy.workspace_overrides names {', '.join(stray)}, which is "
-                f"not this installation's workspace ({self.workspace!r}). An override keyed to "
-                f"a workspace that never asks a question is never applied."
+                f"security.data_policy.workspace_overrides names {', '.join(stray)}, which no "
+                f"workspace on this installation uses. Reachable workspaces: {known}. An "
+                f"override keyed to a workspace that never asks a question is never applied, "
+                f"and a restriction that is not applied reads as in force and is not."
             )
         return problems
 

@@ -64,8 +64,18 @@ BUILTIN_DETECTORS: Mapping[str, Detector] = {
         # hiding it, which is a different and worse failure from over-matching.
         _detector(
             "phone",
-            2,
-            r"(?<![\w.,-])(?:\+\d{7,15}|\+?\d{1,3}[\s.-]\(?\d{2,4}\)?(?:[\s.-]?\d{2,4}){2,4})(?![\w.,-])",
+            3,
+            # Three alternatives, and the middle one is the correction: version 2 required a
+            # separator immediately after the leading digits and only allowed parentheses
+            # after it, which silently stopped matching `(555) 123-4567` — the commonest
+            # written form there is. Version 1 had caught it. A detector that quietly narrows
+            # is the failure this project keeps naming, so the negative samples that motivated
+            # v2 and the positive samples v2 lost are now both pinned by tests.
+            r"(?<![\w.,-])(?:"
+            r"\+\d{7,15}"
+            r"|\+?\d{0,3}[\s.-]?\(\d{2,4}\)[\s.-]?\d{2,4}(?:[\s.-]?\d{2,4}){1,3}"
+            r"|\+?\d{1,3}[\s.-]\(?\d{2,4}\)?(?:[\s.-]?\d{2,4}){2,4}"
+            r")(?![\w.,-])",
         ),
         _detector("credit-card", 1, r"(?<!\d)(?:\d{4}[ -]?){3}\d{1,4}(?!\d)"),
         # IPv6 must be a full eight groups or carry a `::`. Version 1 accepted two to seven
@@ -216,8 +226,12 @@ class Redactor:
         containing none, which is false security telemetry, and it mangles the co-reference
         token that is the only reason the ``hash`` method exists.
 
-        Overlapping spans go to whichever detector is configured first, so a substitution is
-        never applied inside another one.
+        Where two spans overlap the **earliest** wins, and a tie goes to the longest, so a
+        substitution is never applied inside another one. Note what that is not: it is not
+        "the first detector configured". A later detector matching earlier in the string takes
+        the span, which is right for the text and worth knowing when reading
+        ``detectors_fired`` — the counts attribute a redaction to whichever detector claimed
+        the span, not to whichever would have.
         """
         if not self.enabled or not text:
             return RedactionResult(text)

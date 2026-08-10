@@ -55,6 +55,7 @@ def _build(context: BuildContext) -> Generator:
         base_url=endpoint.base_url,
         egress=endpoint.egress,
         profile=profile,
+        profile_name=settings.rag.profile.value,
         system_prompt_tokens=system_prompt_tokens,
         extra_params=dict(config.extra_params),
     )

@@ -122,6 +122,13 @@ def error_table() -> tuple[tuple[type[Exception], type[GenerationError]], ...]:
     )
 
 
+MAX_LEADING_CHUNKS = 8
+"""How many text-free opening chunks may be held while the retry window is still open.
+
+Enough for the role-only chunk every OpenAI-compatible provider sends, plus slack for a
+provider that sends a few more; small enough that a keep-alive stream cannot be buffered.
+"""
+
 TIMEOUT_SETTINGS: Mapping[str, str] = {
     "first token": "llm.first_token_timeout_s",
     "gap between tokens": "llm.stream_idle_timeout_s",
@@ -160,6 +167,7 @@ class LitellmGenerator:
         egress: Egress = Egress.LOOPBACK,
         completion: CompletionCall | None = None,
         profile: ProfileConfig | None = None,
+        profile_name: str = "",
         system_prompt_tokens: int = 0,
         extra_params: Mapping[str, Any] | None = None,
     ) -> None:
@@ -169,6 +177,7 @@ class LitellmGenerator:
         self._egress = egress
         self._completion = completion
         self._profile = profile
+        self._profile_name = profile_name
         self._system_prompt_tokens = system_prompt_tokens
         self._extra_params = dict(extra_params or {})
         # Derived from the profile arithmetic, never configured, so the window manicule
@@ -260,7 +269,14 @@ class LitellmGenerator:
             generation_reserve=self._settings.max_tokens,
         )
         if problem:
-            raise ConfigError(problem)
+            # The shared predicate says "choose a lighter profile" without knowing which one is
+            # in force, and that is unactionable on its own: an operator cannot pick a lighter
+            # profile without being told what they are running. Naming it is this layer's to
+            # add, because configuration is what this layer holds.
+            named = (
+                f" The configured profile is {self._profile_name!r}." if self._profile_name else ""
+            )
+            raise ConfigError(f"{problem}{named}")
 
     def _require_credential(self) -> None:
         from manicule.config.providers import env_var_names, needs_credential  # noqa: PLC0415
@@ -509,7 +525,12 @@ class LitellmGenerator:
                     if chunk is None:
                         return stream, leading
                     leading.append(chunk)
-                    if _delta_text(chunk):
+                    # Bounded. A provider that streams keep-alive frames with no content would
+                    # otherwise have every one of them held until the first token, rebuilt from
+                    # scratch on each retry — hundreds of thousands of objects on a long
+                    # first-token budget. Past the bound the retry window simply closes, which
+                    # is the pre-existing behaviour and is safe: nothing has been delivered.
+                    if _delta_text(chunk) or len(leading) >= MAX_LEADING_CHUNKS:
                         return stream, leading
             except GenerationError as exc:
                 # An attempt that opened a stream and then failed still holds a connection to

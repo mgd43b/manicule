@@ -68,8 +68,10 @@ async def load_documents(lookup: DocumentLookup, context: Context) -> dict[str, 
     per citation would be the same rows fetched twice, once too late.
 
     A document absent from the result is one that is no longer in the index. Its passages are
-    still shown to the model — they are what retrieval found — and citations to them are
-    dropped, because a citation that cannot name the document it points into is not one.
+    dropped by :func:`~manicule.generation.policy.filter_context` when anything is leaving
+    the machine, because a source policy that cannot be evaluated must not be assumed
+    permissive; where nothing leaves, the passage is kept and only its citations are dropped,
+    because a citation that cannot name the document it points into is not one.
     """
     found: dict[str, Document] = {}
     for document_id in dict.fromkeys(p.chunk.document_id for p in context.passages):
@@ -420,6 +422,19 @@ class VerificationRun:
             self._tasks.append(asyncio.create_task(self._verify_document(document_id, slots)))
 
     def _settle(self, slot: int, verdict: SlotVerdict) -> None:
+        """Record a slot's verdict. **The first one wins, for the life of the run.**
+
+        Without that, recording a timeout in :meth:`verdict` achieves nothing: the in-flight
+        task lands a moment later and overwrites it, so a second marker naming the same slot
+        gets a different answer from the first. The reader is then told the citation was
+        dropped for a slow disk *and* shown it as resolved, and the accounting counts both.
+
+        It is the same invariant :meth:`_settle_remaining` already enforced by checking
+        membership before settling; this makes it a property of settling rather than of
+        remembering to check.
+        """
+        if slot in self._verdicts:
+            return
         self._verdicts[slot] = verdict
         self._ready[slot].set()
 

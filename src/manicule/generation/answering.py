@@ -213,6 +213,9 @@ class Answerer:
         result = result or AnswerResult()
         binder: CitationBinder | None = None
         run = None
+        prepared: Prepared | None = None
+        policy_drops: tuple[PolicyDrop, ...] = ()
+        estimate = 0
         try:
             try:
                 documents = await load_documents(self._documents, request.context)
@@ -232,6 +235,19 @@ class Answerer:
                     async for event in events:
                         yield event
 
+            except Exception as exc:  # noqa: BLE001 - the last thing standing between a failure and silence
+                # Everything before the first token can fail too — the document store, the
+                # redactor, the estimator's first use of its vocabulary. A caller written to
+                # the documented contract reads `events[-1].envelope`, so a failure that
+                # emits nothing at all is the one shape it cannot survive.
+                result.envelope = self._failed(binder, result, f"{type(exc).__name__}: {exc}")
+
+            # **Outside the guard**, deliberately. All of this runs after the answer has been
+            # streamed in full, so a bug in the bookkeeping was turning a delivered, complete
+            # answer into `finish_reason=error` — telling the reader that the text in front of
+            # them had failed, and persisting it that way. A failure here loses a trace, which
+            # is a diagnostic; it must not lose the answer, which is the product.
+            if binder is not None and prepared is not None:
                 result.envelope = self._envelope(request, binder, policy_drops, result, prepared)
                 result.trace = self._trace(
                     binder,
@@ -247,12 +263,6 @@ class Answerer:
                     tolerance=self._settings.llm.token_drift_tolerance,
                     model=self._generator.model_id,
                 )
-            except Exception as exc:  # noqa: BLE001 - the last thing standing between a failure and silence
-                # Everything before the first token can fail too — the document store, the
-                # redactor, the estimator's first use of its vocabulary. A caller written to
-                # the documented contract reads `events[-1].envelope`, so a failure that
-                # emits nothing at all is the one shape it cannot survive.
-                result.envelope = self._failed(binder, result, f"{type(exc).__name__}: {exc}")
             yield AnswerEvent.final(result.envelope)
         finally:
             # Two independent cleanups, so a failure in the first cannot skip the second.
@@ -520,7 +530,7 @@ class Answerer:
                 "citations_verified": accounting.verified,
                 "drops": binder.drops,
                 "verification_level": self._verifier.ceiling,
-                "verification_cache_hits": self._verifier.cache_hits,
+                "verification_cache_hits": binder.run.cache_hits,
                 "redaction_scope": self._policy.redaction_scope.value,
                 # Names and counts. **Never what a detector matched** — that would turn the
                 # trace into the leak the detector existed to prevent.

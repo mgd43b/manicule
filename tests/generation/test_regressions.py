@@ -1,6 +1,7 @@
 """Defects found by review, each with the assertion that would have caught it.
 
-Every test here failed before the fix it names. They are collected rather than scattered
+Every test here failed before the fix it names, with one marked exception that exists to pin
+a behaviour a fix must *not* change. They are collected rather than scattered
 because what they have in common is the shape of the bug: in each case the suite was green,
 the code looked right, and the guarantee was not being kept.
 """
@@ -19,6 +20,7 @@ from pydantic import SecretStr
 from manicule.config.profiles import PROFILES
 from manicule.config.settings import RedactionMethod, RedactionSettings, Settings
 from manicule.core.anchors import HeadingAnchor
+from manicule.core.content import RawDocument
 from manicule.core.errors import ConfigError, ProviderTimeoutError
 from manicule.core.generation import FinishReason, Usage
 from manicule.core.retrieval import RetrievalProfile
@@ -37,6 +39,7 @@ from manicule.generation.policy import EgressPolicy, filter_context
 from manicule.generation.redaction import Redactor
 from manicule.generation.verification import (
     CitationVerifier,
+    OpenSource,
     UnverifiableSource,
     load_documents,
 )
@@ -57,6 +60,11 @@ from tests.generation.test_provider_and_budget import FakeStream, chunk, generat
 
 ROLLBACK = "Roll back with `deploy --rollback`."
 EMAIL = "oncall@example.invalid"
+
+
+def _raw() -> RawDocument:
+    """Bytes for a resolver that has to return a real :class:`OpenSource`."""
+    return RawDocument(source_id="doc-1-src", uri="u", media_type="text/markdown", content=ROLLBACK)
 
 
 # --- the scanner ---------------------------------------------------------------------------
@@ -117,13 +125,19 @@ def test_which_citations_exist_does_not_depend_on_where_the_network_split_the_an
         assert canonical(sample, chunks) == baseline, f"split into {chunks} pieces diverged"
 
 
-def test_feeding_the_scanner_without_draining_it_cannot_lose_the_chunk() -> None:
-    """``feed`` was a generator, so the buffer append happened on the first ``next()``."""
-    scanner = MarkerScanner()
-    produced = scanner.feed("LOST TEXT ")
+def test_a_feed_whose_result_is_discarded_still_advances_the_scanner() -> None:
+    """``feed`` was a generator, so the buffer append happened on the first ``next()``.
 
-    assert "".join(event.text for event in produced) == "LOST TEXT "
-    assert list(scanner.finish()) == [], "everything decidable was already returned"
+    The test that first replaced this one *drained* the returned iterable, which is exactly
+    what used to trigger the deferred append — so it passed against the broken code and
+    asserted nothing. It also claimed a property the fix does not provide: a discarded return
+    value still loses the events it carried. What the fix actually guarantees is that the
+    scanner's **state** advances, which is what a partial marker spanning two calls depends on.
+    """
+    scanner = MarkerScanner()
+    scanner.feed(f"prose {ATTEMPT_PREFIX}:1")  # discarded on purpose
+
+    assert [event.kind for event in scanner.feed("]]")] == [ScanEventKind.MARKER]
 
 
 @pytest.mark.parametrize("payload", [":\u0663", ":\uff13"])
@@ -155,14 +169,22 @@ async def test_a_slots_verdict_does_not_change_during_one_answer() -> None:
     *and* shown it as resolved, and the accounting counted both.
     """
 
-    class Slow:
+    class SlowButCorrect:
+        """Slow enough to miss the deadline, and then **succeeds**.
+
+        The fixture that first covered this returned ``None``, so the late verdict was also a
+        drop and no citation could ever appear — the assertions could not tell the fixed code
+        from the broken code, and the test passed against both. Succeeding late is the only
+        shape in which an overwritten verdict is observable at all.
+        """
+
         can_resolve = True
 
         async def open(self, document: object) -> Any:
             await asyncio.sleep(0.2)
-            return None
+            return OpenSource(FakeParser(resolutions={"Rollback": ROLLBACK}), _raw())
 
-    verifier = CitationVerifier(Slow(), timeout_s=0.02)
+    verifier = CitationVerifier(SlowButCorrect(), timeout_s=0.02)
     passages = (candidate(chunk_id="c1", document_id="doc-1", text=ROLLBACK),)
     assembled = context(passages)
     run = verifier.start(assembled, {"doc-1": document()}, started_at=time.monotonic())
@@ -174,7 +196,11 @@ async def test_a_slots_verdict_does_not_change_during_one_answer() -> None:
     await binder.finish()
     await run.aclose()
 
-    assert binder.citations == ()
+    assert binder.citations == (), (
+        "the slot timed out for the first marker, so it stays timed out for the second — "
+        "otherwise the reader is told the citation was dropped for a slow disk and shown it "
+        "as resolved, with the accounting counting both"
+    )
     assert [drop.reason for drop in binder.drops] == [DropReason.VERIFICATION_TIMEOUT]
     assert binder.accounting.verified == 0
 
@@ -339,7 +365,6 @@ async def test_the_total_wall_clock_is_named_when_it_is_the_shorter_budget() -> 
         completion=never,
         settings={"timeout_s": 0.05, "first_token_timeout_s": 60, "max_retries": 0},
     )
-    _unused = never
 
     with pytest.raises(ProviderTimeoutError, match="total generation time"):
         [token async for token in gen.stream([{"role": "user", "content": "hi"}])]
@@ -348,13 +373,11 @@ async def test_the_total_wall_clock_is_named_when_it_is_the_shorter_budget() -> 
 async def test_retries_do_not_sleep_past_the_total_deadline() -> None:
     """Once the wall clock expired the budget clamped to zero, `_call` raised a retryable
     timeout, and the loop slept and tried again on a budget that could not improve."""
-    failure = FakeStream([])
 
     async def refuse(**kwargs: Any) -> Any:
         raise APIConnectionError(message="refused", llm_provider="ollama_chat", model="m")
 
     gen, _ = generator(completion=refuse, settings={"timeout_s": 0.05, "max_retries": 4})
-    _unused = failure
 
     began = time.monotonic()
     with pytest.raises((ProviderTimeoutError, Exception)):
@@ -418,7 +441,6 @@ async def test_a_failure_before_the_first_token_still_ends_with_a_final_envelope
             raise RuntimeError(msg)
 
     answers = build(ScriptedGenerator(script=["fine"]), documents=Broken())
-    _unused = Broken
 
     events = [event async for event in answers.answer(a_request())]
 
@@ -544,7 +566,12 @@ def test_a_passage_whose_document_vanished_is_not_sent_to_a_remote_model() -> No
 
 
 def test_a_passage_whose_document_vanished_is_kept_when_nothing_leaves() -> None:
-    """There is nothing to fail closed about, so proportionality wins."""
+    """There is nothing to fail closed about, so proportionality wins.
+
+    The one test in this file that passed *before* its fix as well as after: it pins the half
+    of the fail-closed change that must **not** happen, so that a later tightening cannot
+    quietly start refusing passages on a fully local install.
+    """
     assembled = context((candidate(chunk_id="c1", document_id="doc-gone"),))
 
     filtered, drops = filter_context(assembled, {}, EgressPolicy.of(settings()))
@@ -599,6 +626,30 @@ def test_an_override_naming_no_workspace_is_refused_at_startup() -> None:
     ).policy_problems()
 
     assert any("workspace_overrides" in problem for problem in problems)
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        "(555) 123-4567",
+        "call (555) 123-4567 today",
+        "+1 (555) 123-4567",
+        "555-123-4567",
+        "+44 20 7123 4567",
+        "+15551234567",
+    ],
+)
+def test_the_phone_detector_still_catches_the_forms_people_actually_write(sample: str) -> None:
+    """The negative samples that tightened this pattern removed positives with them.
+
+    ``(555) 123-4567`` — the commonest written US form — stopped matching, and nothing
+    noticed: the suite had exactly one positive phone sample, which happened to survive. A
+    security control that quietly narrows is the failure this project keeps naming, so both
+    directions are pinned now.
+    """
+    result = Redactor(RedactionSettings(enabled=True, patterns=("phone",))).redact(sample)
+
+    assert result.counts == {"phone": 1}, f"{sample!r} was not detected"
 
 
 @pytest.mark.parametrize(
