@@ -163,9 +163,13 @@ Two rules make it behave:
   `LineAnchor` duplicates another chunk's lines, which breaks the tightness assertion in
   §3.3.
 - **Overlap is taken in whole units, never mid-sentence.** Fill backwards with complete
-  sentences (falling back to complete paragraphs when a single sentence exceeds the
-  window) until the next one would exceed 64 tokens. A window that cuts mid-sentence
+  sentences until the next one would exceed 64 tokens. A window that cuts mid-sentence
   produces a chunk starting on a fragment, which is what the overlap was meant to avoid.
+  **Where even one sentence exceeds the window, no overlap is taken.** A sentence is already
+  the smallest whole unit available, so there is nothing smaller to fall back to — an
+  earlier draft said "falling back to complete paragraphs", which is larger, not smaller.
+  Taking no overlap costs a little recall on one boundary; cutting mid-sentence costs the
+  property the window exists for.
 
 ### 1.6 Minimum chunk size — 64 tokens, merged backwards
 
@@ -173,9 +177,14 @@ A trailing 8-token chunk is retrieval noise: short texts produce vectors dominat
 few tokens and they win queries they should lose.
 
 A chunk below `min_tokens` (64) is merged into the preceding chunk **when that chunk has
-the same `kind` and the merge stays within budget**. Otherwise it stands alone. It is never
-dropped — dropping is data loss, and silent data loss is the thing this document is mostly
-about.
+the same `kind`, the merge stays within budget, and the two anchors combine (§4.3)**.
+Otherwise it stands alone. It is never dropped — dropping is data loss, and silent data loss
+is the thing this document is mostly about.
+
+**The merge never crosses a heading.** A short section merged backwards would take the
+previous section's `heading_path`, so its text would be embedded under a breadcrumb it does
+not belong to and cited under a heading it is not in — a wrong location produced by a
+size optimisation. A chunk that opens a section stands alone however short it is.
 
 **`min_tokens` equals the overlap window, which needs one guard.** A 64-token prose chunk
 followed by a 64-token overlap window would make the next chunk begin as an exact duplicate
@@ -261,8 +270,11 @@ which the fingerprint makes an explicit, priced operation rather than an acciden
 
 ### 2.2 `Rect` — one coordinate convention, normalised at parse time
 
-`Rect` is `(x0, y0, x1, y1)` in **points (1/72 inch), origin top-left, y increasing
-downward, relative to the page as displayed.**
+`Rect` is `(x0, y0, x1, y1)` **normalised 0.0–1.0 on both axes, origin top-left, y increasing
+downward, relative to the CropBox with `/Rotate` applied** — the page exactly as a reader
+sees it. This is the shape [`contracts.md`](contracts.md) §1 fixes and
+`src/manicule/core/anchors.py` implements; an earlier draft of this section said "points",
+which would have required storing the page dimensions alongside every rectangle to render it.
 
 Normalising at parse time means a consumer needs the page number and nothing else. Getting
 there is not one flip, and the shape of the mistake is worth spelling out because it is
@@ -287,14 +299,37 @@ page it is not even visibly wrong.
 The transform, in order, using the box and rotation accessors and **never** the page-size
 convenience:
 
-1. **Translate** by the CropBox origin (falling back to the MediaBox), so coordinates are
-   relative to the visible page rather than to the media.
-2. **Rotate** by `/Rotate` about the cropped box, swapping width and height for 90 and 270.
-3. **Flip y** using the height of the box *after* rotation.
+1. **Translate** by the visible box's origin, so coordinates are relative to the visible page
+   rather than to the media.
+2. **Rotate** by `/Rotate` about that box, swapping width and height for 90 and 270. A page
+   displayed at `/Rotate 90` is turned clockwise, so user-space "up" becomes display "right"
+   and user-space "right" becomes display "down".
+3. **Flip y** using the height of the box *after* rotation, and divide through by the rotated
+   width and height.
 
-A page whose rotation is not a multiple of 90 — malformed, but it occurs — yields
-`rects=[]` with the page number still correct. This whole transform is a required
-structurally-hard fixture (§3.5): rotated and cropped pages, with expected rects.
+**The visible box is one call, not an intersection anyone has to compute.** pdfium's
+page-bounding-box accessor returns the CropBox intersected with the MediaBox, in user space,
+**unrotated** — which is exactly the box step 1 needs. Verified: a page with MediaBox
+`[50 50 662 842]`, CropBox `[100 100 500 700]` and `/Rotate 90` reports a bounding box of
+`(100, 100, 500, 700)` and a page size of `(600, 400)`. Reading the CropBox directly instead
+would be wrong on any file whose CropBox extends beyond its MediaBox, which is legal and
+occurs.
+
+**pdfium normalises `/Rotate` into a quarter turn**, so a malformed `/Rotate 45` arrives as
+`0` and the "not a multiple of 90 yields `rects=[]`" rule is defence in depth rather than a
+live branch. It costs one comparison and it is kept, so that a later reader reaching for the
+raw dictionary value does not silently produce rectangles rotated by a fraction of a turn.
+
+**This transform is verified against pdfium's own renderer, not against a second copy of the
+arithmetic.** The test renders the page — which composes the page matrix that encodes crop
+and rotation — finds the bounding box of the ink, and requires the parser's rectangle to
+cover it. Two independent paths through the same geometry, one of which is what a reader
+actually sees. A companion test runs the naive `page_height - rect_top` implementation past
+the same assertion and requires it to *fail*, so the check cannot be quietly weakened into
+one that passes everything. Rotated, cropped and MediaBox-offset pages are required
+structurally-hard fixtures (§3.5) for exactly this reason: on an upright, uncropped page the
+correct transform and the naive one agree, so a fixture set that is only upright certifies
+nothing.
 
 PPTX uses the same convention. `python-pptx` reports shape geometry in EMU, origin
 top-left; the parser converts (`1 pt = 12700 EMU`) and stores points. Same `Rect`, same
@@ -434,6 +469,26 @@ fixes it, which is worth saying in the diagnostic.
 
 **`.msg` needs a GPL-3.0 parser, which the relicence permits.** §10, §12.
 
+### 2.6 Content that precedes the first heading
+
+Real documents open with text before their first heading, and `HeadingAnchor.path` requires
+at least one element — so a heading-anchored parser has to decide what to do with the
+opening. The first draft of this document did not say, and the three plausible answers are
+not equally honest.
+
+**Where the format is line-addressable, use a `LineAnchor`.** Markdown source lines are exact
+and free, and an exact location beats a synthesised one every time. A parser emitting two
+anchor kinds is fine: `Anchor` is a union and each kind is budgeted separately.
+
+**Otherwise, `HeadingAnchor(path=(document_title,), fragment=None)`** — the document root,
+which is what `path` already means ("the breadcrumb from the document root to the containing
+section"). It resolves to the opening and it discriminates against every real section.
+
+**With one guard: if a real heading path would collide with it, the anchor is
+`Unlocated("ambiguous heading path")` instead.** A Markdown file whose only `h1` equals its
+title is the common case, and two locations that resolve to the same address resolve to
+neither (§2.3). This is what the 0.05 budgets on HTML, DOCX and Jupyter are for.
+
 ---
 
 ## 3. The round-trip contract
@@ -522,9 +577,13 @@ rewrites `½`, superscripts and full-width forms — changes to text that a cita
 to reproduce verbatim. Folding five ligatures explicitly is the narrow fix; NFKC is a wide one
 that would quietly alter quoted content.
 
-The normaliser is versioned and its version is part of `chunker_version` (§1.7). It is used
-by the tests and by nothing else — stored `text` is never normalised, because `text` is what
-gets shown.
+The normaliser is versioned, and its version is deliberately **not** part of
+`chunker_version`. It is used by the tests and by nothing else — stored `text` is never
+normalised, because `text` is what gets shown — so it cannot move a chunk boundary or shift
+an anchor. Putting it in the fingerprint would force a re-chunk and a full re-embed of a
+corpus in exchange for a change that cannot alter one stored byte. (The pinned HTML-to-text
+conversion in §10 is a different matter and *is* in `chunker_version`, because email line
+numbers address its output.)
 
 ### 3.3 The six assertions
 
@@ -539,7 +598,7 @@ gets shown.
    four. For each group:
 
    ```
-   len(normalize(resolved))  <=  k * len(normalize(union_of_source_spans(group)))
+   len(normalize(resolved))  <=  k * (len(normalize(union_of_source_spans(group))) + fixed)
    ```
 
    **The denominator is the union of the group's source spans, not the sum of their text
@@ -554,7 +613,16 @@ gets shown.
    | `CellAnchor` | 1.0 | the cell range is the text |
    | `PageAnchor` **with rects** | 1.05 | the boxes bound the quote; slack for glyphs clipped by a box edge |
    | `PageAnchor` **with `rects=[]`** | — | **exempt — capped by assertion 5 instead** |
-   | `HeadingAnchor` | 1.2 | the resolved section includes its own heading line and inter-block whitespace |
+   | `HeadingAnchor` | 1.2 | inter-block whitespace within the section |
+
+   **`fixed` is the heading's own text, and only a `HeadingAnchor` has any.** A resolved
+   section legitimately carries its heading line, and that is a *fixed* overhead rather than
+   a proportional one — an eight-word heading over a twelve-word section is 40% and over a
+   four-hundred-word section is 2%. A purely multiplicative bound therefore measures section
+   length rather than anchor quality: it passes every long section and fails short ones that
+   are perfectly anchored. The heading's length is already in `HeadingAnchor.path`, so adding
+   it to the denominator assumes nothing about the document, and the multiplier is then left
+   covering only the whitespace it was meant to cover.
 
    Grouping is what makes this assertion correct rather than merely strict. Comparing a
    whole section against one of its four chunks would fail a parser that is behaving
@@ -574,7 +642,10 @@ gets shown.
    - **Page-level `PageAnchor`s** (`rects=[]`) are excluded as `a`, since resolving one
      returns a whole page and every other chunk on that page is legitimately inside it.
    - **Adjacent prose chunks sharing an overlap window** (§1.5) are compared on their
-     non-overlapping remainder only. The shared sentences are duplicated by design.
+     non-overlapping remainder only. The shared sentences are duplicated by design. **This
+     exclusion applies to chunks and never to blocks** — a parser does not overlap, so a
+     block whose text happens to end with the next block's text is not sharing a window, it
+     is an anchor confused with its neighbour, which is the failure the assertion exists for.
    - **Anchors whose locations genuinely nest** — a `HeadingAnchor` for a section and one
      for its subsection — are excluded, and the parser declares the nesting.
 
@@ -782,12 +853,73 @@ item text as context, in `embed_text` only.
 
 **Prose — paragraph, then sentence, then token.**
 
+*(continued below in §4.3 and §4.4, which the first draft of this document left implicit and
+which turned out to be load-bearing.)*
+
 Sentence segmentation uses a tokenizer-free rule (terminator plus whitespace plus an
 uppercase or digit start, with an abbreviation exception list), because pulling in a
 sentence-segmentation model to draw chunk boundaries would put a second model's version
 into `chunker_version`. Only a single sentence longer than the budget — a minified line, a
 base64 blob pasted into a page — falls through to a hard token split, and that fact is
 recorded in `metadata.hard_split = true` so `doctor` can count it.
+
+### 4.3 A chunk's anchor is the merge of its blocks' anchors
+
+A chunk usually holds several blocks, so it needs one anchor covering all of them. Left
+unstated, the obvious implementation takes the first block's anchor — and a chunk whose
+anchor names page 4 while half its text is on page 5 is a citation that reads correctly, is
+wrong, and passes every check that looks only at the first block.
+
+So the rule is stated the other way round: **two blocks may share a chunk only if their
+anchors combine.** Where they do not, the chunk closes. That single rule makes page,
+sheet and section boundaries into chunk boundaries without any of them being special-cased.
+
+| Pair | Combines? | Result |
+|---|---|---|
+| identical anchors | yes | that anchor |
+| two `LineAnchor`s | yes | `(min start, max end)`; `symbol` survives only when every anchor agrees on it |
+| two `PageAnchor`s, same page | yes | the concatenation of their rects, in order |
+| two `PageAnchor`s, different pages | **no** | the chunk closes at the page break |
+| two `CellAnchor`s, same sheet | yes | the union of their areas, comma-separated (§4.2) |
+| two `CellAnchor`s, different sheets | **no** | the chunk closes at the sheet boundary |
+| two different `HeadingAnchor`s | **no** | a heading already closes the chunk |
+| anything with `Unlocated` | **no** | a located anchor must not absorb an unlocated block |
+
+`symbol` dropping to `None` on a merge is deliberate: a chunk covering two definitions
+belongs to neither, and naming one of them would put a wrong symbol into the breadcrumb,
+which reaches the embedder.
+
+**The overlap window extends the anchor with it.** A chunk that opens with the previous
+chunk's last sentences must cover those lines too, or it quotes from outside the place it
+names — so overlap is only taken where the two anchors combine.
+
+This is what makes assertion 1 (containment) checkable on chunks rather than only on blocks:
+a chunk's text is the source-ordered join of its blocks' texts, and its anchor covers exactly
+their span. A parser that emits blocks with gaps between them — skipping content it chose not
+to index — produces a chunk whose text is not contiguous in the source, and containment
+fails. That is the correct outcome, and it is why `media` block text is placed at its source
+position rather than appended at the end of the chunk.
+
+### 4.4 What a `table` or `list` block must carry for the chunker to split it
+
+The chunker never inspects text to find structure, so a block it may have to split has to
+describe itself. Three keys in `ParsedBlock.metadata`, all set by the parser:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `rows` | `list[str]` | the rendered rows in order; `text == "\n".join(rows)` |
+| `header_rows` | `int` | how many leading entries of `rows` are header |
+| `row_refs` | `list[str]` | optional, `CellAnchor` formats only: each row's sheet-relative A1 range |
+
+Without `rows`, a chunker splitting a table would have to guess that a newline separates rows
+— which is wrong for any cell containing one, and wrong silently, since the result is still a
+plausible-looking table part. Without `header_rows` it would have to guess that the first row
+is a header, which promotes a data row on every table that has none. Without `row_refs` a
+split part cannot narrow its `CellAnchor`, so every part would address the whole table and
+fail tightness.
+
+**A block that does not supply `rows` is split as prose.** That keeps the text whole and
+honest about having no better structure available, rather than inventing one.
 
 ---
 
@@ -1061,12 +1193,18 @@ as they come (rule 3, §2.1).
 
 - **Rects and page size are in different coordinate spaces.** §2.2, and the most expensive
   mistake available in this parser.
-- **Text extraction has a UCS-2 variant and a full-Unicode variant**, and the shorter-named
-  one is the UCS-2 one. Anything outside the basic multilingual plane — emoji, some CJK
-  extensions, mathematical alphanumerics — comes back mangled. Use the bounded/full-Unicode
-  extraction call. A mangled character does not raise; it fails the round-trip containment
-  assertion (§3.3) on any fixture that contains one, which is why the hostile fixture set
-  includes astral-plane text.
+- **Character indices are UTF-16 code units, not codepoints — and this is the astral trap,
+  not the extraction call.** An earlier draft of this section warned that one extraction call
+  was UCS-2 and mangled astral characters. Measured, that is not where the damage is:
+  `pypdfium2`'s range and bounded extraction calls both decode UTF-16LE and both return
+  `😀B😀B` correctly. What *is* true, and worse, is that the page's **character count and
+  every index into it are UTF-16 code units**. The same page reports **six** characters where
+  Python sees four, because each astral character is a surrogate pair occupying two indices
+  that share one character box. So a Python string offset is not a pdfium index, and passing
+  one straight through asks for the rectangles of a **different run of glyphs** — right page,
+  wrong place, nothing raised. The parser builds the map between the two once, when it reads
+  the page. Astral-plane text in a PDF is a required hostile fixture (§3.5) precisely because
+  this is the only way the mistake shows up.
 - **Rect counting is stateful.** The rect count for a range must be requested before
   individual rects are read; reading them without it returns nothing useful. This is an
   API-shape trap that produces empty `rects` — that is, silently page-level anchors — rather

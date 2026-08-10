@@ -45,7 +45,21 @@ storage = [        # #2
   "pyarrow>=18.0",
 ]
 embeddings = []    # #3  mlx-embeddings, onnxruntime, numpy
-parsers = []       # #4  pypdfium2, tree-sitter, selectolax, python-docx, ...
+parsers = [
+  # Every one of these is permissively licensed; docs/parsing.md §12 records the rejections
+  # (PyMuPDF, extract-msg) and why a copyleft dependency is refused at selection time.
+  "pypdfium2>=4.30",
+  "tree-sitter>=0.23",
+  "tree-sitter-language-pack>=0.7",
+  "selectolax>=0.3.21",
+  "python-docx>=1.1",
+  "python-calamine>=0.2",
+  "python-pptx>=1.0",
+  "nbformat>=5.10",
+  "markdown-it-py>=3.0",
+  "ruamel.yaml>=0.18",
+  "tiktoken>=0.8",
+]
 generation = []    # #7  litellm
 serve = []         # #8, #11  Typer, Rich, FastMCP, FastAPI, uvicorn
 
@@ -60,6 +74,11 @@ dev = [
   "pytest-cov>=6.0",
   "ruff>=0.8",
   "pyright>=1.1.390",
+  # Fixture generation (docs/parsing.md §3.5): fixtures are built by a checked-in script
+  # wherever generation is possible, so their structure is reviewable as code rather than as
+  # an opaque binary, and the hostile ones need never be committed at all.
+  "reportlab>=4.2",
+  "openpyxl>=3.1",
   # Installed so that entry-point discovery is exercised against a real distribution rather
   # than a mock. See packages/manicule-plugin-example.
   "manicule-plugin-example",

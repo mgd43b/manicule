@@ -15,17 +15,30 @@ from manicule.testing.contracts import (
     assert_vector_store_rejects_foreign_vectors,
     closing,
 )
+from manicule.testing.normalise import NORMALISER_VERSION, normalise
+from manicule.testing.roundtrip import (
+    ParserProfile,
+    RoundTripReport,
+    assert_location_budget,
+    assert_round_trip,
+)
 
 __all__ = [
+    "NORMALISER_VERSION",
+    "ParserProfile",
+    "RoundTripReport",
     "assert_chunker_contract",
     "assert_connector_contract",
     "assert_embedder_contract",
+    "assert_location_budget",
     "assert_middleware_contract",
     "assert_parser_contract",
     "assert_protocol_signatures",
     "assert_refuses_oversized_chunks",
     "assert_retrieval_stage_contract",
+    "assert_round_trip",
     "assert_vector_store_is_dimension_agnostic",
     "assert_vector_store_rejects_foreign_vectors",
     "closing",
+    "normalise",
 ]
