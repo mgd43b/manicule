@@ -1038,9 +1038,24 @@ rather than wasted disk. Every ordering decision in this document resolves the s
 prefer the failure that costs space over the failure that costs correctness.
 
 **Retention.** The live document's bytes are kept for as long as the document exists.
-Prior versions' bytes are kept for `retain_version_bytes` (default 30 days), because a chatty
-wiki otherwise grows the blob store without bound. This is a real policy decision that no
-existing document made; it is a default, and it is configurable.
+Prior versions' bytes are kept for a bounded window — 30 days,
+`manicule.storage.history.DEFAULT_VERSION_BYTES_RETENTION_S` — because a chatty wiki otherwise
+grows the blob store without bound. This is a real policy decision that no existing document
+made.
+
+**How that window is enforced, and what it does not delete.** A `document_versions` row appears
+in the mark-and-sweep query above, so **recording a version pins its bytes** for as long as
+`original_ref` is set. `VersionStore.release_expired_versions(cutoff)` is what lets go: it
+clears `original_ref` on versions superseded before the cutoff and leaves the row, because the
+history is a permanent record and costs almost nothing while the bytes are the whole cost. The
+release is written onto the row rather than left to be inferred — "never retained" and
+"retained and since reclaimed" are different facts and a bare `NULL` is both, which is the same
+reason `documents.original_omitted_reason` exists.
+
+It is a constant rather than a configuration setting, and that is the honest position rather
+than the tidy one: nothing schedules the pass that would read a setting. `collect_garbage`
+itself is a verb with no scheduler, and a setting nothing reads is a promise nothing keeps.
+Both become configurable at the point something runs them on a timer.
 
 ### 7.1 What the data directory now contains
 
@@ -1103,6 +1118,14 @@ nothing else: chunks stay, vectors stay, FTS rows stay, and all of them become i
 the join. Restore is clearing the timestamp — no re-embed, no re-parse, no re-fetch. Hard
 deletion cascades to `chunks`, whose `AFTER DELETE` trigger writes the IDs into
 `vector_tombstones`, and a sweep removes them from LanceDB later.
+
+**Soft delete is idempotent and does not restart the clock.** A second delete of an
+already-deleted document leaves the original `deleted_at` alone. This is not politeness: §11.2
+of [`ingest.md`](ingest.md) has reconciliation soft-deleting on *every* pass over a source that
+no longer has the document, so "deleted repeatedly" is the ordinary case rather than an abuse.
+Refreshing the timestamp would make the grace period never expire, the sweep never reclaim
+anything, and the vector-table dilution this whole trade exists to bound grow without limit —
+with every individual operation looking correct.
 
 **Deferred deletion is not free, and the cost lands on retrieval.** "Invisible at the join"
 is true of the *result*, but the rows are still in the derived indexes and still compete for
@@ -1317,6 +1340,161 @@ so this is the difference between a diagnostic and a decoration.
 
 ---
 
+## 11. Organisation on top of the corpus
+
+Six of the twenty tables exist to let a person impose structure on a corpus rather than to
+index one: `collections`, `collection_documents`, `tags`, `document_tags`, `document_versions`
+and `chunk_relations`. They shipped with the schema and are filled by
+[#10](https://github.com/mgd43b/manicule/issues/10). The operations arrive as five protocols
+of their own — `CollectionStore`, `TagStore`, `VersionStore`, `TrashStore`,
+`ChunkRelationStore` — implemented by one class, for the reasons `docs/contracts.md` §3 gives.
+
+### 11.1 Two properties every one of them has
+
+**A grouping never widens a workspace.** None of these tables has a `workspace_id`. They reach
+documents and chunks by id, and a document reaches its workspace through `documents`. So
+tenancy is enforced by the code that writes them or it is not enforced at all — and the failure
+is silent in both directions: a foreign document in a collection is a cross-tenant search
+result with an entirely ordinary explanation, and a `chunk_relations` edge across the boundary
+makes a lookup from one tenant's chunk hand back another tenant's chunk id.
+
+Membership writes are therefore **all or nothing**. A batch naming an id this handle cannot see
+is refused whole, rather than applied to the ids it recognised. "Added thirty-nine of forty" is
+a success report about a failure, and the dropped id — a typo, or another tenant's — is the one
+that mattered.
+
+**A grouping never deletes what it grouped.** Deleting a collection takes its memberships;
+deleting a tag takes its applications; neither touches a document. That is a property of where
+each foreign key points, and one pointed a table further would take a corpus with it while the
+schema still looked plausible, so it is asserted in the conformance suites rather than reviewed.
+
+### 11.2 Collections: membership is evaluated, never materialised
+
+A collection has manual members and, optionally, an `auto_rules` rule. Membership is the union,
+computed at read time, so "everything from the runbooks space" keeps meaning that as the corpus
+grows. Materialising the rule's answer would make the collection a snapshot with a name that
+promises otherwise, and nothing would report that it had gone stale.
+
+**The rule carries no workspace, and cannot.** It is stored and re-executed later by whichever
+handle reads the collection; if it could name a workspace, a saved query would be able to widen
+its own scope past the handle running it. The evaluating store supplies the scope, always. The
+rule is also refused if it restricts nothing — an empty rule selects the whole workspace, and
+"no rule" already has a spelling.
+
+There is **one** expression of a rule, `rule_clause`, used by all three readers: listing a
+collection, reporting which collections hold a document, and resolving a filter. A second,
+Python-side reading for the "does this one document match" case is how the same rule starts
+giving two answers.
+
+### 11.3 Resolving `collection_ids` and `tag_ids` — and the inversion it avoids
+
+Neither store honours those two `Filter` fields; both refuse them, because neither the lexical
+statement nor the vector predicate has a join to reach them. `resolve_filter` is the step that
+turns them into `document_ids` first, and it returns `Filter | None`.
+
+**`None` means "no document can match", and that option is the whole point.** A filter's
+set-valued fields default to empty and an empty field restricts *nothing* — so resolving an
+empty collection into `document_ids = frozenset()` would not lose the restriction, it would
+**invert** it: the narrowest request anybody can make, answered with the entire workspace,
+ranked and plausible. Same family as the `MATCH`-then-hydrate result in §6.1: a well-formed
+answer to a question nobody asked.
+
+### 11.4 Tag and collection names
+
+Normalised to NFKC with whitespace collapsed. Without NFKC, `café` typed on two keyboards is
+two rows — a precomposed `é` against `e` plus a combining acute — identical on screen and
+splitting every filter that uses the label.
+
+**Case is preserved, so uniqueness is case-sensitive.** A decision, and it rests on the failure
+being *visible*: `Runbook` and `runbook` appear next to each other in the tag list, where a
+person notices. Compare what the schema's `CHECK` constraints exist for — a misspelled
+`documents.status` makes a document unservable for ever with nothing rendered anywhere. Case
+folding is also not free: `str.casefold` maps `İ` to two codepoints and `ẞ` to `ss`, so a label
+would come back spelled differently from how it was typed, and a label is display text.
+
+### 11.5 Versions, and what a stale citation resolves to
+
+**A `document_versions` row is a state the document has *left*.** It is written inside
+`upsert_document`'s transaction, when and only when `content_hash` changes — ingest writes a
+document row far more often than a document changes, and a version per write would fill the
+history with rows recording nothing, each pinning a blob. `version` counts supersessions, so
+the state a document holds now is one past the highest row and has no row of its own.
+
+That asymmetry is deliberate. Recording the *incoming* state would write a row whose
+`original_ref` is filled in a moment later by `set_original` — a history whose most recent
+entry is the one that might still be wrong. The outgoing state is complete when it is recorded.
+
+**A citation into a superseded version resolves to nothing, and says which kind of nothing.**
+`chunks.id` is content-derived (§3.2), so a chunk that survived a re-parse unchanged kept its
+id and its vector, and one whose text or position moved did not — the old id *dangles*. That is
+the property §3.2 chose the scheme for, and versioning is what makes it explicable rather than
+merely true. `resolve_citation(document_id, chunk_id)` returns one of four states:
+
+| State | Means |
+|---|---|
+| `present` | The chunk is stored and its document is not in the trash |
+| `superseded` | The document was re-ingested and no longer contains that text |
+| `deleted` | The document is in the trash, or its content was purged after the grace period |
+| `unknown` | No such document here, so there is no history to explain the chunk |
+
+Nothing returns the passage that replaced it. That would be a citation quoting text the source
+never had at that location — `docs/contracts.md` §1's forbidden case, arriving through the one
+path built to explain why a citation stopped working. Three of the four states are absences,
+and they have different remedies, which is why they are different answers rather than a `None`.
+
+### 11.6 The trash, and the two ways back
+
+`TrashStore` is soft delete, restore, and a listing that says how long each document has left
+before the sweep is entitled to purge it. It is designed **around** the sweep rather than
+against it: the only state the two share is `deleted_at`, restore clears it, and
+`soft_deleted_before` selects on it — so a restored document leaves the purge list by
+construction rather than by a second flag somebody has to remember.
+
+Restore has two outcomes and the caller has to be able to tell them apart:
+
+| When | What restore does | What it costs |
+|---|---|---|
+| Inside `soft_delete_grace` | Clears `deleted_at` | Nothing. Chunks, vectors and FTS rows were never removed |
+| After the sweep purged it | Clears `deleted_at`, sets `status = 'pending'` | A re-parse from retained bytes — rung 3 |
+| After the sweep, no retained bytes | The same, and says so | A forced re-sync — rung 4, **may fail** |
+
+`pending` is exactly what that state means everywhere else: nothing has claimed it, retrieval
+does not serve it, and a repair pass selects it. A restore that reported plain success in the
+second row would hand back a document with no chunks, invisible to every search, with nothing
+to explain why — so `Restoration` carries `needs_reparse` and a reason naming which rung
+applies. The repair is `manicule.ingest.reindex.reindex_document`, which resolves one id
+through the store and re-parses it from `original_ref`; the id lookup skips the trash, so
+**restore first, then reindex** — the other order finds nothing, and says that rather than
+doing nothing.
+
+### 11.7 Chunk relations
+
+Edges are written **once** and read from both ends. §4.4 keeps an index on `target_chunk_id`
+precisely because lookups are `WHERE source = ? OR target = ?` and a composite primary key
+leading with `source` cannot serve the second half — so a mirror row would double the table to
+answer a question the schema already answers, and would create a pair that can drift. Direction
+survives the round trip, because for a parent link the two directions mean opposite things and
+a set of neighbours cannot recover which.
+
+`relation_type` stays plain `TEXT` with no `CHECK`, and the vocabulary is closed in Python
+instead. That is the right side of §3.4's trade rather than an exception to it: a misspelled
+`documents.status` makes a document invisible to retrieval for ever and silently, which is what
+justifies a constraint; a misspelled relation type produces an edge no query asks for —
+visible, inert, reversible — while a database constraint would make a plugin-defined relation a
+schema migration.
+
+An edge whose far end is not visible to the reading handle is dropped rather than returned: a
+soft-deleted document's chunk is still there by design, and relations are a context-expansion
+mechanism, so a lookup that ignored the soft-delete predicate would put deleted content back
+into an answer by the side door.
+
+### 11.8 No migration
+
+All twenty tables, their constraints and their indexes shipped with the initial schema. #10
+adds no revision, and `alembic check` is unchanged by it.
+
+---
+
 ## Appendix A: what this design decided that nothing else had
 
 Flagged because these were calls made in the absence of a stated position, not derived from
@@ -1349,6 +1527,15 @@ one.
 | Blob retention: current version forever, prior versions 30 days; 256 MiB cap | §7 |
 | `<data_dir>` is `0700`/`0600`; `doctor` fails on a looser mode; backup refuses a world-readable target | §7.1 |
 | Deletion from derived stores is always deferred to a sweep | §8.2 |
+| Soft delete is idempotent and never restarts the grace period | §8.2 |
+| Organisation is five protocols implemented by one class | §11 |
+| Collection membership is evaluated at read time; a stored rule cannot name a workspace | §11.2 |
+| Resolving an empty collection refuses the query rather than widening it to the workspace | §11.3 |
+| A version row is the state a document *left*, written only when `content_hash` changes | §11.5 |
+| A citation into a superseded version is an absence that names itself, never its replacement | §11.5 |
+| Restore after the grace period returns `pending` and names the rung its repair lands on | §11.6 |
+| `chunk_relations` rows are written once and read from both ends; no `CHECK` on `relation_type` | §11.7 |
+| Prior versions release their bytes rather than deleting their history | §7 |
 | Backup order is SQLite first, LanceDB second, under a sweep-blocking lock | §9.1 |
 | `STRICT` tables rejected for v1 | §3.4 |
 

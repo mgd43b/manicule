@@ -91,6 +91,27 @@ class ChunkingError(ManiculeError):
     """A chunker could not produce chunks from a document's blocks."""
 
 
+class NameInUseError(ManiculeError):
+    """A workspace already has a collection or a tag under the name that was asked for.
+
+    Raised rather than absorbed into an upsert, because the two operations differ in what they
+    do to somebody else's data. Creating a collection that already exists and quietly handing
+    back the existing one merges two people's sets under one name; renaming a tag onto an
+    existing name moves every document from one label to the other. Both look like success.
+    """
+
+
+class UnknownEntityError(ManiculeError):
+    """An id names nothing this workspace-scoped handle can see.
+
+    One error for "there is no such row" and "there is such a row and it belongs to another
+    tenant", and the two are deliberately not distinguished in the message. Telling a caller
+    which of the two it hit confirms the existence of another workspace's document from
+    outside that workspace, which is a membership oracle — small, but exactly the kind of leak
+    a tenancy boundary is supposed to close.
+    """
+
+
 class MiddlewareViolationError(ManiculeError):
     """A middleware hook did something the contract forbids.
 
@@ -177,6 +198,7 @@ __all__ = [
     "InstanceLockedError",
     "ManiculeError",
     "MiddlewareViolationError",
+    "NameInUseError",
     "ParseError",
     "PluginDependencyError",
     "PluginError",
@@ -185,5 +207,6 @@ __all__ = [
     "ReconciliationRefusedError",
     "TokenStateError",
     "UnknownComponentError",
+    "UnknownEntityError",
     "WorkerKilledError",
 ]

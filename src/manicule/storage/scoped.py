@@ -1,0 +1,208 @@
+"""The workspace boundary, in one place, for every relational surface that carries it.
+
+:class:`SqliteDocStore` implements six protocols — documents and chunks, collections, tags,
+versions, the trash, chunk relations — and every one of them is scoped to a single workspace
+in exactly the same way: **the handle carries the workspace and no method takes one.** A query
+cannot forget a parameter it was never given.
+
+That shared state and the guards that use it live here rather than in the module that happens
+to have needed them first. The alternative is five copies of a tenancy check, and a boundary
+enforced in five places is a boundary enforced in whichever of them somebody remembered.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from sqlalchemy import select
+
+from manicule.core.errors import ManiculeError, UnknownEntityError
+from manicule.storage import models
+from manicule.storage.engine import session_factory
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+    from manicule.core.retrieval import Filter
+
+DEFAULT_WORKSPACE = "default"
+"""Personal mode has one workspace and never says so out loud.
+
+The workspace is bound to the store handle rather than passed per call, so a query cannot
+forget it. Team mode supplies a real id; personal mode gets this one, and the isolation
+predicate is identical either way — which means the path that enforces tenancy is exercised
+by every test rather than only by the team-mode ones.
+"""
+
+
+class CrossWorkspaceCollisionError(ManiculeError):
+    """A document id was offered to a workspace that does not own it.
+
+    **This should be unreachable.** :func:`manicule.core.ids.document_id` takes the workspace
+    as the first component of its digest, so two tenants indexing the same upstream source
+    derive different ids by construction. What remains is a caller that built an id some other
+    way, or a workspace mismatch between the handle and the document it was handed.
+
+    Kept as a guard rather than deleted, because the failure it catches is silent: an id
+    computed without the workspace lands on another tenant's row, overwriting content its
+    author cannot read while its own document appears to vanish. An assertion that cannot fire
+    costs one comparison per write; the same bug without it costs a tenant's data.
+    """
+
+
+class WorkspaceScoped:
+    """Shared construction and tenancy guards for the SQLite store's several surfaces.
+
+    Not a protocol and not part of any public contract — it is the piece of implementation the
+    protocol implementations have in common. Each mixin inherits it, so the concrete store has
+    one ``__init__``, one session factory and one workspace however many protocols it satisfies.
+    """
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        workspace_id: str = DEFAULT_WORKSPACE,
+        sessions: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._engine = engine
+        self._workspace_id = workspace_id
+        self._sessions = sessions or session_factory(engine)
+
+    @property
+    def workspace_id(self) -> str:
+        return self._workspace_id
+
+    async def ensure_workspace(self) -> None:
+        """Create this store's workspace row if it is absent. Idempotent."""
+        async with self._sessions.begin() as session:
+            existing = await session.get(models.Workspace, self._workspace_id)
+            if existing is None:
+                session.add(
+                    models.Workspace(id=self._workspace_id, name=self._workspace_id, settings={})
+                )
+
+    # --- tenancy guards ---------------------------------------------------------------------
+
+    def _require_honourable(
+        self,
+        filter: Filter | None,  # noqa: A002
+        honoured: frozenset[str],
+        operation: str,
+    ) -> None:
+        """Refuse a filter this query cannot apply in full.
+
+        Two refusals, and the order matters only in that both must happen before the
+        statement is built.
+
+        **A workspace this handle does not serve.** A subset check, because
+        :attr:`~manicule.core.retrieval.Filter.workspace_ids` is set-valued: cross-workspace
+        search is N scoped handles fanned out and merged (``docs/retrieval.md`` §3.2), so this
+        handle only ever sees its own workspace. A filter naming another one is a caller who
+        believes they are querying somewhere else, and answering the question they did not ask
+        is the shape a cross-tenant leak takes.
+
+        **A field this query has no column for.** Silently dropping it returns rows the filter
+        was written to exclude — a listing or a search that still looks like it worked. The
+        same rule as :func:`~manicule.storage.vectors.predicate_for`, applied here so that
+        "a store honours the whole filter or refuses" holds for both halves of storage.
+
+        Raises:
+            CrossWorkspaceCollisionError: The filter names another workspace.
+            ValueError: The filter sets a field this query cannot apply.
+        """
+        if filter is None:
+            return
+
+        outside = sorted(filter.workspace_ids - {self._workspace_id})
+        if outside:
+            named = ", ".join(repr(name) for name in outside)
+            msg = (
+                f"filter names workspace(s) {named} but this store serves "
+                f"{self._workspace_id!r}. Cross-workspace search is one store per workspace, "
+                f"merged — open a store for each."
+            )
+            raise CrossWorkspaceCollisionError(msg)
+
+        unhonoured = sorted(filter.restricting_fields - honoured)
+        if unhonoured:
+            msg = (
+                f"this store cannot {operation} by {', '.join(unhonoured)}. Resolve those "
+                f"fields into document_ids first; applying the rest and ignoring them would "
+                f"return rows the filter was written to exclude."
+            )
+            raise ValueError(msg)
+
+    # --- row lookups ------------------------------------------------------------------------
+
+    async def _live_document(
+        self, session: AsyncSession, document_id: str
+    ) -> models.Document | None:
+        row = await session.get(models.Document, document_id)
+        if row is None or row.workspace_id != self._workspace_id or row.deleted_at is not None:
+            return None
+        return row
+
+    async def _any_document(
+        self, session: AsyncSession, document_id: str
+    ) -> models.Document | None:
+        """A document in this workspace whether or not it is in the trash.
+
+        The trash surface and the version history both have to see deleted rows — that is what
+        they are for — so they cannot go through :meth:`_live_document`, which exists to keep
+        a soft-deleted document out of everything else.
+        """
+        row = await session.get(models.Document, document_id)
+        if row is None or row.workspace_id != self._workspace_id:
+            return None
+        return row
+
+    async def _require_live_documents(
+        self, session: AsyncSession, document_ids: Sequence[str]
+    ) -> list[str]:
+        """The ids, having checked every one of them is a live document in this workspace.
+
+        **All or nothing.** A membership write that skipped the ids it could not see would
+        report "added forty" having added thirty-nine, and the one it dropped is the one that
+        mattered — a typo, or a document id from another tenant. Refusing the batch is the only
+        outcome a caller can act on.
+
+        Raises:
+            UnknownEntityError: Naming the ids this handle cannot see, without saying which of
+                them exist elsewhere.
+        """
+        wanted = list(dict.fromkeys(document_ids))
+        if not wanted:
+            return []
+        found = set(
+            (
+                await session.execute(
+                    select(models.Document.id).where(
+                        models.Document.id.in_(wanted),
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.deleted_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        missing = [document_id for document_id in wanted if document_id not in found]
+        if missing:
+            named = ", ".join(repr(document_id) for document_id in missing)
+            msg = (
+                f"no live document {named} in workspace {self._workspace_id!r}. Nothing was "
+                f"written: a partially applied membership change reports a success it did not "
+                f"have."
+            )
+            raise UnknownEntityError(msg)
+        return wanted
+
+
+__all__ = [
+    "DEFAULT_WORKSPACE",
+    "CrossWorkspaceCollisionError",
+    "WorkspaceScoped",
+]

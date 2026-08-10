@@ -92,7 +92,15 @@ VectorStore
     search(vector: Vector, k: int, filter: Filter|None) -> list[Candidate]
 
 DocStore
-    # metadata, collections, tags, versions, conversations
+    # documents, chunks, lexical search, sync state
+
+CollectionStore                                  # named sets, manual or rule-driven
+TagStore                                         # arbitrary labels
+VersionStore                                     # history across re-ingests
+    resolve_citation(document_id, chunk_id) -> CitationResolution
+TrashStore                                       # soft delete, and the two ways back
+ChunkRelationStore                               # parent and sibling links
+    # conversations belong to the ticket that builds chat
 
 RetrievalStage
     name: str
@@ -112,6 +120,27 @@ Connector
 
 **`Parser` returns blocks, not text.** Structure is discovered once, by the component that
 can actually see it, and never re-derived downstream from prose.
+
+**Storage is six protocols, not one, and one class implements all six.** `DocStore` was
+deliberately partial in [#1](https://github.com/mgd43b/manicule/issues/1) — documents, chunks,
+lexical search and sync watermarks, the ingest and retrieval critical path — on the stated
+promise that organisation would arrive as protocols of its own.
+[#10](https://github.com/mgd43b/manicule/issues/10) is that arrival. Splitting them is what
+lets a component declare the narrow surface it needs: a stage that resolves a collection into
+document ids asks for a `CollectionStore` and cannot reach a document's chunks with the handle
+it was given. Joining the *implementation* is what keeps the workspace boundary in one place —
+`SqliteDocStore` has one constructor, one session factory and one tenancy check however many
+contracts it satisfies. See [`storage.md`](storage.md) §11.
+
+**`VersionStore.resolve_citation` takes the document as well as the chunk, and the reason is
+the anchor rule.** `chunks.id` is derived from `(document_id, position, text)`, so a chunk that
+survives a re-parse unchanged keeps its id and one whose text moved does not — the old id
+*dangles* rather than silently re-pointing at whatever replaced it. A dangling id is opaque and
+there is nothing left to look it up against, so the document comes too. What comes back is the
+absence, labelled: `present`, `superseded`, `deleted`, or `unknown`. Nothing resolves a citation
+into a superseded version to the text that replaced it. That would be §1's forbidden case
+exactly — a location that is plausible and wrong — arriving through the one path built to
+explain why a citation stopped working.
 
 **`Embedder` has two tiers.** Tier A returns pre-pooled token states and manicule does the
 pooling; tier B returns finished vectors. The distinction exists because a backend's
