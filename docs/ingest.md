@@ -940,7 +940,7 @@ Calls made in the absence of a stated position.
 | The complete `Document.status` set and its transitions, collected for #1 | §2.2 |
 | PII redaction moves to the generation boundary; ingest-time redaction rejected | §3.4 |
 | Two-level change detection, and a skip that still writes three things | §4, §4.1 |
-| Parse and chunk in `spawn`ed worker subprocesses; embed deliberately not | §6 |
+| Parse in `spawn`ed worker subprocesses; embed deliberately not (chunk moved to the parent, §2) | §6 |
 | Memory bounding is platform-split: `RLIMIT_AS` on Linux, RSS polling on macOS | §6.2 |
 | Crash recovery is a startup sweep on `status` + `updated_at`, no new schema | §6.4 |
 | One instance per data directory, enforced by a lock file | §6.5 |
