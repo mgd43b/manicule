@@ -134,12 +134,18 @@ jobs:
         run: uv run tools/prefetch_embedding_models.py --mlx
       # The whole point of the job is the assertion, not the fetch. The embedding suites skip
       # what is not downloaded — right on a developer's machine, and worthless here, where a
-      # broken pre-seed would leave the parity check unrun and the job green.
-      # MANICULE_REQUIRE_EMBEDDING_MODELS turns every one of those skips into a failure.
+      # broken pre-seed would leave the parity check unrun and the job green. Naming the model
+      # that was seeded turns its skips into failures, and only its own: BAAI/bge-m3 is exercised
+      # opportunistically wherever it is already on disk, and is not worth 4.6 GB per CI run.
+      #
+      # The variable is deliberately not in manicule's `MANICULE_` namespace. The test
+      # environment fixture deletes everything in that namespace before each test, so an earlier
+      # name for this switch was scrubbed before it was ever read — and the job went green having
+      # skipped the parity check entirely.
       - name: pytest (models required)
         env:
-          MANICULE_REQUIRE_EMBEDDING_MODELS: "1"
-        run: uv run pytest tests/test_embedding_backends.py -q
+          REQUIRE_EMBEDDING_MODELS: BAAI/bge-small-en-v1.5
+        run: uv run pytest tests/test_embedding_backends.py -q -rs
 
   # Runs on every pull request, including ones that touch no Python at all. The repository
   # is mostly cross-referenced design documents, and a heading renumbered in one file

@@ -8,15 +8,48 @@ are the interesting ones, because they are where a default would take over.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+from manicule.config.settings import ENV_PREFIX
 from manicule.core.embedding import Pooling
 from manicule.core.errors import ConfigError
 from manicule.embedding.artifacts import MLX_WEIGHTS, mlx_repo, mlx_weights, onnx_weights
 from manicule.embedding.cards import load_tokenizer, read_card
-from tests.embedding_support import write_model, write_tokenizer
+from tests.embedding_support import (
+    REQUIRE_MODELS_ENV,
+    REQUIRED_MODELS,
+    write_model,
+    write_tokenizer,
+)
+
+
+def test_the_models_required_switch_survives_the_test_environment() -> None:
+    """The switch that stops a green job from meaning nothing, and it silently did not work.
+
+    ``manicule_environment`` deletes every ``MANICULE_``-prefixed variable before each test, so
+    that a developer's own configuration cannot leak into the suite. The first version of this
+    switch was called ``MANICULE_REQUIRE_EMBEDDING_MODELS`` and lived inside that namespace, so
+    it was deleted before it was ever read: CI set it, the backend suites skipped every case for
+    which no weights were present, and the job reported success — the exact failure the switch
+    exists to prevent, inside the mechanism meant to prevent it. Found by reading a green CI log
+    rather than by any test, which is why there is now a test.
+
+    Two things are asserted, because either alone would have let it through: the name is outside
+    manicule's namespace, and what the environment holds *during a test* is what was read at
+    import time.
+    """
+    assert not REQUIRE_MODELS_ENV.startswith(ENV_PREFIX), (
+        f"{REQUIRE_MODELS_ENV} is inside manicule's configuration namespace, which the test "
+        f"environment fixture clears before every test. It configures the suite, not the "
+        f"application, and a switch that is deleted before it is read disables itself in silence"
+    )
+
+    live = os.environ.get(REQUIRE_MODELS_ENV, "")
+    expected = frozenset(name.strip() for name in live.split(",") if name.strip())
+    assert expected == REQUIRED_MODELS
 
 
 def test_a_model_is_read_rather_than_guessed(tmp_path: Path) -> None:
@@ -251,6 +284,34 @@ def test_the_conventional_onnx_graph_is_preferred_over_its_quantisations(tmp_pat
     _, graph = onnx_weights(str(directory))
 
     assert graph.name == "model.onnx"
+
+
+def test_a_lone_quantised_onnx_graph_is_refused(tmp_path: Path) -> None:
+    """The case the ambiguity refusal below cannot see, and the one that would load silently.
+
+    An ONNX graph declares no precision of its own, unlike an MLX conversion's ``config.json``,
+    so a repository publishing only ``model_quantized.onnx`` is the *unambiguous* candidate. Its
+    name is weak evidence and it is the only evidence there is — worth acting on, because
+    admitting it puts vectors measured at cosine 0.92-0.97 to the named model into an index
+    whose fingerprint says the runtime cannot have changed the output.
+    """
+    directory = write_model(tmp_path / "quantised-onnx")
+    (directory / "onnx").mkdir()
+    (directory / "onnx" / "model_quantized.onnx").write_bytes(b"graph")
+
+    with pytest.raises(ConfigError, match="quantised"):
+        onnx_weights(str(directory))
+
+
+def test_a_lone_full_precision_onnx_graph_is_accepted(tmp_path: Path) -> None:
+    """Half precision is not quantisation: it is what the MLX side runs, and parity holds."""
+    directory = write_model(tmp_path / "fp16-onnx")
+    (directory / "onnx").mkdir()
+    (directory / "onnx" / "model_fp16.onnx").write_bytes(b"graph")
+
+    _, graph = onnx_weights(str(directory))
+
+    assert graph.name == "model_fp16.onnx"
 
 
 def test_several_onnx_graphs_and_no_conventional_one_is_refused(tmp_path: Path) -> None:

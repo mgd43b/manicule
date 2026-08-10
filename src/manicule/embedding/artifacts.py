@@ -49,6 +49,26 @@ _ONNX_PATTERNS: Final[tuple[str, ...]] = (f"{ONNX_SUBDIR}/*", "*.json")
 
 _QUANTISATION_KEYS: Final[tuple[str, ...]] = ("quantization", "quantization_config")
 
+_QUANTISED_GRAPH_MARKERS: Final[tuple[str, ...]] = (
+    "quantized",
+    "quantised",
+    "int8",
+    "uint8",
+    "qint8",
+    "quint8",
+)
+"""Substrings that mark an ONNX graph as reduced-precision.
+
+A name is weak evidence and it is the only evidence available: an ONNX graph carries no
+declaration of its own precision the way an MLX conversion's ``config.json`` does. Weak
+evidence is still worth acting on here, because the alternative is admitting a graph measured
+at cosine 0.92-0.97 to the model it claims to be, into an index whose fingerprint says the
+runtime cannot have changed the output.
+
+``fp16`` is deliberately absent: half precision is what the MLX side already runs, and parity
+holds across it.
+"""
+
 
 class WeightsRef(BaseModel):
     """The artefact a backend loaded, recorded so a vector can be traced to its bytes."""
@@ -135,7 +155,7 @@ def _graph_file(repo: str, path: Path) -> Path:
 
     candidates = sorted(path.glob(f"{ONNX_SUBDIR}/*.onnx")) or sorted(path.glob("*.onnx"))
     if len(candidates) == 1:
-        return candidates[0]
+        return _refuse_quantised_graph(repo, candidates[0])
     if not candidates:
         msg = (
             f"{repo} publishes no ONNX export. The onnx backend is the portable runtime and "
@@ -149,6 +169,28 @@ def _graph_file(repo: str, path: Path) -> Path:
         f"{repo} publishes {len(candidates)} ONNX graphs ({names}) and none called "
         f"model.onnx. They are usually different quantisations of one model, which do not "
         f"produce the same vectors; name the one you mean with `weights`."
+    )
+    raise ConfigError(msg)
+
+
+def _refuse_quantised_graph(repo: str, graph: Path) -> Path:
+    """Refuse an ONNX graph whose name says its precision was reduced.
+
+    The asymmetry with the MLX path is worth stating: there, quantisation is declared in the
+    artefact's ``config.json`` and read. An ONNX graph declares nothing, so a repository
+    publishing only ``model_quantized.onnx`` would otherwise be the *unambiguous* candidate and
+    be loaded without a word — the one case the ambiguity refusal below cannot see.
+    """
+    lowered = graph.name.lower()
+    marker = next((mark for mark in _QUANTISED_GRAPH_MARKERS if mark in lowered), None)
+    if marker is None:
+        return graph
+    msg = (
+        f"{repo}'s only ONNX export is {graph.name}, whose name says it is quantised "
+        f"({marker!r}). Quantisation changes the vectors — measured at cosine 0.92-0.97 for a "
+        f"4-bit conversion of the same model — while the runtime is excluded from embedding "
+        f"fingerprint identity precisely because it is not supposed to. Point `weights` at a "
+        f"repository publishing a full-precision export, or run the mlx backend."
     )
     raise ConfigError(msg)
 

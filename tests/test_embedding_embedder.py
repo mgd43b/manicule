@@ -162,6 +162,28 @@ async def test_text_the_model_would_truncate_is_refused(card: ModelCard) -> None
     assert await embedder.embed([" ".join(["alpha"] * limit)])
 
 
+async def test_the_refusal_names_only_the_texts_that_are_actually_too_long(
+    card: ModelCard,
+) -> None:
+    """Measured from the mask, because the batch is padded to its longest member.
+
+    Measuring ``len(ids)`` instead reports the longest text's size for every row: the error
+    still fires, on the right batch, while naming innocent texts as the offenders and telling
+    the caller to shorten a two-word string. An unactionable error on the one path where the
+    alternative is silent truncation.
+    """
+    embedder = StubEmbedder(card)
+    limit = embedder.fingerprint.max_sequence_length
+
+    with pytest.raises(ContextOverflowError) as raised:
+        await embedder.embed(["alpha", " ".join(["beta"] * (limit + 5))])
+
+    message = str(raised.value)
+    assert "1 of 2 texts exceed" in message
+    assert f"text 1 ({limit + 5} tokens)" in message
+    assert "text 0" not in message
+
+
 async def test_embedding_stored_chunks_refuses_ones_the_model_cannot_read(
     embedder: StubEmbedder,
 ) -> None:

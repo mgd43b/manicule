@@ -7,9 +7,10 @@ offline, in milliseconds, including the cases no published model would ever ship
 flags at once, a dimension that disagrees with itself, a missing sequence length.
 
 The real models are still needed, for the one thing a synthetic repository cannot check: that
-two runtimes agree. Those tests find their weights in the local Hugging Face cache and skip
-when it is empty — except under ``MANICULE_REQUIRE_EMBEDDING_MODELS``, where a missing model
-fails instead. CI sets it, because a conformance suite that skips certifies nothing.
+two runtimes agree. Those tests find their weights in the local Hugging Face cache and skip when
+it is empty — except for the models named in ``REQUIRE_EMBEDDING_MODELS``, where a missing model
+fails instead. CI names what it pre-seeded, because a conformance suite that skips certifies
+nothing.
 """
 
 # This module is the suite's seam over libraries that ship no type information — MLX,
@@ -28,8 +29,31 @@ from typing import Final
 
 import pytest
 
-REQUIRE_MODELS_ENV: Final = "MANICULE_REQUIRE_EMBEDDING_MODELS"
-"""Set in CI. Turns "this model is not downloaded" from a skip into a failure."""
+REQUIRE_MODELS_ENV: Final = "REQUIRE_EMBEDDING_MODELS"
+"""Which models must be present rather than merely welcome.
+
+A comma-separated list of model ids, or ``all``. CI sets it to exactly what it pre-seeded, so a
+green job means those suites *ran*; a model outside the list still skips when absent, which is
+what lets ``bge-m3`` be exercised on a developer's machine without putting 4.6 GB of downloads
+in every CI run.
+
+**Deliberately outside manicule's ``MANICULE_`` namespace**, and the reason is a bug this
+caught. ``manicule_environment`` deletes every ``MANICULE_``-prefixed variable before each test,
+so that a developer's own configuration cannot leak into the suite. The first version of this
+switch was called ``MANICULE_REQUIRE_EMBEDDING_MODELS`` and was therefore deleted before it was
+ever read: on a runner with no weights every case skipped and the job reported green — the exact
+failure the switch exists to prevent, inside the mechanism meant to prevent it. This is not
+application configuration; it configures the suite, and it is named accordingly.
+"""
+
+REQUIRED_MODELS: Final[frozenset[str]] = frozenset(
+    name.strip() for name in os.environ.get(REQUIRE_MODELS_ENV, "").split(",") if name.strip()
+)
+"""Read once, at import time, before any fixture has had a chance to touch the environment.
+
+Belt and braces against the failure above: the rename is what fixes it, and reading it here is
+what stops a future fixture from silently undoing the fix.
+"""
 
 PARITY_MODEL: Final = "BAAI/bge-small-en-v1.5"
 """The model the backend parity suite runs on by default.
@@ -62,8 +86,13 @@ def onnx_weights_available(model_id: str) -> bool:
     return _cached(model_id, ("onnx/model.onnx",))
 
 
+def is_required(model_id: str) -> bool:
+    """Whether this model must be present for the suite to be considered to have run."""
+    return "all" in REQUIRED_MODELS or model_id in REQUIRED_MODELS
+
+
 def require_model(model_id: str, *, mlx: bool = False, onnx: bool = False) -> None:
-    """Skip — or under CI, fail — unless the named weights are already downloaded."""
+    """Skip unless the named weights are downloaded — or fail, if this model is required."""
     missing: list[str] = []
     if not model_available(model_id):
         missing.append(f"{model_id} (declaration)")
@@ -75,27 +104,32 @@ def require_model(model_id: str, *, mlx: bool = False, onnx: bool = False) -> No
         return
 
     detail = ", ".join(missing)
-    if os.environ.get(REQUIRE_MODELS_ENV):
+    if is_required(model_id):
         pytest.fail(
-            f"{detail} not in the local model cache, and {REQUIRE_MODELS_ENV} is set. "
-            f"Pre-seed with tools/prefetch_embedding_models.py; a skipped conformance suite "
-            f"reports green while checking nothing."
+            f"{detail} not in the local model cache, and {REQUIRE_MODELS_ENV} names "
+            f"{model_id}. Pre-seed with tools/prefetch_embedding_models.py; a skipped "
+            f"conformance suite reports green while checking nothing."
         )
     pytest.skip(f"{detail} not downloaded. Run tools/prefetch_embedding_models.py to enable.")
 
 
-def requires_mlx() -> None:
-    """Skip — or under CI, fail — unless the MLX runtime is importable and working."""
-    try:
-        import mlx.core as mx  # noqa: PLC0415 - Apple-only, and optional off Apple Silicon
+def requires_mlx(model_id: str) -> None:
+    """Skip unless MLX works here — or fail, if a model requiring it was named.
 
-        mx.eval(mx.array([1.0]) + 1)
-    except Exception as error:  # noqa: BLE001 - any failure here means "no working MLX"
-        if os.environ.get(REQUIRE_MODELS_ENV):
-            pytest.fail(
-                f"MLX is not usable on this machine ({error}), and {REQUIRE_MODELS_ENV} is set"
-            )
-        pytest.skip(f"MLX is not usable on this machine ({error})")
+    Takes the model so that "MLX is missing" fails exactly where "the weights are missing"
+    would. On a runner that is supposed to be measuring backend parity, an absent runtime and
+    absent weights are the same outcome: the comparison did not happen.
+    """
+    from manicule.embedding.runtimes import mlx_usable  # noqa: PLC0415 - an embeddings extra
+
+    if mlx_usable():
+        return
+    if is_required(model_id):
+        pytest.fail(
+            f"MLX is not usable on this machine, and {REQUIRE_MODELS_ENV} names {model_id}. "
+            f"Backend parity cannot be measured with one backend"
+        )
+    pytest.skip("MLX is not usable on this machine")
 
 
 def _cached(repo: str, patterns: tuple[str, ...]) -> bool:
@@ -200,8 +234,10 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
 __all__ = [
     "FULL_MODEL",
     "PARITY_MODEL",
+    "REQUIRED_MODELS",
     "REQUIRE_MODELS_ENV",
     "VOCABULARY",
+    "is_required",
     "mlx_weights_available",
     "model_available",
     "onnx_weights_available",

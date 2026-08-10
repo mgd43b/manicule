@@ -36,9 +36,13 @@ uv run python -c "from manicule.parsers import grammars; grammars.prefetch(gramm
 uv run tools/prefetch_embedding_models.py --mlx   # add --full for BAAI/bge-m3, ~4.6 GB
 ```
 
-Set `MANICULE_REQUIRE_EMBEDDING_MODELS=1` to turn a missing model into a failure, which is what
-CI does. If you are touching embeddings, run it that way at least once: a skipped conformance
-suite reports green while checking nothing.
+`REQUIRE_EMBEDDING_MODELS` names the models that must be present rather than merely welcome —
+a comma-separated list, or `all`. CI sets it to exactly what it pre-seeded. If you are touching
+embeddings, run `REQUIRE_EMBEDDING_MODELS=all uv run pytest` at least once: a skipped
+conformance suite reports green while checking nothing.
+
+It is not a `MANICULE_` variable, and that is deliberate — the test environment clears that
+whole namespace before each test, so a switch living inside it is deleted before it is read.
 
 ## Nothing is deferred
 

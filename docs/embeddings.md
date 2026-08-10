@@ -548,6 +548,13 @@ invisible without this test because every individual vector looks fine.
   model sitting on disk becomes invisible and every model suite skips — green, having checked
   nothing. `tests/conftest.py` pins `HF_HUB_CACHE` for the session, the same hazard the
   tree-sitter grammar cache had and the same fix.
+- **A switch inside `MANICULE_` is deleted before it is read.** The test environment clears that
+  namespace per test so a developer's configuration cannot leak in. The switch that turns a
+  missing model from a skip into a failure was first named `MANICULE_REQUIRE_EMBEDDING_MODELS`
+  and was therefore scrubbed: CI set it, every case skipped, and the job reported success — the
+  failure the switch exists to prevent, occurring inside it. It is now
+  `REQUIRE_EMBEDDING_MODELS`, read at import time, and a test asserts both. Found by reading a
+  green CI log, not by a test.
 
 ---
 
@@ -614,4 +621,4 @@ unfinished:
 | §4.1 | the BGE-M3 cosine was deferred to §6 | 0.66–0.80, measured |
 | §5 | `architecture` "raised, not added" | settled against, with the reason |
 | §5 | two non-identity fields | three: `weights_ref` added |
-| §7 | five traps | eight; three of the new ones only appear when the code runs |
+| §7 | five traps | nine; four of the new ones only appear when the code runs, and one only in CI |

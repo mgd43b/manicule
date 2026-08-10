@@ -215,8 +215,15 @@ reportUnknownArgumentType = "none"
 # fully checked themselves. That split matters more here than for parsers, because
 # mlx-embeddings is version 0.1.0 and binds one attribute to different meanings on different
 # architectures: a hand-written stub would be confidently wrong rather than merely absent.
+# `reportMissingImports` is off for the same directory and a different reason: MLX installs on
+# Apple Silicon and nowhere else, so on Linux — where CI type-checks — `import mlx.core` cannot
+# resolve at all. That is a narrow real loss, covered by running the code rather than checking
+# it: the plugin factory imports these modules and tests/test_embedding_backends.py builds and
+# runs both backends. `manicule.embedding.runtimes.mlx_core` exists so that this suppression can
+# stay inside this directory instead of following MLX into every caller.
 [[tool.pyright.executionEnvironments]]
 root = "src/manicule/embedding/runtimes"
+reportMissingImports = "none"
 reportMissingTypeStubs = "none"
 reportUnknownMemberType = "none"
 reportUnknownVariableType = "none"

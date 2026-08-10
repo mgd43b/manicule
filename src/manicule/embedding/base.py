@@ -290,16 +290,17 @@ class PooledEmbedder(Lifecycle, ABC):
         encoded = self._tokenizer.encode_batch(texts)
         limit = self.fingerprint.max_sequence_length
         specials = self.card.special_token_count
-        oversized = [
-            (index, len(ids) - specials)
-            for index, ids in enumerate(encoded.ids)
-            if len(ids) - specials > limit
-        ]
+        # From the mask, never from ``len(ids)``. The batch is padded to its longest member, so
+        # every row's id list is that length — measuring it would report the longest text's size
+        # for every text in the batch, and name innocent ones as the offenders. The error would
+        # still fire, on the right batch, saying the wrong thing about which text to shorten.
+        lengths = [sum(row) - specials for row in encoded.attention_mask]
+        oversized = [(index, length) for index, length in enumerate(lengths) if length > limit]
         if oversized:
             worst = sorted(oversized, key=lambda pair: pair[1], reverse=True)[:3]
             listed = ", ".join(f"text {index} ({count} tokens)" for index, count in worst)
             msg = (
-                f"{len(oversized)} of {len(encoded.ids)} texts exceed the {limit}-token limit of "
+                f"{len(oversized)} of {len(lengths)} texts exceed the {limit}-token limit of "
                 f"{self.fingerprint.describe()}: {listed}. Truncation is deliberately not "
                 f"enabled: the model would drop the remainder without an error and the vector "
                 f"would describe only the opening. Shorten the text, or chunk it first."

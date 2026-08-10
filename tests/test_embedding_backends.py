@@ -29,6 +29,7 @@ skips, or fails under ``MANICULE_REQUIRE_EMBEDDING_MODELS``, which CI sets.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Final
 
 import numpy as np
@@ -86,7 +87,7 @@ _LOADED: dict[tuple[str, str], PooledEmbedder] = {}
 
 
 @pytest.fixture(scope="module", autouse=True)
-def release_backends() -> object:
+def release_backends() -> Iterator[None]:
     """Load each model once per module and release the worker threads at the end.
 
     Loading ``bge-m3`` is 2.3 GB per runtime; doing it per test would make this file the slowest
@@ -131,7 +132,7 @@ async def embedder_for(
 def require(model_id: str, backend: str) -> None:
     """Skip — or fail under CI — unless this model can run on this backend here."""
     if backend == "mlx":
-        requires_mlx()
+        requires_mlx(model_id)
     require_model(model_id, mlx=backend == "mlx", onnx=backend == "onnx")
 
 
@@ -185,8 +186,9 @@ async def test_the_mlx_convenience_field_is_the_wrong_reduction_for_this_model(
     embedder = await embedder_for(model_id, "mlx")
     assert embedder.fingerprint.pooling is Pooling.CLS
 
-    import mlx.core as mx  # noqa: PLC0415 - guarded by requires_mlx above
+    from manicule.embedding.runtimes import mlx_core  # noqa: PLC0415 - guarded by require() above
 
+    mx = mlx_core()
     encoded = await embedder.encode(list(TEXTS))
     ours = np.asarray(await embedder.embed(list(TEXTS)), dtype=np.float32)
 
