@@ -20,6 +20,7 @@ from manicule.testing import (
     assert_chunker_contract,
     assert_connector_contract,
     assert_embedder_contract,
+    assert_middleware_contract,
     assert_parser_contract,
     assert_refuses_oversized_chunks,
     assert_retrieval_stage_contract,
@@ -29,6 +30,7 @@ from manicule.testing import (
 from tests.fakes import (
     AliasingStage,
     BlockChunker,
+    BlockRewritingMiddleware,
     FixedDimensionVectorStore,
     ForgetfulConnector,
     ForgetfulVectorStore,
@@ -38,9 +40,13 @@ from tests.fakes import (
     MemoryConnector,
     MemoryVectorStore,
     MutatingStage,
+    PassThroughMiddleware,
+    RedactingMiddleware,
     SilentParser,
+    TextRewritingMiddleware,
     TopKStage,
     TruncatingEmbedder,
+    UndeclaredEmbedMiddleware,
     make_chunks,
     make_document,
     make_raw,
@@ -256,3 +262,69 @@ def test_chunk_ids_are_derived_not_generated() -> None:
     assert chunk_id(document.id, 0, "x") == chunk_id(document.id, 0, "x")
     assert chunk_id(document.id, 0, "x") != chunk_id(document.id, 1, "x")
     assert chunk_id(document.id, 0, "x") != chunk_id(document.id, 0, "y")
+
+
+# --- middleware ------------------------------------------------------------------------
+
+
+async def test_middleware_contract_accepts_a_middleware_that_touches_nothing() -> None:
+    document = make_document()
+    chunks = make_chunks(document)
+
+    returned = await assert_middleware_contract(PassThroughMiddleware(), document, chunks)
+
+    assert [chunk.text for chunk in returned] == [chunk.text for chunk in chunks]
+
+
+async def test_middleware_contract_accepts_declared_embed_text_rewriting() -> None:
+    """Rewriting embed_text is the reason after_chunk exists. It must not be rejected."""
+    document = make_document()
+    chunks = make_chunks(document)
+
+    returned = await assert_middleware_contract(RedactingMiddleware(), document, chunks)
+
+    assert any("[REDACTED]" in chunk.embed_text for chunk in returned)
+    assert all("[REDACTED]" not in chunk.text for chunk in returned)
+
+
+async def test_middleware_contract_catches_a_rewritten_text() -> None:
+    """The defect no parser suite can catch, and the reason this check exists."""
+    document = make_document()
+    chunks = make_chunks(document)
+
+    with pytest.raises(AssertionError, match=r"rewrote Chunk\.text"):
+        await assert_middleware_contract(TextRewritingMiddleware(), document, chunks)
+
+
+async def test_middleware_contract_catches_undeclared_embed_text_mutation() -> None:
+    """Not a corrupted citation, but a corpus no fingerprint describes."""
+    document = make_document()
+    chunks = make_chunks(document)
+
+    with pytest.raises(AssertionError, match="without declaring mutates_embedded_text"):
+        await assert_middleware_contract(UndeclaredEmbedMiddleware(), document, chunks)
+
+
+async def test_middleware_contract_needs_a_chunk_to_have_an_opinion() -> None:
+    document = make_document()
+
+    with pytest.raises(AssertionError, match="at least one chunk"):
+        await assert_middleware_contract(PassThroughMiddleware(), document, [])
+
+
+async def test_middleware_contract_catches_a_rewritten_block() -> None:
+    """after_parse can corrupt a citation exactly as after_chunk can, one hook earlier."""
+    document = make_document()
+    chunks = make_chunks(document)
+
+    with pytest.raises(AssertionError, match=r"rewrote ParsedBlock\.text"):
+        await assert_middleware_contract(
+            BlockRewritingMiddleware(), document, chunks, blocks=_blocks()
+        )
+
+
+async def test_middleware_contract_accepts_untouched_blocks() -> None:
+    document = make_document()
+    chunks = make_chunks(document)
+
+    await assert_middleware_contract(PassThroughMiddleware(), document, chunks, blocks=_blocks())

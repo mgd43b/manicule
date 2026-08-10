@@ -442,6 +442,38 @@ contracts.md §1 calls this "a test obligation on every parser, not a convention
 section is the obligation, written so a parser either satisfies it or does not compile past
 review.
 
+### 3.0 `text` is immutable after parse
+
+The obligation has a scope condition that no parser test can enforce from inside a parser, so
+it is stated first.
+
+> **`ParsedBlock.text` and `Chunk.text` may not be modified after the parser emits
+> them. `embed_text` may.**
+
+Every assertion below compares `chunk.text` against what `resolve` returns from the source
+bytes. Any stage that rewrites `text` afterwards breaks that correspondence **after every
+parser test has passed** — leaving a corpus that is internally consistent and whose citations
+quote text the source document does not contain. That is the defect this whole document
+exists to prevent, arriving through a door the parser cannot see.
+
+`embed_text` is different in kind: never cited, never displayed, and shaped for retrieval
+rather than for reproduction (§5). Rewriting it is legitimate — redaction and context
+augmentation both belong there — and it changes every vector, which is why a middleware that
+does so declares `mutates_embedded_text` and is folded into the chunk fingerprint
+([`ingest.md`](ingest.md) §3.3).
+
+Both hooks matter. Rewriting a block's text in `after_parse` is the same corruption one
+step earlier, since block text becomes chunk text while the block's anchor still points at
+source text that no longer matches.
+
+**Enforced, not asserted in prose.** `Middleware` states the rule and
+`manicule.testing.assert_middleware_contract` fails a middleware that breaks it at either
+hook — including
+one that rewrites `embed_text` without declaring it, which corrupts no citation but produces
+a corpus no fingerprint describes. `contracts.md` §5 is explicit that an unenforced guarantee
+is worse than an absent one, and that is the reasoning that removed the `permissions` field;
+a rule living only here would be the same failure.
+
 ### 3.1 Resolution has to be part of the protocol
 
 The obligation is unenforceable as `Parser` currently stands, because nothing in the
