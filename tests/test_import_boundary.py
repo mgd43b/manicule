@@ -74,13 +74,20 @@ MANICULE_PACKAGES = (
 )
 
 
-def _modules_after_importing(*packages: str) -> set[str]:
-    """Import ``packages`` in a clean interpreter and report what ended up loaded."""
+def _modules_added_by_importing(*packages: str) -> set[str]:
+    """Import ``packages`` in a fresh interpreter and report what *they* loaded.
+
+    The difference across the import, not the contents of ``sys.modules`` afterwards. An
+    interpreter arrives with things already loaded — coverage hooks, ``sitecustomize``,
+    whatever the environment injects — and none of it is manicule's doing. Measuring the
+    total would make this test a report on the runner rather than on the code.
+    """
     script = (
         "import json, sys\n"
+        "before = set(sys.modules)\n"
         f"for name in {list(packages)!r}:\n"
         "    __import__(name)\n"
-        "print(json.dumps(sorted(sys.modules)))\n"
+        "print(json.dumps(sorted(set(sys.modules) - before)))\n"
     )
     completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
         [sys.executable, "-I", "-c", script],
@@ -88,13 +95,13 @@ def _modules_after_importing(*packages: str) -> set[str]:
         text=True,
         check=True,
     )
-    loaded: list[str] = json.loads(completed.stdout)
-    return set(loaded)
+    added: list[str] = json.loads(completed.stdout)
+    return set(added)
 
 
 @pytest.mark.contract
 def test_importing_manicule_pulls_in_no_implementation() -> None:
-    loaded = _modules_after_importing(*MANICULE_PACKAGES)
+    loaded = _modules_added_by_importing(*MANICULE_PACKAGES)
     leaked = sorted(name for name in IMPLEMENTATION_MODULES if name in loaded)
     assert leaked == [], (
         f"importing manicule loaded {', '.join(leaked)}. Core defines contracts; "
@@ -106,17 +113,18 @@ def test_importing_manicule_pulls_in_no_implementation() -> None:
 @pytest.mark.contract
 def test_core_alone_needs_nothing_but_pydantic() -> None:
     """The narrower claim: the protocols and types on their own."""
-    loaded = _modules_after_importing("manicule.core")
+    added = _modules_added_by_importing("manicule.core")
     third_party = {
         name.split(".")[0]
-        for name in loaded
+        for name in added
         if not name.startswith(("_", "manicule"))
         and name.split(".")[0] not in sys.stdlib_module_names
     }
+    # Pydantic and what pydantic itself needs. Nothing else has any business being here.
     assert third_party <= {
+        "annotated_types",
         "pydantic",
         "pydantic_core",
-        "annotated_types",
         "typing_extensions",
         "typing_inspection",
     }, f"manicule.core imported {sorted(third_party)}"
