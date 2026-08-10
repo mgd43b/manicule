@@ -28,7 +28,7 @@ it.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -38,7 +38,7 @@ from pydantic import JsonValue
 from manicule.connectors import cql
 from manicule.connectors.client import ConfluenceClient
 from manicule.connectors.config import CONNECTOR_NAME, ConfluenceConfig, Deployment
-from manicule.connectors.errors import ConnectorError, NotFoundError
+from manicule.connectors.errors import BodyUnavailableError, ConnectorError, NotFoundError
 from manicule.connectors.macros import (
     IncludedPage,
     Lookup,
@@ -192,9 +192,8 @@ class ConfluenceConnector:
             spaces[space] = observed.isoformat()
         if not spaces:
             return None
-        newest = max(spaces.values())
         return Watermark(
-            value=newest,
+            value=_newest(spaces.values()),
             observed_at=datetime.now(tz=UTC),
             metadata={"spaces": cast("Metadata", dict(spaces))},
         )
@@ -504,7 +503,14 @@ class ConfluenceConnector:
         if not self._is_cloud:
             return await self._storage_body(page_id)
 
-        body = await self._adf_body(page_id)
+        try:
+            body = await self._adf_body(page_id)
+        except BodyUnavailableError:
+            # The page is there and the format is not. Storage format is a different code path
+            # on the source's side, which is exactly the situation it exists for; anything
+            # else — a 429, a rejected credential — must not be retried through a second
+            # endpoint, which is why only this failure is caught.
+            return await self._storage_body(page_id)
         if expected is None or body.version >= expected:
             return body
         retried = await self._adf_body(page_id)
@@ -553,9 +559,9 @@ class ConfluenceConnector:
             msg = (
                 f"page {page_id} came back with no Atlassian Document Format body. The page "
                 f"exists, so this is the source declining the format rather than the page "
-                f"being empty; storage format is the fallback."
+                f"being empty."
             )
-            raise ConnectorError(msg)
+            raise BodyUnavailableError(msg)
         links = _obj(payload.get("_links"))
         return _Body(
             page_id=page_id,
@@ -620,7 +626,10 @@ class ConfluenceConnector:
                 if body_format == ADF_BODY
                 else await self._storage_body(page_id)
             )
-        except NotFoundError:
+        except (NotFoundError, BodyUnavailableError):
+            # An include whose target cannot be read is recorded as unresolved, with the reason,
+            # rather than failing the page that includes it: the rest of that page is content
+            # somebody is looking for, and the gap is already reported where it happened.
             return None
         if body_format == ADF_BODY:
             return IncludedPage(
@@ -658,6 +667,22 @@ def _adf_document(value: str, page_id: str) -> Mapping[str, object]:
         msg = f"page {page_id} returned a JSON {type(loaded).__name__} where a document was due"
         raise ConnectorError(msg)
     return cast("Mapping[str, object]", loaded)
+
+
+def _newest(stamps: Iterable[str]) -> str:
+    """The latest of some ISO-8601 instants, compared as instants.
+
+    Not ``max()`` over the strings. Timestamps keep the offset the instance reported (§2), and
+    two spaces on one instance can report different offsets across a daylight-saving boundary —
+    at which point the lexicographic maximum is the wrong string. Nothing interprets
+    ``Watermark.value``, but a summary that is subtly wrong is worse than none: it is read by
+    whoever is working out why a sync did what it did.
+    """
+    values = list(stamps)
+    known = [(when, value) for value in values if (when := cql.parse_when(value)) is not None]
+    if not known:
+        return max(values)
+    return max(known, key=lambda pair: pair[0])[1]
 
 
 def _space_watermarks(watermark: Watermark | None) -> Mapping[str, str]:

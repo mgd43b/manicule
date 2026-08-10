@@ -13,7 +13,12 @@ import json
 
 import pytest
 
-from manicule.connectors import AttachmentTooLargeError, NotFoundError
+from manicule.connectors import (
+    AttachmentTooLargeError,
+    NotFoundError,
+    RateLimitedError,
+    UntrustedLinkError,
+)
 from manicule.connectors.confluence import ANCESTORS, STORAGE_MEDIA_TYPE, VERSION_TOKEN
 from manicule.core.sources import DocRef
 from manicule.parsers.config import ADF_MEDIA_TYPE
@@ -233,3 +238,60 @@ async def test_a_ref_without_ancestors_still_gets_a_breadcrumb() -> None:
 
     assert raw.metadata[ANCESTORS] == ["ENG", "Platform", "Auth Service"]
     assert raw.metadata["breadcrumb_complete"] is True
+
+
+async def test_a_page_whose_adf_body_is_declined_falls_back_to_storage() -> None:
+    """The page exists and the format does not, which is not the same as an empty page.
+
+    Falling back is the whole reason two formats are read; the alternative is a document that
+    fails for a reason the source did not actually give.
+    """
+    instance = FakeConfluence(
+        pages=[FakePage(id="1", title="Page", space="ENG", adf_available=False)]
+    )
+    raw = await _fetched(instance, "1")
+
+    assert raw.media_type == STORAGE_MEDIA_TYPE
+    assert raw.metadata["body_format"] == "storage"
+
+
+async def test_a_throttled_page_is_not_retried_through_a_second_endpoint() -> None:
+    """The fallback is for one failure, and catching any error would widen it into a hazard.
+
+    A 429 answered by trying a different endpoint doubles the load on a source that has just
+    said stop, and reports the wrong problem when it fails again. So the retry budget is spent
+    on the endpoint that was asked, and the throttling surfaces as throttling.
+    """
+    instance = FakeConfluence(pages=[FakePage(id="1", title="Page", space="ENG")])
+    connector = await connected(instance, cloud_config(base_url=instance.base_url, max_retries=1))
+    try:
+        found = await drain(connector.discover(None))
+        instance.throttle(times=4, retry_after="1")
+        with pytest.raises(RateLimitedError):
+            await connector.fetch(found[0].ref)
+    finally:
+        await connector.teardown()
+
+    v1 = [request for request in instance.requests if "/rest/api/content/1" in request.url.path]
+    assert v1 == [], "a throttled page must not be retried through the storage endpoint"
+
+
+async def test_a_download_link_naming_another_host_is_refused() -> None:
+    """An attachment's download link comes from the response, and the request carries the
+    sync account's credential. Using it unchecked lets a response choose who receives that
+    credential."""
+    instance = FakeConfluence(
+        pages=[FakePage(id="1", title="Page", space="ENG")],
+        attachments=[
+            FakeAttachment(
+                id="att-9",
+                title="d.pdf",
+                space="ENG",
+                page_id="1",
+                page_title="Page",
+                download_link="https://collector.example/steal",
+            )
+        ],
+    )
+    with pytest.raises(UntrustedLinkError, match=r"collector\.example"):
+        await _fetched(instance, "att-9")

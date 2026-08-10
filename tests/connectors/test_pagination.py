@@ -16,13 +16,15 @@ from collections.abc import Mapping
 from typing import cast
 from urllib.parse import parse_qsl, urlsplit
 
+import httpx
 import pytest
 
 from manicule.connectors import ConnectorError, CursorExpiredError, UntrustedLinkError
+from manicule.connectors.client import ConfluenceClient
 from manicule.connectors.pagination import NextPage, next_page, split_query
 from manicule.testing import closing
-from tests.connectors.fake_confluence import FakeConfluence, FakePage
-from tests.connectors.support import Clock, cloud_config, connected, drain, ids
+from tests.connectors.fake_confluence import CLOUD_BASE, FakeConfluence, FakePage
+from tests.connectors.support import Clock, client_for, cloud_config, connected, drain, ids
 
 
 def _instance(count: int = 5) -> FakeConfluence:
@@ -185,3 +187,47 @@ async def test_a_cursor_held_longer_than_its_lifetime_is_refused() -> None:
                 await anext(stream)
     finally:
         await connector.teardown()
+
+
+async def test_a_next_link_that_repeats_without_a_cursor_stops_the_walk() -> None:
+    """The loop guard compares the whole request, not the cursor alone.
+
+    A link that keeps pointing at itself with no cursor at all would slip past a cursor-only
+    check and enumerate the same results forever, which reads as a very large space rather
+    than as a fault.
+    """
+    payload = {
+        "results": [{"id": "1", "type": "page", "title": "A"}],
+        "_links": {"base": CLOUD_BASE, "next": "/rest/api/content/search?limit=1"},
+    }
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=payload)
+
+    config = cloud_config()
+    client = ConfluenceClient(config, transport=httpx.MockTransport(handle), clock=lambda: 0.0)
+    await client.setup()
+    try:
+        with pytest.raises(ConnectorError, match="already followed"):
+            await drain(client.paginate(client.url("/rest/api/content/search")))
+    finally:
+        await client.teardown()
+
+
+async def test_a_request_off_the_configured_origin_is_refused_before_it_is_sent() -> None:
+    """Not only the pagination link: most URLs this client is handed come from a response.
+
+    The check lives at the one place requests are made, so a URL threaded in later — a
+    download link, an endpoint added next year — cannot skip it.
+    """
+    instance = FakeConfluence(pages=[FakePage(id="1", title="A", space="ENG")])
+    _, client = client_for(instance)
+    await client.setup()
+    try:
+        with pytest.raises(UntrustedLinkError, match=r"collector\.example"):
+            await client.get_json("https://collector.example/rest/api/space")
+    finally:
+        await client.teardown()
+
+    assert instance.requests == [], "the refusal must happen before anything is sent"

@@ -60,6 +60,13 @@ class FakePage:
     stale_once: bool = False
     """Whether the disagreement clears on a second request, as a caching artefact would."""
 
+    adf_available: bool = True
+    """Whether the Cloud body endpoint returns an Atlassian Document Format body at all.
+
+    It has been seen to decline the format for a page that exists, which is a different thing
+    from the page being empty and wants a different answer.
+    """
+
     storage_version: int | None = None
     """Version the storage-format endpoint reports. ``None`` means it agrees with search.
 
@@ -79,6 +86,13 @@ class FakeAttachment:
     media_type: str = "application/pdf"
     version: int = 1
     when: str = "2026-08-09T14:31:00.000+01:00"
+
+    download_link: str = ""
+    """Overrides the download link this attachment advertises.
+
+    A response can name any URL it likes, and the client attaches the sync account's
+    credential to whatever it is given — so a fixture has to be able to name a hostile one.
+    """
 
 
 def paragraph(text: str) -> dict[str, object]:
@@ -280,7 +294,8 @@ class FakeConfluence:
             },
             "_links": {
                 "webui": f"/spaces/{item.space}/pages/{item.page_id}/{item.title}",
-                "download": f"/download/attachments/{item.page_id}/{item.title}",
+                "download": item.download_link
+                or f"/download/attachments/{item.page_id}/{item.title}",
             },
         }
 
@@ -301,6 +316,9 @@ class FakeConfluence:
                 },
             )
         version = self._served_version(page)
+        body: dict[str, object] = (
+            {"atlas_doc_format": {"value": json.dumps(page.adf)}} if page.adf_available else {}
+        )
         return httpx.Response(
             200,
             json={
@@ -308,7 +326,7 @@ class FakeConfluence:
                 "title": page.title,
                 "status": "current",
                 "version": {"number": version},
-                "body": {"atlas_doc_format": {"value": json.dumps(page.adf)}},
+                "body": body,
                 "_links": {
                     "base": self.base_url,
                     "webui": f"/spaces/{page.space}/pages/{page.id}/{page.title}",

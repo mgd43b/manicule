@@ -25,6 +25,7 @@ from manicule.connectors.config import (
 )
 from manicule.connectors.errors import (
     AttachmentTooLargeError,
+    BodyUnavailableError,
     ConnectorError,
     CursorExpiredError,
     NotFoundError,
@@ -36,6 +37,7 @@ from manicule.connectors.errors import (
 __all__ = [
     "CONNECTOR_NAME",
     "AttachmentTooLargeError",
+    "BodyUnavailableError",
     "ConfluenceConfig",
     "ConnectorError",
     "CursorExpiredError",

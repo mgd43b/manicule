@@ -97,9 +97,13 @@ everything that space ever contributed.
 
 **`_links.next` is resolved against `_links.base` by concatenation, and the origin is
 checked.** An instance served from a context path (`/confluence`) has that path in `base` and
-not in `next`, and RFC 3986 resolution of a root-absolute reference discards it. Following a
-`base` that names another host would send the sync account's credentials wherever a response
-asked, so a link that resolves off-origin stops the enumeration.
+not in `next`, and RFC 3986 resolution of a root-absolute reference discards it.
+
+The origin check is not only pagination's. **Every** URL the client is given is checked before
+the request goes out, because most of them come from responses — the next page's link, an
+attachment's `_links.download` — and every request carries the sync account's credential.
+Without a check at the point requests are made, a response decides who receives that
+credential.
 
 Per page, `version.number` is the change token — cheaper than hashing content.
 
@@ -152,6 +156,12 @@ expands them for every page it returns, so the fetch needs no second call. A ref
 somewhere else (a re-fetch, a targeted single-page sync) carries none, and then the Cloud
 ancestors endpoint is asked; an ancestor whose title it omits is skipped rather than filled
 in with an id, and the document records that its breadcrumb is incomplete.
+
+**A page that comes back with no ADF body at all** — the format declined for a page that
+exists, which is not the same as an empty page — is read as storage format instead. Only that
+failure falls back: a 429 or a rejected credential answered by trying a second endpoint would
+double the load on a source that has just said stop, and report the wrong problem when it
+failed again.
 
 **Known Cloud bugs to guard against:** batch page-version endpoints have returned 500 with
 ADF requested (CONFCLOUD-80964), and there are reports of ADF returning stale page

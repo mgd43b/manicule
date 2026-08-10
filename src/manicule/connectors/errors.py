@@ -18,6 +18,7 @@ from manicule.core.errors import ManiculeError
 
 __all__ = [
     "AttachmentTooLargeError",
+    "BodyUnavailableError",
     "ConnectorError",
     "CursorExpiredError",
     "NotFoundError",
@@ -74,12 +75,24 @@ class CursorExpiredError(ConnectorError):
     """
 
 
-class UntrustedLinkError(ConnectorError):
-    """A link in a response pointed somewhere other than the configured host.
+class BodyUnavailableError(ConnectorError):
+    """The page exists but did not come back in the body format that was asked for.
 
-    Pagination follows ``_links.next`` and resolves it against the ``_links.base`` the
-    response supplies. Following that blindly would send the sync user's credentials wherever
-    a response asked, so the resolved origin is checked against the configured one.
+    Narrower than :class:`ConnectorError` on purpose, because it is the one failure the caller
+    answers by asking for a different format. Falling back on *any* error would retry through a
+    second endpoint after a 429 or a rejected credential, doubling the load on a source that
+    has just said stop and hiding which of the two problems it was.
+    """
+
+
+class UntrustedLinkError(ConnectorError):
+    """A request was about to be sent somewhere other than the configured host.
+
+    Responses are full of URLs — ``_links.next``, ``_links.base``, an attachment's
+    ``_links.download`` — and every request carries the sync account's credential. Using one
+    without checking where it points means a response can decide who receives that credential.
+    So the origin of every URL is checked against the configured one before the request is
+    made, not only for the pagination link where the hazard is most obvious.
     """
 
 

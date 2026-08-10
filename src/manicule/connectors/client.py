@@ -34,8 +34,9 @@ from manicule.connectors.errors import (
     NotFoundError,
     RateLimitedError,
     RemoteError,
+    UntrustedLinkError,
 )
-from manicule.connectors.pagination import has_seen, next_page
+from manicule.connectors.pagination import next_page, origin_of
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     import httpx
@@ -122,7 +123,7 @@ class ConfluenceClient:
         access token. The two deployments differ here and in the body format, and nowhere else
         that matters.
         """
-        headers = {"Accept": "application/json", "X-Atlassian-Token": "no-check"}
+        headers = {"Accept": "application/json"}
         config = self._config
         if config.deployment is Deployment.CLOUD:
             token = config.api_token.get_secret_value() if config.api_token else ""
@@ -142,6 +143,29 @@ class ConfluenceClient:
     def url(self, path: str) -> str:
         """An absolute URL for a path relative to the configured site root."""
         return f"{self._config.base_url.rstrip('/')}/{path.lstrip('/')}"
+
+    def _checked(self, url: str) -> str:
+        """``url``, or a refusal if it is not on the configured origin.
+
+        Most URLs this client is given ultimately come from a response — the next page's link,
+        an attachment's download link — and every request carries the sync account's
+        credential. Without this, a response decides who receives that credential. Checked at
+        the one place requests are made rather than at each call site, so that a URL threaded
+        in later cannot skip it.
+
+        Raises:
+            UntrustedLinkError: The URL points at another host.
+        """
+        expected = origin_of(self._config.base_url)
+        found = origin_of(url)
+        if found != expected:
+            msg = (
+                f"refusing to request {url!r}: it is on {found or 'no host'} and this connector "
+                f"is configured for {expected}. Links like this come from responses, and "
+                f"following one would send this account's Confluence credentials elsewhere."
+            )
+            raise UntrustedLinkError(msg)
+        return url
 
     async def get_json(self, url: str, params: Params = ()) -> Json:
         """GET ``url`` and decode a JSON object from it.
@@ -181,8 +205,7 @@ class ConfluenceClient:
         """
         current_url = url
         current_params: Params = params
-        followed: list[str] = []
-        received = self._clock()
+        followed: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
 
         while True:
             payload = await self.get_json(current_url, current_params)
@@ -207,14 +230,17 @@ class ConfluenceClient:
                 )
                 raise CursorExpiredError(msg)
 
-            if has_seen(followed, following.cursor):
+            request = (following.url, following.params)
+            if request in followed:
                 msg = (
-                    f"pagination was sent back to a cursor it has already followed "
-                    f"({following.cursor[:24]!r}). Continuing would enumerate the same pages "
-                    f"forever while looking like an unusually large space."
+                    f"pagination was sent back to a page it has already followed "
+                    f"(cursor {following.cursor[:24]!r}). Continuing would enumerate the same "
+                    f"results forever while looking like an unusually large space. The whole "
+                    f"request is compared rather than the cursor alone, so a link that repeats "
+                    f"without one is caught too."
                 )
                 raise ConnectorError(msg)
-            followed.append(following.cursor)
+            followed.add(request)
             current_url = following.url
             current_params = following.params
 
@@ -230,6 +256,7 @@ class ConfluenceClient:
                 so the document records why it has no content rather than recording a size.
         """
         client = self._require_client()
+        url = self._checked(url)
         import httpx  # noqa: PLC0415 - see setup()
 
         for attempt in range(self._config.max_retries + 1):
@@ -262,6 +289,7 @@ class ConfluenceClient:
 
     async def _get(self, url: str, params: Params) -> httpx.Response:
         client = self._require_client()
+        url = self._checked(url)
         import httpx  # noqa: PLC0415 - see setup()
 
         for attempt in range(self._config.max_retries + 1):

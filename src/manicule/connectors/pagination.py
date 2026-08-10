@@ -24,7 +24,7 @@ wrong.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import cast
@@ -152,12 +152,3 @@ def _resolve(base: str, link: str) -> str:
     if link.startswith("/"):
         return base.rstrip("/") + link
     return f"{base.rstrip('/')}/{link}"
-
-
-def has_seen(cursors: Sequence[str], cursor: str) -> bool:
-    """Whether a cursor has already been followed in this enumeration.
-
-    A response whose ``next`` addresses a page already walked is a loop, and a loop over a
-    paginated search does not look like a fault: it looks like a very large space.
-    """
-    return bool(cursor) and cursor in cursors

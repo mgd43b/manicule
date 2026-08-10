@@ -593,11 +593,17 @@ class _StorageScanner(HTMLParser):
 
 
 def _line_starts(source: str) -> list[int]:
-    """Absolute offset of the start of each line, so ``getpos()`` can be turned into one."""
+    """Absolute offset of the start of each line, so ``getpos()`` can be turned into one.
+
+    Found with :meth:`str.find` rather than by looping over characters: a page body is
+    routinely tens of thousands of characters and this runs once per macro scan, which is up
+    to three times per fetched page.
+    """
     starts = [0]
-    for index, character in enumerate(source):
-        if character == "\n":
-            starts.append(index + 1)
+    index = source.find("\n")
+    while index != -1:
+        starts.append(index + 1)
+        index = source.find("\n", index + 1)
     return starts
 
 
