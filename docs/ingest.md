@@ -873,12 +873,18 @@ that never happened. Two workers found the same hole from opposite ends, and it 
 *completed* enumeration got, `None` when the source has no change signal or the enumeration did
 not finish.
 
-**Two independent checks guard that write, which is the right number.** The connector answers
-`None` until its own enumeration completed, and `assert_connector_contract` holds every
-connector to it by abandoning a stream after one document and requiring the position has not
-moved. The pipeline refuses on a run that did not finish. Persisting a partly-advanced position
-does not *delay* the documents it skipped — it makes them permanently invisible, with nothing
-raised, which is why one check is not enough.
+**Two checks guard that write and neither is redundant.** `assert_connector_contract` catches
+a connector that advances its watermark as it yields — by abandoning a stream after one document
+and requiring the position has not moved — and it catches it on an *uninterrupted* run, which is
+the only kind anyone looks at. The pipeline's own gate catches a caller that persists a
+watermark for work that was not committed, on a run that has already gone wrong. A connector can
+pass the first and still lose documents through a caller that ignores the second.
+
+Deleting either restores a failure whose symptom is documents that exist in the source, were
+enumerated once, and are in no index — permanently, with nothing raised, and no later sync
+fixing it. This is written down in both places on purpose: two tests that look like they overlap
+are what this guarantee has to look like, and a reader who finds them without the reason will
+delete one.
 
 **The exception, stated:** a connector whose `discover` is not restartable from a watermark
 re-enumerates fully. That is a connector property, not a pipeline one, and it is visible in

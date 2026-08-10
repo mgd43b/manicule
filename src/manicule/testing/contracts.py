@@ -494,6 +494,14 @@ async def _assert_watermark_survives_abandonment(connector: Connector) -> None:
 
     A source with no documents at all is skipped rather than passed — there is nothing an
     abandoned enumeration could have been abandoned part-way through.
+
+    **This is one of two checks on the same guarantee, and it is not redundant with the other.**
+    The ingest pipeline separately refuses to persist a watermark after a run that did not
+    finish. That gate fires on a run which has already gone wrong; this one fires on a run where
+    nothing went wrong at all, which is the only kind anyone looks at. A connector can pass this
+    check and still lose documents through a caller that ignores the other. Deleting either
+    restores the same failure — documents in the source, enumerated once, in no index,
+    permanently.
     """
     before = connector.watermark
 

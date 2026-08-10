@@ -281,11 +281,17 @@ class IngestPipeline:
         that cannot say where it got to re-enumerating is cheaper than one that invents a
         position and is believed.
 
-        **Two independent checks guard the same write, and that is the right number.** The
-        connector answers ``None`` until its own enumeration completed;
-        :func:`manicule.testing.assert_connector_contract` holds it to that. This end refuses on
-        a run that did not finish. Persisting a partly-advanced position does not delay the
-        documents it skipped — it makes them permanently invisible, with nothing raised.
+        **Two checks guard this write and neither is redundant.**
+        :func:`manicule.testing.assert_connector_contract` catches a connector that advances its
+        watermark as it yields — and it catches it on an *uninterrupted* run, which is the only
+        kind anyone looks at. This gate catches a caller that persists a watermark for work that
+        was not committed, on a run that has already gone wrong. A connector can pass the first
+        and still lose documents through a caller that ignores the second.
+
+        Deleting either one restores a failure whose symptom is documents that exist in the
+        source, were enumerated once, and are in no index — permanently, with nothing raised,
+        and no later sync fixing it. Two tests that look like they overlap are the shape this
+        guarantee has to take; they are checking different halves of it.
         """
         reached = connector.watermark
         if reached is not None:
