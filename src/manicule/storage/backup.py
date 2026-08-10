@@ -133,6 +133,14 @@ def _write_snapshot(
     if target.exists() and any(target.iterdir()):
         msg = f"backup target is not empty: {target}"
         raise BackupError(msg)
+    resolved_target = target.resolve()
+    resolved_source = data_dir.resolve()
+    if resolved_target == resolved_source or resolved_source in resolved_target.parents:
+        msg = (
+            f"backup target {target} is inside the data directory being backed up; "
+            f"the copy would include itself"
+        )
+        raise BackupError(msg)
 
     target.mkdir(mode=0o700, parents=True, exist_ok=True)
 

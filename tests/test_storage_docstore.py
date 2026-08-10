@@ -11,7 +11,7 @@ from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
 from manicule.core.protocols import DocStore
 from manicule.core.retrieval import Filter
 from manicule.core.sources import Watermark
-from manicule.storage.docstore import SqliteDocStore
+from manicule.storage.docstore import CrossWorkspaceCollisionError, SqliteDocStore
 from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
@@ -279,7 +279,10 @@ async def test_two_workspaces_cannot_see_each_others_documents(engine: AsyncEngi
 async def test_the_same_source_identity_can_exist_in_two_workspaces(
     engine: AsyncEngine,
 ) -> None:
-    """Uniqueness is per workspace; two tenants indexing one wiki is not a conflict."""
+    """Uniqueness is per workspace; two tenants indexing one wiki is not a conflict.
+
+    They must arrive with distinct document ids to do it — see the collision test below.
+    """
     alpha = SqliteDocStore(engine, workspace_id="alpha")
     beta = SqliteDocStore(engine, workspace_id="beta")
     await alpha.ensure_workspace()
@@ -291,6 +294,63 @@ async def test_the_same_source_identity_can_exist_in_two_workspaces(
 
     assert len(await alpha.list_documents()) == 1
     assert len(await beta.list_documents()) == 1
+
+
+async def test_one_workspace_cannot_overwrite_another_ones_document(
+    engine: AsyncEngine,
+) -> None:
+    """Document ids are derived from (source, source_id) and carry no workspace.
+
+    Two tenants indexing the same upstream source therefore compute the same id. Unguarded,
+    the second write lands on the first tenant's row — overwriting content the writer cannot
+    read, while the writer's own document appears to vanish because the row belongs to
+    somebody else.
+    """
+    alpha = SqliteDocStore(engine, workspace_id="alpha")
+    beta = SqliteDocStore(engine, workspace_id="beta")
+    await alpha.ensure_workspace()
+    await beta.ensure_workspace()
+
+    private = make_document(source="confluence", source_id="123", title="alpha private")
+    await alpha.upsert_document(private)
+
+    with pytest.raises(CrossWorkspaceCollisionError, match="already belongs to workspace"):
+        await beta.upsert_document(private.model_copy(update={"title": "beta overwrote it"}))
+
+    survived = await alpha.get_document(private.id)
+    assert survived is not None
+    assert survived.title == "alpha private"
+
+
+async def test_a_filter_naming_another_workspace_is_refused(engine: AsyncEngine) -> None:
+    """Silently ignoring it would answer a question nobody asked."""
+    alpha = SqliteDocStore(engine, workspace_id="alpha")
+    await alpha.ensure_workspace()
+
+    with pytest.raises(CrossWorkspaceCollisionError, match="this store serves"):
+        await alpha.list_documents(Filter(workspace_id="beta"))
+    with pytest.raises(CrossWorkspaceCollisionError, match="this store serves"):
+        await alpha.search_lexical("anything", k=5, filter=Filter(workspace_id="beta"))
+
+    assert await alpha.list_documents(Filter(workspace_id="alpha")) == []
+
+
+async def test_lexical_search_takes_its_query_under_the_protocols_parameter_name(
+    store: SqliteDocStore,
+) -> None:
+    """A caller using the protocol's keyword must reach the implementation.
+
+    ``runtime_checkable`` only checks that attributes exist, so a renamed parameter satisfies
+    ``isinstance`` and fails at the first keyword call.
+    """
+    import inspect  # noqa: PLC0415
+
+    from manicule.core.protocols import DocStore as Protocol  # noqa: PLC0415
+
+    assert list(inspect.signature(Protocol.search_lexical).parameters) == list(
+        inspect.signature(SqliteDocStore.search_lexical).parameters
+    )
+    assert await store.search_lexical(text="nothing indexed yet", k=5) == []
 
 
 async def test_getting_no_chunks_asks_the_database_nothing(store: SqliteDocStore) -> None:

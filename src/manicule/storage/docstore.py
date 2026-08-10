@@ -10,11 +10,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select
+from sqlalchemy import text as sql
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from manicule.core.anchors import Anchor
 from manicule.core.content import BlockKind, Document, DocumentStatus
+from manicule.core.errors import ManiculeError
 from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import SourceId, Watermark
 from manicule.storage import models
@@ -38,6 +40,24 @@ forget it. Team mode supplies a real id; personal mode gets this one, and the is
 predicate is identical either way — which means the path that enforces tenancy is exercised
 by every test rather than only by the team-mode ones.
 """
+
+
+class CrossWorkspaceCollisionError(ManiculeError):
+    """A document id already exists in a different workspace.
+
+    :func:`manicule.core.ids.document_id` derives an id from ``(source, source_id)`` and
+    carries no workspace, so two tenants indexing the same upstream source arrive at the same
+    id. Left unchecked, the second write lands on the first tenant's row: it overwrites
+    content the writer cannot read, and the writer's own document then appears to have
+    vanished, because the row belongs to somebody else's workspace.
+
+    Raised rather than worked around, because the alternatives are worse. Silently namespacing
+    the id would make it disagree with what ingest computed; a composite primary key would
+    have to be threaded through every foreign key that points at a document. Global uniqueness
+    across workspaces is a real limitation of the current id scheme, and it belongs to team
+    mode ([#13](https://github.com/mgd43b/manicule/issues/13)) — this is the guard that stops
+    it corrupting anything before then.
+    """
 
 
 class SqliteDocStore:
@@ -100,6 +120,14 @@ class SqliteDocStore:
     async def upsert_document(self, document: Document) -> Document:
         async with self._sessions.begin() as session:
             row = await session.get(models.Document, document.id)
+            if row is not None and row.workspace_id != self._workspace_id:
+                msg = (
+                    f"document id {document.id!r} already belongs to workspace "
+                    f"{row.workspace_id!r}, not {self._workspace_id!r}. Document ids are "
+                    f"derived from (source, source_id) and carry no workspace, so two "
+                    f"tenants indexing {document.source!r} collide here."
+                )
+                raise CrossWorkspaceCollisionError(msg)
             if row is None:
                 row = models.Document(id=document.id, workspace_id=self._workspace_id)
                 session.add(row)
@@ -142,6 +170,7 @@ class SqliteDocStore:
             .limit(limit)
             .offset(offset)
         )
+        self._require_same_workspace(filter)
         if filter is not None:
             if filter.source is not None:
                 statement = statement.where(models.Document.source == filter.source)
@@ -226,7 +255,7 @@ class SqliteDocStore:
 
     async def search_lexical(
         self,
-        text_query: str,
+        text: str,
         k: int,
         filter: Filter | None = None,  # noqa: A002 - mirrors the protocol
     ) -> list[Candidate]:
@@ -237,7 +266,8 @@ class SqliteDocStore:
         ``k`` live rows, because deferred deletion leaves soft-deleted chunks in the index
         competing for the same slots.
         """
-        match = escape_match_query(text_query)
+        self._require_same_workspace(filter)
+        match = escape_match_query(text)
         if not match:
             return []
 
@@ -261,7 +291,7 @@ class SqliteDocStore:
                 dict(zip(names, sorted(kind.value for kind in filter.kinds), strict=True))
             )
 
-        statement = text(SEARCH_SQL.format(extra="\n  ".join(clauses)))
+        statement = sql(SEARCH_SQL.format(extra="\n  ".join(clauses)))
         async with self._sessions() as session:
             rows = (await session.execute(statement, params)).all()
             chunk_ids = [str(row.chunk_id) for row in rows]
@@ -329,6 +359,22 @@ class SqliteDocStore:
                 yield source_id
 
     # --- internals ------------------------------------------------------------------------
+
+    def _require_same_workspace(self, filter: Filter | None) -> None:  # noqa: A002
+        """Refuse a filter that names a workspace this handle does not serve.
+
+        The workspace comes from the handle, so a filter carrying a *different* one is a
+        caller who believes they are querying somewhere else. Ignoring it silently would
+        answer a question nobody asked, which is the shape a cross-tenant leak takes.
+        """
+        if filter is None or filter.workspace_id is None:
+            return
+        if filter.workspace_id != self._workspace_id:
+            msg = (
+                f"filter names workspace {filter.workspace_id!r} but this store serves "
+                f"{self._workspace_id!r}. Open a store for that workspace instead."
+            )
+            raise CrossWorkspaceCollisionError(msg)
 
     async def _live_document(
         self, session: AsyncSession, document_id: str
@@ -427,4 +473,4 @@ def _to_chunk(row: models.Chunk) -> Chunk:
     )
 
 
-__all__ = ["DEFAULT_WORKSPACE", "SqliteDocStore"]
+__all__ = ["DEFAULT_WORKSPACE", "CrossWorkspaceCollisionError", "SqliteDocStore"]

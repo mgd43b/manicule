@@ -196,6 +196,15 @@ async def test_backing_up_into_a_non_empty_directory_is_refused(
         await create_backup(engine, data_dir, backup_dir)
 
 
+async def test_backing_up_into_the_directory_being_backed_up_is_refused(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """The copy would include itself, and would not terminate usefully."""
+    await _populate(engine, data_dir)
+    with pytest.raises(BackupError, match="inside the data directory"):
+        await create_backup(engine, data_dir, data_dir / "snapshots" / "one")
+
+
 async def test_a_restored_database_is_at_the_same_migration_revision(
     engine: AsyncEngine, data_dir: Path, tmp_path: Path
 ) -> None:
