@@ -92,6 +92,16 @@ of the system the ticket is about.
 Concretely, an installed generator plugin can change which model answers, how it is reached,
 what it costs and how fast it streams. It cannot change which citations survive.
 
+**And it does not get to number the slots either**, which review found was a hole in exactly
+this argument. The prompt was originally built inside the `Generator`, so the correspondence
+between "slot 3" and `Context.passages[2]` — the thing every level of the ladder is checking
+*against* — was an unenforced convention inside the pluggable component. A plugin that
+reordered passages, a documented lost-in-the-middle mitigation, produced citations naming a
+passage the model never saw at that number: mechanically wrong, passing all three levels, and
+presenting exactly like the misattribution §3.5 honestly excludes. So the prompt is built
+above the seam and handed over whole. A generator may still decline it and build its own —
+the protocol cannot forbid that — but manicule's own path no longer relies on it not to.
+
 ### 2.3 One thing `Generator` needs and does not have
 
 The startup cross-check `retrieval.md` §7.4 requires — profile budgets against the model's
@@ -304,8 +314,16 @@ it means deciding whether a passage entails a sentence, which is the hallucinati
 So the guarantee this system makes is exact and narrower than "the citations are correct":
 
 > **Every citation resolves to a real location in a real document, and the text shown at that
-> location is the text the model was given.** It is not a claim that the passage supports the
+> location is the text the passage contains.** It is not a claim that the passage supports the
 > sentence.
+
+The last clause used to read "the text the model was given", and review showed that is
+literally false on two deliberate paths: a redacted passage is shown to the model as
+`[REDACTED]` and quoted unredacted (§7.4, which argues for exactly that), and a passage
+containing marker syntax is shown escaped and quoted unescaped (§3.2). The quote is the
+*passage*, byte for byte; what the model saw is a projection of it. Saying so is the same
+discipline as stating the misattribution exclusion — a guarantee that overreaches gets
+believed.
 
 Saying the narrower thing is the point. A system that claimed the wider one would be believed,
 and `contracts.md` §5 already records what this project thinks of guarantees nothing enforces.

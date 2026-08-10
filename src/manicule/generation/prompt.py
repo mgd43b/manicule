@@ -89,6 +89,8 @@ def describe_location(anchor: Anchor) -> str:
             if anchor.start == anchor.end
             else f"lines {anchor.start}-{anchor.end}"
         )
+        # `symbol` is corpus content — a private repository's function name — so it travels on
+        # the egress path like any other, and is redacted with the rest of the slot label.
         return f"{span} of {anchor.symbol}" if anchor.symbol else span
     if isinstance(anchor, HeadingAnchor):
         # The breadcrumb already carries this, and repeating it wastes budget on every slot.

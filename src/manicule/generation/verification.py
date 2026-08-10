@@ -49,7 +49,7 @@ from manicule.core.lifecycle import HealthReport
 from manicule.core.protocols import CLOSE_DEADLINE_S, Parser
 from manicule.core.retrieval import Candidate, Context
 from manicule.generation.answers import CitationDrop, DropReason, Verification
-from manicule.testing.normalise import contains_claimed_text
+from manicule.testing.normalise import contains_claimed_text, normalise
 
 
 @runtime_checkable
@@ -74,7 +74,12 @@ async def load_documents(lookup: DocumentLookup, context: Context) -> dict[str, 
     found: dict[str, Document] = {}
     for document_id in dict.fromkeys(p.chunk.document_id for p in context.passages):
         document = await lookup.get_document(document_id)
-        if document is not None:
+        # A store that resolves through an alias, a merge or a redirect would otherwise
+        # produce a citation whose `document_id` and `uri` name different documents. Level 2
+        # catches most instances by accident — the anchor is resolved against the wrong bytes,
+        # so containment fails — but only where level 2 runs at all, and with source bytes not
+        # retained nothing checks it.
+        if document is not None and document.id == document_id:
             found[document_id] = document
     return found
 
@@ -468,9 +473,19 @@ class VerificationRun:
     async def _verify_slots(self, document: Document, slots: Sequence[int]) -> None:
         if self._ceiling is Verification.LOCATED:
             # Level 2 is impossible in this configuration rather than failing, so every
-            # located anchor has already reached the strongest level there is.
+            # located anchor has already reached the strongest level there is — except that a
+            # passage with nothing in it has no claim to certify. `contains_claimed_text`
+            # refuses an empty claim on the level-2 path for exactly this reason, and that
+            # guard has to hold at every ceiling, not only the one that happens to call it.
             for slot in slots:
-                self._settle(slot, SlotVerdict(Verification.LOCATED, None, document))
+                if normalise(self._passages[slot - 1].chunk.text):
+                    self._settle(slot, SlotVerdict(Verification.LOCATED, None, document))
+                else:
+                    self._settle_remaining(
+                        [slot],
+                        "the passage has no text, so there is nothing at that location to show",
+                        document,
+                    )
             return
         version = document.version_token or document.content_hash
         reader = str(document.metadata.get("parser_used") or document.media_type)

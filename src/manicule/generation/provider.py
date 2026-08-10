@@ -397,17 +397,40 @@ class LitellmGenerator:
         *,
         history: Sequence[ChatMessage] = (),
         documents: Mapping[str, Document] | None = None,
+        messages: Sequence[ChatMessage] | None = None,
     ) -> AsyncIterator[Token]:
         """Stream the answer. Iterate through
-        :func:`~manicule.core.protocols.generating`, never bare."""
-        messages = build_messages(
-            query_text=query.text,
-            context=context,
-            documents=documents or {},
-            history=history,
-            system_extra=self._settings.system_prompt_extra,
+        :func:`~manicule.core.protocols.generating`, never bare.
+
+        **``messages`` wins when it is given, and the answer path always gives it.** Building
+        the prompt down here from ``query`` and ``context`` was wrong in a way that was
+        invisible: the answer path had already built a *redacted* prompt — titles, URIs and
+        heading paths substituted — and used it for the token estimate, and then this method
+        rebuilt an unredacted one from the raw arguments and sent that. The trace reported
+        redaction that had been computed and discarded.
+
+        It is also what makes the slot numbering enforceable. The correspondence between "slot
+        3" and ``context.passages[2]`` is the whole basis of the citation guarantee, and while
+        the prompt was built inside the pluggable component that correspondence was an
+        unenforced convention: a plugin that reordered passages, or numbered from zero,
+        produced citations naming a passage the model never saw at that number — mechanically
+        wrong, passing all three verification levels, and indistinguishable from the
+        misattribution the design honestly excludes.
+
+        The fallback remains for a caller working from the protocol alone, which cannot pass
+        keywords the protocol does not declare.
+        """
+        return self.stream(
+            messages
+            if messages is not None
+            else build_messages(
+                query_text=query.text,
+                context=context,
+                documents=documents or {},
+                history=history,
+                system_extra=self._settings.system_prompt_extra,
+            )
         )
-        return self.stream(messages)
 
     async def stream(self, messages: Sequence[ChatMessage]) -> AsyncIterator[Token]:
         """The provider call, as an async generator with cleanup around the ``yield``.

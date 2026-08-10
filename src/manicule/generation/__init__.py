@@ -61,13 +61,17 @@ from manicule.generation.ports import (
     ConversationStore,
     Feedback,
     FeedbackReason,
+    SharedTurn,
     ShareStore,
     StoredMessage,
 )
 from manicule.generation.prompt import CITATION_PROTOCOL, SYSTEM_PROMPT, ChatMessage, build_messages
 from manicule.generation.redaction import BUILTIN_DETECTORS, Detector, Redactor
 from manicule.generation.sharing import (
+    CitationLabel,
     ShareLink,
+    anonymous_location,
+    anonymous_trail,
     hash_token,
     is_live,
     new_share,
@@ -105,6 +109,7 @@ __all__ = [
     "CitationAccounting",
     "CitationBinder",
     "CitationDrop",
+    "CitationLabel",
     "CitationVerifier",
     "ConversationStore",
     "Detector",
@@ -124,6 +129,7 @@ __all__ = [
     "ScanEventKind",
     "ShareLink",
     "ShareStore",
+    "SharedTurn",
     "StoredMessage",
     "TokenEstimator",
     "Turn",
@@ -131,6 +137,8 @@ __all__ = [
     "Verification",
     "VerificationRun",
     "accepted_extras",
+    "anonymous_location",
+    "anonymous_trail",
     "answering",
     "build_messages",
     "drift_problem",

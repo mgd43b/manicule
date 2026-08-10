@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from manicule.core.generation import FinishReason
 from manicule.generation.answers import AnswerEnvelope, Citation
 from manicule.generation.history import Turn
-from manicule.generation.sharing import CitationLabel
+from manicule.generation.sharing import CitationLabel, ShareLink
 
 
 class Feedback(StrEnum):
@@ -147,20 +147,33 @@ class SharedTurn(BaseModel):
 class ShareStore(Protocol):
     """Minting, reading and revoking share links."""
 
-    async def create_share(
-        self, conversation_id: str, *, token_hash: str, expires_at: datetime, shared_at: datetime
-    ) -> bool: ...
+    async def create_share(self, conversation_id: str, link: ShareLink) -> bool:
+        """Record a minted link.
+
+        Takes the whole value object, not its parts. A caller that assembled the parts could
+        mint a capability outliving ``security.sharing.link_ttl_s``, or set a future
+        ``shared_at`` and turn the snapshot back into a live view.
+        """
+        ...
 
     async def revoke_share(self, conversation_id: str) -> bool: ...
 
     async def shared_conversation(
-        self, token_hash: str, *, now: datetime, sharing_enabled: bool = True
+        self, token_hash: str, *, now: datetime, sharing_enabled: bool
     ) -> Sequence[SharedTurn]:
         """The conversation a live token names, projected for an anonymous reader.
 
-        Deliberately **one** call rather than "resolve the token" followed by "read the
-        messages". Two calls leave a window in which an owner's revocation lands between
-        them, and they let a caller reach the second one holding only a conversation id.
+        Deliberately **one statement**, not merely one call. Two statements leave a window in
+        which an owner's revocation lands between them — there is no read snapshot to hold it
+        off — and a two-step also lets a caller reach the second half holding only a
+        conversation id, which is the shape this replaced. Nothing about the conversation's
+        identity comes back either, for the same reason: an id plus a store handle bound to the
+        owning workspace reconstructs the full citations through
+        :meth:`ConversationStore.history`.
+
+        ``sharing_enabled`` has no default. It is the one predicate the store cannot evaluate
+        for itself, and every other decision here fails closed, so the one that could fail
+        open by omission is one the caller must state.
 
         An empty result covers every reason at once — unknown token, expired link, revoked
         link, soft-deleted conversation, sharing switched off — because distinguishing them

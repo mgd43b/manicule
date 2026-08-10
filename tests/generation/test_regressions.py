@@ -22,14 +22,24 @@ from manicule.core.anchors import HeadingAnchor
 from manicule.core.errors import ConfigError, ProviderTimeoutError
 from manicule.core.generation import FinishReason, Usage
 from manicule.core.retrieval import RetrievalProfile
-from manicule.generation.answering import Answerer, AnswerRequest, AnswerResult, answering
+from manicule.generation.answering import (
+    Answerer,
+    AnswerRequest,
+    AnswerResult,
+    accepted_extras,
+    answering,
+)
 from manicule.generation.answers import DropReason, EventKind
 from manicule.generation.binder import CitationBinder
 from manicule.generation.history import Turn
 from manicule.generation.markers import ATTEMPT_PREFIX, MARKER_MAX_LEN, MarkerScanner, ScanEventKind
 from manicule.generation.policy import EgressPolicy, filter_context
 from manicule.generation.redaction import Redactor
-from manicule.generation.verification import CitationVerifier
+from manicule.generation.verification import (
+    CitationVerifier,
+    UnverifiableSource,
+    load_documents,
+)
 from manicule.testing.normalise import contains_claimed_text
 from tests.generation.fakes import (
     FakeDocuments,
@@ -46,6 +56,7 @@ from tests.generation.fakes import (
 from tests.generation.test_provider_and_budget import FakeStream, chunk, generator
 
 ROLLBACK = "Roll back with `deploy --rollback`."
+EMAIL = "oncall@example.invalid"
 
 
 # --- the scanner ---------------------------------------------------------------------------
@@ -638,3 +649,116 @@ def test_a_custom_pattern_matching_the_empty_string_is_refused() -> None:
     prompt several times larger sent to a metered endpoint."""
     with pytest.raises(ConfigError, match="empty string"):
         Redactor(RedactionSettings(enabled=True, patterns=(), custom_patterns=(r"\d*",)))
+
+
+# --- the second review pass ----------------------------------------------------------------
+
+
+async def test_the_prompt_that_reaches_the_provider_is_the_redacted_one() -> None:
+    """The defect this catches was in the *fix* for a previous one.
+
+    Redacted titles, URIs and heading paths were computed, used for the token estimate, and
+    then thrown away: the generator rebuilt its own prompt from the raw arguments and sent
+    that. ``envelope.redacted`` was ``True`` and the trace counted the detector firing, so the
+    record reported protection that had been discarded — which is worse than not redacting at
+    all, because it is protection somebody could rely on.
+
+    The fix hands the generator the prompt rather than the parts, which also makes the
+    estimate literally the thing that was sent.
+    """
+    config = settings(
+        llm={"provider": "openai", "model": "gpt-4o-mini"},
+        providers={"openai": {"api_key": "k"}},
+        security={"data_policy": {"auto_redact": {"enabled": True, "patterns": ["email"]}}},
+    )
+    leaky = document(document_id="doc-1", title=f"Q3 comp {EMAIL}")
+    parser = FakeParser(resolutions={"Rollback": f"## Rollback\n{ROLLBACK}"})
+    generator_ = ScriptedGenerator(script=["ok"])
+    answers = Answerer(
+        generator=generator_,
+        verifier=CitationVerifier(resolver(parser)),
+        documents=FakeDocuments({"doc-1": leaky}),
+        settings=config,
+        policy=EgressPolicy.of(config),
+        redactor=Redactor(config.security.data_policy.auto_redact),
+    )
+
+    request = AnswerRequest(
+        query=query(),
+        context=context(
+            (
+                candidate(
+                    chunk_id="c1",
+                    document_id="doc-1",
+                    text=ROLLBACK,
+                    heading_path=("Ops", f"owner {EMAIL}"),
+                ),
+            )
+        ),
+    )
+    async for _ in answers.answer(request):
+        pass
+
+    on_the_wire = "\n".join(message["content"] for message in generator_.seen_messages)
+    assert on_the_wire, "the generator is handed the prompt, not asked to rebuild it"
+    assert EMAIL not in on_the_wire
+    assert "[REDACTED]" in on_the_wire
+    for sent in generator_.seen_documents:
+        for document_ in sent.values():
+            assert EMAIL not in document_.title
+
+
+async def test_a_generator_is_given_the_prompt_so_slot_numbering_is_not_its_to_decide() -> None:
+    """The correspondence between "slot 3" and ``context.passages[2]`` is the basis of the
+    citation guarantee, and while the prompt was built inside the pluggable component it was
+    an unenforced convention. A plugin that reordered passages — a documented
+    lost-in-the-middle mitigation — produced citations naming a passage the model never saw at
+    that number: mechanically wrong, passing all three levels, and indistinguishable from the
+    misattribution the design honestly excludes.
+    """
+    generator_ = ScriptedGenerator(script=["fine"])
+    answers = build(generator_)
+
+    async for _ in answers.answer(a_request()):
+        pass
+
+    assert "messages" in accepted_extras(generator_)
+    assert generator_.seen_messages, "the prompt is built above the generator and handed over"
+    assert "[slot 1]" in "\n".join(m["content"] for m in generator_.seen_messages)
+
+
+async def test_a_document_the_store_substituted_is_not_turned_into_a_citation() -> None:
+    """A store resolving through an alias, a merge or a redirect would otherwise produce a
+    citation whose ``document_id`` and ``uri`` name different documents."""
+
+    class Redirecting:
+        async def get_document(self, document_id: str) -> Any:
+            return document(document_id="doc-OTHER", title="Some Other Document")
+
+    found = await load_documents(
+        Redirecting(),
+        context((candidate(chunk_id="c1", document_id="doc-1", text=ROLLBACK),)),
+    )
+
+    assert found == {}, "a document that is not the one asked for is not an answer"
+
+
+@pytest.mark.parametrize("blank", ["", "   \n\t "])
+async def test_a_passage_with_no_text_produces_no_citation_at_either_ceiling(blank: str) -> None:
+    """``contains_claimed_text`` refuses an empty claim on the level-2 path, and that guard has
+    to hold at every ceiling — not only the one that happens to call it. Otherwise a
+    whitespace-only chunk is cited, the reader gets a blank preview, and "the text at that
+    location is the text the model was given" is vacuously true.
+    """
+    passages = (candidate(chunk_id="c1", document_id="doc-1", text=blank),)
+    documents = {"doc-1": document()}
+
+    for source in (
+        resolver(FakeParser(resolutions={"Rollback": blank})),
+        UnverifiableSource("retention is off"),
+    ):
+        run = CitationVerifier(source).start(context(passages), documents)
+        verdict = await run.verdict(1)
+        await run.aclose()
+
+        assert not verdict.survives, f"a blank passage survived under {type(source).__name__}"

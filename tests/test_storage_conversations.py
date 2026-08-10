@@ -7,7 +7,7 @@ Both are corrections of the same shape of bug: a public read that is *almost* sc
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -18,7 +18,7 @@ from sqlalchemy import text as sql
 from manicule.core.anchors import PageAnchor
 from manicule.core.generation import FinishReason
 from manicule.generation.answers import Citation, Verification
-from manicule.generation.ports import Feedback, FeedbackReason, StoredMessage
+from manicule.generation.ports import Feedback, FeedbackReason, SharedTurn, StoredMessage
 from manicule.generation.sharing import ShareLink, new_share
 from manicule.storage import models
 from manicule.storage.conversations import SqliteConversationStore, UnknownConversationError
@@ -68,20 +68,26 @@ async def a_conversation(store: SqliteConversationStore) -> tuple[str, str]:
     return conversation_id, message_id
 
 
+async def read(
+    store: SqliteConversationStore,
+    token_hash: str,
+    *,
+    now: datetime | None = None,
+    enabled: bool = True,
+) -> Sequence[SharedTurn]:
+    """The anonymous read, as a route would make it."""
+    return await store.shared_conversation(token_hash, now=now or NOW, sharing_enabled=enabled)
+
+
 async def share(
     store: SqliteConversationStore, conversation_id: str, *, now: datetime | None = None
 ) -> ShareLink:
     moment = now or datetime.now(UTC)
     link = new_share(conversation_id, ttl_s=3600, now=moment)
-    await store.create_share(
-        conversation_id,
-        token_hash=link.token_hash,
-        expires_at=link.expires_at,
-        # The snapshot boundary is when the share happened, which is *now* — the turns above
-        # were written a moment ago. `moment` may be a fixed instant chosen for the expiry
-        # arithmetic, and using it here would put the boundary before the conversation.
-        shared_at=datetime.now(UTC),
-    )
+    # The snapshot boundary is when the share happened, which is *now* — the turns above were
+    # written a moment ago, and `moment` may be a fixed instant chosen for the expiry
+    # arithmetic. The store clamps a future boundary to now for the same reason.
+    await store.create_share(conversation_id, link.model_copy(shared_at=datetime.now(UTC)))
     return link
 
 
@@ -194,9 +200,9 @@ async def test_a_share_link_resolves_only_while_it_is_live(
     conversation_id, _ = await a_conversation(conversations)
     link = await share(conversations, conversation_id, now=NOW)
 
-    assert await conversations.find_shared(link.token_hash, now=NOW) == conversation_id
-    assert await conversations.find_shared(link.token_hash, now=NOW + timedelta(hours=2)) is None
-    assert await conversations.find_shared("some-other-hash", now=NOW) is None
+    assert await read(conversations, link.token_hash)
+    assert not await read(conversations, link.token_hash, now=NOW + timedelta(hours=2))
+    assert not await read(conversations, "some-other-hash")
 
 
 async def test_the_anonymous_read_resolves_the_token_rather_than_a_conversation_id(
@@ -212,8 +218,14 @@ async def test_the_anonymous_read_resolves_the_token_rather_than_a_conversation_
     conversation_id, _ = await a_conversation(conversations)
     link = await share(conversations, conversation_id, now=NOW)
 
-    assert len(await conversations.shared_conversation(link.token_hash, now=NOW)) == 2
-    assert await conversations.shared_conversation("not-a-token", now=NOW) == []
+    assert len(await read(conversations, link.token_hash)) == 2
+    assert await read(conversations, "not-a-token") == []
+    assert await read(conversations, "") == [], "an empty token must match nothing, not NULL"
+
+    # There is deliberately no method that turns a token into a conversation id. One would
+    # rebuild the two-step this replaced: a store handle bound to the owning workspace turns
+    # an id into full citations — quote, uri, chunk id — through `history`.
+    assert not hasattr(conversations, "find_shared")
 
 
 async def revoked(store: SqliteConversationStore, conversation_id: str) -> bool:
@@ -234,17 +246,14 @@ async def test_a_revoked_or_deleted_conversation_stops_rendering(
 
     assert await withdraw(conversations, conversation_id)
 
-    assert await conversations.shared_conversation(link.token_hash, now=NOW) == []
-    assert await conversations.find_shared(link.token_hash, now=NOW) is None
+    assert await read(conversations, link.token_hash) == []
 
 
 async def test_an_expired_link_stops_rendering(conversations: SqliteConversationStore) -> None:
     conversation_id, _ = await a_conversation(conversations)
     link = await share(conversations, conversation_id, now=NOW)
 
-    assert (
-        await conversations.shared_conversation(link.token_hash, now=NOW + timedelta(days=1)) == []
-    )
+    assert await read(conversations, link.token_hash, now=NOW + timedelta(days=1)) == []
 
 
 async def test_switching_sharing_off_stops_existing_links_rendering(
@@ -259,10 +268,7 @@ async def test_switching_sharing_off_stops_existing_links_rendering(
     conversation_id, _ = await a_conversation(conversations)
     link = await share(conversations, conversation_id, now=NOW)
 
-    assert (
-        await conversations.shared_conversation(link.token_hash, now=NOW, sharing_enabled=False)
-        == []
-    )
+    assert await read(conversations, link.token_hash, enabled=False) == []
 
 
 async def test_an_anonymous_viewer_never_receives_passage_text_or_an_identifier(
@@ -273,7 +279,7 @@ async def test_an_anonymous_viewer_never_receives_passage_text_or_an_identifier(
     conversation_id, _ = await a_conversation(conversations)
     link = await share(conversations, conversation_id, now=NOW)
 
-    turns = await conversations.shared_conversation(link.token_hash, now=NOW)
+    turns = await read(conversations, link.token_hash)
 
     labels = [label for turn in turns for label in turn.citations]
     assert [label.title for label in labels] == ["Deploy runbook"]
@@ -295,7 +301,7 @@ async def test_a_share_is_a_snapshot_so_later_turns_are_not_exposed(
         StoredMessage(conversation_id=conversation_id, role="user", content="and after that?")
     )
 
-    exposed = await conversations.shared_conversation(link.token_hash, now=datetime.now(UTC))
+    exposed = await read(conversations, link.token_hash, now=datetime.now(UTC))
 
     assert len(exposed) == 2
     assert all("after that" not in turn.content for turn in exposed)
@@ -309,8 +315,8 @@ async def test_re_sharing_replaces_the_previous_token(
     first = await share(conversations, conversation_id, now=NOW)
     second = await share(conversations, conversation_id, now=NOW)
 
-    assert await conversations.shared_conversation(first.token_hash, now=NOW) == []
-    assert len(await conversations.shared_conversation(second.token_hash, now=NOW)) == 2
+    assert await read(conversations, first.token_hash) == []
+    assert len(await read(conversations, second.token_hash)) == 2
 
 
 # --- schema ---------------------------------------------------------------------------------

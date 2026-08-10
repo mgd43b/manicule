@@ -194,6 +194,10 @@ class ScriptedGenerator:
     seen_history: list[ChatMessage] = field(default_factory=list[ChatMessage])
     seen_context: list[Context] = field(default_factory=list[Context])
     seen_query: list[Query] = field(default_factory=list[Query])
+    seen_messages: list[ChatMessage] = field(default_factory=list[ChatMessage])
+    seen_documents: list[Mapping[str, Document]] = field(
+        default_factory=list[Mapping[str, Document]]
+    )
     closed: bool = False
 
     def generate(
@@ -203,8 +207,16 @@ class ScriptedGenerator:
         *,
         history: Sequence[ChatMessage] = (),
         documents: Mapping[str, Document] | None = None,
+        messages: Sequence[ChatMessage] | None = None,
     ) -> AsyncIterator[Token]:
-        del documents
+        """Records the prompt as well as the parts.
+
+        The earlier fake did ``del documents`` and never saw ``messages`` at all, which is why
+        a redaction test could pass while the labels reaching the provider were unredacted:
+        the fake could not observe the channel the defect was on.
+        """
+        self.seen_documents.append(dict(documents or {}))
+        self.seen_messages.extend(messages or ())
         if not self.supports_history:
             history = ()
         self.seen_history.extend(history)

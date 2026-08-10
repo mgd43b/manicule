@@ -35,9 +35,9 @@ from datetime import UTC, datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from manicule.core.anchors import Anchor, LineAnchor, PageAnchor
 from manicule.core.errors import PolicyError
 from manicule.generation.answers import Citation, Verification
-from manicule.generation.prompt import describe_location
 
 TOKEN_BYTES = 32
 """256 bits. Guessing is not the threat model a shorter token would fail; leaking is."""
@@ -76,6 +76,12 @@ class ShareLink:
     @property
     def path(self) -> str:
         return f"/shared/{self.token}"
+
+    def model_copy(self, **changes: object) -> ShareLink:
+        """A copy with fields replaced. Named for consistency with the pydantic types."""
+        import dataclasses  # noqa: PLC0415 - only this helper needs it
+
+        return dataclasses.replace(self, **changes)
 
 
 def new_share(
@@ -169,10 +175,46 @@ def redact_for_anonymous(citation: Citation) -> CitationLabel:
     return CitationLabel(
         slot=citation.slot,
         title=citation.title,
-        heading_path=citation.heading_path,
-        location=describe_location(citation.anchor),
+        heading_path=anonymous_trail(citation.anchor, citation.heading_path),
+        location=anonymous_location(citation.anchor),
         verification=citation.verification,
     )
+
+
+def anonymous_location(anchor: Anchor) -> str:
+    """Where a citation points, for a reader outside the workspace.
+
+    **Deliberately not** :func:`~manicule.generation.prompt.describe_location`. That renderer
+    exists for the *model*, which is already holding the passage, so it spends the anchor
+    freely: a :class:`~manicule.core.anchors.LineAnchor` becomes ``"lines 41-58 of
+    charge_customer_card"`` and a :class:`~manicule.core.anchors.CellAnchor` becomes
+    ``"Q3 Layoffs!B4"``.
+
+    Those are the two examples this module's own docstring gives for why the anchor is
+    dropped from :class:`CitationLabel` — so reusing that function put the field's contents
+    back through a differently-named field, and a test asserting on field *names* passed the
+    whole time. Dropping a field and then re-encoding it as a string is not a structural
+    guarantee; it is the same disclosure with an extra step.
+
+    So: a page number, which is meaningless without the document, and nothing else.
+    """
+    return f"page {anchor.page}" if isinstance(anchor, PageAnchor) else ""
+
+
+def anonymous_trail(anchor: Anchor, heading_path: tuple[str, ...]) -> tuple[str, ...]:
+    """The breadcrumb an anonymous viewer may see.
+
+    §11.3 discloses the heading path deliberately, and for a wiki page or a document that is
+    exactly the "'Deploy runbook' § Rollback" attestation the feature is for. For **source
+    code** it is something else: the code parser sets ``heading_path`` to the symbol chain, so
+    the same field that reads ``Operations > Rollback`` for a runbook reads
+    ``PaymentGateway > charge_customer_card`` for a private repository.
+
+    A :class:`~manicule.core.anchors.LineAnchor` is what says "this citation is into code", so
+    that is the discriminator. The title still goes — a file name is title-class disclosure and
+    the operator's one switch covers it — but the symbols do not.
+    """
+    return () if isinstance(anchor, LineAnchor) else heading_path
 
 
 def is_live(expires_at: datetime | None, *, now: datetime | None = None) -> bool:
@@ -192,6 +234,8 @@ __all__ = [
     "TOKEN_BYTES",
     "CitationLabel",
     "ShareLink",
+    "anonymous_location",
+    "anonymous_trail",
     "hash_token",
     "is_live",
     "mint_token",

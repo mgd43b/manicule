@@ -113,6 +113,7 @@ class Prepared:
     sent_query: Query
     sent_context: Context
     sent_history: tuple[ChatMessage, ...]
+    sent_documents: Mapping[str, Document]
     messages: tuple[ChatMessage, ...]
     redaction_counts: Mapping[str, int]
 
@@ -288,6 +289,7 @@ class Answerer:
                 sent_query=request.query,
                 sent_context=context,
                 sent_history=offered,
+                sent_documents=documents,
                 messages=tuple(
                     build_messages(
                         query_text=request.query.text,
@@ -356,6 +358,7 @@ class Answerer:
             sent_query=request.query.model_copy(update={"text": query_text}),
             sent_context=sent_context,
             sent_history=tuple(sent_history),
+            sent_documents=sent_documents,
             messages=tuple(
                 build_messages(
                     query_text=query_text,
@@ -385,10 +388,16 @@ class Answerer:
         on to keep it.
         """
         extra: dict[str, object] = {}
+        # The prompt itself, when the generator can take it. Everything below is the fallback
+        # for a generator that cannot: the *parts*, from which it builds its own — and note
+        # that `sent_documents` rather than `documents` is what carries the redacted titles
+        # and URIs, so passing the raw map here would send what redaction had just removed.
+        if "messages" in self._extras:
+            extra["messages"] = prepared.messages
         if self.history_supported:
             extra["history"] = prepared.sent_history
         if "documents" in self._extras:
-            extra["documents"] = documents
+            extra["documents"] = prepared.sent_documents
         first_token_at: float | None = None
         began = time.monotonic()
         try:

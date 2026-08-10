@@ -26,7 +26,7 @@ from manicule.core.generation import FinishReason
 from manicule.generation.answers import Citation
 from manicule.generation.history import Turn
 from manicule.generation.ports import Feedback, FeedbackReason, SharedTurn, StoredMessage
-from manicule.generation.sharing import redact_for_anonymous
+from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.storage import models
 from manicule.storage.engine import session_factory
 from manicule.storage.types import utcnow
@@ -256,19 +256,19 @@ class SqliteConversationStore:
 
     # --- sharing --------------------------------------------------------------------
 
-    async def create_share(
-        self,
-        conversation_id: str,
-        *,
-        token_hash: str,
-        expires_at: datetime,
-        shared_at: datetime,
-    ) -> bool:
+    async def create_share(self, conversation_id: str, link: ShareLink) -> bool:
         """Record a minted link. Replaces any previous one for this conversation.
+
+        Takes the whole :class:`~manicule.generation.sharing.ShareLink` rather than its parts.
+        The parts version accepted any ``expires_at`` and any ``shared_at``, so a caller that
+        assembled them itself could mint a capability outliving
+        ``security.sharing.link_ttl_s``, or set a *future* ``shared_at`` and turn the snapshot
+        back into the live view §11.2 exists to prevent. A value object that only
+        :func:`~manicule.generation.sharing.new_share` produces cannot be built wrong.
 
         Replacing rather than accumulating is what makes re-sharing an explicit new act that
         produces a **new snapshot**: the old token stops working the moment a new one is
-        minted, so there is never more than one live link to reason about per conversation.
+        minted, so there is never more than one live link per conversation to reason about.
         """
         async with self._sessions.begin() as session:
             result = await session.execute(
@@ -280,9 +280,11 @@ class SqliteConversationStore:
                 )
                 .values(
                     shared=True,
-                    share_token_hash=token_hash,
-                    share_expires_at=expires_at,
-                    shared_at=shared_at,
+                    share_token_hash=link.token_hash,
+                    share_expires_at=link.expires_at,
+                    # Never later than now: a snapshot boundary in the future exposes turns
+                    # that have not been written yet, which is the live view by another name.
+                    shared_at=min(link.shared_at, utcnow()),
                 )
             )
             return _touched(result)
@@ -304,78 +306,56 @@ class SqliteConversationStore:
             )
             return _touched(result)
 
-    async def find_shared(self, token_hash: str, *, now: datetime) -> str | None:
-        """The id of the conversation a live token names, or ``None``.
-
-        **Not the anonymous read path** — that is :meth:`shared_conversation`, which resolves
-        the token and projects the transcript in one statement. This exists for the owner-side
-        question "is this link live", and for an audit record that needs something to join to.
-        It returns an id and nothing else, so nothing about the workspace travels with it.
-
-        ``None`` covers unknown, expired, revoked and deleted alike. Distinguishing them for
-        a caller who guessed tells them which guess was closest.
-        """
-        async with self._sessions() as session:
-            return (
-                await session.execute(
-                    select(models.Conversation.id).where(
-                        models.Conversation.share_token_hash == token_hash,
-                        models.Conversation.shared.is_(True),
-                        models.Conversation.deleted_at.is_(None),
-                        models.Conversation.share_expires_at.is_not(None),
-                        models.Conversation.share_expires_at > now,
-                    )
-                )
-            ).scalar_one_or_none()
-
     async def shared_conversation(
-        self, token_hash: str, *, now: datetime, sharing_enabled: bool = True
+        self, token_hash: str, *, now: datetime, sharing_enabled: bool
     ) -> Sequence[SharedTurn]:
         """The conversation a live token names, as an anonymous viewer receives it.
 
-        **It resolves the token itself.** An earlier shape took a conversation id and checked
-        only ``deleted_at IS NULL``, which meant holding an id was enough: revoked links,
-        expired links and other tenants' conversations all still rendered, forever, because
-        ``shared_at`` is deliberately left set on revocation. Taking the token and applying
-        every predicate in one statement also closes the gap between "the link is valid" and
-        "here is the transcript", in which an owner's revocation would otherwise land.
+        **It resolves the token itself, in one statement.** An earlier shape took a
+        conversation id and checked only ``deleted_at IS NULL``, which meant holding an id was
+        enough: revoked links, expired links and other tenants' conversations all still
+        rendered, because ``shared_at`` is deliberately left set on revocation. A second shape
+        resolved the token and then read the messages, which is two statements with no read
+        snapshot between them — pysqlite opens an implicit transaction before DML only, so an
+        owner's revocation landing between them still served the transcript. This is the join,
+        so every predicate is evaluated against the same row at the same instant.
 
-        ``sharing_enabled`` is checked on the **read** path, not only when a link is minted.
-        An operator who turns the switch off after links exist is telling the system to stop
-        disclosing, and leaving every existing link live would make the setting a statement
-        about the future only.
+        ``sharing_enabled`` has no default. It is the one predicate the store cannot evaluate
+        for itself, it is checked on the **read** path because an operator switching sharing
+        off has decided the disclosure already made is the problem, and every other decision
+        here fails closed — so the one that could fail open by omission is one the caller must
+        state.
 
-        It is a **snapshot**: only turns written at or before ``shared_at``. Somebody shares
-        after turn 2, keeps using the conversation, and turn 7 would otherwise be public the
-        moment it is written — and nobody re-reads a link they already sent.
+        It is a **snapshot**: only turns written at or before ``shared_at``.
 
-        Returns citation **labels**, never passage text, and never a document or chunk id.
+        Returns citation **labels**, never passage text, never a document or chunk id, and —
+        deliberately — no conversation id either. Handing one back would rebuild the two-step
+        this method exists to replace, since a store handle bound to the owning workspace can
+        turn an id into full citations through :meth:`history`.
         """
-        if not sharing_enabled:
+        if not sharing_enabled or not token_hash:
+            # `col == None` renders `IS NULL`, so an empty token would match rows whose hash is
+            # null rather than matching nothing. Unreachable today — revocation clears `shared`
+            # alongside the hash — and total if it were ever reached.
             return []
         async with self._sessions() as session:
-            conversation = (
-                await session.execute(
-                    select(models.Conversation).where(
-                        models.Conversation.share_token_hash == token_hash,
-                        models.Conversation.shared.is_(True),
-                        models.Conversation.deleted_at.is_(None),
-                        models.Conversation.share_expires_at.is_not(None),
-                        models.Conversation.share_expires_at > now,
-                    )
-                )
-            ).scalar_one_or_none()
-            if conversation is None or conversation.shared_at is None:
-                return []
-            conversation_id = conversation.id
             rows = (
                 (
                     await session.execute(
                         select(models.Message)
+                        .join(
+                            models.Conversation,
+                            models.Conversation.id == models.Message.conversation_id,
+                        )
                         .where(
-                            models.Message.conversation_id == conversation_id,
+                            models.Conversation.share_token_hash == token_hash,
+                            models.Conversation.shared.is_(True),
+                            models.Conversation.deleted_at.is_(None),
+                            models.Conversation.share_expires_at.is_not(None),
+                            models.Conversation.share_expires_at > now,
+                            models.Conversation.shared_at.is_not(None),
+                            models.Message.created_at <= models.Conversation.shared_at,
                             models.Message.role.in_(("user", "assistant")),
-                            models.Message.created_at <= conversation.shared_at,
                         )
                         .order_by(models.Message.created_at, sql_text("messages.rowid"))
                     )

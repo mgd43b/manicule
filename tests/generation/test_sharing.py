@@ -6,10 +6,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from manicule.core.anchors import PageAnchor
+from manicule.core.anchors import Anchor, CellAnchor, HeadingAnchor, LineAnchor, PageAnchor
 from manicule.core.errors import PolicyError
 from manicule.generation.answers import Citation, Verification
 from manicule.generation.sharing import (
+    CitationLabel,
     hash_token,
     is_live,
     new_share,
@@ -58,31 +59,72 @@ def test_sharing_can_be_switched_off_entirely() -> None:
         require_sharing_enabled(False)
 
 
-def test_an_anonymous_viewer_gets_the_label_and_the_verification_state_but_no_passage() -> None:
-    """The same message renders differently by audience, and the difference is **content
-    only** — never the existence of a citation, never its label, never whether it verified."""
-    citation = Citation(
+def citation(anchor: Anchor | None = None) -> Citation:
+    return Citation(
         slot=1,
         document_id="doc-1",
         uri="https://intranet.invalid/runbook",
         title="Deploy runbook",
         heading_path=("Operations", "Rollback"),
-        anchor=PageAnchor(page=4),
+        anchor=anchor or PageAnchor(page=4),
         chunk_id="c1",
         quote="Roll back with `deploy --rollback`.",
         verification=Verification.RESOLVED,
     )
 
-    shared = redact_for_anonymous(citation)
+
+@pytest.mark.parametrize(
+    ("anchor", "expected_location", "expected_trail"),
+    [
+        pytest.param(PageAnchor(page=4), "page 4", ("Operations", "Rollback"), id="page"),
+        pytest.param(
+            LineAnchor(start=41, end=58, symbol="charge_customer_card"),
+            "",
+            (),
+            id="code-symbol-and-breadcrumb-suppressed",
+        ),
+        pytest.param(
+            CellAnchor(sheet="Q3 Layoffs", ref="B4:D12"),
+            "",
+            ("Operations", "Rollback"),
+            id="sheet-name-suppressed",
+        ),
+        pytest.param(
+            HeadingAnchor(path=("Operations", "Rollback")),
+            "",
+            ("Operations", "Rollback"),
+            id="heading",
+        ),
+    ],
+)
+def test_an_anonymous_viewer_gets_a_label_and_never_the_anchors_contents(
+    anchor: Anchor, expected_location: str, expected_trail: tuple[str, ...]
+) -> None:
+    """The same message renders differently by audience, and the difference is **content
+    only** — never the existence of a citation, never whether it verified.
+
+    **Parametrised over the anchors that actually disclose something**, which the original
+    test was not: it used a ``PageAnchor`` throughout and asserted on field *names*, so it
+    passed while the anchor's contents flowed through a differently-named field. Rendering the
+    location with the prompt's own helper put ``lines 41-58 of charge_customer_card`` and
+    ``Q3 Layoffs!B4:D12`` back in — a private repository's function name and a spreadsheet
+    nobody outside the workspace should learn the title of.
+    """
+    shared = redact_for_anonymous(citation(anchor=anchor))
 
     assert shared.title == "Deploy runbook"
-    assert shared.heading_path == ("Operations", "Rollback")
-    assert shared.location == "page 4"
     assert shared.verification is Verification.RESOLVED
+    assert shared.location == expected_location
+    assert shared.heading_path == expected_trail
 
-    # A *different type*, not a blanked-out Citation. The corpus's internal identifiers have
-    # nowhere to go: `LineAnchor.symbol` is a private repository's function name and
-    # `CellAnchor` names a spreadsheet and a cell, so keeping the anchor "because it is not
-    # text" would disclose exactly the things a workspace boundary exists to hold.
-    fields = set(type(shared).model_fields)
+    # Values, not field names. A field-name check is what let the leak through.
+    rendered = shared.model_dump_json()
+    for secret in ("charge_customer_card", "Q3 Layoffs", "B4:D12", "deploy --rollback", "intranet"):
+        assert secret not in rendered, f"{secret!r} reached an anonymous viewer"
+
+
+def test_the_anonymous_projection_has_nowhere_to_put_the_corpus() -> None:
+    """Structural, not remembered: a helper that blanks fields is one a route can skip."""
+    fields = set(CitationLabel.model_fields)
+
     assert not fields & {"quote", "uri", "document_id", "chunk_id", "anchor"}
