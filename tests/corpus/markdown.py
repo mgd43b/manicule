@@ -161,6 +161,12 @@ Tight components leave their children as Markdown even without blank lines.
 <Chart data={series} />
 
 The figure above is generated when the site is built.
+
+```jsx
+<Banner tone="note">
+  Documented usage, shown to the reader rather than rendered for them.
+</Banner>
+```
 """
 
 _LARGE_TOPICS = (

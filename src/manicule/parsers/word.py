@@ -167,7 +167,7 @@ def _render_content(items: Iterable[Paragraph | Table]) -> list[str]:
     lines: list[str] = []
     for item in items:
         if isinstance(item, Table):
-            lines.extend(_render_table(item).split("\n"))
+            lines.extend(_render_table(item))
             continue
         text = item.text.strip()
         if text:
@@ -175,19 +175,23 @@ def _render_content(items: Iterable[Paragraph | Table]) -> list[str]:
     return lines
 
 
-def _render_table(table: Table) -> str:
-    """A table as tab-separated cells, one row per line.
+def _render_table(table: Table) -> list[str]:
+    """A table as one tab-separated line per row.
+
+    One line per row is not cosmetic: the chunker splits an oversized table at row boundaries
+    by splitting this list, so a cell whose own text contains a newline is flattened to spaces.
+    A row that spanned two lines would be cut in half by a row split.
 
     A merged cell reports its text once in the XML but occupies every grid position it spans,
     and ``row.cells`` yields it at each of them. The repeat is kept deliberately: it is what
     the grid shows, and it is what lets a split part of the table (``docs/parsing.md`` §4.2)
     carry the header that applies to *its* columns rather than a blank.
     """
-    rows: list[str] = []
+    rendered: list[str] = []
     for row in table.rows:
         cells = [" ".join(_render_content(cell.iter_inner_content())) for cell in row.cells]
-        rows.append(_CELL_SEPARATOR.join(cells))
-    return _ROW_SEPARATOR.join(rows)
+        rendered.append(_CELL_SEPARATOR.join(" ".join(cell.split()) for cell in cells))
+    return rendered
 
 
 def _elements(document: DocxDocument, config: WordConfig) -> list[_Heading | _Item]:
@@ -215,16 +219,21 @@ def _elements(document: DocxDocument, config: WordConfig) -> list[_Heading | _It
     for content in document.iter_inner_content():
         if isinstance(content, Table):
             flush_list()
-            text = _render_table(content)
+            rows = _render_table(content)
+            text = _ROW_SEPARATOR.join(rows)
             if text.strip():
-                rows = list(content.rows)
                 out.append(
                     _Item(
                         kind=BlockKind.TABLE,
                         text=text,
+                        # ``rows`` is the rendered lines, not a count: it is what the chunker
+                        # splits an oversized table at, and a count would leave it guessing
+                        # where the row boundaries are (docs/parsing.md §4.2).
                         metadata={
-                            "rows": len(rows),
-                            "columns": max((len(row.cells) for row in rows), default=0),
+                            "rows": list(rows),
+                            "column_count": max(
+                                (len(row.split(_CELL_SEPARATOR)) for row in rows), default=0
+                            ),
                             "header_rows": min(config.table_header_rows, len(rows)),
                         },
                     )

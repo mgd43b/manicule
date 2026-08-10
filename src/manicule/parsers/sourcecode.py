@@ -24,25 +24,30 @@ emitted whole and over budget rather than cut somewhere unsafe.
 would hand the file to the plain-text parser and line-split it — the very outcome the
 declared language set exists to prevent. See :mod:`manicule.parsers.grammars`.
 
-**The parse tree is copied into plain Python objects before anything walks it.** This is the
-one decision here made for the library's sake rather than the document's, so it is worth
-being exact about. Retaining ``tree_sitter.Node`` objects across the yields of a generator
-puts them inside reference cycles, and collecting such a cycle segfaults the interpreter on
-files of a few hundred kilobytes — reproduced on this version, with and without a tags query,
-at the point where the collector runs rather than at any particular call. Copying the parse
-tree into :class:`_Item` in one pass that outlives no ``Node`` removes the failure mode
-entirely instead of arranging the traversal to avoid it, which would be a fix nobody could
-maintain because nothing would fail when it was undone. It also leaves the segmentation
-algorithm working on plain data, which is testable without a grammar.
+**Line numbers come from byte offsets, and the parse tree is copied before anything walks
+it.** This is the one decision here made for the library's sake rather than the document's,
+so it is worth being exact about. ``tree_sitter`` also reports a row and column per node, and
+reading them is the obvious way to get a line number — but on this version the ``Point``
+objects those accessors return segfault the interpreter once a few hundred thousand of them
+have been created, reproducibly, on a file of a couple of hundred kilobytes, with and without
+a tags query. Byte offsets are plain integers and have no such problem, so a line number is
+found by locating the offset among the file's line starts. That is not merely a workaround:
+the offsets and the line starts are both measured on the same bytes this module decoded, so
+there is one line-counting mechanism here rather than two that have to agree.
+
+The copy is the same reasoning applied to lifetimes. Every ``Node`` is read inside one loop
+and none survives it, so the rest of the parser cannot be broken by how the extension manages
+its objects — and the segmentation algorithm ends up working on plain data, which is testable
+without a grammar.
 """
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pydantic import BaseModel, Field
 from tree_sitter import Node, QueryCursor, Tree
 
 from manicule.core.anchors import Anchor, LineAnchor
@@ -50,43 +55,11 @@ from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.parsers import grammars
 from manicule.parsers.base import ParserProfile, decode, lines_of, resolve_lines
+from manicule.parsers.grammars import SourceCodeConfig
 
 __all__ = ["SourceCodeConfig", "SourceCodeParser"]
-
-
-class SourceCodeConfig(BaseModel):
-    """Configuration for :class:`SourceCodeParser`.
-
-    Set under ``plugins.config."parser.sourcecode"``. Every field is load-bearing: the
-    language set decides what routes here and what the corpus fingerprint records, and the
-    two grammar overrides are what a container image and an air-gapped site respectively
-    need in order to pre-seed at all.
-    """
-
-    languages: tuple[str, ...] = grammars.DECLARED_LANGUAGES
-    """The declared language set. Validated against the grammar manifest when the parser is
-    built, so a typo — ``c_sharp`` for ``csharp`` — fails at startup with the near misses
-    listed, rather than becoming a document that mysteriously never parses."""
-
-    grammar_cache_dir: Path | None = None
-    """Where grammars live. ``None`` uses the per-user cache. A container image sets this so
-    the grammars pre-seeded at build time are the ones the running process finds."""
-
-    grammar_manifest_url: str | None = None
-    """Where the grammar manifest is fetched from. ``None`` uses the public one; a site with
-    no route to it points this at an internal mirror."""
-
-    max_block_chars: int = Field(default=1536, gt=0)
-    """When a block's source is longer than this, it is split at the next node boundary down.
-
-    Measured in characters rather than tokens because a parser runs before an embedder is
-    bound, and a token count is only meaningful with the embedder's own vocabulary
-    (``manicule.chunking.tokens``). 1536 is a 512-token budget at three characters per token,
-    which is conservative for code — identifiers, punctuation and indentation all tokenize
-    densely — so a block under this bound is comfortably under the budget the chunker later
-    enforces with the real tokenizer. It is a *pre*-split threshold, not a guarantee: the
-    chunker still measures, and this only decides which boundaries it is offered.
-    """
+"""``SourceCodeConfig`` is re-exported from :mod:`manicule.parsers.grammars`, where it is
+defined so that plugin registration can validate settings without importing a C extension."""
 
 
 class SourceCodeParser:
@@ -147,8 +120,8 @@ class SourceCodeParser:
         # rows then index the same lines `lines_of` produces, which is what lets a row become
         # a LineAnchor without a second, differently-encoded view of the document.
         data = text.encode("utf-8")
-        root = _mirror(parser.parse(data), language, data)
-        lines = _Lines.of(text)
+        lines = _Lines.of(text, data)
+        root = _mirror(parser.parse(data), language, data, lines)
         separator = grammars.scope_separator(language)
         wrappers = grammars.DEFINITION_WRAPPERS.get(language, frozenset())
 
@@ -219,50 +192,25 @@ class _Item:
         return "comment" in self.type
 
 
-def _first_row(node: Node) -> int:
-    """The 1-based line a node starts on.
-
-    tree-sitter rows are 0-based, and ``LineAnchor`` is 1-based and inclusive; this function
-    and :func:`_last_row` are the only two places in the parser where that is converted.
-    """
-    return node.start_point.row + 1
-
-
-def _last_row(node: Node) -> int:
-    """The 1-based line a node's last character is on.
-
-    A node whose end point sits at column 0 of a row ends *before* that row — it is the
-    newline that closed the previous line, not content on the next one. Counting it would
-    make every such block claim one line more than it holds, and the extra line is the first
-    line of the next block, which reads perfectly and cites the wrong thing.
-    """
-    end = node.end_point
-    if end.column == 0 and end.row > node.start_point.row:
-        return end.row
-    return end.row + 1
-
-
 _Raw = tuple[str, bool, int, int, int, int, str | None, int]
 """One node reduced to primitives: type, named, first line, last line, start byte, end byte,
 definition name, index of its parent (``-1`` for the root)."""
 
 
-def _mirror(tree: Tree, language: str, data: bytes) -> _Item:
+def _mirror(tree: Tree, language: str, data: bytes, lines: _Lines) -> _Item:
     """Copy a parse tree into :class:`_Item` objects, resolving every definition name.
 
-    Two passes, and the split between them is the whole point. The first reads the tree and
+    Two passes, and the split between them is the point. The first reads the tree and
     produces **nothing but tuples of primitives**; the second builds the linked
-    :class:`_Item` tree after the parse tree has been released. Building the object graph
-    while ``Node`` objects are still reachable is what segfaults the collector — see the
-    module docstring — and the split makes that state unreachable rather than merely
-    short-lived.
+    :class:`_Item` tree after the parse tree has been released, so no ``Node`` is reachable
+    from anything this parser keeps.
     """
-    flat = _flatten(tree, language, data)
+    flat = _flatten(tree, language, data, lines)
     del tree
     return _link(flat)
 
 
-def _flatten(tree: Tree, language: str, data: bytes) -> list[_Raw]:
+def _flatten(tree: Tree, language: str, data: bytes, lines: _Lines) -> list[_Raw]:
     """Read the parse tree into a flat list of primitives, parents before children.
 
     A node's children occupy consecutive entries in source order, which is what lets
@@ -272,13 +220,20 @@ def _flatten(tree: Tree, language: str, data: bytes) -> list[_Raw]:
     rules = grammars.NODE_TYPE_DEFINITIONS.get(language, {})
 
     def raw(node: Node, parent: int) -> _Raw:
+        start, end = node.start_byte, node.end_byte
         return (
             node.type,
             node.is_named,
-            _first_row(node),
-            _last_row(node),
-            node.start_byte,
-            node.end_byte,
+            lines.row_of(start),
+            # The last line the node has characters on. A node that ends at the start of a
+            # line ends on the *previous* one — what it holds there is the newline that
+            # closed it, not content — and counting the extra line would make the block claim
+            # the first line of the block after it, which reads perfectly and cites the wrong
+            # thing. Asking for the row of the last byte rather than of the end offset says
+            # exactly that, with no special case.
+            lines.row_of(max(start, end - 1)),
+            start,
+            end,
             tagged.get(node.id) or _named_by_rule(node, rules, data),
             parent,
         )
@@ -373,23 +328,31 @@ def _decode(data: bytes, node: Node) -> str:
 
 @dataclass(frozen=True, slots=True)
 class _Lines:
-    """A file's lines, with the arithmetic to measure a range without building it.
+    """A file's lines, and the two lookups the parser needs over them.
 
-    The offsets exist because ``_pack`` asks the length of a candidate range once per
-    sibling. Joining the lines to measure them turns segmentation into quadratic string
+    ``characters`` exists because ``_pack`` asks the length of a candidate range once per
+    sibling; joining the lines to measure them turns segmentation into quadratic string
     building, which on a file of a few hundred kilobytes is most of the parse.
+
+    ``byte_starts`` is how a node's byte offset becomes a line number. Both it and the lines
+    come from the same bytes, split on the same character, so there is one idea of where a
+    line begins here rather than two that have to agree.
     """
 
     lines: tuple[str, ...]
-    offsets: tuple[int, ...]
+    characters: tuple[int, ...]
+    byte_starts: tuple[int, ...]
 
     @classmethod
-    def of(cls, text: str) -> _Lines:
+    def of(cls, text: str, data: bytes) -> _Lines:
         lines = tuple(lines_of(text))
-        offsets: list[int] = [0]
+        characters: list[int] = [0]
         for line in lines:
-            offsets.append(offsets[-1] + len(line) + 1)
-        return cls(lines=lines, offsets=tuple(offsets))
+            characters.append(characters[-1] + len(line) + 1)
+        byte_starts: list[int] = [0]
+        for chunk in data.split(b"\n")[:-1]:
+            byte_starts.append(byte_starts[-1] + len(chunk) + 1)
+        return cls(lines=lines, characters=tuple(characters), byte_starts=tuple(byte_starts))
 
     def text(self, first: int, last: int) -> str:
         """The source of lines ``first`` to ``last``, both 1-based and inclusive."""
@@ -397,7 +360,15 @@ class _Lines:
 
     def length(self, first: int, last: int) -> int:
         """How long :meth:`text` would be, without building it."""
-        return self.offsets[min(last, len(self.lines))] - self.offsets[first - 1] - 1
+        return self.characters[min(last, len(self.lines))] - self.characters[first - 1] - 1
+
+    def row_of(self, offset: int) -> int:
+        """The 1-based line a byte offset falls on.
+
+        1-based and inclusive because that is what every anchor in manicule is and what
+        ``token.py:42`` means to a person; the conversion happens here and nowhere else.
+        """
+        return bisect_right(self.byte_starts, offset)
 
 
 # --- segmentation --------------------------------------------------------------------------
@@ -470,18 +441,44 @@ def _fit(items: tuple[_Item, ...], lines: _Lines, budget: int) -> Iterator[_Span
             yield from _fit(group, lines, budget)
         return
 
-    if len(items) == 1 and items[0].children:
-        inner = _pack(tuple(items[0].children), lines, budget)
-        if len(inner) > 1:
-            for group in inner:
-                yield from _fit(group, lines, budget)
-            return
+    expanded = _expand(items, lines)
+    if expanded is not None:
+        yield from _fit(expanded, lines, budget)
+        return
 
     # Over budget with no safe boundary anywhere inside it: a minified line, or a single
     # enormous string or comment. Emitted whole. "Never split mid-token" outranks "then
     # lines" — a chunk cut through the middle of a string literal is not code, and the
     # citation it carries quotes half a token.
     yield span
+
+
+def _expand(items: tuple[_Item, ...], lines: _Lines) -> tuple[_Item, ...] | None:
+    """Replace the widest item with its own children, or ``None`` when none has any.
+
+    One level at a time, and only the widest, because the run is over budget for one item's
+    sake. Expanding everything would offer boundaries inside constructs that already fit,
+    which is how a file of small functions ends up chunked by statement — and a block that
+    holds three lines of a function that would have fitted whole is a worse citation than
+    the function.
+
+    Recursing here rather than descending in one step matters for the shapes where a
+    definition's body opens on the definition's own line: ``pub mod ledger {`` puts the
+    braces and the block on one line, so the first level down offers no boundary at all and
+    the level below it offers every statement.
+    """
+    widest: _Item | None = None
+    index = 0
+    for position, item in enumerate(items):
+        if not item.children:
+            continue
+        if widest is None or lines.length(item.first, item.last) > lines.length(
+            widest.first, widest.last
+        ):
+            widest, index = item, position
+    if widest is None:
+        return None
+    return (*items[:index], *widest.children, *items[index + 1 :])
 
 
 def _pack(items: tuple[_Item, ...], lines: _Lines, budget: int) -> list[tuple[_Item, ...]]:
@@ -497,7 +494,26 @@ def _pack(items: tuple[_Item, ...], lines: _Lines, budget: int) -> list[tuple[_I
         current.append(item)
     if current:
         groups.append(current)
-    return [tuple(group) for group in groups]
+    return [tuple(group) for group in _joined_to_neighbours(groups)]
+
+
+def _joined_to_neighbours(groups: list[list[_Item]]) -> list[list[_Item]]:
+    """Fold any group of nothing but unnamed tokens into an adjacent one.
+
+    Descending far enough eventually offers the closing brace of a block as a boundary of its
+    own, and a block whose entire text is ``}`` is not a citation — worse, it appears inside
+    every other block that closes a scope, so no two such blocks can be told apart. What the
+    grammar declined to name is punctuation, and punctuation belongs to the run it punctuates.
+    """
+    folded: list[list[_Item]] = []
+    for group in groups:
+        if folded and not any(item.named for item in group):
+            folded[-1].extend(group)
+        else:
+            folded.append(list(group))
+    if len(folded) > 1 and not any(item.named for item in folded[0]):
+        folded[1][:0] = folded.pop(0)
+    return folded
 
 
 def _span_of(items: tuple[_Item, ...]) -> _Span:
@@ -517,7 +533,14 @@ def _block(
     wrappers: frozenset[str],
 ) -> ParsedBlock | None:
     """One block for a span, or ``None`` when the span holds no text worth citing."""
-    text = lines.text(first, span.last)
+    last = span.last
+    # Blank lines at either end are not part of what this block cites. Claiming them widens
+    # the anchor past the text it addresses, which is the thing tightness measures.
+    while first < last and not lines.lines[first - 1].strip():
+        first += 1
+    while last > first and not lines.lines[last - 1].strip():
+        last -= 1
+    text = lines.text(first, last)
     if not text.strip():
         return None
     path = _symbol_chain(span, wrappers)
@@ -526,7 +549,7 @@ def _block(
         text=text,
         anchor=LineAnchor(
             start=first,
-            end=span.last,
+            end=last,
             symbol=separator.join(path) if path else None,
         ),
         heading_path=path,

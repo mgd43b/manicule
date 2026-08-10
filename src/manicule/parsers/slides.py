@@ -113,7 +113,7 @@ def _slide_size(presentation: Presentation) -> tuple[int, int] | None:
     page-level. Returning ``None`` rather than assuming 4:3 keeps that visible in the
     page-level ratio instead of producing boxes measured against a guess.
     """
-    width = _emu(presentation.slide_width)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - python-pptx leaves slide_width unannotated
+    width = _emu(presentation.slide_width)
     height = _emu(presentation.slide_height)
     if width is None or height is None or width <= 0 or height <= 0:
         return None
@@ -153,12 +153,14 @@ def _table_metadata(table: Table, rows: Sequence[str]) -> Metadata:
     ``header_rows`` comes from the table's own first-row flag — the one PowerPoint records —
     and is 0 when the file does not set it. Nothing here reads formatting to decide.
 
-    The row and column counts are taken from the rendered lines rather than from the table's
-    own collections, so they describe exactly the text the chunker will be splitting.
+    The rows are the rendered lines rather than the table's own collections, so they describe
+    exactly the text the chunker will be splitting.
     """
     return {
-        "rows": len(rows),
-        "columns": max((len(row.split(_CELL_SEPARATOR)) for row in rows), default=0),
+        # ``rows`` is the rendered lines rather than a count, because that is what the chunker
+        # splits at; ``header_rows`` is repeated into every part it produces.
+        "rows": list(rows),
+        "column_count": max((len(row.split(_CELL_SEPARATOR)) for row in rows), default=0),
         "header_rows": 1 if table.first_row and rows else 0,
     }
 

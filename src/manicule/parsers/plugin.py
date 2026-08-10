@@ -1,0 +1,273 @@
+"""The built-in parsing plugin: every parser, and the chunker.
+
+Registered through the public ``manicule.plugins`` entry point, exactly as a third-party
+plugin is. There is no shorter internal route, so the extension mechanism is exercised by
+every installation rather than only by the people extending it, and it cannot rot unnoticed.
+
+**Nothing here imports a parsing library.** Registration needs two things eagerly — the media
+types a parser claims, so a document can be routed without building every installed parser,
+and the configuration model, so settings written for a parser are validated rather than
+silently ignored. Both live in :mod:`manicule.parsers.config`, which imports nothing heavier
+than pydantic. The parser module itself, and the C extension behind it, are imported inside
+the factory: an installed plugin nobody has configured costs one cheap import.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
+from importlib import import_module
+from typing import TYPE_CHECKING
+
+from pydantic import BaseModel
+
+from manicule.container import keys
+from manicule.core.errors import UnknownComponentError
+from manicule.parsers import config as parser_config
+from manicule.plugins import BuildContext, ComponentRegistry, PluginManifest
+
+if TYPE_CHECKING:
+    from manicule.chunking import StructuralChunker
+    from manicule.core.protocols import Chunker, Parser
+
+CHUNKER_NAME = "structural"
+
+
+@dataclass(frozen=True, slots=True)
+class _Registration:
+    """One parser, described without importing it."""
+
+    name: str
+    module: str
+    factory: str
+    config_model: type[BaseModel]
+    media_types: AbstractSet[str]
+    summary: str
+
+
+PARSERS: tuple[_Registration, ...] = (
+    _Registration(
+        name="pdf",
+        module="manicule.parsers.pdf",
+        factory="PdfParser",
+        config_model=parser_config.PdfConfig,
+        media_types=parser_config.PDF_MEDIA_TYPES,
+        summary="Page and rectangle provenance from pdfium character boxes.",
+    ),
+    _Registration(
+        name="sourcecode",
+        module="manicule.parsers.sourcecode",
+        factory="SourceCodeParser",
+        config_model=parser_config.SourceCodeConfig,
+        media_types=parser_config.SOURCE_CODE_MEDIA_TYPES,
+        summary="Line anchors and symbols from tree-sitter parse trees.",
+    ),
+    _Registration(
+        name="markdown",
+        module="manicule.parsers.markdown",
+        factory="MarkdownParser",
+        config_model=parser_config.MarkdownConfig,
+        media_types=parser_config.MARKDOWN_MEDIA_TYPES,
+        summary="Heading anchors with synthesised fragments, from markdown-it token maps.",
+    ),
+    _Registration(
+        name="html",
+        module="manicule.parsers.web",
+        factory="WebParser",
+        config_model=parser_config.WebConfig,
+        media_types=parser_config.WEB_MEDIA_TYPES,
+        summary="Heading anchors, deep-linking only where the author supplied an id.",
+    ),
+    _Registration(
+        name="adf",
+        module="manicule.parsers.adf",
+        factory="AdfParser",
+        config_model=parser_config.AdfConfig,
+        media_types=parser_config.ADF_MEDIA_TYPES,
+        summary="Confluence Atlassian Document Format, with the source's own anchors.",
+    ),
+    _Registration(
+        name="docx",
+        module="manicule.parsers.word",
+        factory="WordParser",
+        config_model=parser_config.WordConfig,
+        media_types=parser_config.WORD_MEDIA_TYPES,
+        summary="Section anchors from paragraph styles. Never a page number.",
+    ),
+    _Registration(
+        name="pptx",
+        module="manicule.parsers.slides",
+        factory="SlidesParser",
+        config_model=parser_config.SlidesConfig,
+        media_types=parser_config.SLIDES_MEDIA_TYPES,
+        summary="Slide numbers and shape geometry as normalised rectangles.",
+    ),
+    _Registration(
+        name="spreadsheet",
+        module="manicule.parsers.spreadsheet",
+        factory="SpreadsheetParser",
+        config_model=parser_config.SpreadsheetConfig,
+        media_types=parser_config.SPREADSHEET_MEDIA_TYPES,
+        summary="Cell anchors for XLSX and CSV alike, once a CSV is given a sheet name.",
+    ),
+    _Registration(
+        name="notebook",
+        module="manicule.parsers.notebook",
+        factory="NotebookParser",
+        config_model=parser_config.NotebookConfig,
+        media_types=parser_config.NOTEBOOK_MEDIA_TYPES,
+        summary="Heading anchors fragmented by nbformat cell id.",
+    ),
+    _Registration(
+        name="email",
+        module="manicule.parsers.mail",
+        factory="MailParser",
+        config_model=parser_config.MailConfig,
+        media_types=parser_config.MAIL_MEDIA_TYPES,
+        summary="Line anchors within the canonical body part, headers included.",
+    ),
+    _Registration(
+        name="plaintext",
+        module="manicule.parsers.plaintext",
+        factory="PlaintextParser",
+        config_model=parser_config.PlaintextConfig,
+        media_types=parser_config.PLAINTEXT_MEDIA_TYPES,
+        summary="Source line anchors, and the refusal that makes the global tail safe.",
+    ),
+    _Registration(
+        name="structured",
+        module="manicule.parsers.structured",
+        factory="StructuredParser",
+        config_model=parser_config.StructuredConfig,
+        media_types=parser_config.STRUCTURED_MEDIA_TYPES,
+        summary="Line spans and key paths for JSON, YAML and TOML.",
+    ),
+    _Registration(
+        name="archive",
+        module="manicule.parsers.archive",
+        factory="ArchiveParser",
+        config_model=parser_config.ArchiveConfig,
+        media_types=parser_config.ARCHIVE_MEDIA_TYPES,
+        summary="Expands members into documents of their own. Emits no chunks.",
+    ),
+)
+
+
+def _build_parser(registration: _Registration, context: BuildContext) -> Parser:
+    """Import the parser's module and construct it.
+
+    The import happens here rather than at module level so that installing the parsing
+    plugin costs nothing until a document of that type is routed to it — which for a corpus
+    of Markdown means never loading pdfium, tree-sitter, or the Office readers at all.
+    """
+    module = import_module(registration.module)
+    parser_type = getattr(module, registration.factory)
+    settings = context.config
+    if not isinstance(settings, registration.config_model):
+        settings = registration.config_model()
+    built: Parser = parser_type(settings)
+    return built
+
+
+def _build_chunker(context: BuildContext) -> StructuralChunker:
+    """Construct the chunker, bound to the embedder when one is configured.
+
+    The embedder is a **construction** dependency rather than something looked up later,
+    because the budget check has to happen before ingest: past a model's sequence length the
+    input is truncated with no error raised, and the chunk is indexed as its opening tokens
+    while still claiming all of its text.
+
+    When no embedder is installed — a parse-only run, a fixture build — the chunker counts
+    with a stand-in vocabulary, inflates the result, and marks its chunks provisional so that
+    ingest refuses them. That is a narrower thing than falling back: the chunks exist, they
+    are usable for inspection, and they cannot reach an index.
+    """
+    from manicule.chunking import StructuralChunker, TokenCounter  # noqa: PLC0415 - see docstring
+    from manicule.chunking.tokens import SupportsTokenCount  # noqa: PLC0415
+
+    embedder: SupportsTokenCount | None = None
+    try:
+        candidate = context.components.get(keys.EMBEDDER)
+    except UnknownComponentError:
+        candidate = None
+    if isinstance(candidate, SupportsTokenCount):
+        embedder = candidate
+
+    counter = (
+        TokenCounter.bound_to(embedder) if embedder is not None else TokenCounter.provisionally()
+    )
+    return StructuralChunker(
+        counter,
+        embedder=embedder,
+        grammars=_grammar_versions(context),
+        version_components=_pinned_versions(),
+    )
+
+
+def _grammar_versions(context: BuildContext) -> dict[str, str]:
+    """Grammar version by language, for ``ChunkFingerprint.grammars``.
+
+    Empty when the code parser is not installed or its grammars have not been fetched. That
+    is honest rather than convenient: a fingerprint claiming a grammar version the machine
+    does not have would let a corpus built without tree-sitter pass a comparison against one
+    built with it.
+    """
+    del context
+    try:
+        from manicule.parsers.grammars import grammar_versions  # noqa: PLC0415 - optional
+    except ImportError:  # pragma: no cover - tree-sitter is a declared dependency
+        return {}
+    return dict(grammar_versions())
+
+
+def _pinned_versions() -> dict[str, str]:
+    """Other pinned transformations whose output an anchor addresses.
+
+    The HTML-to-text conversion is the one that matters: an email with an HTML-only body has
+    line numbers into the *converted* text, so a converter upgrade would shift every anchor
+    in every HTML email — round-tripping today and pointing at the wrong paragraph after a
+    dependency bump, with no test failing in between.
+    """
+    return {"html_text": parser_config.HTML_TEXT_VERSION}
+
+
+class ParsingPlugin:
+    """The plugin object the ``parsing`` entry point resolves to."""
+
+    manifest = PluginManifest(
+        name="parsing",
+        version="0.1.0",
+        core_version=">=0.1,<0.2",
+        summary="Every built-in parser, and the structure-aware chunker.",
+    )
+
+    def register(self, registry: ComponentRegistry) -> None:
+        for registration in PARSERS:
+            registry.add(
+                keys.PARSER.named(registration.name),
+                _factory_for(registration),
+                config_model=registration.config_model,
+                summary=registration.summary,
+                media_types=registration.media_types,
+            )
+        registry.add(
+            keys.CHUNKER.named(CHUNKER_NAME),
+            _build_chunker,
+            summary="512 tokens on embed_text, 64 overlap, boundaries from block structure.",
+        )
+
+
+def _factory_for(registration: _Registration):  # noqa: ANN202 - the closure's type is Factory[Parser]
+    def factory(context: BuildContext) -> Parser:
+        return _build_parser(registration, context)
+
+    return factory
+
+
+PLUGIN = ParsingPlugin()
+
+# Checked when this file is type-checked, so registration cannot drift out of conformance
+# with the protocols it registers against.
+_chunker_key: type[Chunker] | None = None
+
+__all__ = ["CHUNKER_NAME", "PARSERS", "PLUGIN", "ParsingPlugin"]

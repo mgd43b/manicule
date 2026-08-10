@@ -67,12 +67,14 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
-import tree_sitter_language_pack as pack
-from tree_sitter import Parser, Query
+from pydantic import BaseModel, Field
 
 from manicule.core.errors import ConfigError, ManiculeError
+
+if TYPE_CHECKING:
+    from tree_sitter import Parser, Query
 
 __all__ = [
     "DECLARED_LANGUAGES",
@@ -81,11 +83,11 @@ __all__ = [
     "MANIFEST_URL_ENV",
     "MEDIA_TYPES",
     "NODE_TYPE_DEFINITIONS",
-    "PACK_VERSION",
     "SCOPE_SEPARATORS",
     "DefinitionRule",
     "GrammarFetchError",
     "GrammarUnavailableError",
+    "SourceCodeConfig",
     "cache_directory",
     "configure_pack",
     "grammar_versions",
@@ -93,6 +95,7 @@ __all__ = [
     "language_for_media_type",
     "load_parser",
     "missing_grammars",
+    "pack_version",
     "prefetch",
     "scope_separator",
     "tags_query",
@@ -109,8 +112,10 @@ from :func:`configure_pack` keeps that fact in one place instead of in every dep
 shell profile.
 """
 
-PACK_VERSION: Final[str] = pack.__version__
-"""The installed grammar pack release. See :func:`grammar_versions`."""
+def pack_version() -> str:
+    """The installed grammar pack release. See :func:`grammar_versions`."""
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+    return pack.__version__
 
 
 MEDIA_TYPES: Final[Mapping[str, str]] = {
@@ -256,6 +261,43 @@ Java annotations and C# attributes all sit *inside* the declaration node.
 """
 
 
+class SourceCodeConfig(BaseModel):
+    """Configuration for :class:`~manicule.parsers.sourcecode.SourceCodeParser`.
+
+    Set under ``plugins.config."parser.sourcecode"``. It lives here rather than beside the
+    parser because what it configures is this module: the declared language set decides what
+    routes to the parser at all and what the corpus fingerprint records, and the two grammar
+    overrides are what a container image and an air-gapped site respectively need in order to
+    pre-seed. Keeping it here also keeps it importable without the C extension, so plugin
+    registration can validate settings for a parser nobody has built yet.
+    """
+
+    languages: tuple[str, ...] = DECLARED_LANGUAGES
+    """The declared language set. Validated against the grammar manifest when the parser is
+    built, so a typo — ``c_sharp`` for ``csharp`` — fails at startup with the near misses
+    listed, rather than becoming a document that mysteriously never parses."""
+
+    grammar_cache_dir: Path | None = None
+    """Where grammars live. ``None`` uses the per-user cache. A container image sets this so
+    the grammars pre-seeded at build time are the ones the running process finds."""
+
+    grammar_manifest_url: str | None = None
+    """Where the grammar manifest is fetched from. ``None`` uses the public one; a site with
+    no route to it points this at an internal mirror."""
+
+    max_block_chars: int = Field(default=1536, gt=0)
+    """When a block's source is longer than this, it is split at the next node boundary down.
+
+    Measured in characters rather than tokens because a parser runs before an embedder is
+    bound, and a token count is only meaningful with the embedder's own vocabulary
+    (``manicule.chunking.tokens``). 1536 is a 512-token budget at three characters per token,
+    which is conservative for code — identifiers, punctuation and indentation all tokenize
+    densely — so a block under this bound is comfortably under the budget the chunker later
+    enforces with the real tokenizer. It is a *pre*-split threshold, not a guarantee: the
+    chunker still measures, and this only decides which boundaries it is offered.
+    """
+
+
 class GrammarUnavailableError(ManiculeError):
     """A declared language's grammar is not in the cache, so the document is refused.
 
@@ -320,6 +362,7 @@ def validate_languages(languages: Sequence[str]) -> tuple[str, ...]:
         )
         raise ConfigError(msg)
 
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
     known = set(pack.manifest_languages())
     unknown = sorted({language for language in languages if language not in known})
     if unknown:
@@ -361,6 +404,7 @@ def scope_separator(language: str) -> str:
 
 def cache_directory() -> Path:
     """Where the pack keeps grammars for the running configuration."""
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
     return Path(pack.cache_dir())
 
 
@@ -385,6 +429,7 @@ def configure_pack(
         manifest_url: Where the grammar manifest is fetched from. ``None`` uses the public
             one.
     """
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
     if manifest_url is None:
         os.environ.pop(MANIFEST_URL_ENV, None)
     else:
@@ -404,6 +449,7 @@ def configure_pack(
 
 def is_available(language: str) -> bool:
     """Whether ``language``'s grammar is in the cache, checked without any network access."""
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
     return language in set(pack.downloaded_languages())
 
 
@@ -412,6 +458,7 @@ def missing_grammars(languages: Sequence[str]) -> tuple[str, ...]:
 
     What ``manicule doctor`` reports and what :func:`prefetch` acts on.
     """
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
     present = set(pack.downloaded_languages())
     return tuple(sorted(language for language in languages if language not in present))
 
@@ -435,6 +482,7 @@ def prefetch(languages: Sequence[str]) -> tuple[str, ...]:
         GrammarFetchError: The fetch failed — no route to the manifest, a mirror that does
             not have it, a checksum mismatch.
     """
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
     wanted = validate_languages(languages)
     absent = missing_grammars(wanted)
     if not absent:
@@ -489,7 +537,8 @@ def grammar_versions(languages: Sequence[str]) -> dict[str, str]:
         to be independent: a map that shrank when a grammar was missing would make the
         fingerprint depend on cache state, which is the hazard this module exists to close.
     """
-    return {language: PACK_VERSION for language in validate_languages(languages)}
+    version = pack_version()
+    return {language: version for language in validate_languages(languages)}
 
 
 _PARSERS: dict[str, Parser] = {}
@@ -510,6 +559,7 @@ def load_parser(language: str) -> Parser:
             asked for a parser, because asking would fetch it — and a fetch here is the
             corpus-consistency hazard arriving through the back door.
     """
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
     cached = _PARSERS.get(language)
     if cached is not None:
         return cached
@@ -527,6 +577,7 @@ def tags_query_source(language: str) -> str | None:
     all: a query set that varied by machine would be the same corpus-consistency hazard the
     declared language set closes.
     """
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
     return pack.get_tags_query(language)
 
 
@@ -540,6 +591,10 @@ def tags_query(language: str) -> Query | None:
         GrammarUnavailableError: The grammar is not cached. A query compiles against a
             language, so this cannot answer before :func:`load_parser` would have refused.
     """
+    from tree_sitter import Query  # noqa: PLC0415 - lazy, see module docstring
+
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
     if language in _QUERIES:
         return _QUERIES[language]
     source = tags_query_source(language)

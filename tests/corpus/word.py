@@ -51,7 +51,7 @@ def build(dest: Path) -> None:
     (dest / "word_degenerate_zero_bytes.docx").write_bytes(b"")
     _astral(dest / "word_hostile_astral.docx")
     _repeated_heading_path(dest / "word_repeated_heading_path.docx")
-    _large(dest / "word_large.docx")
+    _large(dest / "word-large.docx")
     _truncated(dest / "word_hostile_truncated.docx")
     _plain_zip(dest / "word_hostile_plain_zip.docx")
 

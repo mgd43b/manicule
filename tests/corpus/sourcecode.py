@@ -372,18 +372,18 @@ def _large_module() -> str:
 
 
 _TEXT_FIXTURES: dict[str, str] = {
-    "typical_tokens.py": _TYPICAL_PYTHON,
-    "typical_store.rs": _TYPICAL_RUST,
-    "typical_sessions.ts": _TYPICAL_TYPESCRIPT,
-    "hard_nested_classes.py": _NESTED_CLASSES,
-    "hard_decorated_handlers.py": _DECORATED,
-    "hard_scoped_modules.rs": _SCOPED_RUST,
-    "table_symbols.sh": _BASH,
-    "absent_symbols.sql": _SQL,
-    "degenerate_comments_only.py": _COMMENTS_ONLY,
-    "degenerate_no_trailing_newline.py": _NO_TRAILING_NEWLINE,
-    "hostile_broken_syntax.py": _BROKEN_SYNTAX,
-    "hostile_astral.py": _ASTRAL,
+    "typical-tokens.py": _TYPICAL_PYTHON,
+    "typical-store.rs": _TYPICAL_RUST,
+    "typical-sessions.ts": _TYPICAL_TYPESCRIPT,
+    "hard-nested-classes.py": _NESTED_CLASSES,
+    "hard-decorated-handlers.py": _DECORATED,
+    "hard-scoped-modules.rs": _SCOPED_RUST,
+    "table-symbols.sh": _BASH,
+    "absent-symbols.sql": _SQL,
+    "degenerate-comments-only.py": _COMMENTS_ONLY,
+    "degenerate-no-trailing-newline.py": _NO_TRAILING_NEWLINE,
+    "hostile-broken-syntax.py": _BROKEN_SYNTAX,
+    "hostile-astral.py": _ASTRAL,
 }
 
 MALFORMED_UTF8 = b'"""Latin-1 in a file declared as UTF-8."""\n\n\ndef caf\xe9() -> int:\n    return 1\n'
@@ -392,22 +392,18 @@ arrives, so this cannot be mistaken for an encoding the parser should have guess
 
 
 def build(dest: Path) -> None:
-    """Write this format's fixtures into ``dest``.
-
-    Everything lands in a ``sourcecode`` subdirectory so that formats sharing one corpus
-    directory cannot collide on a name, and so a test can enumerate this parser's fixtures
-    without knowing every other parser's naming.
-    """
-    root = dest / "sourcecode"
-    root.mkdir(parents=True, exist_ok=True)
+    """Write this format's fixtures into ``dest``."""
+    dest.mkdir(parents=True, exist_ok=True)
 
     for name, content in _TEXT_FIXTURES.items():
-        (root / name).write_text(content, encoding="utf-8")
+        (dest / name).write_text(content, encoding="utf-8")
 
-    (root / "hard_oversized_function.py").write_text(_oversized_function(), encoding="utf-8")
-    (root / "hard_large_module.py").write_text(_large_module(), encoding="utf-8")
+    (dest / "hard-oversized-function.py").write_text(_oversized_function(), encoding="utf-8")
+    # The one deliberate exception to the corpus size cap, named so the intent is visible in
+    # the directory listing rather than only in the generator.
+    (dest / "module-large.py").write_text(_large_module(), encoding="utf-8")
 
     # Zero bytes, written explicitly rather than by touching the path, so the fixture is
     # obviously deliberate to anyone reading the directory.
-    (root / "degenerate_empty.py").write_bytes(b"")
-    (root / "hostile_malformed_utf8.py").write_bytes(MALFORMED_UTF8)
+    (dest / "degenerate-empty.py").write_bytes(b"")
+    (dest / "hostile-malformed-utf8.py").write_bytes(MALFORMED_UTF8)

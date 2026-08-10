@@ -188,7 +188,9 @@ async def test_two_sections_called_overview_get_different_fragments(corpus: Path
     identical. The ``-1`` suffix is counted from the second occurrence, as every Markdown
     host does it, so the section that was there first keeps the address it already had.
     """
-    blocks = await read_blocks(_parser(), raw_from(corpus / "markdown" / "structure.md", MEDIA_TYPE))
+    blocks = await read_blocks(
+        _parser(), raw_from(corpus / "markdown" / "structure.md", MEDIA_TYPE)
+    )
     overviews = [
         block.anchor
         for block in blocks
@@ -215,8 +217,10 @@ async def test_each_repeated_heading_resolves_to_its_own_section(corpus: Path) -
     second = await parser.resolve(
         HeadingAnchor(path=("Alpha", "Overview"), fragment="overview-1"), raw
     )
-    assert first is not None and "ATX heading" in first
-    assert second is not None and "setext way" in second
+    assert first is not None
+    assert second is not None
+    assert "ATX heading" in first
+    assert "setext way" in second
     assert first != second
 
 
@@ -302,7 +306,9 @@ async def test_front_matter_does_not_become_a_heading_nobody_wrote() -> None:
     assert [block.heading_path for block in kept][-1] == ("Real heading",)
 
     unstripped = MarkdownParser(MarkdownConfig(front_matter=False))
-    paths = [block.heading_path for block in await read_blocks(unstripped, raw_of(source, MEDIA_TYPE))]
+    paths = [
+        block.heading_path for block in await read_blocks(unstripped, raw_of(source, MEDIA_TYPE))
+    ]
     assert ("title: A page",) in paths
 
 
@@ -326,13 +332,27 @@ async def test_a_jsx_component_is_media_and_its_children_stay_markdown(corpus: P
     assert "Tight components leave their children as Markdown even without blank lines." in prose
 
 
+async def test_a_component_tag_inside_a_code_fence_stays_code(corpus: Path) -> None:
+    """An MDX page documenting a component shows its tags, and showing is not invoking.
+
+    Treating those lines as invocations would blank them out of the fence, so the page would
+    lose the example it exists to give and gain ``media`` blocks for components nobody used.
+    """
+    raw = raw_from(corpus / "markdown" / "components.mdx", MDX_MEDIA_TYPE)
+    blocks = await read_blocks(_parser(), raw)
+    fence = next(block for block in blocks if block.kind is BlockKind.CODE)
+    assert fence.lang == "jsx"
+    assert '<Banner tone="note">' in fence.text
+    assert "Banner" not in [block.metadata.get("component") for block in blocks]
+
+
 async def test_a_component_tag_in_a_plain_markdown_file_is_kept_as_text() -> None:
     """``.md`` is not ``.mdx``, and a line that looks like a tag there is text.
 
     Treating it as a component would drop the line from the index, on a guess about a file
     the author wrote as Markdown.
     """
-    blocks = await _blocks("<Callout kind=\"warning\">\n", MEDIA_TYPE)
+    blocks = await _blocks('<Callout kind="warning">\n', MEDIA_TYPE)
     assert [block.kind for block in blocks] == [BlockKind.PROSE]
 
 

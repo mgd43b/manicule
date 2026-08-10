@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, JsonValue
 from python_calamine import (
     CalamineError,
     CalamineWorkbook,
@@ -182,7 +182,9 @@ def _render_cell(value: _CellValue) -> str:
         return str(value)
     if isinstance(value, dt.date | dt.time):
         return value.isoformat()
-    return value
+    # Flattened: a cell entered with Alt+Enter holds newlines, and one row has to be one line
+    # because that is the boundary the chunker splits a large table at (docs/parsing.md §4.2).
+    return " ".join(value.split())
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +208,21 @@ class _Region:
             last_row=self.first_row + len(self.rows) - 1,
             last_column=self.first_column + max(width, 1) - 1,
         )
+
+    def row_refs(self) -> list[str]:
+        """One full-width A1 range per row, in row order.
+
+        The chunker narrows a split part's ``CellAnchor`` by picking the refs of the rows the
+        part kept and the header rows it repeated, so each part addresses exactly its own cells
+        (``docs/parsing.md`` §4.2). Always the range form, never a bare cell, so runs of
+        adjacent rows collapse into one area.
+        """
+        area = self.area
+        return [
+            f"{_column_letters(area.first_column)}{number}"
+            f":{_column_letters(area.last_column)}{number}"
+            for number in range(area.first_row, area.last_row + 1)
+        ]
 
     def text(self, area: _Area | None = None) -> str | None:
         """The rendered cells of ``area``, or ``None`` when it is not inside this region.
@@ -433,12 +450,38 @@ class SpreadsheetParser:
         return _xlsx_regions(raw, self._config)
 
     def _metadata(self, region: _Region) -> Metadata:
+        """What a chunker needs to split this table without losing its header or its address.
+
+        ``rows`` is the rendered lines and ``row_refs`` their A1 ranges, index for index, so a
+        part built from a subset of the rows can carry an anchor covering exactly those cells
+        and the header repeated into it.
+        """
         area = region.area
+        rendered = (region.text(_row_area(area, number)) for number in _numbers(area))
+        rows: list[JsonValue] = [row for row in rendered if row is not None]
         return {
             "sheet": region.sheet,
             "sheet_index": region.index,
             "header_rows": min(self._config.header_rows, len(region.rows)),
-            "rows": [area.first_row, area.last_row],
-            "columns": [area.first_column, area.last_column],
+            "rows": rows,
+            "row_refs": list(region.row_refs()),
+            "first_row": area.first_row,
+            "last_row": area.last_row,
+            "first_column": area.first_column,
+            "last_column": area.last_column,
             "merged_ranges": list(region.merged),
         }
+
+
+def _numbers(area: _Area) -> range:
+    return range(area.first_row, area.last_row + 1)
+
+
+def _row_area(area: _Area, number: int) -> _Area:
+    """One row of ``area``, full width."""
+    return _Area(
+        first_row=number,
+        first_column=area.first_column,
+        last_row=number,
+        last_column=area.last_column,
+    )

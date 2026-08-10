@@ -27,6 +27,7 @@ files and we indexed 197" is not a fact anyone would ever discover.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator, Sequence
 from typing import Protocol, runtime_checkable
 
@@ -37,6 +38,7 @@ from manicule.core.content import DocumentStatus, Metadata, RawDocument
 __all__ = [
     "CONTAINER_DEPTH",
     "CONTAINER_SEPARATOR",
+    "MAX_DEPTH",
     "OCTET_STREAM",
     "PATH_HASHES",
     "TREE_BYTES",
@@ -46,6 +48,7 @@ __all__ = [
     "MemberOutcome",
     "SupportsExpansion",
     "container_depth_of",
+    "inner_path",
     "media_type_for",
     "member_source_id",
     "member_uri",
@@ -53,6 +56,14 @@ __all__ = [
     "tree_bytes_of",
     "tree_members_of",
 ]
+
+MAX_DEPTH = 3
+"""How far containers may nest, counted from the top-level document.
+
+A zip in a zip in a zip is already unusual and deeper is either a mistake or an attack. A
+member past the limit is stored with a reason rather than dropped, so the boundary is visible
+to whoever hits it (``docs/parsing.md`` §9.2).
+"""
 
 CONTAINER_SEPARATOR = "!/"
 """What separates a container's address from the path inside it.
@@ -128,12 +139,41 @@ def media_type_for(name: str) -> str:
     return _MEDIA_TYPE_BY_SUFFIX.get(lowered[dot:], OCTET_STREAM)
 
 
-def member_uri(container_uri: str, inner_path: str, *, scheme: str) -> str:
+_DRIVE_LETTER = re.compile(r"^[A-Za-z]:")
+
+
+def inner_path(name: str) -> str | None:
+    """A member's name as a path inside its container, or ``None`` when it escapes.
+
+    Members are parsed in memory and never written to disk, which removes most of the risk in
+    a hostile name — but the name still becomes part of a ``uri`` shown to users and stored in
+    the index, so it is normalised, and a name that escapes the container root is **rejected**
+    rather than sanitised. Sanitising ``../../etc/passwd`` into ``etc/passwd`` produces a
+    citation that looks ordinary and describes a file the archive never contained.
+
+    Backslashes are read as separators because a zip written on Windows uses them, empty and
+    ``.`` segments are dropped, and anything else — a leading ``/``, a drive letter, a ``..``
+    segment anywhere — is a refusal.
+    """
+    candidate = name.replace("\\", "/")
+    if candidate.startswith("/") or _DRIVE_LETTER.match(candidate):
+        return None
+    parts: list[str] = []
+    for part in candidate.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            return None
+        parts.append(part)
+    return "/".join(parts) if parts else None
+
+
+def member_uri(container_uri: str, path: str, *, scheme: str) -> str:
     """The address of a document inside a container, as a person would paste it."""
-    return f"{scheme}:{container_uri}{CONTAINER_SEPARATOR}{inner_path}"
+    return f"{scheme}:{container_uri}{CONTAINER_SEPARATOR}{path}"
 
 
-def member_source_id(container_source_id: str, inner_path: str, *, scheme: str) -> str:
+def member_source_id(container_source_id: str, path: str, *, scheme: str) -> str:
     """The stable identity of a member, built from its inner path and never from its position.
 
     Identity is what reconciliation compares, so it has to rest on something the container can
@@ -141,7 +181,7 @@ def member_source_id(container_source_id: str, inner_path: str, *, scheme: str) 
     inserted ahead of another must not inherit its identity — which is exactly what an
     ordinal would do, silently, on the next sync.
     """
-    return f"{scheme}:{container_source_id}{CONTAINER_SEPARATOR}{inner_path}"
+    return f"{scheme}:{container_source_id}{CONTAINER_SEPARATOR}{path}"
 
 
 class ExpandedMember(BaseModel):

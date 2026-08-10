@@ -28,7 +28,7 @@ Markdown inside a component's children is ordinary Markdown and is parsed as suc
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from markdown_it import MarkdownIt
@@ -74,6 +74,11 @@ _FRONT_MATTER_FENCE = "---"
 _JSX_TAG = re.compile(r"^</?(?P<name>[A-Z][A-Za-z0-9_.]*)(?:\s[^<>]*?)?/?>$")
 """A JSX component tag alone on a line. Capitalised initial letter is what distinguishes a
 component from an HTML element in JSX, and it is the rule the MDX compiler itself applies."""
+
+_FENCE_MARKERS = ("```", "~~~")
+
+_MAX_BLOCK_INDENT = 3
+"""Indent past which CommonMark stops seeing a block start and starts seeing code."""
 
 _HEADING_LEVELS: Mapping[str, int] = {f"h{level}": level for level in range(1, 7)}
 
@@ -194,25 +199,50 @@ class MarkdownParser:
         parse as ordinary Markdown instead of being absorbed into the tag.
         """
         masked = list(lines)
-        for index in range(_front_matter_end(lines) if self._config.front_matter else 0):
+        start = _front_matter_end(lines) if self._config.front_matter else 0
+        for index in range(start):
             masked[index] = ""
         media: list[_Draft] = []
         if media_type not in self._config.jsx_media_types:
             return masked, media
-        for index, line in enumerate(lines):
-            match = _JSX_TAG.match(line.strip())
-            if match is None:
-                continue
+        for index, name in _component_lines(lines, start):
             masked[index] = ""
             media.append(
                 _Draft(
                     first_line=index + 1,
                     last_line=index + 1,
                     kind=BlockKind.MEDIA,
-                    metadata={"component": match["name"]},
+                    metadata={"component": name},
                 )
             )
         return masked, media
+
+
+def _component_lines(lines: Sequence[str], start: int) -> Iterator[tuple[int, str]]:
+    """Every line that is a JSX component tag and nothing else, with the component's name.
+
+    Code is skipped, both fenced and indented. An MDX page documenting a component shows its
+    tags inside a fence, and treating those as an invocation would blank the lines out of the
+    code block — so the page would lose the example it exists to give, and gain ``media``
+    blocks for components nobody used.
+    """
+    fence = ""
+    for index in range(start, len(lines)):
+        line = lines[index]
+        stripped = line.strip()
+        if fence:
+            if stripped.startswith(fence):
+                fence = ""
+            continue
+        marker = next((mark for mark in _FENCE_MARKERS if stripped.startswith(mark)), "")
+        if marker:
+            fence = marker
+            continue
+        if len(line) - len(line.lstrip(" ")) > _MAX_BLOCK_INDENT:
+            continue
+        match = _JSX_TAG.match(stripped)
+        if match is not None:
+            yield index, match["name"]
 
 
 def _front_matter_end(lines: Sequence[str]) -> int:
