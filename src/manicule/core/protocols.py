@@ -392,6 +392,23 @@ class Generator(Protocol):
 
     model_id: str
 
+    context_window: int
+    """Tokens this generator will actually accept, prompt and completion together.
+
+    **Served, not advertised.** Not the model's trained maximum: the window that will be in
+    force for this configuration. Ollama applies a runtime ``num_ctx`` that defaults far below
+    what modern models are trained for, and a prompt exceeding it is truncated from the front
+    rather than refused — which silently discards the system prompt and the citation protocol,
+    and presents as a model that does not follow instructions. An Ollama-backed implementation
+    therefore derives this from ``/api/show`` combined with the ``num_ctx`` manicule itself
+    sets; a hosted one reads its library's model metadata.
+
+    Read by the startup cross-check in ``docs/retrieval.md`` §7.4:
+    ``context_tokens + history_tokens + system_prompt_tokens + generation_reserve`` must fit
+    it. A profile that does not fit is a refusal with both numbers named, because a limit that
+    can only be discovered by exceeding it gets discovered in production.
+    """
+
     def generate(self, query: Query, context: Context) -> AsyncIterator[Token]:
         """Stream the answer. The final token carries a finish reason."""
         ...

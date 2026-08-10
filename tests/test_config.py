@@ -6,14 +6,19 @@ from pathlib import Path
 
 import pytest
 import tomli_w
+from pydantic import ValidationError
 
 from manicule.config.loader import load_settings, save_settings
 from manicule.config.profiles import PROFILES, profile_config
 from manicule.config.providers import (
+    Egress,
     ProviderSettings,
+    egress_for,
+    endpoint_egress,
     env_var_names,
-    is_local,
+    needs_credential,
     resolve_provider_keys,
+    runs_in_process,
 )
 from manicule.config.settings import AuthMode, Mode, Settings, Theme
 from manicule.core.errors import ConfigError, PolicyError
@@ -52,10 +57,82 @@ def test_a_selected_provider_picks_its_key_up_with_no_config_file_at_all() -> No
 
 
 def test_local_providers_are_not_asked_for_a_credential() -> None:
-    assert is_local("ollama")
+    """Whether a key is needed is a property of the name, wherever the endpoint turns out to be."""
+    assert not needs_credential("ollama")
+    assert needs_credential("openai")
     resolved = resolve_provider_keys({}, required=frozenset({"ollama"}), environ={})
     assert resolved["ollama"].api_key is None
     assert resolved["ollama"].base_url == "http://localhost:11434"
+
+
+# --- egress ------------------------------------------------------------------------------
+
+
+def test_an_in_process_backend_has_no_endpoint_to_check() -> None:
+    """The one thing a provider's name settles on its own: there is nowhere to send anything."""
+    assert runs_in_process("mlx")
+    assert egress_for("mlx") is Egress.IN_PROCESS
+    assert egress_for("mlx", "http://gpu-box.lan:11434") is Egress.IN_PROCESS
+
+
+def test_a_served_provider_with_no_endpoint_falls_back_to_what_its_name_implies() -> None:
+    """A default, and stated as one — ``DEFAULT_BASE_URLS`` fills the same value in."""
+    assert egress_for("ollama") is Egress.LOOPBACK
+    assert egress_for("openai") is Egress.REMOTE
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://127.0.0.1:11434",
+        "http://127.4.5.6:11434",
+        "http://[::1]:11434",
+        "http://[::ffff:127.0.0.1]:11434",
+        "http://localhost:11434",
+        "http://LOCALHOST:11434",
+        "http://ollama.localhost:11434",
+        "http://user:pass@127.0.0.1:11434",
+        "unix:///var/run/ollama.sock",
+    ],
+)
+def test_an_endpoint_on_this_machine_is_loopback(base_url: str) -> None:
+    """Including the aliases, because a policy that only knows one spelling is a policy people
+    route around."""
+    assert endpoint_egress(base_url) is Egress.LOOPBACK
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://gpu-box.lan:11434",
+        "http://192.168.1.10:11434",
+        "http://0.0.0.0:11434",
+        "http://[::]:11434",
+        "http://169.254.169.254/latest/meta-data",
+        "http://[fe80::1]:11434",
+        "http://localhost.example.com:11434",
+        "http://not-localhost:11434",
+        "localhost:11434",
+        "http://[::1:11434",
+    ],
+)
+def test_an_endpoint_that_is_not_demonstrably_this_machine_is_remote(base_url: str) -> None:
+    """Conservative in one direction on purpose.
+
+    ``0.0.0.0`` and ``::`` are addresses you bind rather than dial; a link-local address is
+    another machine on the same link; a hostname is a name, and no name is resolved here — see
+    ``egress_for`` for why. A scheme-less or unparseable value is refused rather than guessed
+    at, and the refusal names the URL it could not vouch for.
+    """
+    assert egress_for("ollama", base_url) is Egress.REMOTE
+    assert endpoint_egress(base_url) is Egress.REMOTE
+
+
+def test_an_empty_base_url_is_an_absent_one_rather_than_a_bad_one() -> None:
+    """Nothing configured falls back to the name; a URL that parses to no host does not."""
+    assert egress_for("ollama", "") is Egress.LOOPBACK
+    assert egress_for("ollama", "   ") is Egress.LOOPBACK
+    assert endpoint_egress("") is Egress.REMOTE
 
 
 def test_a_key_in_a_dotenv_file_is_found(manicule_environment: Path) -> None:
@@ -199,6 +276,97 @@ def test_a_hosted_model_under_a_local_only_policy_is_refused(
     assert any("cloud_allowed" in problem for problem in problems)
     with pytest.raises(PolicyError):
         settings.require_valid()
+
+
+def test_a_local_provider_pointed_at_another_host_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defect this whole section exists for.
+
+    ``is_local("ollama")`` was true whatever ``base_url`` said, so this configuration started
+    cleanly while every prompt crossed the network under the setting that forbids it.
+    """
+    del monkeypatch
+    settings = Settings(
+        llm={"provider": "ollama", "base_url": "http://gpu-box.lan:11434"},  # pyright: ignore[reportArgumentType]
+        security={"data_policy": {"cloud_allowed": False}},  # pyright: ignore[reportArgumentType]
+    )
+
+    assert settings.cloud_providers_in_use == frozenset({"ollama"})
+    problems = settings.policy_problems()
+    assert any("gpu-box.lan" in problem for problem in problems), problems
+    with pytest.raises(PolicyError):
+        settings.require_valid()
+
+
+def test_a_local_provider_on_loopback_still_starts_under_that_policy() -> None:
+    """The safe configuration must not be the one that fails."""
+    settings = Settings(
+        llm={"provider": "ollama", "base_url": "http://127.0.0.1:11434"},  # pyright: ignore[reportArgumentType]
+        security={"data_policy": {"cloud_allowed": False}},  # pyright: ignore[reportArgumentType]
+    )
+
+    assert settings.cloud_providers_in_use == frozenset()
+    assert settings.policy_problems() == []
+
+
+def test_a_hosted_provider_served_on_loopback_is_not_treated_as_cloud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error in the other direction: an OpenAI-compatible server on 127.0.0.1.
+
+    It was classified cloud and refused under a local-only policy, which made the safe
+    configuration the one that failed.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    settings = Settings(
+        llm={"provider": "openai", "base_url": "http://127.0.0.1:8080/v1"},  # pyright: ignore[reportArgumentType]
+        security={"data_policy": {"cloud_allowed": False}},  # pyright: ignore[reportArgumentType]
+    )
+
+    assert settings.cloud_providers_in_use == frozenset()
+    assert settings.policy_problems() == []
+
+
+def test_the_endpoints_a_configuration_will_open_are_reported_per_role() -> None:
+    """One provider name, two endpoints, and only one of them on this machine."""
+    settings = Settings(
+        llm={"provider": "ollama", "base_url": "http://gpu-box.lan:11434"},  # pyright: ignore[reportArgumentType]
+        embedding={"provider": "ollama"},  # pyright: ignore[reportArgumentType]
+    )
+
+    egress = {endpoint.role.value: endpoint.egress for endpoint in settings.selected_endpoints}
+    assert egress == {"llm": Egress.REMOTE, "embedding": Egress.LOOPBACK}
+
+
+def test_a_blank_provider_is_refused_at_validation_rather_than_later(
+    manicule_environment: Path,
+) -> None:
+    """``policy_problems`` reports; it must not be the thing that raises.
+
+    Resolving an endpoint per role means the provider name is read while the report is being
+    built, so a name that is not a name has to be caught at the boundary — the same
+    ``min_length`` the model fields beside it already carry.
+    """
+    del manicule_environment
+    with pytest.raises(ValidationError, match="provider"):
+        Settings(llm={"provider": ""})  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ValidationError, match="provider"):
+        Settings(embedding={"provider": ""})  # pyright: ignore[reportArgumentType]
+
+    # And anything that slips past it is still reported rather than raised.
+    problems = Settings(llm={"provider": "   "}).policy_problems()  # pyright: ignore[reportArgumentType]
+    assert any("no API key" in problem for problem in problems)
+
+
+def test_a_base_url_on_an_in_process_provider_is_reported_rather_than_ignored() -> None:
+    """A setting that appears to be in force and is not is worse than one that fails."""
+    settings = Settings(
+        embedding={"provider": "mlx"},  # pyright: ignore[reportArgumentType]
+        providers={"mlx": {"base_url": "http://gpu-box.lan:11434"}},  # pyright: ignore[reportArgumentType]
+    )
+
+    assert any("dials nothing" in problem for problem in settings.policy_problems())
 
 
 def test_a_hosted_model_with_no_credential_says_which_variable_to_set() -> None:

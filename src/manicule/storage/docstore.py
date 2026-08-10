@@ -7,10 +7,10 @@ rather than a reconciliation nobody can adjudicate.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import delete, func, select
+from sqlalchemy import bindparam, delete, func, select
 from sqlalchemy import text as sql
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -24,7 +24,7 @@ from manicule.core.sources import SourceId, Watermark
 from manicule.storage import models
 from manicule.storage.engine import session_factory
 from manicule.storage.fts import SEARCH_SQL, escape_match_query
-from manicule.storage.types import utcnow
+from manicule.storage.types import UtcDateTime, utcnow
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Mapping, Sequence
@@ -37,6 +37,34 @@ _WATERMARK: TypeAdapter[Watermark] = TypeAdapter(Watermark)
 
 _INDEX_STATE_ID = 1
 """``index_state`` holds one row, because a data directory holds one index."""
+
+LISTABLE_FILTER_FIELDS: Final = frozenset(
+    {
+        "workspace_ids",
+        "sources",
+        "document_ids",
+        "media_types",
+        "updated_after",
+        "updated_before",
+    }
+)
+""":class:`~manicule.core.retrieval.Filter` fields :meth:`SqliteDocStore.list_documents` honours.
+
+Document-level fields only. ``kinds`` and ``langs`` are properties of a chunk and have no
+meaning in a list of documents; ``collection_ids`` and ``tag_ids`` need join tables this query
+does not touch. All four are refused rather than ignored, for the same reason
+:func:`~manicule.storage.vectors.predicate_for` refuses: a dropped restriction returns rows the
+filter was written to exclude, and the listing still looks like it worked.
+"""
+
+SEARCHABLE_FILTER_FIELDS: Final = LISTABLE_FILTER_FIELDS | {"kinds", "langs"}
+""":class:`~manicule.core.retrieval.Filter` fields :meth:`SqliteDocStore.search_lexical` honours.
+
+The lexical leg is one statement against the authoritative store, so it applies the whole
+filter inline, before ``LIMIT`` (``docs/retrieval.md`` §3.3). Only ``collection_ids`` and
+``tag_ids`` remain, and those are resolved into ``document_ids`` before either store is
+reached.
+"""
 
 DEFAULT_WORKSPACE = "default"
 """Personal mode has one workspace and never says so out loud.
@@ -191,10 +219,10 @@ class SqliteDocStore:
             .limit(limit)
             .offset(offset)
         )
-        self._require_same_workspace(filter)
+        self._require_honourable(filter, LISTABLE_FILTER_FIELDS, "list documents")
         if filter is not None:
-            if filter.source is not None:
-                statement = statement.where(models.Document.source == filter.source)
+            if filter.sources:
+                statement = statement.where(models.Document.source.in_(filter.sources))
             if filter.document_ids:
                 statement = statement.where(models.Document.id.in_(filter.document_ids))
             if filter.media_types:
@@ -581,7 +609,7 @@ class SqliteDocStore:
         ``k`` live rows, because deferred deletion leaves soft-deleted chunks in the index
         competing for the same slots.
         """
-        self._require_same_workspace(filter)
+        self._require_honourable(filter, SEARCHABLE_FILTER_FIELDS, "search")
         match = escape_match_query(text)
         if not match:
             return []
@@ -592,21 +620,38 @@ class SqliteDocStore:
             "limit": k,
             "workspace_id": self._workspace_id,
         }
-        if filter is not None and filter.source is not None:
-            clauses.append("AND d.source = :source")
-            params["source"] = filter.source
-        if filter is not None and filter.document_ids:
-            names = _bind_names("doc", len(filter.document_ids))
-            clauses.append(f"AND d.id IN ({', '.join(':' + n for n in names)})")
-            params.update(dict(zip(names, sorted(filter.document_ids), strict=True)))
-        if filter is not None and filter.kinds:
-            names = _bind_names("kind", len(filter.kinds))
-            clauses.append(f"AND c.kind IN ({', '.join(':' + n for n in names)})")
-            params.update(
-                dict(zip(names, sorted(kind.value for kind in filter.kinds), strict=True))
-            )
+        timestamps: list[str] = []
+        if filter is not None:
+            for column, values in (
+                ("d.source", sorted(filter.sources)),
+                ("d.id", sorted(filter.document_ids)),
+                ("d.media_type", sorted(filter.media_types)),
+                ("c.kind", sorted(kind.value for kind in filter.kinds)),
+                ("c.lang", sorted(filter.langs)),
+            ):
+                if not values:
+                    continue
+                names = _bind_names(column.replace(".", "_"), len(values))
+                clauses.append(f"AND {column} IN ({', '.join(':' + n for n in names)})")
+                params.update(dict(zip(names, values, strict=True)))
+            for name, comparison, moment in (
+                ("updated_after", ">", filter.updated_after),
+                ("updated_before", "<", filter.updated_before),
+            ):
+                if moment is None:
+                    continue
+                clauses.append(f"AND d.updated_at {comparison} :{name}")
+                params[name] = moment
+                timestamps.append(name)
 
         statement = sql(SEARCH_SQL.format(extra="\n  ".join(clauses)))
+        if timestamps:
+            # Textual SQL binds nothing by type on its own, so a datetime would reach the
+            # driver as whatever sqlite3 makes of it rather than in the one encoding
+            # `UtcDateTime` writes. Same column, same conversion, one representation.
+            statement = statement.bindparams(
+                *(bindparam(name, type_=UtcDateTime()) for name in timestamps)
+            )
         async with self._sessions() as session:
             rows = (await session.execute(statement, params)).all()
             chunk_ids = [str(row.chunk_id) for row in rows]
@@ -717,21 +762,54 @@ class SqliteDocStore:
 
     # --- internals ------------------------------------------------------------------------
 
-    def _require_same_workspace(self, filter: Filter | None) -> None:  # noqa: A002
-        """Refuse a filter that names a workspace this handle does not serve.
+    def _require_honourable(
+        self,
+        filter: Filter | None,  # noqa: A002
+        honoured: frozenset[str],
+        operation: str,
+    ) -> None:
+        """Refuse a filter this query cannot apply in full.
 
-        The workspace comes from the handle, so a filter carrying a *different* one is a
-        caller who believes they are querying somewhere else. Ignoring it silently would
-        answer a question nobody asked, which is the shape a cross-tenant leak takes.
+        Two refusals, and the order matters only in that both must happen before the
+        statement is built.
+
+        **A workspace this handle does not serve.** A subset check, because
+        :attr:`~manicule.core.retrieval.Filter.workspace_ids` is set-valued: cross-workspace
+        search is N scoped handles fanned out and merged (``docs/retrieval.md`` §3.2), so this
+        handle only ever sees its own workspace. A filter naming another one is a caller who
+        believes they are querying somewhere else, and answering the question they did not ask
+        is the shape a cross-tenant leak takes.
+
+        **A field this query has no column for.** Silently dropping it returns rows the filter
+        was written to exclude — a listing or a search that still looks like it worked. The
+        same rule as :func:`~manicule.storage.vectors.predicate_for`, applied here so that
+        "a store honours the whole filter or refuses" holds for both halves of storage.
+
+        Raises:
+            CrossWorkspaceCollisionError: The filter names another workspace.
+            ValueError: The filter sets a field this query cannot apply.
         """
-        if filter is None or filter.workspace_id is None:
+        if filter is None:
             return
-        if filter.workspace_id != self._workspace_id:
+
+        outside = sorted(filter.workspace_ids - {self._workspace_id})
+        if outside:
+            named = ", ".join(repr(name) for name in outside)
             msg = (
-                f"filter names workspace {filter.workspace_id!r} but this store serves "
-                f"{self._workspace_id!r}. Open a store for that workspace instead."
+                f"filter names workspace(s) {named} but this store serves "
+                f"{self._workspace_id!r}. Cross-workspace search is one store per workspace, "
+                f"merged — open a store for each."
             )
             raise CrossWorkspaceCollisionError(msg)
+
+        unhonoured = sorted(filter.restricting_fields - honoured)
+        if unhonoured:
+            msg = (
+                f"this store cannot {operation} by {', '.join(unhonoured)}. Resolve those "
+                f"fields into document_ids first; applying the rest and ignoring them would "
+                f"return rows the filter was written to exclude."
+            )
+            raise ValueError(msg)
 
     async def _live_document(
         self, session: AsyncSession, document_id: str
@@ -808,7 +886,9 @@ def _from_chunk(chunk: Chunk, document_id: str) -> models.Chunk:
         heading_text=" > ".join(chunk.heading_path),
         heading_path=list(chunk.heading_path),
         kind=chunk.kind,
-        lang=None,
+        # Promoted into a column so the lexical leg can filter on it, through the one
+        # accessor the Lance row also uses (`docs/retrieval.md` §3.3).
+        lang=chunk.lang,
         position=chunk.position,
         token_count=chunk.token_count,
         anchor=chunk.anchor.model_dump(mode="json"),
@@ -834,4 +914,10 @@ def _to_chunk(row: models.Chunk) -> Chunk:
     )
 
 
-__all__ = ["DEFAULT_WORKSPACE", "CrossWorkspaceCollisionError", "SqliteDocStore"]
+__all__ = [
+    "DEFAULT_WORKSPACE",
+    "LISTABLE_FILTER_FIELDS",
+    "SEARCHABLE_FILTER_FIELDS",
+    "CrossWorkspaceCollisionError",
+    "SqliteDocStore",
+]

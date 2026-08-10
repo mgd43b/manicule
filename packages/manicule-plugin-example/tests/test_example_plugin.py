@@ -19,7 +19,7 @@ from manicule.container import Container, keys
 from manicule.core.anchors import LineAnchor, Unlocated
 from manicule.core.content import RawDocument
 from manicule.core.protocols import Middleware, Parser, RetrievalStage
-from manicule.core.retrieval import Query
+from manicule.core.retrieval import Filter, Query
 from manicule.core.version import CORE_VERSION
 from manicule.plugins import ComponentRegistry, check_core_version, discover
 from manicule.testing import assert_parser_contract, assert_retrieval_stage_contract
@@ -75,7 +75,8 @@ async def test_configuration_reaches_the_component() -> None:
 
 
 async def test_the_control_stage_changes_nothing() -> None:
-    await assert_retrieval_stage_contract(PassthroughStage(), Query(text="q"), [])
+    query = Query(text="q", filter=Filter(workspace_ids=frozenset({"default"})))
+    await assert_retrieval_stage_contract(PassthroughStage(), query, [])
 
 
 def test_each_component_satisfies_its_protocol(settings: Settings) -> None:

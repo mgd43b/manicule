@@ -119,6 +119,46 @@ async def test_a_chunker_with_no_embedder_bound_starts_and_marks_its_chunks() ->
     assert chunks[0].metadata["provisional"] is True
 
 
+def test_a_chunk_records_the_language_its_blocks_agree_on() -> None:
+    """A promoted column nothing populates is a filter field that can never match.
+
+    Both stores read ``metadata["lang"]`` into a column a ``langs`` filter resolves against,
+    and nothing was putting it there: ``ParsedBlock.lang`` stopped at the chunker.
+    """
+    chunker = make_chunker()
+    blocks = [
+        prose("alpha beta gamma").model_copy(update={"lang": "fr"}),
+        prose("delta epsilon", start=2, end=2).model_copy(update={"lang": "fr"}),
+    ]
+
+    chunks = chunker.chunk(document(), blocks)
+
+    assert [chunk.metadata["lang"] for chunk in chunks] == ["fr"]
+
+
+def test_a_chunk_whose_blocks_disagree_about_language_claims_none() -> None:
+    """``ParsedBlock.lang`` means a code language on one block and a natural one on the next.
+
+    Naming either as the chunk's language would make a ``langs`` filter return the other.
+    ``None`` is what undetermined already means everywhere else it appears.
+    """
+    chunker = make_chunker()
+    blocks = [
+        prose("alpha beta gamma").model_copy(update={"lang": "en"}),
+        ParsedBlock(
+            kind=BlockKind.CODE,
+            text="def f():\n    return 1",
+            anchor=LineAnchor(start=2, end=3),
+            lang="python",
+        ),
+    ]
+
+    chunks = chunker.chunk(document(), blocks)
+
+    assert len(chunks) == 1
+    assert "lang" not in chunks[0].metadata
+
+
 def test_a_provisional_count_is_inflated_rather_than_trusted() -> None:
     inflated = counter(provisional=True)("one two three four")
     assert inflated > int(4 * PROVISIONAL_SAFETY_FACTOR) - 1

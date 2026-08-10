@@ -358,8 +358,8 @@ correctness depends on it: the post-filter plan is always correct, only slower.
 
 The shape above is not what shipped, so closing the question has a bill, and it is a small one.
 Filed as [#36](https://github.com/mgd43b/manicule/issues/36) rather than done here, because this
-document owns no code and two implementation tickets are in flight. The mechanical consequences,
-so the ticket is actionable:
+document owns no code and two implementation tickets are in flight, and **paid there** — the
+list below is what that ticket did, kept as the record of why each item was necessary:
 
 - `Filter()` no longer constructs. `predicate_for` uses `default = Filter()` as a comparison
   sentinel and `filter.is_empty` as a short-circuit; both need replacing with a comparison

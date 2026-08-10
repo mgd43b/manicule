@@ -273,6 +273,25 @@ class Chunk(_Content):
     token_count: int = Field(ge=0)
     metadata: Metadata = Field(default_factory=dict)
 
+    @property
+    def lang(self) -> str | None:
+        """The language this chunk records, or ``None`` when it is undetermined.
+
+        Read through :attr:`metadata` rather than stored as a field of its own, because
+        ``docs/contracts.md`` §2 fixes what a chunk *is* and this is a chunker-supplied
+        annotation rather than part of that identity. The chunker sets it only when a chunk's
+        blocks agree on a language.
+
+        It is a property rather than two `metadata.get` calls because both stores promote it
+        into a column that :attr:`~manicule.core.retrieval.Filter.langs` resolves against —
+        ``chunks.lang`` in SQLite and ``lang`` in the Lance table — and a promotion rule that
+        differed between them would return two different corpora for one filter. ``None``
+        means undetermined, which is not the same as any particular language and never matches
+        an ``IN`` list.
+        """
+        value = self.metadata.get("lang")
+        return value if isinstance(value, str) else None
+
 
 class Retention(_Content):
     """What became of a document's source bytes when the pipeline offered them for keeping.

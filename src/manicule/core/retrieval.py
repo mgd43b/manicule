@@ -12,7 +12,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from manicule.core.content import BlockKind, Chunk, Metadata
 
@@ -28,35 +28,34 @@ class RetrievalProfile(StrEnum):
 class Filter(BaseModel):
     """A restriction on which chunks a search may return.
 
-    Every field is a conjunct; within a field, membership is a disjunction. An unset field
-    imposes no restriction.
+    Every field is a conjunct; within a field, membership is a disjunction. A field left at
+    its default restricts nothing — except :attr:`workspace_ids`, which has no default.
 
-    .. note::
-
-       Provisional. The exact split between predicates pushed into the vector store and
-       those applied as a metadata pre-filter wants contact with real data volumes, so the
-       shape here is the conservative superset the relational model already supports.
-       :attr:`extra` exists so a store can accept a predicate this type cannot yet express
-       without anyone widening it prematurely.
+    The shape is settled: ``docs/retrieval.md`` §3 closes the question ``docs/contracts.md``
+    §6 had carried open since #1. There is deliberately no untyped escape hatch. This is the
+    one type that carries a security boundary, so a reviewer has to be able to see the whole
+    restriction, and a field whose meaning is whatever the store decides cannot be reviewed.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    workspace_id: str | None = Field(
-        default=None,
-        description="Tenant scope. Applied on every query when team mode is on; a query "
-        "that forgets it is a cross-tenant leak, so stores must treat it as mandatory "
-        "rather than optional in that mode.",
+    workspace_ids: frozenset[str] = Field(
+        min_length=1,
+        description="Tenant scope. Required and non-empty, because a boundary you can forget "
+        "to pass is not a boundary and ``frozenset()`` reads as 'no restriction' while "
+        "meaning 'match nothing'. Set-valued so that admin cross-workspace search — N scoped "
+        "handles fanned out and merged — is more members rather than a way to make the field "
+        "optional again.",
     )
-    source: str | None = None
     document_ids: frozenset[str] = frozenset()
+    sources: frozenset[str] = frozenset()
     collection_ids: frozenset[str] = frozenset()
     tag_ids: frozenset[str] = frozenset()
     media_types: frozenset[str] = frozenset()
     kinds: frozenset[BlockKind] = frozenset()
+    langs: frozenset[str] = frozenset()
     updated_after: datetime | None = None
     updated_before: datetime | None = None
-    extra: dict[str, JsonValue] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _timestamps_are_aware(self) -> Self:
@@ -68,9 +67,22 @@ class Filter(BaseModel):
         return self
 
     @property
-    def is_empty(self) -> bool:
-        """True when this filter restricts nothing."""
-        return self == Filter()
+    def restricting_fields(self) -> frozenset[str]:
+        """The fields this filter actually restricts on.
+
+        Each field is compared against its own declared default rather than against an empty
+        ``Filter``, because there is no such thing: :attr:`workspace_ids` is required, so it
+        has no default and is always in this set.
+
+        This is what lets a store enumerate what it was asked for and refuse the fields it
+        cannot honour. A store that silently drops one returns results the filter was written
+        to exclude, and the result still looks like a working search.
+        """
+        return frozenset(
+            name
+            for name, field in type(self).model_fields.items()
+            if getattr(self, name) != field.get_default(call_default_factory=True)
+        )
 
 
 class Query(BaseModel):
@@ -86,7 +98,11 @@ class Query(BaseModel):
 
     text: str = Field(min_length=1)
     limit: int = Field(default=10, ge=1, description="Candidates the pipeline should return.")
-    filter: Filter = Field(default_factory=Filter)
+    filter: Filter = Field(
+        description="What the search may return. Required, and has no default, because it "
+        "carries the workspace scope: a query that can be built without one is a query that "
+        "can be run without one."
+    )
     profile: RetrievalProfile = RetrievalProfile.BALANCED
     metadata: Metadata = Field(default_factory=dict)
 

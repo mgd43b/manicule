@@ -3,9 +3,10 @@
 Shipped rather than kept in the test tree, so a third-party plugin can be held to the same
 standard as a built-in one with an import instead of a copied file.
 
-Every check here corresponds to a promise made in :mod:`manicule.core.protocols`. A promise
-in a docstring is a hope; the same promise with a function that fails when it is broken is a
-contract.
+Every check here corresponds to a promise made in :mod:`manicule.core.protocols` — or, for the
+last two, in :mod:`manicule.config` and by the stores that carry the workspace boundary. A
+promise in a docstring is a hope; the same promise with a function that fails when it is broken
+is a contract.
 
 Checks raise :class:`AssertionError` explicitly rather than using ``assert``, so they keep
 working under ``python -O``.
@@ -22,14 +23,16 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 from manicule.core.anchors import Unlocated
-from manicule.core.content import Chunk, Document, ParsedBlock, RawDocument
+from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
 from manicule.core.embedding import EmbedFingerprint, Pooling, Vector
 from manicule.core.errors import ContextOverflowError, FingerprintMismatchError
 from manicule.core.protocols import (
     Chunker,
     Connector,
+    DocStore,
     Embedder,
     Middleware,
     Parser,
@@ -38,6 +41,9 @@ from manicule.core.protocols import (
     read_blocks,
 )
 from manicule.core.retrieval import Candidate, Query
+
+if TYPE_CHECKING:  # pragma: no cover - imported for typing only, never at run time
+    from manicule.config.settings import Settings
 
 
 @asynccontextmanager
@@ -604,12 +610,168 @@ async def assert_middleware_contract(
     return returned
 
 
+# --- the workspace boundary --------------------------------------------------------------
+
+
+async def assert_pipeline_enforces_scope(
+    pipeline: Sequence[RetrievalStage],
+    docstore: DocStore,
+    query: Query,
+    *,
+    expect_results: bool = True,
+) -> list[Candidate]:
+    """Check that no stage of a pipeline emits a chunk the query's scope excludes.
+
+    **This is the check that makes one deliberate omission safe.**
+    :data:`manicule.storage.vectors.EXEMPT_FILTER_FIELDS` lets the vector store drop
+    ``workspace_ids`` — it has no column for tenancy and will not get one, because copying a
+    value into a derived store creates a value that can disagree. The boundary moves to the
+    hydrating join inside the dense stage (``docs/retrieval.md`` §4.2) rather than
+    disappearing, and "it is enforced somewhere else" is a claim, not a guarantee, until
+    something fails when it is not.
+
+    Run it against a fixture that holds what a leak would draw from: chunks of a soft-deleted
+    document, chunks of one that is not ``indexed``, and chunks belonging to another
+    workspace. A dense stage that searched Lance and skipped the join returns them, ranked and
+    plausible, and fails here.
+
+    Every stage's output is checked, not just the last. A stage that emits an out-of-scope
+    chunk and a later filter that happens to remove it is a pipeline whose safety depends on
+    stage order — and the whole point of a uniform stage is that the order can change.
+
+    Visibility is decided by the store rather than by a list passed in, because the store is
+    the thing retrieval will actually consult: ``get_document`` returns ``None`` for a
+    document in another workspace or soft-deleted, and the status it reports covers the rest.
+    Pass the handle for the workspace the query names.
+
+    Args:
+        pipeline: The stages, in the order the runner would call them.
+        docstore: The document store scoped to the query's workspace.
+        query: The query to run. Its filter carries the scope being enforced.
+        expect_results: Require the pipeline to return something. On by default: a pipeline
+            that returns nothing satisfies "returned nothing out of scope" without having
+            demonstrated anything, so a fixture with no live in-scope chunk is a check that
+            cannot fail. Turn it off only where this runs as a runtime assertion, where an
+            empty result is an ordinary outcome.
+
+    Returns:
+        The final stage's candidates, so a caller can make further assertions.
+
+    Raises:
+        AssertionError: A stage emitted a chunk outside the scope, or the pipeline is empty,
+            or it returned nothing while ``expect_results`` was set.
+    """
+    _require(pipeline, "assert_pipeline_enforces_scope needs at least one stage to run")
+
+    candidates: list[Candidate] = []
+    for stage in pipeline:
+        candidates = await stage.run(query, list(candidates))
+        for candidate in candidates:
+            document = await docstore.get_document(candidate.chunk.document_id)
+            where = (
+                f"stage {stage.name!r} returned chunk {candidate.chunk.id!r} of document "
+                f"{candidate.chunk.document_id!r}"
+            )
+            if document is None:
+                _fail(
+                    f"{where}, which this store cannot see: it belongs to another workspace "
+                    f"or has been soft-deleted. The vector table has no column for either, so "
+                    f"a stage that searched it without hydrating through the document store "
+                    f"has turned a scoped query into an unscoped one that still looks like it "
+                    f"worked"
+                )
+            elif document.status is not DocumentStatus.INDEXED:
+                _fail(
+                    f"{where}, whose status is {document.status.value!r} rather than "
+                    f"'indexed'. Only an indexed document has chunks whose vectors and text "
+                    f"are both current; the rest are visible to the store and must not be "
+                    f"visible to a search"
+                )
+
+    if expect_results:
+        _require(
+            candidates,
+            "the pipeline returned no candidates, so this check passed without seeing one. "
+            "Give the fixture at least one live, indexed, in-workspace chunk that the query "
+            "matches — otherwise a stage that enforces nothing passes too",
+        )
+    return candidates
+
+
+# --- configuration -------------------------------------------------------------------------
+
+
+def assert_local_only_policy_is_enforced(settings: Settings) -> None:
+    """Check that a local-only configuration is admitted exactly when nothing leaves.
+
+    ``security.data_policy.cloud_allowed = false`` is a promise about where document content
+    goes. It was once kept by consulting the provider's *name*, which meant an ``ollama``
+    pointed at another host satisfied it while every prompt and every retrieved passage
+    crossed the network — the policy reporting itself satisfied by the configuration it exists
+    to forbid.
+
+    Both directions are checked, and the second is not a formality: a predicate that refuses
+    an endpoint on ``127.0.0.1`` because the provider is spelled ``openai`` is not a policy,
+    it is a ban, and it teaches people to turn the policy off.
+
+    Args:
+        settings: A configuration whose data policy is local-only.
+
+    Raises:
+        AssertionError: An endpoint that leaves the machine was admitted, an endpoint on this
+            machine was refused, or a refusal did not name the endpoint responsible.
+    """
+    _require(
+        not settings.security.data_policy.cloud_allowed,
+        "assert_local_only_policy_is_enforced needs a configuration with "
+        "security.data_policy.cloud_allowed set to false; there is no policy to enforce "
+        "otherwise",
+    )
+
+    problems = _problems_attributable_to_the_policy(settings)
+    for endpoint in settings.selected_endpoints:
+        blamed = [problem for problem in problems if endpoint.describe() in problem]
+        if endpoint.leaves_machine:
+            _require(
+                blamed,
+                f"the {endpoint.describe()} is not on this machine, and the configuration "
+                f"was admitted anyway. Every prompt and every retrieved passage would cross "
+                f"the network under a policy that forbids exactly that, and nothing would "
+                f"report it. Problems reported: {problems or 'none'}",
+            )
+        else:
+            _require(
+                not blamed,
+                f"the {endpoint.describe()} is on this machine and was refused: "
+                f"{blamed}. A local-only policy that rejects a genuinely local endpoint is "
+                f"not a policy, it is a ban, and the way round it is to switch the policy off",
+            )
+
+
+def _problems_attributable_to_the_policy(settings: Settings) -> list[str]:
+    """The problems this configuration has *because* cloud processing is forbidden.
+
+    Computed as the difference against the same configuration with ``cloud_allowed`` on,
+    rather than by matching on the text of a message. A configuration has problems for
+    several reasons at once — a missing credential, a stray ``base_url`` on an in-process
+    provider — and several of them name an endpoint too. Blaming an endpoint for one of those
+    would report a local endpoint as refused when nothing refused it, which is a false alarm
+    on the branch that exists to catch over-strictness.
+    """
+    permissive = settings.model_copy(deep=True)
+    permissive.security.data_policy.cloud_allowed = True
+    unrelated = permissive.policy_problems()
+    return [problem for problem in settings.policy_problems() if problem not in unrelated]
+
+
 __all__ = [
     "assert_chunker_contract",
     "assert_connector_contract",
     "assert_embedder_contract",
+    "assert_local_only_policy_is_enforced",
     "assert_middleware_contract",
     "assert_parser_contract",
+    "assert_pipeline_enforces_scope",
     "assert_protocol_signatures",
     "assert_refuses_oversized_chunks",
     "assert_retrieval_stage_contract",

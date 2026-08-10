@@ -38,7 +38,7 @@ this one instead keeps the integration tests hermetic: building the real embedde
 download a model, which is not something a test suite should do.
 
 ``local`` rather than an invented name, because provider names are also what the credential
-policy reads: anything outside ``LOCAL_PROVIDERS`` is required to carry an API key, and a
+policy reads: anything outside ``KEYLESS_PROVIDERS`` is required to carry an API key, and a
 stand-in that tripped that check would be testing the wrong thing.
 """
 

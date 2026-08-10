@@ -101,13 +101,14 @@ needs the window. Nothing on the protocol exposes it:
 ```
 Generator
     model_id: str
-    context_window: int        # ← does not exist today
+    context_window: int        # ← added by #41
     generate(query, context) -> AsyncIterator[Token]
 ```
 
 This document does not edit `contracts.md`; three implementation tickets are building against
-it. The change is filed as [#41](https://github.com/mgd43b/manicule/issues/41), and §4.3 says
-what the number must mean, because the obvious reading of it is wrong on the default runtime.
+it. The change was filed as [#41](https://github.com/mgd43b/manicule/issues/41) and has since
+landed there, and §4.3 says what the number must mean, because the obvious reading of it is
+wrong on the default runtime.
 
 It is additive and it is not `RetrievalStage` or `Anchor`, so it carries neither lock.
 
@@ -932,7 +933,9 @@ through a changed redactor would churn chunk ids and vectors on every pattern ed
 ### 7.1 The predicate is the endpoint, not the provider's name
 
 The question "is this text leaving the machine?" has an obvious wrong answer, and **manicule
-currently gives it.**
+gave it.** The rule below is what replaced it: the findings in this section are recorded in the
+past tense because [#44](https://github.com/mgd43b/manicule/issues/44) fixed them, and the rule
+itself is in force — it is what every provider added from here on gets classified by.
 
 > **Prior art.** `const cloudProviders = new Set(['openai', 'anthropic', 'google', 'grok'])`,
 > hardcoded in `bootstrap.ts`. The set has to be edited every time a provider is added, and
@@ -952,14 +955,17 @@ nothing leaves." `Settings.cloud_providers_in_use` and the `cloud_allowed` check
 `Settings.policy_problems()` are both built on it. And `ProviderSettings.base_url` exists
 precisely so that "local and hosted models differ by this and nothing else" — so
 `provider = "ollama"` with `base_url = "http://gpu-box.lan:11434"` and
-`cloud_allowed = false` **starts cleanly today** while every prompt and every retrieved passage
-crosses the network. The policy that exists to prevent that reports itself satisfied. It errs
-the other way too: an OpenAI-compatible endpoint on `127.0.0.1` is classified cloud, so the
-safe configuration is the one that fails.
+`cloud_allowed = false` **started cleanly** while every prompt and every retrieved passage
+crossed the network. The policy that exists to prevent that reported itself satisfied. It erred
+the other way too: an OpenAI-compatible endpoint on `127.0.0.1` was classified cloud, so the
+safe configuration was the one that failed.
 
 Naming this rather than quietly designing around it, because a document that criticises a
 pattern its own codebase implements has not finished the argument. Filed as
-[#44](https://github.com/mgd43b/manicule/issues/44).
+[#44](https://github.com/mgd43b/manicule/issues/44), and fixed there: `manicule.config.providers`
+now exposes `Egress` and `egress_for(provider, base_url)`, `Settings.selected_endpoints` resolves
+one endpoint per role, and `manicule.testing.assert_local_only_policy_is_enforced` holds a
+configuration to the guarantee in both directions.
 
 **The predicate splits what the provider name conflates:**
 
@@ -1677,7 +1683,7 @@ Three concrete Apple-specific notes, all throughput:
 | System / turns / passages-then-question, with the question last so truncation loses a passage | §6.1 |
 | The citation protocol section of the system prompt is not configurable | §6.1 |
 | The label carries the breadcrumb; the body is `Chunk.text`; no chunk ids in the prompt | §6.2 |
-| Egress is classified by resolved endpoint, never by provider name — merged `is_local` gets this wrong today | §7.1 |
+| Egress is classified by resolved endpoint, never by provider name — merged `is_local` got this wrong, fixed in [#44](https://github.com/mgd43b/manicule/issues/44) | §7.1 |
 | Query and history are redacted on egress; the answer and the index are not | §7.2 |
 | `RedactionSettings.scope` (`remote` default, `always` available) | §7.2 |
 | Detectors are named and versioned; a custom pattern that does not compile is a startup refusal | §7.3 |
@@ -1723,11 +1729,11 @@ Places this design had to decide something no merged document had a position on.
 - **`SourceRestrictions.local_only`, `SourceRestrictions.cloud_allowed` and
   `WorkspaceOverride.cloud_allowed` had no defined behaviour.** They are declared in merged
   configuration and nothing reads them; §7.5 gives them one.
-- **The `cloud_allowed` policy that *is* enforced is computed from the wrong input.**
-  `is_local` classifies egress by provider name, so a LAN Ollama satisfies a local-only policy
-  while content leaves the machine (§7.1,
-  [#44](https://github.com/mgd43b/manicule/issues/44)). No document had noticed that
-  `base_url` makes the provider name insufficient.
+- **The `cloud_allowed` policy that *is* enforced was computed from the wrong input.**
+  `is_local` classified egress by provider name, so a LAN Ollama satisfied a local-only policy
+  while content left the machine (§7.1,
+  [#44](https://github.com/mgd43b/manicule/issues/44), since fixed). No document had noticed
+  that `base_url` makes the provider name insufficient.
 - **`RedactionSettings` had no scope, no detector registry and no failure semantics.** The
   section's docstring settles *where* redaction happens; §7.2 and §7.3 settle what it does, what
   it costs, and which direction it fails in.

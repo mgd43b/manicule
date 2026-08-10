@@ -99,11 +99,29 @@ against this set, so a future edit that threads a name in from somewhere less tr
 fails loudly instead of composing a query out of it.
 """
 
-PUSHED_DOWN_FILTER_FIELDS: Final = frozenset({"document_ids", "kinds"})
+PUSHED_DOWN_FILTER_FIELDS: Final = frozenset({"document_ids", "kinds", "langs"})
 """:class:`~manicule.core.retrieval.Filter` fields this store can answer by itself.
 
-Every other field needs a join the vector table has no columns for. Those are resolved in
-the document store first and arrive here as ``document_ids`` (``docs/storage.md`` §6.6).
+One entry per promoted column. Every other field needs a join the vector table has no columns
+for; those are resolved in the document store first and arrive here as ``document_ids``
+(``docs/retrieval.md`` §3.3).
+"""
+
+EXEMPT_FILTER_FIELDS: Final = frozenset({"workspace_ids"})
+""":class:`~manicule.core.retrieval.Filter` fields this store neither honours nor refuses.
+
+**A named exemption rather than an omission, because the two look identical in a loop and
+only one of them is deliberate.** ``workspace_ids`` is a security boundary (``PLAN.md`` §14),
+and the vector table has no column for it — not by oversight but by design: tenancy and
+liveness live on ``documents`` in the authoritative store, and copying them into a derived one
+creates a value that can disagree (``docs/storage.md`` §6.2).
+
+The boundary therefore moved rather than disappeared. It is enforced by the hydrating join
+inside the dense stage (``docs/retrieval.md`` §4.2), which is also what stops soft-deleted and
+cross-workspace rows consuming top-``k`` slots, and
+:func:`manicule.testing.assert_pipeline_enforces_scope` is what holds a pipeline to it. That
+check is the reason this exemption is acceptable at all: without it, "the boundary is enforced
+somewhere else" is a claim nothing verifies.
 """
 
 
@@ -162,22 +180,23 @@ def membership(column: str, values: Iterable[str]) -> str:
 
 
 def predicate_for(filter: Filter | None) -> str | None:  # noqa: A002 - the domain's word
-    """The Lance predicate for ``filter``, or ``None`` when it restricts nothing.
+    """The Lance predicate for ``filter``, or ``None`` when nothing pushes down.
+
+    ``None`` covers two cases that are the same instruction to this store: no filter at all,
+    and a filter restricting only fields resolved elsewhere — which
+    :data:`EXEMPT_FILTER_FIELDS` names, one field, with the reason attached.
 
     Raises:
-        ValueError: When ``filter`` sets a field this store cannot honour. Refusing is the
-            point. ``workspace_id`` is a security boundary (``PLAN.md`` §14) and the vector
-            table has no column for it, so quietly dropping it would turn a tenant scope
-            into a cross-tenant search that still looks like it worked.
+        ValueError: When ``filter`` sets a field this store can neither honour nor has been
+            granted an exemption for. Refusing is the point: quietly dropping a restriction
+            returns results the filter was written to exclude, and the search still looks
+            like it worked.
     """
-    if filter is None or filter.is_empty:
+    if filter is None:
         return None
 
-    default = Filter()
     unhonoured = sorted(
-        name
-        for name in type(filter).model_fields
-        if name not in PUSHED_DOWN_FILTER_FIELDS and getattr(filter, name) != getattr(default, name)
+        filter.restricting_fields - PUSHED_DOWN_FILTER_FIELDS - EXEMPT_FILTER_FIELDS
     )
     if unhonoured:
         msg = (
@@ -193,6 +212,8 @@ def predicate_for(filter: Filter | None) -> str | None:  # noqa: A002 - the doma
         terms.append(membership("document_id", filter.document_ids))
     if filter.kinds:
         terms.append(membership("kind", [kind.value for kind in filter.kinds]))
+    if filter.langs:
+        terms.append(membership("lang", filter.langs))
     return " AND ".join(terms) if terms else None
 
 
@@ -452,13 +473,12 @@ class LanceVectorStore:
                 f"fingerprint, so a disagreement here means two embedders are in play."
             )
             raise ValueError(msg)
-        lang = chunk.metadata.get("lang")
         return {
             ID_COLUMN: chunk.id,
             VECTOR_COLUMN: values,
             "document_id": chunk.document_id,
             "kind": chunk.kind.value,
-            "lang": lang if isinstance(lang, str) else None,
+            "lang": chunk.lang,
             "position": chunk.position,
             CHUNK_COLUMN: chunk.model_dump_json(),
         }
@@ -546,6 +566,7 @@ class LanceVectorStore:
 
 
 __all__ = [
+    "EXEMPT_FILTER_FIELDS",
     "FILTERABLE_COLUMNS",
     "META_TABLE",
     "PUSHED_DOWN_FILTER_FIELDS",

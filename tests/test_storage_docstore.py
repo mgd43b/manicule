@@ -11,12 +11,25 @@ from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
 from manicule.core.protocols import DocStore
 from manicule.core.retrieval import Filter
 from manicule.core.sources import Watermark
-from manicule.storage.docstore import CrossWorkspaceCollisionError, SqliteDocStore
+from manicule.storage.docstore import (
+    DEFAULT_WORKSPACE,
+    CrossWorkspaceCollisionError,
+    SqliteDocStore,
+)
 from manicule.testing import assert_protocol_signatures, closing
 from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
+
+
+def scoped(**restrictions: object) -> Filter:
+    """A filter scoped to the workspace the ``store`` fixture serves.
+
+    Every filter carries a workspace now — the field is required precisely so that no query
+    can be written without one — so the tests say it once here rather than in every call.
+    """
+    return Filter(workspace_ids=frozenset({DEFAULT_WORKSPACE}), **restrictions)  # pyright: ignore[reportArgumentType]
 
 
 @pytest.mark.contract
@@ -184,8 +197,20 @@ async def test_listing_documents_can_be_filtered(store: SqliteDocStore) -> None:
     )
 
     assert len(await store.list_documents()) == 2
-    assert len(await store.list_documents(Filter(source="confluence"))) == 1
-    assert len(await store.list_documents(Filter(media_types=frozenset({"text/html"})))) == 1
+    assert len(await store.list_documents(scoped(sources=frozenset({"confluence"})))) == 1
+    assert len(await store.list_documents(scoped(media_types=frozenset({"text/html"})))) == 1
+
+
+async def test_listing_documents_refuses_a_field_it_has_no_column_for(
+    store: SqliteDocStore,
+) -> None:
+    """A chunk restriction on a list of documents has no meaning, so it is not guessed at.
+
+    Applying the rest of the filter and dropping this one would return documents the caller
+    asked to exclude, in a listing that still looks like it worked.
+    """
+    with pytest.raises(ValueError, match="kinds"):
+        await store.list_documents(scoped(kinds=frozenset({BlockKind.CODE})))
 
 
 async def test_filtering_lexical_search_by_kind_pushes_into_the_query(
@@ -202,9 +227,77 @@ async def test_filtering_lexical_search_by_kind_pushes_into_the_query(
         ],
     )
     only_code = await store.search_lexical(
-        "authentication", k=5, filter=Filter(kinds=frozenset({BlockKind.CODE}))
+        "authentication", k=5, filter=scoped(kinds=frozenset({BlockKind.CODE}))
     )
     assert [candidate.chunk.kind for candidate in only_code] == [BlockKind.CODE]
+
+
+async def test_lexical_search_filters_on_the_language_column_it_promotes(
+    store: SqliteDocStore,
+) -> None:
+    """The authoritative store has to hold what the derived one filters on.
+
+    ``langs`` resolves against ``chunks.lang`` here and against the Lance ``lang`` column in
+    the dense leg. Both are promoted out of the chunk's metadata by the same rule, because two
+    legs of one query that disagreed about what language a chunk is in would return two
+    different corpora for the same filter.
+    """
+    document = make_document()
+    await store.upsert_document(document)
+    await store.replace_chunks(
+        document.id,
+        [
+            make_chunk(document, 0, "authentication in english", lang="en"),
+            make_chunk(document, 1, "authentication en francais", lang="fr"),
+        ],
+    )
+
+    french = await store.search_lexical(
+        "authentication", k=5, filter=scoped(langs=frozenset({"fr"}))
+    )
+
+    assert [candidate.chunk.text for candidate in french] == ["authentication en francais"]
+
+
+async def test_lexical_search_applies_every_document_level_restriction_inline(
+    store: SqliteDocStore,
+) -> None:
+    """One statement, so ``LIMIT`` lands after the filters rather than before them."""
+    wanted = make_document(source="confluence", source_id="a", media_type="text/html")
+    other = make_document(source="fs", source_id="b")
+    for document in (wanted, other):
+        await store.upsert_document(document)
+        await store.replace_chunks(document.id, [make_chunk(document, 0, "authentication")])
+
+    by_source = await store.search_lexical(
+        "authentication", k=5, filter=scoped(sources=frozenset({"confluence"}))
+    )
+    by_media_type = await store.search_lexical(
+        "authentication", k=5, filter=scoped(media_types=frozenset({"text/html"}))
+    )
+    before_the_epoch = await store.search_lexical(
+        "authentication", k=5, filter=scoped(updated_before=datetime(2000, 1, 1, tzinfo=UTC))
+    )
+    since_the_epoch = await store.search_lexical(
+        "authentication", k=5, filter=scoped(updated_after=datetime(2000, 1, 1, tzinfo=UTC))
+    )
+
+    assert [candidate.chunk.document_id for candidate in by_source] == [wanted.id]
+    assert [candidate.chunk.document_id for candidate in by_media_type] == [wanted.id]
+    # Both bounds, because "returned nothing" is what a timestamp that reached the driver in
+    # the wrong encoding looks like as well.
+    assert before_the_epoch == []
+    assert len(since_the_epoch) == 2
+
+
+async def test_lexical_search_refuses_a_field_it_cannot_apply(store: SqliteDocStore) -> None:
+    """``collection_ids`` needs a join this statement does not make.
+
+    The retrieval layer resolves it into ``document_ids`` before either store is reached, so
+    arriving here with one set is a caller who believes a restriction is in force that is not.
+    """
+    with pytest.raises(ValueError, match="collection_ids"):
+        await store.search_lexical("anything", k=5, filter=scoped(collection_ids=frozenset({"c"})))
 
 
 async def test_a_document_id_containing_a_quote_cannot_break_the_filter(
@@ -217,7 +310,7 @@ async def test_a_document_id_containing_a_quote_cannot_break_the_filter(
 
     hostile = "' OR 1=1 --"
     results = await store.search_lexical(
-        "authentication", k=5, filter=Filter(document_ids=frozenset({hostile}))
+        "authentication", k=5, filter=scoped(document_ids=frozenset({hostile}))
     )
     assert results == []
 
@@ -339,16 +432,22 @@ async def test_an_id_built_without_the_workspace_cannot_land_on_another_tenants_
 
 
 async def test_a_filter_naming_another_workspace_is_refused(engine: AsyncEngine) -> None:
-    """Silently ignoring it would answer a question nobody asked."""
+    """Silently ignoring it would answer a question nobody asked.
+
+    A subset check rather than an equality one, because the field is set-valued: cross-workspace
+    search is one handle per workspace merged, so a handle that is offered a set reaching past
+    its own is being asked for somebody else's corpus.
+    """
     alpha = SqliteDocStore(engine, workspace_id="alpha")
     await alpha.ensure_workspace()
 
-    with pytest.raises(CrossWorkspaceCollisionError, match="this store serves"):
-        await alpha.list_documents(Filter(workspace_id="beta"))
-    with pytest.raises(CrossWorkspaceCollisionError, match="this store serves"):
-        await alpha.search_lexical("anything", k=5, filter=Filter(workspace_id="beta"))
+    for named in (frozenset({"beta"}), frozenset({"alpha", "beta"})):
+        with pytest.raises(CrossWorkspaceCollisionError, match="this store serves"):
+            await alpha.list_documents(Filter(workspace_ids=named))
+        with pytest.raises(CrossWorkspaceCollisionError, match="this store serves"):
+            await alpha.search_lexical("anything", k=5, filter=Filter(workspace_ids=named))
 
-    assert await alpha.list_documents(Filter(workspace_id="alpha")) == []
+    assert await alpha.list_documents(Filter(workspace_ids=frozenset({"alpha"}))) == []
 
 
 async def test_lexical_search_takes_its_query_under_the_protocols_parameter_name(

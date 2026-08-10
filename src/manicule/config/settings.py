@@ -33,10 +33,14 @@ from pydantic_settings import (
 )
 
 from manicule.config.providers import (
+    Endpoint,
+    ModelRole,
     ProviderSettings,
+    egress_for,
     env_var_names,
-    is_local,
+    needs_credential,
     resolve_provider_keys,
+    runs_in_process,
 )
 from manicule.core.errors import PolicyError
 from manicule.core.retrieval import RetrievalProfile
@@ -455,7 +459,9 @@ class EmbeddingSettings(Section):
     wrong.
     """
 
-    provider: str = Field(default="mlx", description="Which embedder implementation to use.")
+    provider: str = Field(
+        default="mlx", min_length=1, description="Which embedder implementation to use."
+    )
     model: str = Field(default="BAAI/bge-m3", min_length=1)
     revision: str | None = None
     batch_size: int = Field(default=32, ge=1)
@@ -473,7 +479,7 @@ class EmbeddingSettings(Section):
 class LlmSettings(Section):
     """The generation runtime. Local and hosted differ by ``base_url`` and nothing else."""
 
-    provider: str = "ollama"
+    provider: str = Field(default="ollama", min_length=1)
     model: str = Field(default="qwen2.5:14b", min_length=1)
     base_url: str | None = None
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
@@ -632,9 +638,43 @@ class Settings(BaseSettings):
         return frozenset({self.llm.provider.lower(), self.embedding.provider.lower()})
 
     @property
+    def selected_endpoints(self) -> tuple[Endpoint, ...]:
+        """Every model endpoint this configuration will open, with where its content goes.
+
+        This is the resolution :func:`~manicule.config.providers.egress_for` needs and cannot
+        do on its own, because the endpoint is spread across two places: ``llm.base_url``
+        overrides for generation, and ``providers.<name>.base_url`` — already defaulted by
+        :func:`~manicule.config.providers.resolve_provider_keys` — covers both roles.
+
+        Per role rather than per provider name, because the same provider can be configured
+        at two different addresses and only one of them may be on this machine.
+        """
+        return (
+            self._endpoint(ModelRole.LLM, self.llm.provider, self.llm.base_url),
+            self._endpoint(ModelRole.EMBEDDING, self.embedding.provider, None),
+        )
+
+    def _endpoint(self, role: ModelRole, provider: str, override: str | None) -> Endpoint:
+        name = provider.strip().lower()
+        base_url = override or self.provider(name).base_url
+        return Endpoint(
+            role=role,
+            provider=name,
+            base_url=base_url,
+            egress=egress_for(name, base_url),
+        )
+
+    @property
     def cloud_providers_in_use(self) -> frozenset[str]:
-        """Selected providers that send content off this machine."""
-        return frozenset(name for name in self.selected_providers if not is_local(name))
+        """Selected providers whose endpoint is off this machine.
+
+        Derived from the endpoints rather than from the provider names: an ``ollama`` at
+        ``http://gpu-box.lan:11434`` belongs here, and an OpenAI-compatible server on
+        ``127.0.0.1`` does not.
+        """
+        return frozenset(
+            endpoint.provider for endpoint in self.selected_endpoints if endpoint.leaves_machine
+        )
 
     def provider(self, name: str) -> ProviderSettings:
         """Settings for one provider, defaulted if never configured."""
@@ -664,16 +704,27 @@ class Settings(BaseSettings):
         """
         problems: list[str] = []
 
-        cloud = self.cloud_providers_in_use
-        if cloud and not self.security.data_policy.cloud_allowed:
-            names = ", ".join(sorted(cloud))
-            problems.append(
-                f"security.data_policy.cloud_allowed is false, but the hosted provider(s) "
-                f"{names} are selected. Choose a local provider, or allow cloud processing."
-            )
+        if not self.security.data_policy.cloud_allowed:
+            for endpoint in self.selected_endpoints:
+                if endpoint.leaves_machine:
+                    problems.append(
+                        f"security.data_policy.cloud_allowed is false, but the "
+                        f"{endpoint.describe()} is not on this machine, so every prompt and "
+                        f"every retrieved passage would cross the network to reach it. Point "
+                        f"it at loopback, choose an in-process provider, or allow cloud "
+                        f"processing."
+                    )
+
+        for endpoint in self.selected_endpoints:
+            if runs_in_process(endpoint.provider) and endpoint.base_url:
+                problems.append(
+                    f"the {endpoint.describe()} carries a base_url, but "
+                    f"{endpoint.provider!r} runs in this process and dials nothing. That "
+                    f"setting is not in force; remove it, or select a served provider."
+                )
 
         for name in sorted(self.selected_providers):
-            if not is_local(name) and not self.provider(name).has_key:
+            if needs_credential(name) and not self.provider(name).has_key:
                 expected = " or ".join(env_var_names(name))
                 problems.append(
                     f"provider {name!r} is selected but has no API key. Set {expected}, or "
