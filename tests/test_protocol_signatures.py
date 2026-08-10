@@ -140,3 +140,60 @@ def test_the_shipped_protocols_are_checkable() -> None:
     assert_protocol_signatures(MemoryVectorStore(), VectorStore)
     assert_protocol_signatures(TopKStage(), RetrievalStage)
     assert_protocol_signatures(MemoryConnector(), Connector)
+
+
+# --- async iterator lifetime ------------------------------------------------------------
+
+
+async def test_closing_finalises_a_generator_abandoned_part_way() -> None:
+    """A generator suspended at a yield holds whatever it had open until it is finalised.
+
+    Drained bare, that happens at garbage-collection time through the event loop's
+    async-generator hook — possibly after the loop has closed. It leaks at best and has been
+    observed to crash CPython 3.13 at worst.
+    """
+    from collections.abc import AsyncIterator  # noqa: PLC0415
+
+    from manicule.testing import closing  # noqa: PLC0415
+
+    released: list[str] = []
+
+    async def source() -> AsyncIterator[int]:
+        try:
+            for value in range(100):
+                yield value
+        finally:
+            released.append("closed")
+
+    async with closing(source()) as numbers:
+        async for value in numbers:
+            if value == 2:
+                break
+
+    assert released == ["closed"], "the generator must be finalised when the block exits"
+
+
+async def test_closing_accepts_an_iterator_that_cannot_be_closed() -> None:
+    """The protocols declare ``AsyncIterator``, so an implementation may hand back a plain one.
+
+    ``contextlib.aclosing`` would raise on it; narrowing the protocol to ``AsyncGenerator``
+    to satisfy the helper would be the tail wagging the dog.
+    """
+    from manicule.testing import closing  # noqa: PLC0415
+
+    class PlainIterator:
+        def __init__(self) -> None:
+            self._values = iter((1, 2, 3))
+
+        def __aiter__(self) -> PlainIterator:
+            return self
+
+        async def __anext__(self) -> int:
+            try:
+                return next(self._values)
+            except StopIteration as stop:
+                raise StopAsyncIteration from stop
+
+    async with closing(PlainIterator()) as numbers:
+        collected = [value async for value in numbers]
+    assert collected == [1, 2, 3]

@@ -13,7 +13,15 @@ working under ``python -O``.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Sequence,
+)
+from contextlib import asynccontextmanager
 
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, ParsedBlock, RawDocument
@@ -29,6 +37,30 @@ from manicule.core.protocols import (
     VectorStore,
 )
 from manicule.core.retrieval import Candidate, Query
+
+
+@asynccontextmanager
+async def closing[T](iterator: AsyncIterator[T]) -> AsyncGenerator[AsyncIterator[T]]:
+    """Consume an async iterator and close it deterministically if it can be closed.
+
+    An async *generator* suspended at a ``yield`` holds whatever it had open — a database
+    session, a file, an HTTP response — until it is finalised. Drained bare, that finalisation
+    happens at garbage-collection time through the event loop's async-generator hook, possibly
+    after the loop it belongs to has closed. That is a resource leak at best and an
+    interpreter crash at worst; it has been observed to segfault CPython 3.13.
+
+    :func:`contextlib.aclosing` is the standard answer but requires an ``AsyncGenerator``,
+    while every protocol in :mod:`manicule.core.protocols` declares the wider
+    ``AsyncIterator`` — deliberately, so an implementation is free to return a hand-written
+    iterator. This closes what can be closed and leaves the rest alone, so the protocol does
+    not have to narrow.
+    """
+    try:
+        yield iterator
+    finally:
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 def _fail(message: str) -> None:
@@ -129,7 +161,11 @@ async def assert_parser_contract(parser: Parser, raw: RawDocument) -> list[Parse
     """
     _require(parser.media_types, "parser declares no media types, so nothing routes to it")
 
-    blocks = [block async for block in parser.parse(raw)]
+    # aclosing, not a bare drain: an async generator suspended at a yield is finalised by
+    # the event loop's generator hook at GC time, which has been observed to crash the
+    # interpreter on 3.13. Closing it here makes the lifetime deterministic.
+    async with closing(parser.parse(raw)) as blocks_iter:
+        blocks = [block async for block in blocks_iter]
 
     for index, block in enumerate(blocks):
         where = f"block {index}"
@@ -414,7 +450,8 @@ async def assert_connector_contract(connector: Connector) -> None:
     """
     _require(connector.name, "connector has no name")
 
-    discovered = [doc async for doc in connector.discover(None)]
+    async with closing(connector.discover(None)) as discovered_iter:
+        discovered = [doc async for doc in discovered_iter]
     for doc in discovered:
         _require(doc.ref.source_id, "a discovered document has no source id")
         _require(doc.ref.uri, "a discovered document has no uri")
@@ -427,7 +464,8 @@ async def assert_connector_contract(connector: Connector) -> None:
         )
         _require(raw.media_type, "the fetched document has no media type")
 
-    reconciled = {source_id async for source_id in connector.reconcile()}
+    async with closing(connector.reconcile()) as reconcile_iter:
+        reconciled = {source_id async for source_id in reconcile_iter}
     missing = {doc.ref.source_id for doc in discovered} - reconciled
     _require(
         not missing,
@@ -529,4 +567,5 @@ __all__ = [
     "assert_retrieval_stage_contract",
     "assert_vector_store_is_dimension_agnostic",
     "assert_vector_store_rejects_foreign_vectors",
+    "closing",
 ]

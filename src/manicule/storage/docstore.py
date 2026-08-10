@@ -343,6 +343,13 @@ class SqliteDocStore:
 
         Streamed rather than collected: reconciliation runs over whole corpora, and the diff
         does not need the list in memory at once.
+
+        **Close it.** This is an async generator holding an open session while suspended, so a
+        consumer that stops early leaves the session open until the generator is finalised —
+        which happens at garbage-collection time, through the event loop's async-generator
+        hook, possibly after the loop it belongs to has closed. Wrap consumption in
+        :func:`contextlib.aclosing` rather than draining it bare, and the session closes when
+        the block does.
         """
         async with self._sessions() as session:
             result = await session.stream(
