@@ -33,7 +33,7 @@ OpenDocuments got it right. Where it does not, the reason is stated.
 | Vectors | LanceDB |
 | Metadata | SQLite · SQLAlchemy 2.0 async · Alembic |
 | Lexical search | SQLite FTS5 |
-| Embeddings | **MLX**, in-process · onnxruntime fallback |
+| Embeddings | **onnxruntime**, in-process · MLX path filed, blocked on licence |
 | Generation | **Ollama** locally, via **litellm** · any hosted provider through the same call |
 | Reranking | sentence-transformers CrossEncoder |
 | HTTP | FastAPI · uvicorn |
@@ -180,29 +180,47 @@ runs `html.replace(/<[^>]+>/g, ' ')`. Tables, code blocks, headings and macros c
 into a run of words. ADF gives a typed JSON document tree instead, mapping directly onto
 the chunk model with no markup parsing at all.
 
-## 7. Model runtimes — MLX and Ollama
+## 7. Model runtimes — onnxruntime and Ollama
 
 Two runtimes, split by job. This is deliberate: the two have different requirements and
 neither is good at both.
 
-### Embeddings — MLX, in-process
+### Embeddings — in-process, and the runtime changed
 
 | | OpenDocuments | manicule | |
 |---|---|---|---|
-| Runtime | Ollama / cloud HTTP | **MLX** (`mlx-embeddings`) | **No server process.** Runs inside the application, which is what keeps `uv tool install manicule` a single command with nothing to operate alongside it |
-| Fallback | — | **onnxruntime** | Anywhere that is not Apple Silicon |
+| Runtime | Ollama / cloud HTTP | **onnxruntime** | **No server process.** Runs inside the application, which is what keeps `uv tool install manicule` a single command with nothing to operate alongside it |
+| Model | — | **`gte-modernbert-base`**, D = **768** | Apache-2.0, 149M params, 8192 max_seq. Full reasoning and the rejected candidates in [`docs/embeddings.md`](docs/embeddings.md) §1 |
+| MLX | — | **filed, not shipped** | Metal-native execution is still wanted — see below |
+
+**The runtime changed, and this supersedes the earlier "MLX in-process, onnxruntime
+fallback".** `mlx-embeddings` is **GPL-3.0**, verified from its distribution metadata. That
+is the same objection that removed PyMuPDF and `extract-msg`, and worse in kind: those are
+parsers behind a fallback chain, this would be a required in-process dependency of an MIT
+product.
+
+The argument for MLX also does not survive the swap. This section's stated reason was that it
+*runs in-process* — which onnxruntime does equally — and the only MLX-specific claim, speed,
+is disowned two paragraphs below. So the case rested on a property both options share.
+
+MLX is not abandoned. Apple's `mlx` is MIT, and a future path implements the encoder against
+it directly, without the GPL package. It is gated on a **measured** speedup over onnxruntime
+with CoreML, and on backend parity — not on preference.
 | Pooling | whatever the provider does | **ours, in numpy** | **Gain.** See below |
 | Caching | in-memory L2 | same, keyed by the **full `EmbedFingerprint`** | Not by model *name*: same weights with different pooling differ by ~0.85 cosine, and a prefix, dtype or revision change moves the vector too. Same key as `index_state`, so cache and index cannot disagree |
 
 **Why not speed.** An earlier draft justified MLX with "~50% faster than llama.cpp on
 embeddings." That figure has no traceable primary measurement and should not be repeated.
-The argument for MLX is that it runs in-process; benchmark it during #3 if the number
-matters.
+Note where that leaves things: with the speed claim withdrawn and in-process satisfied by
+both, nothing distinguished MLX from onnxruntime even before the licence was checked. The
+benchmark is now the gate on adding MLX back, not a nice-to-have.
 
-**Why pooling is ours.** `mlx-embeddings` does not give `last_hidden_state` one meaning.
-On `bert`, `xlm_roberta`, `gemma3_text` and `qwen3` it is genuine 3-D token states. On
-`modernbert` it is the **2-D pooled vector** — the library rebinds the name before
-returning it — and token states are reachable only from the inner encoder.
+**Why pooling is ours.** No backend can be trusted to mean one thing by
+`last_hidden_state`. Measured in `mlx-embeddings`: on `bert`, `xlm_roberta`, `gemma3_text`
+and `qwen3` it is genuine 3-D token states; on `modernbert` it is the **2-D pooled vector**,
+because the library rebinds the name before returning it. The MLX package is no longer a
+dependency, but the lesson survives the swap — the discipline is to read token states and
+assert their rank, not to trust a field name in whichever runtime is current.
 
 **That inconsistency is a worse hazard than a uniform lie**, because code verified against
 one architecture breaks silently on another. It is not even per-architecture: the same
@@ -243,9 +261,11 @@ instead, so the install does not require it.
 
 `llama-server` can do both: embeddings with `--pooling none` and OpenAI-compatible
 generation, from one process and one model format, portable off Apple Silicon. Rejected
-because it makes embeddings a server dependency rather than an in-process call, and gives
-up Metal-native execution on the machine this is built for. Defensible if operating one
-runtime ever matters more than those two things.
+because it makes embeddings a server dependency rather than an in-process call. The second
+half of that rejection — that it gives up Metal-native execution — **no longer
+distinguishes it**, since the embedding runtime is now onnxruntime and Metal-native
+execution is filed rather than shipped. So it stands on the in-process argument alone, which
+is the one that was doing the work anyway.
 
 ## 8. Retrieval
 

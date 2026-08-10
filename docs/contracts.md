@@ -111,10 +111,13 @@ Connector
 can actually see it, and never re-derived downstream from prose.
 
 **`Embedder` has two tiers.** Tier A returns pre-pooled token states and manicule does the
-pooling; tier B returns finished vectors. The distinction exists because `mlx-embeddings`
-binds `last_hidden_state` to the *pooled* vector, and CLS-versus-mean on the target model
-differs by 0.856 cosine with no error raised. Tier B backends are admitted only by
-measurement, since they cannot be verified by inspection.
+pooling; tier B returns finished vectors. The distinction exists because a backend's
+`last_hidden_state` does not have one meaning: `mlx-embeddings` returns genuine 3-D token
+states for `bert`, `xlm_roberta`, `gemma3_text` and `qwen3`, but the 2-D *pooled* vector for
+`modernbert` — so code that trusts the field name is correct on some models and silently
+wrong on others. Pooling choice is not cosmetic: CLS versus mean diverges to **0.69 cosine at
+a 450-token chunk** on a ModernBERT model, with no error raised. Tier B backends are admitted
+only by measurement, since they cannot be verified by inspection.
 
 **`Connector.discover` takes a watermark and `reconcile` exists separately.** Incremental
 sync tells you what changed; it cannot tell you what was deleted, because a deleted page
