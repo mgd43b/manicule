@@ -444,8 +444,14 @@ candidates would have needed. `bge-base-en-v1.5` at 512 has **510** usable, so a
 budget would overflow by two tokens and lose the tail of every full chunk — and the refusal
 would fire on the shipped defaults. E5 would have **507** on the document side. The
 effective budget is therefore `min(configured_budget, usable_tokens)`, computed at startup and
-recorded in `ChunkFingerprint`, so the number that built the corpus is the number stored
-rather than the number configured.
+recorded in `ChunkFingerprint.max_tokens`, so the number that built the corpus is the number
+stored rather than the number configured.
+
+**`max_sequence_length` is a required field, not an optional one.** "Unknown" is precisely
+the state that produces silent truncation, so the type does not permit expressing it — an
+embedder that cannot report its own limit cannot be bound to a chunker. The refusal itself is
+the chunker's obligation: it resolves the `Embedder` as a construction dependency and refuses
+to start when `max_tokens > embedder.fingerprint.max_sequence_length`.
 
 ---
 
