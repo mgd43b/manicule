@@ -389,6 +389,26 @@ class Middleware(Protocol):
     :attr:`~manicule.core.content.DocumentStatus.SKIPPED`. That is the only short-circuit;
     a hook that wants to abort for any other reason raises.
 
+    **``Chunk.text`` is immutable after parse. ``Chunk.embed_text`` is not.**
+
+    This is the one hard limit on what a hook may do, and it exists because no parser test
+    can catch a violation of it. Every parser is held to a round-trip obligation — resolving
+    a chunk's anchor returns the text the chunk claims (:func:`assert_parser_contract
+    <manicule.testing.assert_parser_contract>`). A middleware that rewrites ``text`` breaks
+    that correspondence *after every one of those tests has passed*, leaving a corpus that is
+    internally consistent while its citations quote text the source document does not
+    contain.
+
+    ``embed_text`` is different in kind: never cited, never displayed, and shaped for
+    retrieval rather than for reproduction. Rewriting it is legitimate — redaction and
+    context augmentation both belong there — and it changes every vector, which is why a
+    middleware that does so declares :attr:`mutates_embedded_text` and is folded into the
+    chunk fingerprint.
+
+    So: rewrite ``embed_text`` freely and declare it; return ``text`` unchanged.
+    :func:`assert_middleware_contract <manicule.testing.assert_middleware_contract>` enforces
+    this, because an unenforced guarantee is worse than an absent one.
+
     Hooks run in the order middleware is listed in configuration. Order is declared where a
     reader can see it, rather than emerging from priority numbers spread across packages.
 
@@ -397,6 +417,19 @@ class Middleware(Protocol):
     """
 
     name: str
+
+    mutates_embedded_text: bool = False
+    """Whether any hook rewrites ``Chunk.embed_text``.
+
+    Declared rather than detected, because detection would only catch the mutations that
+    happened to fire on the documents someone tested. The ingest pipeline folds the sorted
+    ``(name, version)`` set of middleware declaring this into the chunk fingerprint it
+    compares at startup — otherwise a middleware that rewrites embedded text changes every
+    vector while both fingerprint refusals pass, since neither knows middleware exists.
+
+    Leaving this ``False`` while mutating ``embed_text`` does not corrupt a citation, but it
+    does make a corpus that no fingerprint describes.
+    """
 
     async def before_parse(self, raw: RawDocument) -> RawDocument | None:
         """Transform, or return ``None`` to skip the document."""

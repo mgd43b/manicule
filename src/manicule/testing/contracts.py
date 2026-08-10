@@ -23,6 +23,7 @@ from manicule.core.protocols import (
     Chunker,
     Connector,
     Embedder,
+    Middleware,
     Parser,
     RetrievalStage,
     VectorStore,
@@ -364,10 +365,74 @@ async def assert_connector_contract(connector: Connector) -> None:
     )
 
 
+# --- middleware ------------------------------------------------------------------------
+
+
+async def assert_middleware_contract(
+    middleware: Middleware, document: Document, chunks: Sequence[Chunk]
+) -> list[Chunk]:
+    """Check that a middleware leaves ``Chunk.text`` alone, and returns what it produced.
+
+    This is the check no parser suite can perform. :func:`assert_parser_contract` verifies
+    that resolving a chunk's anchor returns the text the chunk claims — but it runs against
+    the parser, before any middleware exists. A hook that rewrites ``text`` breaks that
+    correspondence *afterwards*, so every parser in the project still passes while the
+    corpus grows citations quoting text no source document contains.
+
+    ``embed_text`` is deliberately not checked for equality: rewriting it is the reason
+    ``after_chunk`` exists. What is checked is that a middleware which rewrites it says so,
+    because the ingest pipeline folds that declaration into the chunk fingerprint and a
+    silent mutation produces a corpus no fingerprint describes.
+
+    Args:
+        middleware: The implementation under test.
+        document: Passed through to the hook.
+        chunks: Input chunks. Give at least one with a non-trivial ``text``.
+
+    Returns:
+        The chunks the middleware returned, so a caller can make further assertions.
+    """
+    _require(chunks, "assert_middleware_contract needs at least one chunk to have an opinion")
+
+    before = {chunk.id: chunk.text for chunk in chunks}
+    before_embed = {chunk.id: chunk.embed_text for chunk in chunks}
+
+    returned = await middleware.after_chunk(document, list(chunks))
+
+    for chunk in returned:
+        original = before.get(chunk.id)
+        if original is None:
+            continue
+        if chunk.text != original:
+            _fail(
+                f"middleware {middleware.name!r} rewrote Chunk.text on {chunk.id!r}. "
+                f"text is what a citation displays and what resolving an anchor must "
+                f"reproduce, so changing it here breaks the round-trip guarantee after "
+                f"every parser test has already passed — the corpus stays internally "
+                f"consistent while its citations quote text the source does not contain. "
+                f"Rewrite embed_text instead and declare mutates_embedded_text"
+            )
+
+    mutated_embed = any(
+        chunk.embed_text != before_embed.get(chunk.id, chunk.embed_text) for chunk in returned
+    )
+    if mutated_embed and not middleware.mutates_embedded_text:
+        _fail(
+            f"middleware {middleware.name!r} rewrote Chunk.embed_text without declaring "
+            f"mutates_embedded_text. That changes every vector while both fingerprint "
+            f"refusals pass, because neither fingerprint knows middleware exists. Set "
+            f"mutates_embedded_text = True so the pipeline can fold it into the chunk "
+            f"fingerprint"
+        )
+
+    return returned
+
+
 __all__ = [
     "assert_chunker_contract",
     "assert_connector_contract",
     "assert_embedder_contract",
+    "assert_middleware_contract",
     "assert_parser_contract",
     "assert_refuses_oversized_chunks",
     "assert_retrieval_stage_contract",

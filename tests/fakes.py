@@ -348,3 +348,68 @@ class ForgetfulConnector(MemoryConnector):
 
 def now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+class PassThroughMiddleware:
+    """A middleware that touches nothing. The baseline the contract must accept."""
+
+    name = "pass-through"
+    mutates_embedded_text = False
+
+    async def before_parse(self, raw: RawDocument) -> RawDocument | None:
+        return raw
+
+    async def after_parse(self, document: Document, blocks: list[ParsedBlock]) -> list[ParsedBlock]:
+        return blocks
+
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        return chunks
+
+    async def after_store(self, document: Document) -> None:
+        return
+
+
+class RedactingMiddleware(PassThroughMiddleware):
+    """Rewrites ``embed_text`` and says so. The legitimate case."""
+
+    name = "redacting"
+    mutates_embedded_text = True
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        return [
+            chunk.model_copy(update={"embed_text": chunk.embed_text.replace("chunk", "[REDACTED]")})
+            for chunk in chunks
+        ]
+
+
+class TextRewritingMiddleware(PassThroughMiddleware):
+    """Rewrites ``Chunk.text``, which no middleware may do.
+
+    This is the defect ``assert_middleware_contract`` exists to catch: every parser test
+    still passes, and the corpus acquires citations quoting text no source contains.
+    """
+
+    name = "text-rewriting"
+    mutates_embedded_text = False
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        return [
+            chunk.model_copy(update={"text": chunk.text.replace("chunk", "[REDACTED]")})
+            for chunk in chunks
+        ]
+
+
+class UndeclaredEmbedMiddleware(PassThroughMiddleware):
+    """Rewrites ``embed_text`` without declaring it, so no fingerprint describes the corpus."""
+
+    name = "undeclared-embed"
+    mutates_embedded_text = False
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        return [
+            chunk.model_copy(update={"embed_text": chunk.embed_text + " extra context"})
+            for chunk in chunks
+        ]
