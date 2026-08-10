@@ -197,7 +197,12 @@ def _walk(node: LexborNode) -> Iterator[_Found]:
             continue
         yield from _flush(pending)
         if tag in _HEADING_LEVELS:
-            yield _heading(child, tag)
+            heading = _heading(child, tag)
+            # A heading of only an image or an anchor names nothing, so it cannot be a path
+            # element: an empty one would reach the embedder through the breadcrumb as a
+            # heading nobody wrote. Its section is the enclosing one.
+            if heading.text:
+                yield heading
         elif tag in _BLOCK_KINDS:
             found = _block(child, tag)
             if found is not None:

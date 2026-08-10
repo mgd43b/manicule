@@ -248,6 +248,18 @@ async def test_a_heading_path_that_skips_a_level_is_not_padded_with_an_invented_
     assert blocks[-1].heading_path == ("Top", "Deep")
 
 
+async def test_a_heading_with_no_text_does_not_become_an_empty_path_element() -> None:
+    """A heading that names nothing cannot be part of a breadcrumb.
+
+    An empty element would reach the embedder as a heading nobody wrote, and the block under
+    it would be addressed by a path with a hole in it. The content belongs to the enclosing
+    section instead, which here is the document above the first real heading.
+    """
+    blocks = await _blocks("#\n\nBody under a heading with no text.\n")
+    assert [block.heading_path for block in blocks] == [()]
+    assert blocks[0].anchor == LineAnchor(start=3, end=3)
+
+
 async def test_an_ambiguous_heading_path_with_no_fragment_is_unlocated() -> None:
     """Two sections one address cannot tell apart are reported, not guessed at.
 

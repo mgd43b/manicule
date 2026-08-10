@@ -182,6 +182,18 @@ async def test_a_heading_with_no_published_address_carries_no_fragment() -> None
     assert blocks[0].anchor == HeadingAnchor(path=("Unaddressed",), fragment=None)
 
 
+async def test_a_heading_holding_only_an_anchor_does_not_become_an_empty_path_element() -> None:
+    """A heading that names nothing is not a heading path element, and not a block either.
+
+    ``<h2><a name="…"></a></h2>`` is a real pattern and it has no text. Emitting it would put
+    a block with no text into the index and an empty element into every breadcrumb below it,
+    so the content stays in the section that encloses it.
+    """
+    blocks = await _blocks('<h2><a name="x"></a></h2><p>Body under it.</p>', title="Page")
+    assert [block.text for block in blocks] == ["Body under it."]
+    assert blocks[0].anchor == HeadingAnchor(path=("Page",), fragment=None)
+
+
 async def test_synthesising_a_fragment_the_page_never_published_fails_the_round_trip() -> None:
     """The rule above is load-bearing: with it removed, the harness goes red.
 

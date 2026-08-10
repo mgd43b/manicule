@@ -27,11 +27,16 @@ different embeddings, one corpus. Platform may change *throughput*; it must neve
 reading the installed package rather than from documentation, because the obvious call is
 the wrong one twice over:
 
-``manifest_languages()``
-    The 371 declared names. Compiled into the native library, so it answers instantly and
-    offline — this is what a declared key is validated against. Note that ``has_language()``
-    also answers offline but accepts *aliases*, which would let a name through that
-    ``downloaded_languages()`` never reports, so it is not used for validation.
+``SupportedLanguage``
+    The 371 names, as a ``Literal`` in the wheel. This is what a declared key is validated
+    against, and the choice is not the obvious one. ``manifest_languages()`` reads like the
+    right call and **is not offline**: it reads a manifest file from the cache and fetches
+    that file when the cache lacks it, so on a fresh install it raises a download error
+    instead of answering — which would make validating the declared set require the network
+    that the declared set exists to stop depending on. ``has_language()`` does answer
+    offline, but it accepts *aliases*, which would let through a name that
+    ``downloaded_languages()`` never reports. The ``Literal`` is plain data in the wheel and
+    answers with no I/O at all.
 
 ``downloaded_languages()``
     The languages whose shared library is already in the cache. **This is the absence check,
@@ -67,7 +72,7 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, get_args
 
 from pydantic import BaseModel, Field
 
@@ -102,6 +107,8 @@ __all__ = [
     "tags_query_source",
     "validate_languages",
 ]
+
+_SUPPORTED: frozenset[str] | None = None
 
 MANIFEST_URL_ENV: Final = "TREE_SITTER_LANGUAGE_PACK_MANIFEST_URL"
 """Environment variable the pack reads to locate the grammar manifest.
@@ -363,7 +370,7 @@ def validate_languages(languages: Sequence[str]) -> tuple[str, ...]:
         raise ConfigError(msg)
 
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
-    known = set(pack.manifest_languages())
+    known = _supported_names()
     unknown = sorted({language for language in languages if language not in known})
     if unknown:
         hints = {
@@ -390,6 +397,16 @@ def validate_languages(languages: Sequence[str]) -> tuple[str, ...]:
         raise ConfigError(msg)
 
     return tuple(sorted(set(languages)))
+
+
+def _supported_names() -> frozenset[str]:
+    """Every grammar name the installed pack knows, read offline from the wheel."""
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
+    global _SUPPORTED  # noqa: PLW0603 - a one-shot cache of an immutable value
+    if _SUPPORTED is None:
+        _SUPPORTED = frozenset(get_args(pack.SupportedLanguage))
+    return _SUPPORTED
 
 
 def language_for_media_type(media_type: str) -> str | None:

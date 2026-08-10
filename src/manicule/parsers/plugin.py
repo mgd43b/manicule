@@ -24,11 +24,12 @@ from pydantic import BaseModel
 from manicule.container import keys
 from manicule.core.errors import UnknownComponentError
 from manicule.parsers import config as parser_config
-from manicule.plugins import BuildContext, ComponentRegistry, PluginManifest
+from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
+from manicule.plugins.registry import Factory
 
 if TYPE_CHECKING:
     from manicule.chunking import StructuralChunker
-    from manicule.core.protocols import Chunker, Parser
+    from manicule.core.protocols import Parser
 
 CHUNKER_NAME = "structural"
 
@@ -257,7 +258,13 @@ class ParsingPlugin:
         )
 
 
-def _factory_for(registration: _Registration):  # noqa: ANN202 - the closure's type is Factory[Parser]
+def _factory_for(registration: _Registration) -> Factory[Parser]:
+    """Bind one registration into a factory the container can call.
+
+    A closure rather than a `partial`, so the registration it captures is visible in a
+    traceback when a parser's own import fails.
+    """
+
     def factory(context: BuildContext) -> Parser:
         return _build_parser(registration, context)
 
@@ -266,8 +273,8 @@ def _factory_for(registration: _Registration):  # noqa: ANN202 - the closure's t
 
 PLUGIN = ParsingPlugin()
 
-# Checked when this file is type-checked, so registration cannot drift out of conformance
-# with the protocols it registers against.
-_chunker_key: type[Chunker] | None = None
+# Checked when this file is type-checked, so the plugin cannot drift out of conformance with
+# the protocol every installation loads it through.
+_plugin: Plugin = PLUGIN
 
 __all__ = ["CHUNKER_NAME", "PARSERS", "PLUGIN", "ParsingPlugin"]

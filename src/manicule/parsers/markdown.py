@@ -311,6 +311,12 @@ def _drafts(tokens: Sequence[Token], lines: Sequence[str]) -> list[_Draft]:
         if kind is None or token.level != 0 or token.map is None:
             continue
         follower = tokens[index + 1] if index + 1 < len(tokens) else None
+        title = _inline_text(follower) if kind is BlockKind.HEADING else ""
+        if kind is BlockKind.HEADING and not title.strip():
+            # A heading of only an image or an anchor names nothing, so it cannot be a path
+            # element: an empty one would reach the embedder through the breadcrumb as a
+            # heading nobody wrote. Its section is the enclosing one.
+            continue
         # token.map is 0-based and half-open; anchors are 1-based and inclusive.
         first_line = token.map[0] + 1
         drafts.append(
@@ -318,7 +324,7 @@ def _drafts(tokens: Sequence[Token], lines: Sequence[str]) -> list[_Draft]:
                 first_line=first_line,
                 last_line=_trim(lines, first_line, token.map[1]),
                 kind=kind,
-                title=_inline_text(follower) if kind is BlockKind.HEADING else "",
+                title=title,
                 lang=_fence_language(token) if token.type == "fence" else None,
                 metadata=_header_rows(tokens, index) if kind is BlockKind.TABLE else {},
             )
