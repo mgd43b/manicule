@@ -26,11 +26,13 @@ from manicule.testing import (
     assert_retrieval_stage_contract,
     assert_vector_store_is_dimension_agnostic,
     assert_vector_store_rejects_foreign_vectors,
+    closing,
 )
 from tests.fakes import (
     AliasingStage,
     BlockChunker,
     BlockRewritingMiddleware,
+    EagerWatermarkConnector,
     FixedDimensionVectorStore,
     ForgetfulConnector,
     ForgetfulVectorStore,
@@ -254,6 +256,29 @@ async def test_a_connector_that_skips_reconciliation_is_caught() -> None:
     """Reconciliation drives deletion, so returning nothing would empty the index."""
     with pytest.raises(AssertionError, match="reconcile"):
         await assert_connector_contract(ForgetfulConnector())
+
+
+async def test_a_connector_whose_watermark_advances_as_it_yields_is_caught() -> None:
+    """An uninterrupted run of this connector is indistinguishable from a correct one.
+
+    Which is the whole problem: the defect only shows when a run is interrupted, and then it
+    shows as documents that are in the source, were enumerated once, and are in no index —
+    permanently, because the next sync starts past them.
+    """
+    with pytest.raises(AssertionError, match="abandoned"):
+        await assert_connector_contract(EagerWatermarkConnector())
+
+
+async def test_a_watermark_is_offered_only_after_a_complete_enumeration() -> None:
+    """The positive half: draining the walk does produce one."""
+    connector = MemoryConnector()
+    assert connector.watermark is None
+
+    async with closing(connector.discover(None)) as stream:
+        async for _ in stream:
+            pass
+
+    assert connector.watermark is not None
 
 
 def test_chunk_ids_are_derived_not_generated() -> None:

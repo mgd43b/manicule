@@ -102,6 +102,7 @@ Generator
     generate(query: Query, context: Context) -> AsyncIterator[Token]
 
 Connector
+    watermark: Watermark|None                    # read-only; last *completed* enumeration
     discover(watermark: Watermark|None) -> AsyncIterator[DiscoveredDoc]
     fetch(ref: DocRef) -> RawDocument
     reconcile() -> AsyncIterator[SourceId]       # for deletion detection
@@ -123,6 +124,25 @@ they cannot be verified by inspection. See [`embeddings.md`](embeddings.md) §3.
 sync tells you what changed; it cannot tell you what was deleted, because a deleted page
 simply stops appearing. Without a reconciliation pass the index serves removed documents
 forever. Making it part of the protocol means no connector can quietly omit it.
+
+**`Connector.watermark` produces the one `discover` consumes.** `storage.md` §4.7 ships a
+`connectors.watermark` column and `discover` takes a watermark, so the system had somewhere to
+persist one and no way, through this protocol, to obtain it. A read-only member closes that;
+the concrete connector may compute it however it likes.
+
+Its meaning is the part worth writing down: **safe to persist if and only if every document
+`discover` yielded has been durably committed.** The connector's promise is narrower — that it
+reflects a *complete* enumeration and never a partial one — and the rest is the caller's
+obligation ([`ingest.md`](ingest.md) §13.2 already makes advancing it conditional on a clean
+run). Storing a watermark for work that was not committed does not delay those documents, it
+makes them **permanently invisible**: the next sync starts past them, nothing raises, and there
+is nothing to notice. Same class as a citation pointing at a page that does not exist.
+
+The race between "yielded" and "committed" is not eliminated, it is made survivable —
+connectors overlap their queries slightly rather than resuming exactly, and content-hash dedup
+absorbs the repeat (`connectors/confluence.md` §2). Widened in
+[#9](https://github.com/mgd43b/manicule/issues/9), before anything had synced and therefore
+before any stored watermark existed to invalidate.
 
 **`RetrievalStage` is uniform — `candidates in, candidates out`.** A pipeline is a declared
 list of stages, so the evaluation harness can compare whole pipelines by configuration

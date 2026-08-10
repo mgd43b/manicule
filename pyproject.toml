@@ -76,6 +76,13 @@ parsers = [
   "tiktoken>=0.8",
 ]
 generation = []    # #7  litellm
+connectors = [     # #9
+  # One HTTP client, async, with a pluggable transport. The transport seam is why this is the
+  # choice: the connector suites run against a synthetic Confluence built on
+  # `httpx.MockTransport`, so the traps in docs/connectors/confluence.md §2 are exercised over
+  # the same code path a live instance would take rather than against a mocked-out client.
+  "httpx>=0.28",
+]
 serve = []         # #8, #11  Typer, Rich, FastMCP, FastAPI, uvicorn
 
 # The built-in parsers and the chunker register the same way a third-party plugin does, through
@@ -84,6 +91,7 @@ serve = []         # #8, #11  Typer, Rich, FastMCP, FastAPI, uvicorn
 [project.entry-points."manicule.plugins"]
 parsing = "manicule.parsers.plugin:PLUGIN"
 embedding = "manicule.embedding.plugin:PLUGIN"
+connectors = "manicule.connectors.plugin:PLUGIN"
 
 [project.urls]
 Homepage = "https://github.com/mgd43b/manicule"
@@ -113,6 +121,9 @@ dev = [
   # backend parity suite. On Linux this resolves to onnxruntime alone, which is exactly what
   # the parity test's skip logic is written against.
   "manicule[embeddings]",
+  # The connector stack, for the same reason: `uv sync --all-groups` is what CI runs, and the
+  # Confluence suites need the HTTP client they drive their synthetic instance through.
+  "manicule[connectors]",
 ]
 
 [tool.uv.workspace]

@@ -438,14 +438,19 @@ async def assert_retrieval_stage_contract(
 
 
 async def assert_connector_contract(connector: Connector) -> None:
-    """Check the three things every connector must do, including the one easy to skip.
+    """Check the four things every connector must do, including the two easy to skip.
 
     ``reconcile`` is part of the protocol because incremental sync cannot detect deletions.
     A connector returning nothing from it is claiming its source has no documents, which
     would delete the lot — so it must yield what exists, and this check makes an omission
     visible rather than catastrophic.
+
+    ``watermark`` is the other one, and its failure is quieter still: see
+    :func:`_assert_watermark_survives_abandonment`.
     """
     _require(connector.name, "connector has no name")
+
+    await _assert_watermark_survives_abandonment(connector)
 
     async with closing(connector.discover(None)) as discovered_iter:
         discovered = [doc async for doc in discovered_iter]
@@ -468,6 +473,44 @@ async def assert_connector_contract(connector: Connector) -> None:
         not missing,
         f"reconcile() omitted {sorted(missing)}, which discover() had just returned. "
         f"Reconciliation drives deletion, so anything it omits is deleted from the index",
+    )
+
+
+async def _assert_watermark_survives_abandonment(connector: Connector) -> None:
+    """Check that an abandoned enumeration does not move the watermark.
+
+    The failure this exists to catch is a connector that advances its watermark **as it
+    yields** rather than when the enumeration completes. Nothing about that looks wrong: every
+    document it produced is correct, the run reports success, and the watermark it offers is a
+    real position in the source. But if the run was interrupted — cancellation, an error three
+    documents later, a bounded queue that was never drained — that position is *past* documents
+    the caller never received. The next sync starts from it, so those documents are never
+    enumerated again. Not delayed: permanently invisible, with nothing raised and nothing to
+    notice, until somebody searches for something that has been in the source the whole time.
+
+    So: take one document, abandon the stream, and require that the watermark has not moved.
+    ``None`` passes, because a connector offering nothing is offering nothing wrong; what fails
+    is a watermark that advanced on the strength of a walk that did not finish.
+
+    A source with no documents at all is skipped rather than passed — there is nothing an
+    abandoned enumeration could have been abandoned part-way through.
+    """
+    before = connector.watermark
+
+    async with closing(connector.discover(None)) as stream:
+        try:
+            await anext(stream)
+        except StopAsyncIteration:
+            return
+
+    after = connector.watermark
+    _require(
+        after is None or after == before,
+        f"the watermark moved to {after!r} after an enumeration that was abandoned after one "
+        f"document. A watermark advanced by a walk that did not finish is a position past "
+        f"documents nobody received: the next sync starts there and never sees them again, "
+        f"with no error and nothing to notice. Advance it when the enumeration completes, and "
+        f"leave the caller to decide whether the run was clean",
     )
 
 

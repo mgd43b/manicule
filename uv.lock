@@ -736,6 +736,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+connectors = [
+    { name = "httpx" },
+]
 embeddings = [
     { name = "huggingface-hub" },
     { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -766,7 +769,7 @@ storage = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "manicule", extra = ["embeddings", "parsers"] },
+    { name = "manicule", extra = ["connectors", "embeddings", "parsers"] },
     { name = "manicule-plugin-example" },
     { name = "openpyxl" },
     { name = "pyright" },
@@ -781,6 +784,7 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", marker = "extra == 'storage'", specifier = ">=0.20" },
     { name = "alembic", marker = "extra == 'storage'", specifier = ">=1.14" },
+    { name = "httpx", marker = "extra == 'connectors'", specifier = ">=0.28" },
     { name = "huggingface-hub", marker = "extra == 'embeddings'", specifier = ">=0.26" },
     { name = "lancedb", marker = "extra == 'storage'", specifier = ">=0.17" },
     { name = "markdown-it-py", marker = "extra == 'parsers'", specifier = ">=3.0" },
@@ -806,10 +810,11 @@ requires-dist = [
     { name = "tree-sitter", marker = "extra == 'parsers'", specifier = ">=0.23" },
     { name = "tree-sitter-language-pack", marker = "extra == 'parsers'", specifier = ">=0.7" },
 ]
-provides-extras = ["storage", "embeddings", "parsers", "generation", "serve"]
+provides-extras = ["storage", "embeddings", "parsers", "generation", "connectors", "serve"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "manicule", extras = ["connectors"], editable = "." },
     { name = "manicule", extras = ["embeddings"], editable = "." },
     { name = "manicule", extras = ["parsers"], editable = "." },
     { name = "manicule-plugin-example", editable = "packages/manicule-plugin-example" },
