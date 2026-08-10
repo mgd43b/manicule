@@ -44,6 +44,77 @@ def _normalise(text: str) -> str:
     return " ".join(text.split())
 
 
+# --- protocol shape ---------------------------------------------------------------------
+
+
+def assert_protocol_signatures(implementation: object, protocol: type) -> None:
+    """Check that an implementation's method *signatures* match the protocol's.
+
+    ``@runtime_checkable`` deliberately checks only that attributes exist — never their
+    signatures — so ``isinstance(store, DocStore)`` returns ``True`` for an implementation
+    whose parameter is called ``text_query`` where the protocol says ``text``. The mismatch
+    surfaces at the first keyword call, which may be in a caller written months later, and the
+    ``isinstance`` check that was supposed to catch it reported success the whole time.
+
+    This is what makes a structural protocol safe to rely on: every method the protocol
+    declares must exist, be callable, and accept the same parameters in the same order under
+    the same names. An implementation may add parameters the protocol does not have, provided
+    they have defaults — a caller working from the protocol will never pass them.
+
+    Args:
+        implementation: The object or class under test.
+        protocol: The :class:`typing.Protocol` it claims to satisfy.
+
+    Raises:
+        AssertionError: A method is missing, is not callable, or has a different signature.
+    """
+    import inspect  # noqa: PLC0415 - only this check needs it
+
+    for name, declared in vars(protocol).items():
+        if name.startswith("_") or not inspect.isfunction(declared):
+            continue
+
+        found = getattr(implementation, name, None)
+        _require(found is not None, f"{protocol.__name__}.{name} is not implemented")
+        _require(callable(found), f"{protocol.__name__}.{name} is not callable")
+
+        expected = _parameters(inspect.signature(declared))
+        actual = _parameters(inspect.signature(found))  # pyright: ignore[reportArgumentType] - callable, checked above
+
+        _require(
+            actual[: len(expected)] == expected,
+            f"{protocol.__name__}.{name} takes {expected} but the implementation takes "
+            f"{actual}. isinstance() cannot see this: @runtime_checkable checks that the "
+            f"attribute exists, not what it accepts, so a keyword call fails at run time "
+            f"against a check that passed",
+        )
+        for extra in actual[len(expected) :]:
+            _require(
+                extra.endswith("="),
+                f"{protocol.__name__}.{name} has an extra required parameter {extra!r}; a "
+                f"caller working from the protocol will never pass it",
+            )
+
+
+def _parameters(signature: object) -> list[str]:
+    """Parameter names in order, with ``=`` appended to those carrying a default.
+
+    ``self`` is dropped: it is present on the protocol's unbound function and absent from a
+    bound method, and the difference says nothing about compatibility.
+    """
+    import inspect  # noqa: PLC0415
+
+    if not isinstance(signature, inspect.Signature):  # pragma: no cover - defensive
+        return []
+    names: list[str] = []
+    for parameter in signature.parameters.values():
+        if parameter.name == "self":
+            continue
+        suffix = "=" if parameter.default is not inspect.Parameter.empty else ""
+        names.append(f"{parameter.name}{suffix}")
+    return names
+
+
 # --- parsers ---------------------------------------------------------------------------
 
 
@@ -369,6 +440,7 @@ __all__ = [
     "assert_connector_contract",
     "assert_embedder_contract",
     "assert_parser_contract",
+    "assert_protocol_signatures",
     "assert_refuses_oversized_chunks",
     "assert_retrieval_stage_contract",
     "assert_vector_store_is_dimension_agnostic",

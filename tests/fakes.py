@@ -36,7 +36,7 @@ MEDIA_TYPE = "text/x-fake"
 
 def make_document(text: str = "alpha\nbeta\ngamma") -> Document:
     return Document(
-        id=document_id("fake", "doc-1"),
+        id=document_id("default", "fake", "doc-1"),
         source="fake",
         source_id="doc-1",
         uri="fake://doc-1",

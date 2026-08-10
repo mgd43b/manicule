@@ -21,7 +21,7 @@ from tests.fakes import MEDIA_TYPE, make_document
 
 def _document(**overrides: object) -> Document:
     base: dict[str, object] = {
-        "id": document_id("s", "1"),
+        "id": document_id("w", "s", "1"),
         "source": "s",
         "source_id": "1",
         "uri": "s://1",

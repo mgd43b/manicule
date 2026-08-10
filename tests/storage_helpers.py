@@ -17,7 +17,7 @@ from manicule.core.content import (
 )
 from manicule.core.embedding import EmbedFingerprint, Pooling
 from manicule.core.ids import chunk_id, content_hash, document_id
-from manicule.storage.docstore import SqliteDocStore
+from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
 from manicule.storage.engine import create_engine
 from manicule.storage.migrator import upgrade
 
@@ -55,6 +55,7 @@ def make_document(
     source: str = "fs",
     source_id: str = "s1",
     *,
+    workspace_id: str = DEFAULT_WORKSPACE,
     status: DocumentStatus = DocumentStatus.INDEXED,
     uri: str = "file:///a.md",
     title: str = "A",
@@ -64,7 +65,7 @@ def make_document(
     """A document with the invariants the model insists on already satisfied."""
     detail = "synthetic detail" if status in NEEDS_ATTENTION else None
     return Document(
-        id=document_id(source, source_id),
+        id=document_id(workspace_id, source, source_id),
         source=source,
         source_id=source_id,
         uri=uri,

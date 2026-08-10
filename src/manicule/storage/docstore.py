@@ -43,20 +43,17 @@ by every test rather than only by the team-mode ones.
 
 
 class CrossWorkspaceCollisionError(ManiculeError):
-    """A document id already exists in a different workspace.
+    """A document id was offered to a workspace that does not own it.
 
-    :func:`manicule.core.ids.document_id` derives an id from ``(source, source_id)`` and
-    carries no workspace, so two tenants indexing the same upstream source arrive at the same
-    id. Left unchecked, the second write lands on the first tenant's row: it overwrites
-    content the writer cannot read, and the writer's own document then appears to have
-    vanished, because the row belongs to somebody else's workspace.
+    **This should be unreachable.** :func:`manicule.core.ids.document_id` takes the workspace
+    as the first component of its digest, so two tenants indexing the same upstream source
+    derive different ids by construction. What remains is a caller that built an id some other
+    way, or a workspace mismatch between the handle and the document it was handed.
 
-    Raised rather than worked around, because the alternatives are worse. Silently namespacing
-    the id would make it disagree with what ingest computed; a composite primary key would
-    have to be threaded through every foreign key that points at a document. Global uniqueness
-    across workspaces is a real limitation of the current id scheme, and it belongs to team
-    mode ([#13](https://github.com/mgd43b/manicule/issues/13)) — this is the guard that stops
-    it corrupting anything before then.
+    Kept as a guard rather than deleted, because the failure it catches is silent: an id
+    computed without the workspace lands on another tenant's row, overwriting content its
+    author cannot read while its own document appears to vanish. An assertion that cannot fire
+    costs one comparison per write; the same bug without it costs a tenant's data.
     """
 
 
@@ -122,10 +119,10 @@ class SqliteDocStore:
             row = await session.get(models.Document, document.id)
             if row is not None and row.workspace_id != self._workspace_id:
                 msg = (
-                    f"document id {document.id!r} already belongs to workspace "
-                    f"{row.workspace_id!r}, not {self._workspace_id!r}. Document ids are "
-                    f"derived from (source, source_id) and carry no workspace, so two "
-                    f"tenants indexing {document.source!r} collide here."
+                    f"document id {document.id!r} belongs to workspace "
+                    f"{row.workspace_id!r}, not {self._workspace_id!r}. Ids from "
+                    f"manicule.core.ids.document_id include the workspace, so this id was "
+                    f"built some other way."
                 )
                 raise CrossWorkspaceCollisionError(msg)
             if row is None:

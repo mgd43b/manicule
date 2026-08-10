@@ -169,13 +169,37 @@ async def test_inheriting_lifecycle_gives_working_defaults() -> None:
 
 
 def test_identifiers_are_derived_so_re_ingest_replaces_rather_than_accumulates() -> None:
-    assert document_id("confluence", "12345") == document_id("confluence", "12345")
-    assert document_id("confluence", "12345") != document_id("github", "12345")
+    assert document_id("w", "confluence", "12345") == document_id("w", "confluence", "12345")
+    assert document_id("w", "confluence", "12345") != document_id("w", "github", "12345")
+
+
+def test_two_workspaces_indexing_one_source_get_two_documents() -> None:
+    """Workspace is part of identity, not a filter applied afterwards.
+
+    Without it the second workspace's write lands on the first workspace's row: it overwrites
+    content its author cannot read, and its own document appears to vanish. Isolation is
+    enforced on every query, and an identity that ignores the workspace defeats it before any
+    query runs.
+    """
+    assert document_id("alpha", "confluence", "12345") != document_id("beta", "confluence", "12345")
+
+
+def test_chunk_identity_inherits_the_workspace_from_its_document() -> None:
+    """``chunk_id`` derives from ``document_id``, so scoping one scopes the other.
+
+    This is why the workspace had to be settled before anything was indexed: changing it
+    later re-derives every chunk id, which invalidates every vector and forces a full
+    re-embed.
+    """
+    alpha = chunk_id(document_id("alpha", "confluence", "1"), 0, "same text")
+    beta = chunk_id(document_id("beta", "confluence", "1"), 0, "same text")
+    assert alpha != beta
 
 
 def test_hashing_is_unambiguous_about_where_one_part_ends() -> None:
     """Length-prefixed, so ("ab", "c") and ("a", "bc") cannot collide."""
-    assert document_id("ab", "c") != document_id("a", "bc")
+    assert document_id("w", "ab", "c") != document_id("w", "a", "bc")
+    assert document_id("w", "ab", "c") != document_id("wa", "b", "c")
     assert chunk_id("ab", 1, "c") != chunk_id("a", 1, "bc")
 
 

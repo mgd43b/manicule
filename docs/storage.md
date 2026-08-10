@@ -283,7 +283,19 @@ class Document(Base):
     deleted_at:    Mapped[datetime | None]
 ```
 
-**`source_id` is new and it is the important one.** Document identity must be whatever the
+**Identity is `(workspace_id, source, source_id)`, and the workspace is part of the id
+itself.** `manicule.core.ids.document_id` takes all three, so two workspaces indexing the same
+upstream source derive different ids rather than colliding on one row. This has to be settled
+before anything is indexed: `chunk_id` derives from `document_id`, so changing the scheme later
+re-derives every chunk id, which invalidates every vector and forces a full re-embed — the
+same "settle it before you index" class as vector dimensionality and chunk size.
+
+The cost is real and small. The same source synced into two workspaces produces two documents,
+two chunk sets and two sets of vectors, which is what isolation *means*. It does not duplicate
+the corpus: retained bytes are content-addressed (§7), so both workspaces reference one blob.
+The partial unique index below is then a second line of defence rather than the mechanism.
+
+**`source_id` is the other half of it.** Document identity must be whatever the
 connector can *promise* is stable, and a URI is not that. A URI is display data — the string
 a citation points at, chosen for a human to read — and nothing obliges a source to keep it
 fixed. Identity has to be the handle the source itself uses.
@@ -1302,7 +1314,7 @@ one.
 |---|---|
 | Four tables added beyond the sixteen: `chunks`, `blobs`, `index_state`, `vector_tombstones` | §4.1 |
 | `chunks.id` is content-derived; `position` is part of the digest, and the trade is stated | §3.2 |
-| `documents.source_id` added; identity keyed on it rather than on the URI | §4.2 |
+| Identity is `(workspace_id, source, source_id)`; the workspace is part of the derived id, settled before any corpus exists | §4.2 |
 | `documents.connector_id` is `NOT NULL`; filesystem and upload are connectors | §4.2 |
 | `documents.container_id` self-referential cascade for archive members | §4.2 |
 | `chunk_count` dropped | §4.2 |
