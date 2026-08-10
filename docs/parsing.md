@@ -746,6 +746,35 @@ Per parser, four kinds, all four required:
 Fixture size cap: **256 KiB**, with one deliberate exception per parser for a generated
 large file that exercises the streaming path.
 
+### 3.6 Closing a parser's block stream
+
+`Parser.parse` returns an `AsyncIterator`, and every parser here implements it as an async
+generator. That has a consequence the protocol does not state and every parser has to obey.
+
+A generator abandoned part-way — a consumer that stops early, an exception in the loop body,
+an assertion failing between two blocks — stays **suspended**, holding whatever it had open
+at the `yield`: a PDF document handle, a native text page, a `ZipFile` and a member stream.
+Nothing collects it promptly. CPython finalises a live async generator through the event loop
+that created it, so one still suspended when that loop closes is finalised late, from the
+wrong loop, after the resources it is about to release have been torn down.
+
+Two rules, and both are needed:
+
+- **Consumers close the stream.** `manicule.core.protocols` provides `read_blocks(parser,
+  raw)` for the ordinary full drain and `parsing(parser, raw)` for iterating a block at a
+  time; both close in a `finally`. `assert_parser_contract`, the round-trip harness and the
+  fallback chain all go through them. A bare `[block async for block in parser.parse(raw)]`
+  is fine right up until something exits early, which is the only case that matters.
+- **Parsers release in a `finally` that wraps the `yield`.** `aclose()` throws
+  `GeneratorExit` in at the suspension point, so a release placed *after* the loop never
+  runs on an early close. It is correct on a full drain — which is every ordinary run — and
+  wrong on exactly the path nobody exercises.
+
+This is a required test per parser: iterate one block, stop, and assert the resource was
+released. The suite ships the pair — a parser that releases in a `finally` and one that
+releases after its last block — and asserts the check catches the second, because a test that
+only drains fully passes against both.
+
 **Expected-anchor files.** Every fixture needs a committed sibling recording, per chunk:
 `position`, `kind`, the anchor, `token_count`, and the first 48 characters of `text`. It must
 be regenerable by a script and reviewed as a diff — never hand-maintained, or it will drift
