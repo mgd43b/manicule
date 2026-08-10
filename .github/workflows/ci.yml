@@ -23,8 +23,8 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: uv sync --all-groups --all-extras
@@ -39,8 +39,8 @@ jobs:
     name: typecheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: uv sync --all-groups --all-extras
@@ -55,8 +55,8 @@ jobs:
       matrix:
         python: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: uv sync --all-groups --all-extras --python ${{ matrix.python }}
@@ -67,7 +67,7 @@ jobs:
       # suite still reports green. Pre-seeding is the same step an operator runs, so this
       # also checks that `prefetch` works on a machine that has never had a grammar.
       - name: cache tree-sitter grammars
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/tree-sitter-language-pack
           key: grammars-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -91,8 +91,8 @@ jobs:
     name: migrations
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: uv sync --all-groups --all-extras
@@ -117,8 +117,8 @@ jobs:
     name: backend parity (macOS)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: uv sync --all-groups --all-extras
@@ -126,7 +126,7 @@ jobs:
       # is a test that fails when the network does, and one that downloads several hundred
       # megabytes per case is a test nobody runs twice.
       - name: cache model weights
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           key: models-${{ runner.os }}-${{ hashFiles('tools/prefetch_embedding_models.py') }}
@@ -160,7 +160,7 @@ jobs:
     name: docs links
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: lychee
         uses: lycheeverse/lychee-action@v2
         with:
