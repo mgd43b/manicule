@@ -9,7 +9,10 @@ still reported green.
 from __future__ import annotations
 
 import hashlib
+import time
 from pathlib import Path
+
+import pytest
 
 from tests.corpus import MAX_FIXTURE_BYTES, build_all, generators
 
@@ -23,6 +26,31 @@ count.
 """
 
 
+_A_YEAR_LATER = 1_800_000_000.0
+"""An instant a long way from now, used to build the corpus a second time.
+
+Far enough that no granularity hides it: a zip member's timestamp resolves to two seconds and
+a PDF's ``/CreationDate`` to one, so two builds a few hundred milliseconds apart agree even
+when the generator is reading the clock.
+"""
+
+
+def _move_the_clock_forward(patch: pytest.MonkeyPatch) -> None:
+    """Make every clock a generator can read report a different instant.
+
+    ``time.time`` is what reportlab stamps into a PDF's dates, and ``time.localtime`` is what
+    :mod:`zipfile` fills a member's ``date_time`` from. Patching both covers every mechanism
+    that has actually gone wrong here, and any generator that ignores the clock — which is all
+    of them, once they are correct — is unaffected.
+    """
+
+    def later(seconds: float | None = None) -> time.struct_time:
+        return time.gmtime(_A_YEAR_LATER if seconds is None else seconds)
+
+    patch.setattr(time, "time", lambda: _A_YEAR_LATER)
+    patch.setattr(time, "localtime", later)
+
+
 def _digest(root: Path) -> dict[str, str]:
     """Every file under ``root``, keyed by relative path, hashed."""
     return {
@@ -32,23 +60,33 @@ def _digest(root: Path) -> dict[str, str]:
     }
 
 
-def test_the_whole_corpus_is_byte_identical_on_every_build(tmp_path: Path) -> None:
+def test_the_whole_corpus_is_byte_identical_on_every_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The property everything else in the suite rests on, checked over every generator.
 
-    Not a hypothetical: three separate sources of drift were live here and each was invisible
+    Not a hypothetical: four separate sources of drift were live here and each was invisible
     until this ran. ``reportlab`` stamps the wall clock into a PDF's ``/CreationDate`` and
     derives an encrypted file's key from ``os.urandom``; pdfium writes a fresh trailer ``/ID``
     on every save; and :mod:`zipfile` fills a member's timestamp from the local clock whenever
     it is handed a name rather than a :class:`zipfile.ZipInfo`, which is what python-docx and
     python-pptx do — so the Office fixtures differed between two runs *and* between two
-    timezones.
+    timezones. None of it made a test fail. It made the corpus unusable as a baseline, which
+    is a slower and quieter kind of wrong.
 
-    None of that made a test fail. It made the corpus unusable as a baseline, which is a
-    slower and quieter kind of wrong.
+    **The clock is moved between the two builds, and that is what makes this a check.**
+    Building twice back to back compares two instants a few hundred milliseconds apart, and a
+    zip timestamp has two-second granularity — so a generator that stamps the wall clock
+    agrees with itself most of the time and this test passes for the wrong reason. It did:
+    with the fixed timestamps removed from one generator it still went green here, and the
+    drift surfaced on CI instead. Moving the clock a year makes the comparison a property of
+    the generators rather than of how fast the machine is.
     """
     first, second = tmp_path / "first", tmp_path / "second"
     build_all(first)
-    build_all(second)
+    with monkeypatch.context() as later:
+        _move_the_clock_forward(later)
+        build_all(second)
 
     left, right = _digest(first), _digest(second)
 
