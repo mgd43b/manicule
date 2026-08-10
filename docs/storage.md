@@ -147,7 +147,7 @@ platform provides, and a build without FTS5 fails at the first query rather than
   > any document ID containing `_chunk_` breaks the parse.
 
 - **`chunks` additionally has `seq INTEGER PRIMARY KEY`** — a rowid alias, required as the
-  `content_rowid` for external-content FTS5 (§5). `chunks.id` carries a `UNIQUE` constraint.
+  `content_rowid` for external-content FTS5 (§6.1). `chunks.id` carries a `UNIQUE` constraint.
 
 ### 3.3 Timestamps
 
@@ -333,6 +333,21 @@ must delete its members. That is a foreign key, so it is a column — it cannot 
 inside `metadata`, and `chunk_relations` is the wrong table because this relates documents,
 not chunks. `container_depth` carries a `CHECK` against a configured maximum so a nested
 archive cannot recurse without bound.
+
+**Re-deriving a container's members is a reconcile, not a delete-then-insert.**
+`docs/parsing.md` re-derives every member when a container's bytes change, on the grounds
+that matching old members to new ones is guesswork. That is right at the parse stage and
+does *not* have to reach storage as a wholesale replacement — because the inner path is a
+stable key. A member's `source_id` is its `zip:…!/inner/path` string, so storage reconciles
+the derived set against the stored one exactly as `Connector.reconcile` does for a source:
+members present in both are **upserted by `source_id`**, members no longer present are
+soft-deleted. No content matching and no heuristics.
+
+This matters because delete-then-insert would mint new `documents.id` values for every
+member, discarding their `document_versions` history and dangling every citation into the
+archive — including members whose bytes did not change. Under reconcile, an unchanged
+member keeps its ID, keeps its history, and its unchanged `content_hash` lets ingest skip
+re-parsing and re-embedding it entirely.
 
 **`status`** is a `CHECK`-constrained enum owned by
 [#1](https://github.com/mgd43b/manicule/issues/1). Storage requires only that it includes
@@ -592,12 +607,42 @@ FTS5's `bm25()` returns a **negative** number, and a better match is *more* nega
 ordering is `ORDER BY bm25(chunks_fts, 1.0, 0.4)` **ascending**. Anything that treats it as a
 similarity — or takes its absolute value — inverts the ranking or flattens it, and the result
 still looks like a plausible ranked list. The value fed to RRF is a rank, not a score, which
-sidesteps the question entirely; where a score is genuinely needed, negate it. The breadcrumb
+sidesteps the question entirely; where a score is genuinely needed, negate it. Note also that
+`bm25()`'s first argument must be the FTS table's real name — it is parsed as a column
+reference, so a query that aliases `chunks_fts` fails with `no such column`. The breadcrumb
 has to be searchable for the same reason it is prefixed to `embed_text`: "Configuration" is
 unfindable without knowing what it configures. But it repeats on every chunk of a page, so
 indexing it at full weight both floods term frequencies and depresses the IDF of the very
 terms that identify the page. Separate columns let it contribute without dominating; a
 single concatenated column cannot.
+
+**Query it as one joined statement, never as MATCH-then-hydrate.** This is the canonical
+lexical query and the shape is load-bearing:
+
+```sql
+SELECT c.id, c.text, d.uri, d.title
+FROM chunks_fts
+JOIN chunks    c ON c.seq = chunks_fts.rowid
+JOIN documents d ON d.id  = c.document_id
+WHERE chunks_fts MATCH :q
+  AND d.workspace_id IN (:workspaces)
+  AND d.deleted_at IS NULL
+  AND d.status = 'indexed'
+ORDER BY bm25(chunks_fts, 1.0, 0.4)
+LIMIT :k
+```
+
+The `LIMIT` has to be applied *after* the joins and filters, not before. Running `MATCH … LIMIT k`
+first and filtering the results afterwards silently returns fewer than `k` live rows —
+because deletion is deferred (§8.2), the chunks of soft-deleted documents are still in the
+index and still compete for those `k` slots, as are chunks belonging to other workspaces,
+which `chunks_fts` cannot distinguish because the workspace lives on `documents`.
+
+Measured on a fixture with three matching live chunks in the target workspace, five in a
+soft-deleted document and five in another workspace: **`MATCH`-then-hydrate with `k = 5`
+returned zero live in-workspace results; the joined statement returned all three.** Not a
+marginal loss of recall — a total one, silently, with a well-formed empty result set. SQLite
+pushes the `MATCH` down and applies the `LIMIT` last, so the joined form costs nothing.
 
 **Tokenizer: `porter unicode61 remove_diacritics 2`.**
 
@@ -900,11 +945,36 @@ Prior versions' bytes are kept for `retain_version_bytes` (default 30 days), bec
 wiki otherwise grows the blob store without bound. This is a real policy decision that no
 existing document made; it is a default, and it is configurable.
 
-**One consequence worth stating plainly.** Retaining original bytes means the data directory
-now holds complete source documents, not just derived text and vectors. A backup of it is a
-copy of the corpus. That changes what the directory is worth to an attacker and what a
-mislaid backup costs, and it belongs in the security surface
-([#13](https://github.com/mgd43b/manicule/issues/13)) rather than being discovered.
+### 7.1 What the data directory now contains
+
+Stated here rather than tracked elsewhere, on the same principle as the permission-awareness
+warning in `docs/connectors/confluence.md` §9: this is a consequence of a design decision, and
+it should ship with the design rather than be discovered by whoever finds the directory.
+
+**Before retention, `<data_dir>` held derived artefacts** — extracted text, vectors, metadata.
+Recovering the source documents from it would have been lossy and partial.
+
+**With retention it holds the corpus itself.** Every PDF, every attachment, every page body,
+byte-identical to what the connector fetched. And because the index is not permission-aware —
+content is fetched as the sync user, per `docs/connectors/confluence.md` §9 — the directory
+accumulates everything that user can see, now in original form. Two consequences follow, and
+both are storage's to handle:
+
+**Permissions are part of the layout.** `<data_dir>` and everything under it is created
+`0700`/`0600`, owned by the running user. `doctor` fails — not warns — if the directory is
+group- or world-readable, and names the offending path. A default that depends on the
+operator's `umask` is not a default.
+
+**`manicule backup` refuses a world-readable target** unless `--allow-insecure-target` is
+passed, and creates its own output `0700`. §9 makes backup a routine, exercised operation,
+which makes an unprotected backup the most likely way a copy of the corpus ends up somewhere
+it should not be. A procedure that is safe only when performed carefully is not safe.
+
+**What is genuinely not storage's to decide** stays with the security surface
+([#13](https://github.com/mgd43b/manicule/issues/13),
+[#19](https://github.com/mgd43b/manicule/issues/19)): encryption at rest and its key
+management, whether retention is opt-out per connector, and the deployment-guide wording. The
+disclosure itself is discharged here.
 
 ---
 
@@ -936,6 +1006,29 @@ nothing else: chunks stay, vectors stay, FTS rows stay, and all of them become i
 the join. Restore is clearing the timestamp — no re-embed, no re-parse, no re-fetch. Hard
 deletion cascades to `chunks`, whose `AFTER DELETE` trigger writes the IDs into
 `vector_tombstones`, and a sweep removes them from LanceDB later.
+
+**Deferred deletion is not free, and the cost lands on retrieval.** "Invisible at the join"
+is true of the *result*, but the rows are still in the derived indexes and still compete for
+top-`k` slots before the join runs. A document soft-deleted an hour ago can crowd live
+content out of a result set entirely. The two legs pay for this differently:
+
+- **The lexical leg does not pay.** FTS5 and `documents` are in the same database, so the
+  filter and the `LIMIT` go in one statement and `k` means `k` live rows (§6.1).
+- **The vector leg does pay**, and cannot be fixed the same way: `deleted_at` and `status`
+  live in SQLite, not in the Lance table, so the ANN search selects its top-`k` before
+  anything can filter on them. It must over-fetch and expand-retry — the trap already named
+  in §6.6, now with a guaranteed cause rather than a hypothetical one.
+
+Promoting `deleted_at` into the Lance table would fix that and is rejected: it makes every
+soft delete a write to the vector store, which is exactly the coupling deferred deletion
+exists to remove, and it re-introduces a value that can disagree with SQLite.
+
+**So the sweep also collects soft-deleted documents, after a grace period.** Within
+`soft_delete_grace` (default 30 days) restore is free. After it, the sweep purges the
+chunks — and restore then costs a re-parse from retained bytes, rung 3, still not a re-fetch.
+This is a real trade rather than a free lunch: unbounded free restore would mean unbounded
+dilution of every vector search. `doctor` reports the soft-deleted fraction of the vector
+table so the over-fetch factor can be set against a measured number.
 
 ```sql
 CREATE TRIGGER chunks_ad_tomb AFTER DELETE ON chunks BEGIN
@@ -1039,7 +1132,7 @@ sha256 — plus what it must:
   "vector_table": "chunks__7f3a91c2",
   "lance_version": 5182,
   "counts": { "documents": 14203, "chunks": 412908, "blobs": 9871 },
-  "files": [ { "path": "…", "size": 0, "sha256": "…" } ]
+  "files": [ { "path": "manicule.db", "size": 184287232, "sha256": "…" } ]
 }
 ```
 
@@ -1091,15 +1184,34 @@ rung on the ladder.
 | `sqlite_version()` ≥ 3.35, FTS5 probe | A platform SQLite too old or built without FTS5 |
 | `PRAGMA foreign_keys` on a fresh connection | The §3.1 trap |
 | `PRAGMA integrity_check`, `foreign_key_check` | Database corruption, orphaned references |
-| `INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')` | FTS index corruption |
-| `COUNT(chunks)` vs `COUNT(chunks_fts)` | A trigger that was dropped by a bad migration |
+| `INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1)` | FTS index corruption **and** disagreement with `chunks` — see below |
+| Soft-deleted fraction of the vector table | Dilution of vector top-`k` (§8.2); calibrates the over-fetch factor |
 | Chunks with no vector | Interrupted ingest — rung 2 |
 | Vectors with no chunk | Unswept tombstones or an interrupted delete |
 | Fingerprint agreement across config / `index_state` / `_manicule_meta` | A swapped or half-restored vector directory |
 | `alembic current` vs `head` | An un-migrated database |
 | Dangling `original_ref` | The one rung-4 case |
 | Blobs on disk absent from `blobs` | A leaked GC sweep — reports reclaimable bytes |
+| `<data_dir>` mode is `0700` and files `0600` | A corpus readable by other local users (§7.1) — **fails**, does not warn |
 | `size_bytes` vs `stored_bytes` totals, by media type | What retention is actually costing |
+
+**The `1` argument on the FTS integrity check is the whole check.** Two obvious ways to
+verify the lexical index against `chunks` do not work, and both were in an earlier draft of
+this table:
+
+- **`COUNT(*)` on each table can never disagree.** `chunks_fts` is an external-content table,
+  so `SELECT count(*) FROM chunks_fts` reads through to `chunks`. The two counts are the same
+  number by construction, whatever the index contains.
+- **A bare `integrity-check` passes on a completely empty index.** Without an argument it
+  verifies only that the index is internally consistent — an empty index is perfectly
+  consistent with itself.
+
+Checked directly: with the triggers dropped and two rows inserted, both counts report `2`,
+`MATCH` returns nothing, and a bare `integrity-check` passes. Only
+`INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1)` compares the index
+against the content table, and it raises `database disk image is malformed` on that fixture.
+A silently empty lexical index halves hybrid retrieval while every health check reports green,
+so this is the difference between a diagnostic and a decoration.
 
 ---
 
@@ -1122,6 +1234,8 @@ one.
 | `audit_logs` deliberately has no foreign keys; `query_logs` deliberately cascades | §4.7 |
 | Column renames to match `docs/contracts.md` §2: `source_type`→`source`, `source_path`→`uri`, `file_type`→`media_type`, `source_version`→`version_token`, `parser_used`→`parser` | §4.2 |
 | FTS5 is external-content over `chunks` and trigger-maintained | §6.1 |
+| The lexical query is one joined statement so `LIMIT` applies after filtering | §6.1 |
+| The sweep collects soft-deleted documents after a grace period, trading free restore against vector top-`k` dilution | §8.2 |
 | Two FTS columns with BM25 weights `1.0 / 0.4` | §6.1 |
 | `porter unicode61 remove_diacritics 2`, no `tokenchars` | §6.1 |
 | The refusal covers retrieval, not just ingest | §6.3 |
@@ -1130,6 +1244,7 @@ one.
 | `index_state.vector_table` is a pointer; re-embed builds alongside and swaps | §6.5 |
 | `Filter.workspace_ids` required and set-valued | §6.6 — **the rest of `Filter` stays open** |
 | Blob retention: current version forever, prior versions 30 days; 256 MiB cap | §7 |
+| `<data_dir>` is `0700`/`0600`; `doctor` fails on a looser mode; backup refuses a world-readable target | §7.1 |
 | Deletion from derived stores is always deferred to a sweep | §8.2 |
 | Backup order is SQLite first, LanceDB second, under a sweep-blocking lock | §9.1 |
 | `STRICT` tables rejected for v1 | §3.4 |
@@ -1140,8 +1255,10 @@ one.
   retrieval feature, and `PLAN.md` §8 gates those on a measured improvement from
   [#15](https://github.com/mgd43b/manicule/issues/15). It would be a table, and it can be
   added by a migration when it earns one.
-- **Encryption at rest.** §7 changes what the data directory is worth; the response belongs
-  to [#13](https://github.com/mgd43b/manicule/issues/13).
+- **Encryption at rest, and its key management.** §7.1 states what the data directory now
+  contains and sets its permissions; encrypting it is a different problem with a key-handling
+  design behind it, and belongs to [#13](https://github.com/mgd43b/manicule/issues/13) /
+  [#19](https://github.com/mgd43b/manicule/issues/19).
 - **Any store other than SQLite.** Settled in `PLAN.md` §2 and not reopened here.
 - **The full `Filter` shape.** Still open per `docs/contracts.md` §6. §6.6 proposes; it does
   not decide.
