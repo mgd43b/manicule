@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manicule-plugin-example"
+version = "0.1.0"
+description = "Reference plugin: the smallest complete example of every extension point."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["manicule"]
+
+# This is the entire registration mechanism. A third-party plugin is this file, with a
+# different name.
+[project.entry-points."manicule.plugins"]
+example = "manicule_plugin_example:PLUGIN"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manicule_plugin_example"]

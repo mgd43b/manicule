@@ -10,6 +10,14 @@ venv/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
+build/
+dist/
+.coverage
+.coverage.*
+htmlcov/
+
+# uv.lock is deliberately committed: CI installs with --frozen, so a build here is the
+# build that runs there.
 
 # macOS
 .DS_Store

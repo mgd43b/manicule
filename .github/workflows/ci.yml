@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  # Lint, typecheck and tests are three jobs rather than three steps of one, so a failing
+  # typecheck still tells you whether the tests pass. One job would stop at the first
+  # failure and hide the rest.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ruff format
+        # tools/ is excluded from formatting only: it is generator scripts owned by the
+        # documentation they produce. It is still linted above.
+        run: uv run ruff format --check src tests packages
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups
+      - name: pyright (strict)
+        run: uv run pyright
+
+  test:
+    name: test (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --python ${{ matrix.python }}
+      - name: pytest
+        run: uv run --python ${{ matrix.python }} pytest --cov --cov-report=term-missing
+
+  # Runs on every pull request, including ones that touch no Python at all. The repository
+  # is mostly cross-referenced design documents, and a heading renumbered in one file
+  # silently invalidates every inbound reference to it. Nothing else catches that.
+  docs:
+    name: docs links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: lychee
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --offline
+            --include-fragments
+            --no-progress
+            --verbose
+            '**/*.md'
+          fail: true
+        # External links are excluded by --offline: the documents are full of GitHub issue
+        # URLs, and a rate-limited fetch must never fail a build. What is checked is what
+        # this repository controls — relative paths, and anchors resolving to real headings.
