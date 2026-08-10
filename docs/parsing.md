@@ -170,6 +170,14 @@ Two rules make it behave:
   earlier draft said "falling back to complete paragraphs", which is larger, not smaller.
   Taking no overlap costs a little recall on one boundary; cutting mid-sentence costs the
   property the window exists for.
+- **A block is taken into the window whole, or not at all.** The window extends the next
+  chunk's anchor over the blocks it came from (§4.3), and an anchor addresses whole blocks —
+  so taking half of one would leave the anchor covering lines the chunk does not quote, and a
+  `LineAnchor` is meant to *be* the text it addresses. The one exception is a block the next
+  chunk's anchor already covers, which is what an oversized block split across two chunks
+  looks like: cutting into that one widens nothing, so sentences are taken from it as
+  normal. The same reasoning as the sentence rule one line up, applied at the granularity an
+  anchor actually has.
 
 ### 1.6 Minimum chunk size — 64 tokens, merged backwards
 
@@ -907,7 +915,8 @@ sheet and section boundaries into chunk boundaries without any of them being spe
 |---|---|---|
 | identical anchors | yes | that anchor |
 | two `LineAnchor`s | yes | `(min start, max end)`; `symbol` survives only when every anchor agrees on it |
-| two `PageAnchor`s, same page | yes | the concatenation of their rects, in order |
+| two `PageAnchor`s, same page, both with rects | yes | the concatenation of their rects, in order |
+| two `PageAnchor`s, same page, **either page-level** | yes | page-level (`rects=[]`), never the other's rects |
 | two `PageAnchor`s, different pages | **no** | the chunk closes at the page break |
 | two `CellAnchor`s, same sheet | yes | the union of their areas, comma-separated (§4.2) |
 | two `CellAnchor`s, different sheets | **no** | the chunk closes at the sheet boundary |
@@ -918,9 +927,18 @@ sheet and section boundaries into chunk boundaries without any of them being spe
 belongs to neither, and naming one of them would put a wrong symbol into the breadcrumb,
 which reaches the embedder.
 
+**A page-level `PageAnchor` swallows the rectangles it merges with**, rather than the other
+way round. `rects=[]` means "this page, no finer location" — a slide's speaker notes are on
+the slide but not on its surface — so a union of rectangles taken across a group containing
+one of those would cover only the blocks that *had* rectangles, and the chunk would resolve
+to text not containing what it claims. Page-level is the coarser answer and the only one
+every member of the group is honestly inside. It costs tightness, which is why §3.3 exempts
+page-level anchors from that assertion and budgets them under assertion 5 instead.
+
 **The overlap window extends the anchor with it.** A chunk that opens with the previous
 chunk's last sentences must cover those lines too, or it quotes from outside the place it
-names — so overlap is only taken where the two anchors combine.
+names — so overlap is only taken where the two anchors combine, and only in whole blocks
+(§1.5).
 
 This is what makes assertion 1 (containment) checkable on chunks rather than only on blocks:
 a chunk's text is the source-ordered join of its blocks' texts, and its anchor covers exactly
@@ -1033,6 +1051,25 @@ Sniffing is a **tiebreaker, never an override** of a declared media type, with o
 exception: `application/octet-stream` is not a claim, it is the absence of one, and sniffing
 replaces it. Letting sniffing override a real declaration is how a `.docx` gets parsed as a
 zip (§9.4).
+
+**Routing reads the registration, not the parser.** Every parser declares its media types
+when the plugin registers it, so choosing one parser for a document does not construct the
+other twelve — and a parser's factory is exactly where its library import lives. That
+declaration and the parser's configuration model are the only two things registration needs
+eagerly, and both live in `manicule.parsers.config`, which imports nothing heavier than
+pydantic.
+
+The cost of getting this wrong is paid by every process that starts, not only by one that
+parses: plugin discovery runs before configuration is read, so media types stored beside
+their parsers would load pdfium, tree-sitter, python-docx, python-pptx, selectolax, nbformat,
+calamine and ruamel.yaml at startup — including for `manicule doctor` on a machine whose
+corpus is entirely Markdown. `tests/test_import_boundary.py` fails the build if that
+regresses.
+
+A parser that narrows its media types relative to its registration — the code parser
+configured with a subset of the declared languages — is caught the first time a document
+routes to it, with both sets named, rather than falling through the chain as though nothing
+were installed.
 
 ### 6.2 `parserFallbacks`
 
@@ -1290,6 +1327,25 @@ guardrail. So it is closed in three moves:
    declared set (`download_all()` / `prefetch()`, with the cache directory and language set
    fixed via `configure(PackConfig(...))`). Container images prefetch at build time. The
    manifest URL is overridable, so an air-gapped deployment can point at an internal mirror.
+
+   **Two things about the pack's own API make this less obvious than it reads**, and both
+   were found by observation rather than from its documentation:
+
+   - `configure(PackConfig(cache_dir=None))` does **not** restore the default cache. An
+     absent `cache_dir` means "keep whatever is in force", so a call meaning "go back to the
+     default" silently keeps the previous override. `manicule` captures the pack's default on
+     first use and passes it back explicitly.
+   - `prefetch()` returns **successfully** for a language already in the pack's
+     process-global registry, whatever the configured cache actually holds. A container build
+     that parses one Python file and then pre-seeds into the image directory is told it
+     succeeded and ships an image with no grammars in it — which surfaces on an air-gapped
+     host as a refusal to parse code that worked on the machine that built the image. So the
+     cache is asked afterwards, and a pre-seed that wrote nothing is a `GrammarFetchError`
+     naming what is still absent.
+
+   CI pre-seeds too, and asserts the cache is populated afterwards. The code parser's suite
+   skips precisely when a grammar is absent — right for a developer's machine, and green for
+   the wrong reason on a runner where nothing was parsed at all.
 3. **A missing grammar is a refusal, not a fallback.** If a declared language's grammar is
    absent at parse time, the document gets `unsupported_media_type` with
    `reason="grammar unavailable: python — run manicule doctor --fix"`. It does **not**
