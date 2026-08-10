@@ -141,9 +141,12 @@ them out:
 | A `contextvars.ContextVar` trace frame, installed by the runner | **Chosen.** Per-task by construction, so concurrent queries cannot cross; invisible to stages that ignore it; no signature changes |
 
 The contextvar is implicit coupling and that is a real cost, paid down by one rule and one
-test: **nothing in the pipeline's behaviour may depend on the trace frame**, and the
-conformance suite runs every stage with no frame installed. A stage that changes what it
-returns based on whether anyone is recording fails.
+test: **nothing in the pipeline's behaviour may depend on the trace frame**. `assert_retrieval_stage_contract`
+installs no frame, so a stage that only works while someone is recording fails there — but the
+sharper failure is a stage that behaves *differently* under one, and that needs both runs. So
+each shipped stage is run twice over identical input, once observed and once not, and must
+produce the same candidates; a stage written to misbehave demonstrates first that the
+difference is detectable at all. A check that has never seen a failure is not evidence.
 
 **A stage context object.** Still rejected, and the reasoning is unchanged: this is the
 widening that never gets narrowed again. Everything proposed for it in this design has landed
@@ -287,6 +290,15 @@ consequences worth stating:
 
 N is bounded by configuration and the feature is gated on team mode.
 
+**What #6 built, and what waits for team mode.** The rule above is a rule about *merging*, and
+merging needs N store handles. Obtaining them is a workspace registry — team-mode plumbing in
+the storage layer, not a retrieval question — and it does not exist. What ships with the
+pipeline is the property that makes waiting safe rather than risky: `SqliteDocStore` refuses a
+filter naming a workspace it does not serve, with a message pointing at the fan-out, so a
+cross-workspace query today is an error naming its own remedy rather than a query that quietly
+answers about one workspace. The merge itself lands in the same change as the registry, and the
+rule it must follow is settled above.
+
 ### 3.3 The split, settled as a rule rather than as a constant
 
 `storage.md` §6.6 named the honest difficulty: pushing a resolved id list down works while the
@@ -327,6 +339,15 @@ second means *constrain to nothing*. Collapsing them is a filter bypass — a qu
 collection that happens to be empty would return the whole workspace, ranked and plausible. It
 is the same shape as the empty `workspace_ids` hazard in §3.2, one layer down, and it is why
 step 1 tests whether the *fields* are set rather than whether the *result* is empty.
+
+**Resolution stops one row past the limit**, which the rule above did not say and the
+implementation forced. Step 2 as written resolves the join-requiring fields into a document-id
+set; on a corpus with a million documents in one source, "resolve" would mean listing a million
+rows to answer a question the first thousand already answered. So the resolving query asks for
+`prefilter_id_limit + 1`: at or below the limit the count is exact and the ids push down, and
+above it the only thing anyone needed to know is that there were more. The trace records
+`resolved_id_count_exact` alongside the count, because a lower bound recorded as a measurement
+would skew the very distribution the threshold is meant to be set from.
 
 `prefilter_id_limit` starts at **1000** and is configuration, not a constant. It is a starting
 value and this document says so plainly rather than dressing it up: an `IN` list of a thousand
@@ -406,6 +427,13 @@ a query that tokenizes to nothing after `escape_match_query`. It is also what an
 looks like. Either way the pipeline continues with one leg and the ranking it produces is
 well-formed, so the trace records `matched: 0` and the run is marked single-leg. §5.3 says what
 #15 must do with that.
+
+> **Corrected while building it.** An earlier draft of §11.1 had this leg record *the escaped
+> match string*. It cannot, and should not: escaping belongs to `DocStore.search_lexical`, and a
+> stage that reached into `manicule.storage.fts` to reproduce it would both import SQLAlchemy
+> into a package that needs none and hardcode one store's query language into a leg that is
+> meant to be swappable for a learned-sparse one. The trace records the text the leg was
+> **given**, and the store owns what it makes of it.
 
 > **Prior art.** `retriever.ts` wraps the FTS5 call in `try/catch` and, on failure, logs
 > `console.warn('[retriever] FTS5 search failed, using dense-only')` and continues. The query
@@ -809,11 +837,19 @@ trace lists which candidates were dropped and how large they were.
 otherwise.** [`parsing.md`](parsing.md) §1.3 splits the 512-token chunk budget as `64` for the
 breadcrumb and `448` for the text, and the breadcrumb never appears in `text` at all
 ([`parsing.md`](parsing.md) §5.1) — so a passage reaching the context is at most **448** embedder
-tokens, not 512. `fast` allows 3 of those against 8192 context tokens; `precise` allows 10 against
-32768. Selection is done by `final_top_k` in every shipped profile and the fitter never binds. It
-exists for the configurations that do not ship — a raised chunk budget, a raised `final_top_k`, a
-long history — and it asserts rather than handles the case where even the top-ranked passage does
-not fit, because the shipped budgets make that arithmetically impossible.
+tokens, not 512. Selection is done by `final_top_k` in every shipped profile and the fitter never
+binds. It exists for the configurations that do not ship — a raised chunk budget, a raised
+`final_top_k`, a long history — and it asserts rather than handles the case where even the
+top-ranked passage does not fit, because the shipped budgets make that arithmetically impossible.
+
+That last sentence is a claim about numbers, so §12 sets the numbers from it rather than the
+other way round. It is deliberately **not** a validator on `ProfileConfig`: raising
+`final_top_k` without raising the budget is an ordinary thing to want, typical passages are a
+fraction of the chunk budget, and refusing a configuration that works in practice on the
+strength of a worst case that will not occur is the kind of over-strictness that teaches people
+to route around a check. What happens instead is visible rather than silent — the fitter skips
+what does not fit, `Context.truncated` is set, and the trace names each dropped passage and its
+size.
 
 One caveat that keeps the rail honest: those bounds are in the *embedder's* tokenizer and the
 budget is in the *generator's* (§7.2). The margin is wide enough that no plausible ratio between
@@ -837,7 +873,12 @@ A profile that does not fit is a refusal with both numbers named, not a runtime 
 is the same discipline as [`ingest.md`](ingest.md) §7's budget/context cross-check, run in the
 same place and for the same reason: a limit that can only be discovered by exceeding it gets
 discovered in production. #7 owns the generator and therefore owns the enforcement point; this
-document owns the requirement.
+document owns the requirement, and `manicule.retrieval.assembly.window_problem` is the predicate
+both sides share so that neither has to re-derive the arithmetic.
+
+**And the profile numbers had to move, because `precise` did not pass its own check.** #43 made
+startup refuse and name the fix rather than change the numbers, on the grounds that the profile
+numbers belonged to this document. They are settled in §12.
 
 ---
 
@@ -893,8 +934,12 @@ them.
 **An `exhausted_budget` leg (§4.4) caps confidence at `medium`,** because the retrieval is known
 to be a floor rather than a result.
 
-**A degraded leg (§5.3) suppresses the agreement term rather than scoring it zero.** This one
-matters and is easy to get backwards. If the lexical leg returned nothing, no passage can carry
+**A degraded leg (§5.3) suppresses every component that depended on it, rather than scoring
+them zero.** This one matters and is easy to get backwards, and building it showed the rule is
+about the *cause* rather than about one named term: if the dense leg is the one that returned
+nothing, no passage carries a similarity either, and a similarity term computed as 0 reports
+weak evidence for what is a fault in the pipeline — the same mistake the paragraph below
+forbids, one component along. So the rule is stated once and applies to both. If the lexical leg returned nothing, no passage can carry
 both leg scores, so cross-leg agreement computes to 0 and drags confidence down by up to 0.15 —
 reporting lower confidence because *FTS5 threw*, which is a statement about the system dressed up
 as a statement about the evidence. So when a leg is degraded, the agreement component is absent
@@ -1068,6 +1113,17 @@ document store** rather than at each of these call sites — the same reasoning 
 synchronisation in triggers rather than in application code ([`storage.md`](storage.md) §6.1).
 Application-level bookkeeping covers only the write paths someone remembered.
 
+**And "the write paths in the document store" is still a list, so it is not what shipped.** A
+bump at the top of each write method is a per-method list with the same weakness one layer
+down: the method nobody annotates is the one that serves a stale ranking. The counter instead
+counts **committed transactions on the store's engine**, which is the closest thing SQLAlchemy
+has to a trigger — a write path cannot avoid committing, and a read cannot reach it, because a
+session closed without a commit rolls back. Verified in both directions: `upsert_document`,
+`replace_chunks` and `soft_delete_document` each move it, and `get_document`, `list_documents`
+and `search_lexical` do not. It over-counts, deliberately — a watermark write bumps it too, and
+so does a write through any other handle on the same database — and over-counting costs a cold
+cache while under-counting serves a ranking computed over a corpus that no longer exists.
+
 **An in-process counter is sufficient, and the reason is a property this project already
 enforces:** exactly one instance per data directory, held by an exclusive lock for the process
 lifetime ([`ingest.md`](ingest.md) §6.5). The writer and the reader are the same process, so
@@ -1105,8 +1161,8 @@ One `RetrievalTrace` per query, assembled by the runner:
 |---|---|
 | Run | route, profile + effective overrides, pipeline declaration, RRF `K`, reranker `model_id`, embed fingerprint, cached, total wall time |
 | Every stage | name, wall time, candidates in, candidates out |
-| `dense` | `k`, derived `k′`, `live_fraction`, fetched, dropped by join, dropped by `min_score`, survived, expansions, outcome (§4.4), `resolved_id_count`, regime (pre-filter or post-filter) |
-| `lexical` | escaped match string, rows matched |
+| `dense` | `k`, derived `k′`, `live_fraction` and whether it was measured, fetched, dropped by join, dropped by `min_score`, survived, expansions, outcome (§4.4), `resolved_id_count` and whether that count is exact, regime (§3.3) |
+| `lexical` | query text as the leg received it, rows requested, rows matched, degraded flag |
 | `rrf` | legs fused, per-leg candidate counts, overlap count, degraded flag |
 | `rerank` | pairs scored, model id |
 | Assembly | tokens used, tokens available, tokenizer identity, passages dropped and their sizes |
@@ -1153,7 +1209,8 @@ Named settings are only useful if the names mean something specific. What actual
 | Fused set, before rerank | ≤ 20 | ≤ 40 | ≤ 100 |
 | Cross-encoder | **not loaded** | 20 pairs | 50 pairs |
 | Passages into context | 3 | 5 | 10 |
-| Context / history tokens | 8192 / 512 | 16384 / 1024 | 32768 / 2048 |
+| Context / history tokens | 4096 / 512 | 5632 / 1024 | 12288 / 2048 |
+| Smallest generator window that fits | 8k | 8k | 16k |
 | Model loads on the query path | 1 (embedder) | 2 | 2 |
 | Confidence ceiling (§8.3) | **0.70 — cannot reach `high`** | 1.0 | 1.0 |
 
@@ -1163,6 +1220,44 @@ it. `precise` is `balanced` with 2.5× the reranker cost and a much lower simila
 is a bet that the cross-encoder can rescue passages the dense leg nearly discarded. Whether that
 bet pays is a #15 measurement and one of the first worth running, because it is the cheapest
 change to make if it does not.
+
+### 12.1 Where the token budgets come from
+
+The three budgets this document first carried — 8192 / 16384 / 32768 — were inherited rather
+than derived, and they were wrong in two ways that only showed up when something finally
+compared them against anything.
+
+**They were unreachable.** A passage reaching a context is at most 448 embedder tokens (§7.3).
+Ten of those, at a vocabulary ratio of 2.0 — far past any plausible ratio between a
+SentencePiece embedder vocabulary and a BPE estimate for the generator — plus per-passage
+framing, is about **9 300** generator tokens. `precise` therefore reserved 32768 for something
+that could not exceed a third of it. A budget nothing can reach is not a rail; it is a number
+that tells a reader nothing.
+
+**And `precise` did not fit its own default model.** `32768 + 2048 + ~400 + 1024 = 36 240`
+against `qwen2.5:14b`'s 32768-token window, which §7.4 turns into a startup refusal. `balanced`
+had the same shape one size down: 16384 + 1024 against an 8k local model is an assembled context
+twice the size of the window, on every query.
+
+So each budget is now set from what its own `final_top_k` can actually hold, with 1.2–1.5×
+headroom:
+
+| | `fast` | `balanced` | `precise` |
+|---|---|---|---|
+| Largest possible context, generator tokens | 2 784 | 4 640 | 9 280 |
+| `context_tokens` | 4 096 | 5 632 | 12 288 |
+| Headroom | 1.47× | 1.21× | 1.32× |
+| Total with history, prompt and reserve | 6 032 | 8 080 | 15 760 |
+
+Two consequences worth remembering, and the first is the one an operator feels: **`fast` and
+`balanced` both fit an 8k window**, prompt and generation reserve included, and **`precise`
+needs 16k** — the default generator's 32768 fits all three with room to spare. The second is
+that the rail is now a real one: the fitter still cannot bind on a shipped profile, but it is
+within a factor of 1.5 of doing so rather than a factor of five, so an override that pushes past
+it is an override a reader can see coming.
+
+The similarity floors are the one set of numbers here that stay inherited. §4.5 says why, and
+that they are placeholders in the right place rather than tuned values.
 
 Every knob is overridable per field (`ProfileConfig` + `rag.overrides`), and overrides start from
 the named profile so changing one cannot silently move another.
@@ -1267,6 +1362,20 @@ out here because a reader of the other documents will not have seen it coming.
 | Ticket | What | Why not here |
 |---|---|---|
 | [#36](https://github.com/mgd43b/manicule/issues/36) | **Reshape `Filter` to the settled form** (§3.1, §3.4), and add `assert_pipeline_enforces_scope` | It changes `manicule.core.retrieval` and both stores — merged code owned by #1 and #2 — while two implementation tickets are in flight. It is also worth landing as its own reviewable change, because it moves a security boundary |
+
+## Appendix E: what #6 changed in this document
+
+Implementation is the only review a design gets that can disagree with it. Six places where it
+did, each fixed above rather than noted:
+
+| Where | What building it showed |
+|---|---|
+| §3.2 | The cross-workspace **merge rule** is a retrieval decision and is settled; the **fan-out** needs a workspace registry that is team-mode storage plumbing. The store's refusal is what holds the line meanwhile, and it names its own remedy |
+| §3.3 | Resolution has to stop one row past `prefilter_id_limit`, and the count it records is then a lower bound. A figure recorded as exact when it is not would skew the distribution the threshold is to be set from |
+| §4.1, §11.1 | The lexical trace records the query text the leg was **given**, not the escaped match string. Escaping belongs to the store; reproducing it in the stage would import a database driver into a package that needs none and hardcode one store's query language into a swappable leg |
+| §7.3, §12.1 | The token budgets were inherited, unreachable by a factor of three to five, and `precise` failed its own startup cross-check against the model this project ships with. They are now derived from what each profile can hold |
+| §8.2 | The suppression rule is about the **cause**, not about one named term: a degraded dense leg has to suppress the similarity component for exactly the reason a degraded lexical leg suppresses agreement |
+| §10.3 | "Bump on the write paths in the document store" is still a list. The counter counts **committed transactions**, which a write cannot avoid and a read cannot reach |
 
 ## Appendix D: checklist against ticket #6
 

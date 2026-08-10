@@ -487,6 +487,110 @@ class LlmSettings(Section):
     timeout_s: float = Field(default=120.0, gt=0)
 
 
+class QueryCacheSettings(Section):
+    """The L1 query-result cache: ranked chunk ids, never chunk text.
+
+    Caching the *decision* rather than the content is what makes a hit incapable of serving a
+    soft-deleted, unindexed or foreign-workspace chunk: the entry holds no chunks, so the
+    boundary is re-enforced on every hit through the same join the dense leg uses rather than
+    snapshotted at the moment of the miss.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Turned off for evaluation runs, which must measure retrieval rather than "
+        "the cache. A flag, not a code path — the pipeline is identical either way.",
+    )
+    entries: int = Field(
+        default=512, ge=0, description="Rankings held, least-recently-used evicted. ``0`` is off."
+    )
+    ttl_s: float = Field(
+        default=300.0,
+        gt=0,
+        description="A bound on staleness from anything the generation counter was not taught "
+        "about. Belt-and-braces underneath the counter, never the mechanism.",
+    )
+
+
+class RouterSettings(Section):
+    """The deterministic query router: a pure function over the query text.
+
+    Tuned for precision rather than recall, and the rule is worth stating because it decides
+    every question about the pattern lists: **a missed greeting costs one retrieval, which is
+    harmless; a false greeting costs a wrong answer to a real question, which is not.** When
+    in doubt, retrieve.
+    """
+
+    enabled: bool = True
+    max_chars: int = Field(
+        default=40,
+        ge=1,
+        description="Longest input that may route away from the corpus. A greeting is short; "
+        "a sentence beginning with one is a question.",
+    )
+    greetings: tuple[str, ...] = Field(
+        default=(
+            "hi",
+            "hello",
+            "hey",
+            "howdy",
+            "yo",
+            "sup",
+            "greetings",
+            "good morning",
+            "good afternoon",
+            "good evening",
+            "thanks",
+            "thank you",
+            "thanks!",
+            "cheers",
+            "bye",
+            "goodbye",
+        ),
+        description="Whole inputs that are greetings, matched in full and never as a prefix. "
+        "Configuration rather than a constant, because any list is incomplete on a "
+        "multilingual corpus and being incomplete costs only latency.",
+    )
+
+
+class ContextSettings(Section):
+    """How the assembled context is measured against the generator's window.
+
+    The tokenizer here is **not** the one that sized the chunks. That budget is measured in the
+    embedder's vocabulary, to stop the embedder truncating silently; this one is measured in
+    the generator's, to stop the server truncating the prompt. ``Chunk.token_count`` is the
+    first of those and is wrong for this purpose by an unknown factor.
+    """
+
+    encoding: str = Field(
+        default="o200k_base",
+        min_length=1,
+        description="A ``tiktoken`` encoding name, never a model name. The generator is "
+        "Ollama-hosted and runs a Llama, Qwen or Mistral vocabulary — none of them tiktoken's "
+        "— so naming a model here would make an estimate look authoritative.",
+    )
+    safety_factor: float = Field(
+        default=1.2,
+        ge=1.0,
+        description="Inflation applied to the estimate. Undercounting overflows the window and "
+        "the server truncates the prompt, silently; overcounting costs a passage. The error is "
+        "pushed in the direction that is visible.",
+    )
+    drift_tolerance: float = Field(
+        default=0.15,
+        ge=0.0,
+        description="How far the estimate may sit from the generator's own "
+        "``prompt_eval_count`` before it is an error worth surfacing. Measuring once beats a "
+        "safety factor forever.",
+    )
+    system_prompt_tokens: int = Field(
+        default=400,
+        ge=0,
+        description="Room the citation protocol and system prompt occupy, for the startup "
+        "cross-check against the generator's window.",
+    )
+
+
 class RagSettings(Section):
     """Retrieval and chunking."""
 
@@ -507,6 +611,16 @@ class RagSettings(Section):
         default_factory=dict,
         description="Per-field overrides on the selected profile. Everything not named here "
         "keeps the profile's value.",
+    )
+    cache: QueryCacheSettings = Field(default_factory=QueryCacheSettings)
+    router: RouterSettings = Field(default_factory=RouterSettings)
+    context: ContextSettings = Field(default_factory=ContextSettings)
+    assert_scope: bool = Field(
+        default=False,
+        description="Run the pipeline's scope assertion on every query, as a runtime check "
+        "rather than only in the suite. Off by default because it costs a document lookup per "
+        "candidate per stage; on, it holds a live pipeline to the property that makes the "
+        "vector store's ``workspace_ids`` exemption safe.",
     )
 
 
@@ -794,6 +908,7 @@ __all__ = [
     "AuthMode",
     "AuthSettings",
     "ConnectorSettings",
+    "ContextSettings",
     "DataPolicySettings",
     "EmbeddingSettings",
     "EventSettings",
@@ -803,10 +918,12 @@ __all__ = [
     "OAuthProvider",
     "PluginSettings",
     "ProviderSettings",
+    "QueryCacheSettings",
     "RagSettings",
     "RedactionMethod",
     "RedactionSettings",
     "Role",
+    "RouterSettings",
     "SecuritySettings",
     "Settings",
     "SourceRestrictions",
