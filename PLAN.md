@@ -211,12 +211,19 @@ one is active at a time, and changing it means a full re-embed — bounded, resu
 loud rather than silent, because `EmbedFingerprint` refuses a mismatched index. Citations
 survive it: `chunks.id` derives from content, not from the model.
 
-**Why pooling is ours.** `mlx-embeddings` binds `last_hidden_state` to the *pooled*
-vector — token states are one attribute below, on the inner encoder. Anyone trusting the
-field name gets pooled output and never knows. On the target model, CLS versus mean
-pooling differs by **0.856 cosine**: plausible vectors, materially worse retrieval, no
-error raised. So manicule reads token states and pools in its own numpy, driven by the
-model's declared pooling.
+**Why pooling is ours.** `mlx-embeddings` offers a convenience field, and on the chosen
+model it is the wrong pooling. `BAAI/bge-m3` pools with **CLS**; the library's XLM-RoBERTa
+implementation computes `text_embeds` with **mean pooling, unconditionally**. Anyone
+trusting the obviously-named field gets correctly-shaped, normalised vectors from the wrong
+reduction, with no error raised.
+
+The same library also gives `last_hidden_state` different meanings on different
+architectures — genuine token states on `xlm_roberta` and `bert`, the *pooled* vector on
+`modernbert` — so neither field can be trusted by name. manicule reads token states and
+pools them in its own numpy, driven by the model's declared configuration. CLS and mean
+diverge more the longer the chunk, so at the 512-token budget the gap is at its widest.
+Full detail, with what was measured and what still must be, in
+[`docs/embeddings.md`](docs/embeddings.md) §4.
 
 ### Ollama is not an embedding backend
 

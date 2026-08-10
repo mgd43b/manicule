@@ -111,10 +111,13 @@ Connector
 can actually see it, and never re-derived downstream from prose.
 
 **`Embedder` has two tiers.** Tier A returns pre-pooled token states and manicule does the
-pooling; tier B returns finished vectors. The distinction exists because `mlx-embeddings`
-binds `last_hidden_state` to the *pooled* vector, and CLS-versus-mean on the target model
-differs by 0.856 cosine with no error raised. Tier B backends are admitted only by
-measurement, since they cannot be verified by inspection.
+pooling; tier B returns finished vectors. The distinction exists because a backend's
+convenience output cannot be trusted to be the model's own pooling: `mlx-embeddings`
+computes its XLM-RoBERTa `text_embeds` with mean pooling unconditionally, while the chosen
+model pools with CLS, and it binds `last_hidden_state` to the *pooled* vector on some
+architectures and to genuine token states on others. Both produce well-shaped, normalised
+vectors and raise nothing. Tier B backends are therefore admitted only by measurement, since
+they cannot be verified by inspection. See [`embeddings.md`](embeddings.md) §3.2 and §4.1.
 
 **`Connector.discover` takes a watermark and `reconcile` exists separately.** Incremental
 sync tells you what changed; it cannot tell you what was deleted, because a deleted page
