@@ -8,7 +8,7 @@ from typing import Any
 import tomli_w
 from pydantic import ValidationError
 
-from manicule.config.settings import Settings, config_file
+from manicule.config.settings import Settings, config_file, looks_secret
 from manicule.core.errors import ConfigError
 
 
@@ -48,17 +48,16 @@ def save_settings(settings: Settings, path: Path | None = None) -> Path:
     return destination
 
 
-_SECRET_FIELDS = frozenset(
-    {"api_key", "secret", "client_secret", "token", "password", "encryption_key"}
-)
-
-
 def _strip(value: Any) -> Any:  # noqa: ANN401 - recursive over decoded JSON
-    """Drop nulls and secrets; TOML has no null, and secrets do not belong on disk."""
+    """Drop nulls and secrets; TOML has no null, and secrets do not belong on disk.
+
+    Uses the same predicate as the redacted view, so that what is hidden when configuration
+    is displayed and what is omitted when it is written can never disagree.
+    """
     if isinstance(value, dict):
         cleaned: dict[str, Any] = {}
         for key, item in value.items():  # pyright: ignore[reportUnknownVariableType]
-            if not isinstance(key, str) or key in _SECRET_FIELDS:
+            if not isinstance(key, str) or looks_secret(key):
                 continue
             stripped = _strip(item)
             if stripped is not None:

@@ -31,6 +31,9 @@ zero-argument callable returning one. The entry-point name and `manifest.name` m
   has configured should cost an import of this file and nothing more.
 - **Declare a `config_model`.** Configuration written for a component that declares no model
   is rejected rather than ignored, so the model is how your settings become settable.
+- **Parsers declare their media types when registering.** Routing reads that declaration,
+  so picking one parser never builds the others — which is the whole point of keeping heavy
+  imports inside the factory.
 - **Pin `core_version` to a range you have tested.** A mismatch is refused at startup, with
   the versions named. That is deliberate: the alternative is an attribute error somewhere
   unrelated, much later.

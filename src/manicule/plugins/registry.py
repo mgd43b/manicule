@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from importlib.metadata import EntryPoint, entry_points
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, override
@@ -96,6 +96,12 @@ class ComponentRecord[T]:
     factory: Factory[T]
     config_model: type[BaseModel] | None = None
     summary: str = ""
+    media_types: frozenset[str] = frozenset()
+    """For parsers: what this one claims, declared without constructing it.
+
+    Routing a single document must not build every installed parser, because a parser's
+    factory is exactly where its heavy imports live.
+    """
 
     @property
     def key(self) -> ComponentKey[T]:
@@ -131,11 +137,12 @@ class ComponentRegistry:
         *,
         config_model: type[BaseModel] | None = None,
         summary: str = "",
+        media_types: AbstractSet[str] = frozenset(),
     ) -> None:
         """Register a factory under ``key``.
 
         Args:
-            key: Must name an implementation — an unnamed key is a request, not a offering.
+            key: Must name an implementation — an unnamed key is a request, not an offering.
             factory: Called with a :class:`BuildContext` to construct the component. Keep
                 expensive imports inside it, so that installing a plugin costs nothing until
                 it is used.
@@ -143,14 +150,24 @@ class ComponentRegistry:
                 component is built with an empty config and any configuration written for it
                 is rejected rather than silently ignored.
             summary: One line, shown by diagnostics.
+            media_types: Required when registering a parser, and meaningless otherwise.
+                Declared here so that routing a document does not have to build every
+                installed parser to ask each one what it handles. The parser is checked
+                against this declaration when it is first used, so the two cannot drift.
 
         Raises:
-            ValueError: ``key`` has no name.
+            ValueError: ``key`` has no name, or a parser declared no media types.
             DuplicateComponentError: Another plugin already claimed that kind and name.
                 Silent shadowing would make behaviour depend on installation order.
         """
         if key.name is None:
             msg = f"cannot register an unnamed component of kind {key.kind.value!r}"
+            raise ValueError(msg)
+        if key.kind is ComponentKind.PARSER and not media_types:
+            msg = (
+                f"parser {key.name!r} must declare the media types it handles, so that a "
+                f"document can be routed without constructing every installed parser"
+            )
             raise ValueError(msg)
         slot = (key.kind, key.name)
         existing = self._records.get(slot)
@@ -167,6 +184,7 @@ class ComponentRegistry:
             factory=factory,
             config_model=config_model,
             summary=summary,
+            media_types=frozenset(media_types),
         )
         self._records[slot] = record
 
@@ -228,7 +246,7 @@ class Discovery:
 class _Candidate:
     entry_point: EntryPoint
     plugin: Plugin
-    manifest: PluginManifest = field(compare=False)
+    manifest: PluginManifest
 
 
 def _load_entry_point(entry_point: EntryPoint) -> Plugin:
@@ -245,9 +263,10 @@ def _load_entry_point(entry_point: EntryPoint) -> Plugin:
         )
         raise PluginLoadError(msg) from exc
 
-    if isinstance(target, Plugin):
-        return target
-    if callable(target):
+    # A class is checked before the protocol, because a class whose instances are plugins
+    # satisfies the protocol itself — it has both attributes — and calling `register` on the
+    # class rather than an instance passes the registry as `self`.
+    if isinstance(target, type) or (not isinstance(target, Plugin) and callable(target)):
         produced: object = target()
         if isinstance(produced, Plugin):
             return produced
@@ -256,6 +275,8 @@ def _load_entry_point(entry_point: EntryPoint) -> Plugin:
             f"{type(produced).__name__}, which has no 'manifest' and 'register'"
         )
         raise PluginLoadError(msg)
+    if isinstance(target, Plugin):
+        return target
     msg = (
         f"plugin entry point {entry_point.name!r} resolved to {type(target).__name__}, which "
         f"is neither a plugin (an object with 'manifest' and 'register') nor a callable "

@@ -67,6 +67,24 @@ def test_a_key_in_a_dotenv_file_is_found(manicule_environment: Path) -> None:
     assert key.get_secret_value() == "sk-from-dotenv"
 
 
+def test_a_dotenv_file_may_hold_variables_that_are_not_settings(
+    manicule_environment: Path,
+) -> None:
+    """A .env file is shared ground: project variables live alongside manicule's.
+
+    Treating every unrecognised line as a misspelled setting would make a normal .env file
+    unloadable. A misspelled *prefixed* name is still rejected, which is where a typo shows.
+    """
+    (manicule_environment / ".env").write_text(
+        "DATABASE_URL=postgres://elsewhere\nOPENAI_API_KEY=sk-x\nMANICULE_WORKSPACE=docs\n"
+    )
+    settings = Settings(llm={"provider": "openai"})  # pyright: ignore[reportArgumentType]
+    assert settings.workspace == "docs"
+    key = settings.provider("openai").api_key
+    assert key is not None
+    assert key.get_secret_value() == "sk-x"
+
+
 def test_a_real_environment_variable_beats_a_dotenv_file(
     manicule_environment: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -195,6 +213,36 @@ def test_binding_beyond_loopback_without_authentication_is_refused() -> None:
         security={"transport": {"bind_host": "0.0.0.0"}},  # noqa: S104  # pyright: ignore[reportArgumentType]
     )
     assert any("bind_host" in problem for problem in settings.policy_problems())
+
+
+def test_oauth_without_a_provider_is_refused() -> None:
+    settings = Settings(security={"auth": {"mode": "oauth"}})  # pyright: ignore[reportArgumentType]
+    assert any("oauth" in problem for problem in settings.policy_problems())
+
+
+def test_auditing_to_a_webhook_with_no_webhook_is_refused() -> None:
+    settings = Settings(
+        security={"audit": {"enabled": True, "destination": "webhook"}},  # pyright: ignore[reportArgumentType]
+    )
+    assert any("webhooks is empty" in problem for problem in settings.policy_problems())
+
+
+def test_a_saved_configuration_keeps_list_valued_settings(
+    manicule_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = Settings(
+        events={  # pyright: ignore[reportArgumentType]
+            "webhooks": [{"url": "https://example/hook", "events": ["indexed"], "secret": "s3cr3t"}]
+        }
+    )
+    path = save_settings(original, manicule_environment / "hooks.toml")
+    body = path.read_text()
+    assert "https://example/hook" in body
+    assert "s3cr3t" not in body
+
+    monkeypatch.setenv("MANICULE_CONFIG_FILE", str(path))
+    reloaded = load_settings()
+    assert reloaded.events.webhooks[0].events == ("indexed",)
 
 
 def test_the_default_configuration_is_runnable_and_local() -> None:

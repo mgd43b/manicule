@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from importlib.metadata import EntryPoint
 
 import pytest
+from pydantic import ValidationError
 
 from manicule.container import keys
 from manicule.core.errors import (
@@ -152,6 +153,18 @@ def test_a_requirement_cycle_is_reported_as_a_cycle() -> None:
         load_order([manifest(name="a", requires=("b",)), manifest(name="b", requires=("a",))])
 
 
+@pytest.mark.parametrize("field", ["requires", "conflicts"])
+def test_a_manifest_cannot_name_the_same_plugin_twice(field: str) -> None:
+    """A duplicate is always a mistake, and silently deduplicating hides which one."""
+    with pytest.raises(ValidationError, match="duplicate"):
+        manifest(**{field: ("same", "same")})
+
+
+def test_a_requirement_on_something_absent_does_not_derail_ordering() -> None:
+    """The missing requirement is reported by the dependency check, with a better message."""
+    assert load_order([manifest(name="a", requires=("absent",))]) == ["a"]
+
+
 def test_there_is_no_permissions_field() -> None:
     """Plugins run in-process with full privileges, and the manifest does not pretend otherwise.
 
@@ -167,21 +180,31 @@ def test_there_is_no_permissions_field() -> None:
 def test_two_plugins_cannot_claim_the_same_component() -> None:
     """Silent shadowing would make behaviour depend on installation order."""
     registry = ComponentRegistry()
-    registry.bind("first").add(keys.PARSER.named("pdf"), lambda _: _never())
+    registry.bind("first").add(keys.PARSER.named("pdf"), lambda _: _never(), media_types={"a/b"})
     with pytest.raises(DuplicateComponentError, match="first"):
-        registry.bind("second").add(keys.PARSER.named("pdf"), lambda _: _never())
+        registry.bind("second").add(
+            keys.PARSER.named("pdf"), lambda _: _never(), media_types={"a/b"}
+        )
 
 
 def test_asking_for_something_absent_lists_what_is_present() -> None:
     registry = ComponentRegistry()
-    registry.bind("p").add(keys.PARSER.named("markdown"), lambda _: _never())
+    registry.bind("p").add(
+        keys.PARSER.named("markdown"), lambda _: _never(), media_types={"text/markdown"}
+    )
     with pytest.raises(UnknownComponentError, match="markdown"):
         registry.record(keys.PARSER.named("pdf"))
 
 
 def test_an_unnamed_component_cannot_be_registered() -> None:
     with pytest.raises(ValueError, match="unnamed"):
-        ComponentRegistry().add(keys.PARSER, lambda _: _never())
+        ComponentRegistry().add(keys.PARSER, lambda _: _never(), media_types={"a/b"})
+
+
+def test_a_parser_must_declare_what_it_handles() -> None:
+    """Routing reads the declaration, so a parser without one could never be reached."""
+    with pytest.raises(ValueError, match="must declare the media types"):
+        ComponentRegistry().add(keys.PARSER.named("pdf"), lambda _: _never())
 
 
 def _never() -> object:  # pragma: no cover - factories here are never invoked
@@ -212,6 +235,30 @@ def test_an_entry_point_may_be_a_plugin_or_a_callable_returning_one() -> None:
         points=list(_points(direct=direct, factory=lambda: _Plugin(manifest(name="factory"))))
     )
     assert sorted(found.names) == ["direct", "factory"]
+
+
+def test_an_entry_point_may_be_the_plugin_class_itself() -> None:
+    """A class has both attributes, so it satisfies the protocol without being a plugin.
+
+    Calling ``register`` on the class rather than an instance passes the registry as
+    ``self``, which fails somewhere confusing. The class is instantiated instead.
+    """
+
+    class Klass:
+        manifest = manifest(name="klass")
+
+        def register(self, registry: ComponentRegistry) -> None:
+            registry.add(keys.MIDDLEWARE.named("from-class"), lambda _: object())
+
+    found = discover(points=list(_points(klass=Klass)))
+    assert found.names == ("klass",)
+    assert found.registry.has(ComponentKind.MIDDLEWARE, "from-class")
+
+
+def test_a_manifest_can_be_looked_up_by_name() -> None:
+    found = discover()
+    assert found.manifest("example") is not None
+    assert found.manifest("not-installed") is None
 
 
 def test_an_entry_point_pointing_at_something_else_is_an_error() -> None:

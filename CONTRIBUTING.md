@@ -113,6 +113,9 @@ builds it, installs it and loads it, so it cannot go stale.
   startup, with both versions named.
 - Register factories, not instances. Keep heavy imports inside the factory so an installed
   plugin nobody has configured costs one cheap import.
+- Parsers declare their media types at registration, not only on the class. Routing a
+  document reads the declaration, so choosing one parser does not construct the rest — and
+  a parser that disagrees with its own declaration is caught the first time it is used.
 - Declare a `config_model`. Settings written for a component with no model are rejected
   rather than ignored.
 - Run the conformance suites from `manicule.testing` against your components.

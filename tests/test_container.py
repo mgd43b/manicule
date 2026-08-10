@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import override
 
 import pytest
@@ -12,13 +13,14 @@ from manicule.container import Container, build_container, check_wiring, keys
 from manicule.core.errors import (
     CircularDependencyError,
     ConfigError,
+    PluginError,
     PolicyError,
     UnknownComponentError,
 )
 from manicule.core.lifecycle import HealthReport, HealthState, Metric
 from manicule.core.protocols import Chunker, Embedder, Parser
 from manicule.plugins.registry import BuildContext, ComponentRegistry, Discovery
-from tests.fakes import BlockChunker, HashEmbedder, LineParser
+from tests.fakes import MEDIA_TYPE, BlockChunker, HashEmbedder, LineParser
 
 
 class ParserConfig(BaseModel):
@@ -60,6 +62,7 @@ def wired(settings: Settings) -> tuple[Container, list[str]]:
         keys.PARSER.named("lines"),
         lambda _: LineParser(),
         config_model=ParserConfig,
+        media_types={MEDIA_TYPE},
     )
     registry.add(keys.EMBEDDER.named("mlx"), lambda _: HashEmbedder())
     registry.add(keys.CHUNKER.named("structural"), lambda _: BlockChunker())
@@ -111,6 +114,7 @@ def test_a_factory_receives_its_validated_configuration(settings: Settings) -> N
         keys.PARSER.named("lines"),
         lambda ctx: seen.append(ctx) or LineParser(),
         config_model=ParserConfig,
+        media_types={MEDIA_TYPE},
     )
     configured = settings.model_copy(
         update={
@@ -127,7 +131,12 @@ def test_a_factory_receives_its_validated_configuration(settings: Settings) -> N
 
 def test_configuration_a_component_cannot_accept_is_rejected(settings: Settings) -> None:
     registry = ComponentRegistry().bind("test")
-    registry.add(keys.PARSER.named("lines"), lambda _: LineParser(), config_model=ParserConfig)
+    registry.add(
+        keys.PARSER.named("lines"),
+        lambda _: LineParser(),
+        config_model=ParserConfig,
+        media_types={MEDIA_TYPE},
+    )
     configured = settings.model_copy(
         update={
             "plugins": settings.plugins.model_copy(
@@ -136,6 +145,25 @@ def test_configuration_a_component_cannot_accept_is_rejected(settings: Settings)
         }
     )
     with pytest.raises(ConfigError, match=r"parser\.lines"):
+        Container(configured, registry).get(keys.PARSER.named("lines"))
+
+
+def test_a_setting_of_the_wrong_type_names_the_field(settings: Settings) -> None:
+    registry = ComponentRegistry().bind("test")
+    registry.add(
+        keys.PARSER.named("lines"),
+        lambda _: LineParser(),
+        config_model=ParserConfig,
+        media_types={MEDIA_TYPE},
+    )
+    configured = settings.model_copy(
+        update={
+            "plugins": settings.plugins.model_copy(
+                update={"config": {"parser.lines": {"greeting": 42}}}
+            )
+        }
+    )
+    with pytest.raises(ConfigError, match="greeting"):
         Container(configured, registry).get(keys.PARSER.named("lines"))
 
 
@@ -189,7 +217,10 @@ async def test_a_failed_startup_leaves_nothing_running(settings: Settings) -> No
 
     with pytest.raises(RuntimeError, match="refuses to start"):
         await container.start()
-    assert log == ["setup:good", "teardown:good"]
+
+    # "bad" is torn down too. Its setup raised part-way, which is precisely when a component
+    # has acquired something and not finished with it.
+    assert log == ["setup:good", "teardown:bad", "teardown:good"]
 
 
 async def test_one_component_failing_to_stop_does_not_strand_the_others(
@@ -216,6 +247,34 @@ async def test_one_component_failing_to_stop_does_not_strand_the_others(
     with pytest.raises(ExceptionGroup):
         await container.aclose()
     assert "teardown:first" in log
+
+
+async def test_a_shutdown_error_never_hides_the_error_that_caused_the_shutdown(
+    settings: Settings,
+) -> None:
+    """The failure being handled is more interesting than a failure while handling it."""
+
+    class Stubborn(Recorder):
+        @override
+        async def teardown(self) -> None:
+            msg = "will not close"
+            raise RuntimeError(msg)
+
+    registry = ComponentRegistry().bind("test")
+    registry.add(keys.MIDDLEWARE.named("first"), lambda _: Stubborn("first", []))
+    container = Container(settings, registry)
+    container.get(keys.MIDDLEWARE.named("first"))
+    await container.start()
+
+    async def fail_inside_the_context() -> None:
+        async with container:
+            msg = "the original problem"
+            raise ValueError(msg)
+
+    with pytest.raises(ValueError, match="the original problem") as caught:
+        await fail_inside_the_context()
+
+    assert any("shutting down also failed" in note for note in caught.value.__notes__)
 
 
 async def test_health_says_which_component_is_unwell(settings: Settings) -> None:
@@ -270,7 +329,7 @@ async def test_metrics_are_labelled_with_where_they_came_from(
 # --- subsystem views --------------------------------------------------------------------------
 
 
-def test_middleware_runs_in_the_order_configuration_lists_it(settings: Settings) -> None:
+async def test_middleware_runs_in_the_order_configuration_lists_it(settings: Settings) -> None:
     """Declared where a reader can see it, not emerging from priority numbers."""
     log: list[str] = []
     registry = ComponentRegistry().bind("test")
@@ -280,23 +339,54 @@ def test_middleware_runs_in_the_order_configuration_lists_it(settings: Settings)
     configured = settings.model_copy(
         update={"plugins": settings.plugins.model_copy(update={"middleware": ("second", "first")})}
     )
-    chain = Container(configured, registry).middleware()
+    chain = await Container(configured, registry).middleware()
     assert [m.name for m in chain] == ["second", "first"]
 
 
-def test_the_parser_chain_puts_the_configured_order_first(settings: Settings) -> None:
+async def test_the_parser_chain_puts_the_configured_order_first(settings: Settings) -> None:
     registry = ComponentRegistry().bind("test")
-    registry.add(keys.PARSER.named("lines"), lambda _: LineParser())
-    registry.add(keys.PARSER.named("other"), lambda _: LineParser())
+    registry.add(keys.PARSER.named("lines"), lambda _: LineParser(), media_types={MEDIA_TYPE})
+    registry.add(keys.PARSER.named("other"), lambda _: LineParser(), media_types={MEDIA_TYPE})
 
     configured = settings.model_copy(
-        update={"parser_fallbacks": {"text/x-fake": ("other",), "*": ("lines",)}}
+        update={"parser_fallbacks": {MEDIA_TYPE: ("other",), "*": ("lines",)}}
     )
-    chain = Container(configured, registry).parser_chain("text/x-fake")
+    chain = await Container(configured, registry).parser_chain(MEDIA_TYPE)
     assert len(chain) == 2
 
 
-def test_a_connector_is_named_by_the_user_and_typed_by_configuration(
+async def test_routing_does_not_construct_the_parsers_it_did_not_choose(settings: Settings) -> None:
+    """A parser's factory is where its heavy imports live, so routing must not run them all."""
+    built: list[str] = []
+
+    def factory(name: str) -> Callable[[BuildContext], LineParser]:
+        def build(_: BuildContext) -> LineParser:
+            built.append(name)
+            return LineParser()
+
+        return build
+
+    registry = ComponentRegistry().bind("test")
+    registry.add(keys.PARSER.named("wanted"), factory("wanted"), media_types={MEDIA_TYPE})
+    registry.add(keys.PARSER.named("other"), factory("other"), media_types={"application/pdf"})
+
+    chain = await Container(settings, registry).parser_chain(MEDIA_TYPE)
+    assert len(chain) == 1
+    assert built == ["wanted"]
+
+
+async def test_a_parser_disagreeing_with_its_own_declaration_is_caught(settings: Settings) -> None:
+    """Routing reads the declaration, so a parser that handles something else is unreachable."""
+    registry = ComponentRegistry().bind("test")
+    registry.add(
+        keys.PARSER.named("mislabelled"), lambda _: LineParser(), media_types={"application/pdf"}
+    )
+    container = Container(settings, registry)
+    with pytest.raises(PluginError, match="must agree"):
+        await container.parser_chain("application/pdf")
+
+
+async def test_a_connector_is_named_by_the_user_and_typed_by_configuration(
     settings: Settings,
 ) -> None:
     from tests.fakes import MemoryConnector  # noqa: PLC0415
@@ -306,9 +396,9 @@ def test_a_connector_is_named_by_the_user_and_typed_by_configuration(
     configured = settings.model_copy(update={"connectors": {"docs": _connector_settings("memory")}})
     container = Container(configured, registry)
 
-    assert container.connector("docs").name == "memory"
+    assert (await container.connector("docs")).name == "memory"
     with pytest.raises(UnknownComponentError, match="no connector named 'absent'"):
-        container.connector("absent")
+        await container.connector("absent")
 
 
 def _connector_settings(type_: str) -> object:

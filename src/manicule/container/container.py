@@ -30,9 +30,11 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from manicule.config.profiles import profile_config
 from manicule.config.settings import Settings
+from manicule.container import keys
 from manicule.core.errors import (
     CircularDependencyError,
     ConfigError,
+    PluginError,
     PolicyError,
     UnknownComponentError,
 )
@@ -195,43 +197,62 @@ class Container:
     # Each is a few lines that read configuration and resolve components. They live here
     # rather than in one startup routine so that a subsystem's wiring stays the size of the
     # subsystem.
+    #
+    # All of them are async, and none of them is async because it does I/O. They hand a
+    # component to a caller who is about to use it, so anything they resolve must already
+    # have been set up — and setup is the one part of the lifecycle that can await. The
+    # synchronous `get` exists for factories, which run during construction, before setup
+    # is due.
 
-    def parser_chain(self, media_type: str) -> list[Parser]:
+    async def parser_chain(self, media_type: str) -> list[Parser]:
         """Parsers to try for ``media_type``, in order.
 
-        The configured chain first, then every parser claiming the media type, then the
-        global ``*`` tail. Order is fixed by configuration rather than by which plugin
+        The configured chain first, then every parser that declared the media type, then
+        the global ``*`` tail. Order is fixed by configuration rather than by which plugin
         happened to register first, so two installations with the same config parse the same
         document the same way.
-        """
-        from manicule.container import keys  # noqa: PLC0415 - avoids an import cycle
 
+        Routing reads the declaration each parser made when it registered, so choosing a
+        parser does not construct the ones it did not choose. Each parser that *is* chosen
+        is checked against its own declaration, so the two cannot drift apart unnoticed.
+        """
         fallbacks = self.settings.parser_fallbacks
         names: list[str] = [*fallbacks.get(media_type, ())]
-        for record in self.registry.records(ComponentKind.PARSER):
-            if record.name in names:
-                continue
-            parser = self.get(keys.PARSER.named(record.name))
-            if media_type in parser.media_types:
-                names.append(record.name)
+        names.extend(
+            record.name
+            for record in self.registry.records(ComponentKind.PARSER)
+            if media_type in record.media_types and record.name not in names
+        )
         names.extend(name for name in fallbacks.get("*", ()) if name not in names)
-        return [self.get(keys.PARSER.named(name)) for name in names]
 
-    def middleware(self) -> list[Middleware]:
+        chain: list[Parser] = []
+        for name in names:
+            parser = self.get(keys.PARSER.named(name))
+            declared = self.registry.record(keys.PARSER.named(name)).media_types
+            if parser.media_types != declared and media_type not in parser.media_types:
+                msg = (
+                    f"parser {name!r} registered {sorted(declared)} but handles "
+                    f"{sorted(parser.media_types)}, and does not handle {media_type!r}. "
+                    f"The declaration is what routing uses, so the two must agree."
+                )
+                raise PluginError(msg)
+            chain.append(parser)
+        await self._setup_pending()
+        return chain
+
+    async def middleware(self) -> list[Middleware]:
         """Configured middleware, in the order it runs."""
-        from manicule.container import keys  # noqa: PLC0415
+        chain = [self.get(keys.MIDDLEWARE.named(n)) for n in self.settings.plugins.middleware]
+        await self._setup_pending()
+        return chain
 
-        return [self.get(keys.MIDDLEWARE.named(n)) for n in self.settings.plugins.middleware]
-
-    def retrieval_pipeline(self) -> list[RetrievalStage]:
+    async def retrieval_pipeline(self) -> list[RetrievalStage]:
         """The retrieval stages for the configured profile, in order.
 
         The reranker is appended when the profile asks for one and configuration names one.
         The result is a plain list of uniform stages, which is what lets the evaluation
         harness compare two pipelines without either of them being special.
         """
-        from manicule.container import keys  # noqa: PLC0415
-
         settings = self.settings
         stages: list[RetrievalStage] = [
             self.get(keys.RETRIEVAL_STAGE.named(name)) for name in settings.rag.pipeline
@@ -239,44 +260,52 @@ class Container:
         profile = profile_config(settings.rag.profile, settings.rag.overrides)
         if profile.rerank and settings.rag.reranker:
             stages.append(self.get(keys.RERANKER.named(settings.rag.reranker)))
+        await self._setup_pending()
         return stages
 
-    def connector(self, instance: str) -> Connector:
+    async def connector(self, instance: str) -> Connector:
         """The connector for a configured source.
 
         Sources are named by the user and typed by configuration, so two Confluence spaces
         are two connectors of one type rather than one connector serving two configurations.
         """
-        from manicule.container import keys  # noqa: PLC0415
-
         configured = self.settings.connectors.get(instance)
         if configured is None:
             known = ", ".join(sorted(self.settings.connectors)) or "none configured"
             msg = f"no connector named {instance!r} in configuration. Configured: {known}"
             raise UnknownComponentError(msg)
-        return self.get(keys.CONNECTOR.named(configured.type))
+        return await self.aget(keys.CONNECTOR.named(configured.type))
 
     # --- lifecycle ------------------------------------------------------------------
 
     async def start(self) -> None:
         """Set up every constructed component, in dependency order.
 
-        If one fails, those already started are torn down before the failure propagates, so
-        a failed startup leaves nothing running.
+        If one fails, everything already started is torn down before the failure
+        propagates, so a failed startup leaves nothing running.
         """
         try:
             await self._setup_pending()
-        except Exception:
-            await self.aclose()
+        except BaseException as exc:
+            # The startup failure is the one worth reading. A teardown that also fails is
+            # recorded against it rather than replacing it.
+            try:
+                await self.aclose()
+            except Exception as during_teardown:  # noqa: BLE001 - attached, not swallowed
+                exc.add_note(f"shutting down after the failed start also failed: {during_teardown}")
             raise
 
     async def _setup_pending(self) -> None:
         while self._pending:
             slot = self._pending.pop(0)
             instance = self._instances[slot]
+            # Recorded as started *before* setup runs. A component whose setup raises
+            # part-way has usually acquired something, and its teardown is documented as
+            # safe to call after a failed setup — which is worth nothing if the container
+            # never calls it.
+            self._started.append(slot)
             if isinstance(instance, SupportsSetup):
                 await instance.setup()
-            self._started.append(slot)
 
     async def aclose(self) -> None:
         """Tear everything down, in reverse setup order.
@@ -312,8 +341,16 @@ class Container:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        del exc_type, exc, tb
-        await self.aclose()
+        del exc_type, tb
+        if exc is None:
+            await self.aclose()
+            return
+        # Something is already on its way out, and it is almost certainly more interesting
+        # than a shutdown error. Record the shutdown error on it instead of replacing it.
+        try:
+            await self.aclose()
+        except Exception as during_teardown:  # noqa: BLE001 - attached, not swallowed
+            exc.add_note(f"shutting down also failed: {during_teardown}")
 
     # --- observability --------------------------------------------------------------
 

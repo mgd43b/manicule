@@ -34,9 +34,11 @@ from pydantic_settings import (
 
 from manicule.config.providers import (
     ProviderSettings,
+    env_var_names,
     is_local,
     resolve_provider_keys,
 )
+from manicule.core.errors import PolicyError
 from manicule.core.retrieval import RetrievalProfile
 
 ENV_PREFIX = "MANICULE_"
@@ -504,10 +506,9 @@ class Settings(BaseSettings):
     def model_post_init(self, context: Any, /) -> None:
         """Fill provider credentials from the environment by convention."""
         del context
-        resolved = resolve_provider_keys(
+        self.providers = resolve_provider_keys(
             self.providers, self.selected_providers, environ=provider_environment()
         )
-        object.__setattr__(self, "providers", resolved)
 
     # --- derived ------------------------------------------------------------------------
 
@@ -559,8 +560,6 @@ class Settings(BaseSettings):
 
         for name in sorted(self.selected_providers):
             if not is_local(name) and not self.provider(name).has_key:
-                from manicule.config.providers import env_var_names  # noqa: PLC0415
-
                 expected = " or ".join(env_var_names(name))
                 problems.append(
                     f"provider {name!r} is selected but has no API key. Set {expected}, or "
@@ -593,8 +592,6 @@ class Settings(BaseSettings):
         """
         problems = self.policy_problems()
         if problems:
-            from manicule.core.errors import PolicyError  # noqa: PLC0415
-
             joined = "\n  - ".join(problems)
             msg = f"configuration cannot be run:\n  - {joined}"
             raise PolicyError(msg)
@@ -604,7 +601,11 @@ class Settings(BaseSettings):
 _SECRET_KEYS = ("api_key", "secret", "token", "password", "client_secret", "encryption_key")
 
 
-def _looks_secret(key: str) -> bool:
+def looks_secret(key: str) -> bool:
+    """Whether a field name identifies a credential.
+
+    One rule, used both to mask configuration for display and to omit it when writing.
+    """
     normalised = key.replace("-", "").replace("_", "").lower()
     return any(marker.replace("_", "") in normalised for marker in _SECRET_KEYS)
 
@@ -614,7 +615,7 @@ def _mask(value: JsonValue, key: str = "") -> Any:  # noqa: ANN401 - recursive o
         return {k: _mask(v, k) for k, v in value.items()}
     if isinstance(value, list):
         return [_mask(v, key) for v in value]
-    if value is not None and _looks_secret(key):
+    if value is not None and looks_secret(key):
         return "**********"
     return value
 
@@ -655,5 +656,6 @@ __all__ = [
     "default_config_dir",
     "default_data_dir",
     "env_files",
+    "looks_secret",
     "provider_environment",
 ]

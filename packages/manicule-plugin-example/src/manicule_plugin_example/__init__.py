@@ -7,14 +7,16 @@ without a model or a database. Read top to bottom; it is short on purpose.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import override
 
 from pydantic import BaseModel, Field
 
 from manicule.container import keys
 from manicule.core.anchors import Anchor, LineAnchor, Unlocated
-from manicule.core.content import BlockKind, ParsedBlock, RawDocument
+from manicule.core.content import BlockKind, Chunk, Document, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.core.lifecycle import HealthReport, Metric
+from manicule.core.protocols import Middleware, Parser, RetrievalStage
 from manicule.core.retrieval import Candidate, Query
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
 
@@ -80,29 +82,25 @@ class LineParser:
         return (Metric(name="documents_parsed", value=float(self._parsed)),)
 
 
-class TrimMiddleware:
-    """Strips trailing whitespace from every chunk before it is embedded and stored.
+class TrimMiddleware(Middleware):
+    """Strips trailing whitespace from the text of every chunk before it is stored.
 
-    Middleware is transformational: what it returns is what the pipeline continues with.
-    Inheriting the protocol's defaults would be the usual way to skip the hooks you do not
-    need; this one implements them explicitly so the shape is visible.
+    Middleware is transformational: what a hook returns is what the pipeline continues
+    with. Inheriting :class:`~manicule.core.protocols.Middleware` supplies pass-through
+    defaults for the hooks this one does not need, so only the interesting method is here.
     """
 
     name = "trim"
 
-    async def before_parse(self, raw: RawDocument) -> RawDocument | None:
-        return raw
-
-    async def after_parse(self, document: object, blocks: list[ParsedBlock]) -> list[ParsedBlock]:
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
         del document
-        return blocks
-
-    async def after_chunk(self, document: object, chunks: list[object]) -> list[object]:
-        del document
-        return chunks
-
-    async def after_store(self, document: object) -> None:
-        del document
+        return [
+            chunk.model_copy(
+                update={"text": chunk.text.rstrip(), "embed_text": chunk.embed_text.rstrip()}
+            )
+            for chunk in chunks
+        ]
 
 
 class PassthroughStage:
@@ -135,11 +133,12 @@ class ExamplePlugin:
             _build_parser,
             config_model=LineParserConfig,
             summary="One block per line, with real line anchors.",
+            media_types={MEDIA_TYPE},
         )
         registry.add(
             keys.MIDDLEWARE.named("trim"),
             lambda _: TrimMiddleware(),
-            summary="Leaves everything as it found it.",
+            summary="Trims trailing whitespace from chunk text.",
         )
         registry.add(
             keys.RETRIEVAL_STAGE.named("passthrough"),
@@ -158,7 +157,12 @@ def _build_parser(context: BuildContext) -> LineParser:
 
 PLUGIN = ExamplePlugin()
 
-_: Plugin = PLUGIN  # A compile-time check that the plugin protocol is satisfied.
+# Checked when this file is type-checked, so the example cannot drift out of conformance
+# with the protocols it exists to demonstrate.
+_plugin: Plugin = PLUGIN
+_parser: Parser = LineParser(LineParserConfig())
+_middleware: Middleware = TrimMiddleware()
+_stage: RetrievalStage = PassthroughStage()
 
 __all__ = [
     "MEDIA_TYPE",
