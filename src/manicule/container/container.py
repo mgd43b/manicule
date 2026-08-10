@@ -204,6 +204,25 @@ class Container:
     # synchronous `get` exists for factories, which run during construction, before setup
     # is due.
 
+    def parser_chain_names(self, media_type: str) -> list[str]:
+        """Registered parser names to try for ``media_type``, in order.
+
+        Synchronous and constructing nothing, because two callers need the *chain* without
+        needing the parsers: the ingest pipeline records it on the document before the first
+        attempt (``docs/ingest.md`` §5), and each attempt then runs in a worker subprocess
+        that resolves only the one parser it was asked for. Resolving lazily instead would
+        let a configuration reload mid-chain produce a chain that never existed.
+        """
+        fallbacks = self.settings.parser_fallbacks
+        names: list[str] = [*fallbacks.get(media_type, ())]
+        names.extend(
+            record.name
+            for record in self.registry.records(ComponentKind.PARSER)
+            if media_type in record.media_types and record.name not in names
+        )
+        names.extend(name for name in fallbacks.get("*", ()) if name not in names)
+        return names
+
     async def parser_chain(self, media_type: str) -> list[Parser]:
         """Parsers to try for ``media_type``, in order.
 
@@ -216,17 +235,8 @@ class Container:
         parser does not construct the ones it did not choose. Each parser that *is* chosen
         is checked against its own declaration, so the two cannot drift apart unnoticed.
         """
-        fallbacks = self.settings.parser_fallbacks
-        names: list[str] = [*fallbacks.get(media_type, ())]
-        names.extend(
-            record.name
-            for record in self.registry.records(ComponentKind.PARSER)
-            if media_type in record.media_types and record.name not in names
-        )
-        names.extend(name for name in fallbacks.get("*", ()) if name not in names)
-
         chain: list[Parser] = []
-        for name in names:
+        for name in self.parser_chain_names(media_type):
             parser = self.get(keys.PARSER.named(name))
             declared = self.registry.record(keys.PARSER.named(name)).media_types
             if parser.media_types != declared and media_type not in parser.media_types:

@@ -47,12 +47,21 @@ document can corrupt.
 | discover | `Watermark \| None` | `DiscoveredDoc` stream | async, in-process | connector page size |
 | fetch | `DocRef` | `RawDocument` | async, in-process | HTTP timeout, size cap |
 | parse | `RawDocument` | `ParsedBlock` stream | **worker subprocess** | wall clock + memory |
-| chunk | `ParsedBlock` stream | `Chunk` list | worker subprocess | token budget |
+| chunk | `ParsedBlock` stream | `Chunk` list | in-process | token budget |
 | embed | `Chunk` list | vectors | **in-process** | batch size |
 | store | chunks + vectors | committed document | in-process | SQLite transaction |
 
-Two things in that table are load-bearing and are argued in §6: **parse and chunk run in a
-subprocess, and embed does not.**
+One thing in that table is load-bearing and is argued in §6: **parse runs in a subprocess, and
+embed does not.**
+
+> **Corrected during implementation.** This table originally put *chunk* in the worker too.
+> It cannot be there, and the reason is the middleware contract rather than anything about
+> chunking: `after:parse` operates on blocks, middleware is a plugin the container builds, and
+> a `spawn`ed worker would have to re-discover plugins and construct middleware that may hold
+> network clients and per-run state. So blocks come back across the boundary and are chunked
+> in the parent, which is also what §6.3's "workers receive bytes and return blocks" already
+> said. The worker still owns the whole of what needs a deadline: the parser chain, and
+> container expansion, which is a parser's work under the same limits.
 
 ### 2.1 Discover is not fetch
 
@@ -92,7 +101,7 @@ means an Alembic batch rebuild (`storage.md` §3.4).
 | Member | Set by | Terminal | Servable |
 |---|---|---|---|
 | `pending` | discovery, or the §6.4 sweep | no | no |
-| `fetching` `parsing` `embedding` | the pipeline, in flight | no | no |
+| `fetching` `parsing` `embedding` | the pipeline, in flight — and only for a document with nothing servable to lose (§9) | no | no |
 | `parsed` | parse stage, ≥ 1 chunk (`parsing.md` §6.4) | no | no |
 | `indexed` | store stage, last write (`storage.md` §8.2 I3) | yes | **yes** |
 | `failed` + `failed_stage` | **any** stage (`parsing.md` §6.4) | yes | no |
@@ -104,6 +113,15 @@ resolves the concern that prompted this section: fetch, parse and middleware fai
 each mint an enum member, so the `CHECK`-constrained set does not grow every time a stage is
 added. This document contributes only `fetching` and `embedding` — two in-flight states — and
 `failed_stage` values for the stages it owns.
+
+> **Implemented as three, not two.** #1 shipped `DocumentStatus` without any of the in-flight
+> states, so `fetching`, `parsing` **and** `embedding` all arrive here, along with
+> `middleware` as a `failed_stage` value. Both columns are `VARCHAR` + `CHECK`, so widening
+> them is the Alembic batch rebuild §3.4 said it would be — revision `9c1a4f7b2d10`, with a
+> downgrade that maps in-flight back to `pending` and a middleware failure back to `parse`.
+> `middleware` is placed after the six stages and documented as a hook boundary rather than a
+> stage, so "the six, in order" stays true: a hook that raises is a plugin problem, and filing
+> it under the stage it happened to bound would send an operator to read a parser that worked.
 
 **Two terminal states are easy to sweep by mistake, and must not be.** `container` has zero
 chunks *by design* — an archive whose members became their own documents has nothing of its own
@@ -118,6 +136,16 @@ WHERE status IN ('fetching', 'parsing', 'embedding')   -- never NOT IN (...)
 
 An allowlist fails closed: a status added later is not swept until someone adds it. A denylist
 fails open, and the failure is a terminal document being requeued forever.
+
+**Change detection needs the mirror-image allowlist, and this document missed it.** A skip is
+also a `WHERE`, and getting it wrong is just as quiet. A run interrupted mid-ingest leaves a
+document requeued to `pending` — with its `version_token` and `content_hash` already written,
+because both are recorded before the parse that failed. A skip rule consulting only the token
+would then skip that document on every subsequent sync, forever, while every counter reported
+it as handled. So `SETTLED` names the statuses in which a stored document is a finished answer
+about the bytes it holds, and only those may skip. Both sets are in
+`manicule.core.content`, and a test asserts they do not overlap and that no status is missing
+from both — a status in neither is never requeued *and* never skipped.
 
 **Only `indexed` is servable**, and that is enforced by the join in `storage.md` §6.2 rather
 than by anything here. Every other state is invisible to retrieval whatever exists in the
@@ -173,8 +201,14 @@ original input would resurrect exactly the bug above.
 | Read configuration | Write to either store directly |
 | Emit events and metrics | Mutate another document |
 | Annotate `Document.metadata` / `Chunk.metadata` | Set or alter an `Anchor` |
-| Skip a document by raising `SkipDocument(reason)` | **Alter `Chunk.text` — ever (§3.3)** |
+| Skip a document by returning `None` from `before_parse` | **Alter `Chunk.text` — ever (§3.3)** |
 | Rewrite `embed_text`, having declared it (§3.3) | Perform network I/O without a declared timeout |
+
+> **Corrected during implementation.** This row said "raising `SkipDocument(reason)`". #1
+> settled it the other way, in `manicule.core.protocols.Middleware`: `before_parse` returns
+> `None` to drop a document. That is the better shape and the doc is what was wrong — a
+> document excluded by configuration is an ordinary outcome, not an exception, and it records
+> as `skipped` rather than as a failure. There is one short-circuit, not two.
 
 **No store handle** is the important one. A middleware that writes to the stores bypasses the
 write ordering in `storage.md` §8.2, and the ordering is what makes crash recovery possible.
@@ -433,6 +467,25 @@ for a resource limit to be missing, because that is where the malformed PDF gets
 nothing there requires it today; if that dependency is unwelcome, the macOS path can shell out
 to `ps`, at the cost of a fork per poll.
 
+> **Corrected during implementation, and the correction is the interesting one.** The table
+> above makes the *mechanism* platform-specific, which is right, and the *enforced quantity*
+> platform-specific too, which is not. `RLIMIT_AS` bounds address space; RSS polling bounds
+> resident memory. They are different numbers, so a parser that reserves a large arena without
+> touching it dies on Linux and succeeds on macOS — the same document, two outcomes, decided by
+> the machine. That is precisely the split `PLAN.md` §7 forbids.
+>
+> **So resident memory is the enforced quantity everywhere**, sampled by the parent, and
+> `SIGKILL` carries it on both platforms. `RLIMIT_AS` is still applied in the child wherever
+> the kernel accepts it, at four times the resident bound: loose enough that it cannot fire
+> before the uniform check in any realistic case, tight enough to catch an allocation so sudden
+> that a 250 ms sample misses it. A backstop, not the policy. The child reports whether it was
+> able to take that limit, so the difference is observable rather than assumed.
+
+`psutil` is an optional extra rather than a requirement, and the `ps` fallback is the tested
+path when it is absent — because a limit that silently stops applying because a package was not
+installed is worse than one that costs a fork per poll. Neither choice changes what gets
+indexed, which is the test for whether a dependency may be optional at all.
+
 The parent-side poll is a sampling check, so it can overshoot between ticks. That is accepted
 and stated: the goal is to stop a runaway before it takes the machine down, not to enforce a
 byte-exact quota. Poll interval defaults to 250 ms.
@@ -607,6 +660,20 @@ adds two rules.
 re-ingest fails at any stage, it stays `indexed` with its existing chunks and vectors, and the
 failure is recorded in `error_message` and `metadata.last_ingest_error`. The new status is
 applied only when there is something to replace the old content with.
+
+**A terminal *determination* does replace it, and that is not a softening of the rule.**
+Implementation forced the distinction: `failed` means we do not know whether the new bytes hold
+text, so destroying a working answer over it is indefensible. `no_extractable_text`,
+`unsupported_media_type` and `container` are conclusions *about the new bytes* — the source
+document changed, and continuing to serve chunks derived from bytes it no longer has would cite
+text the document does not contain. Between "keep serving something stale" and "keep serving
+something the source never said", this project has only ever had one answer. So a failure never
+demotes; a conclusion does.
+
+The same asymmetry governs the in-flight statuses: they are written only for a document with no
+servable content. An `indexed` document is never marked `fetching` or `parsing`, because those
+states are not servable and writing one would unserve a working document for the duration of
+every re-sync — which is the very bug this section exists to prevent, arriving by the back door.
 
 > **Prior art, and the reason this rule exists.** `updateDocumentForReindex` sets
 > `status = 'pending'` *before* parsing begins, and the failure handler sets `status = 'error'`.
@@ -798,6 +865,27 @@ So resume is: run it again. There is no checkpoint file, no resume token, and no
 corrupt. The only cost is re-enumeration, which is exactly the cost the watermark exists to
 bound.
 
+**Where the new watermark comes from, which this document did not say.** `Connector.discover`
+*took* a position and nothing returned one, so a pipeline written to the protocol alone could
+never advance it — and "the watermark advances only on a clean run" was a rule about a write
+that never happened. Two workers found the same hole from opposite ends, and it is now
+`Connector.watermark` in `contracts.md` §3: a read-only property answering how far the last
+*completed* enumeration got, `None` when the source has no change signal or the enumeration did
+not finish.
+
+**Two checks guard that write and neither is redundant.** `assert_connector_contract` catches
+a connector that advances its watermark as it yields — by abandoning a stream after one document
+and requiring the position has not moved — and it catches it on an *uninterrupted* run, which is
+the only kind anyone looks at. The pipeline's own gate catches a caller that persists a
+watermark for work that was not committed, on a run that has already gone wrong. A connector can
+pass the first and still lose documents through a caller that ignores the second.
+
+Deleting either restores a failure whose symptom is documents that exist in the source, were
+enumerated once, and are in no index — permanently, with nothing raised, and no later sync
+fixing it. This is written down in both places on purpose: two tests that look like they overlap
+are what this guarantee has to look like, and a reader who finds them without the reason will
+delete one.
+
 **The exception, stated:** a connector whose `discover` is not restartable from a watermark
 re-enumerates fully. That is a connector property, not a pipeline one, and it is visible in
 `doctor` rather than hidden.
@@ -823,6 +911,14 @@ the impatient case safe.
 ## 14. `doctor` — ingest checks
 
 Complementing the storage checks (`storage.md` §10) and the parse checks (`parsing.md` §6.6).
+
+There is no `doctor` command yet — it belongs to the CLI work, alongside the storage checks
+(`storage.md` §10) and the parse checks (`parsing.md` §6.6), none of which have one either.
+What the pipeline owes it is the *data*, and each row below names something already recorded
+rather than something to be derived later: statuses and `updated_at` on `documents`, kill counts
+by reason on the worker pool, `last_run` counters and `last_clean_reconcile_at` on
+`connectors.metadata`, `proposed_deletion` where guard 2 fired, `original_omitted_reason` on
+every document that has no retained bytes, and the lock file's holder.
 
 | Check | Detects |
 |---|---|
@@ -850,7 +946,7 @@ Calls made in the absence of a stated position.
 | The complete `Document.status` set and its transitions, collected for #1 | §2.2 |
 | PII redaction moves to the generation boundary; ingest-time redaction rejected | §3.4 |
 | Two-level change detection, and a skip that still writes three things | §4, §4.1 |
-| Parse and chunk in `spawn`ed worker subprocesses; embed deliberately not | §6 |
+| Parse in `spawn`ed worker subprocesses; embed deliberately not (chunk moved to the parent, §2) | §6 |
 | Memory bounding is platform-split: `RLIMIT_AS` on Linux, RSS polling on macOS | §6.2 |
 | Crash recovery is a startup sweep on `status` + `updated_at`, no new schema | §6.4 |
 | One instance per data directory, enforced by a lock file | §6.5 |
@@ -863,6 +959,21 @@ Calls made in the absence of a stated position.
 | The sweep is scheduled and yields to backup and sync | §11.2 |
 | Watch never reconciles; debounce with a post-debounce re-`stat` | §12 |
 | Resume needs no checkpoint; run counters live in `connectors.metadata` | §13 |
+
+Decisions the implementation added, each argued where it appears:
+
+| Decision | Where |
+|---|---|
+| Resident memory is the enforced quantity on every platform; `RLIMIT_AS` is a looser backstop | §6.2 |
+| Chunking runs in the parent, because `after:parse` is a plugin hook | §2 |
+| Change detection needs its own allowlist (`SETTLED`), for the mirror of §6.4's reason | §2.2 |
+| A terminal *conclusion* replaces an indexed document; a *failure* never does | §9 |
+| In-flight statuses are written only for a document with nothing servable to lose | §9 |
+| Container expansion is a parse attempt, decided in the worker that holds the parser | §2 |
+| `middleware` is a `failed_stage` value, positioned after the six stages | §2.2 |
+| A connector reports its position through `Connector.watermark`, asked only on a clean run | §13.2 |
+| Retention happens before any hook, so retained bytes are the connector's and `content_hash` describes them | §4.2 |
+| Members of a container are counted apart from discovered documents, so one archive cannot exhaust a `--limit` | §13.1 |
 
 ## Appendix B: filed, not deferred
 

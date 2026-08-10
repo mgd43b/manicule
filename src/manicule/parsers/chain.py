@@ -28,7 +28,7 @@ what status results.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -154,33 +154,18 @@ class ParserChain:
         return (*base, *tail)
 
     async def run(self, raw: RawDocument) -> ChainResult:
-        """Run the chain to completion and classify the result."""
-        chain = self.resolve(raw.media_type)
-        if not chain:
-            return ChainResult(
-                blocks=[],
-                status=DocumentStatus.UNSUPPORTED_MEDIA_TYPE,
-                status_detail=(
-                    f"no parser chain matched {raw.media_type!r}. Configure one under "
-                    f"[parserFallbacks], or add a '*' entry to index unknown text files."
-                ),
-            )
+        """Run the chain to completion, in this process, and classify the result."""
+        return await run_chain(self.resolve(raw.media_type), raw, self.attempt)
 
-        attempts: list[Attempt] = []
-        for name in chain:
-            blocks, attempt = await self._attempt(name, raw)
-            attempts.append(attempt)
-            if attempt.outcome is Outcome.PARSED:
-                return ChainResult(
-                    blocks=blocks,
-                    status=DocumentStatus.PARSED,
-                    status_detail="",
-                    parser_used=name,
-                    attempts=tuple(attempts),
-                )
-        return _classify(raw, tuple(attempts))
+    async def attempt(self, name: str, raw: RawDocument) -> tuple[list[ParsedBlock], Attempt]:
+        """Give one parser its turn, in this process, and say what came of it.
 
-    async def _attempt(self, name: str, raw: RawDocument) -> tuple[list[ParsedBlock], Attempt]:
+        The unit the ingest pipeline dispatches. Per *attempt* rather than per document,
+        because ``docs/parsing.md`` §6.3 makes the time and memory limits per-parser: a chain
+        of three parsers on a 30-second limit may legitimately take 90 seconds, and a
+        per-document limit would make the last parser in a chain fail for reasons belonging
+        to the first.
+        """
         parser = self.parsers[name]
         try:
             blocks = await read_blocks(parser, raw)
@@ -189,12 +174,51 @@ class ParserChain:
         except Exception as exc:  # noqa: BLE001 - a parser's own bug must not end the batch
             reason = f"{type(exc).__name__}: {exc}"
             return [], Attempt(parser=name, outcome=Outcome.FAILED, reason=reason)
-        if not _bears_text(blocks):
+        if not bears_text(blocks):
             return [], Attempt(parser=name, outcome=Outcome.EMPTY, reason="no text-bearing blocks")
         return blocks, Attempt(parser=name, outcome=Outcome.PARSED)
 
 
-def _classify(raw: RawDocument, attempts: Sequence[Attempt]) -> ChainResult:
+async def run_chain(
+    chain: Sequence[str],
+    raw: RawDocument,
+    attempt: Callable[[str, RawDocument], Awaitable[tuple[list[ParsedBlock], Attempt]]],
+) -> ChainResult:
+    """Run ``chain`` to completion over ``raw``, and classify what came out.
+
+    The loop is separated from the thing that runs one parser because the ingest pipeline
+    runs each attempt in a **worker subprocess**: a deadline is only enforceable across a
+    process boundary, since a parser inside a native extension observes no cancellation and
+    Python cannot kill a thread. Both callers share this loop, so an attempt that was killed
+    and an attempt that raised advance the chain identically — and, crucially, are classified
+    identically.
+    """
+    if not chain:
+        return ChainResult(
+            blocks=[],
+            status=DocumentStatus.UNSUPPORTED_MEDIA_TYPE,
+            status_detail=(
+                f"no parser chain matched {raw.media_type!r}. Configure one under "
+                f"[parserFallbacks], or add a '*' entry to index unknown text files."
+            ),
+        )
+
+    attempts: list[Attempt] = []
+    for name in chain:
+        blocks, outcome = await attempt(name, raw)
+        attempts.append(outcome)
+        if outcome.outcome is Outcome.PARSED:
+            return ChainResult(
+                blocks=blocks,
+                status=DocumentStatus.PARSED,
+                status_detail="",
+                parser_used=name,
+                attempts=tuple(attempts),
+            )
+    return classify(raw, tuple(attempts))
+
+
+def classify(raw: RawDocument, attempts: Sequence[Attempt]) -> ChainResult:
     """Turn a chain that produced no text into the one status that describes it.
 
     **The mixed case is the one an implementation guesses at.** A chain where one parser hard
@@ -258,7 +282,7 @@ def container_result(members: int) -> ChainResult:
     )
 
 
-def _bears_text(blocks: Sequence[ParsedBlock]) -> bool:
+def bears_text(blocks: Sequence[ParsedBlock]) -> bool:
     """Whether any block carries a character worth indexing.
 
     Whitespace-only, form-feed-only and empty-string blocks all count as nothing, which is
@@ -284,5 +308,8 @@ __all__ = [
     "ChainResult",
     "Outcome",
     "ParserChain",
+    "bears_text",
+    "classify",
     "container_result",
+    "run_chain",
 ]

@@ -21,7 +21,9 @@ from manicule.core.anchors import (
 )
 from manicule.core.content import (
     CHUNKLESS_BY_DESIGN,
+    IN_FLIGHT,
     NEEDS_ATTENTION,
+    SETTLED,
     BlockKind,
     Chunk,
     Document,
@@ -30,6 +32,7 @@ from manicule.core.content import (
     ParsedBlock,
     PipelineStage,
     RawDocument,
+    Retention,
 )
 from manicule.core.embedding import (
     EmbedFingerprint,
@@ -93,7 +96,9 @@ __all__ = [
     "CHUNKLESS_BY_DESIGN",
     "CORE_VERSION",
     "EDGE_TOLERANCE",
+    "IN_FLIGHT",
     "NEEDS_ATTENTION",
+    "SETTLED",
     "Anchor",
     "BlockKind",
     "Candidate",
@@ -148,6 +153,7 @@ __all__ = [
     "RawDocument",
     "Rect",
     "Reranker",
+    "Retention",
     "RetrievalProfile",
     "RetrievalStage",
     "SourceId",

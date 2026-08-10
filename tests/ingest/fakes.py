@@ -1,0 +1,655 @@
+"""In-memory doubles for the pipeline, and the ones that misbehave on purpose.
+
+Every guard in :mod:`manicule.ingest` has a fake here that breaks the rule the guard exists
+for. That is the repo's pattern and it is not decoration: a pipeline whose whole purpose is
+surviving failure is certified by nothing if only its happy path is exercised. Each of these
+was checked by disabling the guard and watching the suite go red.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
+from datetime import UTC, datetime
+from typing import override
+
+from manicule.core.anchors import LineAnchor
+from manicule.core.content import (
+    BlockKind,
+    Chunk,
+    Document,
+    DocumentStatus,
+    Metadata,
+    ParsedBlock,
+    RawDocument,
+    Retention,
+)
+from manicule.core.embedding import EmbedFingerprint, IndexFingerprints, Vector
+from manicule.core.errors import ParseError
+from manicule.core.fingerprints import ChunkFingerprint
+from manicule.core.ids import chunk_id, content_hash
+from manicule.core.retrieval import Candidate, Filter
+from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
+from manicule.parsers.expansion import ExpandedMember, MemberFailure, MemberOutcome
+from tests.fakes import MEDIA_TYPE, HashEmbedder
+
+CONTAINER_MEDIA_TYPE = "application/x-fake-archive"
+
+
+# --- stores --------------------------------------------------------------------------------
+
+
+class MemoryIngestStore:
+    """Everything :class:`~manicule.ingest.ports.IngestStore` promises, in dictionaries.
+
+    Real enough to be worth testing against: it enforces the one invariant the pipeline
+    depends on — that deleting chunks writes tombstones — because a fake that skipped it would
+    make the sweep's tests pass while proving nothing.
+    """
+
+    def __init__(self) -> None:
+        self.documents: dict[str, Document] = {}
+        self.chunks: dict[str, list[Chunk]] = {}
+        self.tombstones: list[str] = []
+        self.metadata: dict[str, Metadata] = {}
+        self.lineage: dict[str, tuple[str | None, str | None]] = {}
+        self.originals: dict[str, tuple[str | None, str | None]] = {}
+        self.seen: dict[str, int] = {}
+        self.deleted_at: dict[str, datetime] = {}
+        self.updated_at: dict[str, datetime] = {}
+        self.watermarks: dict[str, Watermark] = {}
+        self.connector_meta: dict[str, Metadata] = {}
+        self.state = IndexFingerprints()
+
+    # documents
+
+    async def get_document(self, document_id: str) -> Document | None:
+        return self.documents.get(document_id)
+
+    async def find_document(self, source: str, source_id: SourceId) -> Document | None:
+        for document in self.documents.values():
+            if (
+                document.source == source
+                and document.source_id == source_id
+                and document.id not in self.deleted_at
+            ):
+                return document
+        return None
+
+    async def upsert_document(self, document: Document) -> Document:
+        self.documents[document.id] = document
+        self.deleted_at.pop(document.id, None)
+        return document
+
+    async def set_status(self, document_id: str, status: DocumentStatus, detail: str = "") -> None:
+        existing = self.documents.get(document_id)
+        if existing is None:
+            return
+        self.documents[document_id] = existing.model_copy(
+            update={
+                "status": status,
+                "status_detail": detail or None,
+                "failed_stage": existing.failed_stage if status is DocumentStatus.FAILED else None,
+            }
+        )
+
+    async def delete_document(self, document_id: str) -> None:
+        self.documents.pop(document_id, None)
+        await self.replace_chunks(document_id, [])
+
+    async def soft_delete_document(self, document_id: str) -> None:
+        self.deleted_at[document_id] = UTC_ZERO
+
+    async def list_documents(
+        self,
+        filter: Filter | None = None,  # noqa: A002
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Sequence[Document]:
+        del filter
+        return list(self.documents.values())[offset : offset + limit]
+
+    # chunks
+
+    async def replace_chunks(self, document_id: str, chunks: Sequence[Chunk]) -> None:
+        for stale in self.chunks.get(document_id, []):
+            self.tombstones.append(stale.id)
+        self.chunks[document_id] = list(chunks)
+        for chunk in chunks:
+            if chunk.id in self.tombstones:
+                self.tombstones.remove(chunk.id)
+
+    async def get_chunks(self, chunk_ids: Sequence[str]) -> Sequence[Chunk]:
+        wanted = set(chunk_ids)
+        return [c for chunks in self.chunks.values() for c in chunks if c.id in wanted]
+
+    async def count_chunks(self, document_id: str | None = None) -> int:
+        if document_id is not None:
+            return len(self.chunks.get(document_id, []))
+        return sum(len(chunks) for chunks in self.chunks.values())
+
+    async def document_chunks(self, document_id: str) -> Sequence[Chunk]:
+        return list(self.chunks.get(document_id, []))
+
+    # bookkeeping
+
+    async def record_seen(self, document_id: str, *, version_token: str | None = None) -> None:
+        self.seen[document_id] = self.seen.get(document_id, 0) + 1
+        if version_token is not None and document_id in self.documents:
+            self.documents[document_id] = self.documents[document_id].model_copy(
+                update={"version_token": version_token}
+            )
+
+    async def annotate(self, document_id: str, updates: Metadata) -> None:
+        merged = dict(self.metadata.get(document_id, {}))
+        merged.update(updates)
+        self.metadata[document_id] = merged
+
+    async def set_lineage(
+        self, document_id: str, *, chunk_fp: str | None, embed_fp: str | None
+    ) -> None:
+        current = self.lineage.get(document_id, (None, None))
+        self.lineage[document_id] = (
+            chunk_fp if chunk_fp is not None else current[0],
+            embed_fp if embed_fp is not None else current[1],
+        )
+
+    async def set_original(
+        self, document_id: str, *, ref: str | None, omitted_reason: str | None
+    ) -> None:
+        self.originals[document_id] = (ref, omitted_reason)
+
+    async def requeue_stale(
+        self,
+        statuses: Collection[DocumentStatus],
+        older_than: datetime,
+        *,
+        detail: str = "",
+    ) -> int:
+        wanted = set(statuses)
+        requeued = 0
+        for document_id, document in list(self.documents.items()):
+            stamp = self.updated_at.get(document_id)
+            if document.status in wanted and stamp is not None and stamp < older_than:
+                self.documents[document_id] = document.model_copy(
+                    update={
+                        "status": DocumentStatus.PENDING,
+                        "status_detail": detail or None,
+                        "failed_stage": None,
+                    }
+                )
+                requeued += 1
+        return requeued
+
+    async def count_documents(
+        self,
+        *,
+        source: str | None = None,
+        statuses: Collection[DocumentStatus] | None = None,
+    ) -> int:
+        return len(await self.select_documents(source=source, statuses=statuses))
+
+    async def select_documents(
+        self,
+        *,
+        source: str | None = None,
+        statuses: Collection[DocumentStatus] | None = None,
+        media_types: Collection[str] | None = None,
+        chunk_fp_other_than: str | None = None,
+        limit: int | None = None,
+    ) -> Sequence[Document]:
+        chosen = [d for d in self.documents.values() if d.id not in self.deleted_at]
+        if source is not None:
+            chosen = [d for d in chosen if d.source == source]
+        if statuses is not None:
+            wanted = set(statuses)
+            chosen = [d for d in chosen if d.status in wanted]
+        if media_types is not None:
+            allowed = set(media_types)
+            chosen = [d for d in chosen if d.media_type in allowed]
+        if chunk_fp_other_than is not None:
+            chosen = [
+                d for d in chosen if self.lineage.get(d.id, (None, None))[0] != chunk_fp_other_than
+            ]
+        return chosen[:limit] if limit is not None else chosen
+
+    # sync state
+
+    async def get_watermark(self, connector: str) -> Watermark | None:
+        return self.watermarks.get(connector)
+
+    async def set_watermark(self, connector: str, watermark: Watermark) -> None:
+        self.watermarks[connector] = watermark
+
+    async def known_source_ids(self, connector: str) -> AsyncIterator[SourceId]:
+        for document in list(self.documents.values()):
+            if document.source == connector and document.id not in self.deleted_at:
+                yield document.source_id
+
+    async def connector_metadata(self, connector: str) -> Metadata:
+        return dict(self.connector_meta.get(connector, {}))
+
+    async def record_connector_metadata(self, connector: str, updates: Metadata) -> None:
+        merged = dict(self.connector_meta.get(connector, {}))
+        for key, value in updates.items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+        self.connector_meta[connector] = merged
+
+    # index state
+
+    async def index_fingerprints(self) -> IndexFingerprints:
+        return self.state
+
+    async def record_index_fingerprints(self, state: IndexFingerprints) -> None:
+        self.state = state
+
+    # the sweep
+
+    async def take_tombstones(self, limit: int) -> Sequence[str]:
+        return self.tombstones[:limit]
+
+    async def clear_tombstones(self, chunk_ids: Sequence[str]) -> None:
+        for chunk_id_ in chunk_ids:
+            if chunk_id_ in self.tombstones:
+                self.tombstones.remove(chunk_id_)
+
+    async def soft_deleted_before(self, cutoff: datetime, *, limit: int = 1000) -> Sequence[str]:
+        return [
+            document_id for document_id, stamp in list(self.deleted_at.items()) if stamp < cutoff
+        ][:limit]
+
+
+UTC_ZERO = datetime.fromtimestamp(0, tz=UTC)
+"""A fixed instant, so a soft delete in a fake is always outside any grace period."""
+
+
+class MemoryVectors:
+    """A vector store that records what it was asked to remove."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, tuple[str, Vector]] = {}
+        self.deleted_documents: list[str] = []
+        self._fingerprint: EmbedFingerprint | None = None
+
+    async def ensure_ready(self, fingerprint: EmbedFingerprint) -> None:
+        self._fingerprint = fingerprint
+
+    async def fingerprint(self) -> EmbedFingerprint | None:
+        return self._fingerprint
+
+    async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
+        for chunk, vector in zip(chunks, vectors, strict=True):
+            self.rows[chunk.id] = (chunk.document_id, vector)
+
+    async def search(
+        self,
+        vector: Vector,
+        k: int,
+        filter: Filter | None = None,  # noqa: A002
+    ) -> list[Candidate]:
+        del vector, k, filter
+        return []
+
+    async def delete_document(self, document_id: str) -> None:
+        self.deleted_documents.append(document_id)
+        for key, (owner, _) in list(self.rows.items()):
+            if owner == document_id:
+                del self.rows[key]
+
+    async def delete_chunks(self, chunk_ids: list[str]) -> None:
+        for chunk_id_ in chunk_ids:
+            self.rows.pop(chunk_id_, None)
+
+    async def count(self) -> int:
+        return len(self.rows)
+
+
+class RefusingVectors(MemoryVectors):
+    """Fails every upsert, so the crash window between chunks and vectors is reachable."""
+
+    @override
+    async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
+        del chunks, vectors
+        msg = "the vector store is unavailable"
+        raise RuntimeError(msg)
+
+
+# --- parsers -------------------------------------------------------------------------------
+
+
+class LineParser:
+    """One block per line."""
+
+    media_types = frozenset({MEDIA_TYPE})
+
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        for number, line in enumerate(raw.as_text().splitlines(), start=1):
+            if line.strip():
+                yield ParsedBlock(
+                    kind=BlockKind.PROSE, text=line, anchor=LineAnchor(start=number, end=number)
+                )
+
+    async def resolve(self, anchor: object, raw: RawDocument) -> str | None:
+        del anchor, raw
+        return None
+
+
+class ExplodingParser(LineParser):
+    """Raises something that is not a decline. The chain must advance and record ``failed``."""
+
+    @override
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        del raw
+        msg = "the parser library segfaulted, metaphorically"
+        raise RuntimeError(msg)
+        yield  # pragma: no cover - unreachable, present to make this an async generator
+
+
+class DecliningParser(LineParser):
+    """Inspects the input and reports that it is not its kind."""
+
+    @override
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        del raw
+        raise ParseError("not my kind of document")
+        yield  # pragma: no cover - unreachable, present to make this an async generator
+
+
+class EmptyParser(LineParser):
+    """Succeeds and produces nothing, the way a scanned PDF does."""
+
+    @override
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        del raw
+        return
+        yield  # pragma: no cover - unreachable, present to make this an async generator
+
+
+class FakeArchive:
+    """A container whose members are named in its own body, one per line."""
+
+    media_types = frozenset({CONTAINER_MEDIA_TYPE})
+
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        del raw
+        return
+        yield  # pragma: no cover - unreachable, present to make this an async generator
+
+    async def resolve(self, anchor: object, raw: RawDocument) -> str | None:
+        del anchor, raw
+        return None
+
+    async def expand(self, raw: RawDocument) -> AsyncIterator[MemberOutcome]:
+        if raw.media_type != CONTAINER_MEDIA_TYPE:
+            raise ParseError("not an archive")
+        for line in raw.as_text().splitlines():
+            name, _, body = line.partition("=")
+            if not name:
+                continue
+            if body == "!encrypted":
+                yield MemberFailure(
+                    source_id=f"{raw.source_id}!/{name}",
+                    uri=f"fake:{raw.uri}!/{name}",
+                    status=DocumentStatus.FAILED,
+                    reason="member is encrypted",
+                    depth=1,
+                )
+                continue
+            yield ExpandedMember(
+                source_id=f"{raw.source_id}!/{name}",
+                uri=f"fake:{raw.uri}!/{name}",
+                raw=RawDocument(
+                    source_id=f"{raw.source_id}!/{name}",
+                    uri=f"fake:{raw.uri}!/{name}",
+                    media_type=MEDIA_TYPE,
+                    content=body,
+                ),
+                depth=1,
+            )
+
+
+# --- chunker and embedder -------------------------------------------------------------------
+
+
+class BlockChunker:
+    """One chunk per block, with a breadcrumb on ``embed_text``."""
+
+    fingerprint = ChunkFingerprint(
+        chunker="block",
+        version="1",
+        max_tokens=64,
+        overlap_tokens=0,
+        tokenizer_id="whitespace",
+    )
+
+    def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+        return [
+            Chunk(
+                id=chunk_id(document.id, position, block.text),
+                document_id=document.id,
+                text=block.text,
+                embed_text=f"{document.title} > {block.text}",
+                anchor=block.anchor,
+                heading_path=block.heading_path,
+                kind=block.kind,
+                position=position,
+                token_count=max(1, len(block.text.split())),
+            )
+            for position, block in enumerate(blocks)
+        ]
+
+
+class RefusingEmbedder(HashEmbedder):
+    """Fails every batch, so the embed stage's failure path is reachable."""
+
+    @override
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        del texts
+        msg = "the model runtime is out of memory"
+        raise RuntimeError(msg)
+
+
+class CountingEmbedder(HashEmbedder):
+    """Records the size of every batch it was given."""
+
+    def __init__(self, dimension: int = 5) -> None:
+        super().__init__(dimension=dimension)
+        self.batches: list[int] = []
+
+    @override
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        self.batches.append(len(texts))
+        return await super().embed(texts)
+
+
+# --- connectors ------------------------------------------------------------------------------
+
+
+class DictConnector:
+    """A connector over a dictionary, with a settable version token per document."""
+
+    def __init__(self, documents: Mapping[str, str], *, name: str = "memory") -> None:
+        self.name = name
+        self.documents = dict(documents)
+        self.media_types: dict[str, str] = {}
+        self.fetches: list[str] = []
+        self.fail_fetch: set[str] = set()
+        self.reconcile_fails_after: int | None = None
+        self.hidden: set[str] = set()
+
+    @property
+    def watermark(self) -> Watermark | None:
+        """Nothing: a dictionary has no change signal to report a position from.
+
+        The honest answer for a source with no native watermark, and the one that keeps the
+        pipeline re-enumerating rather than believing an invented position.
+        """
+        return None
+
+    async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+        del watermark
+        for source_id, text in sorted(self.documents.items()):
+            yield DiscoveredDoc(
+                ref=DocRef(source_id=source_id, uri=f"memory://{source_id}"),
+                version_token=content_hash(text),
+                media_type=self.media_types.get(source_id, MEDIA_TYPE),
+            )
+
+    async def fetch(self, ref: DocRef) -> RawDocument:
+        self.fetches.append(ref.source_id)
+        if ref.source_id in self.fail_fetch:
+            msg = f"503 fetching {ref.source_id}"
+            raise RuntimeError(msg)
+        return RawDocument(
+            source_id=ref.source_id,
+            uri=ref.uri,
+            media_type=self.media_types.get(ref.source_id, MEDIA_TYPE),
+            content=self.documents[ref.source_id],
+        )
+
+    async def reconcile(self) -> AsyncIterator[SourceId]:
+        emitted = 0
+        for source_id in sorted(self.documents):
+            if source_id in self.hidden:
+                continue
+            if self.reconcile_fails_after is not None and emitted >= self.reconcile_fails_after:
+                msg = "429 while enumerating"
+                raise RuntimeError(msg)
+            emitted += 1
+            yield source_id
+
+
+# --- middleware --------------------------------------------------------------------------------
+
+
+class PassThrough:
+    """Touches nothing. The baseline every check must accept."""
+
+    name = "pass-through"
+    mutates_embedded_text = False
+
+    async def before_parse(self, raw: RawDocument) -> RawDocument | None:
+        return raw
+
+    async def after_parse(self, document: Document, blocks: list[ParsedBlock]) -> list[ParsedBlock]:
+        del document
+        return blocks
+
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        del document
+        return chunks
+
+    async def after_store(self, document: Document) -> None:
+        del document
+
+
+class DiscardingHook(PassThrough):
+    """Returns ``None`` from ``after_chunk``, where a value was required."""
+
+    name = "discarding"
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        del document, chunks
+        return None  # pyright: ignore[reportReturnType] - the defect under test
+
+
+class WrongTypeHook(PassThrough):
+    """Returns something that is not a ``RawDocument`` from ``before_parse``."""
+
+    name = "wrong-type"
+
+    @override
+    async def before_parse(self, raw: RawDocument) -> RawDocument | None:
+        del raw
+        return "just some text"  # pyright: ignore[reportReturnType] - the defect under test
+
+
+class TextRewriter(PassThrough):
+    """Rewrites ``Chunk.text``, which no middleware may ever do."""
+
+    name = "text-rewriter"
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        del document
+        return [c.model_copy(update={"text": c.text.upper()}) for c in chunks]
+
+
+class BlockRewriter(PassThrough):
+    """Rewrites ``ParsedBlock.text``: the same corruption, one hook earlier."""
+
+    name = "block-rewriter"
+
+    @override
+    async def after_parse(self, document: Document, blocks: list[ParsedBlock]) -> list[ParsedBlock]:
+        del document
+        return [b.model_copy(update={"text": b.text.upper()}) for b in blocks]
+
+
+class UndeclaredRewriter(PassThrough):
+    """Rewrites ``embed_text`` without declaring it, so no fingerprint describes the corpus."""
+
+    name = "undeclared"
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        del document
+        return [c.model_copy(update={"embed_text": c.embed_text + " extra"}) for c in chunks]
+
+
+class DeclaredRewriter(UndeclaredRewriter):
+    """The same rewrite, declared. The legitimate case."""
+
+    name = "declared"
+    mutates_embedded_text = True
+
+
+class Skipper(PassThrough):
+    """Excludes every document before parsing."""
+
+    name = "skipper"
+
+    @override
+    async def before_parse(self, raw: RawDocument) -> RawDocument | None:
+        del raw
+        return None
+
+
+class Exploder(PassThrough):
+    """Raises. One document fails; the batch does not."""
+
+    name = "exploder"
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        del document, chunks
+        msg = "the hook could not reach its service"
+        raise RuntimeError(msg)
+
+
+# --- blobs --------------------------------------------------------------------------------------
+
+
+class MemoryBlobs:
+    """Retains bytes in a dictionary, and refuses anything over a cap."""
+
+    def __init__(self, max_bytes: int = 1 << 30) -> None:
+        self.data: dict[str, bytes] = {}
+        self._max = max_bytes
+
+    async def retain(self, data: bytes, media_type: str | None = None) -> Retention:
+        del media_type
+        if len(data) > self._max:
+            return Retention(
+                omitted_reason=f"original bytes not retained: {len(data)} exceeds the cap"
+            )
+        digest = content_hash(data)
+        self.data[digest] = data
+        return Retention(ref=digest)
+
+    async def get(self, digest: str) -> bytes | None:
+        return self.data.get(digest)

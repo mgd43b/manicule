@@ -68,10 +68,11 @@ async def test_the_connector_matches_the_protocol_signature_by_signature() -> No
 def test_the_connector_registers_through_the_public_entry_point() -> None:
     """The same route a third-party connector takes. A shorter internal one could rot unseen."""
     from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points  # noqa: PLC0415
+    from tests.test_import_boundary import STALE_INSTALL  # noqa: PLC0415 - one diagnosis
 
     found = {point.name: point.value for point in installed_entry_points(ENTRY_POINT_GROUP)}
 
-    assert found.get("connectors") == "manicule.connectors.plugin:PLUGIN"
+    assert found.get("connectors") == "manicule.connectors.plugin:PLUGIN", STALE_INSTALL
 
 
 @pytest.mark.contract

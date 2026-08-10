@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, select
 
+from manicule.core.content import Retention
 from manicule.core.ids import content_hash
 from manicule.storage import models
 from manicule.storage.engine import BLOBS_DIRNAME, session_factory
@@ -152,6 +153,19 @@ class BlobStore:
                     )
                 )
         return stored
+
+    async def retain(self, data: bytes, media_type: str | None = None) -> Retention:
+        """:meth:`put`, expressed in the vocabulary the ingest pipeline speaks.
+
+        The pipeline records a ``Retention`` on the document either way — a reference or the
+        reason there is none — and it must not have to know which of two storage-side classes
+        came back to do it. ``Retention`` lives in core precisely so neither side imports the
+        other.
+        """
+        stored = await self.put(data, media_type)
+        if isinstance(stored, OmittedBlob):
+            return Retention(omitted_reason=stored.reason)
+        return Retention(ref=stored.hash)
 
     async def get(self, digest: str) -> bytes | None:
         """Read retained bytes back, or ``None`` if they are not held."""

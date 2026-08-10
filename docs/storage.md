@@ -1153,6 +1153,11 @@ an orphan, and the sweep deletes a live vector. A tombstone list only ever names
 *were* deleted, so it cannot. It is also cheap — the sweep reads a small table instead of the
 whole index.
 
+The runner lives in `manicule.ingest.sweeps`, is scheduled rather than triggered by deletion,
+and yields to both a backup and an active sync. Its ordering is this document's ordering: the
+vectors go first and the tombstones are cleared second, so a crash between them costs one
+wasted pass rather than a live vector with nothing left to record that it should go.
+
 ### 8.3 Recovery
 
 `manicule reindex --repair` is the general recovery path and it never leaves rung 2:

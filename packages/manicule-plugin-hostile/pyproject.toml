@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manicule-plugin-hostile"
+version = "0.1.0"
+description = "Parsers that hang and allocate without bound, so isolation can be proven."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.12"
+dependencies = ["manicule"]
+
+# Registered through the same public entry-point group every plugin uses. That is the point:
+# the parse workers build parsers by discovery, so a parser reachable any other way would
+# exercise a path production does not have.
+[project.entry-points."manicule.plugins"]
+hostile = "manicule_plugin_hostile:PLUGIN"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manicule_plugin_hostile"]

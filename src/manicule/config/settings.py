@@ -336,6 +336,116 @@ class StorageSettings(Section):
     )
 
 
+class IngestSettings(Section):
+    """How the pipeline runs: limits, concurrency, and the cadence of the sweeps.
+
+    Every default here is a number the design argued for rather than a round one that felt
+    safe. Where a value bounds a resource, the tunable is the quantity that maps to the
+    resource — ``target_batch_tokens`` rather than a batch count — because a batch size is a
+    proxy for memory and a bad one: thirty-two chunks of 512 tokens and thirty-two of 8 000
+    are very different allocations.
+    """
+
+    fetch_concurrency: int = Field(
+        default=8, ge=1, description="In-flight fetches per connector. Bounded by the remote."
+    )
+    parse_workers: int = Field(
+        default=0,
+        ge=0,
+        description="Parse worker subprocesses. ``0`` derives ``min(4, cpu_count - 1)``, "
+        "never fewer than one.",
+    )
+    parse_timeout_s: float = Field(
+        default=30.0,
+        gt=0,
+        description="Wall clock for one parser attempt, not for the document. A chain of "
+        "three parsers may legitimately take three times this before the document fails; a "
+        "per-document limit would make the last parser fail for the first parser's reasons.",
+    )
+    parse_memory_limit_mb: int = Field(
+        default=1024,
+        ge=64,
+        description="Resident memory one parse worker may reach before it is killed.",
+    )
+    memory_poll_interval_s: float = Field(
+        default=0.25,
+        gt=0,
+        description="How often the parent samples a worker's memory where the kernel will "
+        "not enforce a limit for it. Sampling can overshoot between ticks, which is accepted: "
+        "the goal is to stop a runaway before it takes the machine down, not a byte-exact quota.",
+    )
+    max_documents_per_worker: int = Field(
+        default=500,
+        ge=1,
+        description="Recycle a worker after this many documents, to bound leaks in native "
+        "parser libraries — a category of bug no amount of care in manicule prevents.",
+    )
+    max_fetch_bytes: int = Field(
+        default=256 * 1024 * 1024, ge=1, description="Refuse a fetched body larger than this."
+    )
+    target_batch_tokens: int = Field(
+        default=16_384,
+        ge=1,
+        description="Tokens per embedding batch. The batch *size* is derived from this and "
+        "the chunk budget, because the quantity that maps to memory is tokens, not chunks.",
+    )
+    max_embed_batch: int = Field(default=64, ge=1, description="Upper clamp on the derived size.")
+    queue_depth_factor: int = Field(
+        default=2,
+        ge=1,
+        description="Bounded queue depth, as a multiple of the consumer's parallelism. "
+        "Bounded so that backpressure reaches discovery: an unbounded queue turns a slow "
+        "embedder into unbounded memory growth *and* lets a connector race ahead until its "
+        "pagination cursors expire.",
+    )
+    stale_after_s: float = Field(
+        default=3600.0,
+        gt=0,
+        description="How long a document may sit in an in-flight status before the recovery "
+        "sweep requeues it. Comfortably above any per-document limit.",
+    )
+    shutdown_grace_s: float = Field(
+        default=30.0,
+        ge=0,
+        description="How long in-flight documents get to finish on cancellation. A document "
+        "mid-embed is close to done and finishing it is cheaper than redoing it.",
+    )
+    reconcile_interval_s: float = Field(
+        default=7 * 24 * 3600.0,
+        gt=0,
+        description="Deletion detection that runs only when someone remembers is deletion "
+        "detection that does not run.",
+    )
+    reconcile_max_delete_fraction: float = Field(
+        default=0.1,
+        gt=0.0,
+        le=1.0,
+        description="Refuse a reconciliation proposing to delete more than this share of a "
+        "connector's live documents, and record the proposal for confirmation.",
+    )
+    soft_delete_grace_s: float = Field(
+        default=30 * 24 * 3600.0,
+        ge=0,
+        description="How long a soft-deleted document's chunks survive before the sweep "
+        "purges them. Free restore inside it; a re-parse from retained bytes outside it. "
+        "Unbounded free restore would mean unbounded dilution of every vector search.",
+    )
+    sweep_interval_s: float = Field(
+        default=3600.0,
+        gt=0,
+        description="How often the vector sweep runs. Scheduled rather than triggered by "
+        "deletion, so a large reconciliation does not produce a sweep storm during a sync.",
+    )
+    sweep_batch: int = Field(default=1000, ge=1, description="Tombstones retired per sweep pass.")
+    watch_debounce_s: float = Field(
+        default=0.5,
+        gt=0,
+        description="Coalescing window for filesystem events. Editors do not write files the "
+        "way the naive model assumes: one logical save commonly produces several events, and "
+        "ingesting on the first indexes a partial or empty document.",
+    )
+
+
 class EmbeddingSettings(Section):
     """The embedding runtime.
 
@@ -460,6 +570,7 @@ class Settings(BaseSettings):
     llm: LlmSettings = Field(default_factory=LlmSettings)
     providers: dict[str, ProviderSettings] = Field(default_factory=dict)
     rag: RagSettings = Field(default_factory=RagSettings)
+    ingest: IngestSettings = Field(default_factory=IngestSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     connectors: dict[str, ConnectorSettings] = Field(default_factory=dict)
     plugins: PluginSettings = Field(default_factory=PluginSettings)
@@ -635,6 +746,7 @@ __all__ = [
     "DataPolicySettings",
     "EmbeddingSettings",
     "EventSettings",
+    "IngestSettings",
     "LlmSettings",
     "Mode",
     "OAuthProvider",

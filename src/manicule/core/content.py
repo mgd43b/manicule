@@ -37,11 +37,17 @@ class BlockKind(StrEnum):
 
 
 class PipelineStage(StrEnum):
-    """The ingest stages, in order.
+    """The ingest stages, in order, plus the boundary between them.
 
     One vocabulary serves three purposes: attributing a failure to a stage, labelling
     metrics, and naming middleware hook points. Three enums that had to agree would
     eventually stop agreeing.
+
+    :attr:`MIDDLEWARE` is last and is deliberately not a stage. Hooks run *between* stages,
+    and a hook that raises is a plugin problem rather than a problem with the stage it
+    happened to bound — filing it under ``parse`` would send an operator to read a parser
+    that worked perfectly. It is a value of ``failed_stage`` so that "everything a hook
+    broke" stays a query.
     """
 
     DISCOVER = "discover"
@@ -50,6 +56,7 @@ class PipelineStage(StrEnum):
     CHUNK = "chunk"
     EMBED = "embed"
     STORE = "store"
+    MIDDLEWARE = "middleware"
 
 
 class DocumentStatus(StrEnum):
@@ -60,7 +67,16 @@ class DocumentStatus(StrEnum):
     """
 
     PENDING = "pending"
-    """Discovered or fetched; not yet parsed."""
+    """Discovered, or requeued by the recovery sweep; no stage has claimed it yet."""
+
+    FETCHING = "fetching"
+    """The source bytes are being fetched, in the pipeline's own process."""
+
+    PARSING = "parsing"
+    """The parser chain is running, in a subprocess that may be killed."""
+
+    EMBEDDING = "embedding"
+    """Chunks are written and vectors are being produced."""
 
     PARSED = "parsed"
     """Parsed into at least one block; not yet embedded and stored.
@@ -109,6 +125,49 @@ class DocumentStatus(StrEnum):
     DELETED = "deleted"
     """Removed at the source, or by a user. Retained so citations can explain themselves."""
 
+
+IN_FLIGHT: frozenset[DocumentStatus] = frozenset(
+    {
+        DocumentStatus.FETCHING,
+        DocumentStatus.PARSING,
+        DocumentStatus.EMBEDDING,
+    }
+)
+"""The statuses a document holds only while a process is working on it.
+
+**An allowlist, never a denylist, and that is the whole point of naming it here.** The
+recovery sweep requeues documents stuck in these states after a crash, and the tempting
+formulation — everything that is not ``indexed`` — swallows :attr:`DocumentStatus.CONTAINER`
+and :attr:`DocumentStatus.NO_EXTRACTABLE_TEXT`, both of which are terminal and both of which
+have zero chunks by design. Requeued forever, they would be re-fetched, re-parsed and
+re-requeued on every run.
+
+An allowlist fails closed: a status added later is simply not swept until somebody adds it
+here. A denylist fails open, and the failure is silent.
+"""
+
+SETTLED: frozenset[DocumentStatus] = frozenset(
+    {
+        DocumentStatus.INDEXED,
+        DocumentStatus.CONTAINER,
+        DocumentStatus.NO_EXTRACTABLE_TEXT,
+        DocumentStatus.UNSUPPORTED_MEDIA_TYPE,
+        DocumentStatus.FAILED,
+        DocumentStatus.SKIPPED,
+    }
+)
+"""Statuses in which a stored document is a finished answer about the bytes it holds.
+
+Change detection may skip a document only when it is one of these, and the reason is a bug
+that is otherwise very hard to see. A crash mid-ingest leaves a document requeued to
+``pending`` — but with its ``version_token`` and ``content_hash`` already written. A skip
+rule that consulted only the token would then skip it forever, and a document that never
+finished indexing would be re-skipped on every sync while appearing, to every count, to have
+been handled.
+
+Another allowlist, for the same reason as :data:`IN_FLIGHT`: the members are named, so a
+status added later is not silently treated as finished.
+"""
 
 NEEDS_ATTENTION: frozenset[DocumentStatus] = frozenset(
     {
@@ -215,6 +274,34 @@ class Chunk(_Content):
     metadata: Metadata = Field(default_factory=dict)
 
 
+class Retention(_Content):
+    """What became of a document's source bytes when the pipeline offered them for keeping.
+
+    Exactly one of the two is set. ``ref`` present means re-parsing this document never means
+    re-fetching it — rung 3 of the blast-radius ladder, and the only thing standing between a
+    parser bug fix and a full re-crawl of a rate-limited API. ``omitted_reason`` present means
+    the bytes were not kept and says why, on the same principle as
+    :class:`~manicule.core.anchors.Unlocated`: absent with a stated reason, visible in
+    diagnostics, never a silent partial success.
+
+    Lives in core because it is the vocabulary two sides speak — the store that retains and
+    the pipeline that records the outcome — and neither should have to import the other.
+    """
+
+    ref: str | None = None
+    omitted_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> Self:
+        if (self.ref is None) == (self.omitted_reason is None):
+            msg = (
+                "a Retention carries either a ref or a reason it has none; "
+                f"got ref={self.ref!r} omitted_reason={self.omitted_reason!r}"
+            )
+            raise ValueError(msg)
+        return self
+
+
 class Document(_Content):
     """The indexed record of one source document.
 
@@ -284,7 +371,9 @@ class Document(_Content):
 
 __all__ = [
     "CHUNKLESS_BY_DESIGN",
+    "IN_FLIGHT",
     "NEEDS_ATTENTION",
+    "SETTLED",
     "BlockKind",
     "Chunk",
     "Document",
@@ -293,4 +382,5 @@ __all__ = [
     "ParsedBlock",
     "PipelineStage",
     "RawDocument",
+    "Retention",
 ]
