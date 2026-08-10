@@ -69,6 +69,20 @@ IMPLEMENTATION_MODULES = (
 )
 """What core must not pull in. Every entry is a library this project will eventually use."""
 
+STALE_INSTALL = (
+    "an entry point declared in pyproject.toml is missing from the installed distribution. "
+    "Entry points are read from dist-info metadata, not from source, so an editable install "
+    "made before the declaration was added reports the old set however correct the source is — "
+    "which reads as a regression in the plugin machinery and is not one. "
+    "Run `uv sync --reinstall-package manicule` and try again; if it still fails, the "
+    "declaration really is missing."
+)
+"""Why this assertion fails far more often than the thing it is testing actually breaks.
+
+Shared by every entry-point assertion in the suite rather than written out at each, because
+two copies of the same diagnosis drift and the second one is the one nobody updates.
+"""
+
 MANICULE_PACKAGES = (
     "manicule",
     "manicule.core",
@@ -267,8 +281,8 @@ def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
 
     found = {point.name: point.value for point in installed_entry_points(ENTRY_POINT_GROUP)}
 
-    assert found.get("parsing") == "manicule.parsers.plugin:PLUGIN"
-    assert found.get("embedding") == "manicule.embedding.plugin:PLUGIN"
+    assert found.get("parsing") == "manicule.parsers.plugin:PLUGIN", STALE_INSTALL
+    assert found.get("embedding") == "manicule.embedding.plugin:PLUGIN", STALE_INSTALL
 
 
 @pytest.mark.contract
