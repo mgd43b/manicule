@@ -58,6 +58,7 @@ from tests.fakes import (
     UndeclaredEmbedMiddleware,
     UnenforcedLocalOnly,
     lan_ollama,
+    local_only,
     loopback_ollama,
     make_chunks,
     make_document,
@@ -480,6 +481,24 @@ def test_a_lan_ollama_is_refused_under_a_local_only_policy() -> None:
     settings = lan_ollama()
 
     assert settings.cloud_providers_in_use == frozenset({"ollama"})
+    assert_local_only_policy_is_enforced(settings)
+
+
+@pytest.mark.contract
+def test_a_problem_that_is_not_about_egress_does_not_read_as_a_refusal() -> None:
+    """A configuration has problems for several reasons at once, and some name an endpoint.
+
+    A stray ``base_url`` on an in-process provider is reported whatever the data policy says.
+    Blaming the endpoint for it would report a local endpoint as refused when nothing refused
+    it — a false alarm on the branch that exists to catch over-strictness.
+    """
+    settings = local_only(
+        {"provider": "ollama", "base_url": "http://127.0.0.1:11434"},
+        embedding={"provider": "mlx"},
+        providers={"mlx": {"base_url": "http://gpu-box.lan:11434"}},
+    )
+
+    assert any("dials nothing" in problem for problem in settings.policy_problems())
     assert_local_only_policy_is_enforced(settings)
 
 

@@ -672,20 +672,21 @@ async def assert_pipeline_enforces_scope(
                 f"stage {stage.name!r} returned chunk {candidate.chunk.id!r} of document "
                 f"{candidate.chunk.document_id!r}"
             )
-            _require(
-                document is not None,
-                f"{where}, which this store cannot see: it belongs to another workspace or "
-                f"has been soft-deleted. The vector table has no column for either, so a "
-                f"stage that searched it without hydrating through the document store has "
-                f"turned a scoped query into an unscoped one that still looks like it worked",
-            )
-            _require(
-                document is None or document.status is DocumentStatus.INDEXED,
-                f"{where}, whose status is "
-                f"{document.status.value if document else '?'} rather than 'indexed'. Only "
-                f"an indexed document has chunks whose vectors and text are both current; "
-                f"the rest are visible to the store and must not be visible to a search",
-            )
+            if document is None:
+                _fail(
+                    f"{where}, which this store cannot see: it belongs to another workspace "
+                    f"or has been soft-deleted. The vector table has no column for either, so "
+                    f"a stage that searched it without hydrating through the document store "
+                    f"has turned a scoped query into an unscoped one that still looks like it "
+                    f"worked"
+                )
+            elif document.status is not DocumentStatus.INDEXED:
+                _fail(
+                    f"{where}, whose status is {document.status.value!r} rather than "
+                    f"'indexed'. Only an indexed document has chunks whose vectors and text "
+                    f"are both current; the rest are visible to the store and must not be "
+                    f"visible to a search"
+                )
 
     if expect_results:
         _require(
@@ -727,7 +728,7 @@ def assert_local_only_policy_is_enforced(settings: Settings) -> None:
         "otherwise",
     )
 
-    problems = settings.policy_problems()
+    problems = _problems_attributable_to_the_policy(settings)
     for endpoint in settings.selected_endpoints:
         blamed = [problem for problem in problems if endpoint.describe() in problem]
         if endpoint.leaves_machine:
@@ -745,6 +746,22 @@ def assert_local_only_policy_is_enforced(settings: Settings) -> None:
                 f"{blamed}. A local-only policy that rejects a genuinely local endpoint is "
                 f"not a policy, it is a ban, and the way round it is to switch the policy off",
             )
+
+
+def _problems_attributable_to_the_policy(settings: Settings) -> list[str]:
+    """The problems this configuration has *because* cloud processing is forbidden.
+
+    Computed as the difference against the same configuration with ``cloud_allowed`` on,
+    rather than by matching on the text of a message. A configuration has problems for
+    several reasons at once — a missing credential, a stray ``base_url`` on an in-process
+    provider — and several of them name an endpoint too. Blaming an endpoint for one of those
+    would report a local endpoint as refused when nothing refused it, which is a false alarm
+    on the branch that exists to catch over-strictness.
+    """
+    permissive = settings.model_copy(deep=True)
+    permissive.security.data_policy.cloud_allowed = True
+    unrelated = permissive.policy_problems()
+    return [problem for problem in settings.policy_problems() if problem not in unrelated]
 
 
 __all__ = [

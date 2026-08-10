@@ -541,6 +541,8 @@ class BanningLocalOnly(Settings):
 
     @override
     def policy_problems(self) -> list[str]:
+        if self.security.data_policy.cloud_allowed:
+            return super().policy_problems()
         return [
             *super().policy_problems(),
             *(
@@ -551,11 +553,16 @@ class BanningLocalOnly(Settings):
         ]
 
 
-def local_only(llm: dict[str, str], model: type[Settings] = Settings) -> Settings:
+def local_only(
+    llm: dict[str, str],
+    model: type[Settings] = Settings,
+    **rest: object,
+) -> Settings:
     """Settings forbidding cloud processing, with ``llm`` as the generation provider."""
     return model(
         llm=llm,  # pyright: ignore[reportArgumentType] - a settings section, validated on the way in
         security={"data_policy": {"cloud_allowed": False}},  # pyright: ignore[reportArgumentType]
+        **rest,  # pyright: ignore[reportArgumentType] - further sections, validated the same way
     )
 
 

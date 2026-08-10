@@ -933,9 +933,9 @@ through a changed redactor would churn chunk ids and vectors on every pattern ed
 ### 7.1 The predicate is the endpoint, not the provider's name
 
 The question "is this text leaving the machine?" has an obvious wrong answer, and **manicule
-gave it.** [#44](https://github.com/mgd43b/manicule/issues/44) has since replaced the predicate
-with the one this section specifies; the argument is kept in the present tense it was written
-in, because the reasoning is what future providers get classified by.
+gave it.** The rule below is what replaced it: the findings in this section are recorded in the
+past tense because [#44](https://github.com/mgd43b/manicule/issues/44) fixed them, and the rule
+itself is in force — it is what every provider added from here on gets classified by.
 
 > **Prior art.** `const cloudProviders = new Set(['openai', 'anthropic', 'google', 'grok'])`,
 > hardcoded in `bootstrap.ts`. The set has to be edited every time a provider is added, and
