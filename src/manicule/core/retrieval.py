@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Self
+from typing import Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -158,10 +158,122 @@ class Context(BaseModel):
     metadata: Metadata = Field(default_factory=dict)
 
 
+class PipelineIdentity(BaseModel):
+    """What produced a ranking, in enough detail to refuse a dishonest comparison.
+
+    Travels with every :class:`Confidence` and every retrieval trace. Two runs whose
+    identities differ are not two measurements of the same thing: a different reranker, a
+    different fusion constant or a different embedding space changes what the numbers mean,
+    and averaging across them produces a figure nobody can attribute to anything.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    stages: tuple[str, ...] = Field(
+        default=(), description="Stage names, in the order the runner called them."
+    )
+    profile: RetrievalProfile = RetrievalProfile.BALANCED
+    overrides: Metadata = Field(
+        default_factory=dict, description="Per-field overrides applied on top of the profile."
+    )
+    rrf_k: int | None = Field(
+        default=None, description="The fusion constant, when a fusion stage ran."
+    )
+    reranker_model_id: str | None = Field(
+        default=None,
+        description="Which model reranked. ``None`` means none did, which is a different "
+        "pipeline rather than the same one with a step skipped.",
+    )
+    embed_fingerprint: str | None = Field(
+        default=None,
+        description="Canonical identity of the vector space the query was embedded into.",
+    )
+
+
+class ConfidenceBand(StrEnum):
+    """How well-supported an answer is by the corpus, coarsely."""
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    NONE = "none"
+
+
+class Confidence(BaseModel):
+    """How well-supported an answer is by the corpus. A statement about the retrieval.
+
+    Deliberately **not** a probability that the answer is correct: nothing here is calibrated
+    against anything, and an uncalibrated number presented as a probability is the kind of
+    claim that gets believed. It is computed before generation, from what was retrieved, so an
+    answer can be wrong at high confidence — the evidence was there and the model misread it.
+
+    It is also not comparable across configurations, which is why :attr:`pipeline` travels
+    with it. A score produced under a reranker and one produced without are different
+    measurements that happen to share a scale.
+
+    **Absent is not zero.** A query the router answered directly carries no ``Confidence`` at
+    all, because nothing was retrieved and "we did not look" is a different claim from "we
+    looked and there is nothing" — which is the :attr:`ConfidenceBand.NONE` band with a
+    reason.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    score: float = Field(ge=0.0, le=1.0)
+    band: ConfidenceBand
+    components: dict[str, float] = Field(
+        default_factory=dict,
+        description="Each admissible component's weighted contribution. A number that cannot "
+        "say why it is 0.62 is a number nobody can act on.",
+    )
+    suppressed: dict[str, str] = Field(
+        default_factory=dict,
+        description="Components that did not contribute, and why. A suppressed component "
+        "lowers the reachable ceiling; it is never scored zero, because zero would report the "
+        "corpus as weak when the cause was a fault in the pipeline.",
+    )
+    ceiling: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="The highest score this run could have reached. Below 1.0 whenever a "
+        "component was suppressed — which is what makes a profile's cost visible.",
+    )
+    reason: str = Field(
+        default="",
+        description="Why the band is what it is, when the number alone would mislead.",
+    )
+    pipeline: PipelineIdentity = Field(default_factory=PipelineIdentity)
+
+
+@runtime_checkable
+class SupportsGeneration(Protocol):
+    """A store that reports a counter changing whenever a query's answer could change.
+
+    The invalidation signal behind the L1 query cache (``docs/retrieval.md`` §10.3). A store
+    without one is not a defect — it simply cannot be cached against, and the retriever
+    refuses to enable the cache rather than serving results from an index it cannot tell has
+    moved.
+
+    Structural rather than part of :class:`~manicule.core.protocols.DocStore`, because a store
+    that never changes under a running process — a fixture, a read-only replica — implements
+    the store perfectly well without it.
+    """
+
+    @property
+    def generation(self) -> int:
+        """Monotonically increasing. Any commit that changes what a query could return."""
+        ...
+
+
 __all__ = [
     "Candidate",
+    "Confidence",
+    "ConfidenceBand",
     "Context",
     "Filter",
+    "PipelineIdentity",
     "Query",
     "RetrievalProfile",
+    "SupportsGeneration",
 ]

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from manicule.core.errors import ManiculeError, UnknownEntityError
 from manicule.storage import models
@@ -23,6 +23,7 @@ from manicule.storage.engine import session_factory
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from sqlalchemy import Connection
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
     from manicule.core.retrieval import Filter
@@ -52,6 +53,37 @@ class CrossWorkspaceCollisionError(ManiculeError):
     """
 
 
+class _CommitCounter:
+    """Counts committed transactions on an engine.
+
+    The invalidation signal behind the L1 query cache (``docs/retrieval.md`` §10.3), and it
+    counts *commits* rather than calls to the write methods someone remembered to instrument.
+    That is the same reasoning that puts FTS5 synchronisation in triggers rather than in
+    application code, and the same reasoning that puts the tenancy guards in this module: a
+    per-method bump covers only the write paths its author enumerated, and the one nobody
+    enumerated is the one that serves a stale ranking. A transaction that committed on this
+    engine changed something; a read never reaches here, because a session closed without a
+    commit rolls back.
+
+    Over-counting is the safe direction and is accepted. A commit that could not have changed a
+    result — a watermark, a connector's run metadata — still bumps the counter and costs at most
+    a cold cache. Under-counting would serve a ranking computed over a corpus that no longer
+    exists.
+    """
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._value = 0
+        event.listen(engine.sync_engine, "commit", self._committed)
+
+    def _committed(self, connection: Connection) -> None:
+        del connection  # the fact of the commit is the whole signal
+        self._value += 1
+
+    @property
+    def value(self) -> int:
+        return self._value
+
+
 class WorkspaceScoped:
     """Shared construction and tenancy guards for the SQLite store's several surfaces.
 
@@ -70,10 +102,28 @@ class WorkspaceScoped:
         self._engine = engine
         self._workspace_id = workspace_id
         self._sessions = sessions or session_factory(engine)
+        self._generation = _CommitCounter(engine)
 
     @property
     def workspace_id(self) -> str:
         return self._workspace_id
+
+    @property
+    def generation(self) -> int:
+        """Bumped by every committed transaction on this store's engine.
+
+        Satisfies :class:`~manicule.core.retrieval.SupportsGeneration`, which is what lets the
+        retrieval layer cache a ranking and know when to stop trusting it. It counts commits on
+        the *engine*, so a write through any other handle on the same database — another
+        workspace's store, an ingest run, a repair verb, a collection being renamed — moves this
+        one too. That is deliberate: this counter's job is to be impossible to bypass, not to be
+        minimal.
+
+        Here rather than on the document store for the same reason everything else in this class
+        is: six protocols share one handle, and several of them write. A counter attached to one
+        surface would miss the commits of the other five.
+        """
+        return self._generation.value
 
     async def ensure_workspace(self) -> None:
         """Create this store's workspace row if it is absent. Idempotent."""

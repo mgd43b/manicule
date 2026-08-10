@@ -270,6 +270,12 @@ class Container:
         profile = profile_config(settings.rag.profile, settings.rag.overrides)
         if profile.rerank and settings.rag.reranker:
             stages.append(self.get(keys.RERANKER.named(settings.rag.reranker)))
+        # Two stages sharing a name is refused before construction, in `check_wiring`, and
+        # again over the built stages by the pipeline runner — the first catches a repeated
+        # entry in configuration, the second catches a stage whose own `name` collides with
+        # another's. Both matter: candidate scores are keyed by stage name, so a collision
+        # means the second stage silently overwrites the first's record and fusion reads a
+        # ladder missing half its rungs, which produces a plausible ranking and no error.
         await self._setup_pending()
         return stages
 
@@ -425,6 +431,16 @@ def check_wiring(settings: Settings, registry: ComponentRegistry) -> list[str]:
 
     for name in settings.rag.pipeline:
         require(ComponentKind.RETRIEVAL_STAGE, name, "rag.pipeline")
+    repeated = sorted(
+        {name for name in settings.rag.pipeline if settings.rag.pipeline.count(name) > 1}
+    )
+    if repeated:
+        problems.append(
+            f"rag.pipeline names {', '.join(repeated)} more than once. Candidate scores are "
+            f"keyed by stage name, so the second occurrence would overwrite the first's "
+            f"record and fusion would read a ladder missing half its rungs — a plausible "
+            f"ranking, computed from the wrong numbers"
+        )
     for name in settings.plugins.middleware:
         require(ComponentKind.MIDDLEWARE, name, "plugins.middleware")
     for media_type, chain in sorted(settings.parser_fallbacks.items()):

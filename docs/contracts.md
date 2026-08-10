@@ -229,8 +229,11 @@ a derived over-fetch factor and a configurable id-list threshold. Both inputs to
 are recorded on every query, so the threshold gets set from measurement instead of argument.
 `workspace_ids` alone pushes down to neither store: it is enforced by the hydrating join inside
 the dense stage, which is also what stops soft-deleted and cross-workspace rows consuming
-top-`k` slots. The shape that shipped in `manicule.core.retrieval` predates this and is
-reconciled by [#36](https://github.com/mgd43b/manicule/issues/36).
+top-`k` slots. The shape that shipped in `manicule.core.retrieval` predates this and was
+reconciled by [#36](https://github.com/mgd43b/manicule/issues/36); the pipeline that makes the
+`workspace_ids` exemption safe is built in
+[#6](https://github.com/mgd43b/manicule/issues/6), and
+`assert_pipeline_enforces_scope` runs against it both in the suite and, opt-in, on every query.
 
 **`Context` assembly is not a `RetrievalStage` — settled in [`retrieval.md`](retrieval.md)
 §7.1.** It emits `Context` rather than `list[Candidate]`, and keeping the two types distinct is

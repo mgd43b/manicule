@@ -570,6 +570,32 @@ class SqliteDocStore(
         async with self._sessions() as session:
             return (await session.execute(statement)).scalar_one()
 
+    async def live_chunk_count(self) -> int:
+        """Chunks a search in this workspace could legitimately return.
+
+        The numerator of the dense leg's over-fetch factor (``docs/retrieval.md`` §4.3): the
+        vector table holds a row per chunk with no column for tenancy, liveness or status, so
+        the fraction of its rows that survive the hydrating join is what says how far past
+        ``k`` the leg has to reach. Deliberately narrower than :meth:`count_chunks`, which
+        counts every chunk in the database including other tenants' and soft-deleted ones —
+        using that as the numerator would report a diluted index as a clean one and under-fetch
+        on exactly the deployments that need it most.
+
+        One aggregate over an indexed join, computed once per generation rather than per query.
+        """
+        statement = (
+            select(func.count())
+            .select_from(models.Chunk)
+            .join(models.Document, models.Document.id == models.Chunk.document_id)
+            .where(
+                models.Document.workspace_id == self._workspace_id,
+                models.Document.deleted_at.is_(None),
+                models.Document.status == DocumentStatus.INDEXED,
+            )
+        )
+        async with self._sessions() as session:
+            return (await session.execute(statement)).scalar_one()
+
     # --- lexical search -------------------------------------------------------------------
 
     async def search_lexical(

@@ -83,6 +83,19 @@ parsers = [
   "ruamel.yaml>=0.18",
   "tiktoken>=0.8",
 ]
+retrieval = [      # #6
+  # Context fitting only. It is a stand-in for the generator's tokenizer, not a claim to be
+  # one — the generator runs a Llama, Qwen or Mistral vocabulary and none of them is
+  # tiktoken's — but it is a real BPE implementation rather than a character heuristic, and
+  # the estimate is calibrated against the generator's own prompt_eval_count once one exists.
+  "tiktoken>=0.8",
+]
+rerank = [         # #6
+  # Separate from `retrieval` because it drags in torch, and because the `fast` profile never
+  # loads a cross-encoder at all: an installation that only ever runs `fast` should not pay
+  # several gigabytes for a model it will not construct.
+  "sentence-transformers>=3.0",
+]
 generation = []    # #7  litellm
 connectors = [     # #9
   # One HTTP client, async, with a pluggable transport. The transport seam is why this is the
@@ -100,6 +113,7 @@ serve = []         # #8, #11  Typer, Rich, FastMCP, FastAPI, uvicorn
 parsing = "manicule.parsers.plugin:PLUGIN"
 embedding = "manicule.embedding.plugin:PLUGIN"
 connectors = "manicule.connectors.plugin:PLUGIN"
+retrieval = "manicule.retrieval.plugin:PLUGIN"
 
 [project.urls]
 Homepage = "https://github.com/mgd43b/manicule"
@@ -135,6 +149,11 @@ dev = [
   # The connector stack, for the same reason: `uv sync --all-groups` is what CI runs, and the
   # Confluence suites need the HTTP client they drive their synthetic instance through.
   "manicule[connectors]",
+  # The context fitter's tokenizer, for the same reason. `manicule[rerank]` is deliberately
+  # *not* here: it is torch, and the cross-encoder's ordering, truncation and failure rules are
+  # exercised through `PairScorer` — a seam that exists so those rules can be tested without a
+  # two-gigabyte download. What the extra buys is the model, and a model is not a rule.
+  "manicule[retrieval]",
 ]
 
 [tool.uv.workspace]
@@ -244,6 +263,21 @@ reportUnknownArgumentType = "none"
 # it: the plugin factory imports these modules and tests/test_embedding_backends.py builds and
 # runs both backends. `manicule.embedding.runtimes.mlx_core` exists so that this suppression can
 # stay inside this directory instead of following MLX into every caller.
+# The same relaxation once more, for the one directory that touches a cross-encoder runtime.
+# `sentence-transformers` and torch ship partial type information at best, and the extra is
+# deliberately absent from the dev group — CI type-checks without it installed, so
+# `reportMissingImports` cannot resolve the import at all. That is a narrow, deliberate loss
+# covered by running the code rather than by checking it: `manicule.retrieval.rerank` holds the
+# ordering, truncation and failure rules and stays fully checked, because it reaches a runtime
+# only through `PairScorer`.
+[[tool.pyright.executionEnvironments]]
+root = "src/manicule/retrieval/runtimes"
+reportMissingImports = "none"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+
 [[tool.pyright.executionEnvironments]]
 root = "src/manicule/embedding/runtimes"
 reportMissingImports = "none"

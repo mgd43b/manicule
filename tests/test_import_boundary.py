@@ -270,6 +270,40 @@ def test_registering_the_built_in_embedders_loads_no_model_runtime() -> None:
     )
 
 
+RETRIEVAL_LIBRARIES = (
+    "tiktoken",
+    "sentence_transformers",
+    "torch",
+)
+"""What the retrieval stages are built on, and neither of them cheap.
+
+``tiktoken`` fits the assembled context to the generator's window and is only touched once a
+query is being answered; ``sentence-transformers`` is a cross-encoder's runtime and pulls in
+torch. Neither has any business being loaded by discovery, which runs in every process that
+starts — including one whose profile is ``fast`` and will never construct a reranker at all.
+"""
+
+
+@pytest.mark.contract
+def test_registering_the_retrieval_stages_loads_no_tokenizer_or_cross_encoder() -> None:
+    """What registration needs eagerly is a config model, and that is all it gets.
+
+    The alternative is an installation that loads a BPE vocabulary and, behind the reranker,
+    torch, in order to find out that a stage named ``dense`` exists.
+    """
+    loaded = _modules_added_by_discovery()
+    leaked = sorted(
+        name
+        for name in RETRIEVAL_LIBRARIES
+        if any(module == name or module.startswith(f"{name}.") for module in loaded)
+    )
+    assert leaked == [], (
+        f"plugin discovery loaded {', '.join(leaked)}. A stage's runtime belongs inside the "
+        f"factory that builds the stage; what registration needs eagerly — a config model — "
+        f"belongs in manicule.retrieval.config"
+    )
+
+
 @pytest.mark.contract
 def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
     """The built-in parsers take the same route a third-party plugin takes.
@@ -283,6 +317,7 @@ def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
 
     assert found.get("parsing") == "manicule.parsers.plugin:PLUGIN", STALE_INSTALL
     assert found.get("embedding") == "manicule.embedding.plugin:PLUGIN", STALE_INSTALL
+    assert found.get("retrieval") == "manicule.retrieval.plugin:PLUGIN", STALE_INSTALL
 
 
 @pytest.mark.contract
