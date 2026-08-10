@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Extract the public surface of OpenDocuments as a parity checklist.
+
+Prose summaries of a 33k-line codebase lose things. This reads the source and
+emits every externally-visible element — CLI commands, MCP tools, HTTP endpoints,
+database columns, plugin interface methods, parser file types, config keys — as a
+checklist that can be diffed against what manicule has built.
+
+Parity is then a number, not an opinion.
+
+Usage:
+    uv run tools/extract_surface.py /path/to/OpenDocuments > PARITY.md
+"""
+
+# /// script
+# requires-python = ">=3.10"
+# ///
+
+import re
+import sys
+from pathlib import Path
+
+
+def read(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def cli_commands(root: Path) -> list[str]:
+    """Commander.js command names and their flags."""
+    out = []
+    for f in sorted((root / "packages/cli/src/commands").glob("*.ts")):
+        src = read(f)
+        for name in re.findall(r"\.command\(\s*['\"]([^'\"]+)['\"]", src):
+            out.append(f"`{name}`")
+        for flag in re.findall(r"\.option\(\s*['\"]([^'\"]+)['\"]", src):
+            out.append(f"{f.stem} — option `{flag}`")
+    return out
+
+
+def mcp_tools(root: Path) -> list[str]:
+    src = read(root / "packages/server/src/mcp/server.ts")
+    return [f"`{n}`" for n in re.findall(r"name:\s*'([a-z_]+)'", src)]
+
+
+def http_endpoints(root: Path) -> list[str]:
+    out = []
+    for f in sorted((root / "packages/server/src/http/routes").glob("*.ts")):
+        src = read(f)
+        for verb, path in re.findall(
+            r"app\.(get|post|put|patch|delete)\(\s*['\"]([^'\"]+)['\"]", src
+        ):
+            out.append(f"`{verb.upper():6} {path}`")
+    return out
+
+
+def db_columns(root: Path) -> list[str]:
+    """Every column of every table, from the migration SQL."""
+    out = []
+    for f in sorted((root / "packages/core/src/storage/migrations").glob("*.sql")):
+        src = read(f)
+        for m in re.finditer(
+            r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)\s*\((.*?)\n\s*\);", src, re.S
+        ):
+            table, body = m.group(1), m.group(2)
+            for line in body.splitlines():
+                line = line.strip().rstrip(",")
+                if not line or line.upper().startswith(
+                    ("PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT")
+                ):
+                    continue
+                col = line.split()[0].strip('"`')
+                if col:
+                    out.append(f"`{table}.{col}`")
+    return out
+
+
+def plugin_methods(root: Path) -> list[str]:
+    src = read(root / "packages/core/src/plugin/interfaces.ts")
+    out = []
+    for m in re.finditer(r"export interface (\w+)[^{]*\{(.*?)\n\}", src, re.S):
+        iface, body = m.group(1), m.group(2)
+        for line in body.splitlines():
+            line = line.strip()
+            sig = re.match(r"(\w+)\??\s*[(:]", line)
+            if sig and not line.startswith("//"):
+                out.append(f"`{iface}.{sig.group(1)}`")
+    return out
+
+
+def parser_types(root: Path) -> list[str]:
+    out = []
+    for f in sorted(root.glob("plugins/parser-*/src/index.ts")):
+        src = read(f)
+        m = re.search(r"supportedTypes\s*=\s*\[(.*?)\]", src, re.S)
+        if m:
+            for ext in re.findall(r"['\"]([^'\"]+)['\"]", m.group(1)):
+                out.append(f"`{ext}` ({f.parent.parent.name})")
+    for f in sorted((root / "packages/core/src/parsers").glob("*.ts")):
+        src = read(f)
+        m = re.search(r"supportedTypes\s*=\s*\[(.*?)\]", src, re.S)
+        if m:
+            for ext in re.findall(r"['\"]([^'\"]+)['\"]", m.group(1)):
+                out.append(f"`{ext}` (core/{f.stem})")
+    return out
+
+
+def config_keys(root: Path) -> list[str]:
+    """Top-level and nested keys from the config defaults."""
+    src = read(root / "packages/core/src/config/defaults.ts")
+    return [f"`{k}`" for k in sorted(set(re.findall(r"(\w+):\s*[\{'\"\d\[]", src)))]
+
+
+def core_exports(root: Path) -> list[str]:
+    src = read(root / "packages/core/src/index.ts")
+    out = []
+    for m in re.finditer(r"export\s*\{([^}]*)\}", src, re.S):
+        for name in m.group(1).split(","):
+            name = name.strip().removeprefix("type ").split(" as ")[0].strip()
+            if name:
+                out.append(f"`{name}`")
+    return out
+
+
+SECTIONS = [
+    ("CLI", cli_commands, 8),
+    ("MCP tools", mcp_tools, 8),
+    ("HTTP endpoints", http_endpoints, 11),
+    ("Database columns", db_columns, 2),
+    ("Plugin interface", plugin_methods, 1),
+    ("Parser file types", parser_types, 4),
+    ("Config keys", config_keys, 1),
+    ("Core public API", core_exports, 1),
+]
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    root = Path(sys.argv[1])
+    if not (root / "packages/core").is_dir():
+        sys.exit(f"not an OpenDocuments checkout: {root}")
+
+    print("# Feature parity checklist\n")
+    print(
+        "Generated by `tools/extract_surface.py` from the OpenDocuments source. "
+        "Every externally-visible element, extracted rather than summarised — prose "
+        "summaries of a 33k-line codebase lose things.\n"
+    )
+    print(
+        "Tick an item when manicule implements it. Strike it through when it is "
+        "deliberately dropped, with a reason. Parity is when nothing is unmarked.\n"
+    )
+    print("Regenerate with:\n")
+    print("```bash\nuv run tools/extract_surface.py ../OpenDocuments > PARITY.md\n```\n")
+
+    total = 0
+    counts = []
+    body = []
+    for title, fn, ticket in SECTIONS:
+        items = sorted(set(fn(root)))
+        total += len(items)
+        counts.append((title, len(items), ticket))
+        body.append(f"\n## {title} — {len(items)}\n")
+        body.append(f"Ticket: #{ticket}\n")
+        for i in items:
+            body.append(f"- [ ] {i}")
+
+    print("| Area | Items | Ticket |")
+    print("|---|---:|---|")
+    for title, n, ticket in counts:
+        print(f"| {title} | {n} | #{ticket} |")
+    print(f"| **Total** | **{total}** | |")
+    print("\n".join(body))
+
+
+if __name__ == "__main__":
+    main()
