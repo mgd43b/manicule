@@ -196,8 +196,10 @@ list of stages, so the evaluation harness can compare whole pipelines by configu
 rather than by editing code. This is what makes "no retrieval feature without a measured
 improvement" mechanically enforceable rather than a discipline to remember.
 
-⚠️ **`RetrievalStage` is locked after the evaluation harness exists.** Widening it later
-invalidates every recorded result. Widen it now if at all.
+⚠️ **`RetrievalStage` is locked.** The evaluation harness exists
+([`evaluation.md`](evaluation.md), [#15](https://github.com/mgd43b/manicule/issues/15)) and
+writes versioned records to disk, so widening this now invalidates every recorded result
+rather than merely threatening to.
 
 ## 4. Settled
 
@@ -261,4 +263,6 @@ emitted a different type would make every stage's signature a union.
 **`RetrievalStage` was reconsidered and deliberately not widened** — [`retrieval.md`](retrieval.md)
 §2.3 re-argues the three widenings #1 rejected against a working design, and answers the one new
 pressure that building it surfaced (per-stage diagnostics) without touching the signature. The
-⚠️ in §3 stands: it is locked from the moment the evaluation harness records its first result.
+⚠️ in §3 has since taken effect: the harness in [`evaluation.md`](evaluation.md) reads the
+stage list off every run's trace and stores it in each preference record, so the signature is
+locked rather than pending.

@@ -1187,6 +1187,13 @@ carry the things that make two runs *not* comparable:
 refusal is the mechanism behind "no retrieval feature without a measured improvement": without it,
 the rule is a slogan, because any two numbers can be subtracted.
 
+**The consumer now exists.** [`evaluation.md`](evaluation.md) builds it: a pairing where either
+side's trace carries an `incomparable` reason is recorded and excluded from the rate, with the
+reason kept and the exclusion count printed. It reads `pipeline` off the trace as the
+configuration a record names, and the per-stage spans as the attribution — which is why
+`RetrievalStage` is now locked rather than merely due to be
+([`contracts.md`](contracts.md) §3).
+
 **Where it lives.** The trace is a return value, surfaced through `--json` and the API, and
 consumed by #15's harness, which writes its own versioned result artefacts. It does **not** go
 into `query_logs` — that table's `response_time_ms` is whole-query product telemetry, and a
@@ -1270,6 +1277,12 @@ Ticket #6 lists nine features carried by the prior art, plus the learned-sparse 
 against #6 separately. **None of them is known to help**, because the harness that would know
 scores at random chance — its test embedder is `sin(sum of character codes)`. That is a statement
 about the evidence, not about the features.
+
+manicule's own harness is [`evaluation.md`](evaluation.md), and the first property it was built
+to have is that this cannot happen to it: a configuration is put through a known-answer probe and
+measured against what guessing would do before any preference is recorded, and one that cannot be
+distinguished from guessing gets no report at all. The measurements in the table below are run
+through it.
 
 The rule is `PLAN.md` §8's: each ships with a measured improvement on #15's fixed query set, or
 does not ship. A rule is only enforceable if it says what would count, so:

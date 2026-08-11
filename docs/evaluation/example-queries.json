@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "name": "example query set",
+  "provenance": "example",
+  "description": "An ILLUSTRATIVE set showing the format and the four intent categories. It is not a measurement of anything and must never be reported as one: its provenance is 'example', so QuerySet.is_evidence is false and any report built from it leads with a line saying the numbers are illustrative. Replace it with a set exported from the queries a running system was actually asked.",
+  "queries": [
+    {
+      "id": "example-lookup-1",
+      "text": "which port does the gateway listen on",
+      "intent": "lookup",
+      "note": "A fact expected to sit in one place."
+    },
+    {
+      "id": "example-lookup-2",
+      "text": "what is the default retention period for archived documents",
+      "intent": "lookup"
+    },
+    {
+      "id": "example-how-1",
+      "text": "how does incremental sync decide a document has changed",
+      "intent": "how_does_x_work",
+      "note": "Usually spans several passages, so it exercises recall rather than precision at one."
+    },
+    {
+      "id": "example-how-2",
+      "text": "how are citations resolved back to a location in the original file",
+      "intent": "how_does_x_work"
+    },
+    {
+      "id": "example-comparison-1",
+      "text": "difference between a collection and a tag",
+      "intent": "comparison",
+      "note": "Needs both sides retrieved; a system that finds one of the two answers badly."
+    },
+    {
+      "id": "example-comparison-2",
+      "text": "should I use the balanced or the precise profile for a large corpus",
+      "intent": "comparison"
+    },
+    {
+      "id": "example-identifier-1",
+      "text": "FingerprintMismatchError",
+      "intent": "exact_identifier",
+      "note": "The category most often quietly damaged by a change that improves the average."
+    },
+    {
+      "id": "example-identifier-2",
+      "text": "chunks_fts",
+      "intent": "exact_identifier"
+    },
+    {
+      "id": "example-uncategorised-1",
+      "text": "why did my last search return nothing",
+      "intent": "uncategorised",
+      "note": "A fresh export starts here. Uncategorised is reported as its own row rather than folded into another category."
+    }
+  ]
+}

@@ -121,9 +121,10 @@ document that needs it, by which point a corpus has already been indexed differe
 machine than on another.
 
 **Two types are locked.** `Anchor` is locked once a corpus has been ingested — changing it
-invalidates every stored citation. `RetrievalStage` is locked once the evaluation harness
-exists — widening it invalidates every recorded result. Both are marked in the source. Widen
-them now if at all, and say so loudly in the pull request.
+invalidates every stored citation. `RetrievalStage` **is** locked: the evaluation harness
+exists (`docs/evaluation.md`) and stores the stage list in every preference record, so widening
+it invalidates every recorded result. Both are marked in the source, and a change to either
+says so loudly in the pull request.
 
 ## Writing a plugin
 
