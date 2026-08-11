@@ -46,8 +46,17 @@ _STATUS_STYLE: Mapping[str, str] = {
 
 
 def console(*, stderr: bool = False) -> Console:
-    """A console. ``stderr`` for anything that must not land in a pipe's payload."""
-    return Console(stderr=stderr, soft_wrap=False)
+    """A console. ``stderr`` for anything that must not land in a pipe's payload.
+
+    **Automatic highlighting is off, and that is a correctness setting rather than a taste
+    one.** Rich's highlighter styles what it takes for numbers, paths, URLs and options by
+    inserting escape sequences *inside* the token — so with colour enabled a version prints as
+    ``\x1b[1;36m0.1\x1b[0m.\x1b[1;36m0\x1b[0m`` and a document id, a fingerprint or an
+    anchor comes out of a pipe in pieces. This output is mostly identifiers, and an identifier
+    nobody can copy is not one. Everything that *is* styled here is styled deliberately, with
+    markup, around the value rather than through it.
+    """
+    return Console(stderr=stderr, soft_wrap=False, highlight=False)
 
 
 def render_error(out: Console, op: str, error: r.ErrorInfo) -> None:
@@ -135,18 +144,25 @@ def render_search(out: Console, payload: r.SearchResult) -> None:
 
 
 def render_document_list(out: Console, payload: r.DocumentList) -> None:
-    table = Table("id", "title", "source", "media type", "status", box=None, pad_edge=False)
+    """One record per document: the id on its own line, then what it is.
+
+    Not a table, and the reason is the id. A listing exists to produce an identifier somebody
+    pastes into the next command, and a table cell elides — so at any width narrow enough, an
+    id reads as complete and is not. On its own line it wraps at worst, and every character
+    survives. The prose that follows is what a table would have aligned, and it costs nothing
+    to read as a run-on.
+    """
     for document in payload.documents:
-        table.add_row(
-            # In full. An id abbreviated for the width of a terminal is an id nobody can
-            # paste into the next command, which is the only thing this column is for.
-            document.id,
+        out.print(document.id)
+        facts = [
             escape(_clip(document.title or document.uri, 60)),
             escape(document.source),
             escape(document.media_type),
             _status(document.status),
-        )
-    out.print(table)
+        ]
+        out.print(f"  [dim]{' · '.join(facts)}[/dim]")
+    if not payload.documents:
+        out.print("[dim]no documents[/dim]")
     out.print(
         f"[dim]{payload.count} shown, offset {payload.offset}, page size {payload.limit}[/dim]"
     )
@@ -155,6 +171,10 @@ def render_document_list(out: Console, payload: r.DocumentList) -> None:
 def render_document(out: Console, payload: r.DocumentDetail) -> None:
     document = payload.document
     table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_column()
+    # Values here are identifiers, URIs and hashes. Folded for the same reason the listing
+    # folds its id column: an elided one reads as complete.
+    table.add_column(overflow="fold")
     table.add_row("id", document.id)
     table.add_row("title", escape(document.title))
     table.add_row("uri", escape(document.uri))

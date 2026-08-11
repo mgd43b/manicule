@@ -46,6 +46,23 @@ if TYPE_CHECKING:
     from manicule.app.results import Payload
     from manicule.generation.answers import AnswerEvent
 
+RESET_NEEDS_CONFIRMATION = (
+    "this deletes every document, chunk and vector in this workspace and cannot be undone. "
+    "Pass --yes to confirm."
+)
+"""Why ``reset-index`` refuses without ``--yes``.
+
+A constant rather than a literal at the raise site, so a test can assert that the refusal
+names the flag without reading it back out of a rendered terminal box — which wraps, colours
+and elides differently on every machine.
+"""
+
+BACKUP_NEEDS_A_TARGET = "pass --output to say where the backup goes"
+
+BACKUP_IS_NOT_A_RESTORE = (
+    "pass either --output to take a backup or --restore to put one back, not both"
+)
+
 UNKNOWN_WORKSPACE = "unknown"
 """What an envelope reports when configuration could not be loaded at all.
 
@@ -105,9 +122,13 @@ WorkspaceOption = Annotated[
 
 
 def _show_version(value: bool) -> None:
-    """Print the version and stop, before any command runs."""
+    """Print the version and stop, before any command runs.
+
+    Written to the stream rather than printed through Rich: a version is read by scripts far
+    more often than by people, and it should be one line with nothing around it.
+    """
     if value:
-        render.console().print(CORE_VERSION)
+        sys.stdout.write(f"{CORE_VERSION}\n")
         raise typer.Exit
 
 
@@ -559,14 +580,12 @@ def backup(
 ) -> None:
     """Take a consistent copy of the data directory, or put one back."""
     if output is not None and restore is not None:
-        message = "pass either --output to take a backup or --restore to put one back, not both"
-        raise typer.BadParameter(message)
+        raise typer.BadParameter(BACKUP_IS_NOT_A_RESTORE)
     if restore is not None:
         emit("restore", lambda service: service.restore(restore, force=force))
         return
     if output is None:
-        message = "pass --output to say where the backup goes"
-        raise typer.BadParameter(message)
+        raise typer.BadParameter(BACKUP_NEEDS_A_TARGET)
     emit("backup", lambda service: service.backup(output))
 
 
@@ -595,11 +614,7 @@ def reset_index(
 ) -> None:
     """Delete every document, chunk and vector in this workspace."""
     if not yes:
-        message = (
-            "this deletes every document, chunk and vector in this workspace and cannot be "
-            "undone. Pass --yes to confirm."
-        )
-        raise typer.BadParameter(message)
+        raise typer.BadParameter(RESET_NEEDS_CONFIRMATION)
     emit("reset_index", lambda service: service.reset_index())
 
 
@@ -714,4 +729,14 @@ def main() -> None:
     app()
 
 
-__all__ = ["STATE", "State", "app", "emit", "main", "print_envelope"]
+__all__ = [
+    "BACKUP_IS_NOT_A_RESTORE",
+    "BACKUP_NEEDS_A_TARGET",
+    "RESET_NEEDS_CONFIRMATION",
+    "STATE",
+    "State",
+    "app",
+    "emit",
+    "main",
+    "print_envelope",
+]

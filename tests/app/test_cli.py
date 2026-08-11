@@ -7,7 +7,9 @@ second place a rule lives — which is the thing this design exists to prevent.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -18,9 +20,11 @@ from manicule.app import results as r
 from manicule.app.dispatch import run_op
 from manicule.app.results import succeeded
 from manicule.app.service import ApplicationService
+from manicule.cli import render
 from manicule.cli.shell import SHELLS, completion_script
 from manicule.core.errors import ConfigError
-from tests.app.fakes import FakeBackend, make_chunk, make_document
+from manicule.core.version import CORE_VERSION
+from tests.app.fakes import FakeBackend, FakeMaintenance, make_chunk, make_document
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -125,11 +129,17 @@ def test_reset_index_refuses_without_an_explicit_confirmation(
 
     A prompt cannot be answered by a script and is skipped by a pipe; a required flag is the
     same refusal whether a person or a cron job typed it.
+
+    Asserted against the message and the backend, never against the rendered box. Terminal
+    width, colour and elision differ by machine, and a test that reads them is testing the
+    terminal.
     """
-    del bound
+    assert "--yes" in cli.RESET_NEEDS_CONFIRMATION
     result = run(["reset-index"])
     assert result.exit_code != 0
-    assert "--yes" in result.output
+    maintenance = asyncio.run(bound.backend.maintenance())
+    assert isinstance(maintenance, FakeMaintenance)
+    assert maintenance.resets == 0, "the index was reset by a command that refused"
 
 
 def test_reset_index_runs_when_confirmed(bound: ApplicationService) -> None:
@@ -144,15 +154,18 @@ def test_backup_refuses_a_request_that_is_both_a_backup_and_a_restore(
 ) -> None:
     """Two opposite operations in one invocation is a typo, not a plan."""
     del bound
+    assert "--output" in cli.BACKUP_IS_NOT_A_RESTORE
+    assert "--restore" in cli.BACKUP_IS_NOT_A_RESTORE
     result = run(["backup", "--output", "/tmp/a", "--restore", "/tmp/b"])  # noqa: S108 - never opened
     assert result.exit_code != 0
 
 
 def test_backup_needs_somewhere_to_write(bound: ApplicationService) -> None:
+    """A backup with nowhere to go is a command that would report success and write nothing."""
     del bound
+    assert "--output" in cli.BACKUP_NEEDS_A_TARGET
     result = run(["backup"])
     assert result.exit_code != 0
-    assert "--output" in result.output
 
 
 # --- completion ---------------------------------------------------------------------------------
@@ -231,3 +244,113 @@ def test_the_streaming_flag_is_cleared_between_invocations(bound: ApplicationSer
     cli.STATE.text_already_streamed = True
     run(["--json", "document", "list"])
     assert cli.STATE.text_already_streamed is False
+
+
+# --- values survive a colouring terminal ---------------------------------------------------
+
+
+def _laid_bare(text: str) -> str:
+    """Rendered output with the layout taken back out: no escapes, no padding, no borders.
+
+    What is left is the characters that were actually printed, which is the thing an
+    identifier assertion is about.
+    """
+    without_escapes = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    return re.sub(r"[\s\u2502\u2500]", "", without_escapes)
+
+
+def test_an_identifier_is_not_mangled_when_the_terminal_wants_colour(
+    monkeypatch: pytest.MonkeyPatch, bound: ApplicationService
+) -> None:
+    """Rich's automatic highlighter puts escape codes *inside* a token.
+
+    With highlighting on, a document id prints in pieces — styled around each run of digits —
+    and nobody can copy it out of a pipe or paste it into the next command. The console turns
+    that off; this asserts it stays off, in the one environment where it shows.
+    """
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    result = run(["document", "list"])
+    assert result.exit_code == 0
+    identifier = asyncio.run(bound.document_list()).documents[0].id
+    assert identifier in result.stdout, "a highlighted identifier reached the terminal in pieces"
+
+
+@pytest.mark.parametrize("width", ["30", "40", "80", "200"])
+def test_an_identifier_is_never_elided_however_narrow_the_terminal(
+    monkeypatch: pytest.MonkeyPatch, bound: ApplicationService, width: str
+) -> None:
+    """A table cell elides by default, and an elided id reads exactly like a complete one.
+
+    The id column folds instead, so a narrow terminal costs a line break rather than eight
+    characters — and the prose columns give up their width first. The assertion is over the
+    characters that were printed, with the layout removed, because a folded id is complete
+    and a truncated one is not.
+    """
+    monkeypatch.setenv("COLUMNS", width)
+    result = run(["document", "list"])
+    assert result.exit_code == 0
+    identifier = asyncio.run(bound.document_list()).documents[0].id
+    assert identifier in _laid_bare(result.stdout), (
+        f"at {width} columns the id was truncated rather than folded"
+    )
+
+
+def test_the_version_is_one_plain_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Read by scripts far more often than by people."""
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    result = run(["--version"])
+    assert result.exit_code == 0
+    assert result.stdout == f"{CORE_VERSION}\n"
+
+
+FINGERPRINT = '{"dimension":1024,"model_id":"BAAI/bge-m3","normalized":true}'
+"""A canonical embedding fingerprint: JSON, with numbers, strings and braces in it.
+
+The shape of value this output is full of, and the one Rich's highlighter has the most to say
+about.
+"""
+
+
+def _status_output(capsys: pytest.CaptureFixture[str]) -> str:
+    render.render_index_status(
+        render.console(),
+        r.IndexStatus(documents=1, chunks=2, embed_fingerprint=FINGERPRINT),
+    )
+    return capsys.readouterr().out
+
+
+def test_a_fingerprint_is_not_styled_through(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Rich's highlighter styles JSON element by element, and this value is an identity.
+
+    A URI it styles *around*, so that token survives. A fingerprint it takes apart: the
+    braces, each key and every number get their own escape codes, so what reaches the terminal
+    is a dozen fragments. That string is what a re-embed compares, and it is printed so
+    somebody can compare it — highlighting is off for this, not for taste.
+
+    The width is pinned wide on purpose. The claim here is about *styling*, and letting the
+    ambient terminal decide whether the line also wraps would make the test's subject depend
+    on the machine running it. Wrapping is the next test's business.
+    """
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("COLUMNS", "200")
+    assert FINGERPRINT in _status_output(capsys), (
+        "a highlighted fingerprint reached the terminal in fragments"
+    )
+
+
+@pytest.mark.parametrize("width", ["40", "80", "200"])
+def test_a_fingerprint_is_never_truncated(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], width: str
+) -> None:
+    """However narrow the terminal, every character of it is printed.
+
+    It is on its own line rather than in a table cell for exactly this reason: a cell elides,
+    and half a fingerprint compares unequal to the thing it is half of while looking like a
+    fingerprint.
+    """
+    monkeypatch.setenv("COLUMNS", width)
+    assert FINGERPRINT in _laid_bare(_status_output(capsys)), (
+        f"at {width} columns the fingerprint was truncated rather than wrapped"
+    )

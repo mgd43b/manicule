@@ -301,6 +301,12 @@ class FakeMaintenance:
         default_factory=lambda: [("default", "default", "personal")]
     )
     reset: tuple[int, int, bool] = (0, 0, False)
+    resets: int = 0
+    """How many times the index was actually emptied.
+
+    Counted so a test can assert that a command which *refused* wrote nothing. An exit status
+    says the command stopped; it does not say it stopped before doing the thing.
+    """
 
     async def schema_revision(self) -> str | None:
         return self.revision
@@ -318,6 +324,7 @@ class FakeMaintenance:
         return {"files": [], "path": str(source)}
 
     async def reset_index(self) -> tuple[int, int, bool]:
+        self.resets += 1
         return self.reset
 
     async def export_corpus(self, target: Path) -> tuple[int, int]:
