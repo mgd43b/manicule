@@ -750,9 +750,10 @@ class RetrievalStage(Protocol):
 
     .. warning::
 
-       Locked once the evaluation harness exists. Widening the signature later invalidates
-       every recorded result, because a stage that receives more can no longer be replayed
-       against a run that gave it less.
+       **Locked.** The evaluation harness exists (:mod:`manicule.evaluation`), and every
+       preference record it writes names the stage list that produced each side. Widening the
+       signature now invalidates every recorded result, because a stage that receives more can
+       no longer be replayed against a run that gave it less.
 
     Stages needing the query embedded each embed it. The embedding cache is keyed by model
     identity and text, so the repeat is free — and the alternative, threading shared state
