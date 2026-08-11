@@ -3,11 +3,13 @@
 Self-hosted document search and answers. Index documents from wherever they live — disk,
 git, Notion, Confluence, Drive, S3, the web — ask questions in natural language, and get
 answers with citations that resolve to a real location in a real document. Usable from the
-command line, from a browser, and by AI assistants over MCP.
+command line and by AI assistants over MCP.
 
-> **Early, and runnable.** `uv tool install manicule` gives you a working index: point it at
-> a directory, search it, ask it questions. The HTTP API and the web UI are not built yet; see
-> [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is being built in.
+> **Early, and runnable.** Both surfaces work today: point it at a directory, search it, ask
+> it questions, or hand the same operations to an assistant over MCP. There is no release on
+> PyPI yet, so it is installed from a checkout — [below](#install). The HTTP API and the web
+> UI are not built; see [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is
+> being built in.
 
 ```bash
 manicule init                     # choose a backend this machine can run, write a config
@@ -17,9 +19,125 @@ manicule ask "how do retries work?"
 manicule doctor                   # what is wrong, and what to do about it
 ```
 
-Every command takes `--json`, and every one of them is also an MCP tool — so an assistant
-reaches the same operations through `manicule start --mcp-only`. The output shape is a
-contract, written down in [`docs/surfaces.md`](docs/surfaces.md).
+Every command that emits data takes `--json` — before the command name, `manicule --json
+search …`, because it is an option of `manicule` rather than of each command — and most of
+them are also MCP tools, so an assistant reaches the same operations through `manicule start
+--mcp-only`. The output shape is a contract, written down in
+[`docs/surfaces.md`](docs/surfaces.md).
+
+## Install
+
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.12 or newer.
+
+```bash
+git clone https://github.com/mgd43b/manicule && cd manicule
+uv sync --all-extras
+uv run manicule --version
+```
+
+`--all-extras` installs the parser stack, the storage stack, both embedding backends and the
+optional cross-encoder reranker. Drop it to `--extra storage --extra embeddings --extra
+parsers --extra retrieval --extra serve` for a smaller install without generation or
+connectors.
+
+Everything below writes `manicule`; from a checkout that is `uv run manicule`, or
+`.venv/bin/manicule` if you would rather not type `uv run` each time.
+
+**Two embedding backends, and one of them is chosen for you.** `manicule init` probes the
+machine: `mlx` on Apple silicon, which runs the embedder on Metal in-process, and `onnx`
+everywhere else. Which one you get changes how long an ingest takes and **never what comes out
+of it** — the `backend parity (macOS)` job in CI exists to hold that line, comparing vectors
+from both backends on a runner that can build both. If it ever goes red the fix is to the
+code, not to the tolerance.
+
+## First run
+
+The shortest path from a clone to an answer about your own documents. `manicule init` writes a
+config file; the first `index` downloads the embedding model, which for the default
+`BAAI/bge-m3` is a few gigabytes and happens once.
+
+```bash
+manicule init
+manicule index docs                       # this repository's own design documents
+manicule search "how are citations verified"
+manicule ask "what does an anchor carry when the location is unknown?"
+```
+
+`search` needs nothing but the embedder. **`ask` additionally needs a generator**, and the
+default configuration expects [Ollama](https://ollama.com) on `localhost:11434` serving
+`qwen2.5:14b`:
+
+```bash
+ollama pull qwen2.5:14b
+manicule config set llm.model qwen2.5:14b   # or any model that Ollama is serving
+```
+
+`manicule doctor` reports what is wrong and what to do about it, and it is the first thing to
+run when something does not work.
+
+## The two surfaces
+
+**The command line** is nineteen commands; `manicule --help` lists them. Under `--json` the
+result envelope is the whole of stdout, so a failed run piped into `jq` reads an empty stream
+rather than a prose error.
+
+**The MCP server** is nineteen tools over the same service, and it speaks stdio by default —
+which opens no socket at all. To let Claude Code use your index:
+
+```bash
+claude mcp add manicule -- "$(pwd)/.venv/bin/manicule" start --mcp-only
+```
+
+which writes `.mcp.json` beside the project:
+
+```json
+{
+  "mcpServers": {
+    "manicule": {
+      "type": "stdio",
+      "command": "/absolute/path/to/.venv/bin/manicule",
+      "args": ["start", "--mcp-only"]
+    }
+  }
+}
+```
+
+The server is also reachable as `python -m manicule.mcp`, for a client that would rather name
+an interpreter and a module than trust a console script to be on the PATH it happens to have.
+
+## In a container
+
+A [`Dockerfile`](Dockerfile) and a [`compose.yaml`](compose.yaml) are here, and the image is
+self-contained: the grammars, the model weights and the Python environment all arrive with it.
+The last thing the build does is run `doctor`, index a corpus and search it **with the network
+switched off**, so an image that would have fetched something on first use fails to build
+instead.
+
+```bash
+docker compose build                                   # ~2.3 GB of model weights, once
+docker compose run --rm manicule doctor
+docker compose run --rm manicule index /corpus/docs    # this repository, mounted read-only
+docker compose run --rm manicule search "how are citations verified"
+```
+
+The build downloads the weights and the grammars, and the resulting image is about 3.4 GB.
+That cost is paid at `build`, where a long step is legible, rather than inside the first
+`index`, where it looks like a hang. Indexing this repository's `docs/` — about 600 kB of
+markdown — takes something under four minutes on an M-series Mac running Docker Desktop.
+
+The container runs as an unprivileged user with a `0700` data directory, publishes no port,
+and drops every capability. It runs the ONNX backend, because MLX is Apple silicon and no
+Linux container can use it: **the same vectors, at a lower rate.** `manicule ask` needs a
+generator; the compose file points at an Ollama on the host, which is one line to change.
+
+**MCP is better run natively.** Handing a container's stdio to an assistant means the client
+spawning `docker compose run`, and the failure modes of that — a stale container, a build that
+has not happened, a volume that is not there — surface to the assistant as a tool that will
+not start. The container is for the CLI and for batch ingest; the two are the same index if
+they share a data directory.
+
+[`docs/deployment.md`](docs/deployment.md) covers what the data directory holds, the
+permissions it needs, and what publishing a port will require when there is one.
 
 ## The idea it is organised around
 
