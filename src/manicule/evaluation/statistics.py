@@ -14,11 +14,13 @@ dependencies that core does not carry, and an evaluation harness that cannot be 
 without a numerical stack is one that gets skipped. Everything here is exact to floating point
 over the sample sizes a hand-judged query set reaches.
 
-The computations run in log space rather than multiplying binomial coefficients by powers.
-``comb(1000, 500)`` is about ``1e299`` and ``0.5 ** 500`` is about ``1e-151``: the direct form
-overflows one term and underflows the other, and their product is ``nan`` rather than an
-error. A ``nan`` p-value compares false against every threshold, so a harness computing one
-would report *every* system as failing to beat chance — including a good one.
+The computations run in log space rather than multiplying binomial coefficients by powers. A
+binomial coefficient is an arbitrary-precision integer and a probability is a float, so the
+direct form has to convert one to the other, and past about 1030 trials ``comb(n, n // 2)``
+exceeds the largest representable double and the multiplication raises ``OverflowError``. That
+is not a hypothetical size: the sign test in a report runs over every decided pairing ever
+recorded for a comparison, and a file of judgements is meant to grow — so the direct form is an
+implementation that works right up until the evaluation set is large enough to be worth having.
 """
 
 from __future__ import annotations

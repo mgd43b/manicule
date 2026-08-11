@@ -33,16 +33,25 @@ def test_a_perfect_run_is_the_null_probability_raised_to_the_trials() -> None:
 
 
 def test_the_tail_survives_a_sample_size_that_overflows_the_direct_form() -> None:
-    """``comb(1000, 500) * 0.5 ** 500`` overflows one factor and underflows the other.
+    """``comb(2000, 1000)`` is past the largest representable double.
 
-    Computed directly it produces ``nan``, and a ``nan`` p-value compares false against every
-    threshold — so a harness using it would report *every* system as failing to beat chance,
-    including a good one. This is why the implementation works in log space.
+    Multiplying it by a probability raises ``OverflowError``, which is demonstrated here rather
+    than described — so the log-space implementation is a fix for something that happens rather
+    than a precaution. The size is not hypothetical: the sign test runs over every decided
+    pairing ever recorded for a comparison, and a file of judgements is meant to grow.
     """
-    result = binomial_tail(600, 1000, 0.5)
+
+    def directly() -> float:
+        """One term of the sum, computed the obvious way."""
+        return math.comb(2000, 1000) * 0.5**1000
+
+    with pytest.raises(OverflowError):
+        directly()
+
+    result = binomial_tail(1200, 2000, 0.5)
 
     assert not math.isnan(result)
-    assert 0.0 < result < 1e-9
+    assert 0.0 < result < 1e-18
 
 
 def test_impossible_and_certain_nulls_do_not_produce_a_number_by_accident() -> None:
