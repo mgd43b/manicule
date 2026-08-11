@@ -1,7 +1,12 @@
-"""The three checks that run once per run, before the first document is discovered.
+"""The four checks that run once per run, before the first document is discovered.
 
-Two of them are specified elsewhere and merely *run* here; the third exists only here,
-because nothing else holds both halves of it.
+Two of them are specified elsewhere and merely *run* here; the other two exist only here,
+because nothing else holds both halves of them.
+
+0. **The boundaries were measured, not estimated** — ``docs/parsing.md`` §1.2. First, because
+   a corpus chunked with a stand-in vocabulary cannot be made admissible by anything the
+   three checks below discover, and because it is the one refusal that is about the running
+   configuration alone and needs to read nothing.
 
 1. ``EmbedFingerprint`` — configuration against ``index_state`` against the vector store's own
    record of what it holds (``docs/storage.md`` §6.3). Three places, because two cannot detect
@@ -66,8 +71,10 @@ async def check_before_run(
 
     Raises:
         FingerprintMismatchError: The index was built by something else.
-        PolicyError: The chunk budget exceeds what the model will read.
+        PolicyError: The chunk budget exceeds what the model will read, or the boundaries were
+            measured with a stand-in vocabulary.
     """
+    require_measured(chunk)
     require_coherent(embed=embed, chunk=chunk)
 
     stored = await store.index_fingerprints()
@@ -85,6 +92,39 @@ async def check_before_run(
     if stored != committed:
         await store.record_index_fingerprints(committed)
     return committed
+
+
+def require_measured(chunk: ChunkFingerprint) -> None:
+    """Refuse boundaries taken with a stand-in vocabulary rather than the model's own.
+
+    ``docs/parsing.md`` §1.2 is titled "Count with the embedder's tokenizer, never an
+    estimator", and ends by saying provisional chunks never reach the index. This is that
+    sentence, in code. It had been a docstring in three modules and a refusal in none of them,
+    which is the shape ``docs/contracts.md`` §5 calls worse than an absent guarantee: the
+    stand-in inflates every count by a factor chosen without measuring anything, so the
+    boundaries are neither the model's nor reproducible from it, and every downstream check
+    was written on the assumption that a token count means what the model means by it.
+
+    **A refusal rather than a better identifier, and the identifier as well.** Making the id
+    honest (``provisional:x1.5:tiktoken/cl100k_base@0.13.0`` rather than ``provisional``) is
+    what stops two estimated corpora being mistaken for one another; it does not make either
+    of them fit to serve. The id is what this check reads, so the two halves are one
+    mechanism rather than two guards that can drift apart.
+
+    Raises:
+        PolicyError: The chunker counted without a bound embedder.
+    """
+    if not chunk.provisional:
+        return
+    msg = (
+        f"these chunk boundaries were measured with {chunk.tokenizer_id!r}, which is a "
+        f"stand-in for the embedder's tokenizer rather than the tokenizer itself. The count "
+        f"is inflated by a fixed safety factor and can still undercount by an unknown margin "
+        f"under a vocabulary the model does not use, and undercounting is the direction that "
+        f"truncates without raising. Provisional chunks are for inspection — a dry-run parse, "
+        f"a fixture build — and never for an index. Bind an embedder and chunk again."
+    )
+    raise PolicyError(msg)
 
 
 def require_coherent(*, embed: EmbedFingerprint, chunk: ChunkFingerprint) -> None:
@@ -131,4 +171,4 @@ async def _refuse_embed_mismatch(
         raise
 
 
-__all__ = ["check_before_run", "require_coherent"]
+__all__ = ["check_before_run", "require_coherent", "require_measured"]

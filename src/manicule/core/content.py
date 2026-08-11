@@ -364,6 +364,21 @@ class Document(_Content):
     )
     metadata: Metadata = Field(default_factory=dict)
 
+    parse_fp: str | None = Field(
+        default=None,
+        description="Canonical "
+        ":class:`~manicule.core.fingerprints.ParseFingerprint` of the parser run that "
+        "produced this document's stored text and anchors, or ``None`` when there is no "
+        "recorded lineage. **Read here, written only through "
+        ":meth:`~manicule.ingest.ports.IngestStore.set_lineage`** — like ``chunk_fp`` and "
+        "``embed_fp``, which for that reason are not on this model at all. This one is, "
+        "because change detection reads it: a document whose bytes have not moved but whose "
+        "parser has is not unchanged, and deciding that needs the stored value in hand. A "
+        "store that wrote lineage from here would clear it on every ingest, since the "
+        "pipeline builds a fresh document per run and cannot know a fingerprint before the "
+        "chain has chosen a parser.",
+    )
+
     @model_validator(mode="after")
     def _failures_are_explained(self) -> Self:
         if self.status in NEEDS_ATTENTION and not self.status_detail:

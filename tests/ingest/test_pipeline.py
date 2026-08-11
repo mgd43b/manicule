@@ -7,21 +7,25 @@ surviving failure is certified by nothing if only its happy path is exercised.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError
 from typing import TYPE_CHECKING, override
 
 import pytest
 
 from manicule.core.content import DocumentStatus, PipelineStage, RawDocument
+from manicule.core.errors import PolicyError
+from manicule.core.fingerprints import ParseFingerprint
 from manicule.core.ids import content_hash
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import BlobSink, IngestPipeline
 from manicule.ingest.workers import InProcessRunner
+from manicule.parsers.versions import parse_fingerprint
 from tests.fakes import MEDIA_TYPE, HashEmbedder
 from tests.ingest import fakes
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
     from manicule.core.protocols import Embedder, Middleware
 
@@ -36,24 +40,52 @@ def build(
     embedder: Embedder | None = None,
     blobs: BlobSink | None = None,
     max_fetch_bytes: int = 256 * 1024 * 1024,
+    routes: Mapping[str, Sequence[str]] | None = None,
+    parse_fingerprints: Callable[[str], ParseFingerprint | None] = parse_fingerprint,
 ) -> tuple[IngestPipeline, fakes.MemoryIngestStore, fakes.MemoryVectors]:
-    """A pipeline over in-memory everything, plus the store and vectors to assert against."""
+    """A pipeline over in-memory everything, plus the store and vectors to assert against.
+
+    ``routes`` resolves a chain per media type, for the tests that need two parsers to own two
+    documents. ``chain`` is the single-chain shorthand every other test uses.
+    """
     store = store or fakes.MemoryIngestStore()
     vectors = vectors or fakes.MemoryVectors()
     chunker = fakes.BlockChunker()
+
+    def resolve(media_type: str) -> Sequence[str]:
+        return list(chain if routes is None else routes[media_type])
+
     pipeline = IngestPipeline(
         store=store,
         chunker=chunker,
         embedder=embedder or HashEmbedder(),
         vectors=vectors,
         runner=InProcessRunner(parsers or {"lines": fakes.LineParser()}),
-        resolve_chain=lambda _: list(chain),
+        resolve_chain=resolve,
         middleware=MiddlewareRunner(middleware),
         chunk_fingerprint=chunker.fingerprint,
         blobs=blobs,
         max_fetch_bytes=max_fetch_bytes,
+        parse_fingerprints=parse_fingerprints,
     )
     return pipeline, store, vectors
+
+
+def parse_versions(**libraries: str) -> Callable[[str], ParseFingerprint | None]:
+    """A parse-fingerprint source with a settable library version per parser name.
+
+    A parser absent from ``libraries`` records nothing, which is how a third-party parser
+    behaves: manicule cannot read its version, so it claims none.
+    """
+
+    def lookup(parser: str) -> ParseFingerprint | None:
+        if parser not in libraries:
+            return None
+        return ParseFingerprint(
+            parser=parser, version="1", libraries={f"lib-{parser}": libraries[parser]}
+        )
+
+    return lookup
 
 
 def discovered(source_id: str, text: str, media_type: str = MEDIA_TYPE) -> DiscoveredDoc:
@@ -636,3 +668,259 @@ async def test_ingesting_the_same_bytes_twice_produces_the_same_chunk_ids() -> N
     await pipeline.ingest_raw(raw, source="memory", force=True)
 
     assert [chunk.id for chunk in store.chunks[first[0].document_id]] == before
+
+
+# --- parse lineage ----------------------------------------------------------------------------
+
+
+async def test_a_document_records_the_parser_version_that_produced_its_text() -> None:
+    """Without this column, two generations of extracted text look identical in the corpus.
+
+    Change detection compares the connector's source bytes, which a library upgrade does not
+    touch — so nothing already stored is ever re-read, while a newly ingested document with
+    identical bytes parses differently.
+    """
+    pipeline, store, _ = build(parse_fingerprints=parse_versions(lines="1.0"))
+
+    await pipeline.run(fakes.DictConnector({"a": "alpha\nbeta"}))
+
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert document.parse_fp is not None
+    assert "1.0" in document.parse_fp
+
+
+async def test_a_parser_bump_re_parses_its_documents_and_leaves_the_others_alone() -> None:
+    """Selective invalidation, checked in both directions in one run.
+
+    Two documents, two parsers, one library bump. The document that parser produced must be
+    re-parsed; the other must not be re-fetched or re-parsed at all. Asserting only the first
+    half would pass for an implementation that re-parses the entire corpus on any bump, which
+    is the expensive mistake this field exists to avoid.
+    """
+    store = fakes.MemoryIngestStore()
+    parsers = {"lines": fakes.LineParser(), "other": fakes.LineParser()}
+    routes = {"memory/a": ("lines",), "memory/b": ("other",)}
+    connector = fakes.DictConnector({"a": "alpha", "b": "beta"})
+    connector.media_types = {"a": "memory/a", "b": "memory/b"}
+
+    pipeline, _, _ = build(
+        store=store,
+        parsers=parsers,
+        routes=routes,
+        parse_fingerprints=parse_versions(lines="1.0", other="1.0"),
+    )
+    await pipeline.run(connector)
+
+    first_a = await store.find_document("memory", "a")
+    first_b = await store.find_document("memory", "b")
+    assert first_a is not None
+    assert first_b is not None
+    before_b = [chunk.id for chunk in store.chunks[first_b.id]]
+
+    bumped, _, _ = build(
+        store=store,
+        parsers=parsers,
+        routes=routes,
+        parse_fingerprints=parse_versions(lines="2.0", other="1.0"),
+    )
+    report = await bumped.run(connector)
+
+    after_a = await store.find_document("memory", "a")
+    after_b = await store.find_document("memory", "b")
+    assert after_a is not None
+    assert after_b is not None
+    assert after_a.parse_fp != first_a.parse_fp, "the bumped parser's document must be re-parsed"
+    assert "2.0" in (after_a.parse_fp or "")
+    assert after_b.parse_fp == first_b.parse_fp, "the other parser's document must be left alone"
+    assert report.skipped_version == 1, "and left alone means skipped before the fetch"
+    assert [chunk.id for chunk in store.chunks[after_b.id]] == before_b
+
+
+async def test_a_parser_bump_is_noticed_even_when_the_source_reports_no_change() -> None:
+    """Level 1 needs the check as much as level 2, and for the sharper reason.
+
+    A connector whose version token has not moved never reaches the byte comparison, so a
+    check placed only at level 2 would leave every well-behaved source's corpus permanently
+    stale — the documents would be skipped before anything looked at their bytes.
+    """
+    store = fakes.MemoryIngestStore()
+    connector = fakes.DictConnector({"a": "alpha"})
+    first, _, _ = build(store=store, parse_fingerprints=parse_versions(lines="1.0"))
+    await first.run(connector)
+    assert connector.fetches == ["a"]
+
+    unchanged, _, _ = build(store=store, parse_fingerprints=parse_versions(lines="1.0"))
+    await unchanged.run(connector)
+    assert connector.fetches == ["a"], "an unchanged document must still skip before the fetch"
+
+    bumped, _, _ = build(store=store, parse_fingerprints=parse_versions(lines="2.0"))
+    report = await bumped.run(connector)
+
+    assert connector.fetches == ["a", "a"], "a moved parser must defeat the version-token skip"
+    assert report.skipped_version == 0
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert "2.0" in (document.parse_fp or "")
+
+
+async def test_a_parser_bump_is_noticed_by_a_source_that_reports_no_version_at_all() -> None:
+    """Level 2 on its own, which is the only level a tokenless connector ever reaches.
+
+    ``docs/ingest.md`` §4 notes that a connector supplying no ``version_token`` falls straight
+    to the byte comparison. For those sources the level-1 check never runs, so the level-2 one
+    is the whole of the guard — and the two are separate lines of code that a change could
+    remove independently.
+    """
+
+    class Tokenless(fakes.DictConnector):
+        """A source with no change signal, which is a real and supported shape."""
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            del watermark
+            for source_id in sorted(self.documents):
+                yield DiscoveredDoc(
+                    ref=DocRef(source_id=source_id, uri=f"memory://{source_id}"),
+                    version_token=None,
+                    media_type=MEDIA_TYPE,
+                )
+
+    store = fakes.MemoryIngestStore()
+    connector = Tokenless({"a": "alpha"})
+    first, _, _ = build(store=store, parse_fingerprints=parse_versions(lines="1.0"))
+    await first.run(connector)
+
+    unchanged, _, _ = build(store=store, parse_fingerprints=parse_versions(lines="1.0"))
+    report = await unchanged.run(connector)
+    assert report.skipped_hash == 1, "identical bytes still skip the parse, chunk and embed"
+
+    bumped, _, _ = build(store=store, parse_fingerprints=parse_versions(lines="2.0"))
+    report = await bumped.run(connector)
+
+    assert report.skipped_hash == 0, "a moved parser must defeat the content-hash skip"
+    assert report.indexed == 1
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert "2.0" in (document.parse_fp or "")
+
+
+async def test_a_parser_manicule_cannot_version_does_not_re_parse_on_every_sync() -> None:
+    """``None`` on both sides is agreement, not ignorance.
+
+    A third-party parser's version is not something this repository can read, so nothing is
+    recorded and nothing is expected. Treating that as changed would re-parse a plugin corpus
+    forever to learn nothing.
+    """
+    store = fakes.MemoryIngestStore()
+    connector = fakes.DictConnector({"a": "alpha"})
+    pipeline, _, _ = build(store=store, parse_fingerprints=parse_versions())
+
+    await pipeline.run(connector)
+    await pipeline.run(connector)
+
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert document.parse_fp is None
+    assert connector.fetches == ["a"], "no recorded lineage must not mean re-fetch every sync"
+
+
+async def test_a_document_no_parser_claimed_records_no_lineage_and_still_settles() -> None:
+    """ "The chain found no text" names no parser, so there is no parser version to record.
+
+    Every parser in the chain was tried and none produced a block, so ``parser_used`` is unset
+    — and a fingerprint naming one of them would be a guess about which version decided the
+    outcome. That is not a gap: ``no_extractable_text`` is already the selector for the
+    re-parse pass that runs when the decision is revisited, which is what
+    ``DocumentStatus.NO_EXTRACTABLE_TEXT`` documents. What must not happen is the document
+    counting as stale on every sync and being re-fetched forever.
+    """
+    store = fakes.MemoryIngestStore()
+    connector = fakes.DictConnector({"a": "   "})
+    pipeline, _, _ = build(store=store, parse_fingerprints=parse_versions(lines="1.0"))
+
+    await pipeline.run(connector)
+    await pipeline.run(connector)
+
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert document.status is DocumentStatus.NO_EXTRACTABLE_TEXT
+    assert document.parse_fp is None
+    assert connector.fetches == ["a"]
+
+
+async def test_a_container_records_the_parser_version_that_expanded_it() -> None:
+    """An archive's member set is a conclusion a parser version reached about these bytes.
+
+    It is stored — the members are documents — so the lineage goes with it, and a bump to the
+    expander re-expands rather than leaving a member list nothing can date.
+    """
+    store = fakes.MemoryIngestStore()
+    connector = fakes.DictConnector({"bundle": "one=alpha"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    pipeline, _, _ = build(
+        store=store,
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+        parse_fingerprints=parse_versions(archive="1.0"),
+    )
+
+    await pipeline.run(connector)
+
+    container = await store.find_document("memory", "bundle")
+    assert container is not None
+    assert container.status is DocumentStatus.CONTAINER
+    assert "1.0" in (container.parse_fp or ""), (
+        "the archive parser is what decided this member set, and it has a version"
+    )
+
+
+async def test_a_pipeline_cannot_be_built_on_estimated_chunk_boundaries() -> None:
+    """The boundary in code, not only the one an operator meets.
+
+    ``check_before_run`` is the once-per-run refusal, and a pipeline is constructible without
+    going through it — while everything a pipeline writes is permanent. A chunker counting
+    with a stand-in vocabulary must not be able to reach a store at all.
+    """
+    chunker = fakes.BlockChunker()
+    provisional = chunker.fingerprint.model_copy(
+        update={"tokenizer_id": "provisional:x1.5:tiktoken/cl100k_base@0.13.0"}
+    )
+
+    with pytest.raises(PolicyError, match="stand-in"):
+        IngestPipeline(
+            store=fakes.MemoryIngestStore(),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=provisional,
+        )
+
+
+async def test_an_uninstalled_parser_library_fails_one_document_and_not_the_run() -> None:
+    """Reading a version can raise, and change detection is not the place to let it.
+
+    ``parse_fingerprint`` raises for a distribution that is not installed, which is right
+    where a repair is being planned — a partial set of current fingerprints is a repair that
+    cannot succeed. Inside change detection it would escape into the discovery loop and end
+    the enumeration, taking every other document in the batch with it. One document's problem
+    must stay one document's.
+    """
+
+    def missing(parser: str) -> ParseFingerprint | None:
+        msg = f"No package metadata was found for the library behind {parser!r}"
+        raise PackageNotFoundError(msg)
+
+    store = fakes.MemoryIngestStore()
+    connector = fakes.DictConnector({"a": "alpha", "b": "beta"})
+    seeded, _, _ = build(store=store, parse_fingerprints=parse_versions(lines="1.0"))
+    await seeded.run(connector)
+
+    broken, _, _ = build(store=store, parse_fingerprints=missing)
+    report = await broken.run(connector)
+
+    assert report.clean, "an unreadable version must not end the enumeration"
+    assert report.discovered == 2, "and every document must still be attempted"

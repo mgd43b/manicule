@@ -460,3 +460,72 @@ async def test_lexical_search_takes_its_query_under_the_protocols_parameter_name
 async def test_getting_no_chunks_asks_the_database_nothing(store: SqliteDocStore) -> None:
     """An empty id list is a legitimate call, not a query for every chunk there is."""
     assert list(await store.get_chunks([])) == []
+
+
+# --- parse lineage ------------------------------------------------------------------------
+
+
+async def test_parse_lineage_round_trips_and_is_not_written_by_an_upsert(
+    store: SqliteDocStore,
+) -> None:
+    """Lineage moves through ``set_lineage`` and through nothing else.
+
+    The pipeline builds a fresh :class:`Document` for every ingest and cannot know a parse
+    fingerprint before the chain has chosen a parser, so a store that wrote lineage from the
+    domain object would clear it at the start of every run — and "which documents need
+    re-parsing" would then answer "all of them" for the wrong reason, on every sync, forever.
+    """
+    document = await store.upsert_document(make_document())
+    await store.set_lineage(document.id, chunk_fp=None, embed_fp=None, parse_fp="pdf@5.12.1")
+
+    assert (await store.get_document(document.id)).parse_fp == "pdf@5.12.1"  # pyright: ignore[reportOptionalMemberAccess]
+
+    await store.upsert_document(document.model_copy(update={"title": "renamed"}))
+
+    reread = await store.get_document(document.id)
+    assert reread is not None
+    assert reread.title == "renamed"
+    assert reread.parse_fp == "pdf@5.12.1", "an ordinary upsert must not clear the lineage"
+
+
+async def test_a_null_parse_lineage_leaves_a_stored_one_alone(store: SqliteDocStore) -> None:
+    """``None`` means "leave this one alone", not "clear it".
+
+    Re-embedding moves only the embedding lineage. A store reading ``None`` as a clear would
+    make every re-embed silently mark the whole corpus as needing a re-parse.
+    """
+    document = await store.upsert_document(make_document())
+    await store.set_lineage(document.id, chunk_fp=None, embed_fp=None, parse_fp="pdf@5.12.1")
+
+    await store.set_lineage(document.id, chunk_fp="chunker@1", embed_fp="model@1")
+
+    assert (await store.get_document(document.id)).parse_fp == "pdf@5.12.1"  # pyright: ignore[reportOptionalMemberAccess]
+
+
+async def test_selecting_on_parse_lineage_finds_the_stale_and_the_unrecorded(
+    store: SqliteDocStore,
+) -> None:
+    """The re-parse query, in SQL, in both directions.
+
+    A ``NULL`` lineage is in the selection deliberately: no recorded fingerprint means no
+    evidence the stored text is current, and a selector that assumed it was would skip
+    precisely the documents that predate the column.
+    """
+    stale = await store.upsert_document(make_document(source_id="stale"))
+    fresh = await store.upsert_document(make_document(source_id="fresh"))
+    unrecorded = await store.upsert_document(make_document(source_id="plugin"))
+    await store.set_lineage(stale.id, chunk_fp=None, embed_fp=None, parse_fp="pdf@5.12.1")
+    await store.set_lineage(fresh.id, chunk_fp=None, embed_fp=None, parse_fp="pdf@5.13.0")
+
+    chosen = await store.select_documents(parse_fp_current=["pdf@5.13.0"])
+
+    assert {document.id for document in chosen} == {stale.id, unrecorded.id}
+    assert fresh.id not in {document.id for document in chosen}
+
+
+async def test_not_selecting_on_parse_lineage_selects_everything(store: SqliteDocStore) -> None:
+    """``None`` and an empty collection are different questions, so they are kept apart."""
+    await store.upsert_document(make_document(source_id="a"))
+
+    assert len(await store.select_documents()) == 1
+    assert len(await store.select_documents(parse_fp_current=[])) == 1

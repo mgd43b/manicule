@@ -1,4 +1,4 @@
-"""The three checks that run before a single document is discovered.
+"""The four checks that run before a single document is discovered.
 
 Each one guards a failure that raises nothing and makes every answer quietly wrong, which is
 why they are refusals rather than warnings: there is nothing downstream that can notice.
@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import pytest
 
+from manicule.chunking import TokenCounter
 from manicule.core.content import Chunk
 from manicule.core.embedding import EmbedFingerprint, IndexFingerprints, Pooling
 from manicule.core.errors import FingerprintMismatchError, PolicyError
 from manicule.core.fingerprints import ChunkFingerprint
-from manicule.ingest.refusals import check_before_run, require_coherent
+from manicule.ingest.refusals import (
+    check_before_run,
+    require_coherent,
+    require_measured,
+)
 from tests.ingest import fakes
 
 
@@ -36,6 +41,47 @@ def chunk(*, max_tokens: int = 256, middleware: tuple[str, ...] = ()) -> ChunkFi
         tokenizer_id="whitespace",
         embed_text_middleware=middleware,
     )
+
+
+def provisional_chunk() -> ChunkFingerprint:
+    """A chunker that counted with a stand-in vocabulary, as the chunker itself would build it."""
+    return ChunkFingerprint(
+        chunker="block",
+        version="1",
+        max_tokens=256,
+        overlap_tokens=0,
+        tokenizer_id=TokenCounter(
+            "whitespace", lambda text: len(text.split()), provisional=True
+        ).tokenizer_id,
+    )
+
+
+async def test_an_estimated_corpus_is_refused_before_anything_is_compared() -> None:
+    """``docs/parsing.md`` §1.2, as a refusal rather than as a docstring.
+
+    Nothing the other checks discover could make these chunks admissible: the count came from
+    a vocabulary the model does not use, inflated by a factor chosen without measuring
+    anything, so it is neither the model's number nor reproducible from it. This ran first for
+    that reason — it reads nothing and it cannot be resolved by anything read later.
+    """
+    store = fakes.MemoryIngestStore()
+
+    with pytest.raises(PolicyError, match="stand-in"):
+        await check_before_run(embed=embed(), chunk=provisional_chunk(), store=store)
+
+    assert store.state.is_empty, "a refused run must not commit the index to anything"
+
+
+def test_the_estimated_refusal_reads_the_identity_it_refuses_on() -> None:
+    """One mechanism, not two guards that can drift apart.
+
+    The flag is derived from ``tokenizer_id``, so a fingerprint cannot be provisional in one
+    place and measured in another.
+    """
+    require_measured(chunk())
+
+    with pytest.raises(PolicyError, match=r"provisional:"):
+        require_measured(provisional_chunk())
 
 
 async def test_a_fresh_index_accepts_whatever_the_first_run_brings() -> None:

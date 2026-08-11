@@ -135,11 +135,11 @@ updates:
       # mapping, and it is why this is a cheaper event than an embedding bump — but it is
       # still a re-chunk and therefore a re-embed of what it touches.
       #
-      # `tiktoken` is in this group for a reason worth stating, because it is the one case
-      # the fingerprints do not catch. It backs the *provisional* token counter, which
-      # records `tokenizer_id` as the literal string "provisional". That string does not
-      # change when tiktoken's vocabulary does, so a bump can move chunk boundaries under a
-      # fingerprint that still matches. This grouping is the only warning there is.
+      # `tiktoken` backs the *provisional* token counter, which records its encoding and its
+      # installed version — `provisional:x1.5:tiktoken/cl100k_base@0.13.0` — so a bump moves
+      # the fingerprint and ingest says so. It is grouped here because that is what a bump
+      # costs, not because nothing would notice: provisional chunks are refused by ingest
+      # outright, so the practical effect is on dry-run parses and fixture builds.
       index-affecting-chunking:
         patterns:
           - "tiktoken"
@@ -147,13 +147,17 @@ updates:
           - "tree-sitter-*"
 
       # --- index-affecting: what a document was reduced to -------------------------------
-      # These decide the text that ends up in the corpus, and unlike the two groups above
-      # nothing refuses on their behalf: no fingerprint records a parser version. A bump
-      # changes what the same bytes parse to, so a document ingested before it and a document
-      # ingested after it disagree, and the corpus is quietly inconsistent rather than
-      # loudly wrong. Anchors are the other half of it — `assert_parser_contract` checks that
-      # every anchor still resolves to the text its block claims, which is what would catch a
-      # library that changed its coordinate or offset conventions.
+      # These decide the text that ends up in the corpus. `ParseFingerprint` records every
+      # one of them, per document, in `documents.parse_fp` — so a bump here no longer passes
+      # unnoticed: change detection stops treating the affected documents as unchanged and
+      # re-parses them, and `reindex --re-parse` selects exactly that set without waiting for
+      # a sync. What a bump costs is therefore a re-parse of the documents that library
+      # produced, and nothing else.
+      #
+      # `tests/parsers/test_versions.py` asserts that every distribution reaching a parse
+      # fingerprint is matched by a pattern in this group. A library that decides stored text
+      # and lands in a pull request titled "the runtime group" is the failure that check
+      # exists for.
       #
       # `lxml` is here rather than in `runtime` because it is what `python-docx` and
       # `python-pptx` read OOXML *with*: the XML parse is the extraction step, and neither

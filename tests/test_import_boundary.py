@@ -99,6 +99,12 @@ MANICULE_PACKAGES = (
     # import lives inside the factory that builds the generator, so an installation that
     # never asks a question never pays for it — and `manicule doctor` does not load it at all.
     "manicule.generation",
+    # The evaluation harness computes binomial tails, Wilson intervals and sign tests in pure
+    # Python. numpy and scipy would each have done it in one call, and an evaluation harness
+    # that cannot be imported without a numerical stack is one that gets skipped — which is
+    # the failure this whole subsystem exists to prevent, arriving through the dependency
+    # list rather than through the arithmetic.
+    "manicule.evaluation",
 )
 
 
