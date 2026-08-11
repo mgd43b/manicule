@@ -52,6 +52,14 @@ class MemoryIngestStore:
         self.tombstones: list[str] = []
         self.metadata: dict[str, Metadata] = {}
         self.lineage: dict[str, tuple[str | None, str | None]] = {}
+        self.parse_lineage: dict[str, str] = {}
+        """``documents.parse_fp``, kept beside the documents rather than in them.
+
+        The real store never writes lineage from a domain object — the pipeline builds a fresh
+        one per ingest and cannot know a parse fingerprint before the chain has picked a
+        parser — so a fake that let ``upsert_document`` carry it would clear the lineage at the
+        start of every run and make change detection pass for the wrong reason.
+        """
         self.originals: dict[str, tuple[str | None, str | None]] = {}
         self.seen: dict[str, int] = {}
         self.deleted_at: dict[str, datetime] = {}
@@ -62,8 +70,13 @@ class MemoryIngestStore:
 
     # documents
 
+    def _with_lineage(self, document: Document) -> Document:
+        """A document as a reader sees it: with the lineage the store holds, not the caller's."""
+        return document.model_copy(update={"parse_fp": self.parse_lineage.get(document.id)})
+
     async def get_document(self, document_id: str) -> Document | None:
-        return self.documents.get(document_id)
+        stored = self.documents.get(document_id)
+        return None if stored is None else self._with_lineage(stored)
 
     async def find_document(self, source: str, source_id: SourceId) -> Document | None:
         for document in self.documents.values():
@@ -72,13 +85,13 @@ class MemoryIngestStore:
                 and document.source_id == source_id
                 and document.id not in self.deleted_at
             ):
-                return document
+                return self._with_lineage(document)
         return None
 
     async def upsert_document(self, document: Document) -> Document:
         self.documents[document.id] = document
         self.deleted_at.pop(document.id, None)
-        return document
+        return self._with_lineage(document)
 
     async def set_status(self, document_id: str, status: DocumentStatus, detail: str = "") -> None:
         existing = self.documents.get(document_id)
@@ -146,13 +159,20 @@ class MemoryIngestStore:
         self.metadata[document_id] = merged
 
     async def set_lineage(
-        self, document_id: str, *, chunk_fp: str | None, embed_fp: str | None
+        self,
+        document_id: str,
+        *,
+        chunk_fp: str | None,
+        embed_fp: str | None,
+        parse_fp: str | None = None,
     ) -> None:
         current = self.lineage.get(document_id, (None, None))
         self.lineage[document_id] = (
             chunk_fp if chunk_fp is not None else current[0],
             embed_fp if embed_fp is not None else current[1],
         )
+        if parse_fp is not None:
+            self.parse_lineage[document_id] = parse_fp
 
     async def set_original(
         self, document_id: str, *, ref: str | None, omitted_reason: str | None
@@ -196,9 +216,12 @@ class MemoryIngestStore:
         statuses: Collection[DocumentStatus] | None = None,
         media_types: Collection[str] | None = None,
         chunk_fp_other_than: str | None = None,
+        parse_fp_current: Collection[str] | None = None,
         limit: int | None = None,
     ) -> Sequence[Document]:
-        chosen = [d for d in self.documents.values() if d.id not in self.deleted_at]
+        chosen = [
+            self._with_lineage(d) for d in self.documents.values() if d.id not in self.deleted_at
+        ]
         if source is not None:
             chosen = [d for d in chosen if d.source == source]
         if statuses is not None:
@@ -211,6 +234,9 @@ class MemoryIngestStore:
             chosen = [
                 d for d in chosen if self.lineage.get(d.id, (None, None))[0] != chunk_fp_other_than
             ]
+        if parse_fp_current is not None:
+            current = set(parse_fp_current)
+            chosen = [d for d in chosen if d.parse_fp is None or d.parse_fp not in current]
         return chosen[:limit] if limit is not None else chosen
 
     # sync state

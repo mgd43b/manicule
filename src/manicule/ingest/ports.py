@@ -93,16 +93,32 @@ class IngestStore(Protocol):
         ...
 
     async def set_lineage(
-        self, document_id: str, *, chunk_fp: str | None, embed_fp: str | None
+        self,
+        document_id: str,
+        *,
+        chunk_fp: str | None,
+        embed_fp: str | None,
+        parse_fp: str | None = None,
     ) -> None:
         """Record which fingerprints *this document* was last built with.
 
         What makes invalidation set-valued rather than total: a grammar upgrade that changes
-        code chunk boundaries and nothing else becomes a query.
+        code chunk boundaries and nothing else becomes a query, and so does a ``pypdfium2``
+        bump that changes what a PDF's bytes reduce to.
 
         ``None`` means "leave this one alone", not "clear it". Re-embedding moves only the
-        embedding lineage — it does not re-chunk — and a store that read ``None`` as a clear
-        would make "which documents need re-chunking" answer "none" about documents that do.
+        embedding lineage — it does not re-chunk or re-parse — and a store that read ``None``
+        as a clear would make "which documents need re-chunking" answer "none" about documents
+        that do.
+
+        Args:
+            document_id: Which document.
+            chunk_fp: Canonical ``ChunkFingerprint``, or ``None`` to leave it.
+            embed_fp: Canonical ``EmbedFingerprint``, or ``None`` to leave it.
+            parse_fp: Canonical ``ParseFingerprint``, or ``None`` to leave it. Also ``None``
+                for a document produced by a parser manicule does not ship and so cannot
+                version — recording nothing is the honest answer, and repair selection reads
+                it as "eligible" rather than as "current".
         """
         ...
 
@@ -141,9 +157,24 @@ class IngestStore(Protocol):
         statuses: Collection[DocumentStatus] | None = None,
         media_types: Collection[str] | None = None,
         chunk_fp_other_than: str | None = None,
+        parse_fp_current: Collection[str] | None = None,
         limit: int | None = None,
     ) -> Sequence[Document]:
-        """The selection ``reindex`` runs over. A query, never a scan."""
+        """The selection ``reindex`` runs over. A query, never a scan.
+
+        Args:
+            source: Restrict to one connector.
+            statuses: Restrict to these document statuses.
+            media_types: Restrict to these media types.
+            chunk_fp_other_than: Everything a *different* chunker built.
+            parse_fp_current: Every parse fingerprint that is current, as canonical strings.
+                Selects the complement — documents whose text was produced by a parser
+                version no longer installed, plus documents with no recorded lineage at all.
+                A set rather than a single value because there is no one current parse
+                fingerprint: a corpus holds as many as it has parsers, and a ``pypdfium2``
+                bump moves exactly one of them.
+            limit: Cap the result.
+        """
         ...
 
     # --- sync state --------------------------------------------------------------------

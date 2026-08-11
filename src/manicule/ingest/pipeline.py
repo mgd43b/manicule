@@ -49,6 +49,7 @@ from manicule.core.errors import (
 )
 from manicule.core.ids import content_hash, document_id
 from manicule.ingest.embedding import embed_chunks
+from manicule.ingest.refusals import require_measured
 from manicule.ingest.workers import AttemptResult
 from manicule.parsers.chain import (
     Attempt,
@@ -59,12 +60,13 @@ from manicule.parsers.chain import (
     run_chain,
 )
 from manicule.parsers.expansion import ExpandedMember, MemberFailure
+from manicule.parsers.versions import parse_fingerprint
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from manicule.core.content import Chunk, Metadata
-    from manicule.core.fingerprints import ChunkFingerprint
+    from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
     from manicule.core.protocols import Chunker, Connector, Embedder, VectorStore
     from manicule.core.sources import DiscoveredDoc, DocRef
     from manicule.ingest.middleware import MiddlewareRunner
@@ -216,7 +218,14 @@ class IngestPipeline:
         max_fetch_bytes: int = 256 * 1024 * 1024,
         target_batch_tokens: int = 16_384,
         max_embed_batch: int = 64,
+        parse_fingerprints: Callable[[str], ParseFingerprint | None] = parse_fingerprint,
     ) -> None:
+        # Second of the two places this is refused, and not a redundant one.
+        # `check_before_run` is the once-per-run boundary and is what an operator meets; this
+        # one is the boundary in *code*, because a pipeline is constructible without going
+        # through that function and everything it writes is permanent. A chunker counting with
+        # a stand-in vocabulary must not be able to reach a store at all.
+        require_measured(chunk_fingerprint)
         self._store = store
         self._chunker = chunker
         self._embedder = embedder
@@ -230,6 +239,7 @@ class IngestPipeline:
         self._max_fetch_bytes = max_fetch_bytes
         self._target_batch_tokens = target_batch_tokens
         self._max_embed_batch = max_embed_batch
+        self._parse_fingerprints = parse_fingerprints
         self._fetching = asyncio.Semaphore(max(1, fetch_concurrency))
         self._embedding = asyncio.Lock()
 
@@ -481,6 +491,18 @@ class IngestPipeline:
             retention=retention,
         )
         if result.status is not DocumentStatus.PARSED:
+            if result.status is not DocumentStatus.FAILED:
+                # A container's members and an "unsupported media type" verdict are both
+                # conclusions a parser version reached about these bytes, and both are now
+                # what is stored. A failure is not: it is the absence of a conclusion, and
+                # claiming lineage for it would mark a document current on the strength of
+                # the run that could not read it.
+                await self._store.set_lineage(
+                    document.id,
+                    chunk_fp=None,
+                    embed_fp=None,
+                    parse_fp=self._parse_lineage_of(document),
+                )
             await self._observe(document)
             return (
                 DocumentOutcome(
@@ -658,6 +680,13 @@ class IngestPipeline:
         )
         stored = await self._store.upsert_document(_with_status(document, settled))
         await self._store.replace_chunks(stored.id, [])
+        # The determination "there is no text in this" is itself the output of a parser
+        # version. Without lineage here, a document that yielded nothing would be re-parsed on
+        # every sync forever — and, worse, the day a library learns to read it, nothing would
+        # say which documents were judged empty by the version that could not.
+        await self._store.set_lineage(
+            stored.id, chunk_fp=None, embed_fp=None, parse_fp=self._parse_lineage_of(document)
+        )
         await self._observe(stored)
         return DocumentOutcome(
             source_id=raw.source_id,
@@ -706,6 +735,7 @@ class IngestPipeline:
             indexed.id,
             chunk_fp=self._chunk_fingerprint.canonical(),
             embed_fp=self._embedder.fingerprint.canonical(),
+            parse_fp=self._parse_lineage_of(document),
         )
         await self._observe(indexed)
         return DocumentOutcome(
@@ -717,8 +747,7 @@ class IngestPipeline:
 
     # --- change detection ------------------------------------------------------------------
 
-    @staticmethod
-    def _unchanged_by_token(existing: Document | None, discovered: DiscoveredDoc) -> bool:
+    def _unchanged_by_token(self, existing: Document | None, discovered: DiscoveredDoc) -> bool:
         """Level 1: the source says nothing changed, and we believe it without fetching.
 
         The token is opaque and connector-defined — a git blob SHA, a Confluence version
@@ -733,10 +762,10 @@ class IngestPipeline:
             and existing.status in SETTLED
             and discovered.version_token is not None
             and existing.version_token == discovered.version_token
+            and self._parse_lineage_is_current(existing)
         )
 
-    @staticmethod
-    def _unchanged_by_hash(existing: Document | None, digest: str) -> bool:
+    def _unchanged_by_hash(self, existing: Document | None, digest: str) -> bool:
         """Level 2: the bytes are identical, whatever the source claimed.
 
         Level 1 can lie — a source that touches its modification date on every save reports a
@@ -744,8 +773,56 @@ class IngestPipeline:
         is parse, chunk and embed rather than the fetch.
         """
         return (
-            existing is not None and existing.status in SETTLED and existing.content_hash == digest
+            existing is not None
+            and existing.status in SETTLED
+            and existing.content_hash == digest
+            and self._parse_lineage_is_current(existing)
         )
+
+    def _parse_lineage_is_current(self, existing: Document) -> bool:
+        """Whether the stored text was produced by the parser version installed now.
+
+        **Both change-detection levels ask this, and both have to.** Unchanged bytes are the
+        reason a parser bump is silent: ``content_hash`` is taken over what the connector
+        returned, a new ``pypdfium2`` does not touch those bytes, so nothing already stored is
+        ever re-read — while a newly ingested document with *identical* bytes parses
+        differently, and the corpus ends up holding two generations of extracted text. Level 1
+        needs it as much as level 2 and for a sharper reason: a source whose version token has
+        not moved never even reaches the hash comparison, so a check placed only at level 2
+        would leave every well-behaved connector's corpus permanently stale.
+
+        The comparison is against **the parser this document actually used**, read from
+        ``parser_used`` in its metadata. Not against every installed parser: a ``pypdfium2``
+        bump must re-parse the PDFs and leave the Markdown alone, which is the whole of what
+        ``docs/storage.md`` §6.4 calls set-valued invalidation.
+
+        ``None`` on both sides is agreement rather than ignorance, and the two ways it arises
+        both mean "no version to compare". A parser manicule does not ship has no version this
+        repository can read, so nothing was recorded and nothing is expected; a document that
+        never reached a parser at all — excluded by middleware, claimed by no chain — has no
+        parse to be stale. Treating either as changed would re-parse a plugin corpus on every
+        sync, forever, to learn nothing.
+        """
+        return existing.parse_fp == self._parse_lineage_of(existing)
+
+    def _parse_lineage_of(self, document: Document) -> str | None:
+        """The canonical parse fingerprint this document's parser would produce today.
+
+        ``None`` where there is no version to read: no parser ran, or the one that did is not
+        one manicule ships and therefore not one it can version. Recording ``None`` leaves any
+        stored lineage untouched, which is what makes this safe to call on every commit.
+
+        **Written only where the stored content is now the output of that parse**, which is
+        narrower than "wherever a parse happened" and deliberately so. A document that parsed
+        cleanly and then failed to embed keeps its previous chunks — the pipeline refuses to
+        demote a working document — so recording the new fingerprint there would claim the
+        stored text is current when it is a generation behind, and the next sync, seeing the
+        lineage agree, would skip it forever. That is the silent inconsistency this field
+        exists to end, arriving through the field itself.
+        """
+        used = document.metadata.get("parser_used")
+        current = self._parse_fingerprints(used) if isinstance(used, str) and used else None
+        return current.canonical() if current is not None else None
 
     # --- records ---------------------------------------------------------------------------
 

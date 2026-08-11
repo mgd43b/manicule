@@ -31,7 +31,7 @@ from manicule.ingest.pipeline import (
 )
 from manicule.ingest.ports import IngestStore
 from manicule.ingest.recovery import InstanceLock, requeue_interrupted
-from manicule.ingest.refusals import check_before_run, require_coherent
+from manicule.ingest.refusals import check_before_run, require_coherent, require_measured
 from manicule.ingest.sweeps import SweepGate, SweepResult, sweep_vectors
 from manicule.ingest.workers import (
     AttemptResult,
@@ -64,6 +64,7 @@ __all__ = [
     "embed_chunks",
     "requeue_interrupted",
     "require_coherent",
+    "require_measured",
     "sweep_vectors",
     "text_digest",
     "worker_config",

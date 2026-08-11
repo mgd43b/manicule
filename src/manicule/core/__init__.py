@@ -62,7 +62,7 @@ from manicule.core.errors import (
     UnknownComponentError,
     UnknownEntityError,
 )
-from manicule.core.fingerprints import ChunkFingerprint, Fingerprint
+from manicule.core.fingerprints import ChunkFingerprint, Fingerprint, ParseFingerprint
 from manicule.core.generation import FinishReason, Token, Usage
 from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.core.lifecycle import (
@@ -170,6 +170,7 @@ __all__ = [
     "NameInUseError",
     "PageAnchor",
     "ParseError",
+    "ParseFingerprint",
     "ParsedBlock",
     "Parser",
     "PipelineStage",

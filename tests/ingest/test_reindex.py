@@ -8,7 +8,7 @@ import pytest
 
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, DocumentStatus
-from manicule.core.fingerprints import ChunkFingerprint
+from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
 from manicule.ingest.reindex import re_embed, re_parse, repair, select
 from manicule.testing import assert_refuses_oversized_chunks
 from tests.fakes import HashEmbedder, make_chunks, make_document
@@ -181,6 +181,48 @@ async def test_selection_is_a_query_over_lineage_rather_than_a_scan() -> None:
     chosen = await select(store, chunk_fingerprint=now)
 
     assert [document.id for document in chosen] == ["old"]
+
+
+async def test_a_library_bump_selects_its_own_documents_and_no_others() -> None:
+    """The re-parse selector, checked in both directions.
+
+    ``--re-parse`` is what closes the window between an upgrade and the next sync, during
+    which every anchor stored under the old version is being resolved by the new one. It takes
+    a *set* of current fingerprints, because parsing has no single corpus-wide identity: a
+    ``pypdfium2`` release makes the PDFs stale and says nothing about the Markdown.
+    """
+    store = fakes.MemoryIngestStore()
+    pdf_old = ParseFingerprint(parser="pdf", version="1", libraries={"pypdfium2": "5.12.1"})
+    pdf_new = ParseFingerprint(parser="pdf", version="1", libraries={"pypdfium2": "5.13.0"})
+    markdown = ParseFingerprint(parser="markdown", version="1", libraries={"markdown-it-py": "4"})
+    for name, lineage in (("stale", pdf_old), ("fresh", pdf_new), ("other", markdown)):
+        document = make_document().model_copy(update={"id": name, "source_id": name})
+        store.documents[document.id] = document
+        await store.set_lineage(
+            document.id, chunk_fp=None, embed_fp=None, parse_fp=lineage.canonical()
+        )
+    unversioned = make_document().model_copy(update={"id": "plugin", "source_id": "plugin"})
+    store.documents[unversioned.id] = unversioned
+
+    chosen = await select(store, parse_fingerprints=[pdf_new, markdown])
+
+    assert sorted(document.id for document in chosen) == ["plugin", "stale"], (
+        "the stale PDF and the document with no recorded lineage, and nothing else"
+    )
+
+
+async def test_selecting_on_parse_lineage_is_opt_in() -> None:
+    """``None`` means "do not filter"; an empty set means "nothing is current".
+
+    Collapsing the two with a falsy test would make an installation with no parsers select
+    every document — or, the other way round, make the ordinary unfiltered call select none.
+    """
+    store = fakes.MemoryIngestStore()
+    document = make_document()
+    store.documents[document.id] = document
+
+    assert len(await select(store)) == 1
+    assert len(await select(store, parse_fingerprints=[])) == 1
 
 
 @pytest.mark.parametrize("budget", [16, 512])

@@ -259,12 +259,20 @@ class Document(Base):
     status_detail: Mapped[str | None] = mapped_column(Text)
     failed_stage: Mapped[PipelineStage | None] = mapped_column(_stage_enum())
 
+    parse_fp: Mapped[str | None] = mapped_column(Text)
     chunk_fp: Mapped[str | None] = mapped_column(Text)
     embed_fp: Mapped[str | None] = mapped_column(Text)
     """Which fingerprints this document was last built with.
 
     Per-document lineage is what makes invalidation set-valued: a grammar upgrade that
     changes only code documents is a query, not a corpus-wide rebuild.
+
+    ``parse_fp`` is the one of the three with no corpus-wide counterpart in ``index_state``,
+    and deliberately so. One document has one parser, so there is no single parse identity a
+    whole index can be compared against — a ``pypdfium2`` bump makes the PDFs stale and says
+    nothing about the Markdown. ``NULL`` means no recorded lineage: every row predating the
+    column, and every document produced by a parser manicule does not ship and therefore
+    cannot version.
     """
 
     doc_metadata: Mapped[JsonValue] = mapped_column("metadata", JSON, nullable=False, default=dict)
@@ -295,6 +303,7 @@ class Document(Base):
         Index("ix_documents_workspace_id_status", "workspace_id", "status"),
         Index("ix_documents_workspace_id_uri", "workspace_id", "uri"),
         Index("ix_documents_content_hash", "content_hash"),
+        Index("ix_documents_parse_fp", "parse_fp"),
         Index("ix_documents_chunk_fp", "chunk_fp"),
         Index("ix_documents_embed_fp", "embed_fp"),
         Index(

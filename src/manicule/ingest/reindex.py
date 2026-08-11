@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
 
     from manicule.core.content import Document
-    from manicule.core.fingerprints import ChunkFingerprint
+    from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
     from manicule.core.protocols import Embedder, VectorStore
     from manicule.ingest.pipeline import BlobSink, IngestPipeline
     from manicule.ingest.ports import IngestStore
@@ -62,18 +62,37 @@ async def select(
     statuses: Collection[DocumentStatus] | None = None,
     media_types: Collection[str] | None = None,
     chunk_fingerprint: ChunkFingerprint | None = None,
+    parse_fingerprints: Collection[ParseFingerprint] | None = None,
     limit: int | None = None,
 ) -> Sequence[Document]:
     """The documents a repair verb should run over.
 
     ``chunk_fingerprint`` selects documents built by *something else* — the shape that makes a
     grammar upgrade a targeted repair rather than a corpus-wide rebuild.
+
+    ``parse_fingerprints`` does the same one stage earlier, and is what turns a library bump
+    into a re-parse of the documents that library produced. Pass what every installed parser
+    would produce now — :func:`~manicule.parsers.versions.current_parse_fingerprints` — and
+    the selection is its complement: documents whose text came out of a version that is no
+    longer installed, plus documents carrying no recorded lineage at all.
+
+    **Both of these matter without waiting for a sync.** Change detection re-parses a stale
+    document the next time its connector reports it, which is the right behaviour and the
+    wrong latency: between the upgrade and that sync, every anchor stored under the old
+    version is being resolved by the new one. This is the selector that closes that window on
+    demand, and it needs no network — re-parse reads retained bytes.
     """
+    current = (
+        {fingerprint.canonical() for fingerprint in parse_fingerprints}
+        if parse_fingerprints is not None
+        else None
+    )
     return await store.select_documents(
         source=source,
         statuses=statuses,
         media_types=media_types,
         chunk_fp_other_than=chunk_fingerprint.canonical() if chunk_fingerprint else None,
+        parse_fp_current=current,
         limit=limit,
     )
 
