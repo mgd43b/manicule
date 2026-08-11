@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from manicule.core.content import (
@@ -808,9 +809,20 @@ class IngestPipeline:
     def _parse_lineage_of(self, document: Document) -> str | None:
         """The canonical parse fingerprint this document's parser would produce today.
 
-        ``None`` where there is no version to read: no parser ran, or the one that did is not
-        one manicule ships and therefore not one it can version. Recording ``None`` leaves any
-        stored lineage untouched, which is what makes this safe to call on every commit.
+        ``None`` where there is no version to read: no parser ran, the one that did is not one
+        manicule ships and therefore not one it can version, or its library has since been
+        uninstalled. Recording ``None`` leaves any stored lineage untouched, which is what
+        makes this safe to call on every commit.
+
+        **An uninstalled library is caught here rather than allowed to end a run.**
+        :func:`~manicule.parsers.versions.parse_fingerprint` raises for a distribution that is
+        not present, which is right where a repair is being planned — a partial set of current
+        fingerprints is a repair that cannot succeed. It is wrong here. This runs inside
+        discovery, once per document, and an exception escaping it would abort the enumeration
+        and take every *other* document in the batch with it, which is the one failure mode
+        this pipeline exists not to have. Answering ``None`` instead makes the document
+        ineligible for a skip, so the chain runs, fails on the missing library alone, and is
+        recorded against that document.
 
         **Written only where the stored content is now the output of that parse**, which is
         narrower than "wherever a parse happened" and deliberately so. A document that parsed
@@ -821,7 +833,12 @@ class IngestPipeline:
         exists to end, arriving through the field itself.
         """
         used = document.metadata.get("parser_used")
-        current = self._parse_fingerprints(used) if isinstance(used, str) and used else None
+        if not isinstance(used, str) or not used:
+            return None
+        try:
+            current = self._parse_fingerprints(used)
+        except PackageNotFoundError:
+            return None
         return current.canonical() if current is not None else None
 
     # --- records ---------------------------------------------------------------------------

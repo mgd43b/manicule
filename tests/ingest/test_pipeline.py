@@ -7,6 +7,7 @@ surviving failure is certified by nothing if only its happy path is exercised.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError
 from typing import TYPE_CHECKING, override
 
 import pytest
@@ -897,3 +898,29 @@ async def test_a_pipeline_cannot_be_built_on_estimated_chunk_boundaries() -> Non
             middleware=MiddlewareRunner(()),
             chunk_fingerprint=provisional,
         )
+
+
+async def test_an_uninstalled_parser_library_fails_one_document_and_not_the_run() -> None:
+    """Reading a version can raise, and change detection is not the place to let it.
+
+    ``parse_fingerprint`` raises for a distribution that is not installed, which is right
+    where a repair is being planned — a partial set of current fingerprints is a repair that
+    cannot succeed. Inside change detection it would escape into the discovery loop and end
+    the enumeration, taking every other document in the batch with it. One document's problem
+    must stay one document's.
+    """
+
+    def missing(parser: str) -> ParseFingerprint | None:
+        msg = f"No package metadata was found for the library behind {parser!r}"
+        raise PackageNotFoundError(msg)
+
+    store = fakes.MemoryIngestStore()
+    connector = fakes.DictConnector({"a": "alpha", "b": "beta"})
+    seeded, _, _ = build(store=store, parse_fingerprints=parse_versions(lines="1.0"))
+    await seeded.run(connector)
+
+    broken, _, _ = build(store=store, parse_fingerprints=missing)
+    report = await broken.run(connector)
+
+    assert report.clean, "an unreadable version must not end the enumeration"
+    assert report.discovered == 2, "and every document must still be attempted"

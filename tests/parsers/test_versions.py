@@ -20,6 +20,7 @@ from manicule.core.fingerprints import ParseFingerprint
 from manicule.parsers.plugin import PARSERS as REGISTERED
 from manicule.parsers.versions import (
     PARSERS,
+    ParserVersions,
     current_parse_fingerprints,
     distributions_recorded,
     parse_fingerprint,
@@ -142,10 +143,28 @@ def test_a_parser_manicule_does_not_ship_records_nothing() -> None:
     assert parse_fingerprint("some-plugin-parser") is None
 
 
-def test_a_missing_distribution_raises_rather_than_defaulting() -> None:
-    """A version that falls back to a constant is the constant this table replaced."""
-    with pytest.raises(PackageNotFoundError):
-        installed_version("a-distribution-that-is-not-installed")
+def test_a_missing_distribution_raises_rather_than_defaulting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A version that falls back to a constant is the constant this table replaced.
+
+    Exercised through :func:`parse_fingerprint` rather than through ``importlib`` on its own,
+    because what is being asserted is this module's behaviour: a lookup that quietly returned
+    a default would produce a fingerprint that never moves, which is worse than no fingerprint
+    at all. ``parse_fingerprint`` is cached, so the cache is cleared around the substitution.
+    """
+    absent = ParserVersions(rules="1", distributions=("a-distribution-that-is-not-installed",))
+    monkeypatch.setitem(PARSERS, "pdf", absent)
+    parse_fingerprint.cache_clear()
+
+    try:
+        with pytest.raises(PackageNotFoundError):
+            parse_fingerprint("pdf")
+    finally:
+        # The cache is keyed on the parser name and would otherwise carry the substituted
+        # entry's absence — or, worse, a successful lookup taken before it — into every later
+        # test in the session.
+        parse_fingerprint.cache_clear()
 
 
 def test_the_current_set_covers_every_shipped_parser() -> None:
