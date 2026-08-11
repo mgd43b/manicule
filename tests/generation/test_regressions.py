@@ -9,6 +9,7 @@ the code looked right, and the guarantee was not being kept.
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import sys
 import time
 from typing import Any, override
@@ -865,14 +866,6 @@ async def test_a_policy_dropped_passages_document_never_crosses_the_plugin_bound
         assert all("Layoffs" not in d.title for d in sent.values())
 
 
-# NOTE: the fix for the close deadline (`bounded`) is verified by a standalone reproduction
-# rather than by a test in this suite. The only fixture that discriminates it from `wait_for`
-# is a closer that keeps working *after* swallowing a cancellation — and such a task by
-# definition outlives the call, which pytest's loop management cannot host without hanging.
-# Standalone, `bounded` returns in 0.05s against a closer that ignores cancellation; `wait_for`
-# does not return at all. A hanging test is worse than an honest note.
-
-
 async def test_generating_forwards_only_the_extras_a_generator_declares() -> None:
     """Forwarding unconditionally made the optional-extras mechanism a mandatory one: a
     generator that did not accept a key raised ``TypeError`` before streaming began."""
@@ -884,3 +877,78 @@ async def test_generating_forwards_only_the_extras_a_generator_declares() -> Non
         text = "".join([token.text async for token in tokens])
 
     assert text == "fine"
+
+
+# --- the close deadline, hosted across a process boundary ------------------------------------
+#
+# `bounded` exists because a deadline that waits for the cancellation it just issued is not a
+# deadline. The only fixture that tells it apart from `wait_for` is a closer that keeps working
+# *after* swallowing a cancellation — and such a task outlives the call by definition, which is
+# precisely why the guard is needed and precisely why an in-process test hangs the suite.
+#
+# The answer is the one the parse workers landed on: **a deadline is only enforceable across a
+# process boundary**, and that applies to testing the deadline as much as to imposing it. The
+# child misbehaves and is killed with the process; nothing outlives the test, because the test
+# owns a process rather than a task.
+
+_STUBBORN_CLOSER = """
+import asyncio, os, sys, time
+
+class Stubborn:
+    async def aclose(self):
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                continue          # swallows it and keeps working, forever
+
+async def main():
+    began = time.monotonic()
+    if sys.argv[1] == "bounded":
+        from manicule.core.protocols import aclose
+        await aclose(Stubborn(), timeout=0.05)
+    else:
+        await asyncio.wait_for(Stubborn().aclose(), 0.05)
+    print(time.monotonic() - began, flush=True)
+    # `os._exit`, not a return. `asyncio.run` cancels and *gathers* what is left at shutdown,
+    # and what is left here is a task that swallows cancellation — so a graceful exit hangs on
+    # the very thing the deadline abandoned. Leaving it to the OS is the point restated: past
+    # the deadline the work is no longer ours, and the same idiom the hostile parser fixtures
+    # use to die mid-parse.
+    os._exit(0)
+
+asyncio.run(main())
+"""
+
+
+def _close_under(strategy: str, timeout: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", _STUBBORN_CLOSER, strategy],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+@pytest.mark.slow
+def test_a_close_that_swallows_cancellation_cannot_hold_the_shutdown_open() -> None:
+    """`bounded` returns on its deadline against a closer that ignores cancellation."""
+    finished = _close_under("bounded", timeout=20)
+
+    assert finished.returncode == 0, finished.stderr
+    elapsed = float(finished.stdout.strip())
+    assert elapsed < 1.0, f"the close took {elapsed:.2f}s against a 0.05s deadline"
+
+
+@pytest.mark.slow
+def test_the_deadline_that_waits_for_its_own_cancellation_never_returns() -> None:
+    """The control, and the reason the fix is not a refactor.
+
+    `wait_for` reads as equivalent and is cleaner, so it is exactly what a future reader
+    simplifies `bounded` back to. This is the assertion that goes red when they do: against
+    the same closer it does not return at all, and the only thing that ends it is killing the
+    process.
+    """
+    with pytest.raises(subprocess.TimeoutExpired):
+        _close_under("wait_for", timeout=5)
