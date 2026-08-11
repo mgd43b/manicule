@@ -134,11 +134,24 @@ def test_a_second_pre_seed_copies_nothing(
 
     A bundle that re-copied its libraries on every call would put tens of megabytes of I/O in
     front of every container start, and would look identical from the outside.
+
+    The return value alone does not show that, since a copy followed by an empty answer is the
+    same value. What shows it is the files: seeding writes a temporary name and renames it into
+    place, so a second copy would replace the inode. Comparing inodes is therefore the direct
+    observation, and the empty return is the corroborating one.
     """
-    del empty_cache
     grammars.prefetch(BUNDLE_LANGUAGES, bundle_dir=bundle.root)
+    before = {
+        language: (empty_cache / bundle.grammars[language].filename).stat().st_ino
+        for language in BUNDLE_LANGUAGES
+    }
 
     assert grammars.prefetch(BUNDLE_LANGUAGES, bundle_dir=bundle.root) == ()
+    after = {
+        language: (empty_cache / bundle.grammars[language].filename).stat().st_ino
+        for language in BUNDLE_LANGUAGES
+    }
+    assert after == before
 
 
 def test_a_bundle_serves_a_cache_that_resolves_somewhere_unexpected(
@@ -408,6 +421,66 @@ def test_a_library_edited_without_changing_its_length_is_refused_when_it_is_seed
     assert not list(empty_cache.iterdir())
 
 
+def test_verify_reads_every_byte_where_a_read_only_checks_lengths(
+    bundle: grammar_bundle.GrammarBundle, tmp_path: Path
+) -> None:
+    """The deliberate check, for a ``doctor`` command or a build confirming what it wrote.
+
+    ``read`` deliberately stops at sizes, because it runs on every pre-seed and hashing tens of
+    megabytes to answer "is a bundle present" would make the cheap path expensive. That split
+    is only honest if the expensive half exists and catches what the cheap half cannot, which
+    is a library whose length is right and whose content is not.
+    """
+    damaged = _copied_bundle(bundle, tmp_path)
+    library = damaged / grammar_bundle.LIBRARY_DIR_NAME / bundle.grammars["rust"].filename
+    content = bytearray(library.read_bytes())
+    content[0] ^= 0xFF
+    library.write_bytes(bytes(content))
+
+    read_back = grammar_bundle.read(damaged)
+    with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
+        read_back.verify()
+
+    assert "sha256" in str(raised.value)
+
+
+def test_a_manifest_with_a_licence_nobody_assessed_is_refused_on_read(
+    bundle: grammar_bundle.GrammarBundle, tmp_path: Path
+) -> None:
+    """A bundle arrives by hand, so its manifest is the only licence statement it carries.
+
+    Asserted at build *and* at read, because the two happen on different machines and a
+    manifest is a text file somebody can edit between them.
+    """
+    edited = _edited_manifest(bundle, tmp_path, licence="GPL-3.0-only")
+
+    with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
+        grammar_bundle.read(edited)
+
+    assert "copyleft" in str(raised.value)
+
+
+def test_a_manifest_whose_numbers_are_not_numbers_is_refused_as_a_bundle_problem(
+    bundle: grammar_bundle.GrammarBundle, tmp_path: Path
+) -> None:
+    """A corrupt manifest must read as a corrupt manifest.
+
+    Left to fail wherever the conversion happens, it surfaces as a bare ``ValueError`` from a
+    frame with no file name in it — which sends whoever hits it into manicule's internals
+    rather than to the bundle they copied.
+    """
+    edited = _copied_bundle(bundle, tmp_path)
+    path = edited / grammar_bundle.MANIFEST_NAME
+    manifest = json.loads(path.read_text())
+    manifest["languages"]["python"]["size"] = "quite large"
+    path.write_text(json.dumps(manifest))
+
+    with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
+        grammar_bundle.read(edited)
+
+    assert "malformed" in str(raised.value)
+
+
 def test_a_grammar_that_cannot_be_loaded_refuses_instead_of_declining(tmp_path: Path) -> None:
     """The gap a bundle opens, closed: present, reported as downloaded, and unloadable.
 
@@ -611,9 +684,11 @@ def test_building_a_bundle_leaves_the_pack_where_it_found_it(
     the per-user cache, and would spend the rest of its life looking for grammars where it has
     never put any.
     """
+    library = f"libtree_sitter_python{grammar_bundle.library_suffix()}"
+    real_cache = source_cache()  # named first: reading it puts the pack back on its default
     shutil.copy2(
-        source_cache() / f"libtree_sitter_python{grammar_bundle.library_suffix()}",
-        empty_cache / f"libtree_sitter_python{grammar_bundle.library_suffix()}",
+        real_cache / library,
+        empty_cache / library,
     )
     grammars.configure_pack(
         grammars.DECLARED_LANGUAGES, cache_dir=empty_cache, manifest_url=UNREACHABLE_MANIFEST

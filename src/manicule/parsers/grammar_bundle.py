@@ -107,6 +107,12 @@ thing that would read settings: the grammar pre-seed is a step an image build or
 performs against ``manicule.parsers.grammars`` directly, with no configured parser and no
 container in existence yet. A caller that does have configuration passes the path explicitly
 instead — ``prefetch(..., bundle_dir=...)`` — and that argument wins.
+
+Inside manicule's ``MANICULE_`` namespace deliberately, which the test environment fixture
+clears before every test. That is the right treatment for this one: it is deployment
+configuration, and a developer's own bundle leaking into the suite would make tests pass
+because of what is on their machine. The switch that arms the offline suite in CI is a
+different kind of thing and is named outside the namespace for the opposite reason.
 """
 
 BUNDLE_MODULE: Final = "manicule_grammars"
@@ -445,42 +451,44 @@ def read(root: Path) -> GrammarBundle:
         )
         raise GrammarBundleError(msg)
 
-    grammars = {
-        language: BundledGrammar(
-            language=language,
-            filename=str(entry["filename"]),
-            sha256=str(entry["sha256"]),
-            size=int(entry["size"]),
-        )
-        for language, entry in _entries(manifest, manifest_path).items()
-    }
     bundle = GrammarBundle(
         root=root,
         pack_version=str(manifest["pack_version"]),
         platform=here,
-        licence=str(manifest.get("licence", "")),
-        grammars=grammars,
+        # Checked, not merely recorded. A bundle is redistributed by hand, so the manifest it
+        # arrives with is the only licence statement the receiving machine has, and a manifest
+        # is a text file somebody can edit. Re-asserting it here costs a string split and means
+        # the terms cannot be widened between the build and the install.
+        licence=check_licence(str(manifest.get("licence", ""))),
+        grammars=_entries(manifest, manifest_path),
     )
     _check_sizes(bundle)
     return bundle
 
 
-def _entries(manifest: Mapping[str, Any], path: Path) -> Mapping[str, Mapping[str, Any]]:
-    """The manifest's language table, or an error naming the file rather than a ``KeyError``."""
+def _entries(manifest: Mapping[str, Any], path: Path) -> Mapping[str, BundledGrammar]:
+    """The manifest's language table, or an error naming the file rather than a ``KeyError``.
+
+    Every conversion happens here, inside one ``try``. A size recorded as ``"large"`` is a
+    corrupt manifest and must read as one; leaving the ``int()`` outside would let it escape as
+    a bare ``ValueError`` from somewhere with no file name in it.
+    """
     languages = manifest.get("languages")
     if not isinstance(languages, dict) or not languages:
         msg = f"the grammar bundle manifest {path} lists no languages"
         raise GrammarBundleError(msg)
+    entries: dict[str, Any] = languages
     try:
         return {
-            str(language): {
-                "filename": entry["filename"],
-                "sha256": entry["sha256"],
-                "size": entry["size"],
-            }
-            for language, entry in languages.items()
+            str(language): BundledGrammar(
+                language=str(language),
+                filename=str(entry["filename"]),
+                sha256=str(entry["sha256"]),
+                size=int(entry["size"]),
+            )
+            for language, entry in entries.items()
         }
-    except (KeyError, TypeError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         msg = f"the grammar bundle manifest {path} has a malformed language entry: {exc}"
         raise GrammarBundleError(msg) from exc
 
@@ -551,28 +559,29 @@ def check_licence(expression: str) -> str:
     terms = [term for term in re.split(r"[\s()]+", expression.strip()) if term]
     if not terms:
         msg = (
-            "the grammar pack declares no licence, so a bundle built from it would be "
-            "redistributed under unknown terms"
+            "no grammar licence is declared, so the bundle would be redistributed under "
+            "unknown terms. A bundle built by tools/build_grammar_bundle.py always records "
+            "one; a manifest without it has been edited or was written by something else."
         )
         raise GrammarBundleError(msg)
     named = [term for term in terms if term.upper() not in _LICENCE_OPERATORS]
     copyleft = [term for term in named if term.upper().startswith(COPYLEFT_PREFIXES)]
     if copyleft:
         msg = (
-            f"the grammar pack declares {expression!r}, which includes the copyleft "
-            f"term(s) {copyleft}. docs/parsing.md §12 refuses a copyleft grammar bundle: it "
-            f"would put a source-distribution obligation on everyone who copies the bundle to "
-            f"an air-gapped host, which is an obligation manicule would be imposing rather "
-            f"than accepting."
+            f"the grammar licence {expression!r} includes the copyleft term(s) {copyleft}. "
+            f"docs/parsing.md §12 refuses a copyleft grammar bundle: it would put a "
+            f"source-distribution obligation on everyone who copies the bundle to an "
+            f"air-gapped host, which is an obligation manicule would be imposing rather than "
+            f"accepting."
         )
         raise GrammarBundleError(msg)
     unknown = sorted({term for term in named if term not in PERMISSIVE_LICENCES})
     if unknown:
         msg = (
-            f"the grammar pack declares {expression!r}, and {unknown} is not on the list of "
-            f"licences assessed for redistribution ({sorted(PERMISSIVE_LICENCES)}). Assess it "
-            f"against docs/parsing.md §12 before adding it, rather than adding it to make this "
-            f"pass."
+            f"the grammar licence {expression!r} contains {unknown}, which is not on the list "
+            f"of licences assessed for redistribution ({sorted(PERMISSIVE_LICENCES)}). Assess "
+            f"it against docs/parsing.md §12 before adding it, rather than adding it to make "
+            f"this pass."
         )
         raise GrammarBundleError(msg)
     return expression

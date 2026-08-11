@@ -297,16 +297,21 @@ class GrammarUnavailableError(ManiculeError):
     re-indexable the moment the grammar arrives.
     """
 
-    def __init__(self, language: str) -> None:
+    def __init__(
+        self, language: str, reason: str | None = None, message: str | None = None
+    ) -> None:
         self.language = language
-        self.reason = f"grammar unavailable: {language} — run manicule doctor --fix"
+        self.reason = reason or f"grammar unavailable: {language} — run manicule doctor --fix"
         """The document's ``status_detail``. Names the language and the command that fixes
         it, because "unsupported" on its own tells an operator nothing to do."""
         super().__init__(
-            f"{self.reason}. The grammar for {language!r} was not found in the cache at "
-            f"{cache_directory()}. It is not fetched on demand on purpose: a file that "
-            f"chunks one way here and another way on a machine that reached the network "
-            f"produces one corpus with two chunkings."
+            message
+            or (
+                f"{self.reason}. The grammar for {language!r} was not found in the cache at "
+                f"{cache_directory()}. It is not fetched on demand on purpose: a file that "
+                f"chunks one way here and another way on a machine that reached the network "
+                f"produces one corpus with two chunkings."
+            )
         )
 
 
@@ -327,14 +332,17 @@ class GrammarUnusableError(GrammarUnavailableError):
     """
 
     def __init__(self, language: str, detail: str) -> None:
-        super().__init__(language)
-        self.reason = f"grammar unusable: {language} — run manicule doctor --fix"
-        self.args = (
-            f"{self.reason}. The grammar for {language!r} is present in the cache at "
-            f"{cache_directory()} and the grammar pack could not load it: {detail}. A library "
-            f"built for another platform or truncated in transit looks exactly like this. "
-            f"Re-seed it from an offline bundle built on this platform, or delete it and "
-            f"pre-seed again.",
+        reason = f"grammar unusable: {language} — run manicule doctor --fix"
+        super().__init__(
+            language,
+            reason=reason,
+            message=(
+                f"{reason}. The grammar for {language!r} is present in the cache at "
+                f"{cache_directory()} and the grammar pack could not load it: {detail}. A "
+                f"library built for another platform or truncated in transit looks exactly "
+                f"like this. Re-seed it from an offline bundle built on this platform, or "
+                f"delete it and pre-seed again."
+            ),
         )
 
 
