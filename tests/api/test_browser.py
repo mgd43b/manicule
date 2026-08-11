@@ -81,12 +81,40 @@ def test_credentials_are_never_permitted_cross_origin() -> None:
     assert "access-control-allow-credentials" not in {key.lower() for key in response.headers}
 
 
-def test_something_not_an_origin_is_refused_by_configuration() -> None:
-    """A path or a bare hostname is not an origin, and a browser will never match one."""
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "docs.example.com",
+        "ftp://docs.example.com",
+        "https://docs.example.com/embed",
+        "https://docs.example.com/",
+        "https://docs.example.com?tenant=1",
+        "https://docs.example.com#frag",
+        "https://",
+    ],
+)
+def test_something_that_is_not_exactly_an_origin_is_refused(entry: str) -> None:
+    """A browser's ``Origin`` header is scheme, host and port. Nothing else can ever match one.
+
+    Each of these would be accepted by a validator that only looked at the *path*, and each
+    would then silently disable CORS for the origin the operator meant — configuration that
+    reads as in force and is not, with the symptom appearing as an error on somebody else's
+    page rather than here.
+    """
     from pydantic import ValidationError  # noqa: PLC0415 - only this test names one
 
     with pytest.raises(ValidationError, match="is not an origin"):
-        Settings(security={"transport": {"allowed_origins": ["docs.example.com"]}})  # pyright: ignore[reportArgumentType]
+        Settings(security={"transport": {"allowed_origins": [entry]}})  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["https://docs.example.com", "http://localhost:5173", "https://docs.example.com:8443"],
+)
+def test_a_real_origin_is_accepted(entry: str) -> None:
+    """The positive control for the list above, including an explicit port."""
+    settings = Settings(security={"transport": {"allowed_origins": [entry]}})  # pyright: ignore[reportArgumentType]
+    assert settings.security.transport.allowed_origins == (entry,)
 
 
 # --- framing and sniffing ---------------------------------------------------------------------

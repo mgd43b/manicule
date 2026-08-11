@@ -390,8 +390,15 @@ class TransportSettings(Section):
         for "any page on the internet may read this index with the browser's credentials", and
         the honest response is to say that is not offered rather than to silently narrow it.
 
+        **Anything past the port is refused too** — a path, a query string, a fragment, a
+        trailing slash. A browser's ``Origin`` header is exactly scheme, host and port, so an
+        entry carrying any of those can never match one: CORS is silently off for that origin
+        while the configuration file says it is on. That is the failure mode this whole module
+        is written against, and it is quieter here than most, because the symptom appears as a
+        browser error on somebody else's page rather than anywhere an operator is looking.
+
         Raises:
-            ValueError: An entry is ``*`` or is not a ``scheme://host[:port]`` origin.
+            ValueError: An entry is ``*`` or is not exactly a ``scheme://host[:port]`` origin.
         """
         for entry in value:
             if entry.strip() == "*":
@@ -402,10 +409,13 @@ class TransportSettings(Section):
                 )
                 raise ValueError(msg)
             parsed = urlsplit(entry)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path:
+            extra = parsed.path or parsed.query or parsed.fragment
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or extra:
                 msg = (
                     f"security.transport.allowed_origins entry {entry!r} is not an origin. "
-                    f"Write it as scheme://host[:port], with no path."
+                    f"Write it as scheme://host[:port] — nothing after the port, because a "
+                    f"browser's Origin header carries nothing after the port and an entry "
+                    f"that carries more can never match one."
                 )
                 raise ValueError(msg)
         return value
