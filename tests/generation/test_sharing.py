@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from manicule.core.anchors import Anchor, CellAnchor, HeadingAnchor, LineAnchor, PageAnchor
+from manicule.core.content import BlockKind
 from manicule.core.errors import PolicyError
 from manicule.generation.answers import Citation, Verification
 from manicule.generation.sharing import (
@@ -20,12 +21,13 @@ from manicule.generation.sharing import (
 )
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+CEILING_S = 30 * 24 * 3600
 
 
 def test_a_minted_link_carries_the_token_once_and_stores_only_its_hash() -> None:
     """The database is backed up, exported and imported, so a plaintext token travels into
     artefacts that leave the access boundary that created it."""
-    link = new_share("conv-1", ttl_s=30 * 24 * 3600, now=NOW)
+    link = new_share("conv-1", ttl_s=30 * 24 * 3600, maximum_ttl_s=CEILING_S, now=NOW)
 
     assert len(link.token) >= 40
     assert link.token not in link.token_hash
@@ -38,7 +40,7 @@ def test_a_link_expires_and_a_missing_expiry_is_treated_as_expired() -> None:
     """Fails closed: a row without an expiry predates this feature or was written by
     something that skipped it, and "no expiry" reading as "never expires" is how a
     permanently-public link comes about."""
-    link = new_share("conv-1", ttl_s=3600, now=NOW)
+    link = new_share("conv-1", ttl_s=3600, maximum_ttl_s=CEILING_S, now=NOW)
 
     assert is_live(link.expires_at, now=NOW + timedelta(minutes=59))
     assert not is_live(link.expires_at, now=NOW + timedelta(hours=2))
@@ -47,7 +49,7 @@ def test_a_link_expires_and_a_missing_expiry_is_treated_as_expired() -> None:
 
 def test_a_link_with_no_lifetime_is_refused_rather_than_minted_dead() -> None:
     with pytest.raises(ValueError, match="positive lifetime"):
-        new_share("conv-1", ttl_s=0)
+        new_share("conv-1", ttl_s=0, maximum_ttl_s=CEILING_S)
 
 
 def test_sharing_can_be_switched_off_entirely() -> None:
@@ -59,7 +61,7 @@ def test_sharing_can_be_switched_off_entirely() -> None:
         require_sharing_enabled(False)
 
 
-def citation(anchor: Anchor | None = None) -> Citation:
+def citation(anchor: Anchor | None = None, kind: BlockKind = BlockKind.PROSE) -> Citation:
     return Citation(
         slot=1,
         document_id="doc-1",
@@ -67,6 +69,7 @@ def citation(anchor: Anchor | None = None) -> Citation:
         title="Deploy runbook",
         heading_path=("Operations", "Rollback"),
         anchor=anchor or PageAnchor(page=4),
+        kind=kind,
         chunk_id="c1",
         quote="Roll back with `deploy --rollback`.",
         verification=Verification.RESOLVED,
@@ -74,23 +77,35 @@ def citation(anchor: Anchor | None = None) -> Citation:
 
 
 @pytest.mark.parametrize(
-    ("anchor", "expected_location", "expected_trail"),
+    ("anchor", "kind", "expected_location", "expected_trail"),
     [
-        pytest.param(PageAnchor(page=4), "page 4", ("Operations", "Rollback"), id="page"),
+        pytest.param(
+            PageAnchor(page=4), BlockKind.PROSE, "page 4", ("Operations", "Rollback"), id="page"
+        ),
         pytest.param(
             LineAnchor(start=41, end=58, symbol="charge_customer_card"),
+            BlockKind.CODE,
             "",
             (),
-            id="code-symbol-and-breadcrumb-suppressed",
+            id="code-symbol-chain-suppressed",
         ),
         pytest.param(
             CellAnchor(sheet="Q3 Layoffs", ref="B4:D12"),
+            BlockKind.TABLE,
+            "",
+            (),
+            id="sheet-name-suppressed-in-both-fields",
+        ),
+        pytest.param(
+            LineAnchor(start=1, end=4),
+            BlockKind.PROSE,
             "",
             ("Operations", "Rollback"),
-            id="sheet-name-suppressed",
+            id="prose-with-a-line-anchor-keeps-its-breadcrumb",
         ),
         pytest.param(
             HeadingAnchor(path=("Operations", "Rollback")),
+            BlockKind.HEADING,
             "",
             ("Operations", "Rollback"),
             id="heading",
@@ -98,7 +113,10 @@ def citation(anchor: Anchor | None = None) -> Citation:
     ],
 )
 def test_an_anonymous_viewer_gets_a_label_and_never_the_anchors_contents(
-    anchor: Anchor, expected_location: str, expected_trail: tuple[str, ...]
+    anchor: Anchor,
+    kind: BlockKind,
+    expected_location: str,
+    expected_trail: tuple[str, ...],
 ) -> None:
     """The same message renders differently by audience, and the difference is **content
     only** — never the existence of a citation, never whether it verified.
@@ -110,7 +128,7 @@ def test_an_anonymous_viewer_gets_a_label_and_never_the_anchors_contents(
     ``Q3 Layoffs!B4:D12`` back in — a private repository's function name and a spreadsheet
     nobody outside the workspace should learn the title of.
     """
-    shared = redact_for_anonymous(citation(anchor=anchor))
+    shared = redact_for_anonymous(citation(anchor=anchor, kind=kind))
 
     assert shared.title == "Deploy runbook"
     assert shared.verification is Verification.RESOLVED

@@ -35,7 +35,8 @@ from datetime import UTC, datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from manicule.core.anchors import Anchor, LineAnchor, PageAnchor
+from manicule.core.anchors import Anchor, PageAnchor
+from manicule.core.content import BlockKind
 from manicule.core.errors import PolicyError
 from manicule.generation.answers import Citation, Verification
 
@@ -88,7 +89,7 @@ def new_share(
     conversation_id: str,
     *,
     ttl_s: int,
-    maximum_ttl_s: int | None = None,
+    maximum_ttl_s: int,
     now: datetime | None = None,
 ) -> ShareLink:
     """Mint a link for a conversation.
@@ -97,6 +98,10 @@ def new_share(
     a requested lifetime is clamped to it rather than refused, so a route that surfaces the
     choice to a user cannot mint a capability that outlives the policy.
 
+    It is a **required** argument. As an optional one it was a ceiling nobody passed — the
+    only production caller omitted it — so the clamp existed and never ran, and a hundred-year
+    link minted cleanly. A policy that has to be opted into is not a policy.
+
     Raises:
         ValueError: ``ttl_s`` is not positive. A link that expires at or before the moment it
             is created is not a shorter-lived capability, it is a broken feature.
@@ -104,8 +109,10 @@ def new_share(
     if ttl_s <= 0:
         msg = f"a share link needs a positive lifetime; got ttl_s={ttl_s}"
         raise ValueError(msg)
-    if maximum_ttl_s is not None:
-        ttl_s = min(ttl_s, maximum_ttl_s)
+    if maximum_ttl_s <= 0:
+        msg = f"the share-link ceiling must be positive; got maximum_ttl_s={maximum_ttl_s}"
+        raise ValueError(msg)
+    ttl_s = min(ttl_s, maximum_ttl_s)
     moment = now or datetime.now(UTC)
     token = mint_token()
     return ShareLink(
@@ -175,7 +182,7 @@ def redact_for_anonymous(citation: Citation) -> CitationLabel:
     return CitationLabel(
         slot=citation.slot,
         title=citation.title,
-        heading_path=anonymous_trail(citation.anchor, citation.heading_path),
+        heading_path=anonymous_trail(citation.kind, citation.heading_path),
         location=anonymous_location(citation.anchor),
         verification=citation.verification,
     )
@@ -201,7 +208,18 @@ def anonymous_location(anchor: Anchor) -> str:
     return f"page {anchor.page}" if isinstance(anchor, PageAnchor) else ""
 
 
-def anonymous_trail(anchor: Anchor, heading_path: tuple[str, ...]) -> tuple[str, ...]:
+DISCLOSABLE_TRAIL: frozenset[BlockKind] = frozenset(
+    {BlockKind.PROSE, BlockKind.HEADING, BlockKind.LIST, BlockKind.PANEL, BlockKind.MEDIA}
+)
+"""Kinds whose ``heading_path`` is a section title rather than corpus structure.
+
+``TABLE`` is excluded because the spreadsheet parser puts the **sheet name** in the heading
+path, and ``CODE`` because the source parser puts the **symbol chain** there. An allowlist
+rather than a denylist: a kind added later is not disclosed until somebody says it may be.
+"""
+
+
+def anonymous_trail(kind: BlockKind, heading_path: tuple[str, ...]) -> tuple[str, ...]:
     """The breadcrumb an anonymous viewer may see.
 
     §11.3 discloses the heading path deliberately, and for a wiki page or a document that is
@@ -210,11 +228,17 @@ def anonymous_trail(anchor: Anchor, heading_path: tuple[str, ...]) -> tuple[str,
     the same field that reads ``Operations > Rollback`` for a runbook reads
     ``PaymentGateway > charge_customer_card`` for a private repository.
 
-    A :class:`~manicule.core.anchors.LineAnchor` is what says "this citation is into code", so
-    that is the discriminator. The title still goes — a file name is title-class disclosure and
-    the operator's one switch covers it — but the symbols do not.
+    **The discriminator is the block kind, not the anchor type**, and using the anchor was
+    wrong in both directions. It missed the spreadsheet entirely — ``anonymous_location``
+    refuses to render a ``CellAnchor`` precisely because the sheet name discloses, and then
+    the sheet name went out in the next field, because that is where the parser puts it. And
+    it over-suppressed: Markdown and plaintext emit a ``LineAnchor`` for ordinary prose, so
+    every one of those citations lost the breadcrumb the attestation is *for*.
+
+    The title still goes — a file name is title-class disclosure and the operator's one
+    switch covers it — but a sheet name and a symbol chain do not.
     """
-    return () if isinstance(anchor, LineAnchor) else heading_path
+    return heading_path if kind in DISCLOSABLE_TRAIL else ()
 
 
 def is_live(expires_at: datetime | None, *, now: datetime | None = None) -> bool:
@@ -231,6 +255,7 @@ def is_live(expires_at: datetime | None, *, now: datetime | None = None) -> bool
 
 
 __all__ = [
+    "DISCLOSABLE_TRAIL",
     "TOKEN_BYTES",
     "CitationLabel",
     "ShareLink",

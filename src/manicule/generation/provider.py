@@ -39,7 +39,7 @@ from manicule.core.errors import (
 )
 from manicule.core.generation import FinishReason, Token, Usage
 from manicule.core.lifecycle import HealthReport
-from manicule.core.protocols import CLOSE_DEADLINE_S
+from manicule.core.protocols import CLOSE_DEADLINE_S, bounded
 from manicule.core.retrieval import Context, Query
 from manicule.generation.prompt import ChatMessage, build_messages
 
@@ -735,10 +735,13 @@ async def _close(stream: Any) -> None:  # noqa: ANN401
         return
     try:
         result: object = closer()
-        if asyncio.iscoroutine(result):
-            await asyncio.wait_for(result, CLOSE_DEADLINE_S)
     except Exception:  # noqa: BLE001 - cleanup never raises over the failure it is unwinding
         return
+    if asyncio.iscoroutine(result):
+        # The same bound, from the same helper, for the same reason: `wait_for` would cancel
+        # the close and then wait for that cancellation, so a provider client that catches
+        # `CancelledError` during teardown holds the shutdown open regardless.
+        await bounded(result, CLOSE_DEADLINE_S)
 
 
 __all__ = [

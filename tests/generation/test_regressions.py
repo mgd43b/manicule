@@ -23,6 +23,7 @@ from manicule.core.anchors import HeadingAnchor
 from manicule.core.content import RawDocument
 from manicule.core.errors import ConfigError, ProviderTimeoutError
 from manicule.core.generation import FinishReason, Usage
+from manicule.core.protocols import generating
 from manicule.core.retrieval import RetrievalProfile
 from manicule.generation.answering import (
     Answerer,
@@ -813,3 +814,73 @@ async def test_a_passage_with_no_text_produces_no_citation_at_either_ceiling(bla
         await run.aclose()
 
         assert not verdict.survives, f"a blank passage survived under {type(source).__name__}"
+
+
+async def test_a_policy_dropped_passages_document_never_crosses_the_plugin_boundary() -> None:
+    """Policy removes the passage and left its document in the map forwarded to the generator.
+
+    The built-in ignores that map when it is handed a prompt, so nothing showed — but a plugin
+    does not, and receives the title, URI and metadata of a source an operator marked
+    ``local_only`` precisely so it would not leave. A leak of exactly what the policy exists to
+    stop, through the seam the policy sits above.
+    """
+    config = settings(
+        llm={"provider": "openai", "model": "gpt-4o-mini"},
+        providers={"openai": {"api_key": "k"}},
+        security={"data_policy": {"source_restrictions": {"local_only": ["secrets"]}}},
+    )
+    generator_ = ScriptedGenerator(script=["ok"])
+    answers = Answerer(
+        generator=generator_,
+        verifier=CitationVerifier(resolver(FakeParser())),
+        documents=FakeDocuments(
+            {
+                "doc-secret": document(
+                    document_id="doc-secret", source="secrets", title="Layoffs Q3"
+                ),
+                "doc-public": document(document_id="doc-public", source="public", title="Runbook"),
+            }
+        ),
+        settings=config,
+        policy=EgressPolicy.of(config),
+        redactor=Redactor(config.security.data_policy.auto_redact),
+    )
+
+    request = AnswerRequest(
+        query=query(),
+        context=context(
+            (
+                candidate(chunk_id="c1", document_id="doc-secret", text="restricted"),
+                candidate(chunk_id="c2", document_id="doc-public", text=ROLLBACK),
+            )
+        ),
+    )
+    result = AnswerResult()
+    async for _ in answers.answer(request, result):
+        pass
+
+    assert [drop.source for drop in result.envelope.policy_dropped] == ["secrets"]
+    for sent in generator_.seen_documents:
+        assert "doc-secret" not in sent
+        assert all("Layoffs" not in d.title for d in sent.values())
+
+
+# NOTE: the fix for the close deadline (`bounded`) is verified by a standalone reproduction
+# rather than by a test in this suite. The only fixture that discriminates it from `wait_for`
+# is a closer that keeps working *after* swallowing a cancellation — and such a task by
+# definition outlives the call, which pytest's loop management cannot host without hanging.
+# Standalone, `bounded` returns in 0.05s against a closer that ignores cancellation; `wait_for`
+# does not return at all. A hanging test is worse than an honest note.
+
+
+async def test_generating_forwards_only_the_extras_a_generator_declares() -> None:
+    """Forwarding unconditionally made the optional-extras mechanism a mandatory one: a
+    generator that did not accept a key raised ``TypeError`` before streaming began."""
+    plugin = ProtocolOnlyGenerator(script=["fine"])
+
+    async with generating(
+        plugin, query(), context(), extra={"history": (), "messages": (), "documents": {}}
+    ) as tokens:
+        text = "".join([token.text async for token in tokens])
+
+    assert text == "fine"

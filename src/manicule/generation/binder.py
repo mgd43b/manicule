@@ -208,6 +208,7 @@ class CitationBinder:
             heading_path=chunk.heading_path,
             anchor=chunk.anchor,
             chunk_id=chunk.id,
+            kind=chunk.kind,
             quote=chunk.text,
             verification=verdict.reached,
         )

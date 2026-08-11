@@ -299,7 +299,7 @@ class Answerer:
                 sent_query=request.query,
                 sent_context=context,
                 sent_history=offered,
-                sent_documents=documents,
+                sent_documents=_referenced(context, documents),
                 messages=tuple(
                     build_messages(
                         query_text=request.query.text,
@@ -333,12 +333,15 @@ class Answerer:
         uri_texts, cursor = redacted[cursor : cursor + len(uris)], cursor + len(uris)
         trail_texts = redacted[cursor:]
 
-        sent_documents = {
-            document_id: document.model_copy(update={"title": title, "uri": uri})
-            for (document_id, document), title, uri in zip(
-                documents.items(), title_texts, uri_texts, strict=True
-            )
-        }
+        sent_documents = _referenced(
+            context,
+            {
+                document_id: document.model_copy(update={"title": title, "uri": uri})
+                for (document_id, document), title, uri in zip(
+                    documents.items(), title_texts, uri_texts, strict=True
+                )
+            },
+        )
         trail = iter(trail_texts)
         sent_context = context.model_copy(
             update={
@@ -663,6 +666,22 @@ async def answering(
         yield stream
     finally:
         await aclose(stream, timeout=PERSIST_DEADLINE_S * 2)
+
+
+def _referenced(context: Context, documents: Mapping[str, Document]) -> dict[str, Document]:
+    """Only the documents the **surviving** passages point into.
+
+    Policy filtering removes a passage from the context and left its document in this map,
+    which then went to the generator through the ``documents`` extra. The built-in ignores it
+    when it is handed a prompt — so nothing showed — but a plugin does not, and receives the
+    title, URI and metadata of a source an operator marked ``local_only`` precisely so it
+    would not leave. A leak of exactly what the policy exists to stop, through the seam the
+    policy sits above.
+    """
+    live = {candidate.chunk.document_id for candidate in context.passages}
+    return {
+        document_id: document for document_id, document in documents.items() if document_id in live
+    }
 
 
 def _swallow(finished: asyncio.Future[str]) -> None:

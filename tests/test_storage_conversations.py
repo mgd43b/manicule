@@ -7,6 +7,7 @@ Both are corrections of the same shape of bug: a public read that is *almost* sc
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -14,12 +15,13 @@ from typing import TYPE_CHECKING
 import pytest
 import pytest_asyncio
 from sqlalchemy import text as sql
+from sqlalchemy import update
 
 from manicule.core.anchors import PageAnchor
 from manicule.core.generation import FinishReason
 from manicule.generation.answers import Citation, Verification
 from manicule.generation.ports import Feedback, FeedbackReason, SharedTurn, StoredMessage
-from manicule.generation.sharing import ShareLink, new_share
+from manicule.generation.sharing import ShareLink, hash_token, new_share
 from manicule.storage import models
 from manicule.storage.conversations import SqliteConversationStore, UnknownConversationError
 
@@ -27,6 +29,8 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+CEILING_S = 30 * 24 * 3600
+"""``security.sharing.link_ttl_s``, as a route would pass it."""
 
 
 def citation(slot: int = 1) -> Citation:
@@ -82,12 +86,12 @@ async def read(
 async def share(
     store: SqliteConversationStore, conversation_id: str, *, now: datetime | None = None
 ) -> ShareLink:
-    moment = now or datetime.now(UTC)
-    link = new_share(conversation_id, ttl_s=3600, now=moment)
-    # The snapshot boundary is when the share happened, which is *now* — the turns above were
-    # written a moment ago, and `moment` may be a fixed instant chosen for the expiry
-    # arithmetic. The store clamps a future boundary to now for the same reason.
-    await store.create_share(conversation_id, link.model_copy(shared_at=datetime.now(UTC)))
+    # Minted at real "now" so the snapshot boundary falls *after* the turns above. `NOW` is a
+    # fixed instant used for the expiry arithmetic in `read`, and using it here would put the
+    # boundary before the conversation — which the store would then correctly serve as empty.
+    del now
+    link = new_share(conversation_id, ttl_s=3600, maximum_ttl_s=CEILING_S)
+    await store.create_share(link, maximum_ttl_s=CEILING_S)
     return link
 
 
@@ -201,7 +205,9 @@ async def test_a_share_link_resolves_only_while_it_is_live(
     link = await share(conversations, conversation_id, now=NOW)
 
     assert await read(conversations, link.token_hash)
-    assert not await read(conversations, link.token_hash, now=NOW + timedelta(hours=2))
+    assert not await read(
+        conversations, link.token_hash, now=datetime.now(UTC) + timedelta(hours=2)
+    )
     assert not await read(conversations, "some-other-hash")
 
 
@@ -253,7 +259,9 @@ async def test_an_expired_link_stops_rendering(conversations: SqliteConversation
     conversation_id, _ = await a_conversation(conversations)
     link = await share(conversations, conversation_id, now=NOW)
 
-    assert await read(conversations, link.token_hash, now=NOW + timedelta(days=1)) == []
+    assert (
+        await read(conversations, link.token_hash, now=datetime.now(UTC) + timedelta(days=1)) == []
+    )
 
 
 async def test_switching_sharing_off_stops_existing_links_rendering(
@@ -344,3 +352,164 @@ async def test_the_migrated_database_has_moved_feedback_onto_messages(
     assert "share_token" not in columns["conversations"], "plaintext tokens are not stored"
     assert {"share_expires_at", "shared_at"} <= columns["conversations"]
     assert hasattr(models.Message, "feedback")
+
+
+# --- the consolidated fourth pass -----------------------------------------------------------
+
+
+def test_a_share_link_cannot_outlive_the_policy_ceiling() -> None:
+    """The ceiling was an optional keyword no production caller passed, so the clamp existed
+    and never ran. A link expiring in **2126** minted cleanly."""
+    link = new_share("c", ttl_s=365 * 100 * 86400, maximum_ttl_s=30 * 24 * 3600)
+
+    assert (link.expires_at - link.shared_at).days == 30
+
+    with pytest.raises(TypeError):
+        new_share("c", ttl_s=3600)  # pyright: ignore[reportCallIssue] - the ceiling is required
+
+
+async def test_the_store_refuses_a_link_built_past_the_ceiling(
+    conversations: SqliteConversationStore,
+) -> None:
+    """``ShareLink`` is an ordinary public value object, so the clamp in ``new_share`` is not
+    an enforcement point. The store is."""
+    conversation_id = await conversations.create_conversation()
+    forged = ShareLink(
+        conversation_id=conversation_id,
+        token="t",  # noqa: S106 - a fixture token, not a credential
+        token_hash=hash_token("t"),
+        shared_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(days=365 * 100),
+    )
+
+    with pytest.raises(ValueError, match="ceiling"):
+        await conversations.create_share(forged, maximum_ttl_s=30 * 24 * 3600)
+
+
+async def test_a_link_minted_for_one_conversation_cannot_be_installed_on_another(
+    conversations: SqliteConversationStore,
+) -> None:
+    """``create_share`` took an id *and* a link and used only the id, so a link minted for A
+    installed on B and served B's transcript to anyone holding A's token. There is now one id
+    and it comes from the link."""
+    signature = inspect.signature(conversations.create_share)
+
+    assert "conversation_id" not in signature.parameters, (
+        "two ids that must agree, with nothing making them"
+    )
+
+
+# --- F: the predicates the suite could not see ----------------------------------------------
+#
+# Six of the nine on the anonymous read were inert: removed one at a time, the suite stayed
+# green. Three were genuinely dead; two — including the module's headline `deleted_at IS NULL`
+# claim — passed only because `soft_delete_conversation` *also* clears the hash, so the test
+# that appeared to prove the predicate proved the side effect instead. A dead predicate is not
+# harmless: it is the one a later refactor deletes as redundant.
+#
+# Each test below drives the database into the state the predicate alone can refuse, which
+# means writing that state directly. That is the point — no public method produces it, which
+# is exactly why the suite could not reach it.
+
+
+async def _force(store: SqliteConversationStore, conversation_id: str, **values: object) -> None:
+    """Write a conversation row into a state no public method produces."""
+    async with store.sessions.begin() as session:
+        await session.execute(
+            update(models.Conversation)
+            .where(models.Conversation.id == conversation_id)
+            .values(**values)
+        )
+
+
+async def test_a_soft_deleted_conversation_is_refused_even_with_its_hash_intact(
+    conversations: SqliteConversationStore,
+) -> None:
+    """The module's headline claim, finally tested.
+
+    ``soft_delete_conversation`` clears the hash *and* sets ``deleted_at``, so the existing
+    test passed on either predicate alone. Setting only ``deleted_at`` is what isolates it —
+    and it is the state a restore, a repair, or a second writer produces.
+    """
+    conversation_id, _ = await a_conversation(conversations)
+    link = await share(conversations, conversation_id)
+    await _force(conversations, conversation_id, deleted_at=datetime.now(UTC))
+
+    assert await read(conversations, link.token_hash) == []
+
+
+async def test_a_conversation_marked_unshared_is_refused_even_with_its_hash_intact(
+    conversations: SqliteConversationStore,
+) -> None:
+    """Revocation clears both, so ``shared IS TRUE`` never had to hold on its own."""
+    conversation_id, _ = await a_conversation(conversations)
+    link = await share(conversations, conversation_id)
+    await _force(conversations, conversation_id, shared=False)
+
+    assert await read(conversations, link.token_hash) == []
+
+
+async def test_a_link_with_no_expiry_is_refused_rather_than_treated_as_eternal(
+    conversations: SqliteConversationStore,
+) -> None:
+    """Fails closed. A row with a hash and no expiry predates the feature or was written by
+    something that skipped it, and "no expiry" reading as "never expires" is how the
+    permanently-public link came about in the first place."""
+    conversation_id, _ = await a_conversation(conversations)
+    link = await share(conversations, conversation_id)
+    await _force(conversations, conversation_id, share_expires_at=None)
+
+    assert await read(conversations, link.token_hash) == []
+
+
+async def test_a_share_with_no_boundary_exposes_nothing(
+    conversations: SqliteConversationStore,
+) -> None:
+    """``shared_at IS NOT NULL`` guards the snapshot. Without a boundary there is no answer to
+    "which turns were shared", and the safe answer to that is none."""
+    conversation_id, _ = await a_conversation(conversations)
+    link = await share(conversations, conversation_id)
+    await _force(conversations, conversation_id, shared_at=None)
+
+    assert await read(conversations, link.token_hash) == []
+
+
+async def test_a_system_turn_is_never_served_anonymously(
+    conversations: SqliteConversationStore,
+) -> None:
+    """``role IN ('user', 'assistant')`` is load-bearing **today**.
+
+    Without it a ``system`` row is served — and served *relabelled* ``role='user'``, because
+    the projection coerces the role before ``SharedTurn``'s pattern can reject it. A system
+    prompt attributed to the person who asked the question is a worse disclosure than the row
+    itself.
+    """
+    conversation_id, _ = await a_conversation(conversations)
+    async with conversations.sessions.begin() as session:
+        session.add(
+            models.Message(
+                id="msg-system",
+                conversation_id=conversation_id,
+                role="system",
+                content="INTERNAL: never disclose pricing",
+            )
+        )
+    link = await share(conversations, conversation_id)
+
+    turns = await read(conversations, link.token_hash)
+
+    assert all("INTERNAL" not in turn.content for turn in turns)
+    assert {turn.role for turn in turns} <= {"user", "assistant"}
+
+
+async def test_an_empty_token_matches_nothing_rather_than_a_null_hash(
+    conversations: SqliteConversationStore,
+) -> None:
+    """``col == ""`` is a value comparison, but an *unset* token is ``NULL`` — and a
+    conversation that was never shared has exactly that. The early return is what stops an
+    empty token from being a key to every unshared conversation, if the comparison ever
+    changed shape."""
+    conversation_id, _ = await a_conversation(conversations)
+    await _force(conversations, conversation_id, shared=True, share_token_hash=None)
+
+    assert await read(conversations, "") == []

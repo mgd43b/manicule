@@ -14,6 +14,7 @@ in which "we found the row" and "the link is still valid" are two different answ
 from __future__ import annotations
 
 import secrets
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import TypeAdapter
@@ -81,6 +82,17 @@ class SqliteConversationStore:
     @property
     def workspace_id(self) -> str:
         return self._workspace_id
+
+    @property
+    def sessions(self) -> async_sessionmaker[AsyncSession]:
+        """This store's session factory.
+
+        Public for the suites that have to drive a row into a state no method here produces —
+        a hash without an expiry, a ``system`` turn — which is precisely the state the
+        predicates on the anonymous read exist to refuse and the only way to prove they are
+        not inert.
+        """
+        return self._sessions
 
     # --- conversations --------------------------------------------------------------
 
@@ -256,25 +268,41 @@ class SqliteConversationStore:
 
     # --- sharing --------------------------------------------------------------------
 
-    async def create_share(self, conversation_id: str, link: ShareLink) -> bool:
+    async def create_share(self, link: ShareLink, *, maximum_ttl_s: int) -> bool:
         """Record a minted link. Replaces any previous one for this conversation.
 
-        Takes the whole :class:`~manicule.generation.sharing.ShareLink` rather than its parts.
-        The parts version accepted any ``expires_at`` and any ``shared_at``, so a caller that
-        assembled them itself could mint a capability outliving
-        ``security.sharing.link_ttl_s``, or set a *future* ``shared_at`` and turn the snapshot
-        back into the live view §11.2 exists to prevent. A value object that only
-        :func:`~manicule.generation.sharing.new_share` produces cannot be built wrong.
+        **The conversation comes from the link**, and there is deliberately no second id
+        argument. With one, a link minted for conversation A could be installed on B and would
+        then serve B's transcript to anyone holding A's token — two ids that must agree, with
+        nothing making them.
+
+        **The ceiling is re-checked here**, because ``ShareLink`` is an ordinary public value
+        object: a caller can build one directly and never reach the clamp in
+        :func:`~manicule.generation.sharing.new_share`. This is the store, so this is the
+        choke point — a lifetime past the policy is refused rather than clamped, because
+        silently shortening what a caller asked for hides the misconfiguration.
+
+        ``shared_at`` is clamped rather than refused: a boundary in the future exposes turns
+        that have not been written yet, which is the live view §11.2 removes, and clamping it
+        to now is exactly what the caller meant.
 
         Replacing rather than accumulating is what makes re-sharing an explicit new act that
         produces a **new snapshot**: the old token stops working the moment a new one is
         minted, so there is never more than one live link per conversation to reason about.
         """
+        now = utcnow()
+        if link.expires_at > now + timedelta(seconds=maximum_ttl_s):
+            msg = (
+                f"the share link for {link.conversation_id!r} expires at {link.expires_at}, "
+                f"past the {maximum_ttl_s}s ceiling in security.sharing.link_ttl_s. Mint it "
+                f"with manicule.generation.sharing.new_share, which clamps to the ceiling."
+            )
+            raise ValueError(msg)
         async with self._sessions.begin() as session:
             result = await session.execute(
                 update(models.Conversation)
                 .where(
-                    models.Conversation.id == conversation_id,
+                    models.Conversation.id == link.conversation_id,
                     models.Conversation.workspace_id == self._workspace_id,
                     models.Conversation.deleted_at.is_(None),
                 )
@@ -284,7 +312,7 @@ class SqliteConversationStore:
                     share_expires_at=link.expires_at,
                     # Never later than now: a snapshot boundary in the future exposes turns
                     # that have not been written yet, which is the live view by another name.
-                    shared_at=min(link.shared_at, utcnow()),
+                    shared_at=min(link.shared_at, now),
                 )
             )
             return _touched(result)
@@ -351,9 +379,15 @@ class SqliteConversationStore:
                             models.Conversation.share_token_hash == token_hash,
                             models.Conversation.shared.is_(True),
                             models.Conversation.deleted_at.is_(None),
-                            models.Conversation.share_expires_at.is_not(None),
+                            # No `IS NOT NULL` beside either comparison. Both were here and
+                            # both were provably inert: SQL's three-valued logic makes
+                            # `NULL > now` and `created_at <= NULL` neither true nor false, so
+                            # the comparison already excludes an unset column. Kept, they
+                            # would be the redundant predicates a later reader deletes as
+                            # noise — and deleting the *comparison* instead is the mistake
+                            # that costs something. The behaviour they described is pinned by
+                            # tests either way.
                             models.Conversation.share_expires_at > now,
-                            models.Conversation.shared_at.is_not(None),
                             models.Message.created_at <= models.Conversation.shared_at,
                             models.Message.role.in_(("user", "assistant")),
                         )

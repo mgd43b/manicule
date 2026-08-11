@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from manicule.config.providers import Egress
 from manicule.core.anchors import Anchor
+from manicule.core.content import BlockKind
 from manicule.core.generation import FinishReason, Usage
 
 
@@ -135,6 +136,22 @@ class Citation(BaseModel):
     heading_path: tuple[str, ...] = ()
     anchor: Anchor
     chunk_id: str = Field(min_length=1)
+    kind: BlockKind = Field(
+        default=BlockKind.PROSE,
+        description="What the cited block is. Carried because *whether a breadcrumb may be "
+        "disclosed* depends on it: a spreadsheet chunk's heading path is its sheet name and a "
+        "code chunk's is its symbol chain, while a document's is the section title an "
+        "attestation is supposed to name. Inferring it from the anchor type gets both wrong — "
+        "Markdown emits a LineAnchor for prose.",
+    )
+    kind: BlockKind = Field(
+        default=BlockKind.PROSE,
+        description="What the cited block is. Carried because *whether a breadcrumb may be "
+        "disclosed* depends on it: a spreadsheet chunk's heading path is its sheet name and a "
+        "code chunk's is its symbol chain, while a document's is the section title an "
+        "attestation is supposed to name. Inferring it from the anchor type gets both wrong — "
+        "Markdown emits a LineAnchor for prose.",
+    )
     quote: str = Field(
         description="``Chunk.text``, whole and byte for byte. Never ``embed_text``, which "
         "carries the retrieval breadcrumb; never normalised, because showing a "
