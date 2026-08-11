@@ -29,6 +29,7 @@ two definitions and no failing test.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import shutil
@@ -361,6 +362,72 @@ def test_a_directory_that_is_not_a_bundle_says_so(tmp_path: Path) -> None:
     assert "tools/build_grammar_bundle.py" in str(raised.value)
 
 
+@pytest.mark.parametrize("content", ["not json at all", '["a", "list"]'])
+def test_a_manifest_that_is_not_a_bundle_manifest_says_which_file(
+    tmp_path: Path, content: str
+) -> None:
+    """A truncated copy and a file that was never a manifest both land here.
+
+    Both are one bad ``scp`` away, and both have to name the file — a ``JSONDecodeError``
+    reported from inside a parser sends whoever hits it looking through manicule instead of at
+    the directory they copied.
+    """
+    (tmp_path / grammar_bundle.MANIFEST_NAME).write_text(content)
+
+    with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
+        grammar_bundle.read(tmp_path)
+
+    assert grammar_bundle.MANIFEST_NAME in str(raised.value)
+
+
+def test_an_installed_distribution_without_a_payload_reads_as_no_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `manicule_grammars` importable but empty is "no bundle", not "a broken bundle".
+
+    It is the state a distribution is in before its platform-specific payload has been built
+    into it, and it must not fail an install that has network access and needs no bundle. The
+    loud failure belongs one step later, where the pre-seed cannot complete — and that failure
+    names the bundle search path, so nothing is hidden.
+
+    In-process, on a package the builder's own ``--package`` layout describes, so the branch
+    that the subprocess test exercises end-to-end is also checked where it can be seen.
+    """
+    monkeypatch.delenv(grammar_bundle.BUNDLE_DIR_ENV, raising=False)
+    site = tmp_path / "site"
+    module = site / grammar_bundle.BUNDLE_MODULE
+    module.mkdir(parents=True)
+    (module / "__init__.py").write_text("")
+    # `monkeypatch.syspath_prepend` is untyped in this pytest release; patching the list
+    # directly is the same operation and stays checked.
+    monkeypatch.setattr(sys, "path", [str(site), *sys.path])
+    monkeypatch.delitem(sys.modules, grammar_bundle.BUNDLE_MODULE, raising=False)
+    importlib.invalidate_caches()
+
+    assert grammar_bundle.locate() is None
+
+    (module / "bundle").mkdir()
+
+    assert grammar_bundle.locate() == module / "bundle"
+
+
+def test_the_search_path_report_names_the_place_that_was_actually_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three sources means three different fixes, so the message has to say which one applied.
+
+    "No bundle found" that does not distinguish "you named a path" from "you set a variable"
+    from "nothing is installed" leaves an operator checking all three.
+    """
+    monkeypatch.delenv(grammar_bundle.BUNDLE_DIR_ENV, raising=False)
+    assert str(tmp_path) in grammar_bundle.describe_search_path(tmp_path)
+
+    monkeypatch.setenv(grammar_bundle.BUNDLE_DIR_ENV, str(tmp_path / "from-environment"))
+    described = grammar_bundle.describe_search_path()
+    assert "from-environment" in described
+    assert grammar_bundle.BUNDLE_DIR_ENV in described
+
+
 # --- integrity ------------------------------------------------------------------------------
 
 
@@ -479,6 +546,76 @@ def test_a_manifest_whose_numbers_are_not_numbers_is_refused_as_a_bundle_problem
         grammar_bundle.read(edited)
 
     assert "malformed" in str(raised.value)
+
+
+def test_a_library_that_disappears_between_read_and_seed_is_refused(
+    bundle: grammar_bundle.GrammarBundle, empty_cache: Path, tmp_path: Path
+) -> None:
+    """Reading a bundle and copying from it are two moments, and a disk is not frozen between.
+
+    A bundle on a network mount, or one being rebuilt while another process seeds from it, can
+    pass the size check and then not be there. The copy must say which bundle and which
+    language rather than surfacing a bare ``FileNotFoundError`` from inside a copy loop.
+    """
+    read_back = grammar_bundle.read(_copied_bundle(bundle, tmp_path))
+    read_back.path_for("python").unlink()
+
+    with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
+        read_back.seed(["python"], empty_cache)
+
+    assert "python" in str(raised.value)
+    assert "cannot be read" in str(raised.value)
+
+
+def test_asking_a_bundle_for_a_language_it_does_not_carry_names_what_it_has(
+    bundle: grammar_bundle.GrammarBundle, empty_cache: Path
+) -> None:
+    """The wrong bundle and a broken one are different mistakes.
+
+    Seeding a language the bundle does not carry is not an error — the caller still has the
+    network for it — but *asking* for its file is, and the answer has to be the list, not a
+    ``KeyError`` from a dictionary the caller never saw.
+    """
+    assert bundle.seed(["go"], empty_cache) == ()
+    assert not list(empty_cache.iterdir())
+
+    with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
+        bundle.path_for("go")
+
+    assert "python" in str(raised.value)
+
+
+def test_a_manifest_listing_no_languages_is_not_an_empty_bundle(
+    bundle: grammar_bundle.GrammarBundle, tmp_path: Path
+) -> None:
+    """A bundle carrying nothing would seed nothing and report itself as present.
+
+    That is the worst of both: the pre-seed sees a bundle, copies nothing, and the network
+    failure that follows names a bundle as if it had been consulted usefully.
+    """
+    edited = _edited_manifest(bundle, tmp_path, languages={})
+
+    with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
+        grammar_bundle.read(edited)
+
+    assert "no languages" in str(raised.value)
+
+
+def test_a_manifest_with_no_licence_at_all_is_refused(
+    bundle: grammar_bundle.GrammarBundle, tmp_path: Path
+) -> None:
+    """Silence is not permission.
+
+    An empty licence is the state a hand-written manifest arrives in, and treating it as
+    "nothing to check" would make the licence assertion optional for exactly the bundles that
+    were not built by the tool that asserts it.
+    """
+    edited = _edited_manifest(bundle, tmp_path, licence="")
+
+    with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
+        grammar_bundle.read(edited)
+
+    assert "no grammar licence is declared" in str(raised.value)
 
 
 def test_a_grammar_that_cannot_be_loaded_refuses_instead_of_declining(tmp_path: Path) -> None:
