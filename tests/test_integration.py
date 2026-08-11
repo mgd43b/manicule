@@ -51,27 +51,36 @@ def _install_the_rest(registry: ComponentRegistry) -> None:
     other plugin uses. What is left is the components no plugin provides yet.
     """
     registry.add(keys.EMBEDDER.named(EMBEDDER_NAME), lambda _: HashEmbedder())
-    registry.add(keys.GENERATOR.named("ollama"), lambda _: object())
-    registry.add(keys.VECTOR_STORE.named("lancedb"), lambda _: object())
-    registry.add(keys.DOC_STORE.named("sqlite"), lambda _: object())
 
 
 def test_a_configuration_naming_nothing_installed_refuses_to_start() -> None:
     """The whole failure at once, before a single component is constructed.
 
-    The embedder is no longer among the missing, and that is the point of the second
-    assertion: ``embedding.provider`` defaults to ``mlx``, the built-in embedding plugin
-    registers it through the public entry point, and so a default installation validates it
-    rather than reporting it absent. If that assertion ever starts failing, the plugin has
-    stopped being discovered — which nothing else in the suite would notice, because every
-    other test registers its own embedder.
+    Every name here is deliberately absent from the environment, and every one of them is
+    reported in one message rather than one per attempt: fixing a misconfiguration only to be
+    told about the next is a poor way to spend an afternoon.
+
+    The **defaults** are not among them, and that is asserted separately in
+    ``tests/app/test_runtime.py``: a default installation names only components the built-in
+    plugins register, which is what makes ``uv tool install manicule`` a working install
+    rather than a starting point.
     """
     with pytest.raises(PolicyError) as caught:
-        build_container(Settings())
+        build_container(
+            Settings(
+                embedding={"provider": "nope-embedder"},  # pyright: ignore[reportArgumentType]
+                llm={"generator": "nope-generator"},  # pyright: ignore[reportArgumentType]
+                rag={"chunker": "nope-chunker"},  # pyright: ignore[reportArgumentType]
+            )
+        )
     message = str(caught.value)
-    assert "embedding.provider" not in message
-    assert "storage.db" in message
-    assert "llm.provider" in message
+    assert "embedding.provider" in message
+    assert "llm.generator" in message
+    assert "rag.chunker" in message
+    # The two the storage plugin provides are *not* missing, and if that changes the plugin
+    # has stopped being discovered — which nothing else here would notice.
+    assert "storage.db" not in message
+    assert "storage.vector_db" not in message
 
 
 async def test_the_example_plugin_works_through_the_container(

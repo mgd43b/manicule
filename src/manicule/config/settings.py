@@ -556,7 +556,23 @@ class LlmSettings(Section):
     indistinguishable from a slow answer.
     """
 
-    provider: str = Field(default="ollama", min_length=1)
+    provider: str = Field(
+        default="ollama",
+        min_length=1,
+        description="Which **vendor** serves the model: ``ollama``, ``openai``, "
+        "``anthropic``. This is what decides which credential is needed and whether the "
+        "endpoint leaves this machine — not which component is built. One dependency speaks "
+        "to all of them, and it is named by ``generator``.",
+    )
+    generator: str = Field(
+        default="litellm",
+        min_length=1,
+        description="Which registered generator **component** to build. Separate from "
+        "``provider`` because the two answer different questions and conflating them made "
+        "the default configuration unrunnable: one implementation reaches every vendor "
+        "through a base_url, so the component is not a function of the vendor. Change this "
+        "only to select a third-party generator.",
+    )
     model: str = Field(default="qwen2.5:14b", min_length=1)
     base_url: str | None = None
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)

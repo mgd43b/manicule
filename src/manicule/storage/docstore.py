@@ -365,6 +365,39 @@ class SqliteDocStore(
         async with self._sessions() as session:
             return (await session.execute(statement)).scalar_one()
 
+    async def document_statistics(self) -> dict[str, dict[str, int]]:
+        """Live document counts grouped by source, media type and status.
+
+        Three ``GROUP BY`` queries rather than a listing the caller counts itself. A page of
+        documents answers a different question, and summing one reports the page while looking
+        exactly like a total — the same class of quiet wrongness as a filter a store dropped.
+
+        Scoped like every other read here: the workspace is on the handle, and the trash is
+        excluded, so a soft-deleted document is not counted as one that is in the index.
+        """
+        columns = {
+            "by_source": models.Document.source,
+            "by_media_type": models.Document.media_type,
+            "by_status": models.Document.status,
+        }
+        grouped: dict[str, dict[str, int]] = {}
+        async with self._sessions() as session:
+            for label, column in columns.items():
+                statement = (
+                    select(column, func.count())
+                    .where(
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.deleted_at.is_(None),
+                    )
+                    .group_by(column)
+                )
+                rows = (await session.execute(statement)).all()
+                grouped[label] = {
+                    (value.value if isinstance(value, DocumentStatus) else str(value)): count
+                    for value, count in rows
+                }
+        return grouped
+
     async def select_documents(
         self,
         *,

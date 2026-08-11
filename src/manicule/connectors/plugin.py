@@ -15,7 +15,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from manicule.connectors.config import CONNECTOR_NAME, ConfluenceConfig, resolve_credentials
+from manicule.connectors.config import (
+    CONNECTOR_NAME,
+    FILESYSTEM_CONNECTOR_NAME,
+    ConfluenceConfig,
+    FilesystemConfig,
+    resolve_credentials,
+)
 from manicule.container import keys
 from manicule.core.errors import ConfigError
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
@@ -23,7 +29,7 @@ from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginMani
 if TYPE_CHECKING:
     from manicule.core.protocols import Connector
 
-__all__ = ["PLUGIN", "ConnectorsPlugin", "build_confluence"]
+__all__ = ["PLUGIN", "ConnectorsPlugin", "build_confluence", "build_filesystem"]
 
 
 def build_confluence(context: BuildContext) -> Connector:
@@ -56,6 +62,40 @@ def build_confluence(context: BuildContext) -> Connector:
     return ConfluenceConnector(resolved, ConfluenceClient(resolved))
 
 
+def build_filesystem(context: BuildContext) -> Connector:
+    """Construct the local-directory connector from validated configuration.
+
+    Raises:
+        ConfigError: The context carries configuration of some other type, or names no root.
+            A connector with no root would discover nothing and report a clean run, which is
+            the shape of a sync that looks like it worked.
+    """
+    from pathlib import Path  # noqa: PLC0415 - kept beside its only use
+
+    from manicule.connectors.filesystem import FilesystemConnector  # noqa: PLC0415
+
+    settings = context.config
+    if not isinstance(settings, FilesystemConfig):
+        msg = (
+            f"connector {FILESYSTEM_CONNECTOR_NAME!r} was built with "
+            f"{type(settings).__name__} where it declares FilesystemConfig."
+        )
+        raise ConfigError(msg)
+    if not settings.root:
+        msg = (
+            f"connector {FILESYSTEM_CONNECTOR_NAME!r} has no root. Set "
+            f'plugins.config."connector.filesystem".root to the directory to index, or use '
+            f"`manicule index <path>` for a one-off."
+        )
+        raise ConfigError(msg)
+    return FilesystemConnector(
+        Path(settings.root),
+        name=FILESYSTEM_CONNECTOR_NAME,
+        include_hidden=settings.include_hidden,
+        max_bytes=settings.max_bytes,
+    )
+
+
 class ConnectorsPlugin:
     """The plugin object the ``connectors`` entry point resolves to."""
 
@@ -63,7 +103,7 @@ class ConnectorsPlugin:
         name="connectors",
         version="0.1.0",
         core_version=">=0.1,<0.2",
-        summary="Sources manicule ingests from. Confluence for v1.",
+        summary="Sources manicule ingests from. A local directory, and Confluence for v1.",
     )
 
     def register(self, registry: ComponentRegistry) -> None:
@@ -72,6 +112,12 @@ class ConnectorsPlugin:
             build_confluence,
             config_model=ConfluenceConfig,
             summary="CQL watermark sync, cursor pagination, macro resolution, ID reconciliation.",
+        )
+        registry.add(
+            keys.CONNECTOR.named(FILESYSTEM_CONNECTOR_NAME),
+            build_filesystem,
+            config_model=FilesystemConfig,
+            summary="A local directory tree, walked in a stable order, reconciled by path.",
         )
 
 

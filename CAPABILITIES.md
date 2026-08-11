@@ -12,8 +12,8 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 
 | Area | Items | Ticket |
 |---|---:|---|
-| CLI | 48 | #8 |
-| MCP tools | 20 | #8 |
+| CLI | 48 | #8 — **built** |
+| MCP tools | 20 | #8 — **built** |
 | HTTP endpoints | 52 | #11 |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
@@ -21,81 +21,112 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 
 ## CLI — 48
 
-Ticket: #8
+Ticket: #8 — **built.** Nineteen commands: `ask` `search` `index` `document` `connector`
+`workspace` `auth` `plugin` `config` `backup` `export` `import` `reset-index` `doctor` `init`
+`start` `stop` `upgrade` `completion`. Several of the bare verbs below are subcommands of one
+of those, so the mapping is noted where it is not obvious. The output shape is a contract:
+[`docs/surfaces.md`](docs/surfaces.md).
 
-- [ ] `add <name>`
-- [ ] `add <type>`
-- [ ] `auth <name>`
-- [ ] `create <name>`
-- [ ] `create-key`
-- [ ] `delete <id>`
-- [ ] `delete <name>`
-- [ ] `dev`
-- [ ] `edit`
-- [ ] `get <id>`
-- [ ] `install`
-- [ ] `list-keys`
-- [ ] `list`
-- [ ] `login`
-- [ ] `publish`
-- [ ] `remove <name>`
-- [ ] `reset`
-- [ ] `restore <id>`
-- [ ] `revoke-key <nameOrId>`
-- [ ] `search <query>`
-- [ ] `show`
-- [ ] `status`
-- [ ] `switch <name>`
-- [ ] `sync [name]`
-- [ ] `test`
-- [ ] `trash`
-- [ ] `update [name]`
-- [ ] ask — option `--json`
-- [ ] ask — option `--profile <profile>`
-- [ ] ask — option `--stdin`
-- [ ] auth — option `--role <role>`
-- [ ] backup — option `--force`
-- [ ] backup — option `-o, --output <path>`
-- [ ] completion — option `--shell <shell>`
-- [ ] export-cmd — option `--output <path>`
-- [ ] import-cmd — option `--force`
-- [ ] index-cmd — option `--reindex`
-- [ ] index-cmd — option `--watch`
-- [ ] plugin — option `--type <type>`
-- [ ] reset-index — option `--yes`
-- [ ] search — option `--top <n>`
-- [ ] search — option `--type <type>`
-- [ ] start — option `--mcp-only`
-- [ ] start — option `--no-web`
-- [ ] start — option `-p, --port <port>`
-- [ ] upgrade — option `--skip-backup`
-- [ ] upgrade — option `--version <version>`
-- [ ] workspace — option `--mode <mode>`
+- [x] `add <name>` → `plugin add`
+- [ ] `add <type>` — adding a connector. Sources are declared in configuration, where the
+  whole set is reviewable in one place; `connector sync` runs one. A command that wrote a
+  source into the config file would be a second way to edit it
+- [x] `auth <name>` → the `auth` group
+- [ ] `create <name>` — collections. #10
+- [x] `create-key` → `auth create-key`
+- [x] `delete <id>` → `document delete`
+- [ ] `delete <name>` — collections. #10
+- [ ] ~~`dev`~~ — a development server. There is one way to start manicule and it is `start`
+- [ ] ~~`edit`~~ — opening the config file in `$EDITOR`. `config set` validates the whole tree
+  before writing, and an editor that saves an invalid file has already saved it
+- [x] `get <id>` → `document get`
+- [ ] ~~`install`~~ — installing a plugin. A plugin runs with this process's full authority,
+  so manicule reports the command that would install one and runs nothing. `docs/surfaces.md` §8
+- [x] `list-keys` → `auth list-keys`
+- [x] `list` → `document list`, `connector list`, `workspace list`, `plugin list`
+- [ ] `login` — OAuth. #13
+- [ ] ~~`publish`~~ — publishing a plugin. That is a package index's job
+- [x] `remove <name>` → `plugin remove`
+- [x] `reset` → `reset-index`
+- [ ] `restore <id>` — restoring a document from the trash. #10
+- [x] `revoke-key <nameOrId>` → `auth revoke-key`
+- [x] `search <query>`
+- [x] `show` → `config show`
+- [x] `status` → `index` with no path, and `doctor`
+- [x] `switch <name>` → `workspace switch`
+- [x] `sync [name]` → `connector sync`
+- [ ] `test` — dialling a connector without ingesting. #9
+- [ ] `trash` — listing the trash. #10
+- [ ] `update [name]` — editing a connector. See `add <type>`
+- [x] ask — option `--json` — a **global** option, so every command has it
+- [x] ask — option `--profile <profile>`
+- [ ] ~~ask — option `--stdin`~~ — no flag needed. An argument that was not given and a pipe
+  that is attached are unambiguous, so `echo "…" | manicule ask` just works
+- [x] auth — option `--role <role>`
+- [x] backup — option `--force`
+- [x] backup — option `-o, --output <path>`
+- [x] completion — option `--shell <shell>`
+- [x] export-cmd — option `--output <path>`
+- [x] import-cmd — option `--force`
+- [x] index-cmd — option `--reindex`
+- [x] index-cmd — option `--watch`
+- [ ] plugin — option `--type <type>` — filtering the registry by component kind. The registry
+  itself lands with the fetcher; filtering an empty list is not a feature
+- [x] reset-index — option `--yes`
+- [x] search — option `--top <n>`
+- [x] search — option `--type <type>`
+- [x] start — option `--mcp-only`
+- [x] start — option `--no-web`
+- [x] start — option `-p, --port <port>`
+- [x] upgrade — option `--skip-backup`
+- [x] upgrade — option `--version <version>`
+- [ ] workspace — option `--mode <mode>` — personal or team. #13 owns team mode
+
+### Added, because the commands above could not do their job without them
+
+- `--workspace/-w` — run one command in another workspace, without editing configuration.
+- `index --stats` — counts grouped by source, media type and status.
+- `index --source` — the source name documents are recorded under. It is part of their
+  identity, so it is a decision rather than a constant.
+- `document reindex` — re-parse from retained bytes, with no network and no re-crawl.
+- `plugin list --registry` — browse the community listing, when configuration allows it.
+- `start --transport` and `start --allow-public-bind` — the second is the only way to bind a
+  non-loopback address, and no configuration file can supply it.
+- `ask --repl` — the interactive prompt, which is also what `ask` with no question does at a
+  terminal.
 
 ## MCP tools — 20
 
-Ticket: #8
+Ticket: #8 — **built.** Nineteen tools over the same application service the command line
+calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
+server, so a prefix would be the server's name written twice.
 
-- [ ] `opendocuments_ask`
-- [ ] `opendocuments_config_get`
-- [ ] `opendocuments_config_set`
-- [ ] `opendocuments_connector_list`
-- [ ] `opendocuments_connector_sync`
-- [ ] `opendocuments_doctor`
-- [ ] `opendocuments_document_delete`
-- [ ] `opendocuments_document_get`
-- [ ] `opendocuments_document_list`
-- [ ] `opendocuments_document_reindex`
-- [ ] `opendocuments_index_path`
-- [ ] `opendocuments_index_status`
-- [ ] `opendocuments_plugin_add`
-- [ ] `opendocuments_plugin_list`
-- [ ] `opendocuments_plugin_remove`
-- [ ] `opendocuments_search`
-- [ ] `opendocuments_stats`
-- [ ] `opendocuments_workspace_list`
-- [ ] `opendocuments_workspace_switch`
-- [ ] `opendocuments`
+- [x] `ask`
+- [x] `config_get`
+- [x] `config_set`
+- [x] `connector_list`
+- [x] `connector_sync`
+- [x] `doctor`
+- [x] `document_delete`
+- [x] `document_get`
+- [x] `document_list`
+- [x] `document_reindex`
+- [x] `index_path`
+- [x] `index_status`
+- [x] `plugin_add`
+- [x] `plugin_list`
+- [x] `plugin_remove`
+- [x] `search`
+- [x] `stats`
+- [x] `workspace_list`
+- [x] `workspace_switch`
+- [ ] ~~a catch-all tool~~ — not built. A tool whose arguments decide which operation runs is
+  a tool no client can describe, and the description is how an assistant knows when to call it.
+
+**Deliberately not tools.** `reset-index`, `backup`, `restore`, `import`, `upgrade`, `start`,
+`stop` and the `auth` verbs are command-line only. Each destroys data, mints a credential or
+changes what the installation is, and a surface called unattended should not be able to do any
+of that.
 
 ## HTTP endpoints — 52
 
@@ -261,3 +292,7 @@ is a feature list entry, not a feature.
 - `plugins.config` — per-component settings, validated against each component's own model.
 - `embedding.cache_entries` — keyed by model identity, so a model change can never serve
   vectors made by the previous one.
+- `llm.generator` — which registered generator **component** to build, separate from
+  `llm.provider`, which names the **vendor**. The two answer different questions and
+  conflating them made the default configuration unrunnable: one implementation reaches every
+  vendor through a `base_url`, so the component is not a function of the vendor.

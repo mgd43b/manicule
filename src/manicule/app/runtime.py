@@ -1,0 +1,929 @@
+"""The composition root for a process: configuration and plugins into a running system.
+
+:class:`Runtime` is the production :class:`~manicule.app.ports.Backend`. It owns the container,
+the database engine and the lifecycle, and it builds each expensive part **the first time it is
+asked for and never before** — so ``manicule doctor`` loads no model runtime, ``manicule
+document list`` loads no provider library, and a completion script loads neither.
+
+It contains no policy. Everything a surface can decide is in
+:class:`~manicule.app.service.ApplicationService`; everything a plugin can decide is in the
+container. What is left here is wiring, and wiring that is only ever exercised one way is
+wiring nobody can test — which is why the service takes a protocol and this is one
+implementation of it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import secrets
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Self, cast, override
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from manicule.app.results import ApiKeySummary, Check, CheckState
+from manicule.config.loader import load_settings
+from manicule.container import keys
+from manicule.container.container import Container, build_container
+from manicule.core.content import RawDocument
+from manicule.core.errors import ManiculeError, PolicyError, UnknownEntityError
+from manicule.core.lifecycle import HealthState
+from manicule.plugins.manifest import ComponentKind
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Iterator, Sequence
+
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    from manicule.app.ports import (
+        Answering,
+        DocumentSurface,
+        Ingesting,
+        Keys,
+        Maintenance,
+        Retrieving,
+    )
+    from manicule.config.settings import Settings
+    from manicule.core.protocols import Connector, Parser, VectorStore
+    from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport
+    from manicule.ingest.ports import IngestStore
+    from manicule.ingest.reindex import ReindexReport
+    from manicule.plugins.registry import Discovery
+
+ARCHIVE_MANIFEST = "manicule-export.json"
+"""The file that makes an exported directory an archive rather than a pile of blobs."""
+
+ARCHIVE_VERSION = 1
+"""Bumped when the archive layout changes in a way an older import cannot read."""
+
+KEY_PREFIX = "mnk_"
+"""What every API key starts with.
+
+A recognisable prefix so a leaked key is greppable — by its owner, and by a secret scanner
+that has been taught the pattern. The prefix plus six characters is what is stored in the
+clear, which is enough to tell two keys apart and not enough to be one.
+"""
+
+
+class AssemblyError(ManiculeError):
+    """Something the runtime could not assemble."""
+
+
+class ArchiveEntry(BaseModel):
+    """One document in an exported archive: where it came from, and where its bytes are."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source: str = "import"
+    source_id: str = Field(min_length=1)
+    uri: str = Field(min_length=1)
+    title: str = ""
+    media_type: str = Field(min_length=1)
+    version_token: str | None = None
+    blob: str = Field(min_length=1, description="Path to the retained bytes, inside the archive.")
+
+
+class ArchiveManifest(BaseModel):
+    """What an export wrote, and what an import validates before reading a single byte.
+
+    **No chunks and no vectors, by construction.** There is nowhere in this model to put
+    them, so an archive cannot carry an index built by another chunker or another embedder
+    into a store whose fingerprints say something else.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: int
+    workspace: str = ""
+    documents: tuple[ArchiveEntry, ...] = ()
+
+
+@dataclass(slots=True)
+class _Lazy:
+    """One built-once component, with the lock that keeps it built once.
+
+    A plain ``if self._x is None`` is a race the moment two tool calls arrive together, and
+    the thing being built here is a model runtime — building it twice is not a wasted object,
+    it is a second copy of a multi-gigabyte model.
+    """
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    value: object | None = None
+
+
+class Runtime:
+    """A whole manicule, assembled from configuration and what plugins registered."""
+
+    def __init__(self, settings: Settings, *, discovery: Discovery | None = None) -> None:
+        self._settings = settings
+        self._container = build_container(settings, discovery=discovery)
+        self._slots: dict[str, _Lazy] = {}
+        self._engine: AsyncEngine | None = None
+        self._migrated = False
+
+    # --- lifecycle --------------------------------------------------------------------------
+
+    @classmethod
+    def open(cls, **overrides: Any) -> Runtime:  # noqa: ANN401 - mirrors Settings' own fields
+        """Load configuration, verify it against what is installed, and return the runtime.
+
+        Raises:
+            ConfigError: The configuration is malformed.
+            PolicyError: It is individually valid and jointly unrunnable, or it names a
+                component nothing installed provides. Everything wrong is listed at once.
+        """
+        return cls(load_settings(**overrides))
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        del exc_type, tb
+        await self.aclose(pending=exc)
+
+    async def aclose(self, *, pending: BaseException | None = None) -> None:
+        """Tear everything down, and dispose the engine last.
+
+        The engine is disposed after the container because a component's teardown may still
+        write — a cache flush, a final status — and an engine disposed first turns that into a
+        connection error during shutdown, which is reported as a teardown failure and is not
+        one.
+        """
+        try:
+            await self._container.aclose()
+        except Exception as during_teardown:
+            if pending is None:
+                raise
+            pending.add_note(f"shutting down also failed: {during_teardown}")
+        finally:
+            if self._engine is not None:
+                await self._engine.dispose()
+                self._engine = None
+
+    # --- what the service is given ----------------------------------------------------------
+
+    @property
+    def settings(self) -> Settings:
+        return self._settings
+
+    @property
+    def workspace(self) -> str:
+        return self._settings.workspace
+
+    @property
+    def discovery(self) -> Discovery | None:
+        return self._container.discovery
+
+    @property
+    def container_view(self) -> object:
+        """The container, for a caller that legitimately needs to resolve something else."""
+        return self._container
+
+    async def documents(self) -> DocumentSurface:
+        """The relational store, migrated before it is ever read."""
+        return await self._once("documents", self._build_documents)
+
+    async def vectors(self) -> VectorStore:
+        """The vector store, opened but not yet committed to a dimension.
+
+        Deliberately unprepared. Deleting from a store that has never held a vector is a
+        no-op, and preparing one would mean loading the embedding model to find out its
+        dimension — which is a multi-second, multi-gigabyte cost for a command that is only
+        removing rows.
+        """
+        return await self._once("vectors", self._build_vectors)
+
+    async def prepared_vectors(self) -> VectorStore:
+        """The vector store, committed to the configured embedder's space.
+
+        Both paths that touch vectors for real — ingest and retrieval — come through here, and
+        this is the only place ``ensure_ready`` is called. Without it the store never learns
+        which space it holds: the first upsert fails, the document is recorded ``failed`` at
+        the ``store`` stage, and nothing about the message says the index was never prepared.
+
+        It is also where a directory holding another model's vectors is refused, before a
+        single vector is written into a space it does not belong to.
+        """
+        return await self._once("prepared_vectors", self._build_prepared_vectors)
+
+    async def retriever(self) -> Retrieving:
+        """The whole of retrieval. Builds the embedder, so it is not built for a listing."""
+        return await self._once("retriever", self._build_retriever)
+
+    async def answerer(self) -> Answering:
+        """The answer path. Builds the generator, so it is not built for a search."""
+        return await self._once("answerer", self._build_answerer)
+
+    async def ingestion(self) -> Ingesting:
+        """The ingest operations. The pipeline itself is built on first use."""
+        return await self._once("ingestion", self._build_ingestion)
+
+    async def maintenance(self) -> Maintenance:
+        """Backup, restore, export and reset, over this runtime's engine."""
+        return await self._once("maintenance", self._build_maintenance)
+
+    async def keys(self) -> Keys:
+        """API keys for this workspace."""
+        return await self._once("keys", self._build_keys)
+
+    async def component_checks(self) -> Sequence[Check]:
+        """Health of what is already constructed. Constructs nothing.
+
+        ``doctor`` runs before anything is built in the common case, so this is usually empty
+        — and an empty list is the honest answer to "how are the components you have not made
+        yet", where a fabricated "ok" would be a diagnostic that reports health it never
+        measured.
+        """
+        report = await self._container.health()
+        return [
+            Check(
+                name=f"component:{check.name}",
+                state=_state_name(check.state),
+                detail=check.detail,
+            )
+            for check in sorted(report.checks, key=lambda check: check.name)
+        ]
+
+    # --- construction -----------------------------------------------------------------------
+
+    async def _once[T](self, slot: str, build: Callable[[], Awaitable[T]]) -> T:
+        """Build ``slot`` once, under a lock, and hand back the same object thereafter."""
+        lazy = self._slots.setdefault(slot, _Lazy())
+        if lazy.value is not None:
+            return cast("T", lazy.value)
+        async with lazy.lock:
+            if lazy.value is None:
+                lazy.value = await build()
+            return cast("T", lazy.value)  # pyright: ignore[reportUnnecessaryCast] - the slot is `object`
+
+    async def _build_documents(self) -> DocumentSurface:
+        # Imported here, not at module scope: Alembic is not a cheap import and a process
+        # that never opens the index should not pay for it.
+        from manicule.app.ports import DocumentSurface as Surface  # noqa: PLC0415
+        from manicule.storage.migrator import upgrade  # noqa: PLC0415
+
+        store = await self._container.aget(keys.DOC_STORE)
+        # Checked rather than cast. The container types this by `DocStore`, and the surface
+        # needs more of it than that protocol promises; a cast would turn a store missing a
+        # method into an AttributeError from inside a tool call.
+        if not isinstance(store, Surface):
+            msg = (
+                f"the configured document store {type(store).__name__} does not provide the "
+                f"reads the surfaces need (listing, counting, statistics, soft delete)."
+            )
+            raise AssemblyError(msg)
+        engine = getattr(store, "engine", None)
+        if engine is None:  # pragma: no cover - a store that is not the built-in one
+            msg = (
+                "the configured document store does not expose its engine, so migrations and "
+                "backups have nothing to run against"
+            )
+            raise AssemblyError(msg)
+        self._engine = engine
+        if not self._migrated:
+            # Before the first read, always. A query against an un-migrated database fails in
+            # whatever way SQLite happens to fail, at whichever statement happens to run first.
+            await upgrade(engine)
+            self._migrated = True
+        ensure = getattr(store, "ensure_workspace", None)
+        if ensure is not None:
+            await ensure()
+        return store
+
+    async def _build_vectors(self) -> VectorStore:
+        return await self._container.aget(keys.VECTOR_STORE)
+
+    async def _build_prepared_vectors(self) -> VectorStore:
+        store = await self.vectors()
+        embedder = await self._container.aget(keys.EMBEDDER)
+        await store.ensure_ready(embedder.fingerprint)
+        return store
+
+    async def _build_retriever(self) -> Retrieving:
+        from manicule.retrieval.retriever import build_retriever  # noqa: PLC0415 - heavy
+
+        await self.documents()
+        # Before the dense leg is ever asked a question. A store that has not been prepared
+        # raises rather than returning nothing, so an empty index would answer every search
+        # with an error about vector spaces.
+        await self.prepared_vectors()
+        return await build_retriever(self._container)
+
+    async def _build_answerer(self) -> Answering:
+        from manicule.generation.answering import Answerer  # noqa: PLC0415 - heavy
+        from manicule.generation.policy import EgressPolicy  # noqa: PLC0415
+        from manicule.generation.redaction import Redactor  # noqa: PLC0415
+        from manicule.generation.verification import (  # noqa: PLC0415
+            ChainRouter,
+            CitationVerifier,
+            RetainedBytesResolver,
+        )
+        from manicule.storage.conversations import SqliteConversationStore  # noqa: PLC0415
+
+        settings = self._settings
+        store = await self.documents()
+        generator = await self._container.aget(keys.GENERATOR)
+        resolver = RetainedBytesResolver(
+            blobs=await self.blobs(),
+            router=ChainRouter(chain=_ContainerChain(self._container)),
+        )
+        conversations = SqliteConversationStore(
+            self.require_engine(), workspace_id=settings.workspace
+        )
+        return Answerer(
+            generator=generator,
+            verifier=CitationVerifier(resolver, timeout_s=settings.llm.citation_verify_timeout_s),
+            documents=store,
+            settings=settings,
+            policy=EgressPolicy.of(settings, settings.workspace),
+            redactor=Redactor(settings.security.data_policy.auto_redact),
+            conversations=conversations,
+        )
+
+    async def _build_ingestion(self) -> Ingesting:
+        return _Ingestion(self)
+
+    async def _build_maintenance(self) -> Maintenance:
+        await self.documents()
+        return _Maintenance(self)
+
+    async def _build_keys(self) -> Keys:
+        await self.documents()
+        return _Keys(self)
+
+    async def blobs(self) -> BlobSink:
+        """Where retained source bytes live, or the sink that keeps none.
+
+        Public because two collaborators need the *same* one: re-parse reads bytes back
+        through it and export copies them out of it, and a second blob store over the same
+        directory would be a second opinion about what has been retained.
+        """
+        return await self._once("blobs", self._build_blobs)
+
+    async def _build_blobs(self) -> BlobSink:
+        from manicule.ingest.pipeline import NoRetention  # noqa: PLC0415
+        from manicule.storage.blobs import BlobStore  # noqa: PLC0415
+
+        await self.documents()
+        if not self._settings.storage.retain_source_bytes:
+            return NoRetention()
+        return BlobStore(self.require_engine(), self._settings.data_dir)
+
+    async def pipeline(self) -> IngestPipeline:
+        """The ingest pipeline, refused before construction if it cannot write to this index."""
+        return await self._once("pipeline", self._build_pipeline)
+
+    async def _build_pipeline(self) -> IngestPipeline:
+        from manicule.ingest.middleware import MiddlewareRunner  # noqa: PLC0415
+        from manicule.ingest.pipeline import IngestPipeline  # noqa: PLC0415
+        from manicule.ingest.refusals import check_before_run  # noqa: PLC0415
+        from manicule.ingest.workers import WorkerPool, worker_config  # noqa: PLC0415
+
+        settings = self._settings
+        store = await self.documents()
+        chunker = await self._container.aget(keys.CHUNKER)
+        embedder = await self._container.aget(keys.EMBEDDER)
+        vectors = await self.prepared_vectors()
+        middleware = MiddlewareRunner(await self._container.middleware())
+        fingerprint = chunker.fingerprint.with_middleware(middleware.declarations())
+        # Before a single document is fetched. An index built by a different chunker or a
+        # different embedder is refused here rather than discovered halfway through a run,
+        # by which point half the corpus disagrees with the other half.
+        await check_before_run(
+            embed=embedder.fingerprint,
+            chunk=fingerprint,
+            # The concrete store satisfies both surfaces; the container hands it back typed by
+            # the narrower one, and nothing at this seam can check the wider one statically.
+            # `_build_documents` asserts the reads the surfaces need at construction time.
+            store=cast("IngestStore", store),
+            vectors=vectors,
+        )
+        pool = WorkerPool(
+            worker_config(settings),
+            workers=settings.ingest.parse_workers,
+            timeout_s=settings.ingest.parse_timeout_s,
+            poll_interval_s=settings.ingest.memory_poll_interval_s,
+            max_documents=settings.ingest.max_documents_per_worker,
+        )
+        return IngestPipeline(
+            store=store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
+            chunker=chunker,
+            embedder=embedder,
+            vectors=vectors,
+            runner=pool,
+            resolve_chain=self._container.parser_chain_names,
+            middleware=middleware,
+            chunk_fingerprint=fingerprint,
+            workspace=settings.workspace,
+            blobs=await self.blobs(),
+            fetch_concurrency=settings.ingest.fetch_concurrency,
+            max_fetch_bytes=settings.ingest.max_fetch_bytes,
+            target_batch_tokens=settings.ingest.target_batch_tokens,
+            max_embed_batch=settings.ingest.max_embed_batch,
+        )
+
+    def require_engine(self) -> AsyncEngine:
+        """The engine the document store opened.
+
+        Public for the same reason :meth:`blobs` is: migrations, backups and the conversation
+        store all have to be on the *same* engine, and a second one over the same file is a
+        second connection pool with its own opinion about whether the schema is current.
+
+        Raises:
+            AssemblyError: The store has not been resolved yet, so no engine exists.
+        """
+        if self._engine is None:  # pragma: no cover - reached only by calling out of order
+            msg = "the database engine has not been opened; resolve the document store first"
+            raise AssemblyError(msg)
+        return self._engine
+
+    async def connector(self, name: str) -> Connector:
+        """A configured connector, by the instance name configuration gave it."""
+        return await self._container.connector(name)
+
+
+class _LazyParsers(Mapping[str, "Parser"]):
+    """Every registered parser, constructed only when one is actually asked for.
+
+    Citation verification needs *the* parser a document was parsed with, and nothing else. A
+    mapping built eagerly would load pdfium, tree-sitter, python-docx, python-pptx, selectolax,
+    nbformat and calamine to resolve one anchor into a Markdown file.
+    """
+
+    def __init__(self, container: Container) -> None:
+        self._container = container
+
+    @override
+    def __getitem__(self, name: str) -> Parser:
+        from manicule.core.errors import UnknownComponentError  # noqa: PLC0415
+
+        try:
+            return self._container.get(keys.PARSER.named(name))
+        except UnknownComponentError as exc:
+            raise KeyError(name) from exc
+
+    @override
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._container.registry.names(ComponentKind.PARSER))
+
+    @override
+    def __len__(self) -> int:
+        return len(self._container.registry.names(ComponentKind.PARSER))
+
+
+@dataclass(frozen=True, slots=True)
+class _ContainerChain:
+    """The configured parser chain, read off the container rather than rebuilt beside it.
+
+    Satisfies :class:`~manicule.generation.verification.ParserChainLike`. Building a second
+    :class:`~manicule.parsers.chain.ParserChain` here would be a second answer to "which
+    parser reads this media type", and a citation verified by the wrong reader is a citation
+    certified against text the document never had.
+    """
+
+    container: Container
+
+    @property
+    def parsers(self) -> Mapping[str, Parser]:
+        return _LazyParsers(self.container)
+
+    def resolve(self, media_type: str) -> tuple[str, ...]:
+        return tuple(self.container.parser_chain_names(media_type))
+
+
+class _Ingestion:
+    """The ingest operations a surface can start, over one runtime."""
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    async def index_path(
+        self, path: Path, *, name: str, limit: int | None = None, force: bool = False
+    ) -> RunReport:
+        """Walk a path and ingest what is under it.
+
+        The connector is constructed here rather than resolved from configuration, because the
+        path is the argument. It is the **same class** the ``filesystem`` component builds, so
+        a one-off index and a configured source cannot behave differently.
+        """
+        from manicule.connectors.filesystem import FilesystemConnector  # noqa: PLC0415
+
+        connector = FilesystemConnector(path, name=name)
+        pipeline = await self._runtime.pipeline()
+        if force:
+            return await self._forced(connector, pipeline, limit=limit)
+        return await pipeline.run(connector, limit=limit)
+
+    async def _forced(
+        self, connector: Connector, pipeline: IngestPipeline, *, limit: int | None
+    ) -> RunReport:
+        """Re-ingest every discovered document, skipping change detection.
+
+        Separate from :meth:`~manicule.ingest.pipeline.IngestPipeline.run` rather than a flag
+        on it, because forcing changes what a run *means*: the watermark must not advance from
+        a pass that ignored change detection, and no ``--force`` should be able to make the
+        next ordinary sync think it has already seen everything.
+        """
+        from manicule.ingest.pipeline import RunReport  # noqa: PLC0415
+
+        report = RunReport(connector=connector.name)
+        stream = connector.discover(None)
+        try:
+            async for discovered in stream:
+                raw = await connector.fetch(discovered.ref)
+                outcomes = await pipeline.ingest_raw(
+                    raw,
+                    source=connector.name,
+                    version_token=discovered.version_token,
+                    title=discovered.title,
+                    force=True,
+                )
+                for position, outcome in enumerate(outcomes):
+                    report.record(outcome, expanded=position > 0)
+                if limit is not None and report.discovered >= limit:
+                    break
+        except Exception as exc:  # noqa: BLE001 - an enumeration failure is not a crash
+            report.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            closer = getattr(stream, "aclose", None)
+            if closer is not None:
+                await closer()
+        return report
+
+    async def sync(self, connector: str, *, limit: int | None = None) -> RunReport:
+        pipeline = await self._runtime.pipeline()
+        return await pipeline.run(await self._runtime.connector(connector), limit=limit)
+
+    async def reindex(self, document_id: str) -> ReindexReport:
+        from manicule.ingest.reindex import reindex_document  # noqa: PLC0415
+
+        store = await self._runtime.documents()
+        return await reindex_document(
+            document_id,
+            store=store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
+            pipeline=await self._runtime.pipeline(),
+            blobs=await self._runtime.blobs(),
+        )
+
+    async def import_archive(self, path: Path, *, force: bool = False) -> RunReport:
+        """Ingest an exported archive through the ordinary pipeline.
+
+        Chunks and vectors are produced **here**, by this installation's chunker and embedder.
+        The archive carries source bytes and metadata and nothing derived, so an import can
+        never introduce an index built by something else.
+        """
+        from manicule.ingest.pipeline import RunReport  # noqa: PLC0415
+
+        manifest_path, manifest = await asyncio.to_thread(_open_archive, path)
+        root = manifest_path.parent
+        pipeline = await self._runtime.pipeline()
+        report = RunReport(connector="import")
+        for entry in manifest.documents:
+            blob = root / entry.blob
+            content = await asyncio.to_thread(_read_blob, blob)
+            if content is None:
+                report.error = f"archive entry {entry.source_id!r} has no bytes at {blob}"
+                continue
+            raw = RawDocument(
+                source_id=entry.source_id,
+                uri=entry.uri,
+                media_type=entry.media_type,
+                content=content,
+            )
+            outcomes = await pipeline.ingest_raw(
+                raw,
+                source=entry.source,
+                version_token=entry.version_token,
+                title=entry.title,
+                force=force,
+            )
+            for position, outcome in enumerate(outcomes):
+                report.record(outcome, expanded=position > 0)
+        return report
+
+
+class _Keys:
+    """API keys, over one runtime's engine and workspace.
+
+    The secret is generated here, hashed here, and returned exactly once. Only the digest
+    reaches the database, so a copy of the database — a backup, an export, a support bundle —
+    is not a copy of the credentials.
+    """
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    async def issue(
+        self, name: str, *, role: str, expires_days: int | None = None
+    ) -> tuple[ApiKeySummary, str]:
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        secret = f"{KEY_PREFIX}{secrets.token_urlsafe(32)}"
+        digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        created = utcnow()
+        expires = created + timedelta(days=expires_days) if expires_days else None
+        row = models.ApiKey(
+            id=secrets.token_hex(8),
+            name=name,
+            key_hash=digest,
+            key_prefix=secret[: len(KEY_PREFIX) + 6],
+            workspace_id=self._runtime.workspace,
+            user_id=self._runtime.workspace,
+            role=role,
+            scopes=[],
+            allowed_ips=[],
+            expires_at=expires,
+            created_at=created,
+        )
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            session.add(row)
+        return _key_summary(row), secret
+
+    async def list_keys(self) -> Sequence[ApiKeySummary]:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(models.ApiKey)
+                        .where(models.ApiKey.workspace_id == self._runtime.workspace)
+                        .order_by(models.ApiKey.created_at)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [_key_summary(row) for row in rows]
+
+    async def revoke(self, name_or_id: str) -> ApiKeySummary:
+        from sqlalchemy import or_, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            row = (
+                (
+                    await session.execute(
+                        select(models.ApiKey).where(
+                            # Scoped to this workspace, and not as a courtesy: a revoke that
+                            # could reach another tenant's key is a denial-of-service across
+                            # the boundary the whole design exists to hold.
+                            models.ApiKey.workspace_id == self._runtime.workspace,
+                            or_(models.ApiKey.id == name_or_id, models.ApiKey.name == name_or_id),
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if row is None:
+                msg = f"no API key named {name_or_id!r} in workspace {self._runtime.workspace!r}"
+                raise UnknownEntityError(msg)
+            row.revoked_at = utcnow()
+            return _key_summary(row)
+
+
+class _Maintenance:
+    """Whole-installation operations, over one runtime's engine and data directory."""
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    async def schema_revision(self) -> str | None:
+        from manicule.storage.migrator import current  # noqa: PLC0415
+
+        return await current(self._runtime.require_engine())
+
+    async def backup(self, target: Path) -> Mapping[str, object]:
+        from manicule.storage.backup import create_backup  # noqa: PLC0415
+
+        settings = self._runtime.settings
+        return await create_backup(
+            self._runtime.require_engine(),
+            settings.data_dir,
+            target,
+        )
+
+    async def restore(self, source: Path, *, force: bool = False) -> Mapping[str, object]:
+        from manicule.storage.backup import restore_backup  # noqa: PLC0415
+
+        settings = self._runtime.settings
+        # Disposed first, deliberately. Copying a database file out from under an open pool
+        # leaves connections pointing at an inode that no longer exists, and the next query
+        # reads the *old* file with no error raised.
+        await self._runtime.aclose()
+        return restore_backup(source, settings.data_dir, force=force)
+
+    async def reset_index(self) -> tuple[int, int, bool]:
+        """Delete every document, chunk and vector this workspace owns.
+
+        Vectors are removed **per document, here**, rather than left to the tombstone sweep.
+        A reset that returned with the vectors still present would leave a search answering
+        from an index the caller was told had been emptied — and the sweep runs on a cadence,
+        so "eventually" could be an hour.
+        """
+        from manicule.core.retrieval import Filter  # noqa: PLC0415
+
+        store = await self._runtime.documents()
+        documents = await store.count_documents()
+        chunks = await store.count_chunks()
+        vectors = await self._runtime.vectors()
+        removed = False
+        selector = Filter(workspace_ids=frozenset({self._runtime.workspace}))
+        while True:
+            page = await store.list_documents(selector, limit=200)
+            if not page:
+                break
+            for document in page:
+                try:
+                    await vectors.delete_document(document.id)
+                except ManiculeError:
+                    # An index that never received a vector has no table to delete from, and
+                    # that is not a failed reset. Recorded rather than raised, so the caller
+                    # is told what actually happened.
+                    removed = removed or False
+                else:
+                    removed = True
+                await store.delete_document(document.id)
+        return documents, chunks, removed
+
+    async def export_corpus(self, target: Path) -> tuple[int, int]:
+        """Write retained bytes and metadata, and nothing derived from them."""
+        from manicule.core.retrieval import Filter  # noqa: PLC0415
+
+        store = await self._runtime.documents()
+        blobs = await self._runtime.blobs()
+        await asyncio.to_thread(_prepare_archive_dir, target)
+        selector = Filter(workspace_ids=frozenset({self._runtime.workspace}))
+        entries: list[ArchiveEntry] = []
+        written = 0
+        offset = 0
+        while True:
+            page = await store.list_documents(selector, limit=200, offset=offset)
+            if not page:
+                break
+            offset += len(page)
+            for document in page:
+                if document.original_ref is None:
+                    continue
+                data = await blobs.get(document.original_ref)
+                if data is None:
+                    continue
+                blob_path = target / "blobs" / document.original_ref
+                await asyncio.to_thread(blob_path.write_bytes, data)
+                written += len(data)
+                entries.append(
+                    ArchiveEntry(
+                        source=document.source,
+                        source_id=document.source_id,
+                        uri=document.uri,
+                        title=document.title,
+                        media_type=document.media_type,
+                        version_token=document.version_token,
+                        blob=f"blobs/{document.original_ref}",
+                    )
+                )
+        manifest = ArchiveManifest(
+            version=ARCHIVE_VERSION,
+            workspace=self._runtime.workspace,
+            documents=tuple(entries),
+        )
+        await asyncio.to_thread(
+            (target / ARCHIVE_MANIFEST).write_text,
+            manifest.model_dump_json(indent=2),
+            "utf-8",
+        )
+        return len(entries), written
+
+    async def workspaces(self) -> Sequence[tuple[str, str, str]]:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        await self._runtime.documents()
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.Workspace.id, models.Workspace.name, models.Workspace.mode)
+                )
+            ).all()
+        return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
+
+
+def _key_summary(row: object) -> ApiKeySummary:
+    """One key's record, without anything that could be used as one."""
+    expires = getattr(row, "expires_at", None)
+    return ApiKeySummary(
+        id=str(getattr(row, "id", "")),
+        name=str(getattr(row, "name", "")),
+        prefix=str(getattr(row, "key_prefix", "")),
+        role=str(getattr(row, "role", "")),
+        workspace=str(getattr(row, "workspace_id", "")),
+        created_at=_isoformat(getattr(row, "created_at", None)),
+        expires_at=_isoformat(expires) or None,
+        revoked=getattr(row, "revoked_at", None) is not None,
+    )
+
+
+def _isoformat(value: object) -> str:
+    return value.isoformat() if isinstance(value, datetime) else ""
+
+
+def _prepare_archive_dir(target: Path) -> None:
+    """Create the archive directory and its blob shard. Blocking, so it runs off the loop."""
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "blobs").mkdir(exist_ok=True)
+
+
+def _read_blob(path: Path) -> bytes | None:
+    """One archived blob, or ``None`` when the archive does not contain it.
+
+    ``None`` rather than an exception: an archive missing one document's bytes is a partial
+    archive to report on, not a reason to abandon the other nine hundred.
+    """
+    if not path.is_file():
+        return None
+    return path.read_bytes()
+
+
+def _open_archive(path: Path) -> tuple[Path, ArchiveManifest]:
+    """Locate an archive's manifest — a directory, or the manifest itself — and read it."""
+    manifest_path = path / ARCHIVE_MANIFEST if path.is_dir() else path
+    return manifest_path, _read_archive(manifest_path)
+
+
+def _read_archive(manifest_path: Path) -> ArchiveManifest:
+    """Read an export manifest, refusing one this build cannot read.
+
+    A newer archive is refused by version rather than parsed optimistically. Importing a
+    layout this build does not understand would silently drop whatever it did not recognise,
+    and a partial corpus that reports a clean import is the failure worth preventing.
+
+    Raises:
+        PolicyError: The file is not a manifest, or declares a version this build does not
+            read.
+    """
+    if not manifest_path.is_file():
+        msg = f"{manifest_path} is not an export manifest"
+        raise PolicyError(msg)
+    try:
+        manifest = ArchiveManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    except ValidationError as exc:
+        msg = f"{manifest_path} is not an export manifest this build can read: {exc}"
+        raise PolicyError(msg) from exc
+    if manifest.version != ARCHIVE_VERSION:
+        msg = (
+            f"{manifest_path} declares archive version {manifest.version}, and this build "
+            f"reads version {ARCHIVE_VERSION}. Import it with the manicule that wrote it."
+        )
+        raise PolicyError(msg)
+    return manifest
+
+
+_STATE_NAMES: Mapping[HealthState, CheckState] = {
+    HealthState.OK: "ok",
+    HealthState.DEGRADED: "degraded",
+    HealthState.FAILING: "failing",
+}
+"""A component's health, in the vocabulary the surfaces report.
+
+Two names for three states rather than one shared enum, because the surfaces also report
+``unknown`` — a check that could not run — and no component ever says that about itself.
+"""
+
+
+def _state_name(state: HealthState) -> CheckState:
+    return _STATE_NAMES[state]
+
+
+__all__ = [
+    "ARCHIVE_MANIFEST",
+    "ARCHIVE_VERSION",
+    "ArchiveEntry",
+    "ArchiveManifest",
+    "AssemblyError",
+    "Runtime",
+]

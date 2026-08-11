@@ -29,13 +29,47 @@ from manicule.core.errors import ConfigError
 
 __all__ = [
     "CONNECTOR_NAME",
+    "FILESYSTEM_CONNECTOR_NAME",
     "ConfluenceConfig",
     "Deployment",
+    "FilesystemConfig",
     "resolve_credentials",
 ]
 
 CONNECTOR_NAME = "confluence"
 """The registered name of the connector, and what configuration selects it by."""
+
+FILESYSTEM_CONNECTOR_NAME = "filesystem"
+"""The registered name of the local-directory connector."""
+
+
+class FilesystemConfig(BaseModel):
+    """Configuration for :class:`~manicule.connectors.filesystem.FilesystemConnector`.
+
+    Set under ``plugins.config."connector.filesystem"`` for a configured source. ``manicule
+    index <path>`` builds one directly instead, because the path is the argument rather than a
+    setting — and it goes through the same class, so the two cannot behave differently.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    root: str = Field(
+        default="",
+        min_length=0,
+        description="Directory or file to index. Resolved to an absolute path, because a "
+        "document's identity includes its source id and a relative one would change with the "
+        "working directory.",
+    )
+    include_hidden: bool = Field(
+        default=False,
+        description="Whether to walk dot-files. Off, because the usual dot-file in a "
+        "repository is tool state rather than a document.",
+    )
+    max_bytes: int | None = Field(
+        default=None,
+        ge=1,
+        description="Refuse a file larger than this at discovery, before it is read.",
+    )
 
 
 class Deployment(StrEnum):

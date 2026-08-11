@@ -143,7 +143,7 @@ class Container:
         settings = self.settings
         chosen: Mapping[ComponentKind, str | None] = {
             ComponentKind.EMBEDDER: settings.embedding.provider,
-            ComponentKind.GENERATOR: settings.llm.provider,
+            ComponentKind.GENERATOR: settings.llm.generator,
             ComponentKind.VECTOR_STORE: settings.storage.vector_db,
             ComponentKind.DOC_STORE: settings.storage.db,
             ComponentKind.CHUNKER: settings.rag.chunker,
@@ -423,7 +423,7 @@ def check_wiring(settings: Settings, registry: ComponentRegistry) -> list[str]:
             )
 
     require(ComponentKind.EMBEDDER, settings.embedding.provider, "embedding.provider")
-    require(ComponentKind.GENERATOR, settings.llm.provider, "llm.provider")
+    require(ComponentKind.GENERATOR, settings.llm.generator, "llm.generator")
     require(ComponentKind.VECTOR_STORE, settings.storage.vector_db, "storage.vector_db")
     require(ComponentKind.DOC_STORE, settings.storage.db, "storage.db")
     require(ComponentKind.CHUNKER, settings.rag.chunker, "rag.chunker")

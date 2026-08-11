@@ -440,7 +440,9 @@ def test_a_complete_configuration_builds(settings: Settings) -> None:
     registry = ComponentRegistry().bind("test")
     registry.add(keys.EMBEDDER.named("mlx"), lambda _: HashEmbedder())
     registry.add(keys.CHUNKER.named("structural"), lambda _: BlockChunker())
-    registry.add(keys.GENERATOR.named("ollama"), lambda _: object())
+    # By the name `llm.generator` selects, which is the registered *component* rather
+    # than the vendor `llm.provider` names — one implementation reaches every vendor.
+    registry.add(keys.GENERATOR.named("litellm"), lambda _: object())
     registry.add(keys.VECTOR_STORE.named("lancedb"), lambda _: object())
     registry.add(keys.DOC_STORE.named("sqlite"), lambda _: object())
     for stage in settings.rag.pipeline:
