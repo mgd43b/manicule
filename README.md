@@ -6,7 +6,7 @@ answers with citations that resolve to a real location in a real document. Usabl
 command line, from a browser, and by AI assistants over MCP.
 
 > **Early, and runnable.** `uv tool install manicule` gives you a working index: point it at
-> a directory, search it, ask it questions. The HTTP API and the web UI are not built yet; see
+> a directory, search it, ask it questions. The web UI is not built yet; see
 > [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is being built in.
 
 ```bash
@@ -18,8 +18,10 @@ manicule doctor                   # what is wrong, and what to do about it
 ```
 
 Every command takes `--json`, and every one of them is also an MCP tool — so an assistant
-reaches the same operations through `manicule start --mcp-only`. The output shape is a
-contract, written down in [`docs/surfaces.md`](docs/surfaces.md).
+reaches the same operations through `manicule start --mcp-only`. `manicule start --transport
+http` serves the same operations over HTTP instead, with an OpenAPI document at `/api/docs`.
+All three emit the same envelope, and the shape is a contract written down in
+[`docs/surfaces.md`](docs/surfaces.md).
 
 ## The idea it is organised around
 
@@ -52,17 +54,23 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/app` | The application service. All the behaviour, once, for every surface |
 | `src/manicule/cli` | Nineteen commands over that service, and nothing else |
 | `src/manicule/mcp` | Nineteen MCP tools over that service, and nothing else |
+| `src/manicule/api` | Eleven HTTP route groups over that service, and nothing else |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |
 
-The two surfaces are adapters: they parse arguments, call one method, and render what comes
-back. A rule that lived in one of them would be a rule the other did not have — and the MCP
-tool is the one called unattended, so that is not a distinction worth risking. A test runs the
-same operation through both and compares the results.
+The three surfaces are adapters: they parse arguments, call one method, and render what comes
+back. A rule that lived in one of them would be a rule the others did not have — and two of the
+three are called unattended, so that is not a distinction worth risking. A test runs the same
+operation through all three and compares the results.
 
 **Nothing binds a network socket unless it is asked to.** The MCP server speaks stdio by
-default, which opens no socket at all; the HTTP transport binds loopback, and widening it
-takes an address somebody wrote down, an explicit flag no config file can supply, and
-authentication switched on. Any one missing is a refusal.
+default, which opens no socket at all; every HTTP bind goes through one policy that starts at
+loopback, and widening it takes an address somebody wrote down, an explicit flag no config file
+can supply, and authentication switched on. Any one missing is a refusal.
+
+**Nothing believes a forwarded address unless it was told to.** `X-Forwarded-For` is read only
+from a peer inside `security.transport.trusted_proxies`, which is empty by default — so on an
+ordinary install the header is not consulted at all, and every IP-based decision rests on a
+socket peer rather than on a value the caller chose.
 
 ## Extending it
 

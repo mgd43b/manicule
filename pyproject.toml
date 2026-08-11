@@ -118,7 +118,7 @@ connectors = [     # #9
   # the same code path a live instance would take rather than against a mocked-out client.
   "httpx>=0.28",
 ]
-serve = [          # #8 — the CLI and the MCP server. #11 adds FastAPI and uvicorn here.
+serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API.
   # Typer derives the command line from type hints, so the signature of a service call and
   # the shape of the command that reaches it cannot drift. MIT.
   "typer>=0.15",
@@ -127,6 +127,17 @@ serve = [          # #8 — the CLI and the MCP server. #11 adds FastAPI and uvi
   # FastMCP is decorators over functions: the tool surface is the service surface, with no
   # protocol plumbing of our own to keep in step with the specification. Apache-2.0.
   "fastmcp>=2.10",
+  # FastAPI derives the OpenAPI document from the same type hints the routes are written
+  # against, so the published schema cannot drift from the handler. Starlette underneath it
+  # brings the CORS middleware, the SSE-shaped streaming response and the websocket. MIT.
+  "fastapi>=0.115",
+  # The ASGI server. `standard` is deliberately not used: it pulls `httptools`, `uvloop` and
+  # `watchfiles`, and the bind address here is decided by `manicule.app.bind` rather than by
+  # anything uvicorn defaults to. BSD-3-Clause.
+  "uvicorn>=0.32",
+  # The websocket protocol implementation uvicorn dispatches to. Without it a `ws://` client
+  # is refused at the handshake by a server that otherwise looks healthy. BSD-3-Clause.
+  "websockets>=13.0",
 ]
 
 # The built-in parsers and the chunker register the same way a third-party plugin does, through
@@ -193,6 +204,13 @@ dev = [
   "manicule[storage]",
   # Directory watching, for `manicule index --watch`.
   "manicule[ingest]",
+  # What Starlette's test client is written against. It imports `httpx2` under TYPE_CHECKING
+  # and falls back to `httpx` at run time with a deprecation warning — and `filterwarnings =
+  # ["error"]` turns that warning into a collection failure, while the fallback leaves every
+  # `client.get(...)` typed as Unknown under pyright's strict mode. Both symptoms are the same
+  # missing package. Test-only: nothing manicule ships imports it, and `httpx` stays the
+  # client the connectors use.
+  "httpx2>=2.10",
 ]
 
 # One command. `manicule --help` is the whole surface; `manicule start --mcp-only` is the MCP

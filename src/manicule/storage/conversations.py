@@ -18,7 +18,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -26,7 +26,13 @@ from manicule.core.errors import ManiculeError
 from manicule.core.generation import FinishReason
 from manicule.generation.answers import Citation
 from manicule.generation.history import Turn
-from manicule.generation.ports import Feedback, FeedbackReason, SharedTurn, StoredMessage
+from manicule.generation.ports import (
+    ConversationRecord,
+    Feedback,
+    FeedbackReason,
+    SharedTurn,
+    StoredMessage,
+)
 from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.storage import models
 from manicule.storage.engine import session_factory
@@ -132,6 +138,81 @@ class SqliteConversationStore:
                 )
             )
         return conversation_id
+
+    async def list_conversations(
+        self, *, limit: int = 50, offset: int = 0
+    ) -> Sequence[ConversationRecord]:
+        """This workspace's live conversations, most recently touched first.
+
+        The turn count comes from a correlated subquery rather than from a second pass, so a
+        page of twenty conversations is one statement. Soft-deleted ones are absent for the
+        same reason every other read here excludes them: a delete that leaves the row visible
+        somewhere is a delete that did not happen.
+        """
+        counted = (
+            select(func.count(models.Message.id))
+            .where(models.Message.conversation_id == models.Conversation.id)
+            .correlate(models.Conversation)
+            .scalar_subquery()
+        )
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.Conversation, counted)
+                    .where(
+                        models.Conversation.workspace_id == self._workspace_id,
+                        models.Conversation.deleted_at.is_(None),
+                    )
+                    .order_by(models.Conversation.updated_at.desc(), models.Conversation.id)
+                    .limit(max(limit, 0))
+                    .offset(max(offset, 0))
+                )
+            ).all()
+        return [_to_record(row[0], int(row[1])) for row in rows]
+
+    async def get_conversation(self, conversation_id: str) -> ConversationRecord | None:
+        """One live conversation of this workspace, or ``None``.
+
+        ``None`` covers "not ours" as well as "not there", and deliberately does not say
+        which. Distinguishing them for a caller outside the workspace answers the question
+        "does this id exist somewhere else", which is itself a cross-tenant disclosure.
+        """
+        counted = (
+            select(func.count(models.Message.id))
+            .where(models.Message.conversation_id == models.Conversation.id)
+            .correlate(models.Conversation)
+            .scalar_subquery()
+        )
+        async with self._sessions() as session:
+            row = (
+                await session.execute(
+                    select(models.Conversation, counted).where(
+                        models.Conversation.id == conversation_id,
+                        models.Conversation.workspace_id == self._workspace_id,
+                        models.Conversation.deleted_at.is_(None),
+                    )
+                )
+            ).first()
+        return None if row is None else _to_record(row[0], int(row[1]))
+
+    async def rename_conversation(self, conversation_id: str, title: str) -> bool:
+        """Retitle a conversation. Returns whether a row actually matched.
+
+        The row count is the assertion, exactly as in :meth:`record_feedback`: an update
+        scoped to a workspace that touched nothing has to be reported as such, or renaming
+        somebody else's conversation reads as success.
+        """
+        async with self._sessions.begin() as session:
+            result = await session.execute(
+                update(models.Conversation)
+                .where(
+                    models.Conversation.id == conversation_id,
+                    models.Conversation.workspace_id == self._workspace_id,
+                    models.Conversation.deleted_at.is_(None),
+                )
+                .values(title=title, updated_at=utcnow())
+            )
+            return _touched(result)
 
     async def soft_delete_conversation(self, conversation_id: str) -> bool:
         """Soft-delete a conversation, which also revokes any share link.
@@ -409,6 +490,25 @@ def _touched(result: object) -> bool:
     without checking it is how feedback on a mistyped id is accepted and never seen again.
     """
     return isinstance(result, CursorResult) and cast("CursorResult[Any]", result).rowcount > 0
+
+
+def _to_record(row: models.Conversation, messages: int) -> ConversationRecord:
+    """One conversation as a listing reports it.
+
+    ``share_token_hash`` has no field to go into, which is the point: a listing that carried
+    the stored form of a bearer capability would put it into every log and cache in front of
+    the surface returning it.
+    """
+    return ConversationRecord(
+        id=row.id,
+        title=row.title,
+        shared=row.shared,
+        shared_at=row.shared_at,
+        share_expires_at=row.share_expires_at,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        messages=messages,
+    )
 
 
 def _to_shared_turn(row: models.Message) -> SharedTurn:

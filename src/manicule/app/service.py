@@ -52,9 +52,11 @@ from manicule.core.version import CORE_VERSION
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 
-    from manicule.app.ports import Backend
+    from manicule.app.ports import Backend, Conversing
     from manicule.core.content import Chunk, Document
-    from manicule.generation.answers import AnswerEnvelope, AnswerEvent
+    from manicule.core.organisation import Collection, Tag
+    from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
+    from manicule.generation.ports import ConversationRecord
     from manicule.ingest.pipeline import RunReport
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
@@ -84,6 +86,16 @@ class AskAside:
 
     message_id: str | None = None
     """Where the answer was persisted, when there was a conversation to persist it to."""
+
+    payload: r.AnswerResultPayload | None = None
+    """The settled result, built by :meth:`ApplicationService.ask_stream` when the run ends.
+
+    Here rather than assembled by each caller, because there are now two consumers of the
+    stream — :meth:`ApplicationService.ask` and the HTTP surface's SSE and websocket paths —
+    and a payload rebuilt at the surface is a second answer to "what did this run produce".
+    It is filled after ``message_id`` is known, so a streamed answer carries the id it was
+    persisted under exactly as the non-streaming form does.
+    """
 
 
 class ApplicationService:
@@ -135,9 +147,7 @@ class ApplicationService:
         payload is identical whether or not one is passed. That is the difference between a
         surface that renders progress and a surface that has its own answer path.
         """
-        envelope: AnswerEnvelope | None = None
         aside = AskAside()
-        started = time.monotonic()
         async for event in self.ask_stream(
             question,
             profile=profile,
@@ -148,12 +158,10 @@ class ApplicationService:
         ):
             if on_event is not None:
                 on_event(event)
-            if event.envelope is not None:
-                envelope = event.envelope
-        if envelope is None:  # pragma: no cover - the answer path always ends with `final`
+        if aside.payload is None:  # pragma: no cover - the answer path always ends with `final`
             msg = "the answer stream ended without a final event"
             raise ManiculeError(msg)
-        return self._answer_payload(question, envelope, aside, started, conversation_id)
+        return aside.payload
 
     async def ask_stream(
         self,
@@ -182,15 +190,18 @@ class ApplicationService:
             answering,
         )
 
+        started = time.monotonic()
         query = self._query(question, limit=limit or 8, profile=profile, sources=sources)
         retriever = await self._backend.retriever()
         retrieved = await retriever.retrieve(query)
         await self._require_scoped_context(retrieved)
+        # After the tenancy check and before the model. Recording first would put another
+        # tenant's chunk ids into this workspace's telemetry on the exact path the check
+        # exists to stop.
+        await self._record_query(query, retrieved, started=started)
 
         answerer = await self._backend.answerer()
         confidence = retrieved.confidence
-        if aside is not None and confidence is not None:
-            aside.confidence_band = confidence.band.value
         request = AnswerRequest(
             query=query,
             context=retrieved.context,
@@ -199,13 +210,26 @@ class ApplicationService:
             corpus_consulted=retrieved.cites_the_corpus,
         )
         result = AnswerResult()
+        record = aside if aside is not None else AskAside()
+        if confidence is not None:
+            record.confidence_band = confidence.band.value
+        envelope: AnswerEnvelope | None = None
         try:
             async with answering(answerer, request, result) as events:
                 async for event in events:
+                    if event.envelope is not None:
+                        envelope = event.envelope
                     yield event
         finally:
-            if aside is not None:
-                aside.message_id = result.message_id
+            # After the answering context has closed, so `message_id` is the id the turn was
+            # actually persisted under. Building the payload at the `final` event instead
+            # would report `message_id: null` on every streamed answer, which is precisely the
+            # field a client needs in order to send feedback about it.
+            record.message_id = result.message_id
+            if envelope is not None:
+                record.payload = self._answer_payload(
+                    question, envelope, record, started, conversation_id
+                )
 
     async def search(
         self,
@@ -225,6 +249,7 @@ class ApplicationService:
         retrieved = await retriever.retrieve(query)
         candidates = list(retrieved.candidates or retrieved.context.passages)[:limit]
         documents = await self._require_scoped_chunks(candidate.chunk for candidate in candidates)
+        await self._record_query(query, retrieved, started=started)
         hits = tuple(
             r.SearchHit(
                 document_id=candidate.chunk.document_id,
@@ -743,8 +768,16 @@ class ApplicationService:
 
     # --- plugins --------------------------------------------------------------------------
 
-    async def plugin_list(self, *, registry: bool = False) -> r.PluginList:
-        """What is installed, and — when configuration allows it — what is offered."""
+    async def plugin_list(
+        self, *, registry: bool = False, query: str | None = None
+    ) -> r.PluginList:
+        """What is installed, and — when configuration allows it — what is offered.
+
+        ``query`` filters the **offered** list by name or summary, case-insensitively. It is
+        here rather than in a surface because a filter written twice is a filter that answers
+        differently on two surfaces, and this one decides what an operator is shown before
+        they choose something to install.
+        """
         discovery = self._backend.discovery
         plugins: tuple[r.PluginSummary, ...] = ()
         disabled: tuple[str, ...] = ()
@@ -785,6 +818,13 @@ class ApplicationService:
             else:
                 installed = {plugin.name for plugin in plugins}
                 available, error = await _fetch_registry(settings.plugins.registry_url, installed)
+                if query:
+                    needle = query.casefold()
+                    available = tuple(
+                        entry
+                        for entry in available
+                        if needle in entry.name.casefold() or needle in entry.summary.casefold()
+                    )
         return r.PluginList(
             count=len(plugins),
             plugins=plugins,
@@ -886,6 +926,12 @@ class ApplicationService:
             raise ConfigError(msg) from exc
         keys = await self._backend.keys()
         summary, secret = await keys.issue(label, role=chosen.value, expires_days=expires_days)
+        # The record, never the secret. An audit trail that quoted the credential it was
+        # recording the creation of would be a copy of every key ever minted.
+        await self._audit(
+            "api_key.created",
+            details={"id": summary.id, "name": summary.name, "role": summary.role},
+        )
         return r.ApiKeyIssued(key=summary, secret=secret)
 
     async def api_key_list(self) -> r.ApiKeyList:
@@ -902,6 +948,7 @@ class ApplicationService:
         """
         keys = await self._backend.keys()
         summary = await keys.revoke(name_or_id)
+        await self._audit("api_key.revoked", details={"id": summary.id, "name": summary.name})
         return r.ApiKeyRevoked(id=summary.id, name=summary.name, revoked=True)
 
     # --- operations the command line owns -------------------------------------------------
@@ -1027,7 +1074,717 @@ class ApplicationService:
             ),
         )
 
+    # --- conversations --------------------------------------------------------------------
+
+    async def conversation_create(self, *, title: str | None = None) -> r.ConversationSummary:
+        """Start a conversation in this workspace."""
+        store = await self._backend.conversations()
+        identifier = await store.create_conversation(title=title)
+        record = await store.get_conversation(identifier)
+        if record is None:  # pragma: no cover - the row was just written
+            msg = f"conversation {identifier!r} vanished between creation and reading"
+            raise ManiculeError(msg)
+        return _conversation(record)
+
+    async def conversation_list(self, *, limit: int = 50, offset: int = 0) -> r.ConversationList:
+        """A page of this workspace's live conversations, most recently touched first."""
+        store = await self._backend.conversations()
+        found = await store.list_conversations(limit=limit, offset=offset)
+        return r.ConversationList(
+            count=len(found),
+            limit=limit,
+            offset=offset,
+            conversations=tuple(_conversation(record) for record in found),
+        )
+
+    async def conversation_messages(
+        self, conversation_id: str, *, limit: int = 50
+    ) -> r.ConversationMessages:
+        """A conversation's turns, oldest first, as its **owner** reads them.
+
+        Full citations, passage text included. The anonymous projection is a different method
+        over a different query, and the two never meet: this one is reached only through a
+        workspace-scoped handle.
+
+        Raises:
+            UnknownEntityError: No live conversation of that id in this workspace.
+        """
+        store = await self._backend.conversations()
+        await self._require_conversation(store, conversation_id)
+        turns = await store.history(conversation_id, limit=limit)
+        return r.ConversationMessages(
+            conversation_id=conversation_id,
+            count=len(turns),
+            turns=tuple(
+                r.ConversationTurn(
+                    role=turn.role,
+                    content=turn.content,
+                    citations=tuple(_citation(citation) for citation in turn.citations),
+                )
+                for turn in turns
+            ),
+        )
+
+    async def conversation_rename(self, conversation_id: str, title: str) -> r.ConversationRenamed:
+        """Retitle a conversation.
+
+        Raises:
+            ConfigError: The title is empty.
+            UnknownEntityError: No live conversation of that id in this workspace.
+        """
+        wanted = title.strip()
+        if not wanted:
+            msg = "a conversation title cannot be empty"
+            raise ConfigError(msg)
+        store = await self._backend.conversations()
+        if not await store.rename_conversation(conversation_id, wanted):
+            raise _no_conversation(conversation_id, self.workspace)
+        return r.ConversationRenamed(conversation_id=conversation_id, title=wanted)
+
+    async def conversation_delete(self, conversation_id: str) -> r.ConversationDeleted:
+        """Soft-delete a conversation, which also revokes any share link over it.
+
+        Raises:
+            UnknownEntityError: No live conversation of that id in this workspace.
+        """
+        store = await self._backend.conversations()
+        if not await store.soft_delete_conversation(conversation_id):
+            raise _no_conversation(conversation_id, self.workspace)
+        await self._audit(
+            "conversation.deleted",
+            details={"conversation_id": conversation_id},
+        )
+        return r.ConversationDeleted(conversation_id=conversation_id, deleted=True)
+
+    async def conversation_share(
+        self, conversation_id: str, *, ttl_s: int | None = None
+    ) -> r.ShareCreated:
+        """Mint a share link, and return the only copy of its token.
+
+        Every bound comes from :mod:`manicule.generation.sharing` and the store, not from
+        here: sharing must be switched on, the requested lifetime is clamped to
+        ``security.sharing.link_ttl_s``, and the store re-checks the ceiling because a
+        :class:`~manicule.generation.sharing.ShareLink` is an ordinary value object a caller
+        could have built by hand.
+
+        Minting **replaces** any previous link, so the old token stops working immediately and
+        the new one is a fresh snapshot.
+
+        Raises:
+            PolicyError: ``security.sharing.enabled`` is false.
+            ValueError: The requested lifetime is not positive.
+            UnknownEntityError: No live conversation of that id in this workspace.
+        """
+        from manicule.generation.sharing import (  # noqa: PLC0415 - only sharing needs it
+            new_share,
+            require_sharing_enabled,
+        )
+
+        sharing = self.settings.security.sharing
+        require_sharing_enabled(sharing.enabled)
+        link = new_share(
+            conversation_id,
+            ttl_s=ttl_s if ttl_s is not None else sharing.link_ttl_s,
+            # Always passed. It was optional once, no production caller supplied it, and the
+            # clamp therefore never ran — so a hundred-year link minted cleanly.
+            maximum_ttl_s=sharing.link_ttl_s,
+        )
+        store = await self._backend.conversations()
+        if not await store.create_share(link, maximum_ttl_s=sharing.link_ttl_s):
+            raise _no_conversation(conversation_id, self.workspace)
+        await self._audit(
+            "conversation.shared",
+            details={"conversation_id": conversation_id, "expires_at": link.expires_at.isoformat()},
+        )
+        return r.ShareCreated(
+            conversation_id=conversation_id,
+            token=link.token,
+            path=link.path,
+            expires_at=link.expires_at.isoformat(),
+            shared_at=link.shared_at.isoformat(),
+        )
+
+    async def conversation_unshare(self, conversation_id: str) -> r.ShareRevoked:
+        """Revoke a share link by clearing the stored hash.
+
+        Raises:
+            UnknownEntityError: No conversation of that id in this workspace.
+        """
+        store = await self._backend.conversations()
+        if not await store.revoke_share(conversation_id):
+            raise _no_conversation(conversation_id, self.workspace)
+        await self._audit("conversation.unshared", details={"conversation_id": conversation_id})
+        return r.ShareRevoked(conversation_id=conversation_id, revoked=True)
+
+    async def shared_conversation(self, token: str) -> r.SharedConversation:
+        """Read a shared conversation from its token, as an anonymous viewer.
+
+        **The only path to conversation data that does not require a workspace membership**,
+        and it is deliberately shaped so that holding the token is the whole of what it can
+        do. The token is hashed before it reaches storage, the store resolves it in one
+        statement with expiry, revocation, soft-delete and the snapshot boundary as predicates
+        of that same statement, and what comes back is already citation *labels*.
+
+        An unknown token, an expired one, a revoked one, a deleted conversation and sharing
+        being switched off all produce the same empty result. Distinguishing them for an
+        unauthenticated caller tells them which of their guesses was closest.
+        """
+        from datetime import UTC, datetime  # noqa: PLC0415 - only this method needs the clock
+
+        from manicule.generation.sharing import hash_token  # noqa: PLC0415
+
+        store = await self._backend.conversations()
+        turns = await store.shared_conversation(
+            hash_token(token) if token else "",
+            now=datetime.now(UTC),
+            # Read from configuration on the *read* path, not only at minting: an operator
+            # switching sharing off has decided the disclosure already made is the problem.
+            sharing_enabled=self.settings.security.sharing.enabled,
+        )
+        return r.SharedConversation(
+            count=len(turns),
+            turns=tuple(
+                r.SharedTurnPayload(
+                    role=turn.role,
+                    content=turn.content,
+                    citations=tuple(
+                        r.SharedCitationLabel(
+                            slot=label.slot,
+                            title=label.title,
+                            heading_path=label.heading_path,
+                            location=label.location,
+                            verification=label.verification.value,
+                        )
+                        for label in turn.citations
+                    ),
+                )
+                for turn in turns
+            ),
+        )
+
+    async def chat_feedback(
+        self, message_id: str, *, feedback: str, reason: str | None = None, comment: str = ""
+    ) -> r.FeedbackRecorded:
+        """Rate one answer.
+
+        Raises:
+            ConfigError: The rating or the reason is not one manicule has.
+            UnknownEntityError: No such message in this workspace.
+        """
+        from manicule.generation.ports import Feedback, FeedbackReason  # noqa: PLC0415
+
+        try:
+            rating = Feedback(feedback)
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in Feedback)
+            msg = f"no such feedback {feedback!r}. Available: {allowed}"
+            raise ConfigError(msg) from exc
+        chosen: FeedbackReason | None = None
+        if reason:
+            try:
+                chosen = FeedbackReason(reason)
+            except ValueError as exc:
+                allowed = ", ".join(item.value for item in FeedbackReason)
+                msg = f"no such feedback reason {reason!r}. Available: {allowed}"
+                raise ConfigError(msg) from exc
+        store = await self._backend.conversations()
+        if not await store.record_feedback(
+            message_id, feedback=rating, reason=chosen, comment=comment
+        ):
+            msg = (
+                f"no message {message_id!r} in workspace {self.workspace!r}. Feedback on an id "
+                f"that matched nothing is accepted and never seen again, so it is refused."
+            )
+            raise UnknownEntityError(msg)
+        return r.FeedbackRecorded(message_id=message_id, recorded=True, feedback=rating.value)
+
+    async def _require_conversation(self, store: Conversing, conversation_id: str) -> None:
+        if await store.get_conversation(conversation_id) is None:
+            raise _no_conversation(conversation_id, self.workspace)
+
+    # --- collections ----------------------------------------------------------------------
+
+    async def collection_create(
+        self, name: str, *, description: str | None = None
+    ) -> r.CollectionSummary:
+        """Create a collection. A duplicate name is refused rather than merged.
+
+        Raises:
+            ValueError: The name is empty once normalised.
+            NameInUseError: A collection of that name already exists here.
+        """
+        store = await self._backend.organisation()
+        return _collection(await store.create_collection(name, description=description))
+
+    async def collection_list(self) -> r.CollectionList:
+        """Every collection in this workspace."""
+        store = await self._backend.organisation()
+        found = await store.list_collections()
+        return r.CollectionList(
+            count=len(found), collections=tuple(_collection(item) for item in found)
+        )
+
+    async def collection_delete(self, collection_id: str) -> r.CollectionDeleted:
+        """Delete a collection. The documents in it are untouched.
+
+        Raises:
+            UnknownEntityError: No such collection in this workspace.
+        """
+        store = await self._backend.organisation()
+        await store.delete_collection(collection_id)
+        return r.CollectionDeleted(collection_id=collection_id, deleted=True)
+
+    async def collection_add(
+        self, collection_id: str, document_ids: Sequence[str]
+    ) -> r.CollectionMembership:
+        """Add documents to a collection.
+
+        Raises:
+            UnknownEntityError: No such collection, or a document this workspace cannot see.
+        """
+        store = await self._backend.organisation()
+        changed = await store.add_to_collection(collection_id, list(document_ids))
+        return r.CollectionMembership(
+            collection_id=collection_id, changed=changed, document_ids=tuple(document_ids)
+        )
+
+    async def collection_remove(
+        self, collection_id: str, document_ids: Sequence[str]
+    ) -> r.CollectionMembership:
+        """Remove documents from a collection.
+
+        Raises:
+            UnknownEntityError: No such collection in this workspace.
+        """
+        store = await self._backend.organisation()
+        changed = await store.remove_from_collection(collection_id, list(document_ids))
+        return r.CollectionMembership(
+            collection_id=collection_id, changed=changed, document_ids=tuple(document_ids)
+        )
+
+    async def collection_documents(
+        self, collection_id: str, *, limit: int = 50, offset: int = 0
+    ) -> r.DocumentList:
+        """A page of a collection's documents, checked on the way out like every other read.
+
+        Raises:
+            UnknownEntityError: No such collection in this workspace.
+            CrossWorkspaceError: A document came back whose id was not minted here.
+        """
+        store = await self._backend.organisation()
+        if await store.get_collection(collection_id) is None:
+            msg = f"no collection {collection_id!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        found = require_owned(
+            self.workspace,
+            await store.collection_documents(collection_id, limit=limit, offset=offset),
+        )
+        return r.DocumentList(
+            count=len(found),
+            limit=limit,
+            offset=offset,
+            documents=tuple(_summary(document) for document in found),
+        )
+
+    # --- tags -----------------------------------------------------------------------------
+
+    async def tag_create(self, name: str, *, color: str | None = None) -> r.TagSummary:
+        """Create a tag, or return the existing one of that name. Idempotent by design.
+
+        Raises:
+            ValueError: The name is empty once normalised.
+        """
+        store = await self._backend.organisation()
+        return _tag(await store.ensure_tag(name, color=color))
+
+    async def tag_list(self) -> r.TagList:
+        """Every tag in this workspace."""
+        store = await self._backend.organisation()
+        found = await store.list_tags()
+        return r.TagList(count=len(found), tags=tuple(_tag(item) for item in found))
+
+    async def tag_delete(self, tag_id: str) -> r.TagDeleted:
+        """Delete a tag. Documents keep their other tags.
+
+        Raises:
+            UnknownEntityError: No such tag in this workspace.
+        """
+        store = await self._backend.organisation()
+        await store.delete_tag(tag_id)
+        return r.TagDeleted(tag_id=tag_id, deleted=True)
+
+    async def document_tag(self, document_id: str, tag_ids: Sequence[str]) -> r.DocumentTags:
+        """Apply tags to a document.
+
+        Raises:
+            UnknownEntityError: No such document or tag in this workspace.
+        """
+        await self._require_document(document_id)
+        store = await self._backend.organisation()
+        changed = await store.tag_document(document_id, list(tag_ids))
+        return r.DocumentTags(
+            document_id=document_id,
+            changed=changed,
+            tags=tuple(_tag(item) for item in await store.tags_for(document_id)),
+        )
+
+    async def document_untag(self, document_id: str, tag_ids: Sequence[str]) -> r.DocumentTags:
+        """Remove tags from a document.
+
+        Raises:
+            UnknownEntityError: No such document in this workspace.
+        """
+        await self._require_document(document_id)
+        store = await self._backend.organisation()
+        changed = await store.untag_document(document_id, list(tag_ids))
+        return r.DocumentTags(
+            document_id=document_id,
+            changed=changed,
+            tags=tuple(_tag(item) for item in await store.tags_for(document_id)),
+        )
+
+    # --- the trash ------------------------------------------------------------------------
+
+    async def document_trash(self, *, limit: int = 50, offset: int = 0) -> r.TrashList:
+        """What is in the trash, longest-deleted first — the order the sweep will take them.
+
+        Raises:
+            CrossWorkspaceError: A document came back whose id was not minted here.
+        """
+        store = await self._backend.organisation()
+        entries = await store.list_trash(
+            grace_s=self.settings.ingest.soft_delete_grace_s, limit=limit, offset=offset
+        )
+        require_owned(self.workspace, [entry.document for entry in entries])
+        return r.TrashList(
+            count=len(entries),
+            limit=limit,
+            offset=offset,
+            documents=tuple(
+                r.TrashedDocument(
+                    document=_summary(entry.document),
+                    deleted_at=entry.deleted_at.isoformat(),
+                    purged=entry.purged,
+                    restorable_until=(
+                        entry.restorable_until.isoformat() if entry.restorable_until else None
+                    ),
+                    free_restore=entry.free_restore,
+                )
+                for entry in entries
+            ),
+        )
+
+    async def document_restore(self, document_id: str) -> r.DocumentRestored:
+        """Take a document out of the trash, and say what that achieved.
+
+        Raises:
+            UnknownEntityError: Nothing was restored. The reason is in the message: no such
+                document, or one that is not in the trash.
+        """
+        store = await self._backend.organisation()
+        restoration = await store.restore_document(document_id)
+        if not restoration.restored:
+            raise UnknownEntityError(restoration.reason)
+        return r.DocumentRestored(
+            document_id=restoration.document_id,
+            restored=True,
+            needs_reparse=restoration.needs_reparse,
+            reason=restoration.reason,
+        )
+
+    # --- the workbench --------------------------------------------------------------------
+
+    async def workbench(self, document_id: str) -> r.Workbench:
+        """One document as it was chunked, for seeing what retrieval actually indexes.
+
+        Read-only and one document at a time. A chunking problem and a retrieval problem look
+        identical from a ranked list, and this is the only view that tells them apart.
+
+        Raises:
+            UnknownEntityError: No live document with that id in this workspace.
+        """
+        detail = await self.document_get(document_id, chunks=True)
+        return r.Workbench(
+            document=detail.document,
+            count=len(detail.chunks),
+            tokens=sum(chunk.token_count for chunk in detail.chunks),
+            blocks=tuple(
+                r.WorkbenchBlock(
+                    id=chunk.id,
+                    position=chunk.position,
+                    kind=chunk.kind,
+                    heading_path=chunk.heading_path,
+                    token_count=chunk.token_count,
+                    text=chunk.text,
+                    anchor=chunk.anchor,
+                )
+                for chunk in detail.chunks
+            ),
+        )
+
+    # --- administration -------------------------------------------------------------------
+
+    async def query_logs(self, *, limit: int = 50, offset: int = 0) -> r.QueryLogPage:
+        """A page of retrieval telemetry, newest first.
+
+        Written by :meth:`search` and :meth:`ask_stream`, so the page describes every
+        retrieval this installation ran rather than the ones one surface happened to make.
+        """
+        telemetry = await self._backend.telemetry()
+        rows, total = await telemetry.query_logs(limit=limit, offset=offset)
+        return r.QueryLogPage(
+            total=total,
+            count=len(rows),
+            limit=limit,
+            offset=offset,
+            entries=tuple(
+                r.QueryLogEntry(
+                    id=_text(row.get("id")),
+                    query=_text(row.get("query")),
+                    profile=_text(row.get("profile")),
+                    chunks=_int(row.get("chunks")),
+                    confidence=_float_or_none(row.get("confidence")),
+                    elapsed_ms=_int_or_none(row.get("elapsed_ms")),
+                    created_at=_text(row.get("created_at")),
+                )
+                for row in rows
+            ),
+        )
+
+    async def audit_log(
+        self, *, limit: int = 50, offset: int = 0, event_type: str | None = None
+    ) -> r.AuditPage:
+        """A page of the audit trail, newest first.
+
+        ``enabled`` is reported alongside the entries because an empty audit log means two
+        different things — nothing happened, or nothing was recorded — and an operator reading
+        one needs to know which.
+        """
+        telemetry = await self._backend.telemetry()
+        rows, total = await telemetry.audit_logs(limit=limit, offset=offset, event_type=event_type)
+        return r.AuditPage(
+            enabled=self.settings.security.audit.enabled,
+            total=total,
+            count=len(rows),
+            limit=limit,
+            offset=offset,
+            entries=tuple(
+                r.AuditEntry(
+                    id=_text(row.get("id")),
+                    event_type=_text(row.get("event_type")),
+                    actor=_text_or_none(row.get("actor")),
+                    ip_address=_text_or_none(row.get("ip_address")),
+                    details=_json_object(row.get("details")),
+                    created_at=_text(row.get("created_at")),
+                )
+                for row in rows
+            ),
+        )
+
+    async def search_quality(self) -> r.SearchQuality:
+        """What the evaluation harness has recorded, rendered by the harness itself.
+
+        This reports; it does not measure. :mod:`manicule.evaluation` is the only thing in
+        this project that decides whether one retrieval configuration beats another, and a
+        second scoring path reachable over HTTP would be a number nobody could reconcile with
+        the one the harness produces.
+
+        A report built from an **example** query set is returned with ``is_evidence`` false
+        and the harness's own caveat attached. An example query set is an illustration of the
+        instrument, and presenting one as a measurement is the failure the harness exists to
+        prevent.
+        """
+        from manicule.evaluation.errors import EvaluationError  # noqa: PLC0415 - only here
+        from manicule.evaluation.preference import PreferenceStore  # noqa: PLC0415
+        from manicule.evaluation.report import ILLUSTRATIVE, build_report  # noqa: PLC0415
+
+        path = self.settings.data_dir / "evaluation" / "preferences.jsonl"
+        store = PreferenceStore(path)
+        records = await asyncio.to_thread(lambda: list(store.records()))
+        if not records:
+            return r.SearchQuality(
+                available=False,
+                path=str(path),
+                caveat=(
+                    f"no preference judgements have been recorded at {path}. Retrieval quality "
+                    f"is measured by running the pairwise harness against a query set; there "
+                    f"is no number to report until somebody has judged some pairs."
+                ),
+            )
+        try:
+            report = await asyncio.to_thread(build_report, records)
+        except EvaluationError as exc:
+            return r.SearchQuality(
+                available=True,
+                path=str(path),
+                records=len(records),
+                caveat=(
+                    f"{len(records)} judgement(s) were recorded and no report can be built "
+                    f"from them: {exc}"
+                ),
+            )
+        return r.SearchQuality(
+            available=True,
+            is_evidence=report.is_evidence,
+            caveat="" if report.is_evidence else ILLUSTRATIVE,
+            path=str(path),
+            left_label=report.left_label,
+            right_label=report.right_label,
+            query_set=report.query_set,
+            records=report.total,
+            judged=report.judged,
+            report=report.render(),
+        )
+
+    async def plugin_health(self) -> r.PluginHealthReport:
+        """Installed plugins, with the health of whatever each one has constructed.
+
+        A component that has not been built yet is ``unknown`` rather than ``ok``. The
+        distinction is the whole value of the report: a plugin nothing has asked for has not
+        been proved healthy, and saying it is would be a diagnostic that measured nothing.
+        """
+        discovery = self._backend.discovery
+        checks = {check.name: check for check in await self._backend.component_checks()}
+        listed = await self.plugin_list()
+        health: list[r.PluginHealth] = []
+        for plugin in listed.plugins:
+            states = [
+                checks[f"component:{component.kind}:{component.name}"]
+                for component in plugin.components
+                if f"component:{component.kind}:{component.name}" in checks
+            ]
+            worst: r.CheckState = "unknown" if not states else "ok"
+            details: list[str] = []
+            for check in states:
+                if _severity(check.state) > _severity(worst):
+                    worst = check.state
+                if check.detail:
+                    details.append(f"{check.name}: {check.detail}")
+            health.append(
+                r.PluginHealth(
+                    name=plugin.name,
+                    version=plugin.version,
+                    enabled=plugin.enabled,
+                    components=len(plugin.components),
+                    state=worst,
+                    detail=(
+                        "; ".join(details)
+                        or "nothing this plugin registered has been constructed yet"
+                    ),
+                )
+            )
+        return r.PluginHealthReport(
+            count=len(health),
+            plugins=tuple(health),
+            disabled=listed.disabled if discovery is not None else (),
+        )
+
+    # --- identity -------------------------------------------------------------------------
+
+    async def authenticate(self, secret: str) -> r.Identity:
+        """Turn a presented API key into an identity, or say plainly that it is not one.
+
+        The whole decision lives here rather than in the surface that received the header, so
+        the CLI, the MCP server and the HTTP API cannot disagree about what a valid key is.
+        A key is only ever usable in the workspace it was minted for: the store is scoped, and
+        a key from another tenant simply does not resolve.
+
+        When ``security.auth.mode`` is ``none`` this reports an unauthenticated identity
+        rather than inventing one — and it is the bind policy, not this method, that stops an
+        unauthenticated installation being reachable from anywhere but loopback.
+        """
+        mode = self.settings.security.auth.mode
+        if mode is AuthMode.NONE:
+            return r.Identity(
+                authenticated=False, mode=mode.value, role="", workspace=self.workspace
+            )
+        if not secret:
+            return r.Identity(
+                authenticated=False, mode=mode.value, role="", workspace=self.workspace
+            )
+        keys = await self._backend.keys()
+        summary = await keys.verify(secret)
+        if summary is None:
+            return r.Identity(
+                authenticated=False, mode=mode.value, role="", workspace=self.workspace
+            )
+        return r.Identity(
+            authenticated=True,
+            mode=mode.value,
+            role=summary.role,
+            key_id=summary.id,
+            key_name=summary.name,
+            workspace=summary.workspace,
+        )
+
+    async def auth_providers(self) -> r.AuthProviders:
+        """Which identity providers are configured, by name and type only.
+
+        Never a client secret and never a redirect that was not configured. When the mode is
+        not ``oauth`` the list is empty and ``detail`` says why, rather than advertising a
+        login route that would refuse every attempt.
+        """
+        auth = self.settings.security.auth
+        if auth.mode is not AuthMode.OAUTH:
+            return r.AuthProviders(
+                mode=auth.mode.value,
+                count=0,
+                detail=(
+                    f"security.auth.mode is {auth.mode.value!r}, so no interactive login is "
+                    f"offered. Authenticate with an API key, or configure OAuth."
+                ),
+            )
+        return r.AuthProviders(
+            mode=auth.mode.value,
+            count=len(auth.providers),
+            providers=tuple(provider.type for provider in auth.providers),
+        )
+
     # --- helpers --------------------------------------------------------------------------
+
+    async def _require_document(self, document_id: str) -> None:
+        """Prove a document is live and this tenant's before anything is attached to it."""
+        store = await self._backend.documents()
+        document = await store.get_document(document_id)
+        if document is None:
+            msg = f"no live document {document_id!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        require_owns(self.workspace, document)
+
+    async def _audit(self, event_type: str, *, details: Mapping[str, object]) -> None:
+        """Record one security-relevant event, when auditing is switched on.
+
+        Gated here rather than in the writer, so that "auditing is off" is a decision made
+        once against configuration instead of a condition every call site repeats — and the
+        admin surface reports the same switch alongside the entries, so an empty trail is
+        never mistaken for a quiet one.
+        """
+        audit = self.settings.security.audit
+        if not audit.enabled:
+            return
+        if audit.events and event_type not in audit.events:
+            return
+        telemetry = await self._backend.telemetry()
+        await telemetry.record_audit(event_type, details=details)
+
+    async def _record_query(
+        self, query: Query, retrieved: RetrievalResult, *, started: float
+    ) -> None:
+        """Write one retrieval into ``query_logs``.
+
+        In the service rather than in a surface, and unconditionally rather than behind a
+        switch: this is the row the admin surface pages through, and telemetry that only
+        records the traffic of whichever surface remembered to write it describes nothing.
+        """
+        telemetry = await self._backend.telemetry()
+        confidence = retrieved.confidence
+        await telemetry.record_query(
+            query.text,
+            profile=query.profile.value,
+            chunk_ids=[candidate.chunk.id for candidate in retrieved.context.passages],
+            confidence=confidence.score if confidence else None,
+            elapsed_ms=_millis(started),
+        )
 
     def _query(
         self,
@@ -1318,6 +2075,65 @@ def _connector_kind() -> Any:  # noqa: ANN401 - imported lazily to keep the modu
     return ComponentKind.CONNECTOR
 
 
+def _no_conversation(conversation_id: str, workspace: str) -> UnknownEntityError:
+    """The one refusal every conversation write shares.
+
+    One message rather than five, because they are all the same fact: an update scoped to this
+    workspace matched no row. It never says whether the id exists in another tenant, because
+    that answer is itself a cross-workspace disclosure.
+    """
+    return UnknownEntityError(
+        f"no live conversation {conversation_id!r} in workspace {workspace!r}"
+    )
+
+
+def _conversation(record: ConversationRecord) -> r.ConversationSummary:
+    return r.ConversationSummary(
+        id=record.id,
+        title=record.title,
+        shared=record.shared,
+        shared_at=record.shared_at.isoformat() if record.shared_at else None,
+        share_expires_at=(record.share_expires_at.isoformat() if record.share_expires_at else None),
+        created_at=record.created_at.isoformat(),
+        updated_at=record.updated_at.isoformat(),
+        messages=record.messages,
+    )
+
+
+def _citation(citation: Citation) -> r.AnswerCitation:
+    """One stored citation, in the shape every surface reports citations in."""
+    return r.AnswerCitation(
+        slot=citation.slot,
+        document_id=citation.document_id,
+        chunk_id=citation.chunk_id,
+        uri=citation.uri,
+        title=citation.title,
+        heading_path=citation.heading_path,
+        kind=citation.kind.value,
+        anchor=_json_object(citation.anchor.model_dump(mode="json")),
+        quote=citation.quote,
+        verification=citation.verification.value,
+    )
+
+
+def _collection(collection: Collection) -> r.CollectionSummary:
+    return r.CollectionSummary(
+        id=collection.id,
+        name=collection.name,
+        description=collection.description,
+        rule=(
+            _json_object(collection.rule.model_dump(mode="json"))
+            if collection.rule is not None
+            else None
+        ),
+        created_at=collection.created_at.isoformat(),
+    )
+
+
+def _tag(tag: Tag) -> r.TagSummary:
+    return r.TagSummary(id=tag.id, name=tag.name, color=tag.color)
+
+
 def _summary(document: Document, *, chunk_count: int | None = None) -> r.DocumentSummary:
     return r.DocumentSummary(
         id=document.id,
@@ -1488,6 +2304,14 @@ def _text_or_none(value: object) -> str | None:
 
 def _int(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _int_or_none(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _float_or_none(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def _json_object(value: object) -> dict[str, JsonValue]:

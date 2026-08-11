@@ -26,13 +26,24 @@ from manicule.generation.answering import SupportsAnswer as Answering
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping, Sequence
+    from datetime import datetime
     from pathlib import Path
 
     from manicule.app.results import ApiKeySummary, Check
     from manicule.config.settings import Settings
     from manicule.core.content import Chunk, Document, DocumentStatus
     from manicule.core.embedding import IndexFingerprints
+    from manicule.core.organisation import Collection as DocumentCollection
+    from manicule.core.organisation import CollectionRule, Restoration, Tag, TrashEntry
     from manicule.core.retrieval import Filter, Query
+    from manicule.generation.history import Turn
+    from manicule.generation.ports import (
+        ConversationRecord,
+        Feedback,
+        FeedbackReason,
+        SharedTurn,
+    )
+    from manicule.generation.sharing import ShareLink
     from manicule.ingest.pipeline import RunReport
     from manicule.ingest.reindex import ReindexReport
     from manicule.plugins.registry import Discovery
@@ -163,6 +174,149 @@ class Maintenance(Protocol):
 
 
 @runtime_checkable
+class Organising(Protocol):
+    """Collections, tags and the trash, for one workspace.
+
+    Separate from :class:`DocumentSurface` rather than folded into it, because the two are
+    satisfied by the same object and required by different callers: retrieval needs a store
+    that lists documents and has no business needing one that can rename a tag.
+    """
+
+    async def create_collection(
+        self, name: str, *, description: str | None = None, rule: CollectionRule | None = None
+    ) -> DocumentCollection: ...
+
+    async def list_collections(self) -> Sequence[DocumentCollection]: ...
+
+    async def get_collection(self, collection_id: str) -> DocumentCollection | None: ...
+
+    async def delete_collection(self, collection_id: str) -> None: ...
+
+    async def add_to_collection(self, collection_id: str, document_ids: Sequence[str]) -> int: ...
+
+    async def remove_from_collection(
+        self, collection_id: str, document_ids: Sequence[str]
+    ) -> int: ...
+
+    async def collection_documents(
+        self, collection_id: str, *, limit: int = 100, offset: int = 0
+    ) -> Sequence[Document]: ...
+
+    async def ensure_tag(self, name: str, *, color: str | None = None) -> Tag: ...
+
+    async def list_tags(self) -> Sequence[Tag]: ...
+
+    async def delete_tag(self, tag_id: str) -> None: ...
+
+    async def tag_document(self, document_id: str, tag_ids: Sequence[str]) -> int: ...
+
+    async def untag_document(self, document_id: str, tag_ids: Sequence[str]) -> int: ...
+
+    async def tags_for(self, document_id: str) -> Sequence[Tag]: ...
+
+    async def list_trash(
+        self, *, grace_s: float, limit: int = 100, offset: int = 0
+    ) -> Sequence[TrashEntry]: ...
+
+    async def restore_document(self, document_id: str) -> Restoration: ...
+
+
+@runtime_checkable
+class Conversing(Protocol):
+    """Conversations, their turns, and the share links over them.
+
+    Every method is scoped to the handle's workspace, and the sharing ones are deliberately
+    the concrete store's shapes rather than a convenience layer: ``create_share`` takes the
+    whole minted link and the ceiling, so nothing here can install a link on a conversation it
+    was not minted for or outlive ``security.sharing.link_ttl_s``.
+    """
+
+    async def create_conversation(
+        self, *, user_id: str | None = None, title: str | None = None
+    ) -> str: ...
+
+    async def list_conversations(
+        self, *, limit: int = 50, offset: int = 0
+    ) -> Sequence[ConversationRecord]: ...
+
+    async def get_conversation(self, conversation_id: str) -> ConversationRecord | None: ...
+
+    async def rename_conversation(self, conversation_id: str, title: str) -> bool: ...
+
+    async def soft_delete_conversation(self, conversation_id: str) -> bool: ...
+
+    async def history(self, conversation_id: str, *, limit: int = 20) -> Sequence[Turn]: ...
+
+    async def record_feedback(
+        self,
+        message_id: str,
+        *,
+        feedback: Feedback,
+        reason: FeedbackReason | None = None,
+        comment: str = "",
+    ) -> bool: ...
+
+    async def create_share(self, link: ShareLink, *, maximum_ttl_s: int) -> bool: ...
+
+    async def revoke_share(self, conversation_id: str) -> bool: ...
+
+    async def shared_conversation(
+        self, token_hash: str, *, now: datetime, sharing_enabled: bool
+    ) -> Sequence[SharedTurn]:
+        """The turns a live token names, already projected for an anonymous reader.
+
+        The projection happens in the implementation, not here and not in a surface. A
+        redaction a caller has to remember to apply is one a caller forgets.
+        """
+        ...
+
+
+@runtime_checkable
+class Telemetry(Protocol):
+    """Query logs and the audit trail, for one workspace.
+
+    Both are written by the service and read by the admin surface. Neither is written by a
+    surface: a record only one surface produces describes only that surface's traffic, and an
+    audit trail with holes in it is worse than none because the holes are invisible.
+    """
+
+    async def record_query(
+        self,
+        query: str,
+        *,
+        profile: str,
+        chunk_ids: Sequence[str],
+        confidence: float | None,
+        elapsed_ms: int,
+    ) -> str:
+        """Record one retrieval and return the row's id."""
+        ...
+
+    async def query_logs(
+        self, *, limit: int = 50, offset: int = 0
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        """A page of retrieval telemetry, newest first, and the total row count."""
+        ...
+
+    async def record_audit(
+        self,
+        event_type: str,
+        *,
+        details: Mapping[str, object],
+        actor: str | None = None,
+        ip_address: str | None = None,
+    ) -> None:
+        """Record one security-relevant event."""
+        ...
+
+    async def audit_logs(
+        self, *, limit: int = 50, offset: int = 0, event_type: str | None = None
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        """A page of the audit trail, newest first, and the total row count."""
+        ...
+
+
+@runtime_checkable
 class Keys(Protocol):
     """API keys for one workspace.
 
@@ -185,6 +339,18 @@ class Keys(Protocol):
 
     async def revoke(self, name_or_id: str) -> ApiKeySummary:
         """Revoke a key by name or id. Immediate."""
+        ...
+
+    async def verify(self, secret: str) -> ApiKeySummary | None:
+        """Which key this secret is, or ``None`` if it is not a usable one.
+
+        ``None`` covers unknown, revoked, expired and belonging-to-another-workspace, and
+        deliberately does not say which. Telling a caller that the key they presented is
+        merely *expired* confirms it was once real, which is a fact worth having if you are
+        collecting them.
+
+        The comparison is over a digest, so nothing here can be timed into a byte at a time.
+        """
         ...
 
 
@@ -218,6 +384,12 @@ class Backend(Protocol):
 
     async def maintenance(self) -> Maintenance: ...
 
+    async def organisation(self) -> Organising: ...
+
+    async def conversations(self) -> Conversing: ...
+
+    async def telemetry(self) -> Telemetry: ...
+
     async def keys(self) -> Keys: ...
 
     async def component_checks(self) -> Sequence[Check]:
@@ -228,9 +400,12 @@ class Backend(Protocol):
 __all__ = [
     "Answering",
     "Backend",
+    "Conversing",
     "DocumentSurface",
     "Ingesting",
     "Keys",
     "Maintenance",
+    "Organising",
     "Retrieving",
+    "Telemetry",
 ]

@@ -85,6 +85,27 @@ class StoredMessage(BaseModel):
     )
 
 
+class ConversationRecord(BaseModel):
+    """One conversation, without its turns.
+
+    Carries whether a share link is live and when it expires, and **never the token or its
+    hash**. An owner listing their conversations needs to know one is public; handing back the
+    credential that makes it public would put a bearer capability into every listing, every
+    log line that recorded one, and every cache in front of the API.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1)
+    title: str | None = None
+    shared: bool = False
+    shared_at: datetime | None = None
+    share_expires_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    messages: int = Field(default=0, ge=0)
+
+
 @runtime_checkable
 class ConversationStore(Protocol):
     """Reading history and writing turns. Sharing lives in :mod:`manicule.generation.sharing`."""
@@ -183,6 +204,7 @@ class ShareStore(Protocol):
 
 
 __all__ = [
+    "ConversationRecord",
     "ConversationStore",
     "Feedback",
     "FeedbackReason",

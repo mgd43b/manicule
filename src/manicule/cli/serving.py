@@ -36,12 +36,18 @@ def serve_forever(
     allow_public: bool,
     overrides: Mapping[str, Any],
     json_output: bool,
+    mcp_only: bool = False,
 ) -> int:
     """Run the server until it is stopped. Returns the process's exit status.
 
     The address is decided and announced **first**. A refusal — a non-loopback bind that was
     not asked for three separate times — happens here, before a socket exists, and is
     reported the same way every other failure is.
+
+    ``--transport http`` serves the **HTTP API**; ``--mcp-only`` serves the MCP protocol over
+    the same transport instead. ``stdio`` is MCP whatever else was asked for, because the HTTP
+    API has no stdio form — and it is the default, so the ordinary way of running manicule
+    still opens no socket at all.
     """
     if transport not in {"stdio", "http"}:
         out = render.console(stderr=True)
@@ -56,6 +62,7 @@ def serve_forever(
                 allow_public=allow_public,
                 overrides=overrides,
                 json_output=json_output,
+                mcp_only=mcp_only,
             )
         )
     except KeyboardInterrupt:  # pragma: no cover - a person pressing ^C
@@ -70,6 +77,7 @@ async def _serve(
     allow_public: bool,
     overrides: Mapping[str, Any],
     json_output: bool,
+    mcp_only: bool,
 ) -> int:
     try:
         runtime = Runtime.open(**overrides)
@@ -78,13 +86,18 @@ async def _serve(
         return 1
     async with runtime:
         service = ApplicationService(runtime)
+        api = transport == "http" and not mcp_only
         try:
-            address = address_for(
-                service,
-                transport=transport,
-                host=host,
-                port=port,
-                allow_public=allow_public,
+            address = (
+                _api_address(service, host=host, port=port, allow_public=allow_public)
+                if api
+                else address_for(
+                    service,
+                    transport=transport,
+                    host=host,
+                    port=port,
+                    allow_public=allow_public,
+                )
             )
         except ManiculeError as exc:
             _report(failed("start", service.workspace, error_info(exc)), json_output)
@@ -99,16 +112,39 @@ async def _serve(
             port=address.port,
         )
         try:
-            await serve(
-                service,
-                transport=transport,
-                host=host,
-                port=port,
-                allow_public=allow_public,
-            )
+            if api:
+                from manicule.api.serve import serve as serve_api  # noqa: PLC0415 - heavy
+
+                await serve_api(service, host=host, port=port, allow_public=allow_public)
+            else:
+                await serve(
+                    service,
+                    transport=transport,
+                    host=host,
+                    port=port,
+                    allow_public=allow_public,
+                )
         finally:
             pid.unlink(missing_ok=True)
     return 0
+
+
+def _api_address(
+    service: ApplicationService,
+    *,
+    host: str | None,
+    port: int | None,
+    allow_public: bool,
+) -> ServerAddress:
+    """Where the HTTP API will listen, decided before anything is built.
+
+    Imported inside the function so that starting an MCP server — the default — never loads
+    FastAPI or uvicorn. The same rule every other optional dependency in this project follows.
+    """
+    from manicule.api.serve import address_for as api_address_for  # noqa: PLC0415 - heavy
+
+    _, address = api_address_for(service, host=host, port=port, allow_public=allow_public)
+    return address
 
 
 def stop_running(overrides: Mapping[str, Any], *, workspace: str) -> Envelope:

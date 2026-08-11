@@ -14,7 +14,7 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 |---|---:|---|
 | CLI | 48 | #8 — **built** |
 | MCP tools | 20 | #8 — **built** |
-| HTTP endpoints | 52 | #11 |
+| HTTP endpoints | 52 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
 | **Total** | **178** | |
@@ -130,60 +130,74 @@ of that.
 
 ## HTTP endpoints — 52
 
-Ticket: #11
+Ticket: #11 — **built.** Eleven route groups over the same application service the CLI and the
+MCP server use: health · documents · chat · conversations · collections · tags · admin ·
+plugins · auth · workbench · websocket chat, plus an embeddable widget. Every response is the
+envelope `--json` prints; the reference is [`docs/surfaces.md`](docs/surfaces.md) §9.
 
-- [ ] `DELETE /api/v1/collections/:id/documents/:docId`
-- [ ] `DELETE /api/v1/collections/:id`
-- [ ] `DELETE /api/v1/conversations/:id`
-- [ ] `DELETE /api/v1/documents/:docId/tags/:tagId`
-- [ ] `DELETE /api/v1/documents/:id`
-- [ ] `DELETE /api/v1/plugins/:name`
-- [ ] `DELETE /api/v1/tags/:id`
-- [ ] `GET    /api/v1/admin/audit-logs`
-- [ ] `GET    /api/v1/admin/benchmark`
-- [ ] `GET    /api/v1/admin/connectors`
-- [ ] `GET    /api/v1/admin/plugins`
-- [ ] `GET    /api/v1/admin/query-logs`
-- [ ] `GET    /api/v1/admin/search-quality`
-- [ ] `GET    /api/v1/admin/stats`
-- [ ] `GET    /api/v1/collections/:id/documents`
-- [ ] `GET    /api/v1/collections`
-- [ ] `GET    /api/v1/conversations/:id/messages`
-- [ ] `GET    /api/v1/conversations`
-- [ ] `GET    /api/v1/documents/:id`
-- [ ] `GET    /api/v1/documents/trash`
-- [ ] `GET    /api/v1/documents`
-- [ ] `GET    /api/v1/health`
-- [ ] `GET    /api/v1/healthz`
-- [ ] `GET    /api/v1/plugins/search`
-- [ ] `GET    /api/v1/plugins`
-- [ ] `GET    /api/v1/readyz`
-- [ ] `GET    /api/v1/stats`
-- [ ] `GET    /api/v1/tags`
-- [ ] `GET    /api/v1/workbench`
-- [ ] `GET    /api/v1/workspaces`
-- [ ] `GET    /auth/callback/:provider`
-- [ ] `GET    /auth/login/:provider`
-- [ ] `GET    /auth/providers`
-- [ ] `PATCH  /api/v1/conversations/:id`
-- [ ] `POST   /api/v1/admin/connectors/:name/sync`
-- [ ] `POST   /api/v1/admin/connectors/:type`
-- [ ] `POST   /api/v1/admin/connectors/github/sync`
-- [ ] `POST   /api/v1/admin/connectors/github`
-- [ ] `POST   /api/v1/chat/feedback`
-- [ ] `POST   /api/v1/chat/stream`
-- [ ] `POST   /api/v1/chat`
-- [ ] `POST   /api/v1/collections/:id/documents/:docId`
-- [ ] `POST   /api/v1/collections`
-- [ ] `POST   /api/v1/conversations/:id/share`
-- [ ] `POST   /api/v1/conversations`
-- [ ] `POST   /api/v1/documents/:docId/tags/:tagId`
-- [ ] `POST   /api/v1/documents/:id/restore`
-- [ ] `POST   /api/v1/documents/upload`
-- [ ] `POST   /api/v1/plugins/install`
-- [ ] `POST   /api/v1/tags`
-- [ ] `POST   /auth/logout`
-- [ ] `POST   /auth/session`
+Struck-through entries are **deliberately absent**, each for a stated reason. This surface is
+the one an unattended caller reaches, so an operation that destroys data, opens an ingest path
+or executes code stays on the command line. `tests/api/test_routes.py` asserts each absence by
+name — an absence with no test is an absence that comes back.
+
+- [x] `DELETE /api/v1/collections/:id/documents/:docId`
+- [x] `DELETE /api/v1/collections/:id`
+- [x] `DELETE /api/v1/conversations/:id`
+- [x] `DELETE /api/v1/documents/:docId/tags/:tagId`
+- [x] `DELETE /api/v1/documents/:id`
+- [x] `DELETE /api/v1/plugins/:name`
+- [x] `DELETE /api/v1/tags/:id`
+- [x] `GET    /api/v1/admin/audit-logs`
+- [ ] ~~`GET    /api/v1/admin/benchmark`~~ — a benchmark run on request, from a surface an unattended caller reaches, is one HTTP call away from an unusable installation
+- [x] `GET    /api/v1/admin/connectors`
+- [x] `GET    /api/v1/admin/plugins`
+- [x] `GET    /api/v1/admin/query-logs`
+- [x] `GET    /api/v1/admin/search-quality`
+- [x] `GET    /api/v1/admin/stats`
+- [x] `GET    /api/v1/collections/:id/documents`
+- [x] `GET    /api/v1/collections`
+- [x] `GET    /api/v1/conversations/:id/messages`
+- [x] `GET    /api/v1/conversations`
+- [x] `GET    /api/v1/documents/:id`
+- [x] `GET    /api/v1/documents/trash`
+- [x] `GET    /api/v1/documents`
+- [x] `GET    /api/v1/health`
+- [x] `GET    /api/v1/healthz` — served at `/healthz`, outside the versioned prefix. A liveness
+  probe answers a process supervisor rather than a person, and it must not move when the API
+  version does
+- [x] `GET    /api/v1/plugins/search`
+- [x] `GET    /api/v1/plugins`
+- [x] `GET    /api/v1/readyz` — served at `/readyz`, for the same reason. It asks the store
+  whether the index is usable, which `/healthz` deliberately does not
+- [x] `GET    /api/v1/stats`
+- [x] `GET    /api/v1/tags`
+- [x] `GET    /api/v1/workbench`
+- [x] `GET    /api/v1/workspaces`
+- [ ] ~~`GET    /auth/callback/:provider`~~ — OAuth. #13
+- [ ] ~~`GET    /auth/login/:provider`~~ — OAuth. #13
+- [x] `GET    /auth/providers`
+- [x] `PATCH  /api/v1/conversations/:id`
+- [x] `POST   /api/v1/admin/connectors/:name/sync`
+- [ ] ~~`POST   /api/v1/admin/connectors/:type`~~ — a connector holds credentials and reaches a remote system. Sources are declared in configuration, where the whole set is reviewable in one place; `POST /admin/connectors/:name/sync` runs one that is already declared
+- [ ] ~~`POST   /api/v1/admin/connectors/github/sync`~~ — there is no per-connector route. `POST /admin/connectors/:name/sync` runs whichever connector configuration names
+- [ ] ~~`POST   /api/v1/admin/connectors/github`~~ — see `POST /api/v1/admin/connectors/:type`
+- [x] `POST   /api/v1/chat/feedback`
+- [x] `POST   /api/v1/chat/stream`
+- [x] `POST   /api/v1/chat`
+- [x] `POST   /api/v1/collections/:id/documents/:docId`
+- [x] `POST   /api/v1/collections`
+- [x] `POST   /api/v1/conversations/:id/share`
+- [x] `POST   /api/v1/conversations`
+- [x] `POST   /api/v1/documents/:docId/tags/:tagId`
+- [x] `POST   /api/v1/documents/:id/restore`
+- [ ] ~~`POST   /api/v1/documents/upload`~~ — accepting bytes over HTTP is an ingest path with no filesystem permission check and no path the operator chose. `manicule index <path>` is the ingest this build offers
+- [ ] ~~`POST   /api/v1/plugins/install`~~ — installing a plugin fetches and executes code with this process's full authority. `POST /api/v1/plugins/:name` enables one that is already installed
+- [x] `POST   /api/v1/tags`
+- [ ] ~~`POST   /auth/logout`~~ — there is no session cookie in this build — a key is presented on every request — so there is nothing to log out of. `GET /auth/session` reports who a request is
+- [x] `POST   /auth/session` — as `GET /auth/session`, which *reports* an identity rather than
+  creating one. There is no session cookie in this build: a key is presented on every request,
+  and a signed cookie would be a second credential type with its own expiry, revocation and
+  CSRF story
 
 ## File types — 18
 
