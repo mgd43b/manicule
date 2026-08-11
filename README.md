@@ -52,8 +52,9 @@ code, not to the tolerance.
 ## First run
 
 The shortest path from a clone to an answer about your own documents. `manicule init` writes a
-config file; the first `index` downloads the embedding model, which for the default
-`BAAI/bge-m3` is a few gigabytes and happens once.
+config file; the first `index` downloads the embedding model and then does not again. For the
+default `BAAI/bge-m3` that is about 1.1 GB on Apple silicon — the MLX conversion, in fp16 —
+and about 2.3 GB elsewhere, where the ONNX export is what runs.
 
 ```bash
 manicule init
