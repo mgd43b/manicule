@@ -162,15 +162,20 @@ The bare form binds `0.0.0.0` on the host, which means every interface the machi
 including the one facing the office network. A search index over a verbatim copy of the corpus
 is precisely the service that must not be reachable by anyone who can route a packet to it.
 
-manicule already refuses the software half of this. `manicule.app.bind.resolve_bind` requires
+manicule refuses the software half of this on its own. `manicule.app.bind.resolve_bind` wants
 three separate things before it will bind anywhere but loopback: a non-loopback host somebody
 wrote into configuration, `--allow-public-bind` on the command line where no config file can
 supply it, and `security.auth.mode` set to something other than `none`. Any one missing is a
 refusal, and `manicule doctor` reports a non-loopback bind as failing when authentication is
-off. **A container port mapping is outside all of that.** Docker will happily publish a
-loopback-bound service to the world, because the process inside the container binds
-`127.0.0.1` of the *container's* network namespace and the daemon forwards to it. The `-p`
-argument is yours to get right.
+off.
+
+**In a container the two decisions compose, and both are yours.** A loopback bind *inside* a
+container is reachable only from inside it — `-p` forwards to the container's routable
+address, not to its `127.0.0.1` — so publishing anything at all means the container-side bind
+was already widened, which means manicule's three refusals were already satisfied and
+authentication is already on. What `-p` then decides is which of the **host's** interfaces see
+it, and `-p PORT:PORT` decides all of them. The guard inside the container cannot make that
+choice for you and does not try to.
 
 ---
 
