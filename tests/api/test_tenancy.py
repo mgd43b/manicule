@@ -88,7 +88,7 @@ def test_reading_another_tenants_document_by_id_is_a_refusal() -> None:
     with client_for(backend) as client:
         response = client.get(f"/api/v1/documents/{theirs.id}")
     body = envelope(response)
-    assert body["ok"] is False
+    assert body["ok"] is False, "another tenant's document was returned"
     assert body["error"]["type"] == "CrossWorkspaceError"
 
 
@@ -100,7 +100,9 @@ def test_deleting_another_tenants_document_is_refused_before_anything_is_written
     _leaky(backend)
     with client_for(backend) as client:
         response = client.delete(f"/api/v1/documents/{theirs.id}")
-    assert envelope(response)["error"]["type"] == "CrossWorkspaceError"
+    body = envelope(response)
+    assert body["ok"] is False, "a foreign document was deleted rather than refused"
+    assert body["error"]["type"] == "CrossWorkspaceError"
     assert backend.store.deleted == [], "a foreign document was deleted before the refusal"
 
 
@@ -139,7 +141,11 @@ def test_the_trash_refuses_a_foreign_document() -> None:
     _leaky(backend)
     with client_for(backend) as client:
         response = client.get("/api/v1/documents/trash")
-    assert envelope(response)["error"]["type"] == "CrossWorkspaceError"
+    body = envelope(response)
+    # `ok` first, so a surface that stopped refusing fails on the claim rather than on a
+    # `TypeError` from subscripting a null error.
+    assert body["ok"] is False, "the trash returned a foreign document"
+    assert body["error"]["type"] == "CrossWorkspaceError"
     assert "Their private notes" not in response.text
 
 
@@ -161,7 +167,9 @@ def test_the_workbench_refuses_a_foreign_document() -> None:
     _leaky(backend)
     with client_for(backend) as client:
         response = client.get("/api/v1/workbench", params={"document_id": theirs.id})
-    assert envelope(response)["error"]["type"] == "CrossWorkspaceError"
+    body = envelope(response)
+    assert body["ok"] is False, "the workbench rendered another tenant's passages"
+    assert body["error"]["type"] == "CrossWorkspaceError"
     assert "their private passage" not in response.text
 
 
@@ -180,7 +188,9 @@ def test_a_search_refuses_when_retrieval_returns_another_tenants_chunk() -> None
     backend.retriever_.candidates = [Candidate(chunk=chunk, score=0.9)]
     with client_for(backend) as client:
         response = client.get("/api/v1/search", params={"q": "retry"})
-    assert envelope(response)["error"]["type"] == "CrossWorkspaceError"
+    body = envelope(response)
+    assert body["ok"] is False, "a ranking over another tenant's chunk was returned"
+    assert body["error"]["type"] == "CrossWorkspaceError"
     assert "their private passage" not in response.text
 
 
@@ -200,7 +210,9 @@ def test_asking_a_question_refuses_before_the_model_is_called() -> None:
     ]
     with client_for(backend) as client:
         response = client.post("/api/v1/chat", json={"question": "what is it"})
-    assert envelope(response)["error"]["type"] == "CrossWorkspaceError"
+    body = envelope(response)
+    assert body["ok"] is False, "an answer was produced over another tenant's passages"
+    assert body["error"]["type"] == "CrossWorkspaceError"
     assert backend.answerer_.calls == [], "the model was called with another tenant's passages"
 
 
