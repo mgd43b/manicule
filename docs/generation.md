@@ -92,6 +92,16 @@ of the system the ticket is about.
 Concretely, an installed generator plugin can change which model answers, how it is reached,
 what it costs and how fast it streams. It cannot change which citations survive.
 
+**And it does not get to number the slots either**, which review found was a hole in exactly
+this argument. The prompt was originally built inside the `Generator`, so the correspondence
+between "slot 3" and `Context.passages[2]` — the thing every level of the ladder is checking
+*against* — was an unenforced convention inside the pluggable component. A plugin that
+reordered passages, a documented lost-in-the-middle mitigation, produced citations naming a
+passage the model never saw at that number: mechanically wrong, passing all three levels, and
+presenting exactly like the misattribution §3.5 honestly excludes. So the prompt is built
+above the seam and handed over whole. A generator may still decline it and build its own —
+the protocol cannot forbid that — but manicule's own path no longer relies on it not to.
+
 ### 2.3 One thing `Generator` needs and does not have
 
 The startup cross-check `retrieval.md` §7.4 requires — profile budgets against the model's
@@ -111,6 +121,17 @@ landed there, and §4.3 says what the number must mean, because the obvious read
 wrong on the default runtime.
 
 It is additive and it is not `RetrievalStage` or `Anchor`, so it carries neither lock.
+
+**And one thing implementation found that this section did not anticipate.** The protocol fixes
+two inputs, and conversation history (§8) is a third the seam has no channel for. Widening
+`generate` again — days after #45 landed `context_window`, against three tickets building on it
+— is not worth a keyword. So history travels as an **optional keyword argument**, which
+`assert_protocol_signatures` already sanctions ("an implementation may add parameters the
+protocol does not have, provided they have defaults"): a caller working from the protocol never
+passes it, `generating(..., extra=...)` forwards it to a generator that declares it, and one
+that does not is **recorded in the trace as not having it**. That last part is the point. A
+plugin generator silently receiving no history looks exactly like a model with a short memory,
+and the failure this project keeps refusing is the one nobody can see.
 
 ---
 
@@ -293,8 +314,16 @@ it means deciding whether a passage entails a sentence, which is the hallucinati
 So the guarantee this system makes is exact and narrower than "the citations are correct":
 
 > **Every citation resolves to a real location in a real document, and the text shown at that
-> location is the text the model was given.** It is not a claim that the passage supports the
+> location is the text the passage contains.** It is not a claim that the passage supports the
 > sentence.
+
+The last clause used to read "the text the model was given", and review showed that is
+literally false on two deliberate paths: a redacted passage is shown to the model as
+`[REDACTED]` and quoted unredacted (§7.4, which argues for exactly that), and a passage
+containing marker syntax is shown escaped and quoted unescaped (§3.2). The quote is the
+*passage*, byte for byte; what the model saw is a projection of it. Saying so is the same
+discipline as stating the misattribution exclusion — a guarantee that overreaches gets
+believed.
 
 Saying the narrower thing is the point. A system that claimed the wider one would be believed,
 and `contracts.md` §5 already records what this project thinks of guarantees nothing enforces.
@@ -332,9 +361,17 @@ be mistaken for the passage.
 
 ### 3.7 Where verification runs, and what it actually costs
 
-**Per distinct document, not per citation.** One parse of a document serves every anchor in
-it. With `final_top_k` between 3 and 10 and passages frequently sharing a document, the usual
-answer needs one to three parses.
+**Per distinct document, not per citation** — for the parts that can be. The blob read, the
+`RawDocument` around it and the choice of parser happen once per document, so with
+`final_top_k` between 3 and 10 and passages frequently sharing a document the usual answer
+performs one to three blob reads.
+
+*Corrected during implementation.* This section originally said "one parse of a document
+serves every anchor in it", and the merged `Parser.resolve(anchor, raw)` signature does not
+offer that: each call is independent, so the parse is per **anchor**. Sharing it would mean a
+parser-side handle type — a real change to a protocol three tickets are built against — for a
+saving the cache already makes irrelevant, since a verified anchor stays verified until its
+document changes.
 
 **Cached on `(chunk_id, document.version_token)`.** Chunk ids are content-derived and
 `version_token` changes whenever the document does, so the key is exact and can never go
@@ -358,6 +395,12 @@ draws between `exhausted_budget` and `exhausted_corpus`.
 
 **When the bytes are not retained.** `StorageSettings.retain_source_bytes` may be off, which
 is legitimate and documented as making every re-index a re-crawl. Level 2 is then impossible.
+
+Note the distinction implementation made explicit: the *setting* lowers the ceiling for every
+citation, and is knowable at startup. **One missing blob under a configuration that retains is
+a drop**, with reason `unresolvable` — it is a defect in that document's storage, not a
+property of the deployment, and reporting it as a weaker verification level would hide a lost
+file behind a word.
 The response says so: verification degrades to the strongest level available and **names the
 level it reached**, rather than silently reporting the same word for two different amounts of
 checking. Because the setting is startup configuration, the degradation is knowable at
@@ -503,8 +546,17 @@ auto-growth turns a budgeting mistake into an OOM on a new one. The fix is the s
 and it is to stop leaving the number to the runtime:
 
 - **`Generator.context_window` means the window that will actually be served**, not the model's
-  trained maximum. For Ollama it is read from `/api/show` and combined with what manicule
-  itself sets.
+  trained maximum. For Ollama it is read from `/api/show`; for a hosted provider it comes from
+  the library's model metadata.
+
+  Implementation had to make one thing precise that "combined with what manicule itself sets"
+  leaves ambiguous. The attribute is the **ceiling the runtime will serve if manicule asks for
+  its budget** — the model's trained length — and `num_ctx` is what manicule then demands, which
+  is the profile total. Reporting the *demanded* number here instead would make the cross-check
+  circular: it would be comparing the budget against a number derived from the budget, and it
+  would pass for every profile. A model neither route can describe — an OpenAI-compatible server
+  with a private model name — has `llm.context_window` as an explicit escape hatch, and without
+  it startup refuses rather than guessing.
 - **manicule sets `num_ctx` explicitly on every Ollama call**, derived from the profile
   arithmetic above. Derived rather than configured, so it cannot disagree with the budget it
   exists to satisfy — and so the served window stops varying with the host's VRAM.
@@ -512,25 +564,32 @@ and it is to stop leaving the number to the runtime:
   catches a server that trimmed on an older build: the true count comes back pinned at the
   window rather than tracking the estimate.
 
-**The shipped defaults do not all fit, and this document says so rather than leaving it to be
-discovered.** `LlmSettings.model` defaults to `qwen2.5:14b`, which on Ollama is the Instruct
-model — 32768 native, and 131072 only with opt-in YaRN scaling that Ollama does not apply by
-default. Against a system prompt of roughly 400 tokens:
+**When this was written the shipped defaults did not all fit, and saying so was the point.**
+Against the budgets of the day, `precise` asked for 32768 context tokens plus history plus a
+system prompt plus the reserve — more than the default `qwen2.5:14b`'s own 32768-token native
+window, before `num_ctx` was even considered.
 
-| Profile | context | history | system | reserve (`max_tokens`) | total | fits 32768? |
+[#6](https://github.com/mgd43b/manicule/issues/6) has since re-derived the budgets from what
+each `final_top_k` can actually hold, and they are now 4096 / 5632 / 12288. Against a system
+prompt of roughly 400 tokens and a 1024-token reserve:
+
+| Profile | context | history | system | reserve | total | fits 16384? |
 |---|---|---|---|---|---|---|
-| `fast` | 8192 | 512 | ~400 | 1024 | ~10128 | yes |
-| `balanced` | 16384 | 1024 | ~400 | 1024 | ~18832 | yes |
-| `precise` | 32768 | 2048 | ~400 | 1024 | ~36240 | **no** |
+| `fast` | 4096 | 512 | ~400 | 1024 | ~6032 | yes |
+| `balanced` | 5632 | 1024 | ~400 | 1024 | ~8080 | yes |
+| `precise` | 12288 | 2048 | ~400 | 1024 | ~15760 | yes |
 
-`precise` does not fit the default model's own native window, before `num_ctx` is even
-considered.
-That is a real finding, not a rounding issue, and the honest response is the one the rule
-already prescribes: **it is refused at startup, with both numbers named and the three fixes
-listed** — a model with a longer window, a lower `context_tokens` override, or a different
-profile. The profile numbers belong to
-[#6](https://github.com/mgd43b/manicule/issues/6)/[#1](https://github.com/mgd43b/manicule/issues/1)
-and are not changed here. What is not acceptable is shipping a profile that silently truncates.
+So the arithmetic impossibility is gone and the *rule* is unchanged and still load-bearing:
+a profile that does not fit **is refused at startup, with both numbers named and the fixes
+listed** — a model with a longer window, a lower `context_tokens` override, a lower
+`max_tokens`, or a different profile. What is not acceptable is shipping a profile that
+silently truncates.
+
+**The predicate lives in retrieval, and this ticket calls it.** `retrieval.assembly.window_problem`
+states the rule because `context_tokens` and `history_tokens` are retrieval's budgets;
+`Generator.setup` enforces it because that is where the served window becomes known. One rule
+stated twice is two rules that will disagree, and the one that disagrees silently is the one
+that lets a prompt overflow.
 
 ### 4.4 Startup refusals
 
@@ -819,6 +878,15 @@ The persisted message carries its finish reason (`stop`, `length`, `content_filt
 and its citation accounting, so a truncated or abandoned answer is a first-class stored object
 that can be read, shared and rated rather than a gap in the record.
 
+**One thing implementation added, because the paragraph above is not self-executing.** The
+answer wrapper is itself an async generator, so its `finally` runs when something *finalises*
+it — and a cancelled consumer abandons it rather than closing it. A `finally` that only runs at
+garbage-collection time is precisely the "persistence that silently did not happen" this
+section exists to prevent, on exactly the answer that most needs to be ratable. So there is an
+`answering()` context manager, `generating()`'s sibling one layer up, and consuming an answer
+goes through it. Its close deadline is deliberately wider than the persist deadline; the other
+way round, the close would cut short the write it exists to guarantee.
+
 ### 5.4 One use, and honest backpressure
 
 **The iterator `generate` returns is single-use.** Restarting it means a second provider call
@@ -866,8 +934,8 @@ to have refused at startup. It is a reason to keep the ordering, not a reason to
 it.
 
 **The citation protocol is not configurable.** An operator may *append* instructions to the
-system prompt; they may not replace the section that defines slots and markers, because the
-binder's guarantees assume the model was told the protocol. The appended text is counted into
+system prompt — `llm.system_prompt_extra` — but may not replace the section that defines slots
+and markers, because the binder's guarantees assume the model was told the protocol. The appended text is counted into
 `system_prompt_tokens` for §4.3, so a long custom prompt is refused at startup rather than
 silently displacing passages.
 
@@ -886,9 +954,11 @@ silently displacing passages.
   will see it. Slots are small integers precisely so that the worst thing a leak can look like
   is a stray number.
 - **Marker syntax inside the body is escaped** (§3.2).
-- **Slots are per-answer ordinals**, not identifiers. They are persisted as the position of a
-  citation record in `messages.sources`, which is what lets a stored answer's surviving markers
-  still mean something a year later.
+- **Slots are per-answer ordinals**, not identifiers. They are what lets a stored answer's
+  surviving markers still mean something a year later. Implementation stores each citation
+  record in `messages.sources` **carrying its own `slot`**, rather than relying on its position
+  in the list: a slot whose citation was dropped has no record, so a positional list would
+  either need holes or would silently renumber every marker after the first drop.
 - `Context.truncated` — passages dropped by assembly to fit the budget
   ([`retrieval.md`](retrieval.md) §7.3) — is surfaced on the answer, because an answer built
   from a truncated context is a weaker claim and the `Context` type already says so.
@@ -995,7 +1065,12 @@ away rather than on the one that merely names a hosted provider.
 
 ### 7.2 What is redacted, and what deliberately is not
 
-Redaction applies to **everything on the egress path and nothing else**:
+Redaction applies to **everything on the egress path and nothing else** — which is five text
+channels, not three. Implementation initially redacted the passage bodies, the query and the
+history and left the slot *labels* alone, so a title like `"Q3 comp review —
+someone@example.invalid.docx"` and a URI like `https://intranet/hr/salaries/employee-4471` went
+to a hosted model verbatim above a redacted body. Titles, URIs and heading paths are in the same
+batch:
 
 | Redacted | Not redacted | Why |
 |---|---|---|
@@ -1057,8 +1132,13 @@ than a free precaution.
 
 **A regex over 32k tokens of context on every query, with operator-supplied patterns, is a
 denial-of-service surface.** Python's `re` cannot be interrupted, so redaction runs in a worker
-thread with a wall-clock deadline (`redaction_timeout_s`, default 5.0). **Exceeding it fails
-the query.** The fail-safe direction is refuse-to-send; there is no path in this design where a
+thread with a wall-clock deadline (`security.data_policy.auto_redact.timeout_s`, default 5.0).
+**Exceeding it fails the query.**
+
+The thread is a **daemon**, which is not a style choice. `asyncio.to_thread` uses the default
+executor, whose threads are non-daemon and are joined at interpreter exit — so a runaway
+pattern would not merely leak a thread, it would hang the process's shutdown, turning a bad
+regex into a server that will not stop. The fail-safe direction is refuse-to-send; there is no path in this design where a
 timeout, an exception or a mistake results in unredacted text going to a remote model. Custom
 patterns are the operator's risk, catastrophic backtracking is the named hazard, and the
 built-in detectors are the supported surface.
@@ -1116,6 +1196,12 @@ did not leave. They already had read access; nothing is disclosed that was not.
 
 Three rules to keep it coherent:
 
+- **A passage whose document cannot be found fails closed when anything is leaving.** The
+  document store filters soft-deleted rows while the chunk index still returns their chunks, so
+  a document deleted between retrieval and generation — including one deleted *precisely
+  because* somebody decided it was sensitive — arrives as an absent row. Keeping it would send
+  its text to a hosted model with no policy evaluated at all. Where nothing leaves the machine
+  there is nothing to fail closed about, and the passage is kept.
 - **Policy filtering only removes.** It never reorders, never adds, and never re-runs assembly.
   Re-assembling to backfill the freed budget would make the context a function of which model
   you asked, and two runs that saw different passages are not comparable.
@@ -1236,8 +1322,9 @@ content type.
 The estimate follows `retrieval.md` §7.2 exactly and this document adds nothing to it:
 `tiktoken.get_encoding("o200k_base")` by encoding name rather than
 `encoding_for_model("gpt-4o")` — naming a model that is not being used makes the estimate look
-authoritative — with a per-model safety factor biased toward overcounting, no sampling, and
-counts cached by content-derived `chunk.id`.
+authoritative — with a per-model safety factor biased toward overcounting
+(`llm.token_safety_factor`, default 1.15), no sampling, and counts cached by content-derived
+`chunk.id`.
 
 > **Prior art.** A module-level singleton hardcoded to `encodingForModel('gpt-4o')`, with no
 > parameter and no configuration. The defaults it measures for are `qwen2.5:14b`,
@@ -1277,9 +1364,9 @@ started. That is the property `retrieval.md` §11.2 protects, arriving through a
 first long CJK or code-heavy prompt then overflows a window that a fixed factor would have
 respected.
 
-So drift beyond tolerance is an **error-level event with both numbers and the model named**, and
-`doctor` reports the observed distribution and recommends a factor. The human changes the
-setting. `CONTRIBUTING.md`'s "configuration is declarative" applies to the values a system uses
+So drift beyond tolerance — `llm.token_drift_tolerance`, default 15% — is an **error-level event
+with both numbers and the model named**, and `doctor` reports the observed distribution and
+recommends a factor. The human changes `llm.token_safety_factor`. `CONTRIBUTING.md`'s "configuration is declarative" applies to the values a system uses
 to protect itself, not only to the ones an operator types.
 
 **A provider that reports no usage after being asked** is recorded as `usage_unavailable`, which
@@ -1353,6 +1440,12 @@ AnswerEnvelope
 **An interface must not render a single blended percentage from these.** That is not a
 suggestion about visual design; it is the requirement that makes both numbers mean anything,
 and it is the specific failure recorded above.
+
+The envelope arrives as the final element of the answer stream. The `GenerationTrace` (§14) is
+**not** on it: an async generator cannot also return a value, and putting a diagnostic record on
+every event would make each consumer carry something it mostly does not want. It is filled into
+an `AnswerResult` the caller passes in, which is also where the persisted message id and any
+token drift end up.
 
 ### 10.3 Generation never modifies confidence
 
@@ -1437,7 +1530,16 @@ person with no workspace membership must not receive.
 **Resolution: a shared conversation shows the questions, the answers, and the citation
 *labels* — document title, heading path, page — together with the verification state recorded
 when the answer was generated. It does not show passage text, and its citations do not link into
-the corpus.** An authenticated viewer with access to the workspace opens the same conversation
+the corpus.**
+
+Implementation makes that structural rather than careful. The anonymous read is a *different
+type* — a `CitationLabel` with nowhere to put a quote, a URI, a document id, a chunk id or an
+anchor — and the projection happens inside the store's anonymous path rather than in a helper a
+route must remember to call. Two of those omissions are not obvious: an anchor is not "not
+text", it is a `LineAnchor.symbol` naming a private repository's function, or a `CellAnchor`
+naming a spreadsheet and a cell range. And the read **resolves the share token itself** rather
+than taking a conversation id, because a projection reached by holding an id is one that
+revocation, expiry and workspace membership never see. An authenticated viewer with access to the workspace opens the same conversation
 and sees the passages, because they could have retrieved them anyway.
 
 So the *same message renders differently by audience, and the difference is content only* —
@@ -1455,10 +1557,13 @@ configure correctly.
 
 - **Revocation exists**, as a real endpoint, and clears the hash rather than flipping a boolean
   beside a still-valid token.
+- **Switching sharing off stops existing links resolving**, not merely the minting of new ones.
+  An operator who turns `security.sharing.enabled` off has decided the disclosure already made
+  is the problem; a mint-time-only check would make the setting a statement about the future.
 - **Soft-deleting the conversation revokes the link.** The public read applies
   `deleted_at IS NULL`, like every other read in the system.
-- **Links expire.** `share_expires_at`, defaulting to 30 days, set at creation and enforced on
-  every read. A capability with no expiry accumulates forever, and the set of live ones becomes
+- **Links expire.** `share_expires_at`, set at creation from `security.sharing.link_ttl_s`
+  (default 30 days) and enforced on every read. A capability with no expiry accumulates forever, and the set of live ones becomes
   unknowable.
 - **Both are visible to the owner**: which conversations are shared, when each link expires,
   and one action to revoke.
@@ -1753,7 +1858,7 @@ Places this design had to decide something no merged document had a position on.
 | Ticket | What | Why not here |
 |---|---|---|
 | [#41](https://github.com/mgd43b/manicule/issues/41) | **Add `context_window` to the `Generator` protocol** (§2.3, §4.3) | It changes `docs/contracts.md` and `manicule.core.protocols`, which three implementation tickets are building against right now. Additive, and neither `Anchor` nor `RetrievalStage`, so it carries no lock — but it is a seam change and belongs in its own reviewable commit |
-| [#42](https://github.com/mgd43b/manicule/issues/42) | **Conversation schema for sharing and feedback** (§11.1, §11.4, §12.1) — hash `share_token`, add `share_expires_at` and `shared_at`, add `messages.feedback`, `messages.feedback_reason`, `messages.query_log_id`, `messages.finish_reason` | It is an additive Alembic migration against tables merged under [#2](https://github.com/mgd43b/manicule/issues/2), and [#11](https://github.com/mgd43b/manicule/issues/11) and [#13](https://github.com/mgd43b/manicule/issues/13) both depend on the result. Worth landing as its own change for the same reason [#36](https://github.com/mgd43b/manicule/issues/36) was: it moves a security boundary |
+| [#42](https://github.com/mgd43b/manicule/issues/42) | **Conversation schema for sharing and feedback** (§11.1, §11.4, §12.1) — hash `share_token`, add `share_expires_at` and `shared_at`, add `messages.feedback`, `messages.feedback_reason`, `messages.query_log_id`, `messages.finish_reason` | **Landed with #7 rather than separately.** The separation was worth having while this was a documentation-only change; once #7 was writing conversations there was nothing left to decouple, and a share link whose token was still stored in plaintext for one more merge is a security boundary left open for no benefit. `query_logs.feedback` is dropped rather than kept, because two homes for one fact is the thing the change exists to remove |
 | [#44](https://github.com/mgd43b/manicule/issues/44) | **Fix `is_local` so egress is decided by the resolved endpoint** (§7.1) | It changes `manicule.config`, merged under [#1](https://github.com/mgd43b/manicule/issues/1), and it moves a security boundary. #7's implementation depends on the result, since the egress class is what selects the redaction path |
 
 [#28](https://github.com/mgd43b/manicule/issues/28) — refuse-to-ingest rules — stays where

@@ -17,7 +17,16 @@ runtime or an HTTP client; :mod:`tests.test_import_boundary` fails the build if 
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Sequence
+import asyncio
+import inspect
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from collections.abc import Set as AbstractSet
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -102,6 +111,52 @@ class Parser(Protocol):
         ...
 
 
+_ABANDONED: set[asyncio.Future[None]] = set()
+"""Closes that outlived their deadline.
+
+A reference is held so the task is not collected mid-flight, and its outcome is consumed so a
+failure does not surface later as an unhandled-task warning from a stack naming nobody.
+"""
+
+
+async def bounded(awaitable: Awaitable[None], deadline_s: float | None) -> None:
+    """Await ``awaitable``, **abandoning** it past ``timeout`` rather than waiting for it.
+
+    Deliberately not :func:`asyncio.wait_for`, which on expiry cancels the inner awaitable and
+    then waits for that cancellation to finish — so an awaitable that catches
+    :exc:`asyncio.CancelledError`, as a retry loop or a driver teardown does, blocks past the
+    deadline anyway. The same fact the parse workers had to establish: ``wait_for`` cancels the
+    await, not the work.
+
+    Past the deadline the task is cancelled and left. Whatever it holds goes to its own pool's
+    teardown, which is the trade this bound was always making: a leaked socket is recovered by
+    the pool, a shutdown that never returns is recovered by nothing.
+
+    Exceptions are swallowed. Every caller is a ``finally``, frequently one already unwinding a
+    cancellation, and raising would replace the failure somebody needs to see with the failure
+    of the tidy-up after it.
+    """
+    running = asyncio.ensure_future(awaitable)
+    try:
+        await asyncio.wait({running}, timeout=deadline_s)
+    except asyncio.CancelledError:
+        running.cancel()
+        _abandon(running)
+        raise
+    if not running.done():
+        running.cancel()
+        _abandon(running)
+        return
+    if not running.cancelled():
+        running.exception()
+
+
+def _abandon(task: asyncio.Future[None]) -> None:
+    _ABANDONED.add(task)
+    task.add_done_callback(_ABANDONED.discard)
+    task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+
+
 @asynccontextmanager
 async def parsing(parser: Parser, raw: RawDocument) -> AsyncGenerator[AsyncIterator[ParsedBlock]]:
     """Iterate a parser's blocks, closing the stream on **every** exit path.
@@ -135,17 +190,39 @@ async def parsing(parser: Parser, raw: RawDocument) -> AsyncGenerator[AsyncItera
         await aclose(stream)
 
 
-async def aclose(stream: AsyncIterator[ParsedBlock]) -> None:
-    """Close a block stream if it is a generator, and do nothing if it is not.
+async def aclose[T](stream: AsyncIterator[T], *, timeout: float | None = None) -> None:  # noqa: ASYNC109 - the deadline is enforced here with wait_for; there is nothing below to pass it to
+    """Close a stream if it is a generator, and do nothing if it is not.
 
-    :meth:`Parser.parse` promises an ``AsyncIterator``, which is a weaker thing than an async
-    generator and has no ``aclose``. A parser returning a hand-written iterator is a
-    legitimate implementation of the protocol, so this asks rather than assumes.
+    :meth:`Parser.parse` and :meth:`Generator.generate` both promise an ``AsyncIterator``,
+    which is a weaker thing than an async generator and has no ``aclose``. An implementation
+    returning a hand-written iterator satisfies either protocol, so this asks rather than
+    assumes.
+
+    Args:
+        stream: The iterator to close.
+        timeout: A hard deadline on the close, or ``None`` for none. A parser closes local
+            handles and needs none; a generator holds a provider connection, and a shutdown
+            path that can block indefinitely on a misbehaving remote server is a worse failure
+            than a leaked socket. Past the deadline the close is abandoned to the connection
+            pool's own teardown and this returns.
     """
     closer = getattr(stream, "aclose", None)
     if closer is None:
         return
-    await closer()
+    if timeout is None:
+        await closer()
+        return
+    # **Not `wait_for`.** On expiry `wait_for` cancels the inner awaitable and then *waits for
+    # that cancellation to finish*, so a closer that catches `CancelledError` — a retry loop, a
+    # driver that swallows it during teardown — blocks past the deadline anyway, which is
+    # exactly the shutdown this bound exists to guarantee. The same fact the parse workers had
+    # to establish: `wait_for` cancels the await, not the work.
+    #
+    # So the close runs as a task, and past the deadline the task is cancelled and **left**.
+    # The connection goes to the pool's own teardown, which is the trade this bound was always
+    # making: a leaked socket is recovered by the pool, a shutdown that never returns is
+    # recovered by nothing.
+    await bounded(closer(), timeout)
 
 
 async def read_blocks(parser: Parser, raw: RawDocument) -> list[ParsedBlock]:
@@ -731,8 +808,102 @@ class Generator(Protocol):
     """
 
     def generate(self, query: Query, context: Context) -> AsyncIterator[Token]:
-        """Stream the answer. The final token carries a finish reason."""
+        """Stream the answer. The final token carries a finish reason.
+
+        Iterate it through :func:`generating`, never bare. What an abandoned generation
+        stream holds is worse than a file handle: an open HTTP response to a model that is
+        still working. On a hosted provider that is tokens being billed for an answer nobody
+        will read; on a local one the model keeps generating until the client goes away, so a
+        user who closes a tab and asks again is queued behind their own abandoned answer.
+        """
         ...
+
+
+def _accepted(generator: Generator, extra: Mapping[str, object] | None) -> dict[str, object]:
+    """The subset of ``extra`` this generator's ``generate`` actually declares.
+
+    Silently dropping the rest is right here and would be wrong elsewhere: these are inputs a
+    protocol-conformant generator is *entitled* not to have, and the answer path records which
+    ones it took, so a conversation that did not reach the model is a fact in the trace rather
+    than a silent loss.
+    """
+    if not extra:
+        return {}
+    try:
+        parameters = inspect.signature(generator.generate).parameters
+    except (TypeError, ValueError):  # pragma: no cover - a callable with no readable shape
+        return {}
+    declared = {
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return dict(extra)
+    return {name: value for name, value in extra.items() if name in declared}
+
+
+CLOSE_DEADLINE_S = 5.0
+"""How long :func:`generating` waits for a provider connection to close.
+
+Past it the connection is abandoned to the pool's own teardown. The trade is deliberate and
+one-directional: a leaked socket is recovered by the pool, while a shutdown that blocks
+indefinitely on a misbehaving remote server is recovered by nothing.
+"""
+
+
+@asynccontextmanager
+async def generating(
+    generator: Generator,
+    query: Query,
+    context: Context,
+    *,
+    close_deadline_s: float | None = CLOSE_DEADLINE_S,
+    extra: Mapping[str, object] | None = None,
+) -> AsyncGenerator[AsyncIterator[Token]]:
+    """Iterate a generator's tokens, closing the stream on **every** exit path.
+
+    :func:`parsing`'s sibling, and it exists for the same reason with a worse resource behind
+    it (:meth:`Generator.generate`). Use it the same way::
+
+        async with generating(generator, query, context) as tokens:
+            async for token in tokens:
+                ...
+
+    Two exits have to be covered and they arrive differently. ``aclose()`` — a consumer that
+    stopped early, or this ``finally`` — raises :exc:`GeneratorExit` at the ``yield``.
+    :exc:`asyncio.CancelledError` — the client disconnected and the task was cancelled —
+    arrives at whatever ``await`` the generator is suspended on, usually inside the provider
+    read. One ``try``/``finally`` in the implementation covers both, and only a ``finally``
+    runs after ``GeneratorExit``.
+
+    Two rules on what may go in that ``finally``, both of which this contract relies on.
+    **Cleanup awaits nothing unbounded**, because an ``await`` that never completes hangs
+    ``aclose()``, which is itself being awaited by somebody else's ``finally``;
+    ``close_deadline_s`` is the backstop for an implementation that breaks the rule.
+    **Cleanup never yields**: yielding after :exc:`GeneratorExit` raises ``RuntimeError:
+    async generator ignored GeneratorExit``, so the final token carrying a finish reason is
+    emitted on the normal path only. A stream nobody is reading has nobody to tell.
+
+    ``extra`` forwards keyword arguments the bound generator declares **beyond** the
+    protocol — and *only* those it declares. Forwarding unconditionally made this the opposite
+    of what it says: a generator that did not accept a key raised ``TypeError`` before
+    streaming began, so the mechanism for optional extras was a mechanism for mandatory
+    ones.
+
+    The protocol fixes two inputs and conversation history is a third the seam has
+    no channel for; widening :meth:`Generator.generate` would be a change to a contract three
+    implementations are written against, so the additional inputs travel as optional keywords
+    instead — which :func:`manicule.testing.assert_protocol_signatures` already sanctions,
+    since a caller working from the protocol never passes them. A generator that declares
+    none is called with none, and the answer path records that it did rather than letting a
+    conversation quietly vanish.
+    """
+    stream = generator.generate(query, context, **_accepted(generator, extra))
+    try:
+        yield stream
+    finally:
+        await aclose(stream, timeout=close_deadline_s)
 
 
 # --- connectors --------------------------------------------------------------------------
@@ -883,6 +1054,7 @@ class Middleware(Protocol):
 
 
 __all__ = [
+    "CLOSE_DEADLINE_S",
     "ChunkRelationStore",
     "Chunker",
     "CollectionStore",
@@ -900,6 +1072,8 @@ __all__ = [
     "VectorStore",
     "VersionStore",
     "aclose",
+    "bounded",
+    "generating",
     "parsing",
     "read_blocks",
 ]

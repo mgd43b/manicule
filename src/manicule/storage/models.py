@@ -490,7 +490,34 @@ class Conversation(Base):
     user_id: Mapped[str | None] = mapped_column(Text)
     title: Mapped[str | None] = mapped_column(Text)
     shared: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    share_token: Mapped[str | None] = mapped_column(Text, unique=True)
+    share_token_hash: Mapped[str | None] = mapped_column(Text, unique=True)
+    """The share token, **hashed**, exactly like ``api_keys.key_hash``.
+
+    The argument is not that the hash protects this row from somebody holding the database —
+    that person has the conversation anyway. It is that a share token is a live credential
+    for an *unauthenticated* URL, and this database is backed up, exported and imported, so a
+    plaintext token travels into artefacts that leave the access boundary that created it.
+    The token is shown to its creator once and never stored.
+
+    Revocation clears this column rather than flipping :attr:`shared` beside a still-valid
+    token, so a revoked link stops resolving instead of merely looking revoked.
+    """
+
+    share_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    """When the link stops working. Enforced on every read.
+
+    A capability with no expiry accumulates forever and the set of live ones becomes
+    unknowable. A row with a hash and no expiry is treated as expired, which fails closed.
+    """
+
+    shared_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    """When it was shared — so an owner can see it, and so the audit record has a join.
+
+    Also what makes a share a **snapshot**: only messages created at or before this moment are
+    exposed. The alternative is a live view, where turn 7 becomes public the moment it is
+    written and nobody re-reads a link they already sent.
+    """
+
     deleted_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -516,11 +543,58 @@ class Message(Base):
     profile_used: Mapped[str | None] = mapped_column(Text)
     confidence_score: Mapped[float | None] = mapped_column(Float)
     response_time_ms: Mapped[int | None] = mapped_column(Integer)
+
+    finish_reason: Mapped[str | None] = mapped_column(Text)
+    """How generation ended. A partial or truncated answer is persisted like any other and
+    must be distinguishable from a complete one; an answer that simply stops looks exactly
+    like one that finished."""
+
+    feedback: Mapped[str | None] = mapped_column(Text)
+    """A rating on **this answer**.
+
+    On the message rather than on ``query_logs``, and that is not bookkeeping preference.
+    There are answers with no retrieval behind them, and answers whose retrieval succeeded
+    and whose generation failed; both are ratable and neither has a usable query-log row.
+    A message always exists, including for a partial answer.
+    """
+
+    feedback_reason: Mapped[str | None] = mapped_column(Text)
+    """From a closed vocabulary. ``citation-wrong`` is why the vocabulary exists: it is the
+    only detector this project has for citation misattribution, which verification cannot
+    catch because catching it means deciding entailment."""
+
+    feedback_comment: Mapped[str | None] = mapped_column(Text)
+    feedback_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+
+    query_log_id: Mapped[str | None] = mapped_column(
+        ForeignKey("query_logs.id", ondelete="SET NULL")
+    )
+    """The retrieval run behind this answer, when there was one.
+
+    ``SET NULL`` rather than ``CASCADE``: telemetry ageing out must not delete the answer a
+    person rated. Feedback that cannot name what produced the answer is a mood rather than a
+    datum, so this is worth keeping — but the answer outlives the telemetry.
+    """
+
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
     __table_args__ = (
         CheckConstraint("role IN ('user', 'assistant', 'system')", name="role_is_known"),
+        CheckConstraint(
+            "feedback IS NULL OR feedback IN ('positive', 'negative')",
+            name="feedback_is_known",
+        ),
+        CheckConstraint(
+            "feedback_reason IS NULL OR feedback_reason IN "
+            "('wrong', 'incomplete', 'citation-wrong', 'too-slow', 'other')",
+            name="feedback_reason_is_known",
+        ),
         Index("ix_messages_conversation_id_created_at", "conversation_id", "created_at"),
+        Index(
+            "ix_messages_feedback",
+            "feedback",
+            sqlite_where=text("feedback IS NOT NULL"),
+        ),
     )
 
 
@@ -603,8 +677,12 @@ class QueryLog(Base):
     rerank_score_avg: Mapped[float | None] = mapped_column(Float)
     confidence_score: Mapped[float | None] = mapped_column(Float)
     response_time_ms: Mapped[int | None] = mapped_column(Integer)
-    feedback: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    # There is deliberately no `feedback` column here. A user rates an *answer*, an answer is
+    # a message, and `messages.feedback` is where it lives. Keeping a second copy on the
+    # retrieval row would be two homes for one fact, and the retrieval row is the one that
+    # does not exist for a directly-routed answer or for a generation that failed.
 
     __table_args__ = (Index("ix_query_logs_workspace_id_created_at", "workspace_id", "created_at"),)
 

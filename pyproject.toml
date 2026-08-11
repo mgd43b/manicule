@@ -96,7 +96,21 @@ rerank = [         # #6
   # several gigabytes for a model it will not construct.
   "sentence-transformers>=3.0",
 ]
-generation = []    # #7  litellm
+generation = [     # #7
+  # One provider interface. Local and hosted differ by `base_url` and a model prefix, so
+  # there is no per-vendor client and no per-vendor type — docs/generation.md §4.1. There is
+  # deliberately no Ollama client library here: litellm speaks HTTP, so Ollama is a runtime
+  # dependency of one *configuration* rather than an install dependency of manicule.
+  #
+  # The floor is not decoration. §4.2's `ollama_chat` routing, §4.6's retry gate, §4.8's
+  # `BadRequestError` hierarchy and §4.10's usage fallbacks are behaviours verified against
+  # this release; lowering it means re-verifying those four rather than merely resolving.
+  "litellm>=1.83",
+  # The generation-side token estimate (docs/retrieval.md §7.2, generation.md §9.2). Already
+  # present under `parsers` for the chunker's provisional counter; declared here too so that
+  # installing only the generation extra gets a working estimator.
+  "tiktoken>=0.8",
+]
 connectors = [     # #9
   # One HTTP client, async, with a pluggable transport. The transport seam is why this is the
   # choice: the connector suites run against a synthetic Confluence built on
@@ -114,6 +128,7 @@ parsing = "manicule.parsers.plugin:PLUGIN"
 embedding = "manicule.embedding.plugin:PLUGIN"
 connectors = "manicule.connectors.plugin:PLUGIN"
 retrieval = "manicule.retrieval.plugin:PLUGIN"
+generation = "manicule.generation.plugin:PLUGIN"
 
 [project.urls]
 Homepage = "https://github.com/mgd43b/manicule"
@@ -154,6 +169,10 @@ dev = [
   # exercised through `PairScorer` — a seam that exists so those rules can be tested without a
   # two-gigabyte download. What the extra buys is the model, and a model is not a rule.
   "manicule[retrieval]",
+  # The generation stack, for the same reason: `uv sync --all-groups` is what CI runs, and the
+  # generation suites drive litellm's own streaming wrapper rather than a mock of it, so the
+  # `ollama_chat` routing and the exception hierarchy are exercised against the real library.
+  "manicule[generation]",
 ]
 
 [tool.uv.workspace]

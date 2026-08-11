@@ -1,0 +1,463 @@
+"""Conversations, messages, feedback and share links.
+
+Separate from :class:`~manicule.storage.docstore.SqliteDocStore` because the protocols are
+separate: a store may serve retrieval without ever holding a conversation, and folding these
+into ``DocStore`` would make that impossible to express.
+
+Two rules run through every read here and both are corrections of the same shape of bug.
+**Every read applies ``deleted_at IS NULL``**, including the unauthenticated one — a soft
+delete that does not revoke a public link is a delete that does not delete. And **a share
+link is resolved by hash, with expiry checked in the same statement**, so there is no window
+in which "we found the row" and "the link is still valid" are two different answers.
+"""
+
+from __future__ import annotations
+
+import secrets
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, cast
+
+from pydantic import TypeAdapter
+from sqlalchemy import CursorResult, select, update
+from sqlalchemy import text as sql_text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+from manicule.core.errors import ManiculeError
+from manicule.core.generation import FinishReason
+from manicule.generation.answers import Citation
+from manicule.generation.history import Turn
+from manicule.generation.ports import Feedback, FeedbackReason, SharedTurn, StoredMessage
+from manicule.generation.sharing import ShareLink, redact_for_anonymous
+from manicule.storage import models
+from manicule.storage.engine import session_factory
+from manicule.storage.types import utcnow
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from datetime import datetime
+
+_CITATIONS: TypeAdapter[tuple[Citation, ...]] = TypeAdapter(tuple[Citation, ...])
+
+
+def _new_id(prefix: str) -> str:
+    """A random id for a row nobody derives from content.
+
+    Deliberately not :func:`~manicule.core.ids.document_id`'s content digest: two identical
+    questions asked twice are two conversations, and collapsing them would make a chat
+    idempotent in a way nobody asked for.
+    """
+    return f"{prefix}_{secrets.token_hex(12)}"
+
+
+DEFAULT_WORKSPACE = "default"
+
+
+class UnknownConversationError(ManiculeError):
+    """A write named a conversation this workspace does not own, or has deleted.
+
+    Raised rather than silently ignored: a turn that vanishes is worse than one that fails,
+    because the caller goes on believing the conversation has it.
+    """
+
+
+class SqliteConversationStore:
+    """Conversation storage, bound to one workspace.
+
+    Tenancy is a property of the handle rather than a parameter each call site has to
+    remember, which is the same reason the document store is built that way: a scope you can
+    forget to pass is not a scope.
+    """
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        workspace_id: str = DEFAULT_WORKSPACE,
+        sessions: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._engine = engine
+        self._workspace_id = workspace_id
+        self._sessions = sessions or session_factory(engine)
+
+    @property
+    def workspace_id(self) -> str:
+        return self._workspace_id
+
+    @property
+    def sessions(self) -> async_sessionmaker[AsyncSession]:
+        """This store's session factory.
+
+        Public for the suites that have to drive a row into a state no method here produces —
+        a hash without an expiry, a ``system`` turn — which is precisely the state the
+        predicates on the anonymous read exist to refuse and the only way to prove they are
+        not inert.
+        """
+        return self._sessions
+
+    # --- conversations --------------------------------------------------------------
+
+    async def ensure_workspace(self) -> None:
+        """Create this store's workspace row if it is absent. Idempotent.
+
+        The same call the document store makes, and for the same reason: every table here
+        cascades from ``workspaces``, so a handle bound to a workspace that has never been
+        written is a foreign-key failure on the first conversation rather than on the first
+        document.
+        """
+        async with self._sessions.begin() as session:
+            if await session.get(models.Workspace, self._workspace_id) is None:
+                session.add(
+                    models.Workspace(id=self._workspace_id, name=self._workspace_id, settings={})
+                )
+
+    async def create_conversation(
+        self, *, user_id: str | None = None, title: str | None = None
+    ) -> str:
+        """Start a conversation in **this handle's** workspace.
+
+        There is deliberately no ``workspace_id`` parameter. One would re-introduce exactly
+        what binding the scope to the handle exists to prevent — a scope you can forget to
+        pass, or pass wrongly — and it let a store bound to one tenant create a conversation
+        inside another.
+        """
+        conversation_id = _new_id("conv")
+        async with self._sessions.begin() as session:
+            session.add(
+                models.Conversation(
+                    id=conversation_id,
+                    workspace_id=self._workspace_id,
+                    user_id=user_id,
+                    title=title,
+                    shared=False,
+                )
+            )
+        return conversation_id
+
+    async def soft_delete_conversation(self, conversation_id: str) -> bool:
+        """Soft-delete a conversation, which also revokes any share link.
+
+        The revocation is not a courtesy. A public read that lacks ``deleted_at IS NULL`` —
+        uniquely among every query in a file — is how deleting a conversation leaves its
+        contents readable by anyone holding the URL.
+        """
+        async with self._sessions.begin() as session:
+            result = await session.execute(
+                update(models.Conversation)
+                .where(
+                    models.Conversation.id == conversation_id,
+                    models.Conversation.workspace_id == self._workspace_id,
+                    models.Conversation.deleted_at.is_(None),
+                )
+                .values(deleted_at=utcnow(), shared=False, share_token_hash=None)
+            )
+            return _touched(result)
+
+    # --- messages -------------------------------------------------------------------
+
+    async def append(self, message: StoredMessage) -> str:
+        """Write one turn into a conversation **this handle owns**, and return its id.
+
+        The foreign key alone is not a scope: it only says the conversation exists. Without
+        the workspace and soft-delete checks a store bound to one tenant could append to
+        another's conversation — and, since a shared link renders a conversation at an
+        unauthenticated URL, that is content injection into a public page.
+
+        Raises:
+            UnknownConversationError: No live conversation of that id in this workspace.
+        """
+        message_id = _new_id("msg")
+        async with self._sessions.begin() as session:
+            owned = (
+                await session.execute(
+                    select(models.Conversation.id).where(
+                        models.Conversation.id == message.conversation_id,
+                        models.Conversation.workspace_id == self._workspace_id,
+                        models.Conversation.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if owned is None:
+                msg = (
+                    f"conversation {message.conversation_id!r} is not a live conversation in "
+                    f"workspace {self._workspace_id!r}, so this turn has nowhere to go"
+                )
+                raise UnknownConversationError(msg)
+            session.add(
+                models.Message(
+                    id=message_id,
+                    conversation_id=message.conversation_id,
+                    role=message.role,
+                    content=message.content,
+                    sources=cast("object", _CITATIONS.dump_python(message.citations, mode="json")),
+                    profile_used=message.profile_used,
+                    confidence_score=message.confidence_score,
+                    response_time_ms=message.response_time_ms,
+                    finish_reason=(message.finish_reason.value if message.finish_reason else None),
+                    query_log_id=message.query_log_id,
+                )
+            )
+        return message_id
+
+    async def history(self, conversation_id: str, *, limit: int = 20) -> Sequence[Turn]:
+        """Prior turns, oldest first, each carrying the citations it was stored with.
+
+        ``limit`` bounds the *rows read*, and the newest are the ones kept: an old turn that
+        is about to be dropped by the token budget anyway is not worth reading. The budget
+        itself is applied afterwards, in whole paired turns, against the generation model's
+        tokenizer.
+        """
+        async with self._sessions() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(models.Message)
+                        .join(
+                            models.Conversation,
+                            models.Conversation.id == models.Message.conversation_id,
+                        )
+                        .where(
+                            models.Message.conversation_id == conversation_id,
+                            models.Conversation.workspace_id == self._workspace_id,
+                            models.Conversation.deleted_at.is_(None),
+                            models.Message.role.in_(("user", "assistant")),
+                        )
+                        .order_by(models.Message.created_at.desc(), sql_text("messages.rowid DESC"))
+                        .limit(max(limit, 0))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [_to_turn(row) for row in reversed(rows)]
+
+    async def record_feedback(
+        self,
+        message_id: str,
+        *,
+        feedback: Feedback,
+        reason: FeedbackReason | None = None,
+        comment: str = "",
+    ) -> bool:
+        """Rate an answer. **Returns whether a row actually matched.**
+
+        Two corrections in one method. Reporting success without checking the row count means
+        feedback on a mistyped or foreign id is silently accepted and never seen again; and
+        the value is written from an enum rather than from whatever string arrived, so the
+        column cannot fill up with vocabulary nobody defined.
+        """
+        async with self._sessions.begin() as session:
+            result = await session.execute(
+                update(models.Message)
+                .where(
+                    models.Message.id == message_id,
+                    models.Message.conversation_id.in_(
+                        select(models.Conversation.id).where(
+                            models.Conversation.workspace_id == self._workspace_id,
+                            models.Conversation.deleted_at.is_(None),
+                        )
+                    ),
+                )
+                .values(
+                    feedback=feedback.value,
+                    feedback_reason=reason.value if reason else None,
+                    feedback_comment=comment or None,
+                    feedback_at=utcnow(),
+                )
+            )
+            return _touched(result)
+
+    # --- sharing --------------------------------------------------------------------
+
+    async def create_share(self, link: ShareLink, *, maximum_ttl_s: int) -> bool:
+        """Record a minted link. Replaces any previous one for this conversation.
+
+        **The conversation comes from the link**, and there is deliberately no second id
+        argument. With one, a link minted for conversation A could be installed on B and would
+        then serve B's transcript to anyone holding A's token — two ids that must agree, with
+        nothing making them.
+
+        **The ceiling is re-checked here**, because ``ShareLink`` is an ordinary public value
+        object: a caller can build one directly and never reach the clamp in
+        :func:`~manicule.generation.sharing.new_share`. This is the store, so this is the
+        choke point — a lifetime past the policy is refused rather than clamped, because
+        silently shortening what a caller asked for hides the misconfiguration.
+
+        ``shared_at`` is clamped rather than refused: a boundary in the future exposes turns
+        that have not been written yet, which is the live view §11.2 removes, and clamping it
+        to now is exactly what the caller meant.
+
+        Replacing rather than accumulating is what makes re-sharing an explicit new act that
+        produces a **new snapshot**: the old token stops working the moment a new one is
+        minted, so there is never more than one live link per conversation to reason about.
+        """
+        now = utcnow()
+        if link.expires_at > now + timedelta(seconds=maximum_ttl_s):
+            msg = (
+                f"the share link for {link.conversation_id!r} expires at {link.expires_at}, "
+                f"past the {maximum_ttl_s}s ceiling in security.sharing.link_ttl_s. Mint it "
+                f"with manicule.generation.sharing.new_share, which clamps to the ceiling."
+            )
+            raise ValueError(msg)
+        async with self._sessions.begin() as session:
+            result = await session.execute(
+                update(models.Conversation)
+                .where(
+                    models.Conversation.id == link.conversation_id,
+                    models.Conversation.workspace_id == self._workspace_id,
+                    models.Conversation.deleted_at.is_(None),
+                )
+                .values(
+                    shared=True,
+                    share_token_hash=link.token_hash,
+                    share_expires_at=link.expires_at,
+                    # Never later than now: a snapshot boundary in the future exposes turns
+                    # that have not been written yet, which is the live view by another name.
+                    shared_at=min(link.shared_at, now),
+                )
+            )
+            return _touched(result)
+
+    async def revoke_share(self, conversation_id: str) -> bool:
+        """Revoke a link by **clearing the hash**, not by flipping a flag beside it.
+
+        A boolean turned off next to a still-valid token is a revocation that depends on every
+        future reader remembering to check the boolean.
+        """
+        async with self._sessions.begin() as session:
+            result = await session.execute(
+                update(models.Conversation)
+                .where(
+                    models.Conversation.id == conversation_id,
+                    models.Conversation.workspace_id == self._workspace_id,
+                )
+                .values(shared=False, share_token_hash=None, share_expires_at=None)
+            )
+            return _touched(result)
+
+    async def shared_conversation(
+        self, token_hash: str, *, now: datetime, sharing_enabled: bool
+    ) -> Sequence[SharedTurn]:
+        """The conversation a live token names, as an anonymous viewer receives it.
+
+        **It resolves the token itself, in one statement.** An earlier shape took a
+        conversation id and checked only ``deleted_at IS NULL``, which meant holding an id was
+        enough: revoked links, expired links and other tenants' conversations all still
+        rendered, because ``shared_at`` is deliberately left set on revocation. A second shape
+        resolved the token and then read the messages, which is two statements with no read
+        snapshot between them — pysqlite opens an implicit transaction before DML only, so an
+        owner's revocation landing between them still served the transcript. This is the join,
+        so every predicate is evaluated against the same row at the same instant.
+
+        ``sharing_enabled`` has no default. It is the one predicate the store cannot evaluate
+        for itself, it is checked on the **read** path because an operator switching sharing
+        off has decided the disclosure already made is the problem, and every other decision
+        here fails closed — so the one that could fail open by omission is one the caller must
+        state.
+
+        It is a **snapshot**: only turns written at or before ``shared_at``.
+
+        Returns citation **labels**, never passage text, never a document or chunk id, and —
+        deliberately — no conversation id either. Handing one back would rebuild the two-step
+        this method exists to replace, since a store handle bound to the owning workspace can
+        turn an id into full citations through :meth:`history`.
+        """
+        if not sharing_enabled or not token_hash:
+            # `col == None` renders `IS NULL`, so an empty token would match rows whose hash is
+            # null rather than matching nothing. Unreachable today — revocation clears `shared`
+            # alongside the hash — and total if it were ever reached.
+            return []
+        async with self._sessions() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(models.Message)
+                        .join(
+                            models.Conversation,
+                            models.Conversation.id == models.Message.conversation_id,
+                        )
+                        .where(
+                            models.Conversation.share_token_hash == token_hash,
+                            models.Conversation.shared.is_(True),
+                            models.Conversation.deleted_at.is_(None),
+                            # No `IS NOT NULL` beside either comparison. Both were here and
+                            # both were provably inert: SQL's three-valued logic makes
+                            # `NULL > now` and `created_at <= NULL` neither true nor false, so
+                            # the comparison already excludes an unset column. Kept, they
+                            # would be the redundant predicates a later reader deletes as
+                            # noise — and deleting the *comparison* instead is the mistake
+                            # that costs something. The behaviour they described is pinned by
+                            # tests either way.
+                            models.Conversation.share_expires_at > now,
+                            models.Message.created_at <= models.Conversation.shared_at,
+                            models.Message.role.in_(("user", "assistant")),
+                        )
+                        .order_by(models.Message.created_at, sql_text("messages.rowid"))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [_to_shared_turn(row) for row in rows]
+
+
+def _touched(result: object) -> bool:
+    """Whether a statement actually changed a row.
+
+    SQLAlchemy types ``execute`` as returning ``Result``, which has no ``rowcount``, while an
+    UPDATE really returns a ``CursorResult``. Narrowing rather than ignoring the type keeps
+    the important half honest: **the row count is the assertion**, because reporting success
+    without checking it is how feedback on a mistyped id is accepted and never seen again.
+    """
+    return isinstance(result, CursorResult) and cast("CursorResult[Any]", result).rowcount > 0
+
+
+def _to_shared_turn(row: models.Message) -> SharedTurn:
+    """One turn as an anonymous viewer receives it.
+
+    The projection happens **here**, in the only path that serves an unauthenticated reader,
+    rather than in a helper a route has to remember to call.
+    """
+    role = "assistant" if row.role == "assistant" else "user"
+    return SharedTurn(
+        role=role,
+        content=row.content,
+        citations=tuple(redact_for_anonymous(citation) for citation in _citations(row.sources)),
+    )
+
+
+def _to_turn(row: models.Message) -> Turn:
+    role = "assistant" if row.role == "assistant" else "user"
+    return Turn(role=role, content=row.content, citations=_citations(row.sources))
+
+
+def _citations(stored: object) -> tuple[Citation, ...]:
+    """Rehydrate stored citations, tolerating rows written before this column had a shape.
+
+    A row that cannot be validated yields **no** citations rather than a partial set: a
+    citation is a claim about a location, and half of one is not a weaker claim, it is a
+    different one.
+    """
+    if not stored:
+        return ()
+    try:
+        return _CITATIONS.validate_python(stored)
+    except ValueError:
+        return ()
+
+
+def message_finish_reason(row: models.Message) -> FinishReason | None:
+    """How a stored answer ended, or ``None`` for a turn that never had a generation."""
+    if row.finish_reason is None:
+        return None
+    try:
+        return FinishReason(row.finish_reason)
+    except ValueError:
+        return None
+
+
+__all__ = [
+    "DEFAULT_WORKSPACE",
+    "SqliteConversationStore",
+    "UnknownConversationError",
+    "message_finish_reason",
+]

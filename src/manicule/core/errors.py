@@ -169,6 +169,80 @@ class ContextOverflowError(ManiculeError):
     """
 
 
+# --- generation ------------------------------------------------------------------------
+
+
+class GenerationError(ManiculeError):
+    """Base class for failures on the answer path.
+
+    Provider libraries raise their own hierarchies. Those stop at the adapter and become one
+    of these, for the reason ``docs/contracts.md`` §5 gives: a provider-shaped type in core
+    forces every consumer to learn every provider, and the set of providers only grows.
+
+    Every subclass keeps the provider's own message text. Discarding it is how
+    ``"OpenAI error: 429"`` becomes an operator's whole afternoon.
+    """
+
+
+class ProviderAuthError(GenerationError):
+    """The provider rejected the credential.
+
+    Names the environment variable that was read, because "unauthorized" without it sends
+    somebody to the wrong dashboard. Never retried: a bad key does not improve by being
+    presented three times.
+    """
+
+
+class ProviderRateLimitError(GenerationError):
+    """The provider is throttling. Retryable before the first token, and only then."""
+
+
+class ProviderConnectionError(GenerationError):
+    """The provider could not be reached at all."""
+
+
+class ProviderTimeoutError(GenerationError):
+    """A generation exceeded one of its three deadlines.
+
+    Three, because one covers the wrong interval: time to first token, the gap between two
+    tokens, and total wall clock. A budget that only bounds the connect leaves a provider
+    that opens a stream and then stops sending indistinguishable from a slow answer.
+    """
+
+
+class ContextWindowError(GenerationError):
+    """The server says the prompt did not fit the window.
+
+    **A defect in the startup cross-check, not a runtime condition to absorb.** Reaching it
+    means manicule's estimate and the server disagreed by more than the safety factor, so it
+    surfaces with both counts and the model named rather than being retried or trimmed.
+    """
+
+
+class ContentFilteredError(GenerationError):
+    """The provider refused to produce or continue the answer."""
+
+
+class ProviderRequestError(GenerationError):
+    """A provider rejection with no more specific mapping.
+
+    The catch-all arm, and it is deliberately last: ``ContextWindowExceededError`` and
+    ``ContentPolicyViolationError`` both subclass litellm's ``BadRequestError``, so a generic
+    bad-request arm placed above them swallows the two cases with actionable remedies. The
+    mapping is table-driven rather than a chain of ``except`` blocks precisely so that a
+    correct-looking refactor cannot silently delete a diagnosis.
+    """
+
+
+class RedactionError(GenerationError):
+    """Redaction could not be completed, so nothing was sent.
+
+    The fail-safe direction is refuse-to-send. There is no path where a timeout, an exception
+    or a mistake results in unredacted text reaching a remote model — which is what makes the
+    setting a boundary rather than a best effort.
+    """
+
+
 class TokenStateError(ManiculeError):
     """A backend returned something other than per-token hidden states.
 
@@ -191,9 +265,12 @@ __all__ = [
     "ConfigError",
     "ContainerError",
     "ContainerStateError",
+    "ContentFilteredError",
     "ContextOverflowError",
+    "ContextWindowError",
     "DuplicateComponentError",
     "FingerprintMismatchError",
+    "GenerationError",
     "IncompatiblePluginError",
     "InstanceLockedError",
     "ManiculeError",
@@ -204,7 +281,13 @@ __all__ = [
     "PluginError",
     "PluginLoadError",
     "PolicyError",
+    "ProviderAuthError",
+    "ProviderConnectionError",
+    "ProviderRateLimitError",
+    "ProviderRequestError",
+    "ProviderTimeoutError",
     "ReconciliationRefusedError",
+    "RedactionError",
     "TokenStateError",
     "UnknownComponentError",
     "UnknownEntityError",
