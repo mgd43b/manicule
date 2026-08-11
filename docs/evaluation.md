@@ -150,6 +150,14 @@ be a second copy of the truth, and the copy is the one that goes stale. The harn
 run whose sides changed configuration midway, because half the records would then name a
 pipeline that was not running when they were made and nothing in the file would say which half.
 
+The **route is deliberately not part of that configuration.** It is a property of the query:
+folding it in makes a query set containing "hello" look like a pipeline that changed between
+query 3 and query 4, and the run is then refused with a message that misdiagnoses it entirely.
+Where the route matters it matters as a reason a pairing is not a measurement, so a query the
+router answered directly ([`retrieval.md`](retrieval.md) §9) is marked incomparable — the
+corpus was never consulted, and two empty lists a judge scores as "neither" would otherwise
+read as both systems failing a question neither was asked.
+
 ### 4.1 Per-stage attribution comes nearly free
 
 Every result carries a `StageObservation` per stage — name, wall time, candidates in and out,
@@ -190,6 +198,18 @@ guarding a verdict that was never in doubt:
 | Too few items for a *perfect* run to reach `alpha` | A check whose failing verdict is unconditional is not a check. It would report a flawless system as being at chance — the mirror image of the failure this exists to prevent, and just as useless |
 
 The third refusal names how many items the probe would need, computed from the chance rate.
+
+`k / N` treats the `k` results as `k` distinct documents. A system returning several chunks of
+one document examines fewer than that, so the real chance of a hit is lower and this null is an
+over-estimate — an error that runs in the safe direction and only that direction, since an
+over-stated null makes the test harder to pass and can never admit a system that is guessing.
+
+**A `ProbeOutcome` re-does its own arithmetic** whenever one is constructed: `hit_rate`,
+`chance_rate` and `p_value` are all recomputed from `hits`, `trials`, `k` and `pool_size`, and
+a disagreement beyond floating-point slack refuses the record. Recording the inputs beside the
+verdict is not enough on its own, because outcomes are read back off disk and a file is exactly
+where a hand-edited or foreign record enters. Without it, a record claiming a decisive
+`p_value` beside one hit in twenty-four passes every other check in this package.
 
 ### 5.1 The rule is enforced in three places, and none is redundant
 
@@ -308,6 +328,8 @@ evaluation set spent on the question that was already answerable.
 | Chance is a hypothesis test against `k / N`, at `alpha = 0.01` | §5 |
 | A probe that could not have detected a perfect system refuses to run | §5 |
 | The chance-level rule is enforced at run time, at record construction, and at report time | §5.1 |
+| The route is a property of the query, not the configuration, and a routed-away query is not a measurement | §4 |
+| A probe outcome recomputes its own derived figures and refuses a record whose arithmetic does not hold | §5 |
 | Sides are blinded by a keyed hash of the query id | §6 |
 | Wilson intervals rather than the normal approximation | §7 |
 | Ties and `neither` are counted apart and both dropped from the rate | §7 |

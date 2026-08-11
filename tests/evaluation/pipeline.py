@@ -21,6 +21,7 @@ from manicule.retrieval.cache import L1QueryCache
 from manicule.retrieval.dense import DenseStage
 from manicule.retrieval.profile import Profiles
 from manicule.retrieval.retriever import Retriever
+from manicule.retrieval.router import QueryRouter
 from manicule.retrieval.runner import PipelineRunner
 from manicule.retrieval.tokens import ContextTokenCounter
 from tests.evaluation.fakes import CosineVectorStore
@@ -110,11 +111,13 @@ async def dense_only_retriever(
     chunks: list[Chunk],
     *,
     cache: L1QueryCache | None = None,
+    router: QueryRouter | None = None,
 ) -> Retriever:
     """The shipped retriever with one stage: the shipped dense leg over ``embedder``.
 
-    ``cache`` exists so that a retriever whose cache can hit can be built on purpose, which is
-    what lets the adapter's refusal be demonstrated rather than asserted.
+    ``cache`` and ``router`` exist so that the two conditions the adapter has something to say
+    about — a cache that can hit, and a query the router answers without consulting the corpus
+    — can be built on purpose rather than asserted about.
     """
     vectors = CosineVectorStore()
     await vectors.ensure_ready(embedder.fingerprint)
@@ -128,6 +131,7 @@ async def dense_only_retriever(
         assembler=ContextAssembler(counter=ContextTokenCounter(), profiles=profiles),
         profiles=profiles,
         cache=cache,
+        router=router,
         legs=(),
         embed_fingerprint=embedder.fingerprint.canonical(),
     )

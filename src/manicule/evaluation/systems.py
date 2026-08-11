@@ -28,7 +28,8 @@ from manicule.evaluation.corpus import CorpusVersion
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
-    from manicule.retrieval.retriever import Retriever
+    from manicule.retrieval.retriever import RetrievalResult, Retriever
+    from manicule.retrieval.trace import RetrievalTrace
 
 CACHE_MUST_BE_OFF = (
     "the retriever under comparison has its L1 query cache available, and a cache hit is not a "
@@ -232,8 +233,13 @@ class RetrieverSystem:
             )
             for candidate in result.candidates[:limit]
         )
+        # The route is deliberately *not* folded in here. It is a property of the query, not
+        # of the configuration: a query set containing "hello" would otherwise make the
+        # configuration differ between two queries of one run, and the harness would refuse the
+        # run with a message about a pipeline that changed — a misdiagnosis of a query set doing
+        # something entirely ordinary. Where the route matters, it matters as a reason this
+        # pairing is not a measurement, which is the line below.
         configuration: Metadata = dict(trace.pipeline.model_dump(mode="json"))
-        configuration["route"] = trace.route.value
         configuration["limit"] = limit
         return SystemResult(
             config_label=self._config_label,
@@ -251,8 +257,30 @@ class RetrieverSystem:
                 for span in trace.stages
             ),
             latency_ms=trace.total_ms,
-            incomparable=tuple(trace.incomparable),
+            incomparable=_incomparable(result, trace),
         )
+
+
+def _routed_away(route: str) -> str:
+    """Why a query the router answered directly is not a retrieval measurement."""
+    return (
+        f"the router answered this directly ({route}), so the corpus was never consulted and "
+        f"the empty result is not a retrieval failure"
+    )
+
+
+def _incomparable(result: RetrievalResult, trace: RetrievalTrace) -> tuple[str, ...]:
+    """Every reason this run may not count towards a rate.
+
+    The trace's own reasons — a degraded leg, a cache hit, a search stopped by its own budget —
+    plus the one the trace records without calling incomparable: a query that never reached
+    retrieval at all. Left uncounted, such a pairing is two empty lists a judge scores as
+    "neither", which reads as both systems failing on a question neither was asked.
+    """
+    reasons = list(trace.incomparable)
+    if not result.cites_the_corpus:
+        reasons.append(_routed_away(trace.route.value))
+    return tuple(reasons)
 
 
 __all__ = [

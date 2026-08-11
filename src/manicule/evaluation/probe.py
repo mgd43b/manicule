@@ -84,6 +84,13 @@ show up as a working system failing the probe.
 TITLE_PAGE = 200
 """Documents read per round trip when deriving probe items."""
 
+ARITHMETIC_TOLERANCE = 1e-9
+"""How far a recorded figure may sit from its recomputation before the outcome is refused.
+
+Floating-point slack rather than a margin of judgement: the check re-runs the same
+computations that produced the numbers, so anything larger means they came from somewhere else.
+"""
+
 
 class ProbeItem(BaseModel):
     """One question whose correct answer is known without anybody judging anything."""
@@ -118,8 +125,12 @@ class ProbeItem(BaseModel):
 class ProbeOutcome(BaseModel):
     """What the probe measured, in the form that makes the verdict checkable.
 
-    Every input to :attr:`discriminates` is recorded beside it. A verdict whose arithmetic
-    cannot be re-done from the record is a verdict that has to be trusted.
+    Every input to :attr:`discriminates` is recorded beside it, **and the arithmetic is re-done
+    whenever one of these is constructed.** Recording the inputs is not enough on its own: a
+    verdict nobody recomputes is a verdict that has to be trusted, and this type is read back
+    off disk by :func:`~manicule.evaluation.report.build_report`, where "trusted" means
+    "whatever the file says". A record claiming a decisive ``p_value`` beside one hit in
+    twenty-four would otherwise pass every guard in this package and launder noise into a rate.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -133,6 +144,33 @@ class ProbeOutcome(BaseModel):
     hit_rate: float = Field(ge=0.0, le=1.0)
     p_value: float = Field(ge=0.0, le=1.0)
     alpha: float = Field(gt=0.0, lt=1.0)
+
+    @model_validator(mode="after")
+    def _the_arithmetic_holds(self) -> Self:
+        """Recompute every derived field and refuse the outcome if any disagrees.
+
+        The tolerance is floating-point slack, not a margin: these are the same computations
+        that produced the numbers, so anything beyond rounding means the record was not
+        produced by a probe.
+        """
+        if self.hits > self.trials:
+            msg = f"{self.hits} hits in {self.trials} trials is not possible"
+            raise ValueError(msg)
+        checks: tuple[tuple[str, float, float], ...] = (
+            ("hit_rate", self.hit_rate, self.hits / self.trials),
+            ("chance_rate", self.chance_rate, self.k / self.pool_size),
+            ("p_value", self.p_value, binomial_tail(self.hits, self.trials, self.chance_rate)),
+        )
+        for name, recorded, recomputed in checks:
+            if abs(recorded - recomputed) > ARITHMETIC_TOLERANCE:
+                msg = (
+                    f"{name} is recorded as {recorded!r} but recomputing it from this outcome's "
+                    f"own numbers gives {recomputed!r}. A probe outcome whose arithmetic does "
+                    f"not hold was not produced by a probe, and the verdict it carries decides "
+                    f"whether a whole file of judgements counts"
+                )
+                raise ValueError(msg)
+        return self
 
     @property
     def discriminates(self) -> bool:
@@ -186,6 +224,12 @@ class DiscriminationProbe:
 
     async def run(self, system: SystemUnderComparison) -> ProbeOutcome:
         """Measure the system. Raises only when no honest verdict is available.
+
+        ``k / N`` treats the ``k`` results as ``k`` distinct documents. A system returning
+        several chunks of one document examines fewer documents than that, so the real chance
+        of a hit is lower and this null is an over-estimate. That error runs in the safe
+        direction and only that direction: an over-stated null makes the test harder to pass,
+        so it can make a working system look worse and can never admit one that is guessing.
 
         Raises:
             ProbeUnusableError: The corpus size is unknown, or is too small for ``k`` results

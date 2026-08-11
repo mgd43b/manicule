@@ -99,18 +99,19 @@ class SlotJudge:
         return pairing.resolve(self._slot), f"always chose slot {self._slot.value}"
 
 
-KEYS = {
-    "a": Preference.LEFT,
-    "b": Preference.RIGHT,
-    "t": Preference.TIE,
-    "n": Preference.NEITHER,
-}
-"""What a keypress means, before blinding is undone.
+SLOT_KEYS = {"a": Slot.A, "b": Slot.B}
+"""Keypresses that name a *slot*, which must be resolved through the pairing.
 
-``a`` and ``b`` are *slots*, not sides — :meth:`StreamJudge.judge` resolves them through the
-pairing. Mapping them straight onto systems here is precisely the bug blinding exists to
-prevent, and it would be invisible in every report.
+Kept in a separate table from :data:`VERDICT_KEYS` rather than one map of mixed meanings.
+Pressing ``a`` does not mean "prefer the left system" — it means "prefer whatever was shown
+first", and which system that was is a keyed hash of the query id. A single table returning a
+:class:`~manicule.evaluation.preference.Preference` for ``a`` would invite exactly the
+one-line simplification that discards the blinding, and the resulting bias would be invisible
+in every report it produced.
 """
+
+VERDICT_KEYS = {"t": Preference.TIE, "n": Preference.NEITHER}
+"""Keypresses that name an outcome directly. Neither names a side, so neither needs resolving."""
 
 PROMPT = "[a] A better  [b] B better  [t] tie  [n] neither  [s] skip  [q] quit > "
 
@@ -191,21 +192,21 @@ class StreamJudge:
                 raise JudgingStoppedError(msg)
             if key in {"s", "skip", ""}:
                 return None
-            decision = KEYS.get(key)
-            if decision is Preference.LEFT:
-                return pairing.resolve(Slot.A), ""
-            if decision is Preference.RIGHT:
-                return pairing.resolve(Slot.B), ""
-            if decision is not None:
-                return decision, ""
+            slot = SLOT_KEYS.get(key)
+            if slot is not None:
+                return pairing.resolve(slot), ""
+            verdict = VERDICT_KEYS.get(key)
+            if verdict is not None:
+                return verdict, ""
             self._output.write(f"unrecognised choice {key!r}\n")
 
 
 __all__ = [
-    "KEYS",
     "PROMPT",
     "SHOWN",
+    "SLOT_KEYS",
     "SNIPPET",
+    "VERDICT_KEYS",
     "Judge",
     "JudgingStoppedError",
     "ScriptedJudge",

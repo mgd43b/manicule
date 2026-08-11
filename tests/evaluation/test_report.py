@@ -13,6 +13,7 @@ from manicule.evaluation.preference import Preference, PreferenceRecord, assign_
 from manicule.evaluation.probe import ProbeOutcome
 from manicule.evaluation.queries import Intent, Provenance
 from manicule.evaluation.report import ILLUSTRATIVE, UNVERIFIED_CORPUS, build_report
+from manicule.evaluation.statistics import binomial_tail
 from manicule.evaluation.systems import StageObservation, SystemResult
 from tests.evaluation.fakes import an_item
 
@@ -22,16 +23,24 @@ if TYPE_CHECKING:
 VERSION = CorpusVersion(label="fixture", digest="sha256:aaa", document_count=60)
 
 
-def an_outcome(label: str, *, hits: int = 20, p_value: float = 1e-12) -> ProbeOutcome:
+def an_outcome(label: str, *, hits: int = 20) -> ProbeOutcome:
+    """A probe outcome whose numbers agree with each other.
+
+    ``p_value`` is computed rather than supplied: the model recomputes it, so a fixture that
+    asserted one would be a fixture testing whether the arithmetic guard is switched on rather
+    than whatever the test is about.
+    """
+    trials, k, pool_size = 20, 3, 60
+    chance = k / pool_size
     return ProbeOutcome(
         config_label=label,
-        trials=20,
+        trials=trials,
         hits=hits,
-        k=3,
-        pool_size=60,
-        chance_rate=0.05,
-        hit_rate=hits / 20,
-        p_value=p_value,
+        k=k,
+        pool_size=pool_size,
+        chance_rate=chance,
+        hit_rate=hits / trials,
+        p_value=binomial_tail(hits, trials, chance),
         alpha=0.01,
     )
 
@@ -218,9 +227,7 @@ def test_records_naming_a_side_at_chance_are_not_summarised() -> None:
     here through the model's own back door being closed, which is why the fixture builds the
     record with a passing probe and the report is handed a doctored copy.
     """
-    doctored = a_record().model_copy(
-        update={"right_probe": an_outcome("beta", hits=1, p_value=0.7)}
-    )
+    doctored = a_record().model_copy(update={"right_probe": an_outcome("beta", hits=1)})
 
     with pytest.raises(AtChanceError, match="beta"):
         build_report([doctored])

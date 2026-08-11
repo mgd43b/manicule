@@ -28,7 +28,13 @@ from manicule.evaluation.errors import (
     ProbeUnusableError,
     UnderpoweredProbeError,
 )
-from manicule.evaluation.probe import DiscriminationProbe, ProbeItem, probe_from_titles
+from manicule.evaluation.probe import (
+    DiscriminationProbe,
+    ProbeItem,
+    ProbeOutcome,
+    probe_from_titles,
+)
+from manicule.evaluation.statistics import binomial_tail
 from manicule.evaluation.systems import RetrieverSystem
 from tests.evaluation.fakes import (
     BagOfWordsEmbedder,
@@ -40,7 +46,6 @@ from tests.evaluation.fakes import (
 from tests.evaluation.pipeline import SCOPE, build_corpus, dense_only_retriever
 
 if TYPE_CHECKING:
-    from manicule.evaluation.probe import ProbeOutcome
     from manicule.evaluation.systems import SystemUnderComparison
     from manicule.storage.docstore import SqliteDocStore
 
@@ -239,6 +244,48 @@ async def test_a_probe_item_with_no_known_answer_is_refused() -> None:
     """It would score as a miss for every system, dragging a working one towards chance."""
     with pytest.raises(ValueError, match="declares no correct answer"):
         ProbeItem(text="what is the gateway port")
+
+
+def _honest_outcome_fields() -> dict[str, object]:
+    """One hit in twenty-four against a 5% chance rate, every figure agreeing with the rest."""
+    return {
+        "config_label": "forged",
+        "trials": 24,
+        "hits": 1,
+        "k": 3,
+        "pool_size": 60,
+        "chance_rate": 0.05,
+        "hit_rate": 1 / 24,
+        "p_value": binomial_tail(1, 24, 0.05),
+        "alpha": 0.01,
+    }
+
+
+def test_a_probe_outcome_whose_arithmetic_does_not_hold_is_refused() -> None:
+    """The last hole in the chance-level guard, and it was open.
+
+    Every other refusal in this package reads ``ProbeOutcome.discriminates``, which is a
+    comparison between two recorded floats. Records are read back from a file, and a file is
+    exactly where a hand-edited or foreign one enters — so an outcome claiming a decisive
+    ``p_value`` beside one hit in twenty-four would have passed every check in this package and
+    laundered noise into a rate. The model now re-does the arithmetic it carries.
+    """
+    honest = _honest_outcome_fields()
+
+    assert not ProbeOutcome.model_validate(honest).discriminates
+
+    with pytest.raises(ValueError, match="p_value is recorded as"):
+        ProbeOutcome.model_validate({**honest, "p_value": 1e-30})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("hit_rate", 0.99), ("chance_rate", 0.5), ("hits", 30)],
+)
+def test_every_derived_figure_on_an_outcome_is_recomputed(field: str, value: float) -> None:
+    """Not only the p-value: each of these either decides a verdict or explains it."""
+    with pytest.raises(ValueError, match=r"recorded as|not possible"):
+        ProbeOutcome.model_validate({**_honest_outcome_fields(), field: value})
 
 
 async def test_titles_shared_by_two_documents_are_not_used_as_probes(

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from manicule.config.settings import RagSettings
 from manicule.evaluation.corpus import CorpusVersion, corpus_version_of
 from manicule.evaluation.systems import (
     CACHE_MUST_BE_OFF,
@@ -19,6 +20,8 @@ from manicule.evaluation.systems import (
     RetrieverSystem,
 )
 from manicule.retrieval.cache import L1QueryCache
+from manicule.retrieval.router import QueryRouter
+from manicule.retrieval.utility import handlers_for
 from tests.evaluation.fakes import BagOfWordsEmbedder
 from tests.evaluation.pipeline import SCOPE, build_corpus, dense_only_retriever
 
@@ -120,3 +123,43 @@ async def test_two_chunks_of_one_document_stay_two_results() -> None:
     result = await system.search("q", limit=10)
 
     assert result.document_ids == ("d1", "d1")
+
+
+async def test_a_query_the_router_answers_directly_is_marked_not_a_measurement(
+    store: SqliteDocStore,
+) -> None:
+    """Two bugs live here, and the first hides the second.
+
+    The route is a property of the query, not of the configuration. Recording it as
+    configuration made a query set containing "hello" look like a pipeline that changed
+    mid-run, and the harness refused the whole session with a message that misdiagnosed it
+    completely.
+
+    Underneath that: a routed-away query returns nothing because the corpus was never
+    consulted. Left unmarked, the pairing is two empty lists that a judge scores as "neither",
+    which reads as both systems failing a question neither was asked.
+    """
+    chunks = await build_corpus(store)
+    retriever = await dense_only_retriever(
+        store,
+        BagOfWordsEmbedder(),
+        chunks,
+        router=QueryRouter(RagSettings().router, available=handlers_for(store)),
+    )
+    system = RetrieverSystem(
+        retriever,
+        config_label="routed",
+        corpus_version=await corpus_version_of(store, label="fixture", workspace_ids=SCOPE),
+        workspace_ids=SCOPE,
+    )
+
+    retrieved = await system.search("aurora ledger configuration", limit=5)
+    greeted = await system.search("hello", limit=5)
+
+    assert greeted.items == ()
+    assert any("router answered this directly" in reason for reason in greeted.incomparable)
+    assert retrieved.incomparable == ()
+    assert greeted.configuration == retrieved.configuration, (
+        "the route is not configuration; recording it as such turns an ordinary query set "
+        "into a false report of configuration drift"
+    )
