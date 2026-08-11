@@ -16,10 +16,12 @@ from manicule.chunking import (
 )
 from manicule.chunking.breadcrumb import render
 from manicule.chunking.sentences import sentences
+from manicule.chunking.tokens import tiktoken_tokenizer_id
 from manicule.core.anchors import CellAnchor, LineAnchor, PageAnchor
 from manicule.core.content import BlockKind, Document, DocumentStatus, Metadata, ParsedBlock
 from manicule.core.embedding import EmbedFingerprint, Pooling, Vector
-from manicule.core.errors import ContextOverflowError
+from manicule.core.errors import ConfigError, ContextOverflowError
+from manicule.core.fingerprints import PROVISIONAL_TOKENIZER_PREFIX
 from manicule.testing import assert_chunker_contract
 
 TOKENIZER_ID = "test/whitespace"
@@ -162,6 +164,68 @@ def test_a_chunk_whose_blocks_disagree_about_language_claims_none() -> None:
 def test_a_provisional_count_is_inflated_rather_than_trusted() -> None:
     inflated = counter(provisional=True)("one two three four")
     assert inflated > int(4 * PROVISIONAL_SAFETY_FACTOR) - 1
+
+
+def test_two_stand_in_counters_that_disagree_do_not_share_a_fingerprint() -> None:
+    """The defect, in one line: an estimator returning 1 and one returning 999.
+
+    Both chunk a corpus differently and both used to record ``tokenizer_id`` as the literal
+    string ``"provisional"``, so the two fingerprints were byte-identical — an index built
+    with either was accepted as an index built with the other. Naming the counter is now
+    required, which makes the collision unrepresentable rather than merely unlikely.
+    """
+    one = TokenCounter.provisionally(lambda _: 1, tokenizer_id="always-one")
+    other = TokenCounter.provisionally(lambda _: 999, tokenizer_id="always-999")
+
+    assert one.tokenizer_id != other.tokenizer_id
+    assert StructuralChunker(one).fingerprint != StructuralChunker(other).fingerprint
+
+
+def test_a_stand_in_counter_that_cannot_name_itself_is_refused() -> None:
+    """``provisionally(lambda t: 1)`` is the call that produced two corpora with one identity.
+
+    A callable carries no version anyone can read — every lambda's ``__qualname__`` is
+    ``<lambda>`` and its ``id()`` differs between two runs of the same program — so deriving
+    an identity here would be either indistinguishing or irreproducible. The caller is the
+    only party that knows.
+    """
+    with pytest.raises(ConfigError, match="must name itself"):
+        TokenCounter.provisionally(lambda _: 1)
+
+    with pytest.raises(ConfigError, match="without a counter"):
+        TokenCounter.provisionally(tokenizer_id="pretending-to-be-tiktoken")
+
+
+def test_the_default_stand_in_records_its_vocabulary_and_its_version() -> None:
+    """``cl100k_base`` has meant different boundaries across releases; the name alone lies."""
+    identity = tiktoken_tokenizer_id()
+
+    assert identity.startswith("tiktoken/cl100k_base@")
+    assert identity != "tiktoken/cl100k_base@"
+
+
+def test_every_construction_path_stamps_the_provisional_identity() -> None:
+    """The public constructor inflates too, so it is where the stamp goes.
+
+    A caller reaching ``TokenCounter(...)`` directly — which the fixtures in this suite do —
+    would otherwise multiply every count by the safety factor while recording an id saying it
+    had not.
+    """
+    stamped = TokenCounter(TOKENIZER_ID, lambda text: len(text.split()), provisional=True)
+    measured = TokenCounter(TOKENIZER_ID, lambda text: len(text.split()), provisional=False)
+
+    assert stamped.tokenizer_id.startswith(PROVISIONAL_TOKENIZER_PREFIX)
+    assert str(PROVISIONAL_SAFETY_FACTOR) in stamped.tokenizer_id
+    assert TOKENIZER_ID in stamped.tokenizer_id
+    assert measured.tokenizer_id == TOKENIZER_ID
+    assert StructuralChunker(stamped).fingerprint.provisional
+    assert not StructuralChunker(measured).fingerprint.provisional
+
+
+def test_a_counter_that_names_nothing_cannot_be_built() -> None:
+    """An unnamed counter produces boundaries no fingerprint can describe."""
+    with pytest.raises(ConfigError, match="must name what counted"):
+        TokenCounter("", lambda _: 1, provisional=False)
 
 
 def test_the_fingerprint_records_everything_that_moves_a_boundary() -> None:

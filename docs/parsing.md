@@ -113,6 +113,30 @@ chunker only when no embedder is bound — parsing without embedding, as in a dr
 or a fixture test — and then a **1.5× safety factor** applies and the resulting chunks are
 marked `provisional` and refused by ingest. Provisional chunks never reach the index.
 
+**The refusal is a refusal, and the mark says everything.** Both halves of that sentence had
+been prose for a while and code for neither, which `contracts.md` §5 calls worse than an
+absent guarantee. Two things now hold, and they are one mechanism rather than two:
+
+- `require_measured` raises on a provisional fingerprint at the start of every run, before
+  discovery, and again in `IngestPipeline`'s constructor — because a pipeline is
+  constructible without going through the once-per-run check, and everything it writes is
+  permanent. There is no configuration that turns it off. A corpus counted with a stand-in
+  vocabulary is for inspection; nothing makes it fit to serve.
+- `tokenizer_id` records the whole of what a provisional count was, because a constant there
+  stands in for three things that each move every boundary:
+  `provisional:x1.5:tiktoken/cl100k_base@0.13.0`. The prefix is what the refusal reads, the
+  factor is the inflation, and the tail is the stand-in vocabulary *with its distribution
+  version* — `cl100k_base` has meant subtly different boundaries across `tiktoken` releases.
+  A caller injecting its own counter must name it; a callable has no version anyone can read,
+  since every lambda's `__qualname__` is `<lambda>` and its `id()` differs between two runs,
+  so the caller is the only party that knows and the caller says. **Two stand-in counters
+  that disagree about every boundary cannot share a fingerprint**, which was the defect: an
+  estimator returning 1 and one returning 999 produced byte-identical identity.
+
+Deriving `provisional` from the recorded string rather than storing it beside one is what
+keeps the two from drifting: a boolean field could read `False` next to a stamped id, and the
+refusal would then wave through exactly what it exists to stop.
+
 ### 1.3 The budget is on `embed_text`, not `text`
 
 `embed_text` is `text` with the heading breadcrumb prefixed (contracts.md §2, and §5
@@ -222,11 +246,24 @@ Two of the fields are less obvious than they look:
 
 - **`tokenizer_id`** — the same budget measured with a different tokenizer produces
   different boundaries. A model swap that keeps the dimension but changes the vocabulary
-  would otherwise pass the embedder check and quietly re-chunk.
+  would otherwise pass the embedder check and quietly re-chunk. It also carries the whole
+  identity of a stand-in counter, including its safety factor, for the reasons in §1.2 — and
+  `ChunkFingerprint.provisional` is read off it, so the refusal and the identity cannot
+  disagree.
 - **`grammars` is a per-language map, not one pack version.** A tree-sitter grammar upgrade
   changes parse trees, which changes code chunk boundaries (§8.3). Recording it per language
   means a Python grammar bump invalidates Python documents and nothing else — `changed_fields()`
   names exactly what moved.
+
+**What is deliberately *not* here: parser versions.** `grammars` looks like the precedent for
+folding `pypdfium2` and `selectolax` in beside it, and it is not one. A parser version decides
+`text`, which is upstream of chunking; `ChunkFingerprint` is compared once for a whole corpus,
+where a parser version has no honest corpus-wide value — recorded only for parsers that ran,
+the map would grow the first time a PDF was ingested and refuse the corpus it had just joined;
+recorded for every installed parser, a `pypdfium2` bump would refuse a corpus of Markdown no
+PDF library has touched. `grammars` escapes this only because the declared language set is
+configuration, fixed before the run. So parser versions get their own fingerprint, per
+document, in §3.0.
 
 ### 1.8 What would have to be true to change it
 
@@ -536,6 +573,65 @@ one that rewrites `embed_text` without declaring it, which corrupts no citation 
 a corpus no fingerprint describes. `contracts.md` §5 is explicit that an unenforced guarantee
 is worse than an absent one, and that is the reasoning that removed the `permissions` field;
 a rule living only here would be the same failure.
+
+#### The rule holds within a parser version, and is quietly false across one
+
+"`text` may not be modified after the parser emits it" is scoped to one installation of one
+set of libraries, and nothing above says so. Ten libraries decide what a document is reduced
+to — `pypdfium2`, `selectolax`, `lxml`, `python-docx`, `python-pptx`, `python-calamine`,
+`nbformat`, `markdown-it-py`, `ruamel.yaml`, and tree-sitter, of which only the last was
+recorded anywhere. A bump to any of the others changes what the same bytes produce, and it
+is silent for a specific reason: change detection compares the **connector's source bytes**,
+which a library upgrade does not touch, so nothing already stored is ever re-read while a
+newly ingested document with identical bytes parses differently. The corpus ends up holding
+two generations of extracted text with no column able to say which is which.
+
+**Anchors are the sharper edge.** `assert_parser_contract` checks that an anchor resolves to
+the text its block claims *at parse time*, and says nothing about anchors stored under a
+previous version. A library that changes an offset or coordinate convention leaves old
+anchors resolving into text produced differently — a plausible, wrong location, which is
+exactly the defect this document exists to prevent.
+
+```
+ParseFingerprint  parser, version, libraries: {distribution: version}
+```
+
+**Per document, in `documents.parse_fp`, with no counterpart in `index_state`.** That is the
+decision, and it is forced rather than chosen. One document has one parser, so there is no
+single parse identity a whole index can be compared against, and a corpus-wide refusal would
+have to be either wrong-in-time (a map that grows mid-run, refusing a corpus at the moment it
+gains its first PDF) or wrong-in-scope (a `pypdfium2` bump refusing a corpus of Markdown).
+Per-document lineage is the honest scope, and it is the scope that gives selective
+invalidation for free, as [`storage.md`](storage.md) §6.4 already sets out for `chunk_fp`.
+
+Three properties of what is recorded:
+
+- **`version` is manicule's own extraction rules**, bumped by hand when this repository
+  changes which blocks a parser emits or what its anchors address. Without it, the one change
+  a maintainer makes deliberately would be the only one nothing records. §3.2 already does
+  this for one case, under the name `web-blocks/1`.
+- **`libraries` names only what actually decides the output**, in PEP 503 canonical form —
+  `ruamel-yaml`, never `ruamel.yaml`, because the same distribution spelled two ways is two
+  keys and a bump that appears to change nothing. `docx` and `pptx` name `lxml`, which neither
+  wrapper mentions and both parse OOXML *with*; `email` names `selectolax`, because an
+  HTML-only body's line numbers address the converted text; `sourcecode` names the tree-sitter
+  runtime and not the grammar pack, which `ChunkFingerprint.grammars` already records per
+  language. An empty map is a real answer — `adf`, `archive` and `plaintext` are built on the
+  standard library and cannot be moved by a dependency bump.
+- **Nothing is invented.** A distribution that is not installed raises rather than defaulting;
+  a parser manicule does not ship records no fingerprint at all, because its version is not
+  something this repository can read, and a placeholder in an identity field is the defect one
+  level along.
+
+**Two paths act on it, and both are needed.** Change detection stops treating a document as
+unchanged when its parser has moved, so the next sync re-parses exactly the documents that
+parser produced — *at both levels*, because a source whose version token has not moved never
+reaches the byte comparison, and a check placed only there would leave every well-behaved
+connector's corpus permanently stale. And `reindex --re-parse` selects the complement of the
+currently installed fingerprints, which closes the window between an upgrade and the next
+sync without touching the network. Existing rows are **not** backfilled: `NULL` means no
+recorded lineage, which selects for repair, and writing today's versions into them would
+assert something nobody knows.
 
 ### 3.1 Resolution has to be part of the protocol
 
@@ -1361,14 +1457,69 @@ is recorded rather than inferred from a cache directory.
 grammar is permissively licensed — MIT, Apache-2.0, BSD, ISC or similar — and that copyleft
 licences (GPL, AGPL, LGPL, MPL) are not accepted. Individual grammar licences vary across
 those permissive terms, which is fine under any licence this project might carry. The
-packaging step still asserts
-the policy rather than trusting it: dump the licence list at build time and fail on any
-copyleft entry, so a change in upstream policy surfaces as a build failure instead of a
-licence problem discovered later.
+packaging step still asserts the policy rather than trusting it, and §8.1.1 is where that
+happens: a bundle build fails on any copyleft term, so a change in upstream policy surfaces as
+a build failure instead of a licence problem discovered later.
 
-**Filed, because it is the one weak point left:** an offline grammar bundle, so
-`uv tool install manicule` on a machine with no GitHub access can still parse code
-(§14).
+### 8.1.1 The offline bundle
+
+Pre-seeding closes the ordinary case and not the air-gapped one. `prefetch` still *fetches*,
+and a host with no route to the grammar release has nothing to fetch from; pointing the
+manifest URL at an internal mirror works and assumes somebody has a mirror, which is exactly
+the assumption an air-gapped site cannot make. So grammars can arrive with the install
+instead: **a bundle is a directory of grammar libraries plus a manifest**, built by
+`tools/build_grammar_bundle.py` on a machine that does have network access, and carried to the
+target by whatever moves the install itself.
+
+Three options were on the table and all three are settled here:
+
+| Option | Verdict |
+|---|---|
+| **Vendor a bundle** as a directory or an installable distribution | **taken.** Both, in fact — `--package` writes an importable `manicule_grammars` around the same bundle, so a site that installs software rather than copying directories needs no extra step |
+| **Build grammars at install time** | **rejected**, and recorded so it is not re-proposed: it needs a C toolchain on the user's machine, and the API for building a shared library was removed from `py-tree-sitter` at 0.22 |
+| **Ship the cache directory as a copyable artifact** | **taken, with a manifest.** A bare cache directory is a set of files with no statement of which release, which platform or which bytes they are. That statement is the whole difference between a copyable artifact and a copyable guess |
+
+**The bundle is a source, never the cache.** Seeding copies libraries out of it into the
+configured cache and the ordinary load path takes over. Two reasons: a bundle installed under
+`site-packages` is read-only on any sensibly built image, and one cache directory means one
+answer to "which grammars does this machine have" — the thing `missing_grammars` reports and
+the pre-seed asserts. The library directory is still laid out as a cache, so a read-only
+container can be pointed straight at it and skip the copy.
+
+**`prefetch` consults the bundle first and the network only for what is left.** That order is
+what makes an air-gapped install work rather than merely fail politely, and it is also the
+cheaper order everywhere else, since a file copy beats a release download.
+
+**Everything is recorded, and every recorded fact is checked on read.** The pack release, the
+platform tag, and per library a file name, a size and a SHA-256:
+
+- A bundle built for **another pack release** is refused, naming both. Grammars ship as one
+  bundle per release, so mixing them means the fingerprint records one release while the trees
+  came from another — the corpus-consistency hazard in its purest form.
+- A bundle built for **another platform** is refused, naming both. Libraries are compiled
+  objects, and the pack reports one as downloaded from its file name whatever it contains.
+- A **truncated** library is caught on read, which is a `stat` per language; a library **edited
+  without changing its length** is caught when it is copied, which reads every byte anyway.
+
+**The file name is discovered, not derived.** `csharp`'s library is `libtree_sitter_c_sharp`,
+so a builder constructing the name from the language key writes a bundle silently missing C#.
+Each candidate is offered to the pack alone in an empty directory and the pack says which
+language it answers for; the answer goes in the manifest, so nothing downstream needs a rule.
+
+**A grammar that is present and will not load now refuses through the same door as a missing
+one.** `downloaded_languages()` answers from file names, so a wrong-platform library is
+reported as present and then fails at `get_parser` with `Language 'python' not found` — which
+reaches the parser chain as an ordinary exception and *advances* it, handing the document to
+the next parser. `GrammarUnusableError` is a subclass of `GrammarUnavailableError`, so
+everything already written to stop on a missing grammar stops on a broken one unchanged.
+
+**The licence is asserted where redistribution starts.** The bundle build refuses any copyleft
+term and any term nobody has assessed, and records the expression it asserted. The scope of
+that assertion is stated rather than overstated: the pack enumerates no per-grammar licences —
+its manifest carries a group and a size per language, and the SBOM beside it describes the
+native extension's Rust build dependencies — so what is checked is the distribution that
+publishes them under a stated permissive-only policy. A release that changes that expression
+fails a bundle build instead of shipping.
 
 ### 8.2 Deriving `LineAnchor.symbol`
 
@@ -1828,7 +1979,6 @@ none of them depends on this document having been read.
 | Ticket | What | Why it is not in v1 |
 |---|---|---|
 | [#21](https://github.com/mgd43b/manicule/issues/21) | **`.msg` support** (§10) | either a BSD-licensed higher-level reader works, or it is a hand-written MAPI property reader — not a library call either way. `.eml` covers the common case. The route is specified; only the work is out of scope |
-| [#22](https://github.com/mgd43b/manicule/issues/22) | **Offline grammar bundle** (§8.1) | the grammar pack fetches grammars from GitHub on first use, so an air-gapped install cannot parse code until someone mirrors them. Pre-seeding covers the normal case; a vendored bundle is the real fix |
 | [#23](https://github.com/mgd43b/manicule/issues/23) | **OCR** (`PLAN.md` §5) | settled. `no_extractable_text` and the 5% `doctor` warning (§6.5) are the trigger for revisiting |
 | [#24](https://github.com/mgd43b/manicule/issues/24) | **`docling` / `marker` in the default PDF chain** (§7) | layout models are heavy and unmeasured; they belong behind #15 like every other quality change |
 | [#25](https://github.com/mgd43b/manicule/issues/25) | **PDF reading-order recovery for multi-column layouts** (§7) | any heuristic here risks emitting text that never appeared contiguously; needs the measured baseline first |
@@ -1843,4 +1993,6 @@ none of them depends on this document having been read.
   facts from the parser; the chunker never inspects prose to find structure.
 - **OCR decided explicitly** — settled in `PLAN.md` §5; the mechanism is §6.5.
 - **Chunk size settled** — §1. 512 tokens on `embed_text`, 64 overlap, guarded by
-  `ChunkFingerprint`.
+  `ChunkFingerprint`, and never measured by an estimator (§1.2).
+- **Extraction settled** — §3.0. `ParseFingerprint` per document, so a library bump re-parses
+  what it changed and nothing else.

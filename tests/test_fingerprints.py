@@ -12,7 +12,11 @@ import pytest
 
 from manicule.core.embedding import EmbedFingerprint, Pooling
 from manicule.core.errors import FingerprintMismatchError
-from manicule.core.fingerprints import ChunkFingerprint
+from manicule.core.fingerprints import (
+    PROVISIONAL_TOKENIZER_PREFIX,
+    ChunkFingerprint,
+    ParseFingerprint,
+)
 
 
 def embed(**overrides: object) -> EmbedFingerprint:
@@ -145,3 +149,104 @@ def test_a_fingerprint_never_matches_one_of_another_kind() -> None:
     assert not embedding.matches(chunking)
     with pytest.raises(FingerprintMismatchError):
         embedding.require_match(chunking)
+
+    parsing = cast("EmbedFingerprint", parses())
+    assert not embedding.matches(parsing)
+    assert not chunks().matches(cast("ChunkFingerprint", parses()))
+
+
+# --- provisional counting ------------------------------------------------------------------
+
+
+def test_a_stand_in_vocabulary_is_visible_in_the_fingerprint() -> None:
+    """The flag is read off the identity string, so the two cannot contradict each other.
+
+    A boolean field beside the id could say ``False`` next to a stamped one, and the ingest
+    refusal would then wave through a corpus measured with an estimator.
+    """
+    measured = chunks(tokenizer_id="BAAI/bge-m3")
+    estimated = chunks(tokenizer_id=f"{PROVISIONAL_TOKENIZER_PREFIX}x1.5:tiktoken/cl100k_base@1.0")
+
+    assert not measured.provisional
+    assert estimated.provisional
+    assert not measured.matches(estimated)
+
+
+def test_the_safety_factor_is_part_of_identity() -> None:
+    """It multiplies every count the chunker takes, so it moves every boundary.
+
+    Two corpora inflated by different factors are two chunkings, and a fingerprint that did
+    not move would call them interchangeable.
+    """
+    at_one_and_a_half = chunks(tokenizer_id=f"{PROVISIONAL_TOKENIZER_PREFIX}x1.5:tiktoken@1.0")
+    at_one_and_six = chunks(tokenizer_id=f"{PROVISIONAL_TOKENIZER_PREFIX}x1.6:tiktoken@1.0")
+
+    assert at_one_and_a_half.provisional
+    assert not at_one_and_a_half.matches(at_one_and_six)
+
+
+# --- parse fingerprints --------------------------------------------------------------------
+
+
+def parses(**overrides: object) -> ParseFingerprint:
+    base: dict[str, object] = {
+        "parser": "pdf",
+        "version": "1",
+        "libraries": {"pypdfium2": "5.12.1"},
+    }
+    return ParseFingerprint.model_validate({**base, **overrides})
+
+
+@pytest.mark.parametrize(
+    "difference",
+    [
+        {"parser": "plaintext"},
+        {"version": "2"},
+        {"libraries": {"pypdfium2": "5.13.0"}},
+    ],
+    ids=lambda d: next(iter(d)),
+)
+def test_every_field_of_a_parse_fingerprint_invalidates_a_document(
+    difference: dict[str, object],
+) -> None:
+    """Each of the three decides what the stored text says, so each has to be identity.
+
+    ``version`` is manicule's own extraction rules and is the one an implementation leaves
+    out: a repository that changes which blocks a parser emits, without a dependency moving,
+    would otherwise rewrite text under a fingerprint that stayed still.
+    """
+    with pytest.raises(FingerprintMismatchError):
+        parses().require_match(parses(**difference))
+
+
+def test_a_library_bump_invalidates_only_the_parser_that_uses_it() -> None:
+    """The property the whole field exists for, stated as a comparison.
+
+    A ``pypdfium2`` release makes every PDF stale and says nothing whatever about Markdown —
+    the two fingerprints are different values and always were, so one moving cannot move the
+    other.
+    """
+    pdf_before = parses(libraries={"pypdfium2": "5.12.1"})
+    pdf_after = parses(libraries={"pypdfium2": "5.13.0"})
+    markdown = parses(parser="markdown", libraries={"markdown-it-py": "4.2.0"})
+
+    assert pdf_before.changed_fields(pdf_after) == {"libraries"}
+    assert not pdf_before.matches(pdf_after)
+    assert markdown.matches(parses(parser="markdown", libraries={"markdown-it-py": "4.2.0"}))
+
+
+def test_a_parse_fingerprint_is_byte_stable_across_key_order() -> None:
+    """It is compared as stored text, so a dictionary's insertion order must not reach it."""
+    one = parses(libraries={"lxml": "6.1.1", "python-docx": "1.2.0"})
+    other = parses(libraries={"python-docx": "1.2.0", "lxml": "6.1.1"})
+
+    assert one.canonical() == other.canonical()
+
+
+def test_a_parser_with_no_libraries_still_has_an_identity() -> None:
+    """An empty map is a real answer, and ``version`` is then the whole of it."""
+    before = parses(parser="adf", version="1", libraries={})
+    after = parses(parser="adf", version="2", libraries={})
+
+    assert not before.matches(after)
+    assert "no parsing libraries" in before.describe()

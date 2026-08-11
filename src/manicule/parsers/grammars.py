@@ -18,10 +18,15 @@ different embeddings, one corpus. Platform may change *throughput*; it must neve
 2. **Pre-seed, never lazy-load.** :func:`prefetch` is what ``manicule init`` and
    ``manicule doctor --fix`` call. The cache directory and language set are fixed through
    the pack's own configuration entry point, and the manifest URL is overridable so an
-   air-gapped deployment can point at an internal mirror.
+   air-gapped deployment can point at an internal mirror. Before any of that it seeds from an
+   **offline bundle** if one is installed (:mod:`manicule.parsers.grammar_bundle`), which is
+   what makes a pre-seed succeed on a host with no route to anything at all.
 3. **A missing grammar is a refusal, not a fallback.** :func:`load_parser` raises
    :class:`GrammarUnavailableError`; there is no line-splitting fallback, because a silent
-   fallback is precisely how two machines end up with two chunkings of one file.
+   fallback is precisely how two machines end up with two chunkings of one file. A grammar
+   that is *present and will not load* refuses through the same door
+   (:class:`GrammarUnusableError`), because the pack reports it as downloaded and then fails
+   with "language not found", which reads as a routing mistake rather than a broken file.
 
 **The pack API this module is built on, and why each call was chosen.** Established by
 reading the installed package rather than from documentation, because the obvious call is
@@ -90,6 +95,8 @@ __all__ = [
     "DefinitionRule",
     "GrammarFetchError",
     "GrammarUnavailableError",
+    "GrammarUnusableError",
+    "bundle_status",
     "cache_directory",
     "configure_pack",
     "grammar_versions",
@@ -290,16 +297,52 @@ class GrammarUnavailableError(ManiculeError):
     re-indexable the moment the grammar arrives.
     """
 
-    def __init__(self, language: str) -> None:
+    def __init__(
+        self, language: str, reason: str | None = None, message: str | None = None
+    ) -> None:
         self.language = language
-        self.reason = f"grammar unavailable: {language} — run manicule doctor --fix"
+        self.reason = reason or f"grammar unavailable: {language} — run manicule doctor --fix"
         """The document's ``status_detail``. Names the language and the command that fixes
         it, because "unsupported" on its own tells an operator nothing to do."""
         super().__init__(
-            f"{self.reason}. The grammar for {language!r} was not found in the cache at "
-            f"{cache_directory()}. It is not fetched on demand on purpose: a file that "
-            f"chunks one way here and another way on a machine that reached the network "
-            f"produces one corpus with two chunkings."
+            message
+            or (
+                f"{self.reason}. The grammar for {language!r} was not found in the cache at "
+                f"{cache_directory()}. It is not fetched on demand on purpose: a file that "
+                f"chunks one way here and another way on a machine that reached the network "
+                f"produces one corpus with two chunkings."
+            )
+        )
+
+
+class GrammarUnusableError(GrammarUnavailableError):
+    """A declared language's grammar is in the cache and the pack cannot load it.
+
+    A distinct failure from an absent grammar, and one that is invisible without this class.
+    ``downloaded_languages()`` reports a language whose library file exists, whatever that file
+    contains — so a truncated download, a library built for another platform, or a bundle
+    copied from an x86 machine to an Apple Silicon one all report as *present* and then fail at
+    ``get_parser`` with ``Language 'python' not found``. That message reads as a routing
+    mistake, and left unhandled it reaches the parser chain as an ordinary exception, which
+    advances the chain — so the document is offered to whatever comes next.
+
+    A subclass rather than a sibling, so that everything already written to stop on a missing
+    grammar stops on an unusable one too. Only the ``reason`` differs, because only the remedy
+    does: the fix is to replace the file, not to fetch one that is already there.
+    """
+
+    def __init__(self, language: str, detail: str) -> None:
+        reason = f"grammar unusable: {language} — run manicule doctor --fix"
+        super().__init__(
+            language,
+            reason=reason,
+            message=(
+                f"{reason}. The grammar for {language!r} is present in the cache at "
+                f"{cache_directory()} and the grammar pack could not load it: {detail}. A "
+                f"library built for another platform or truncated in transit looks exactly "
+                f"like this. Re-seed it from an offline bundle built on this platform, or "
+                f"delete it and pre-seed again."
+            ),
         )
 
 
@@ -307,9 +350,10 @@ class GrammarFetchError(ManiculeError):
     """Grammars could not be fetched, so the declared set cannot be completed.
 
     Separate from :class:`GrammarUnavailableError` because the remedy is different: that one
-    says "run the command", this one is raised *by* that command and says which languages
-    and which manifest URL, so an air-gapped deployment can see it is pointing at the public
-    manifest rather than at its mirror.
+    says "run the command", this one is raised *by* that command and says which languages,
+    which manifest URL, and what the offline bundle had to offer — so an air-gapped deployment
+    can see whether it is pointing at the public manifest rather than at its mirror, and
+    whether it has a bundle at all.
     """
 
 
@@ -482,39 +526,86 @@ def missing_grammars(languages: Sequence[str]) -> tuple[str, ...]:
     return tuple(sorted(language for language in languages if language not in present))
 
 
-def prefetch(languages: Sequence[str]) -> tuple[str, ...]:
-    """Fetch every declared grammar that is not already cached. Returns what was fetched.
+def bundle_status(bundle_dir: Path | None = None) -> str:
+    """One line describing what this install has to seed from offline.
+
+    What ``manicule doctor`` prints, and what every pre-seed failure quotes. An operator whose
+    air-gapped host will not parse code needs to know whether a bundle was found, which pack
+    release it was built for, and which languages it carries — because "no grammars and no
+    network" has three different fixes depending on that answer.
+
+    Raises:
+        GrammarBundleError: A bundle exists and cannot be used. Reporting is not a reason to
+            downgrade that to a shrug: a bundle that is present, wrong, and described as
+            absent is how a host ends up waiting for a mirror it does not have.
+    """
+    from manicule.parsers import grammar_bundle  # noqa: PLC0415 - lazy, see module docstring
+
+    bundle = grammar_bundle.resolve(bundle_dir)
+    if bundle is None:
+        return grammar_bundle.describe_search_path(bundle_dir)
+    return (
+        f"offline grammar bundle at {bundle.root}: tree-sitter-language-pack "
+        f"{bundle.pack_version}, {bundle.platform}, {len(bundle.languages)} languages "
+        f"({', '.join(bundle.languages)})"
+    )
+
+
+def prefetch(languages: Sequence[str], *, bundle_dir: Path | None = None) -> tuple[str, ...]:
+    """Seed every declared grammar that is not already cached. Returns what was seeded.
 
     The entry point behind ``manicule init`` and ``manicule doctor --fix``, and the reason
     nothing downloads during ingest: pre-seeding is a step an operator runs and can see fail,
     where a lazy fetch is a step that succeeds on one machine and not on another.
 
+    **The offline bundle is consulted first, and the network only for what it did not supply.**
+    That order is what makes an air-gapped install work rather than merely fail politely: a
+    host carrying a bundle for the declared set never reaches the fetch at all, so it needs no
+    route to the public manifest and no internal mirror. It is also the cheaper order on a
+    machine that *does* have network, since a file copy beats a release download.
+
     Args:
-        languages: The declared set. Validated first, so this cannot half-fetch a typo.
+        languages: The declared set. Validated first, so this cannot half-seed a typo.
+        bundle_dir: An offline bundle to seed from. ``None`` looks in the places
+            :func:`manicule.parsers.grammar_bundle.locate` describes; a bundle that is present
+            and unusable is an error rather than a silent fall through to the network.
 
     Returns:
-        The languages actually fetched, in sorted order. Empty when everything was cached,
-        which is the steady state and is what makes calling this on every start cheap.
+        The languages actually seeded — from the bundle, from the network, or both — in sorted
+        order. Empty when everything was cached, which is the steady state and is what makes
+        calling this on every start cheap.
 
     Raises:
         ConfigError: A declared key is not in the manifest.
+        GrammarBundleError: A bundle was found and is unusable.
         GrammarFetchError: The fetch failed — no route to the manifest, a mirror that does
             not have it, a checksum mismatch — **or it reported success and the grammar is
             still not in the cache**, which is checked rather than assumed. See below.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
 
+    from manicule.parsers import grammar_bundle  # noqa: PLC0415 - lazy, see module docstring
+
     wanted = validate_languages(languages)
     absent = missing_grammars(wanted)
     if not absent:
         return ()
+
+    bundle = grammar_bundle.resolve(bundle_dir)
+    seeded: tuple[str, ...] = ()
+    if bundle is not None:
+        seeded = bundle.seed(absent, cache_directory())
+        absent = missing_grammars(absent)
+    if not absent:
+        return seeded
+
     try:
         pack.prefetch(list(absent))
     except (pack.Error, OSError, RuntimeError) as exc:
         # RuntimeError is in this tuple because the native layer maps some download failures
         # to the pack's own exception hierarchy and others to a bare RuntimeError; catching
         # only the former would let an unreachable mirror surface as an unhandled crash.
-        raise GrammarFetchError(_fetch_failure(absent, str(exc))) from exc
+        raise GrammarFetchError(_fetch_failure(absent, str(exc), bundle_dir)) from exc
 
     # The pack's own prefetch returns without error for a language it has already loaded into
     # its process-global registry, **even when the configured cache does not contain it** —
@@ -528,17 +619,30 @@ def prefetch(languages: Sequence[str]) -> tuple[str, ...]:
         detail = (
             f"the grammar pack reported success but {list(still_missing)} is still not in the cache"
         )
-        raise GrammarFetchError(_fetch_failure(still_missing, detail))
-    return absent
+        raise GrammarFetchError(_fetch_failure(still_missing, detail, bundle_dir))
+    return tuple(sorted({*seeded, *absent}))
 
 
-def _fetch_failure(languages: Sequence[str], detail: str) -> str:
-    """One message for both ways a pre-seed can fail, naming the mirror it tried."""
+def _fetch_failure(languages: Sequence[str], detail: str, bundle_dir: Path | None = None) -> str:
+    """One message for every way a pre-seed can fail, naming the mirror and the bundle.
+
+    The bundle is quoted because this error is read almost exclusively on hosts that have no
+    network: "connection refused" sends an operator to their firewall, when the actionable
+    fact is that the languages they need were not in the bundle they copied over — or that
+    there is no bundle at all.
+    """
+    from manicule.parsers import grammar_bundle  # noqa: PLC0415 - lazy, see module docstring
+
     url = os.environ.get(MANIFEST_URL_ENV, "the pack's default manifest URL")
+    try:
+        offline = bundle_status(bundle_dir)
+    except grammar_bundle.GrammarBundleError as exc:  # pragma: no cover - resolve() raised first
+        offline = f"the offline grammar bundle is unusable: {exc}"
     return (
-        f"could not fetch grammars for {list(languages)} from {url} into "
-        f"{cache_directory()}: {detail}. Set {MANIFEST_URL_ENV} to an internal mirror if "
-        f"this host has no route to the public manifest, or narrow the declared language set."
+        f"could not seed grammars for {list(languages)} from {url} into "
+        f"{cache_directory()}: {detail} — and {offline}. Set {MANIFEST_URL_ENV} to an internal "
+        f"mirror if this host has a route to one, or narrow the declared language set. "
+        f"docs/parsing.md §8.1 covers building a bundle for a host with neither."
     )
 
 
@@ -596,6 +700,9 @@ def load_parser(language: str) -> Parser:
         GrammarUnavailableError: The grammar is not in the cache. Checked before the pack is
             asked for a parser, because asking would fetch it — and a fetch here is the
             corpus-consistency hazard arriving through the back door.
+        GrammarUnusableError: The grammar is in the cache and will not load — the case an
+            offline bundle makes reachable, since a bundle is the one artifact that can put a
+            library built for another platform on this machine.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
 
@@ -604,7 +711,10 @@ def load_parser(language: str) -> Parser:
         return cached
     if not is_available(language):
         raise GrammarUnavailableError(language)
-    parser = pack.get_parser(language)
+    try:
+        parser = pack.get_parser(language)
+    except (pack.Error, OSError) as exc:
+        raise GrammarUnusableError(language, str(exc)) from exc
     _PARSERS[language] = parser
     return parser
 
@@ -630,6 +740,10 @@ def tags_query(language: str) -> Query | None:
     Raises:
         GrammarUnavailableError: The grammar is not cached. A query compiles against a
             language, so this cannot answer before :func:`load_parser` would have refused.
+        GrammarUnusableError: The grammar is cached and will not load, for the same reasons
+            :func:`load_parser` gives. Wrapped here too rather than only there, because a
+            symbol lookup reaching the pack directly would otherwise turn a broken library into
+            an exception with no language in it.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
     from tree_sitter import Query  # noqa: PLC0415 - lazy, see module docstring
@@ -642,6 +756,10 @@ def tags_query(language: str) -> Query | None:
         return None
     if not is_available(language):
         raise GrammarUnavailableError(language)
-    query = Query(pack.get_language(language), source)
+    try:
+        grammar = pack.get_language(language)
+    except (pack.Error, OSError) as exc:
+        raise GrammarUnusableError(language, str(exc)) from exc
+    query = Query(grammar, source)
     _QUERIES[language] = query
     return query

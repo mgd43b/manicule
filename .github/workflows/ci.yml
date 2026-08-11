@@ -81,7 +81,16 @@ jobs:
           print('fetched:', grammars.prefetch(grammars.DECLARED_LANGUAGES));
           missing = grammars.missing_grammars(grammars.DECLARED_LANGUAGES);
           assert not missing, f'grammars still missing after pre-seed: {missing}'"
+      # The offline-bundle suite builds a real bundle out of the cache the step above filled,
+      # so it needs those grammars present rather than merely welcome. Without the variable it
+      # skips on an empty cache — right on a developer's first checkout, and worthless here,
+      # where it would mean the air-gapped install is never exercised and the job still reports
+      # green. Deliberately outside the `MANICULE_` namespace: the test environment fixture
+      # deletes every variable with that prefix before each test, which has already silently
+      # disarmed one switch in this repository.
       - name: pytest
+        env:
+          REQUIRE_GRAMMAR_BUNDLE: "1"
         run: uv run --python ${{ matrix.python }} pytest --cov --cov-report=term-missing
 
   # A model edited without a migration and a downgrade that has never run both look exactly
@@ -106,13 +115,20 @@ jobs:
       - name: downgrade round trip
         run: uv run pytest tests/test_storage_migrations.py -q
 
-  # Its own job, on macOS, because it is the only place the claim can be checked: MLX is Apple
-  # Silicon only, so the ubuntu matrix above has one backend and cannot compare two.
+  # The macOS job. Two claims live here, and both are claims that can only be checked on a
+  # second platform — which is why they share a runner rather than each having one.
   #
-  # What is being defended is `EmbedFingerprint` excluding `backend` from identity — the
-  # property that lets a corpus move between machines without a re-embed. That exclusion is a
-  # claim about numbers, and this job is where the numbers are checked. If it ever goes red,
-  # the fix is to move `backend` into IDENTITY_FIELDS, not to widen a tolerance.
+  # **Backend parity.** MLX is Apple Silicon only, so the ubuntu matrix above has one backend
+  # and cannot compare two. What is being defended is `EmbedFingerprint` excluding `backend`
+  # from identity — the property that lets a corpus move between machines without a re-embed.
+  # That exclusion is a claim about numbers, and this job is where the numbers are checked. If
+  # it ever goes red, the fix is to move `backend` into IDENTITY_FIELDS, not to widen a
+  # tolerance.
+  #
+  # **Grammars and the offline bundle.** The same shape of claim: the grammar pack resolves its
+  # cache through `platformdirs`, which honours `XDG_CACHE_HOME` on Linux and `~/Library/Caches`
+  # on macOS, and a bundle is valid for exactly one operating system and architecture. Both are
+  # properties that a green ubuntu job says nothing about.
   embeddings:
     name: backend parity (macOS)
     runs-on: macos-14
@@ -152,6 +168,31 @@ jobs:
         env:
           REQUIRE_EMBEDDING_MODELS: BAAI/bge-small-en-v1.5
         run: uv run pytest tests/test_embedding_backends.py tests/test_embedding_models.py -q -rs
+
+      # The grammar suites run here too, and macOS is not an arbitrary second platform for
+      # them — it is the platform where this exact area has already produced a silent failure.
+      # The grammar pack resolves its cache through `platformdirs`, which honours
+      # `XDG_CACHE_HOME` on Linux and uses `~/Library/Caches` on macOS, so a cache redirect
+      # that looked fine on the ubuntu matrix hid every grammar here and the suite passed by
+      # skipping. The offline bundle is also platform-specific by construction — a bundle is
+      # valid for one operating system and one architecture — so a bundle that builds, reads
+      # and seeds is a claim that has to be checked on each platform separately.
+      - name: cache tree-sitter grammars
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/tree-sitter-language-pack
+          key: grammars-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: pre-seed grammars
+        run: >-
+          uv run python -c
+          "from manicule.parsers import grammars;
+          print('seeded:', grammars.prefetch(grammars.DECLARED_LANGUAGES));
+          missing = grammars.missing_grammars(grammars.DECLARED_LANGUAGES);
+          assert not missing, f'grammars still missing after pre-seed: {missing}'"
+      - name: pytest (grammar bundle required)
+        env:
+          REQUIRE_GRAMMAR_BUNDLE: "1"
+        run: uv run pytest tests/parsers/test_grammar_bundle.py tests/parsers/test_grammars.py -q -rs
 
   # Runs on every pull request, including ones that touch no Python at all. The repository
   # is mostly cross-referenced design documents, and a heading renumbered in one file

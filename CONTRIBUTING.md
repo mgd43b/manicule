@@ -41,6 +41,24 @@ a comma-separated list, or `all`. CI sets it to exactly what it pre-seeded. If y
 embeddings, run `REQUIRE_EMBEDDING_MODELS=all uv run pytest` at least once: a skipped
 conformance suite reports green while checking nothing.
 
+`REQUIRE_GRAMMAR_BUNDLE` is the same switch for the grammars. The offline-bundle suite builds a
+real bundle out of the pre-seeded cache and proves an air-gapped install can parse code; with an
+empty cache it skips. Set it to anything non-empty — CI does — and a missing grammar fails
+instead. If you are touching parsing, run `REQUIRE_GRAMMAR_BUNDLE=1 uv run pytest` at least once.
+
+To produce a bundle for a host with no network access, run this on a machine that has one, and
+copy the directory over:
+
+```bash
+uv run tools/build_grammar_bundle.py --output dist/grammars   # or --package to make it installable
+MANICULE_GRAMMAR_BUNDLE=/path/to/grammars uv run python -c \
+  "from manicule.parsers import grammars; print(grammars.prefetch(grammars.DECLARED_LANGUAGES))"
+```
+
+A bundle is valid for one platform and one `tree-sitter-language-pack` release, and manicule
+refuses one built for anything else rather than loading it. See
+[`docs/parsing.md`](docs/parsing.md#811-the-offline-bundle).
+
 It is not a `MANICULE_` variable, and that is deliberate — the test environment clears that
 whole namespace before each test, so a switch living inside it is deleted before it is read.
 
@@ -121,9 +139,10 @@ document that needs it, by which point a corpus has already been indexed differe
 machine than on another.
 
 **Two types are locked.** `Anchor` is locked once a corpus has been ingested — changing it
-invalidates every stored citation. `RetrievalStage` is locked once the evaluation harness
-exists — widening it invalidates every recorded result. Both are marked in the source. Widen
-them now if at all, and say so loudly in the pull request.
+invalidates every stored citation. `RetrievalStage` **is** locked: the evaluation harness
+exists (`docs/evaluation.md`) and stores the stage list in every preference record, so widening
+it invalidates every recorded result. Both are marked in the source, and a change to either
+says so loudly in the pull request.
 
 ## Writing a plugin
 
@@ -166,13 +185,19 @@ Most bumps risk a regression and CI catches them. These change what is *in* the 
 | `index-affecting-chunking` | Where chunks begin and end | Re-chunk and re-embed what it touches |
 | `index-affecting-extraction` | The text a document was reduced to | Re-parse the affected documents |
 
-There is machinery here — `EmbedFingerprint` and `ChunkFingerprint` refuse an index built
-with something else, and the macOS backend parity job compares MLX against ONNX within a
-stated tolerance — so a genuinely divergent bump should turn CI red. Red is the signal that
-the corpus needs rebuilding, not a reason to widen a tolerance. Two cases have no guard at
-all and are grouped precisely because of it: no fingerprint records a parser version, and
-the provisional token counter records `tokenizer_id` as the literal string `"provisional"`,
-which does not change when `tiktoken`'s vocabulary does.
+There is machinery here — `EmbedFingerprint`, `ChunkFingerprint` and `ParseFingerprint`
+refuse output built with something else, and the macOS backend parity job compares MLX
+against ONNX within a stated tolerance — so a genuinely divergent bump should turn CI red.
+Red is the signal that the corpus needs rebuilding, not a reason to widen a tolerance.
+
+The three costs are not the same size, and the group name is what tells them apart. An
+embedding bump re-embeds everything. A chunking bump re-chunks and re-embeds what it touches.
+An extraction bump is the narrowest: `documents.parse_fp` records which parser version
+produced each document, so change detection re-parses exactly the documents that library
+produced and `reindex --re-parse` selects the same set without waiting for a sync. Adding a
+library that decides stored text means adding it to `manicule.parsers.versions.PARSERS` *and*
+to the `index-affecting-extraction` patterns; `tests/parsers/test_versions.py` fails if the
+two disagree.
 
 **Nothing here checks licences, and this project has rejected dependencies over them.**
 manicule is GPL-3.0-or-later. Dependabot reports versions; it says nothing about the terms
