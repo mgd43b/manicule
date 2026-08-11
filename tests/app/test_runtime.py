@@ -177,3 +177,182 @@ async def test_the_runtime_disposes_its_engine_on_the_way_out(
         assert opened.require_engine() is not None
     with pytest.raises(Exception, match="engine has not been opened"):
         opened.require_engine()
+
+
+# --- the implementations the HTTP surface added, against a real database ----------------------
+
+
+async def test_the_runtime_satisfies_every_port_the_service_asks_for(runtime: Runtime) -> None:
+    """Structurally, at run time, against the real objects.
+
+    The service is written against protocols, and every suite that drives it drives fakes of
+    them. That proves the *service*; it proves nothing about the objects a running manicule
+    actually hands it. A missing method here would be an ``AttributeError`` from inside a
+    route on somebody's installation, and green everywhere in this repository.
+    """
+    from manicule.app.ports import (  # noqa: PLC0415 - only this assertion needs them
+        Conversing,
+        DocumentSurface,
+        Keys,
+        Organising,
+        Telemetry,
+    )
+
+    assert isinstance(await runtime.documents(), DocumentSurface)
+    assert isinstance(await runtime.organisation(), Organising)
+    assert isinstance(await runtime.conversations(), Conversing)
+    assert isinstance(await runtime.telemetry(), Telemetry)
+    assert isinstance(await runtime.keys(), Keys)
+
+
+async def test_the_conversation_store_is_one_handle_rather_than_two(runtime: Runtime) -> None:
+    """The answer path and the surfaces share it.
+
+    Two stores over one engine would be two places a share link can be minted from and two
+    opinions about what has been deleted.
+    """
+    assert await runtime.conversations() is await runtime.conversations()
+
+
+async def test_a_conversation_round_trips_through_the_real_store(runtime: Runtime) -> None:
+    """Create, list, read, rename, delete — the SQL the surface depends on, executed.
+
+    ``list_conversations`` and ``get_conversation`` were written for this surface, and their
+    correlated subquery has never run anywhere else in the suite.
+    """
+    store = await runtime.conversations()
+    identifier = await store.create_conversation(title="First")
+    listed = await store.list_conversations()
+    assert [record.id for record in listed] == [identifier]
+    assert listed[0].messages == 0
+
+    assert await store.rename_conversation(identifier, "Renamed")
+    record = await store.get_conversation(identifier)
+    assert record is not None
+    assert record.title == "Renamed"
+
+    assert await store.soft_delete_conversation(identifier)
+    assert await store.get_conversation(identifier) is None
+    assert await store.list_conversations() == []
+    assert not await store.rename_conversation(identifier, "Again"), (
+        "a deleted conversation was renamed, so the soft-delete predicate is missing"
+    )
+
+
+async def test_query_telemetry_round_trips_through_the_real_store(runtime: Runtime) -> None:
+    """The SQL behind ``GET /admin/query-logs``, executed rather than faked."""
+    telemetry = await runtime.telemetry()
+    await telemetry.record_query(
+        "retry policy", profile="balanced", chunk_ids=["a", "b"], confidence=0.5, elapsed_ms=12
+    )
+    rows, total = await telemetry.query_logs(limit=10)
+    assert total == 1
+    assert rows[0]["query"] == "retry policy"
+    assert rows[0]["chunks"] == 2, "the chunk ids were stored but not counted back"
+    assert rows[0]["confidence"] == 0.5
+
+
+async def test_the_audit_trail_round_trips_and_filters(runtime: Runtime) -> None:
+    """Including the ``event_type`` filter, which is a second statement nothing else runs."""
+    telemetry = await runtime.telemetry()
+    await telemetry.record_audit("conversation.shared", details={"conversation_id": "c1"})
+    await telemetry.record_audit("api_key.created", details={"name": "widget"})
+
+    rows, total = await telemetry.audit_logs(limit=10)
+    assert total == 2
+    assert [row["event_type"] for row in rows] == ["api_key.created", "conversation.shared"], (
+        "the audit trail is not newest-first"
+    )
+    filtered, count = await telemetry.audit_logs(event_type="api_key.created")
+    assert count == 1
+    assert filtered[0]["details"] == {"name": "widget"}
+
+
+async def test_an_issued_key_verifies_and_a_revoked_one_stops(runtime: Runtime) -> None:
+    """``verify`` is what every authenticated request runs, and it is four predicates in SQL.
+
+    Nothing else in the suite executes it. A wrong column name would be an authentication path
+    that always refuses — or, worse, one whose workspace predicate silently does nothing.
+    """
+    store = await runtime.keys()
+    summary, secret = await store.issue("widget", role="member")
+
+    verified = await store.verify(secret)
+    assert verified is not None
+    assert verified.id == summary.id
+    assert verified.role == "member"
+    assert verified.workspace == runtime.workspace
+
+    assert await store.verify("mnk_not_a_key") is None
+    assert await store.verify("") is None
+
+    await store.revoke("widget")
+    assert await store.verify(secret) is None, "a revoked key still authenticates"
+
+
+async def test_a_key_minted_in_one_workspace_does_not_authenticate_in_another(
+    manicule_environment: Path,
+) -> None:
+    """The predicate that makes a key an identity **in a tenant** rather than in an install.
+
+    Two runtimes over the **same data directory**, differing only in workspace — which is what
+    a second workspace on one machine actually is. Without this, the workspace clause in
+    ``verify`` could be deleted and every other test in this repository would still pass: the
+    fixtures only ever hold one tenant, so there is no foreign key to present.
+
+    A key that resolved across the boundary would let anybody holding one workspace's
+    credential read another's corpus, which is the whole thing the design is for.
+    """
+    data_dir = manicule_environment / "data"
+    async with Runtime.open(data_dir=data_dir, workspace="alpha") as alpha:
+        _, secret = await (await alpha.keys()).issue("shared-name", role="admin")
+        assert await (await alpha.keys()).verify(secret) is not None, "the control failed"
+
+    async with Runtime.open(data_dir=data_dir, workspace="beta") as beta:
+        assert await (await beta.keys()).verify(secret) is None, (
+            "a key minted in 'alpha' authenticated in 'beta'"
+        )
+        # And the listing does not show it either, so the two are separate in both directions.
+        assert await (await beta.keys()).list_keys() == []
+
+
+async def test_an_expired_key_stops_verifying(runtime: Runtime) -> None:
+    """The expiry predicate, driven by writing a past expiry the issuing path cannot produce.
+
+    ``issue`` only ever writes a future one, so without reaching into the row this predicate
+    would be present and never evaluated — which is indistinguishable from absent.
+    """
+    from datetime import timedelta  # noqa: PLC0415 - only this test needs them
+
+    from sqlalchemy import update  # noqa: PLC0415
+
+    from manicule.storage import models  # noqa: PLC0415
+    from manicule.storage.engine import session_factory  # noqa: PLC0415
+    from manicule.storage.types import utcnow  # noqa: PLC0415
+
+    store = await runtime.keys()
+    summary, secret = await store.issue("temporary", role="viewer", expires_days=30)
+    assert await store.verify(secret) is not None
+
+    sessions = session_factory(runtime.require_engine())
+    async with sessions.begin() as session:
+        await session.execute(
+            update(models.ApiKey)
+            .where(models.ApiKey.id == summary.id)
+            .values(expires_at=utcnow() - timedelta(seconds=1))
+        )
+    assert await store.verify(secret) is None, "an expired key still authenticates"
+
+
+async def test_collections_and_tags_reach_the_real_store(runtime: Runtime) -> None:
+    """The organisation handle is the document store, and the surface needs both halves."""
+    store = await runtime.organisation()
+    collection = await store.create_collection("Runbooks", description="Operational")
+    assert [item.id for item in await store.list_collections()] == [collection.id]
+
+    tag = await store.ensure_tag("urgent")
+    assert (await store.ensure_tag("urgent")).id == tag.id, "ensure_tag is not idempotent"
+    assert [item.id for item in await store.list_tags()] == [tag.id]
+
+    await store.delete_collection(collection.id)
+    assert await store.list_collections() == []

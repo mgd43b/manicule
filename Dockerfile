@@ -245,8 +245,9 @@ SMOKE
 
 VOLUME ["/data"]
 
-# No `EXPOSE`, and no default that binds anything. `manicule start` serves MCP over stdio,
-# which opens no socket; docs/deployment.md says what publishing a port will require of you
-# when there is something to publish.
+# No `EXPOSE`, and no default that binds anything. The default command serves MCP over stdio,
+# which opens no socket. `manicule start --transport http` serves the HTTP API on
+# `security.transport.port`; publishing it is an operator's decision, and docs/deployment.md
+# §4 says what it requires of you.
 ENTRYPOINT ["manicule"]
 CMD ["--help"]

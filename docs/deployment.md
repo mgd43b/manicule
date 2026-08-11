@@ -143,20 +143,20 @@ copy of the source documents.
 
 ## 4. Binding a port
 
-There is nothing to publish today. `manicule start` serves MCP over **stdio**, which opens no
-socket at all; the HTTP API and the web UI are not built
-([#11](https://github.com/mgd43b/manicule/issues/11)). The principle is recorded now so that it
-is not invented under time pressure later.
+`manicule start` serves MCP over **stdio** by default, which opens no socket at all, and that
+is still the ordinary way to run it. `manicule start --transport http` serves the HTTP API
+([#11](https://github.com/mgd43b/manicule/issues/11)) on `security.transport.port`, 8765 by
+default. The web UI is not built.
 
 **Publish to host loopback, with authentication on.**
 
 ```bash
-docker run -p 127.0.0.1:PORT:PORT …     # reachable from this machine
-docker run -p PORT:PORT …               # reachable from the network. Not this.
+docker run -p 127.0.0.1:8765:8765 …     # reachable from this machine
+docker run -p 8765:8765 …               # reachable from the network. Not this.
 ```
 
-`PORT` is a placeholder on purpose: nothing here has a port yet, and putting a number in this
-document would be inventing one before the surface that owns it exists.
+The image still publishes nothing by default and `compose.yaml` still declares no `ports:`,
+because serving HTTP is something an operator asks for rather than the default posture.
 
 The bare form binds `0.0.0.0` on the host, which means every interface the machine has,
 including the one facing the office network. A search index over a verbatim copy of the corpus
@@ -197,7 +197,9 @@ What that buys, and what it costs:
 - **Unprivileged.** uid 10001, `/data` created `0700` and owned by it, `cap_drop: ALL` and
   `no-new-privileges` in the compose file. A named volume mounted at `/data` inherits the
   ownership and mode from the image, which is what keeps `doctor` passing.
-- **No published port**, because there is nothing to publish. §4 applies when there is.
+- **No published port.** The image `EXPOSE`s nothing and the compose file declares no
+  `ports:`, because the default command serves MCP over stdio. Publishing one is an operator's
+  decision, and §4 is what it costs.
 
 The container puts its config file in the data directory too — `MANICULE_CONFIG_FILE` is
 `/data/config.toml` — so one named volume carries the whole installation. `MANICULE_CACHE_DIR`

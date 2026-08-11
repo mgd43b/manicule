@@ -53,8 +53,14 @@ def hash_token(token: str) -> str:
     """The stored form. SHA-256, like the API-key store.
 
     No salt and no work factor, deliberately: this is a 256-bit random value, not a password,
-    so there is no dictionary to defend against and a slow hash would only slow the read path
-    that already has a rate limiter in front of it.
+    so there is no dictionary to defend against and a work factor would defend against nothing
+    while slowing every read of a shared link.
+
+    **There is no rate limiter in front of this**, and the entropy is what carries the
+    property rather than a limit on attempts — 256 bits is not guessable at any request rate.
+    Rate limiting belongs to Operations (#14) and is worth having for the resource cost of an
+    unauthenticated route; it is not what makes the token safe, and saying it was would be a
+    guarantee resting on something that does not exist.
     """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 

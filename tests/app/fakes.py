@@ -12,17 +12,20 @@ not to be asked a cross-tenant question.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, override
 
 from manicule.app.ports import (
     Answering,
+    Conversing,
     DocumentSurface,
     Ingesting,
     Keys,
     Maintenance,
+    Organising,
     Retrieving,
+    Telemetry,
 )
 from manicule.app.results import ApiKeySummary, Check
 from manicule.app.tenancy import belongs_to
@@ -30,10 +33,20 @@ from manicule.config.settings import Settings
 from manicule.core.anchors import HeadingAnchor
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus
 from manicule.core.embedding import IndexFingerprints
-from manicule.core.errors import UnknownEntityError
+from manicule.core.errors import NameInUseError, UnknownEntityError
 from manicule.core.ids import chunk_id, content_hash, document_id
+from manicule.core.organisation import Collection as DocumentCollection
+from manicule.core.organisation import CollectionRule, Restoration, Tag, TrashEntry
 from manicule.core.retrieval import Candidate, Confidence, ConfidenceBand, Context, Query
 from manicule.generation.answers import AnswerEnvelope, AnswerEvent, EventKind
+from manicule.generation.history import Turn
+from manicule.generation.ports import (
+    ConversationRecord,
+    Feedback,
+    FeedbackReason,
+    SharedTurn,
+)
+from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.ingest.pipeline import RunReport
 from manicule.ingest.reindex import ReindexReport
 from manicule.retrieval.retriever import RetrievalResult
@@ -213,6 +226,394 @@ class LeakyStore(FakeStore):
 
 
 @dataclass
+class FakeOrganisation:
+    """Collections, tags and the trash, held in memory and correctly scoped.
+
+    The control for :class:`LeakyOrganisation`. Every read filters on
+    :func:`~manicule.app.tenancy.belongs_to`, exactly as the real store's ``WHERE`` clause
+    does, so a refusal seen against the leaky one is a refusal the surface produced rather
+    than one every store would have provoked.
+    """
+
+    workspace_id: str = "default"
+    documents: dict[str, Document] = field(default_factory=dict[str, Document])
+    collections: dict[str, DocumentCollection] = field(
+        default_factory=dict[str, DocumentCollection]
+    )
+    members: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
+    tags: dict[str, Tag] = field(default_factory=dict[str, Tag])
+    applied: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
+    trash: dict[str, Document] = field(default_factory=dict[str, Document])
+    restored: list[str] = field(default_factory=list[str])
+
+    async def create_collection(
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        rule: CollectionRule | None = None,
+    ) -> DocumentCollection:
+        if any(item.name == name for item in self.collections.values()):
+            msg = f"a collection named {name!r} already exists"
+            raise NameInUseError(msg)
+        made = DocumentCollection(
+            id=f"col-{len(self.collections)}",
+            name=name,
+            description=description,
+            rule=rule,
+            created_at=datetime.now(UTC),
+        )
+        self.collections[made.id] = made
+        self.members[made.id] = []
+        return made
+
+    async def list_collections(self) -> Sequence[DocumentCollection]:
+        return sorted(self.collections.values(), key=lambda item: item.name)
+
+    async def get_collection(self, collection_id: str) -> DocumentCollection | None:
+        return self.collections.get(collection_id)
+
+    async def delete_collection(self, collection_id: str) -> None:
+        if collection_id not in self.collections:
+            msg = f"no collection {collection_id!r}"
+            raise UnknownEntityError(msg)
+        del self.collections[collection_id]
+        self.members.pop(collection_id, None)
+
+    async def add_to_collection(self, collection_id: str, document_ids: Sequence[str]) -> int:
+        held = self.members.setdefault(collection_id, [])
+        added = 0
+        for identifier in document_ids:
+            if identifier not in held:
+                held.append(identifier)
+                added += 1
+        return added
+
+    async def remove_from_collection(self, collection_id: str, document_ids: Sequence[str]) -> int:
+        held = self.members.setdefault(collection_id, [])
+        removed = 0
+        for identifier in document_ids:
+            if identifier in held:
+                held.remove(identifier)
+                removed += 1
+        return removed
+
+    async def collection_documents(
+        self, collection_id: str, *, limit: int = 100, offset: int = 0
+    ) -> Sequence[Document]:
+        held = [
+            self.documents[identifier]
+            for identifier in self.members.get(collection_id, [])
+            if identifier in self.documents
+            and belongs_to(self.workspace_id, self.documents[identifier])
+        ]
+        return held[offset : offset + limit]
+
+    async def ensure_tag(self, name: str, *, color: str | None = None) -> Tag:
+        for existing in self.tags.values():
+            if existing.name == name:
+                return existing
+        made = Tag(id=f"tag-{len(self.tags)}", name=name, color=color)
+        self.tags[made.id] = made
+        return made
+
+    async def list_tags(self) -> Sequence[Tag]:
+        return sorted(self.tags.values(), key=lambda item: item.name)
+
+    async def delete_tag(self, tag_id: str) -> None:
+        if tag_id not in self.tags:
+            msg = f"no tag {tag_id!r}"
+            raise UnknownEntityError(msg)
+        del self.tags[tag_id]
+
+    async def tag_document(self, document_id: str, tag_ids: Sequence[str]) -> int:
+        held = self.applied.setdefault(document_id, [])
+        added = 0
+        for identifier in tag_ids:
+            if identifier not in self.tags:
+                msg = f"no tag {identifier!r}"
+                raise UnknownEntityError(msg)
+            if identifier not in held:
+                held.append(identifier)
+                added += 1
+        return added
+
+    async def untag_document(self, document_id: str, tag_ids: Sequence[str]) -> int:
+        held = self.applied.setdefault(document_id, [])
+        removed = 0
+        for identifier in tag_ids:
+            if identifier in held:
+                held.remove(identifier)
+                removed += 1
+        return removed
+
+    async def tags_for(self, document_id: str) -> Sequence[Tag]:
+        return [self.tags[identifier] for identifier in self.applied.get(document_id, [])]
+
+    async def list_trash(
+        self, *, grace_s: float, limit: int = 100, offset: int = 0
+    ) -> Sequence[TrashEntry]:
+        moment = datetime.now(UTC)
+        entries = [
+            TrashEntry(
+                document=document,
+                deleted_at=moment,
+                purged=False,
+                restorable_until=moment + timedelta(seconds=grace_s),
+            )
+            for document in self.trash.values()
+            if belongs_to(self.workspace_id, document)
+        ]
+        return entries[offset : offset + limit]
+
+    async def restore_document(self, document_id: str) -> Restoration:
+        if document_id not in self.trash:
+            return Restoration(document_id=document_id, restored=False, reason="not in the trash")
+        self.restored.append(document_id)
+        del self.trash[document_id]
+        return Restoration(
+            document_id=document_id, restored=True, reason="restored inside the grace period"
+        )
+
+
+class LeakyOrganisation(FakeOrganisation):
+    """Collections and the trash that ignore their workspace scope. **Deliberately broken.**
+
+    The same shape of fault as :class:`LeakyStore`, and for the same reason: the surface's own
+    identity check is the second, independent guard, and a test driven only by a correct store
+    would pass whether or not that check existed. It ignores the **limit** as well as the
+    scope, so a foreign document cannot be caught by accident by a truncation check.
+    """
+
+    @override
+    async def collection_documents(
+        self, collection_id: str, *, limit: int = 100, offset: int = 0
+    ) -> Sequence[Document]:
+        del limit, offset
+        return [
+            self.documents[identifier]
+            for identifier in self.members.get(collection_id, [])
+            if identifier in self.documents
+        ]
+
+    @override
+    async def list_trash(
+        self, *, grace_s: float, limit: int = 100, offset: int = 0
+    ) -> Sequence[TrashEntry]:
+        del grace_s, limit, offset
+        moment = datetime.now(UTC)
+        return [
+            TrashEntry(document=document, deleted_at=moment, purged=False)
+            for document in self.trash.values()
+        ]
+
+
+@dataclass
+class FakeConversations:
+    """Conversations, turns and share links, held in memory.
+
+    The share methods mirror the real store's contract closely enough to be worth stating:
+    ``create_share`` re-checks the ceiling and replaces any previous link, and
+    ``shared_conversation`` resolves a **hash**, checks expiry and the snapshot boundary, and
+    returns citation labels. A fake that resolved a plaintext token or skipped expiry would
+    make every sharing test pass over a hole.
+    """
+
+    workspace_id: str = "default"
+    records: dict[str, ConversationRecord] = field(default_factory=dict[str, ConversationRecord])
+    turns: dict[str, list[tuple[Turn, datetime]]] = field(
+        default_factory=dict[str, list[tuple[Turn, datetime]]]
+    )
+    shares: dict[str, tuple[str, datetime, datetime]] = field(
+        default_factory=dict[str, tuple[str, datetime, datetime]]
+    )
+    feedback: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
+    deleted: list[str] = field(default_factory=list[str])
+
+    def seed(self, conversation_id: str, *turns: Turn) -> str:
+        moment = datetime.now(UTC)
+        self.records[conversation_id] = ConversationRecord(
+            id=conversation_id,
+            title="Seeded",
+            created_at=moment,
+            updated_at=moment,
+            messages=len(turns),
+        )
+        self.turns[conversation_id] = [(turn, moment) for turn in turns]
+        return conversation_id
+
+    async def create_conversation(
+        self, *, user_id: str | None = None, title: str | None = None
+    ) -> str:
+        del user_id
+        identifier = f"conv_{len(self.records)}"
+        moment = datetime.now(UTC)
+        self.records[identifier] = ConversationRecord(
+            id=identifier, title=title, created_at=moment, updated_at=moment
+        )
+        self.turns[identifier] = []
+        return identifier
+
+    async def list_conversations(
+        self, *, limit: int = 50, offset: int = 0
+    ) -> Sequence[ConversationRecord]:
+        ordered = sorted(self.records.values(), key=lambda item: item.id)
+        return ordered[offset : offset + limit]
+
+    async def get_conversation(self, conversation_id: str) -> ConversationRecord | None:
+        return self.records.get(conversation_id)
+
+    async def rename_conversation(self, conversation_id: str, title: str) -> bool:
+        record = self.records.get(conversation_id)
+        if record is None:
+            return False
+        self.records[conversation_id] = record.model_copy(update={"title": title})
+        return True
+
+    async def soft_delete_conversation(self, conversation_id: str) -> bool:
+        if conversation_id not in self.records:
+            return False
+        self.deleted.append(conversation_id)
+        del self.records[conversation_id]
+        self.shares.pop(conversation_id, None)
+        return True
+
+    async def history(self, conversation_id: str, *, limit: int = 20) -> Sequence[Turn]:
+        return [turn for turn, _ in self.turns.get(conversation_id, [])][-limit:]
+
+    async def record_feedback(
+        self,
+        message_id: str,
+        *,
+        feedback: Feedback,
+        reason: FeedbackReason | None = None,
+        comment: str = "",
+    ) -> bool:
+        del reason, comment
+        if not message_id.startswith("msg"):
+            return False
+        self.feedback.append((message_id, feedback.value))
+        return True
+
+    async def create_share(self, link: ShareLink, *, maximum_ttl_s: int) -> bool:
+        if link.expires_at > datetime.now(UTC) + timedelta(seconds=maximum_ttl_s):
+            msg = f"the share link for {link.conversation_id!r} outlives the ceiling"
+            raise ValueError(msg)
+        if link.conversation_id not in self.records:
+            return False
+        self.shares[link.conversation_id] = (
+            link.token_hash,
+            link.expires_at,
+            min(link.shared_at, datetime.now(UTC)),
+        )
+        return True
+
+    async def revoke_share(self, conversation_id: str) -> bool:
+        if conversation_id not in self.records:
+            return False
+        self.shares.pop(conversation_id, None)
+        return True
+
+    async def shared_conversation(
+        self, token_hash: str, *, now: datetime, sharing_enabled: bool
+    ) -> Sequence[SharedTurn]:
+        if not sharing_enabled or not token_hash:
+            return []
+        for conversation_id, (stored, expires, boundary) in self.shares.items():
+            if stored != token_hash or expires <= now:
+                continue
+            return [
+                SharedTurn(
+                    role=turn.role,
+                    content=turn.content,
+                    citations=tuple(redact_for_anonymous(citation) for citation in turn.citations),
+                )
+                for turn, written in self.turns.get(conversation_id, [])
+                if written <= boundary
+            ]
+        return []
+
+
+@dataclass
+class FakeTelemetry:
+    """Query logs and audit entries, recorded in memory.
+
+    ``fails`` makes every write raise, which is what a busy SQLite writer looks like from
+    here. It exists so that "a search does not fail because a telemetry insert did" is a
+    property a test can watch rather than a claim in a docstring.
+    """
+
+    queries: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+    audits: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+    fails: bool = False
+
+    def _refuse(self) -> None:
+        if self.fails:
+            msg = "database is locked"
+            raise OSError(msg)
+
+    async def record_query(
+        self,
+        query: str,
+        *,
+        profile: str,
+        chunk_ids: Sequence[str],
+        confidence: float | None,
+        elapsed_ms: int,
+    ) -> str:
+        self._refuse()
+        identifier = f"q-{len(self.queries)}"
+        self.queries.append(
+            {
+                "id": identifier,
+                "query": query,
+                "profile": profile,
+                "chunks": len(list(chunk_ids)),
+                "confidence": confidence,
+                "elapsed_ms": elapsed_ms,
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        return identifier
+
+    async def query_logs(
+        self, *, limit: int = 50, offset: int = 0
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        newest = list(reversed(self.queries))
+        return newest[offset : offset + limit], len(self.queries)
+
+    async def record_audit(
+        self,
+        event_type: str,
+        *,
+        details: Mapping[str, object],
+        actor: str | None = None,
+        ip_address: str | None = None,
+    ) -> None:
+        self._refuse()
+        self.audits.append(
+            {
+                "id": f"a-{len(self.audits)}",
+                "event_type": event_type,
+                "actor": actor,
+                "ip_address": ip_address,
+                "details": dict(details),
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+        )
+
+    async def audit_logs(
+        self, *, limit: int = 50, offset: int = 0, event_type: str | None = None
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        chosen = [
+            entry
+            for entry in reversed(self.audits)
+            if event_type is None or entry["event_type"] == event_type
+        ]
+        return chosen[offset : offset + limit], len(chosen)
+
+
+@dataclass
 class FakeRetriever:
     """A retriever that returns exactly the candidates it was given."""
 
@@ -341,11 +742,12 @@ class FakeKeys:
 
     issued: list[ApiKeySummary] = field(default_factory=list[ApiKeySummary])
     workspace: str = "default"
+    secrets: dict[str, ApiKeySummary] = field(default_factory=dict[str, ApiKeySummary])
+    revoked: set[str] = field(default_factory=set[str])
 
     async def issue(
         self, name: str, *, role: str, expires_days: int | None = None
     ) -> tuple[ApiKeySummary, str]:
-        del expires_days
         summary = ApiKeySummary(
             id=f"key-{len(self.issued)}",
             name=name,
@@ -353,9 +755,16 @@ class FakeKeys:
             role=role,
             workspace=self.workspace,
             created_at=datetime.now(UTC).isoformat(),
+            expires_at=(
+                (datetime.now(UTC) + timedelta(days=expires_days)).isoformat()
+                if expires_days
+                else None
+            ),
         )
         self.issued.append(summary)
-        return summary, "mnk_abcdefghijklmnop"
+        secret = f"mnk_secret_{summary.id}"
+        self.secrets[secret] = summary
+        return summary, secret
 
     async def list_keys(self) -> Sequence[ApiKeySummary]:
         return list(self.issued)
@@ -363,9 +772,24 @@ class FakeKeys:
     async def revoke(self, name_or_id: str) -> ApiKeySummary:
         for summary in self.issued:
             if name_or_id in {summary.id, summary.name}:
+                self.revoked.add(summary.id)
                 return summary
         msg = f"no API key named {name_or_id!r} in workspace {self.workspace!r}"
         raise UnknownEntityError(msg)
+
+    async def verify(self, secret: str) -> ApiKeySummary | None:
+        """Resolve a secret the same way the real store does: by lookup, then by predicate.
+
+        Revoked and expired keys are refused here rather than merely absent from ``issued``,
+        because "the key exists and is no longer usable" is the case a surface test has to be
+        able to construct.
+        """
+        summary = self.secrets.get(secret)
+        if summary is None or summary.id in self.revoked:
+            return None
+        if summary.expires_at and datetime.fromisoformat(summary.expires_at) <= datetime.now(UTC):
+            return None
+        return summary
 
 
 @dataclass
@@ -378,6 +802,9 @@ class FakeBackend:
     answerer_: FakeAnswerer = field(default_factory=FakeAnswerer)
     ingestion_: FakeIngestion = field(default_factory=FakeIngestion)
     maintenance_: FakeMaintenance = field(default_factory=FakeMaintenance)
+    organisation_: FakeOrganisation = field(default_factory=FakeOrganisation)
+    conversations_: FakeConversations = field(default_factory=FakeConversations)
+    telemetry_: FakeTelemetry = field(default_factory=FakeTelemetry)
     keys_: FakeKeys = field(default_factory=FakeKeys)
     discovery: Discovery | None = None
     checks: list[Check] = field(default_factory=list[Check])
@@ -400,6 +827,15 @@ class FakeBackend:
 
     async def maintenance(self) -> Maintenance:
         return self.maintenance_
+
+    async def organisation(self) -> Organising:
+        return self.organisation_
+
+    async def conversations(self) -> Conversing:
+        return self.conversations_
+
+    async def telemetry(self) -> Telemetry:
+        return self.telemetry_
 
     async def keys(self) -> Keys:
         return self.keys_

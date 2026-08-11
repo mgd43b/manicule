@@ -93,6 +93,19 @@ def failed(op: str, workspace: str, error: ErrorInfo) -> Envelope:
     return Envelope(op=op, ok=False, workspace=workspace, error=error)
 
 
+type CheckState = Literal["ok", "degraded", "failing", "unknown"]
+"""How a diagnostic came out.
+
+``unknown`` is not a fourth severity — it is the honest answer for a check that could
+not run, and is deliberately distinct from ``ok``, which claims something was measured.
+
+Declared here, above every payload that uses it, rather than beside :class:`Check`. Pydantic
+resolves an annotation against the module namespace as the model class is built, so a payload
+defined earlier in the file than its own type alias fails at import — loudly, but at import,
+which is a poor place to discover an ordering rule.
+"""
+
+
 # --- retrieval and answers -----------------------------------------------------------------
 
 
@@ -240,6 +253,379 @@ class DocumentReindexed(Payload):
     detail: str = ""
 
 
+# --- conversations -------------------------------------------------------------------------
+
+
+class ConversationSummary(Payload):
+    """One conversation, without its turns.
+
+    ``share_token`` is absent by construction. A listing that carried it would hand a bearer
+    capability to every reader of the listing, and put it into every log and cache in front of
+    the surface that returned it — which is the whole reason the stored form is a hash.
+    """
+
+    id: str
+    title: str | None = None
+    shared: bool = False
+    shared_at: str | None = None
+    share_expires_at: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+    messages: int = Field(default=0, ge=0)
+
+
+class ConversationList(Payload):
+    """A page of conversations."""
+
+    count: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
+    conversations: tuple[ConversationSummary, ...] = ()
+
+
+class ConversationTurn(Payload):
+    """One turn as its **owner** reads it: full citations, passage text and all."""
+
+    role: str
+    content: str
+    citations: tuple[AnswerCitation, ...] = ()
+
+
+class ConversationMessages(Payload):
+    """A conversation's turns, oldest first."""
+
+    conversation_id: str
+    count: int = Field(ge=0)
+    turns: tuple[ConversationTurn, ...] = ()
+
+
+class ConversationDeleted(Payload):
+    """The outcome of deleting a conversation. Deleting also revokes any share link."""
+
+    conversation_id: str
+    deleted: bool
+    share_revoked: bool = Field(
+        default=True,
+        description="Always true on a successful delete. A soft delete that left a public "
+        "link resolving is a delete that did not delete.",
+    )
+
+
+class ConversationRenamed(Payload):
+    """The outcome of retitling a conversation."""
+
+    conversation_id: str
+    title: str
+
+
+class ShareCreated(Payload):
+    """A minted share link. The token appears here and nowhere else, ever."""
+
+    conversation_id: str
+    token: str = Field(
+        description="Shown once. Only its SHA-256 digest is stored, so a lost link is "
+        "re-minted rather than recovered — and re-minting invalidates the previous one."
+    )
+    path: str = Field(description="Where the link resolves, relative to the server's root.")
+    expires_at: str
+    shared_at: str
+
+
+class ShareRevoked(Payload):
+    """The outcome of revoking a link. Revocation clears the stored hash."""
+
+    conversation_id: str
+    revoked: bool
+
+
+class SharedCitationLabel(Payload):
+    """What an anonymous viewer is told about one citation.
+
+    A **different shape** from :class:`AnswerCitation`, not a blanked-out one. There is
+    nowhere here to put a document id, a chunk id, a URI, an anchor or the quoted passage, so
+    a route cannot leak one by forgetting to clear a field.
+    """
+
+    slot: int = Field(ge=1)
+    title: str
+    heading_path: tuple[str, ...] = ()
+    location: str = ""
+    verification: str = ""
+
+
+class SharedTurnPayload(Payload):
+    """One turn of a shared conversation, as an anonymous viewer receives it."""
+
+    role: str
+    content: str
+    citations: tuple[SharedCitationLabel, ...] = ()
+
+
+class SharedConversation(Payload):
+    """A shared conversation, for a reader with no workspace membership.
+
+    Carries **no conversation id**. Handing one back would let a holder of the link address
+    the conversation by id elsewhere, which is the two-step the single-statement resolution in
+    :meth:`~manicule.storage.conversations.SqliteConversationStore.shared_conversation`
+    exists to replace.
+    """
+
+    count: int = Field(ge=0)
+    turns: tuple[SharedTurnPayload, ...] = ()
+
+
+class FeedbackRecorded(Payload):
+    """The outcome of rating an answer."""
+
+    message_id: str
+    recorded: bool
+    feedback: str
+
+
+# --- collections and tags ------------------------------------------------------------------
+
+
+class CollectionSummary(Payload):
+    """One collection. ``rule`` is present when membership is evaluated rather than stored."""
+
+    id: str
+    name: str
+    description: str | None = None
+    rule: dict[str, JsonValue] | None = None
+    created_at: str = ""
+
+
+class CollectionList(Payload):
+    """Every collection in this workspace."""
+
+    count: int = Field(ge=0)
+    collections: tuple[CollectionSummary, ...] = ()
+
+
+class CollectionMembership(Payload):
+    """The outcome of adding documents to a collection, or removing them."""
+
+    collection_id: str
+    changed: int = Field(ge=0)
+    document_ids: tuple[str, ...] = ()
+
+
+class CollectionDeleted(Payload):
+    """The outcome of deleting a collection. The documents in it are untouched."""
+
+    collection_id: str
+    deleted: bool
+
+
+class TagSummary(Payload):
+    """One tag."""
+
+    id: str
+    name: str
+    color: str | None = None
+
+
+class TagList(Payload):
+    """Every tag in this workspace."""
+
+    count: int = Field(ge=0)
+    tags: tuple[TagSummary, ...] = ()
+
+
+class TagDeleted(Payload):
+    """The outcome of deleting a tag. Documents keep their other tags."""
+
+    tag_id: str
+    deleted: bool
+
+
+class DocumentTags(Payload):
+    """A document's tags after an application or removal."""
+
+    document_id: str
+    changed: int = Field(ge=0)
+    tags: tuple[TagSummary, ...] = ()
+
+
+# --- the trash -----------------------------------------------------------------------------
+
+
+class TrashedDocument(Payload):
+    """One soft-deleted document, and what restoring it would cost."""
+
+    document: DocumentSummary
+    deleted_at: str
+    purged: bool = False
+    restorable_until: str | None = None
+    free_restore: bool = True
+
+
+class TrashList(Payload):
+    """A page of the trash, longest-deleted first — the order the sweep takes them in."""
+
+    count: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
+    documents: tuple[TrashedDocument, ...] = ()
+
+
+class DocumentRestored(Payload):
+    """What restoring a document achieved, and what is still needed."""
+
+    document_id: str
+    restored: bool
+    needs_reparse: bool = False
+    reason: str
+
+
+# --- telemetry and the audit trail ---------------------------------------------------------
+
+
+class QueryLogEntry(Payload):
+    """One recorded retrieval."""
+
+    id: str
+    query: str
+    profile: str = ""
+    chunks: int = Field(default=0, ge=0)
+    confidence: float | None = None
+    elapsed_ms: int | None = None
+    created_at: str = ""
+
+
+class QueryLogPage(Payload):
+    """A page of retrieval telemetry, newest first."""
+
+    total: int = Field(ge=0)
+    count: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
+    entries: tuple[QueryLogEntry, ...] = ()
+
+
+class AuditEntry(Payload):
+    """One security-relevant event."""
+
+    id: str
+    event_type: str
+    actor: str | None = None
+    ip_address: str | None = None
+    details: dict[str, JsonValue] = Field(default_factory=dict)
+    created_at: str = ""
+
+
+class AuditPage(Payload):
+    """A page of the audit trail, newest first.
+
+    ``enabled`` is on the payload rather than implied by an empty list. "Nothing happened" and
+    "nothing was recorded because auditing is off" are different answers, and an operator
+    reading an empty audit log needs to know which one they have.
+    """
+
+    enabled: bool
+    total: int = Field(ge=0)
+    count: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
+    entries: tuple[AuditEntry, ...] = ()
+
+
+class SearchQuality(Payload):
+    """What the evaluation harness has actually recorded.
+
+    Deliberately a report on :mod:`manicule.evaluation`'s own store rather than a second
+    scoring path. ``is_evidence`` is false when the query set is an example one, and the
+    ``caveat`` says so in words — an example query set is an illustration, and presenting one
+    as a measurement is the failure the whole harness exists to prevent.
+    """
+
+    available: bool = Field(description="Whether any judgements have been recorded at all.")
+    is_evidence: bool = False
+    caveat: str = ""
+    path: str = ""
+    left_label: str = ""
+    right_label: str = ""
+    query_set: str = ""
+    records: int = Field(default=0, ge=0)
+    judged: int = Field(default=0, ge=0)
+    report: str = Field(default="", description="The harness's own rendering, verbatim.")
+
+
+class PluginHealth(Payload):
+    """One installed plugin and the health of what it registered."""
+
+    name: str
+    version: str = ""
+    enabled: bool = True
+    components: int = Field(default=0, ge=0)
+    state: CheckState = "unknown"
+    detail: str = ""
+
+
+class PluginHealthReport(Payload):
+    """Plugin health, for the admin surface."""
+
+    count: int = Field(ge=0)
+    plugins: tuple[PluginHealth, ...] = ()
+    disabled: tuple[str, ...] = ()
+
+
+# --- the workbench -------------------------------------------------------------------------
+
+
+class WorkbenchBlock(Payload):
+    """One chunk of a document, with the anchor that locates it."""
+
+    id: str
+    position: int = Field(ge=0)
+    kind: str
+    heading_path: tuple[str, ...] = ()
+    token_count: int = Field(ge=0)
+    text: str
+    anchor: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class Workbench(Payload):
+    """A document as it was chunked, for inspecting what retrieval actually sees.
+
+    Read-only, and one document at a time. It exists so a person can look at the units the
+    index is built from — which is the only way to tell a chunking problem from a retrieval
+    one — and it invents nothing: the blocks are the stored chunks.
+    """
+
+    document: DocumentSummary
+    count: int = Field(ge=0)
+    tokens: int = Field(default=0, ge=0)
+    blocks: tuple[WorkbenchBlock, ...] = ()
+
+
+# --- identity ------------------------------------------------------------------------------
+
+
+class Identity(Payload):
+    """Who the caller is, as the surface that authenticated them sees it."""
+
+    authenticated: bool
+    mode: str = Field(description="The configured auth mode: ``none``, ``api_key`` or ``oauth``.")
+    role: str = ""
+    key_id: str = ""
+    key_name: str = ""
+    workspace: str = ""
+
+
+class AuthProviders(Payload):
+    """The identity providers this installation is configured for.
+
+    Names and types only, never a client secret. Empty when ``security.auth.mode`` is not
+    ``oauth``, which is the honest answer rather than a list nothing would accept.
+    """
+
+    mode: str
+    count: int = Field(ge=0)
+    providers: tuple[str, ...] = ()
+    detail: str = ""
+
+
 # --- ingest --------------------------------------------------------------------------------
 
 
@@ -299,14 +685,6 @@ class Stats(Payload):
     by_source: dict[str, int] = Field(default_factory=dict)
     by_media_type: dict[str, int] = Field(default_factory=dict)
     by_status: dict[str, int] = Field(default_factory=dict)
-
-
-type CheckState = Literal["ok", "degraded", "failing", "unknown"]
-"""How a diagnostic came out.
-
-``unknown`` is not a fourth severity — it is the honest answer for a check that could
-not run, and is deliberately distinct from ``ok``, which claims something was measured.
-"""
 
 
 class Check(Payload):
@@ -593,41 +971,75 @@ __all__ = [
     "ApiKeyList",
     "ApiKeyRevoked",
     "ApiKeySummary",
+    "AuditEntry",
+    "AuditPage",
+    "AuthProviders",
     "AvailablePlugin",
     "BackupReport",
     "Check",
     "CheckState",
+    "CollectionDeleted",
+    "CollectionList",
+    "CollectionMembership",
+    "CollectionSummary",
     "CompletionScript",
     "ComponentSummary",
     "ConfigChange",
     "ConfigValue",
     "ConnectorList",
     "ConnectorSummary",
+    "ConversationDeleted",
+    "ConversationList",
+    "ConversationMessages",
+    "ConversationRenamed",
+    "ConversationSummary",
+    "ConversationTurn",
     "Diagnosis",
     "DocumentChunk",
     "DocumentDeleted",
     "DocumentDetail",
     "DocumentList",
     "DocumentReindexed",
+    "DocumentRestored",
     "DocumentSummary",
+    "DocumentTags",
     "Envelope",
     "ErrorInfo",
     "ExportReport",
+    "FeedbackRecorded",
+    "Identity",
     "ImportReport",
     "IndexStatus",
     "IngestReport",
     "InitReport",
     "Payload",
     "PluginChanged",
+    "PluginHealth",
+    "PluginHealthReport",
     "PluginList",
     "PluginSummary",
+    "QueryLogEntry",
+    "QueryLogPage",
     "ResetReport",
     "RestoreReport",
     "SearchHit",
+    "SearchQuality",
     "SearchResult",
     "ServerAddress",
+    "ShareCreated",
+    "ShareRevoked",
+    "SharedCitationLabel",
+    "SharedConversation",
+    "SharedTurnPayload",
     "Stats",
+    "TagDeleted",
+    "TagList",
+    "TagSummary",
+    "TrashList",
+    "TrashedDocument",
     "UpgradeReport",
+    "Workbench",
+    "WorkbenchBlock",
     "WorkspaceList",
     "WorkspaceSummary",
     "WorkspaceSwitched",

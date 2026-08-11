@@ -1,19 +1,21 @@
-"""The two surfaces are one service, and this is what makes that checkable.
+"""The three surfaces are one service, and this is what makes that checkable.
 
-The claim is specific: for the same operation and the same arguments, an MCP tool call and
-``manicule ... --json`` produce **byte-identical** envelopes. Not "similar shapes" — the same
-bytes, because both go through one builder over one payload model.
+The claim is specific: for the same operation and the same arguments, an MCP tool call, an
+HTTP request and ``manicule ... --json`` produce **byte-identical** envelopes. Not "similar
+shapes" — the same bytes, because all three go through one builder over one payload model.
 
-It matters because the MCP surface is the one called unattended. A rule implemented in the
-command line is a rule an assistant can walk around, and the only durable defence against that
-is a test that fails the moment the two stop being the same call.
+It matters because two of the three are called unattended. A rule implemented in the command
+line is a rule an assistant can walk around; a rule implemented in a route is one the MCP tool
+does not have. The only durable defence is a test that fails the moment they stop being the
+same call — so when a third surface arrived, this file grew a third column rather than a
+parallel file with its own idea of what parity means.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from typer.testing import CliRunner
@@ -145,64 +147,143 @@ def test_every_tool_describes_itself_and_its_arguments(service: ApplicationServi
 # --- the same call through both surfaces ------------------------------------------------------
 
 
-PAIRS: tuple[tuple[str, dict[str, Any], list[str]], ...] = (
-    ("search", {"query": "retry"}, ["search", "retry"]),
-    ("document_list", {}, ["document", "list"]),
-    ("stats", {}, ["index", "--stats"]),
-    ("index_status", {}, ["index"]),
-    ("doctor", {}, ["doctor"]),
-    ("connector_list", {}, ["connector", "list"]),
-    ("workspace_list", {}, ["workspace", "list"]),
-    ("plugin_list", {}, ["plugin", "list"]),
-    ("config_get", {"key": "rag.profile"}, ["config", "get", "rag.profile"]),
+type Envelopes = dict[str, Any]
+"""One serialised envelope, as any of the three surfaces produced it."""
+
+type HttpCall = tuple[str, str, dict[str, Any]] | None
+"""A method, a path and request keyword arguments — or ``None`` for an operation with no route."""
+
+
+def _http(service: ApplicationService, method: str, path: str, **kwargs: Any) -> Envelopes:
+    """Run one request against the **real** application and parse its envelope.
+
+    The production `build_app`, over the same service the other two surfaces are driving. A
+    helper that called the service directly would compare the service with itself.
+    """
+    from fastapi.testclient import TestClient  # noqa: PLC0415 - only the HTTP column needs it
+
+    from manicule.api.app import build_app  # noqa: PLC0415 - keeps FastAPI out of the CLI path
+
+    with TestClient(build_app(service), client=("127.0.0.1", 41234)) as client:
+        body: Envelopes = client.request(method, path, **kwargs).json()
+        return body
+
+
+PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall], ...] = (
+    (
+        "search",
+        {"query": "retry"},
+        ["search", "retry"],
+        ("GET", "/api/v1/search", {"params": {"q": "retry"}}),
+    ),
+    ("document_list", {}, ["document", "list"], ("GET", "/api/v1/documents", {})),
+    ("stats", {}, ["index", "--stats"], ("GET", "/api/v1/stats", {})),
+    ("index_status", {}, ["index"], ("GET", "/api/v1/admin/stats", {})),
+    ("doctor", {}, ["doctor"], ("GET", "/api/v1/health", {})),
+    ("connector_list", {}, ["connector", "list"], ("GET", "/api/v1/admin/connectors", {})),
+    ("workspace_list", {}, ["workspace", "list"], ("GET", "/api/v1/workspaces", {})),
+    ("plugin_list", {}, ["plugin", "list"], ("GET", "/api/v1/plugins", {})),
+    ("config_get", {"key": "rag.profile"}, ["config", "get", "rag.profile"], None),
 )
+"""One row per operation: the MCP tool, the command, and the HTTP request that runs it.
+
+``config_get`` has no HTTP column, and that is a decision rather than an omission: reading and
+writing configuration over the network is how an installation gets repointed at a different
+data directory by something holding a key. It stays on the command line and the MCP tool.
+"""
+
+ELAPSED = "elapsed_ms"
+"""The one field that legitimately differs between two runs of the same operation.
+
+Excluded by name rather than by tolerance. A comparison that ignored whatever happened to
+differ would ignore a real divergence too.
+"""
 
 
-@pytest.mark.parametrize(("tool", "arguments", "argv"), PAIRS)
+def _comparable(envelope: Envelopes) -> Envelopes:
+    """One envelope, with the timing removed, so two runs of one operation can be equal."""
+    payload = envelope.get("data")
+    if not isinstance(payload, dict):
+        return envelope
+    typed = cast("dict[str, Any]", payload)
+    return {**envelope, "data": {key: value for key, value in typed.items() if key != ELAPSED}}
+
+
+@pytest.mark.parametrize(("tool", "arguments", "argv", "request_"), PAIRS)
 def test_a_tool_and_its_command_produce_the_same_envelope(
     monkeypatch: pytest.MonkeyPatch,
     service: ApplicationService,
+    *,
     tool: str,
     arguments: dict[str, Any],
     argv: list[str],
+    request_: HttpCall,
 ) -> None:
-    """The same operation, both ways round, compared as serialised JSON.
+    """The same operation, every way round, compared as serialised JSON.
 
     Comparing the parsed structures rather than the raw text is deliberate: the command line
-    pretty-prints and sorts keys and the tool does not, and neither of those is part of the
+    pretty-prints and sorts keys and the others do not, and neither of those is part of the
     contract. Everything else is.
     """
+    del request_
     from_tool = _tool(service, tool, arguments)
     from_cli = _cli(monkeypatch, service, argv)
-    assert from_tool == from_cli
+    assert _comparable(from_tool) == _comparable(from_cli)
 
 
-@pytest.mark.parametrize(("tool", "arguments", "argv"), PAIRS)
-def test_both_surfaces_carry_the_workspace_and_the_contract_version(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(("tool", "arguments", "argv", "request_"), PAIRS)
+def test_the_http_surface_produces_the_same_envelope_as_the_tool(
     service: ApplicationService,
     tool: str,
     arguments: dict[str, Any],
     argv: list[str],
+    request_: HttpCall,
+) -> None:
+    """The third column. A route that decided anything of its own fails here."""
+    del argv
+    if request_ is None:
+        pytest.skip("this operation is deliberately not on the HTTP surface")
+    method, path, kwargs = request_
+    from_tool = _tool(service, tool, arguments)
+    from_http = _http(service, method, path, **kwargs)
+    assert _comparable(from_tool) == _comparable(from_http)
+
+
+@pytest.mark.parametrize(("tool", "arguments", "argv", "request_"), PAIRS)
+def test_every_surface_carries_the_workspace_and_the_contract_version(
+    monkeypatch: pytest.MonkeyPatch,
+    service: ApplicationService,
+    *,
+    tool: str,
+    arguments: dict[str, Any],
+    argv: list[str],
+    request_: HttpCall,
 ) -> None:
     """Four keys are on every envelope, whichever surface produced it."""
-    for envelope in (_tool(service, tool, arguments), _cli(monkeypatch, service, argv)):
+    produced = [_tool(service, tool, arguments), _cli(monkeypatch, service, argv)]
+    if request_ is not None:
+        method, path, kwargs = request_
+        produced.append(_http(service, method, path, **kwargs))
+    for envelope in produced:
         assert set(envelope) == {"version", "op", "ok", "workspace", "data", "error"}
         assert envelope["workspace"] == WORKSPACE
         assert envelope["op"] == tool
 
 
-def test_a_failure_is_a_result_on_both_surfaces(
+def test_a_failure_is_a_result_on_every_surface(
     monkeypatch: pytest.MonkeyPatch, service: ApplicationService
 ) -> None:
     """A failure is data, not a transport error, so an assistant can act on it.
 
     ``ok`` is false, ``data`` is absent and ``error`` names the type, the message and — where
-    there is something specific to say — what to do next.
+    there is something specific to say — what to do next. The HTTP surface additionally
+    carries a status code, and the **body is still the envelope**, so a client that reads
+    ``ok`` first never has two shapes to parse.
     """
     from_tool = _tool(service, "document_get", {"document_id": "nope"})
     from_cli = _cli(monkeypatch, service, ["document", "get", "nope"])
-    assert from_tool == from_cli
+    from_http = _http(service, "GET", "/api/v1/documents/nope")
+    assert from_tool == from_cli == from_http
     assert from_tool["ok"] is False
     assert from_tool["data"] is None
     assert from_tool["error"]["type"] == "UnknownEntityError"

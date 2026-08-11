@@ -42,11 +42,14 @@ if TYPE_CHECKING:
 
     from manicule.app.ports import (
         Answering,
+        Conversing,
         DocumentSurface,
         Ingesting,
         Keys,
         Maintenance,
+        Organising,
         Retrieving,
+        Telemetry,
     )
     from manicule.config.settings import Settings
     from manicule.core.protocols import Connector, Parser, VectorStore
@@ -232,6 +235,28 @@ class Runtime:
         """Backup, restore, export and reset, over this runtime's engine."""
         return await self._once("maintenance", self._build_maintenance)
 
+    async def organisation(self) -> Organising:
+        """Collections, tags and the trash.
+
+        The **same object** the document store is. Two handles over one workspace would be two
+        opinions about which documents are live, and the collection reads join against exactly
+        the predicate the document reads use.
+        """
+        return await self._once("organisation", self._build_organisation)
+
+    async def conversations(self) -> Conversing:
+        """Conversations, turns and share links, over this runtime's engine.
+
+        One slot, shared with the answer path. A second store over the same engine would be a
+        second session factory writing turns into the same rows, and — more to the point — a
+        second place a share link could be minted from.
+        """
+        return await self._once("conversations", self._build_conversations)
+
+    async def telemetry(self) -> Telemetry:
+        """Query logs and the audit trail."""
+        return await self._once("telemetry", self._build_telemetry)
+
     async def keys(self) -> Keys:
         """API keys for this workspace."""
         return await self._once("keys", self._build_keys)
@@ -337,9 +362,9 @@ class Runtime:
             blobs=await self.blobs(),
             router=ChainRouter(chain=_ContainerChain(self._container)),
         )
-        conversations = SqliteConversationStore(
-            self.require_engine(), workspace_id=settings.workspace
-        )
+        # The same handle the surfaces use, not a second one. Two stores over one engine is
+        # two places a share link can be minted from and two opinions about what is deleted.
+        conversations = cast("SqliteConversationStore", await self.conversations())
         return Answerer(
             generator=generator,
             verifier=CitationVerifier(resolver, timeout_s=settings.llm.citation_verify_timeout_s),
@@ -356,6 +381,36 @@ class Runtime:
     async def _build_maintenance(self) -> Maintenance:
         await self.documents()
         return _Maintenance(self)
+
+    async def _build_organisation(self) -> Organising:
+        from manicule.app.ports import Organising as Surface  # noqa: PLC0415
+
+        store = await self.documents()
+        # Checked rather than cast, like the document surface itself. A store that does not
+        # provide collections would otherwise become an AttributeError from inside a route.
+        if not isinstance(store, Surface):
+            msg = (
+                f"the configured document store {type(store).__name__} does not provide "
+                f"collections, tags and the trash, which the surfaces need."
+            )
+            raise AssemblyError(msg)
+        return store
+
+    async def _build_conversations(self) -> Conversing:
+        from manicule.storage.conversations import SqliteConversationStore  # noqa: PLC0415
+
+        await self.documents()
+        store = SqliteConversationStore(
+            self.require_engine(), workspace_id=self._settings.workspace
+        )
+        # Every table here cascades from `workspaces`, so a handle bound to a workspace with
+        # no row is a foreign-key failure on the first conversation rather than at startup.
+        await store.ensure_workspace()
+        return store
+
+    async def _build_telemetry(self) -> Telemetry:
+        await self.documents()
+        return _Telemetry(self)
 
     async def _build_keys(self) -> Keys:
         await self.documents()
@@ -673,6 +728,50 @@ class _Keys:
             )
         return [_key_summary(row) for row in rows]
 
+    async def verify(self, secret: str) -> ApiKeySummary | None:
+        """Resolve a presented secret to its key, or ``None``.
+
+        Four predicates, all in the statement: the digest matches, the key belongs to **this**
+        workspace, it has not been revoked, and it has not expired. The digest is what is
+        compared — the plaintext is never stored — so there is no string comparison here to
+        time a byte at a time, and no branch that treats an unknown key differently from a
+        revoked one.
+
+        ``last_used_at`` is deliberately **not** updated. It would turn every authenticated
+        read into a write, serialising the whole API behind SQLite's single writer, and
+        "when was this key last used" is a question the audit trail answers without that cost.
+        """
+        from sqlalchemy import or_, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        if not secret:
+            return None
+        digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        now = utcnow()
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            row = (
+                (
+                    await session.execute(
+                        select(models.ApiKey).where(
+                            models.ApiKey.key_hash == digest,
+                            models.ApiKey.workspace_id == self._runtime.workspace,
+                            models.ApiKey.revoked_at.is_(None),
+                            or_(
+                                models.ApiKey.expires_at.is_(None),
+                                models.ApiKey.expires_at > now,
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+        return None if row is None else _key_summary(row)
+
     async def revoke(self, name_or_id: str) -> ApiKeySummary:
         from sqlalchemy import or_, select  # noqa: PLC0415
 
@@ -702,6 +801,157 @@ class _Keys:
                 raise UnknownEntityError(msg)
             row.revoked_at = utcnow()
             return _key_summary(row)
+
+
+class _Telemetry:
+    """Query logs and the audit trail, over one runtime's engine and workspace.
+
+    The two tables differ in one way that matters and is easy to get backwards.
+    ``query_logs.workspace_id`` is a foreign key that cascades — query text is user content,
+    and keeping it past its workspace's deletion is a retention problem. ``audit_logs`` has
+    **no** foreign keys at all: an audit trail that cascades away with the thing it audits is
+    not an audit trail. So one is filtered by a joinable column and the other by a plain one,
+    and neither is written the way the other is.
+    """
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    async def record_query(
+        self,
+        query: str,
+        *,
+        profile: str,
+        chunk_ids: Sequence[str],
+        confidence: float | None,
+        elapsed_ms: int,
+    ) -> str:
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        identifier = secrets.token_hex(8)
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            session.add(
+                models.QueryLog(
+                    id=identifier,
+                    workspace_id=self._runtime.workspace,
+                    query=query,
+                    profile=profile,
+                    retrieved_chunk_ids=list(chunk_ids),
+                    confidence_score=confidence,
+                    response_time_ms=elapsed_ms,
+                )
+            )
+        return identifier
+
+    async def query_logs(
+        self, *, limit: int = 50, offset: int = 0
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        from sqlalchemy import func, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        scope = models.QueryLog.workspace_id == self._runtime.workspace
+        async with sessions() as session:
+            total = (
+                await session.execute(select(func.count(models.QueryLog.id)).where(scope))
+            ).scalar_one()
+            rows = (
+                (
+                    await session.execute(
+                        select(models.QueryLog)
+                        .where(scope)
+                        .order_by(models.QueryLog.created_at.desc(), models.QueryLog.id)
+                        .limit(max(limit, 0))
+                        .offset(max(offset, 0))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [
+            {
+                "id": row.id,
+                "query": row.query,
+                "profile": row.profile or "",
+                # The count, not the ids. A page of telemetry is read by a person looking for
+                # slow or low-confidence queries, and a list of chunk ids is corpus structure
+                # that has no business travelling with it.
+                "chunks": _length(row.retrieved_chunk_ids),
+                "confidence": row.confidence_score,
+                "elapsed_ms": row.response_time_ms,
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in rows
+        ], int(total)
+
+    async def record_audit(
+        self,
+        event_type: str,
+        *,
+        details: Mapping[str, object],
+        actor: str | None = None,
+        ip_address: str | None = None,
+    ) -> None:
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            session.add(
+                models.AuditLog(
+                    id=secrets.token_hex(8),
+                    workspace_id=self._runtime.workspace,
+                    user_id=actor,
+                    event_type=event_type,
+                    details=dict(details),
+                    ip_address=ip_address,
+                )
+            )
+
+    async def audit_logs(
+        self, *, limit: int = 50, offset: int = 0, event_type: str | None = None
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        from sqlalchemy import func, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        clauses = [models.AuditLog.workspace_id == self._runtime.workspace]
+        if event_type:
+            clauses.append(models.AuditLog.event_type == event_type)
+        async with sessions() as session:
+            total = (
+                await session.execute(select(func.count(models.AuditLog.id)).where(*clauses))
+            ).scalar_one()
+            rows = (
+                (
+                    await session.execute(
+                        select(models.AuditLog)
+                        .where(*clauses)
+                        .order_by(models.AuditLog.created_at.desc(), models.AuditLog.id)
+                        .limit(max(limit, 0))
+                        .offset(max(offset, 0))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [
+            {
+                "id": row.id,
+                "event_type": row.event_type,
+                "actor": row.user_id,
+                "ip_address": row.ip_address,
+                "details": row.details if isinstance(row.details, dict) else {},
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in rows
+        ], int(total)
 
 
 class _Maintenance:
@@ -850,6 +1100,16 @@ def _key_summary(row: object) -> ApiKeySummary:
 
 def _isoformat(value: object) -> str:
     return value.isoformat() if isinstance(value, datetime) else ""
+
+
+def _length(value: object) -> int:
+    """How many entries a JSON column holds, tolerating one that holds something else.
+
+    The column is typed ``JsonValue``, so a row written before this table was used — or by
+    hand — can legitimately hold a scalar. ``len`` on that is a ``TypeError`` from inside a
+    listing, which is a worse outcome than reporting zero for a row that recorded no chunks.
+    """
+    return len(cast("list[object]", value)) if isinstance(value, list) else 0
 
 
 def _prepare_archive_dir(target: Path) -> None:

@@ -41,8 +41,10 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Deliberately no `ports:`. There is no HTTP surface to publish, and MCP over stdio opens
-    # no socket. When there is one, docs/deployment.md §4 says what publishing it requires.
+    # Deliberately no `ports:`. The default command serves MCP over stdio, which opens no
+    # socket at all. `manicule start --transport http` serves the HTTP API, and publishing
+    # that is an operator's decision: docs/deployment.md §4 says what it costs, and manicule
+    # refuses a non-loopback bind without authentication either way.
 
 volumes:
   manicule-data:

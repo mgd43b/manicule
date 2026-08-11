@@ -410,7 +410,7 @@ Issue numbers match these steps exactly — step 4 is [#4](https://github.com/mg
 | 15 | [Retrieval quality baseline](https://github.com/mgd43b/manicule/issues/15) | Usable | Starts here, continues forever |
 | 9 | [Connectors](https://github.com/mgd43b/manicule/issues/9) | Reach | All eight, with real incremental sync |
 | 10 | [Document management](https://github.com/mgd43b/manicule/issues/10) | Reach | |
-| 11 | [HTTP API](https://github.com/mgd43b/manicule/issues/11) | Interfaces | |
+| 11 | [HTTP API](https://github.com/mgd43b/manicule/issues/11) | Interfaces | Eleven route groups over the same service the CLI and MCP use |
 | 12 | [Web UI](https://github.com/mgd43b/manicule/issues/12) | Interfaces | |
 | 13 | [Team mode & security](https://github.com/mgd43b/manicule/issues/13) | Production | |
 | 14 | [Operations](https://github.com/mgd43b/manicule/issues/14) | Production | |

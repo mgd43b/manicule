@@ -691,17 +691,20 @@ def start(
     ] = False,
     no_web: Annotated[bool, typer.Option("--no-web", help="Do not serve the web UI.")] = False,
 ) -> None:
-    """Serve manicule over MCP.
+    """Serve manicule: the HTTP API over a socket, or MCP.
 
-    ``stdio`` is the default and opens no socket at all. ``--transport http`` binds loopback
-    unless a non-loopback host is configured **and** ``--allow-public-bind`` is passed **and**
-    authentication is on; any one missing is a refusal.
+    ``stdio`` is the default and opens no socket at all — and it is always MCP, because the
+    HTTP API has no stdio form. ``--transport http`` serves the **HTTP API**; add
+    ``--mcp-only`` to serve the MCP protocol over that socket instead.
 
-    ``--no-web`` and the absence of ``--mcp-only`` currently describe the same thing: the HTTP
-    API and the web UI are not part of this build, so MCP is what there is to serve. Both
-    options exist so that a command line written today keeps working when they arrive.
+    Either way the address goes through one bind policy: loopback unless a non-loopback host
+    is configured **and** ``--allow-public-bind`` is passed **and** authentication is on. Any
+    one missing is a refusal naming which.
+
+    ``--no-web`` is accepted and currently describes what already happens: the web UI is not
+    part of this build, so nothing but the API and MCP is served.
     """
-    del no_web, mcp_only  # see the docstring: MCP is the whole surface in this build
+    del no_web  # the web UI is #12; the API and MCP are what there is to serve
     from manicule.cli.serving import serve_forever  # noqa: PLC0415 - only this command serves
 
     raise typer.Exit(
@@ -712,6 +715,7 @@ def start(
             allow_public=allow_public_bind,
             overrides=STATE.overrides,
             json_output=STATE.json_output,
+            mcp_only=mcp_only,
         )
     )
 

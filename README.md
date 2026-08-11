@@ -3,12 +3,12 @@
 Self-hosted document search and answers. Index documents from wherever they live — disk,
 git, Notion, Confluence, Drive, S3, the web — ask questions in natural language, and get
 answers with citations that resolve to a real location in a real document. Usable from the
-command line and by AI assistants over MCP.
+command line, over HTTP, and by AI assistants over MCP.
 
-> **Early, and runnable.** Both surfaces work today: point it at a directory, search it, ask
-> it questions, or hand the same operations to an assistant over MCP. There is no release on
-> PyPI yet, so it is installed from a checkout — [below](#install). The HTTP API and the web
-> UI are not built; see [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is
+> **Early, and runnable.** All three surfaces work today: point it at a directory, search it,
+> ask it questions, hand the same operations to an assistant over MCP, or serve them over HTTP.
+> There is no release on PyPI yet, so it is installed from a checkout — [below](#install). The
+> web UI is not built; see [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is
 > being built in.
 
 ```bash
@@ -22,8 +22,9 @@ manicule doctor                   # what is wrong, and what to do about it
 Every command that emits data takes `--json` — before the command name, `manicule --json
 search …`, because it is an option of `manicule` rather than of each command — and most of
 them are also MCP tools, so an assistant reaches the same operations through `manicule start
---mcp-only`. The output shape is a contract, written down in
-[`docs/surfaces.md`](docs/surfaces.md).
+--mcp-only`, and `manicule start --transport http` serves them over HTTP with an OpenAPI
+document at `/api/docs`. All three emit the same envelope, and the shape is a contract written
+down in [`docs/surfaces.md`](docs/surfaces.md).
 
 ## Install
 
@@ -75,11 +76,16 @@ manicule config set llm.model qwen2.5:14b   # or any model that Ollama is servin
 `manicule doctor` reports what is wrong and what to do about it, and it is the first thing to
 run when something does not work.
 
-## The two surfaces
+## The three surfaces
 
 **The command line** is nineteen commands; `manicule --help` lists them. Under `--json` the
 result envelope is the whole of stdout, so a failed run piped into `jq` reads an empty stream
 rather than a prose error.
+
+**The HTTP API** is eleven route groups over the same service — documents, chat with SSE
+streaming, conversations and shareable links, collections, tags, admin, plugins, auth, a
+workbench, a websocket channel — plus an embeddable chat widget. `manicule start --transport
+http` serves it, on loopback unless three separate things say otherwise.
 
 **The MCP server** is nineteen tools over the same service, and it speaks stdio by default —
 which opens no socket at all. To let Claude Code use your index:
@@ -171,17 +177,23 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/app` | The application service. All the behaviour, once, for every surface |
 | `src/manicule/cli` | Nineteen commands over that service, and nothing else |
 | `src/manicule/mcp` | Nineteen MCP tools over that service, and nothing else |
+| `src/manicule/api` | Eleven HTTP route groups over that service, and nothing else |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |
 
-The two surfaces are adapters: they parse arguments, call one method, and render what comes
-back. A rule that lived in one of them would be a rule the other did not have — and the MCP
-tool is the one called unattended, so that is not a distinction worth risking. A test runs the
-same operation through both and compares the results.
+The three surfaces are adapters: they parse arguments, call one method, and render what comes
+back. A rule that lived in one of them would be a rule the others did not have — and two of the
+three are called unattended, so that is not a distinction worth risking. A test runs the same
+operation through all three and compares the results.
 
 **Nothing binds a network socket unless it is asked to.** The MCP server speaks stdio by
-default, which opens no socket at all; the HTTP transport binds loopback, and widening it
-takes an address somebody wrote down, an explicit flag no config file can supply, and
-authentication switched on. Any one missing is a refusal.
+default, which opens no socket at all; every HTTP bind goes through one policy that starts at
+loopback, and widening it takes an address somebody wrote down, an explicit flag no config file
+can supply, and authentication switched on. Any one missing is a refusal.
+
+**Nothing believes a forwarded address unless it was told to.** `X-Forwarded-For` is read only
+from a peer inside `security.transport.trusted_proxies`, which is empty by default — so on an
+ordinary install the header is not consulted at all, and every IP-based decision rests on a
+socket peer rather than on a value the caller chose.
 
 ## Extending it
 

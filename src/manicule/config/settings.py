@@ -19,8 +19,10 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from enum import StrEnum
+from ipaddress import ip_network
 from pathlib import Path
 from typing import Any, Literal, Self, override
+from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, field_validator
@@ -332,12 +334,91 @@ class TransportSettings(Section):
         description="CIDR ranges whose forwarded-for headers are believed. Empty means none "
         "are — an unrestricted trust in that header is a trivial identity spoof.",
     )
-    allowed_origins: tuple[str, ...] = ()
+    allowed_origins: tuple[str, ...] = Field(
+        default=(),
+        description="Origins the browser API may be called from, in full ``scheme://host[:port]`` "
+        "form. Empty means same-origin only. There is deliberately no wildcard: an index of "
+        "somebody's documents readable from any page they visit is not a default.",
+    )
     allowed_endpoints: tuple[str, ...] = Field(
         default=(),
         description="Outbound hosts plugins and connectors may reach. Empty is unrestricted.",
     )
-    widget_allowed_domains: tuple[str, ...] = ()
+    widget_allowed_domains: tuple[str, ...] = Field(
+        default=(),
+        description="Origins permitted to embed the chat widget in a frame. Empty means none, "
+        "so the default answer to a framing attempt is a refusal rather than a click nobody "
+        "meant to make.",
+    )
+
+    @field_validator("trusted_proxies")
+    @classmethod
+    def _proxies_are_networks(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Every entry must parse as a network, at startup.
+
+        A typo here does not fail loudly on its own: the entry simply never matches, the
+        proxy in front is never trusted, and the deployment quietly attributes every request
+        to the proxy's own address. That is the safe direction and it is still wrong, because
+        the operator believes a policy is in force that is not. So it is refused.
+
+        Raises:
+            ValueError: An entry is not an address or a CIDR range.
+        """
+        for entry in value:
+            text = entry.strip()
+            if not text:
+                msg = "security.transport.trusted_proxies contains an empty entry"
+                raise ValueError(msg)
+            try:
+                # `strict=False`: a bare host address means that single host.
+                ip_network(text, strict=False)
+            except ValueError as exc:
+                msg = (
+                    f"security.transport.trusted_proxies entry {entry!r} is not an address or "
+                    f"a CIDR range ({exc}). This list decides whose X-Forwarded-For header is "
+                    f"believed, so an entry that silently matches nothing is refused."
+                )
+                raise ValueError(msg) from exc
+        return value
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def _origins_are_explicit(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """No wildcard, and every entry is a real origin.
+
+        ``*`` is refused rather than accepted-and-ignored. An operator who writes it has asked
+        for "any page on the internet may read this index with the browser's credentials", and
+        the honest response is to say that is not offered rather than to silently narrow it.
+
+        **Anything past the port is refused too** — a path, a query string, a fragment, a
+        trailing slash. A browser's ``Origin`` header is exactly scheme, host and port, so an
+        entry carrying any of those can never match one: CORS is silently off for that origin
+        while the configuration file says it is on. That is the failure mode this whole module
+        is written against, and it is quieter here than most, because the symptom appears as a
+        browser error on somebody else's page rather than anywhere an operator is looking.
+
+        Raises:
+            ValueError: An entry is ``*`` or is not exactly a ``scheme://host[:port]`` origin.
+        """
+        for entry in value:
+            if entry.strip() == "*":
+                msg = (
+                    "security.transport.allowed_origins may not contain '*'. A cross-origin "
+                    "wildcard over a document index means any page a user visits can read it; "
+                    "list the origins that may embed or call this installation."
+                )
+                raise ValueError(msg)
+            parsed = urlsplit(entry)
+            extra = parsed.path or parsed.query or parsed.fragment
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or extra:
+                msg = (
+                    f"security.transport.allowed_origins entry {entry!r} is not an origin. "
+                    f"Write it as scheme://host[:port] — nothing after the port, because a "
+                    f"browser's Origin header carries nothing after the port and an entry "
+                    f"that carries more can never match one."
+                )
+                raise ValueError(msg)
+        return value
 
     @property
     def is_loopback(self) -> bool:

@@ -1,26 +1,26 @@
-# Surfaces: the CLI, the MCP server, and the shape of what they return
+# Surfaces: the CLI, the MCP server, the HTTP API, and the shape of what they return
 
-Two surfaces, one service, one output contract. This document says what that contract is,
+Three surfaces, one service, one output contract. This document says what that contract is,
 because `--json` is something scripts and assistants parse, and a shape nobody wrote down is
 whatever the code happened to do last.
 
 - **The application service** (`manicule.app.service.ApplicationService`) has all the
   behaviour.
-- **The command line** (`manicule.cli`) and **the MCP server** (`manicule.mcp`) are adapters
-  over it. Neither decides anything.
-- **The HTTP API** ([#11](https://github.com/mgd43b/manicule/issues/11)) will be a third one.
+- **The command line** (`manicule.cli`), **the MCP server** (`manicule.mcp`) and **the HTTP
+  API** (`manicule.api`) are adapters over it. None of them decides anything.
 
 ---
 
 ## 1. Why the layer exists
 
 A rule implemented in the command line is a rule the MCP tool does not have — and the MCP tool
-is the one an assistant calls unattended. Workspace scoping, credential masking, refusing to
-install a plugin, refusing a wide bind: every one of those is a rule that has to hold on both
-surfaces or it does not hold.
+is the one an assistant calls unattended. The HTTP API is worse again: it is reachable by a
+script, a widget in somebody else's page, or anything holding a key. Workspace scoping,
+credential masking, refusing to install a plugin, refusing a wide bind: every one of those is a
+rule that has to hold on all three surfaces or it does not hold.
 
 So the surfaces are thin by construction and the property is checked rather than intended.
-`tests/app/test_surface_parity.py` runs the same operation through both and compares the
+`tests/app/test_surface_parity.py` runs the same operation through all three and compares the
 results. It fails the moment they stop being the same call.
 
 ### What each layer may contain
@@ -29,6 +29,7 @@ results. It fails the moment they stop being the same call.
 |---|---|---|
 | `manicule.cli` | Parse arguments, read stdin, render, set the exit status | Query a store, compute a filter, decide a policy |
 | `manicule.mcp` | Declare tools, describe them, pass arguments through | Anything the CLI may not |
+| `manicule.api` | Route, authenticate, decide a status code, frame a stream | Anything the CLI may not |
 | `manicule.app.service` | Everything else | Import a database, a model runtime or a web framework |
 | `manicule.app.runtime` | Build components, own the lifecycle | Decide anything a surface could ask about |
 
@@ -41,7 +42,8 @@ watched firing.
 
 ## 2. The envelope
 
-Every `--json` emission and every MCP tool result is **one JSON object** in this shape:
+Every `--json` emission, every MCP tool result and every HTTP response body is **one JSON
+object** in this shape:
 
 ```json
 {
@@ -88,7 +90,28 @@ nothing specific to say.
 
 **A failure is a result, not an exception.** The MCP tool returns this rather than raising, so
 an assistant gets something it can act on instead of a transport error with no shape. The CLI
-prints it and exits **1**.
+prints it and exits **1**. The HTTP API sends it as the body, with a status code derived from
+`error.type` — **the body is the envelope even when the status is not 200**, so a client that
+reads `ok` first never has two shapes to parse:
+
+| `error.type` | Status |
+|---|---|
+| `UnauthenticatedError` | 401 |
+| `ForbiddenError`, `PolicyError` | 403 |
+| `UnknownEntityError`, `UnknownComponentError`, `UnknownConversationError` | 404 |
+| `NameInUseError`, `FingerprintMismatchError` | 409 |
+| `RequestValidationError` | 422 |
+| `CrossWorkspaceError`, `OSError` | 500 |
+| anything else | 400 |
+
+`CrossWorkspaceError` is **5xx** deliberately. Nothing the caller sent could have produced it:
+a store returned another tenant's row and the surface refused it. Reporting that as a client
+error would file a defect against the caller.
+
+A request FastAPI rejects before a handler runs — a missing parameter, an unknown body field —
+is re-dressed as the same envelope rather than left in FastAPI's own `{"detail": [...]}` shape.
+That is the most common failure a client meets, and it is the one place a second response shape
+would otherwise appear.
 
 **Defects still propagate.** Anything that is not a `ManiculeError`, a `ValueError` or an
 `OSError` is a bug in manicule, and dressing one up as a well-formed envelope is how a broken
@@ -246,8 +269,9 @@ invented them here would be a second, weaker copy of that subsystem.
 `manicule start` serves MCP over **stdio** by default, which opens no socket at all. There is
 no address to get wrong on the path everybody uses.
 
-`--transport http` goes through `manicule.app.bind.resolve_bind`, and a non-loopback bind
-needs **all three** of:
+`--transport http` serves the **HTTP API**; add `--mcp-only` to serve the MCP protocol over
+that socket instead. Either way the address goes through `manicule.app.bind.resolve_bind`, and
+a non-loopback bind needs **all three** of:
 
 1. a host that is not loopback — and the configured default is `127.0.0.1`, so this is always
    something a person wrote down;
@@ -261,6 +285,12 @@ absent value in each case is the safe one.
 policy is not merely "refuse everything", and reads the source tree to check that **no module
 but the bind policy names an all-interfaces address**. That last one is what survives a future
 server that binds a literal instead of asking.
+
+There is a **second** refusal, and it is deliberately not the same code. `resolve_bind` decides
+an address; `manicule.api.app.build_app` decides whether an *application* may exist at all, and
+refuses to build an unauthenticated one whose address is not loopback. That one fires even when
+something other than `manicule start` is doing the listening — a container entry point, a
+production ASGI server, a hand-written uvicorn call.
 
 ---
 
@@ -286,6 +316,13 @@ reaches a provider. `tests/app/test_tenancy.py` asserts that through the answere
 log rather than through the exception, because an implementation that refused after streaming
 would raise exactly the same error having already sent the passages.
 
+`tests/api/test_tenancy.py` does the same through the routes, against the same deliberately
+broken stores — one that ignores its workspace filter *and* its limit, so the surface's own
+identity check is what has to fire rather than a truncation catching a foreign row by accident.
+Every case there has a control beside it: the same route against a correct store returns the
+tenant's own document, because a surface that refused everything would satisfy the negatives
+and be useless.
+
 ---
 
 ## 8. Two things the surfaces refuse to do
@@ -305,7 +342,169 @@ left to be discovered.
 
 ---
 
-## 9. Export and import
+## 9. The HTTP API
+
+`manicule.api`. Eleven route groups, `manicule start --transport http`, OpenAPI at
+`/api/docs`. Every route parses a request, calls one service method, and renders the envelope
+above.
+
+### 9.1 The groups
+
+| Group | Routes |
+|---|---|
+| health | `GET /healthz`, `GET /readyz`, `GET /api/v1/health`, `GET /api/v1/stats`, `GET /api/v1/workspaces` |
+| documents | `GET /api/v1/documents`, `GET /api/v1/documents/{id}`, `DELETE /api/v1/documents/{id}`, `GET /api/v1/documents/trash`, `POST /api/v1/documents/{id}/restore`, `POST /api/v1/documents/{id}/reindex`, `GET /api/v1/search` |
+| chat | `POST /api/v1/chat`, `POST /api/v1/chat/stream`, `POST /api/v1/chat/feedback` |
+| conversations | `GET`/`POST /api/v1/conversations`, `GET /api/v1/conversations/{id}/messages`, `PATCH`/`DELETE /api/v1/conversations/{id}`, `POST`/`DELETE /api/v1/conversations/{id}/share`, `GET /shared/{token}` |
+| collections | `GET`/`POST /api/v1/collections`, `DELETE /api/v1/collections/{id}`, `GET /api/v1/collections/{id}/documents`, `POST`/`DELETE /api/v1/collections/{id}/documents/{docId}` |
+| tags | `GET`/`POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`, `POST`/`DELETE /api/v1/documents/{docId}/tags/{tagId}` |
+| admin | `GET /api/v1/admin/stats`, `/query-logs`, `/audit-logs`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync` |
+| plugins | `GET /api/v1/plugins`, `GET /api/v1/plugins/search`, `POST`/`DELETE /api/v1/plugins/{name}` |
+| auth | `GET /auth/providers`, `GET /auth/session`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}` |
+| workbench | `GET /api/v1/workbench?document_id=…` |
+| websocket chat | `WS /api/v1/chat/ws` |
+
+Plus the embeddable widget: `GET /widget/widget.js` and a static page at `GET /widget`.
+
+`/healthz` and `/readyz` are the only routes that answer without an envelope, because they
+answer a probe rather than a person. They also answer different questions: `/healthz` opens
+nothing, `/readyz` asks the store whether the index is usable. Collapsing them gives you a
+liveness probe that restarts a healthy process because a database file is briefly locked.
+
+Both are unauthenticated, so both carry `{"status": …}` and nothing else — no counts, no
+configuration and no reason for an unready answer. "412 documents, chunker structural" is a
+corpus fingerprint, and so, more quietly, is the text of a database error. What "ready" *means*
+is the service's decision (`ApplicationService.ready`), not the route's.
+
+### 9.2 Identity
+
+`security.auth.mode` decides. With `api_key`, a key is presented on **every** request as
+`Authorization: Bearer <key>` or `X-API-Key: <key>` — never a query parameter, because a
+credential in a URL is a credential in the access log, the browser history and every `Referer`
+the page sends. On the websocket, where a browser cannot set headers, it travels in the
+`Sec-WebSocket-Protocol` header as `manicule.api-key.<key>` and the server echoes the
+subprotocol back.
+
+Roles are a floor: `viewer` reads, `member` writes, `admin` administers. A route asks for the
+least it needs.
+
+**A refusal names the same operation a success would.** A refused request never reaches its
+service call, so `op` comes from the matched route — and every route therefore carries an
+explicit `name=` equal to the service method it calls. Without that it would be the handler's
+Python function name (`list_documents` rather than `document_list`), and an access log of
+refusals would be unjoinable to one of successes. `tests/api/test_contract.py` enumerates the
+mounted routes and fails on a name that is not an operation.
+
+With `security.auth.mode = none` there is no credential and the caller is treated as the
+operator — which is only tolerable because that configuration cannot be reached from anywhere
+but loopback, refused twice (§6).
+
+### 9.3 Whose address a request has
+
+`X-Forwarded-For` is a header, and clients set headers. Read without qualification it turns
+every IP-based decision into a value the caller chose, silently.
+
+So: **a forwarding header is believed only from a peer inside
+`security.transport.trusted_proxies`, and that list is empty by default.** With no proxies
+configured the header is not read at all — the socket peer is the answer, and a socket peer is
+not something a caller can set. When a proxy *is* trusted, the client is the **right-most**
+entry that is not itself a trusted proxy, because a caller controls the left-hand end of the
+header: everything it fabricates is prepended, and what the real proxy appended is at the
+right. An entry that does not parse as an address is skipped rather than passed along.
+
+A malformed CIDR in `trusted_proxies` is refused at startup. It would otherwise fail closed and
+silently, with the operator believing a policy is in force that is not.
+
+### 9.4 Cross-origin, framing and the widget
+
+The widget runs inside somebody else's page, which is the only part of manicule that is
+deliberately cross-origin.
+
+- **CORS is explicit or absent.** With no `security.transport.allowed_origins` the middleware
+  is not installed, which means same-origin. Configuration refuses `*` outright: a wildcard
+  over a document index means any page a user visits can read it.
+- **Credentials are never permitted cross-origin.** A key is presented per request; there is no
+  cookie to attach, and `allow-credentials` is the ingredient a CSRF needs.
+- **Framing is refused unless somebody named the frames.** Every response carries
+  `frame-ancestors`, naming `security.transport.widget_allowed_domains` and `'none'` when that
+  is empty.
+- **The widget builds DOM, never markup.** Every piece of answer text and every citation label
+  reaches the page through `textContent`. An answer is model output over indexed documents;
+  treating it as markup would make any document in the corpus a script into every embedding
+  page. The served script is a module-level constant with no request value in it.
+- **A widget key is as public as the page it is on.** manicule does not pretend otherwise: mint
+  a dedicated key, give it the least role that works, and revoke it on its own.
+
+The application-wide policy is `default-src 'none'`, which is right for JSON and for the script
+and **wrong for the one page that loads the script** — a browser applies it to the document and
+refuses the `<script src>`. So `GET /widget` states its own, narrower policy: `script-src
+'self'`, `connect-src 'self'`, inline styles for the shadow root, and still `frame-ancestors
+'none'`. Nothing else on the surface is loosened.
+
+### 9.5 Streaming
+
+`POST /api/v1/chat/stream` emits `delta`, `citation`, `drop` and one `final` event. The `final`
+frame is the **identical envelope** `POST /api/v1/chat` would have returned, because the service
+builds the settled payload once and both paths carry it. A client that reads only that frame
+has made the non-streaming call.
+
+Every frame is `json.dumps` of a model dump. An SSE event ends at a blank line, so answer text
+containing one would terminate a frame early on a hand-built `data:` line — a frame-injection
+primitive built out of a model writing a paragraph break.
+
+The websocket carries the same sequence, wrapped as `{"event": …, "data": …}`, over a
+connection that answers several questions.
+
+### 9.6 What the HTTP surface will not do
+
+Seven operations exist on the command line and have **no route**. This surface is the one an
+unattended caller reaches, so each of them is absent rather than merely guarded:
+
+| Absent | Why |
+|---|---|
+| `document delete --hard` | Unrecoverable. The route soft-deletes, and `POST /documents/{id}/restore` undoes it |
+| `reset-index` | Empties the workspace with no restore path |
+| `backup` / `restore` | One writes wherever the caller names; the other overwrites the live data directory |
+| `import` / `export` | The same, over a corpus archive |
+| `upgrade` | Fetching and executing code |
+| plugin *install* | The same. `POST /plugins/{name}` enables one already installed |
+| document *upload* | An ingest path with no filesystem permission check and no path the operator chose |
+| creating a connector | A connector holds credentials and reaches a remote system. Sources are declared in configuration, where the whole set is reviewable in one place |
+| a benchmark endpoint | A benchmark on request is one HTTP call away from an unusable installation |
+| `config get` / `config set` | Reading and writing configuration over the network is how an installation gets repointed at a different data directory |
+
+`tests/api/test_routes.py` asserts each absence by name. An absence with no test is an absence
+that comes back.
+
+### 9.7 Telemetry, and what a failed write costs
+
+`search` and `ask` record a row in `query_logs`, and that recording is the **service's** rather
+than a surface's: telemetry written only by whichever surface remembered to write it describes
+that surface's traffic instead of the installation's.
+
+The two writes this surface makes are treated **differently on purpose**:
+
+- **A failed query-log write does not fail the query.** Retrieval is a read; recording it is a
+  write, and on SQLite a write can lose to a lock. Letting it propagate would make a search that
+  worked yesterday return 500 today because an observability insert could not get the writer. It
+  is logged at warning — without the query text, which is user content — rather than swallowed.
+- **A failed audit write fails the operation it was auditing.** A trail with holes in it is
+  worse than none, because the holes are invisible and the operation reported success.
+
+### 9.8 Search quality
+
+`GET /api/v1/admin/search-quality` **reports**; it does not measure. `manicule.evaluation` is
+the only thing in this project that decides whether one retrieval configuration beats another,
+and it refuses to report at all for a system it cannot distinguish from guessing. The route
+reads that harness's own store and renders its own report.
+
+`available: false` means nobody has judged any pairs — which is the truth, and is not a score
+of zero. `is_evidence: false` means the query set behind the numbers is an **example** one, and
+the harness's caveat travels with it. See [`evaluation.md`](evaluation.md).
+
+---
+
+## 10. Export and import
 
 `export` writes **retained source bytes and document metadata**. No chunks and no vectors:
 `ArchiveManifest` has nowhere to put them. `import` feeds the archive through the ordinary
