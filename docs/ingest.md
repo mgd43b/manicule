@@ -322,13 +322,30 @@ original beside it satisfies nobody.
 
 ## 4. Change detection
 
-Two levels, cheapest first.
+Two levels, cheapest first, and one condition both of them carry.
 
 ```
-1. version_token differs?   no  -> skip, record liveness, done
-2. content_hash differs?    no  -> skip, record liveness, update version_token
-3. otherwise                    -> full ingest
+1. version_token differs?   no, and parse lineage current  -> skip, record liveness, done
+2. content_hash differs?    no, and parse lineage current  -> skip, record liveness, update token
+3. otherwise                                               -> full ingest
 ```
+
+**"Unchanged" is a claim about the stored text, not only about the bytes.** Both levels
+compare what the *source* has, and neither can see that the parser reading those bytes has
+moved underneath them — which is why a `pypdfium2` bump used to be silent: nothing already
+stored was ever re-read, while a newly ingested document with identical bytes parsed
+differently, and the corpus quietly held two generations of extracted text. So a document
+skips only when `documents.parse_fp` matches what its parser would produce today
+([`parsing.md`](parsing.md) §3.0). The condition sits on **both** levels, and level 1 is the
+one that matters: a source whose version token has not moved never reaches the byte
+comparison at all, so a check placed only at level 2 would leave every well-behaved
+connector's corpus permanently stale.
+
+It is selective by construction — the comparison is against the parser *this document* used,
+so a PDF library bump re-parses the PDFs and leaves the Markdown untouched — and it costs a
+re-parse rather than a re-fetch, because level 2 has already fetched. A parser manicule does
+not ship records no lineage and expects none, so a plugin corpus does not re-parse forever to
+learn nothing.
 
 **The pipeline never interprets `version_token`.** It is opaque and connector-defined
 (`contracts.md` §2) — a git blob SHA, a Confluence `version.number`, an S3 ETag. The pipeline
@@ -374,6 +391,12 @@ compatible.
 as `original_ref` when retention succeeded (`storage.md` §4.2). Hashing parsed output instead
 would make the hash depend on the parser version, so a parser upgrade would look like every
 document changing.
+
+That is right, and it is exactly why the parser version needs a column of its own. The hash
+answers "did the source change"; `documents.parse_fp` answers "did what we made of it change";
+and conflating them into one value would make an upgrade indistinguishable from a corpus-wide
+edit — every document reported as modified, its version history gaining a revision nobody made.
+Two questions, two columns, and only the second moves on a bump.
 
 ---
 
@@ -568,16 +591,33 @@ price of an in-process embedder.
 
 ---
 
-## 7. The two refusals
+## 7. The refusals
 
-Both are specified elsewhere; the pipeline is what runs them. Both run **once per run, before
-the first document is discovered**, and both are hard refusals.
+All are specified elsewhere; the pipeline is what runs them. All run **once per run, before
+the first document is discovered**, and all are hard refusals.
 
 ```
+0. the boundaries were measured, not estimated                   (parsing.md §1.2)
 1. EmbedFingerprint   config vs index_state vs _manicule_meta   (storage.md §6.3)
 2. ChunkFingerprint   config vs index_state                      (parsing.md §1.7)
 3. budget_tokens <= max_sequence_length                          (parsing.md §1.1)
 ```
+
+**Check 0 is first because nothing the others discover can resolve it.** A chunker with no
+bound embedder counts with a stand-in vocabulary and inflates the result by a fixed safety
+factor, so its boundaries are neither the model's numbers nor reproducible from them.
+Provisional chunks are for a dry-run parse or a fixture build; there is no configuration that
+makes them fit to serve. It reads nothing — the answer is in the running `ChunkFingerprint`'s
+own `tokenizer_id` — so it costs nothing to put first. The same refusal runs again in
+`IngestPipeline`'s constructor, which is not redundant: a pipeline is constructible without
+going through this function, and everything a pipeline writes is permanent.
+
+**There is no parse-fingerprint refusal here, and §4 is why.** Parsing is per document, so a
+stale parser version is not a fact about the run — it is a fact about some of the documents in
+it, and the response is to re-parse those and no others. A refusal would have to be
+corpus-wide, and a corpus-wide answer to a per-document question is wrong in both directions:
+it would either refuse a Markdown corpus over a PDF library, or grow mid-run and refuse a
+corpus at the moment it gained its first PDF.
 
 **Check 3 is a cross-check between the two fingerprints**, not a property of either. The chunk
 budget lives in `ChunkFingerprint`; `max_sequence_length` lives in `EmbedFingerprint`. Each is
@@ -954,12 +994,12 @@ Calls made in the absence of a stated position.
 | Text-mutating middleware is a `ChunkFingerprint` input, defaulting to opt-out | §3.3 |
 | The complete `Document.status` set and its transitions, collected for #1 | §2.2 |
 | PII redaction moves to the generation boundary; ingest-time redaction rejected | §3.4 |
-| Two-level change detection, and a skip that still writes three things | §4, §4.1 |
+| Two-level change detection, both levels conditioned on current parse lineage | §4, §4.1 |
 | Parse in `spawn`ed worker subprocesses; embed deliberately not (chunk moved to the parent, §2) | §6 |
 | Memory bounding is platform-split: `RLIMIT_AS` on Linux, RSS polling on macOS | §6.2 |
 | Crash recovery is a startup sweep on `status` + `updated_at`, no new schema | §6.4 |
 | One instance per data directory, enforced by a lock file | §6.5 |
-| Both refusals run once per run, before discovery, plus a budget/context cross-check | §7 |
+| Every refusal runs once per run, before discovery, plus a budget/context cross-check | §7 |
 | Embed batch size derived from both fingerprints, not a constant | §8.2 |
 | Bounded queues, so backpressure reaches discovery and cursors do not expire | §8.3 |
 | A failed re-ingest never demotes a working document | §9 |

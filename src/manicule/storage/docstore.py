@@ -271,18 +271,26 @@ class SqliteDocStore(
             row.doc_metadata = cast("Any", merged)
 
     async def set_lineage(
-        self, document_id: str, *, chunk_fp: str | None, embed_fp: str | None
+        self,
+        document_id: str,
+        *,
+        chunk_fp: str | None,
+        embed_fp: str | None,
+        parse_fp: str | None = None,
     ) -> None:
         """Record which fingerprints this document was last built with.
 
         ``None`` leaves a lineage unchanged rather than clearing it: re-embedding moves only the
         embedding lineage, and clearing the chunk one would make "which documents need
-        re-chunking" answer "none" about documents that do.
+        re-chunking" answer "none" about documents that do. The same holds for ``parse_fp``,
+        which no path other than a re-parse is entitled to move.
         """
         async with self._sessions.begin() as session:
             row = await self._live_document(session, document_id)
             if row is None:
                 return
+            if parse_fp is not None:
+                row.parse_fp = parse_fp
             if chunk_fp is not None:
                 row.chunk_fp = chunk_fp
             if embed_fp is not None:
@@ -364,6 +372,7 @@ class SqliteDocStore(
         statuses: Collection[DocumentStatus] | None = None,
         media_types: Collection[str] | None = None,
         chunk_fp_other_than: str | None = None,
+        parse_fp_current: Collection[str] | None = None,
         limit: int | None = None,
     ) -> Sequence[Document]:
         """The selection a repair verb runs over. A query, never a scan.
@@ -371,6 +380,18 @@ class SqliteDocStore(
         ``chunk_fp_other_than`` is what makes invalidation set-valued: "everything a different
         chunker built" is one indexed predicate, so a grammar upgrade repairs the documents in
         that language and leaves the corpus alone.
+
+        ``parse_fp_current`` is the same idea one stage earlier, and it takes a *set* because
+        parsing has no single corpus-wide identity: the complement of "every parse fingerprint
+        that is current" is exactly the documents a library bump changed the text of. A
+        ``NULL`` lineage is in that complement deliberately — no recorded fingerprint means no
+        evidence the stored text is current, and a repair selector that assumed it was would
+        skip precisely the documents predating the column.
+
+        An empty collection is not the same as ``None``: ``None`` means "do not filter on
+        parse lineage", while an empty set means "nothing is current", which selects every
+        document. Both are reachable — the second from an installation with no parsers
+        configured — so they are kept distinct rather than collapsed by a falsy test.
         """
         statement = (
             select(models.Document)
@@ -390,6 +411,11 @@ class SqliteDocStore(
             statement = statement.where(
                 (models.Document.chunk_fp.is_(None))
                 | (models.Document.chunk_fp != chunk_fp_other_than)
+            )
+        if parse_fp_current is not None:
+            statement = statement.where(
+                (models.Document.parse_fp.is_(None))
+                | (models.Document.parse_fp.notin_(list(parse_fp_current)))
             )
         if limit is not None:
             statement = statement.limit(limit)

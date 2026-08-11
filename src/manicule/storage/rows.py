@@ -37,6 +37,7 @@ def to_document(row: models.Document) -> Document:
         status_detail=row.status_detail,
         failed_stage=row.failed_stage,
         metadata=cast("Metadata", row.doc_metadata or {}),
+        parse_fp=row.parse_fp,
     )
 
 
@@ -46,6 +47,13 @@ def apply_document(row: models.Document, document: Document) -> None:
     Writing a document is asserting that it exists, so an upsert clears a soft delete. A
     document removed at the source and later restored there arrives through exactly this path,
     and leaving the timestamp would index it into a row nothing can see.
+
+    **Lineage is not written here.** ``parse_fp``, ``chunk_fp`` and ``embed_fp`` move only
+    through :meth:`~manicule.storage.docstore.DocumentStore.set_lineage`, which is called
+    after a stage commits. The pipeline builds a fresh :class:`Document` for every ingest and
+    cannot know a parse fingerprint before the chain has chosen a parser, so writing lineage
+    from the domain object would clear it at the start of every run and leave "which
+    documents need re-parsing" answering "all of them" for the wrong reason.
     """
     row.deleted_at = None
     row.source = document.source
