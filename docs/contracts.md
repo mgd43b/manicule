@@ -211,6 +211,16 @@ for joins and transactional updates. See `PLAN.md` §2.
 a constant. The vector table is created at first ingest, and ingest must refuse to start
 if the fingerprint does not match what the index was built with.
 
+**There are three fingerprints, and they are compared at three scopes.** `EmbedFingerprint`
+and `ChunkFingerprint` describe one process applied to a whole corpus, so both are compared
+once per run and a mismatch refuses the run. `ParseFingerprint` describes one parser applied
+to one document, so it is recorded in `documents.parse_fp` and compared per document — a
+`pypdfium2` bump invalidates the PDFs and says nothing about the Markdown.
+[`parsing.md`](parsing.md) §3.0 has the reasoning, [`storage.md`](storage.md) §6.4 the
+storage. All three refuse rather than warn: there is nothing downstream that can detect mixed
+output, and a corpus whose chunk boundaries were measured with a stand-in vocabulary rather
+than the embedder's own is refused before any comparison at all.
+
 ## 5. Deliberately absent
 
 **No `permissions` field on plugins.** OpenDocuments ships one that is typed, tested, and

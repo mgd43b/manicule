@@ -1,8 +1,9 @@
 """Fingerprints — the identity of a process that produced stored data.
 
-Two exist: :class:`~manicule.core.embedding.EmbedFingerprint` for vectors, and
-:class:`ChunkFingerprint` for chunk boundaries. Both are persisted alongside the index and
-compared before anything is written, because both describe transformations whose output is
+Three exist: :class:`~manicule.core.embedding.EmbedFingerprint` for vectors,
+:class:`ChunkFingerprint` for chunk boundaries, and :class:`ParseFingerprint` for the text
+and anchors a parser extracted. All three are persisted alongside the index and compared
+before anything is written, because all three describe transformations whose output is
 useless when mixed with output from a different version of themselves — and useless in the
 quiet way, where nothing raises and every answer is slightly wrong.
 
@@ -21,17 +22,40 @@ Identity is a declared subset of the fields
 A mismatch raises, always
     Never a warning. There is nothing downstream that can detect mixed output, so the only
     place it can be caught is here.
+
+Where they differ is scope, and it follows from what each one produces.
+:class:`ChunkFingerprint` and ``EmbedFingerprint`` describe one process applied to a whole
+corpus, so they are compared once per run and a mismatch refuses the run.
+:class:`ParseFingerprint` describes one parser applied to one document, so it is compared per
+document and a mismatch invalidates that document and no other. §6.4 of ``docs/storage.md``
+calls that per-document lineage; parsing is the case where it is the *only* honest scope.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import ClassVar, Self, override
+from typing import ClassVar, Final, Self, override
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from manicule.core.errors import FingerprintMismatchError
+
+PROVISIONAL_TOKENIZER_PREFIX: Final = "provisional:"
+"""What a token counter that is not the embedder's own puts in front of its identity.
+
+The prefix lives here, beside the field it appears in, because two things read it and they
+must not be able to disagree: :class:`~manicule.chunking.tokens.TokenCounter` stamps it on
+every count it takes without a bound model, and :attr:`ChunkFingerprint.provisional` is
+exactly the question "is this string stamped". Deriving the flag from the identity string
+rather than storing it separately is what makes the two impossible to contradict — a boolean
+field could be ``False`` beside a stamped id, and the refusal would then pass a corpus
+measured with a stand-in vocabulary.
+
+The whole of what follows the prefix is identity as well, and that is the point of §1.2 of
+``docs/parsing.md``: a stand-in counter must name the vocabulary it stood in with *and* the
+safety factor it inflated by, because both move every boundary.
+"""
 
 
 class Fingerprint(BaseModel):
@@ -127,8 +151,13 @@ class ChunkFingerprint(Fingerprint):
     )
     tokenizer_id: str = Field(
         min_length=1,
-        description="Which tokenizer counted the tokens. A budget is meaningless without it: "
-        "the same text is a different number of tokens under a different vocabulary.",
+        description="Which tokenizer counted the tokens, and — when it was not the "
+        "embedder's own — what was done to the number afterwards. A budget is meaningless "
+        "without it: the same text is a different number of tokens under a different "
+        "vocabulary, and an inflated count moves every boundary again. A stand-in counter "
+        "records the whole of that as one string, prefixed "
+        f"``{PROVISIONAL_TOKENIZER_PREFIX}``, so that no part of it can vary behind an "
+        "identifier that stays still.",
     )
     grammars: dict[str, str] = Field(
         default_factory=dict,
@@ -146,6 +175,19 @@ class ChunkFingerprint(Fingerprint):
         "neither otherwise knows middleware exists. Adding, removing or upgrading one is "
         "then exactly as loud as changing the chunk budget, which is what it is.",
     )
+
+    @property
+    def provisional(self) -> bool:
+        """Whether these boundaries were measured without the model that will embed them.
+
+        Read off :attr:`tokenizer_id` rather than carried in a field of its own, so the
+        answer and the identity cannot disagree. Ingest refuses a provisional fingerprint
+        outright (``docs/parsing.md`` §1.2): a stand-in vocabulary undercounts by an unknown
+        margin, undercounting is the direction that truncates silently, and the safety factor
+        that compensates is a guess rather than a measurement. Provisional chunks exist to be
+        inspected, never to be served.
+        """
+        return self.tokenizer_id.startswith(PROVISIONAL_TOKENIZER_PREFIX)
 
     def with_middleware(self, declarations: Sequence[str]) -> ChunkFingerprint:
         """This fingerprint, with ``declarations`` folded into its identity.
@@ -169,4 +211,73 @@ class ChunkFingerprint(Fingerprint):
         )
 
 
-__all__ = ["ChunkFingerprint", "Fingerprint"]
+class ParseFingerprint(Fingerprint):
+    """The identity of the process that produced one document's ``text`` and its anchors.
+
+    ``docs/parsing.md`` §3.0 says ``text`` is immutable after parse. That is true within a
+    parser version and quietly false across one: the same bytes reduce to different text
+    after ``pypdfium2`` moves, and because change detection keys on the connector's source
+    bytes, nothing already stored is ever re-read while newly ingested identical bytes parse
+    differently. A corpus then holds two generations of extracted text with no column saying
+    which is which.
+
+    **Anchors are the sharper edge.**
+    :func:`~manicule.testing.contracts.assert_parser_contract` checks that an anchor resolves
+    to the text its block claims *at parse time*, and says nothing about an anchor stored
+    under a previous version. A library that changes an offset or coordinate convention
+    leaves old anchors resolving into text produced differently — a plausible, wrong
+    location, which is the defect this project exists not to reproduce.
+
+    **Why this is its own fingerprint rather than a field on** :class:`ChunkFingerprint`.
+    :attr:`ChunkFingerprint.grammars` is the precedent for folding a library version into the
+    chunker's identity, and it does not carry here, for a reason that is structural rather
+    than aesthetic:
+
+    - A parser version determines ``text``, which is *upstream* of chunking.
+      :class:`ChunkFingerprint` is "the identity of the process that decided where chunks
+      begin and end", and a PDF text extractor decided none of that.
+    - :class:`ChunkFingerprint` is compared **once per run, for the whole corpus**, and a
+      mismatch refuses the run. Parser versions cannot live in a value with that scope and
+      still be honest. Recorded only for the parsers that actually ran, the map would grow
+      the first time a PDF was ingested and refuse the corpus it had just been part of;
+      recorded for every installed parser instead, a ``pypdfium2`` bump would refuse a corpus
+      of Markdown that no PDF library has ever touched. ``grammars`` escapes this only
+      because the declared language set is configuration, fixed before the run, and read
+      without importing anything.
+    - One document has exactly one parser. There is no corpus-wide parse identity to compare,
+      so the comparison belongs where the fact does: ``documents.parse_fp``, per document.
+
+    So the cost is a third column and a third comparison, and what it buys is invalidation
+    that names the documents a bump actually touched.
+    """
+
+    IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = ("parser", "version", "libraries")
+
+    parser: str = Field(
+        min_length=1, description="Registered name of the parser that produced the text."
+    )
+    version: str = Field(
+        min_length=1,
+        description="The version of manicule's own extraction rules for that parser — which "
+        "blocks it emits, and what its anchors address. Separate from the libraries below "
+        "because editing this repository's rules changes stored text just as surely as a "
+        "dependency bump does, and would otherwise be the one change nothing records.",
+    )
+    libraries: dict[str, str] = Field(
+        default_factory=dict,
+        description="Version by distribution for every library whose behaviour decides this "
+        "parser's text or anchors, e.g. ``{'pypdfium2': '5.12.1'}``. Keys are PEP 503 "
+        "canonical names — ``ruamel-yaml``, never ``ruamel.yaml`` — because the same "
+        "distribution spelled two ways is two keys and a bump that appears to change "
+        "nothing. Empty is a real and common answer: a parser built on the standard library "
+        "alone has no library version to record, and ``version`` above is then the whole of "
+        "its identity.",
+    )
+
+    @override
+    def describe(self) -> str:
+        listed = ", ".join(f"{name} {value}" for name, value in sorted(self.libraries.items()))
+        return f"{self.parser} rules {self.version} ({listed or 'no parsing libraries'})"
+
+
+__all__ = ["PROVISIONAL_TOKENIZER_PREFIX", "ChunkFingerprint", "Fingerprint", "ParseFingerprint"]

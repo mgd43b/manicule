@@ -273,6 +273,7 @@ class Document(Base):
     parser:        Mapped[str | None]
     parse_duration_ms: Mapped[int | None]
 
+    parse_fp:      Mapped[str | None]                          # canonical, §6.4
     chunk_fp:      Mapped[str | None]                          # short hash, §6.4
     embed_fp:      Mapped[str | None]
 
@@ -378,7 +379,7 @@ which needs no counter and is correct even after a crash.
 Indexes: `(workspace_id, status)`, `(workspace_id, uri)`, `(content_hash)`,
 `(workspace_id, deleted_at) WHERE deleted_at IS NOT NULL` (the trash view; live-row queries
 fold `deleted_at IS NULL` into the partial indexes above), `(connector_id)`,
-`(container_id)`, `(chunk_fp)`, `(embed_fp)`.
+`(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`.
 
 ### 4.3 `chunks`
 
@@ -851,6 +852,16 @@ per-language tree-sitter grammar map ([`parsing.md`](parsing.md) §1.7) — sits
 means re-chunk *and* re-embed, so it is a strictly larger invalidation than the embedding
 fingerprint and gets the same refusal.
 
+One refusal here is about the running configuration alone and reads nothing: a
+`ChunkFingerprint` whose `tokenizer_id` says the boundaries were measured with a stand-in
+vocabulary rather than the embedder's own is refused outright, before any comparison
+([`parsing.md`](parsing.md) §1.2). It cannot be made admissible by anything the comparisons
+below would discover, so it is settled first.
+
+There is no `parse_fingerprint` column in this row, and §6.4 is where that decision is
+recorded. Parsing has no corpus-wide identity to compare — one document has one parser — so
+it is per-document lineage or nothing.
+
 **Where it is persisted — three places, all compared.**
 
 | Location | Says |
@@ -918,6 +929,35 @@ WHERE chunk_fp <> :current AND media_type IN (:code_types)
 Without it, the only expressible repair is "everything". The global refusal in §6.3 still
 stands — one vector table cannot hold two spaces — but after adopting a new fingerprint, the
 repair is targeted instead of total.
+
+**`documents.parse_fp` is the third, and the only one with no row in `index_state`.** It
+carries the canonical `ParseFingerprint` ([`parsing.md`](parsing.md) §3.0) of the parser run
+that produced this document's stored text and anchors — its registered name, the version of
+manicule's own extraction rules for it, and the version of every library whose behaviour
+decides the output. The asymmetry with the other two is not an omission:
+
+- Chunking and embedding are one process applied to a whole corpus, so "what this index was
+  built with" is a single value and a mismatch can refuse the run. Parsing is one parser
+  applied to one document, so there is no single value to compare — a `pypdfium2` bump makes
+  the PDFs stale and says nothing whatever about the Markdown.
+- A corpus-wide parse fingerprint would have to be either the set of parsers that have run,
+  which grows during a run and would refuse a corpus at the moment it gained its first PDF, or
+  the set of parsers installed, which would refuse a Markdown corpus over a PDF library.
+
+So the comparison lives where the fact does. Two consumers read it:
+
+```sql
+-- everything a library bump changed the text of, plus everything with no recorded lineage
+SELECT id FROM documents WHERE parse_fp IS NULL OR parse_fp NOT IN (:current_fingerprints)
+```
+
+`reindex --re-parse` runs over exactly that set — rung 3, retained bytes, no network — and
+ingest's change detection asks the same question per document, so a stale one stops counting
+as unchanged and is re-parsed on the next sync. **`NULL` is not backfilled.** Every row
+predating the column keeps it, and reads as "no evidence this text is current", because
+writing today's library versions into rows extracted months ago would assert something nobody
+knows. The price is one re-parse of the corpus; the alternative is a lineage column that lies
+from the day it ships.
 
 ### 6.5 Creating and replacing the vector table
 

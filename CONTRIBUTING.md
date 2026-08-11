@@ -167,13 +167,19 @@ Most bumps risk a regression and CI catches them. These change what is *in* the 
 | `index-affecting-chunking` | Where chunks begin and end | Re-chunk and re-embed what it touches |
 | `index-affecting-extraction` | The text a document was reduced to | Re-parse the affected documents |
 
-There is machinery here — `EmbedFingerprint` and `ChunkFingerprint` refuse an index built
-with something else, and the macOS backend parity job compares MLX against ONNX within a
-stated tolerance — so a genuinely divergent bump should turn CI red. Red is the signal that
-the corpus needs rebuilding, not a reason to widen a tolerance. Two cases have no guard at
-all and are grouped precisely because of it: no fingerprint records a parser version, and
-the provisional token counter records `tokenizer_id` as the literal string `"provisional"`,
-which does not change when `tiktoken`'s vocabulary does.
+There is machinery here — `EmbedFingerprint`, `ChunkFingerprint` and `ParseFingerprint`
+refuse output built with something else, and the macOS backend parity job compares MLX
+against ONNX within a stated tolerance — so a genuinely divergent bump should turn CI red.
+Red is the signal that the corpus needs rebuilding, not a reason to widen a tolerance.
+
+The three costs are not the same size, and the group name is what tells them apart. An
+embedding bump re-embeds everything. A chunking bump re-chunks and re-embeds what it touches.
+An extraction bump is the narrowest: `documents.parse_fp` records which parser version
+produced each document, so change detection re-parses exactly the documents that library
+produced and `reindex --re-parse` selects the same set without waiting for a sync. Adding a
+library that decides stored text means adding it to `manicule.parsers.versions.PARSERS` *and*
+to the `index-affecting-extraction` patterns; `tests/parsers/test_versions.py` fails if the
+two disagree.
 
 **Nothing here checks licences, and this project has rejected dependencies over them.**
 manicule is GPL-3.0-or-later. Dependabot reports versions; it says nothing about the terms

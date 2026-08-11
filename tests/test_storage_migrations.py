@@ -111,14 +111,66 @@ async def test_a_migration_over_a_populated_database_keeps_the_rows(data_dir: Pa
         await _seed(engine)
         before = await _row_counts(engine)
         assert before["chunks"] == 2, "the seed must actually seed, or this test proves nothing"
+        columns = await _document_values(engine)
+        assert columns["chunk_fp"] == _SEEDED_CHUNK_FP, "the seed must set the lineage it checks"
 
         await upgrade(engine)
         assert await _row_counts(engine) == before, (
             "a migration must not delete rows it was not asked to delete"
         )
+        assert await _document_values(engine) == columns, (
+            "a migration must not rewrite the columns it was not asked to touch"
+        )
 
         await downgrade(engine, _first_revision())
         assert await _row_counts(engine) == before, "and neither must the downgrade"
+        assert await _document_values(engine) == columns, "and neither must the downgrade"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
+async def test_parse_lineage_arrives_empty_and_leaves_the_rest_alone(data_dir: Path) -> None:
+    """``documents.parse_fp`` over a database with documents already in it.
+
+    Two claims, and the second is the one an empty database cannot make. The column arrives
+    ``NULL`` on every existing row — not backfilled with today's parser versions, because
+    nothing knows which versions produced text extracted months ago, and a lineage that
+    asserts what nobody knows is worse than one that admits it does not. And adding it leaves
+    every other column of every existing row exactly as it was, including the two lineages
+    that were already there.
+
+    The downgrade is checked the same way and for a sharper reason: it drops an *indexed*
+    column, which SQLite refuses outright unless the index goes first. A downgrade nobody has
+    run is not a downgrade path, and this one would fail at the moment it was needed.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision=_first_revision())
+        await _seed(engine)
+        counts = await _row_counts(engine)
+        original = await _document_values(engine)
+
+        await upgrade(engine)
+        assert await _document_values(engine, "parse_fp") == {"parse_fp": None}, (
+            "an existing document must not be claimed to have been parsed by today's libraries"
+        )
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE documents SET parse_fp = :fp"), {"fp": _SEEDED_PARSE_FP}
+            )
+        assert await _document_values(engine, "parse_fp") == {"parse_fp": _SEEDED_PARSE_FP}
+
+        await downgrade(engine, _first_revision())
+        assert await _row_counts(engine) == counts, "the downgrade must not cascade"
+        assert await _document_values(engine) == original, (
+            "dropping parse_fp must not disturb the columns beside it"
+        )
+
+        await upgrade(engine)
+        assert await _document_values(engine, "parse_fp") == {"parse_fp": None}
+        assert await _row_counts(engine) == counts
     finally:
         await engine.dispose()
 
@@ -128,15 +180,41 @@ def _first_revision() -> str:
     return next(r.revision for r in script.walk_revisions() if r.down_revision is None)
 
 
+_SEEDED_CHUNK_FP = '{"chunker":"structural","max_tokens":512}'
+_SEEDED_EMBED_FP = '{"dimension":1024,"model_id":"BAAI/bge-m3"}'
+_SEEDED_PARSE_FP = '{"libraries":{"pypdfium2":"5.12.1"},"parser":"pdf","version":"1"}'
+_SEEDED_METADATA = '{"parser_used": "markdown"}'
+"""Lineage values the seed writes, so the assertions compare against something specific.
+
+Placeholders would defeat the test twice over: a migration that rewrote every ``chunk_fp`` to
+the empty string would pass an assertion that only checked the column still existed, and a
+migration that swapped two columns would pass one where both held the same string.
+"""
+
+
 async def _seed(engine: AsyncEngine) -> None:
-    """One row in every table a cascade from ``documents`` would reach."""
+    """One row in every table a cascade from ``documents`` would reach.
+
+    The document carries a value in every column an assertion later reads — lineage,
+    version token, metadata — because a rebuild that keeps the row and empties a column
+    counts identically to one that did nothing wrong.
+    """
+    document = (
+        "INSERT INTO documents (id, workspace_id, source, source_id, uri, title, media_type, "
+        "content_hash, version_token, status, status_detail, chunk_fp, embed_fp, metadata, "
+        "created_at, updated_at, indexed_at) "
+        "VALUES ('d1', 'w', 'fs', 's1', 'file:///a.md', 'A', 'text/markdown', 'h', 'v7', "
+        "'indexed', NULL, :chunk_fp, :embed_fp, :metadata, "
+        "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', "
+        "'2026-01-02T00:00:00+00:00')"
+    )
+    # Bound rather than interpolated because a canonical fingerprint contains colons, and
+    # ``text()`` reads ``:512`` in ``{"max_tokens":512}`` as a bind parameter it was never
+    # given — which fails loudly here and would fail identically in any code that built a
+    # statement around one.
     statements = (
         "INSERT INTO workspaces (id, name, mode, settings, created_at) "
         "VALUES ('w', 'w', 'personal', '{}', '2026-01-01T00:00:00+00:00')",
-        "INSERT INTO documents (id, workspace_id, source, source_id, uri, title, media_type, "
-        "content_hash, status, metadata, created_at, updated_at) "
-        "VALUES ('d1', 'w', 'fs', 's1', 'file:///a.md', 'A', 'text/markdown', 'h', 'indexed', "
-        "'{}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
         "INSERT INTO chunks (id, document_id, text, embed_text, heading_text, heading_path, "
         "kind, position, token_count, anchor, metadata, created_at) "
         "VALUES ('c1', 'd1', 'one', 'one', '', '[]', 'prose', 0, 1, '{}', '{}', "
@@ -154,8 +232,55 @@ async def _seed(engine: AsyncEngine) -> None:
         "INSERT INTO collection_documents (collection_id, document_id) VALUES ('k1', 'd1')",
     )
     async with engine.begin() as connection:
-        for statement in statements:
+        await connection.execute(text(statements[0]))
+        await connection.execute(
+            text(document),
+            {
+                "chunk_fp": _SEEDED_CHUNK_FP,
+                "embed_fp": _SEEDED_EMBED_FP,
+                "metadata": _SEEDED_METADATA,
+            },
+        )
+        for statement in statements[1:]:
             await connection.execute(text(statement))
+
+
+_CHECKED_COLUMNS = (
+    "id",
+    "workspace_id",
+    "source",
+    "source_id",
+    "uri",
+    "title",
+    "media_type",
+    "content_hash",
+    "version_token",
+    "status",
+    "chunk_fp",
+    "embed_fp",
+    "metadata",
+    "indexed_at",
+)
+"""What the seeded document must still say after a migration and after its downgrade.
+
+Named explicitly rather than read with ``SELECT *``: the column set changes across revisions,
+so a wildcard would compare a different shape on each side of the round trip and quietly
+compare nothing.
+"""
+
+
+async def _document_values(engine: AsyncEngine, *columns: str) -> dict[str, object]:
+    """The seeded document's columns, as stored. Defaults to :data:`_CHECKED_COLUMNS`."""
+    wanted = columns or _CHECKED_COLUMNS
+    async with engine.connect() as connection:
+        row = (
+            # S608: every name comes from a literal tuple in this module, and a column name
+            # cannot be a bind parameter.
+            await connection.execute(
+                text(f"SELECT {', '.join(wanted)} FROM documents WHERE id = 'd1'")  # noqa: S608
+            )
+        ).one()
+    return dict(zip(wanted, row, strict=True))
 
 
 async def _row_counts(engine: AsyncEngine) -> dict[str, int]:
