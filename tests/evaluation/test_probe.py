@@ -193,6 +193,26 @@ async def test_a_corpus_small_enough_that_guessing_wins_refuses_to_run() -> None
         await probe.run(system)
 
 
+async def test_an_empty_corpus_is_refused_with_a_diagnosis_rather_than_a_crash() -> None:
+    """An empty index is the likeliest reason anyone reads this refusal, and it divided by zero.
+
+    ``pool_size == 0`` satisfies the small-corpus guard, but the guard's own message computed
+    the guessing rate to report it — so the actionable error was replaced by a
+    ``ZeroDivisionError`` raised from inside an f-string. "Nothing is indexed" is also a
+    different instruction from "index more documents", which is what the other branch says.
+    """
+    system = FixedSystem(
+        [an_item("d1")],
+        corpus_version=CorpusVersion(label="empty", document_count=0),
+    )
+    probe = DiscriminationProbe(
+        [ProbeItem(text=f"q{i}", document_ids=frozenset({"d1"})) for i in range(40)], k=3
+    )
+
+    with pytest.raises(ProbeUnusableError, match="empty corpus"):
+        await probe.run(system)
+
+
 async def test_a_system_that_cannot_say_how_large_its_corpus_is_gets_no_verdict() -> None:
     """Chance is ``k / N``. Without ``N`` there is no null hypothesis and any p-value is made up."""
     system = FixedSystem([an_item("d1")], corpus_version=CorpusVersion(label="unknown"))

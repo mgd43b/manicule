@@ -90,6 +90,18 @@ def test_no_trials_is_the_whole_range_rather_than_a_point() -> None:
     assert wilson_interval(0, 0) == (0.0, 1.0)
 
 
+@pytest.mark.parametrize(("successes", "trials"), [(11, 10), (-1, 10), (1, -5)])
+def test_an_impossible_count_produces_no_interval_at_all(successes: int, trials: int) -> None:
+    """The arithmetic returns a plausible interval for every one of these.
+
+    An interval is the form in which this package makes a claim, and a plausible one computed
+    from counts that cannot have happened is the exact output a report reprints without comment
+    — the same failure as an unverified p-value, one function along.
+    """
+    with pytest.raises(ValueError, match=r"negative|not possible"):
+        wilson_interval(successes, trials)
+
+
 def test_a_split_that_a_coin_would_produce_is_not_significant() -> None:
     assert sign_test(6, 4) > 0.05
 

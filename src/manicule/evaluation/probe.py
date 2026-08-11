@@ -287,7 +287,21 @@ class DiscriminationProbe:
 
     def _chance_rate(self, pool_size: int, label: str) -> float:
         """``k`` results drawn from ``pool_size`` documents, under a ranking that ignores the
-        query."""
+        query.
+
+        An empty corpus is separated from a merely small one, and not for tidiness: computing
+        the guessing rate for a message about it divides by zero, so the diagnosis this method
+        exists to give would be replaced by a ``ZeroDivisionError`` from inside an f-string. An
+        empty index is also the single most likely reason somebody is reading this error, and
+        "nothing is indexed" is a different instruction from "index more".
+        """
+        if pool_size == 0:
+            msg = (
+                f"{label} reports an empty corpus, so there is nothing to retrieve and no "
+                f"chance rate to compare against. Index some documents, or check that the "
+                f"workspace scope names the workspace the corpus is in"
+            )
+            raise ProbeUnusableError(msg)
         if pool_size <= self._k:
             msg = (
                 f"{label} holds {pool_size} documents and the probe examines {self._k} results, "

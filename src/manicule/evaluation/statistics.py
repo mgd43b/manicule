@@ -99,8 +99,20 @@ def wilson_interval(successes: int, trials: int, *, z: float = Z_95) -> tuple[fl
     Returns:
         Lower and upper bounds, clamped to ``[0, 1]``. With no trials the interval is the whole
         range, because that is what "no evidence" looks like.
+
+    Raises:
+        ValueError: ``trials`` is negative, or ``successes`` is outside ``[0, trials]``. The
+            arithmetic below happily produces a plausible-looking interval for all three, and a
+            plausible interval computed from impossible counts is precisely the output this
+            module exists to refuse — it is the shape a report reprints without comment.
     """
-    if trials <= 0:
+    if trials < 0:
+        msg = f"trials must not be negative, got {trials}"
+        raise ValueError(msg)
+    if not 0 <= successes <= max(trials, 0):
+        msg = f"observed {successes} successes in {trials} trials, which is not possible"
+        raise ValueError(msg)
+    if trials == 0:
         return 0.0, 1.0
     proportion = successes / trials
     denominator = 1.0 + z * z / trials
