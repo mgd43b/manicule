@@ -130,7 +130,9 @@ async def _loop(
                 from manicule.app.results import AnswerResultPayload as Answer  # noqa: PLC0415
 
                 payload: AnswerResultPayload = Answer.model_validate(envelope.data)
-                render.render_answer(out, payload)
+                # The tokens have already been written by `show`, so only the
+                # citations and the facts about the run are printed here.
+                render.render_answer(out, payload, text_already_shown=True)
             elif envelope.error is not None:
                 render.render_error(render.console(stderr=True), "ask", envelope.error)
 

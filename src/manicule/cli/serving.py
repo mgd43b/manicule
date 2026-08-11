@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, cast
 
-from manicule.app.daemon import read_pidfile, stop_server, write_pidfile
+from manicule.app.bind import is_loopback
+from manicule.app.daemon import Running, read_pidfile, stop_server, write_pidfile
 from manicule.app.dispatch import error_info
 from manicule.app.results import Envelope, ServerAddress, failed, succeeded
 from manicule.app.runtime import Runtime
 from manicule.app.service import ApplicationService
 from manicule.cli import render
+from manicule.config.loader import load_settings
 from manicule.core.errors import ManiculeError
 from manicule.mcp.serve import address_for, serve
 
@@ -110,9 +112,14 @@ async def _serve(
 
 
 def stop_running(overrides: Mapping[str, Any], *, workspace: str) -> Envelope:
-    """Stop the recorded server, and describe what was stopped."""
+    """Stop the recorded server, and describe what was stopped.
+
+    Configuration is *loaded* rather than a whole runtime opened: all this needs is the data
+    directory, and discovering plugins to find a path would make ``stop`` fail on an
+    installation whose plugins are the reason somebody is stopping it.
+    """
     try:
-        settings = Runtime.open(**overrides).settings
+        settings = load_settings(**overrides)
     except (ManiculeError, ValueError, OSError) as exc:
         return failed("stop", workspace, error_info(exc))
     try:
@@ -122,29 +129,36 @@ def stop_running(overrides: Mapping[str, Any], *, workspace: str) -> Envelope:
     return succeeded(
         "stop",
         settings.workspace,
-        ServerAddress(
-            transport=running.transport,
-            host=running.host,
-            port=running.port,
-            loopback=running.host in {"", "127.0.0.1", "::1", "localhost"},
-        ),
+        _address_of(running),
     )
 
 
 def running_address(overrides: Mapping[str, Any]) -> ServerAddress | None:
     """What the pid file says is running, if anything usable is recorded."""
     try:
-        settings = Runtime.open(**overrides).settings
+        settings = load_settings(**overrides)
     except (ManiculeError, ValueError, OSError):
         return None
     running = read_pidfile(settings.data_dir)
     if running is None:
         return None
+    return _address_of(running)
+
+
+def _address_of(running: Running) -> ServerAddress:
+    """Describe a recorded server, deciding "loopback" the one way this project decides it.
+
+    Through :func:`~manicule.app.bind.is_loopback` rather than a set written out here. A
+    second copy of that definition is a second answer to "is this reachable from the
+    network", and the two would disagree the first time either changed.
+    """
     return ServerAddress(
         transport=running.transport,
         host=running.host,
         port=running.port,
-        loopback=running.host in {"", "127.0.0.1", "::1", "localhost"},
+        # A stdio server records no host, and it is loopback in the only sense that matters:
+        # it has no socket at all.
+        loopback=not running.host or is_loopback(running.host),
     )
 
 

@@ -62,6 +62,13 @@ class State:
     json_output: bool = False
     workspace: str | None = None
     overrides: dict[str, Any] = field(default_factory=dict[str, Any])
+    text_already_streamed: bool = False
+    """Whether ``ask`` has already written the answer to the terminal as it arrived.
+
+    Set by the one command that streams, read by the one renderer that would otherwise repeat
+    itself. It is not a rendering *decision* — the payload is identical either way — it is a
+    record of what has already reached the screen.
+    """
 
 
 STATE = State()
@@ -123,6 +130,7 @@ def main_callback(
     STATE.json_output = json_output
     STATE.workspace = workspace
     STATE.overrides = {"workspace": workspace} if workspace else {}
+    STATE.text_already_streamed = False
 
 
 # --- running one operation --------------------------------------------------------------------
@@ -144,10 +152,17 @@ async def _execute(op: str, call: Callable[[ApplicationService], Awaitable[Paylo
 
 def emit(op: str, call: Callable[[ApplicationService], Awaitable[Payload]]) -> None:
     """Run an operation, print it the way the caller asked for, and set the exit status."""
-    _print(asyncio.run(_execute(op, call)))
+    print_envelope(asyncio.run(_execute(op, call)))
 
 
-def _print(envelope: Envelope) -> None:
+def print_envelope(envelope: Envelope) -> None:
+    """Write one result the way the caller asked for, and set the exit status.
+
+    Public because three commands produce an envelope without going through :func:`emit` —
+    ``completion`` needs no runtime, and ``start`` and ``stop`` produce theirs elsewhere — and
+    a second copy of this branching in each of them is three places to forget that a failure
+    goes to stderr.
+    """
     if STATE.json_output:
         # stdout carries the envelope and nothing else, so a pipe is parseable whether the
         # operation succeeded or not.
@@ -157,7 +172,12 @@ def _print(envelope: Envelope) -> None:
         return
     if envelope.ok and envelope.data is not None:
         payload = _PAYLOADS[envelope.op].model_validate(envelope.data)
-        render.render(render.console(), payload)
+        console = render.console()
+        if isinstance(payload, r.AnswerResultPayload):
+            console.print()
+            render.render_answer(console, payload, text_already_shown=STATE.text_already_streamed)
+            return
+        render.render(console, payload)
         return
     if envelope.error is not None:
         render.render_error(render.console(stderr=True), envelope.op, envelope.error)
@@ -267,6 +287,10 @@ def ask(
         if event.kind is EventKind.DELTA and event.text:
             out.file.write(event.text)
             out.file.flush()
+
+    # The renderer is told the text has already been shown, so a streamed answer is not
+    # printed a second time underneath itself.
+    STATE.text_already_streamed = stream
 
     # `_from_stdin` is called **inside** the thunk, so a missing question becomes the same
     # failure envelope as everything else rather than a traceback out of the command body.
@@ -621,7 +645,7 @@ def completion(
         render.render_error(render.console(stderr=True), "completion", error_info(exc))
         raise typer.Exit(1) from exc
     payload = r.CompletionScript(shell=shell, script=script)
-    _print(
+    print_envelope(
         Envelope(
             op="completion",
             ok=True,
@@ -682,7 +706,7 @@ def stop() -> None:
     """Ask a running manicule server to stop, and wait for it."""
     from manicule.cli.serving import stop_running  # noqa: PLC0415 - beside its sibling
 
-    _print(stop_running(STATE.overrides, workspace=STATE.workspace or UNKNOWN_WORKSPACE))
+    print_envelope(stop_running(STATE.overrides, workspace=STATE.workspace or UNKNOWN_WORKSPACE))
 
 
 def main() -> None:
@@ -690,4 +714,4 @@ def main() -> None:
     app()
 
 
-__all__ = ["STATE", "State", "app", "emit", "main"]
+__all__ = ["STATE", "State", "app", "emit", "main", "print_envelope"]

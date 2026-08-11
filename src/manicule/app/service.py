@@ -1087,14 +1087,22 @@ class ApplicationService:
         if not wanted:
             return {}
         store = await self._backend.documents()
-        found: dict[str, Document] = {}
-        missing: list[str] = []
-        for wanted_id in wanted:
-            document = await store.get_document(wanted_id)
-            if document is None:
-                missing.append(wanted_id)
-                continue
-            found[wanted_id] = document
+        # One query rather than one per document. `document_ids` is a field the store honours,
+        # so this is the same scoped, trash-excluding lookup — and a ranked page routinely
+        # spans several documents, which made the per-document form N round trips on the hot
+        # path of every search and every answer.
+        asked = frozenset(wanted)
+        page = await store.list_documents(
+            Filter(workspace_ids=frozenset({self.workspace}), document_ids=asked),
+            limit=len(wanted),
+        )
+        # Restricted to what was asked for. A store that returns more than the filter allowed
+        # is a defect its own conformance suite owns; here the question is only whether every
+        # requested document came back, and whether each one belongs to this tenant.
+        found: dict[str, Document] = {
+            document.id: document for document in page if document.id in asked
+        }
+        missing = [document_id_ for document_id_ in wanted if document_id_ not in found]
         if missing:
             msg = (
                 f"retrieval returned {len(missing)} chunk(s) whose document workspace "
@@ -1225,20 +1233,22 @@ async def _fetch_registry(
     except ValidationError as exc:
         return (), f"the registry at {url} is not a plugin listing this build can read: {exc}"
 
-    offered = [
-        r.AvailablePlugin(
-            name=entry.name,
-            version=entry.version,
-            core_version=entry.core_version,
-            summary=entry.summary,
-            package=entry.package,
-            url=entry.url,
-            installed=entry.name in installed,
-            compatible=_supports_this_core(entry.core_version)[0],
-            incompatible_reason=_supports_this_core(entry.core_version)[1],
+    offered: list[r.AvailablePlugin] = []
+    for entry in listing.plugins:
+        supported, reason = _supports_this_core(entry.core_version)
+        offered.append(
+            r.AvailablePlugin(
+                name=entry.name,
+                version=entry.version,
+                core_version=entry.core_version,
+                summary=entry.summary,
+                package=entry.package,
+                url=entry.url,
+                installed=entry.name in installed,
+                compatible=supported,
+                incompatible_reason=reason,
+            )
         )
-        for entry in listing.plugins
-    ]
     return tuple(sorted(offered, key=lambda item: item.name)), ""
 
 

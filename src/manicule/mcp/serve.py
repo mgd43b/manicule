@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Literal
 
 from manicule.app.bind import resolve_bind, stdio
 from manicule.app.results import ServerAddress
+from manicule.core.errors import PolicyError
 from manicule.mcp.server import TOOL_NAMES, build_server
 
 if TYPE_CHECKING:
@@ -74,12 +75,17 @@ async def serve(
     if address.transport == "stdio":
         await server.run_stdio_async(show_banner=False)
         return
+    if address.port is None:  # pragma: no cover - resolve_bind always decides a port
+        msg = "an HTTP transport was resolved without a port"
+        raise PolicyError(msg)
     await server.run_http_async(
         show_banner=False,
         # Passed explicitly, never left to the library's own default. A default that happens
-        # to be loopback today is a default that can change in a release nobody read.
+        # to be loopback today is a default that can change in a release nobody read — and
+        # `port` is refused above rather than defaulted, because the obvious fallback is 0,
+        # which means "any free port" and would serve somewhere nobody was told about.
         host=address.host,
-        port=address.port or 0,
+        port=address.port,
     )
 
 

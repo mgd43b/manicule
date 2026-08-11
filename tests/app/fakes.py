@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 from manicule.app.ports import (
     Answering,
@@ -25,6 +25,7 @@ from manicule.app.ports import (
     Retrieving,
 )
 from manicule.app.results import ApiKeySummary, Check
+from manicule.app.tenancy import belongs_to
 from manicule.config.settings import Settings
 from manicule.core.anchors import HeadingAnchor
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus
@@ -114,8 +115,23 @@ class FakeStore:
         limit: int = 100,
         offset: int = 0,
     ) -> Sequence[Document]:
-        del filter
-        return list(self.documents.values())[offset : offset + limit]
+        """A page, filtered the way a correct store filters it.
+
+        Honouring ``document_ids`` and the workspace scope matters here rather than being
+        pedantry about a fake: a correct store is the control the leaky one is measured
+        against, and a control that also leaked would make the experiment meaningless.
+        """
+        wanted = list(self.documents.values())
+        if filter is not None:
+            wanted = [
+                document
+                for document in wanted
+                if belongs_to(self.workspace_id, document)
+                and (not filter.document_ids or document.id in filter.document_ids)
+                and (not filter.sources or document.source in filter.sources)
+                and (not filter.media_types or document.media_type in filter.media_types)
+            ]
+        return wanted[offset : offset + limit]
 
     async def document_chunks(self, document_id: str) -> Sequence[Chunk]:
         return self.chunks.get(document_id, [])
@@ -169,13 +185,31 @@ class LeakyStore(FakeStore):
 
     Two ways at once, because a surface guard has to survive both:
 
-    * ``get_document`` returns any document it holds, whatever workspace minted its id.
-    * ``list_documents`` returns every document it holds, ignoring the filter entirely.
+    * ``get_document`` returns any document it holds, whatever workspace minted its id —
+      inherited, because :class:`FakeStore` does not scope that lookup either.
+    * ``list_documents`` returns **every** document it holds, ignoring the filter, the limit
+      and the offset.
+
+    Ignoring the *limit* as well as the filter is what makes this useful. A leaky store that
+    still truncated would let the surface's "some of what I asked for came back missing" check
+    catch a foreign document by accident, and the identity check — the one that would still
+    fire if every ``WHERE`` clause in storage were deleted — would never be exercised.
 
     This is what a store written without the ``WHERE`` clause looks like, and it is the only
     way to see the surface's own check fire. A test that used a correct store would pass
     whether or not the check existed.
     """
+
+    @override
+    async def list_documents(
+        self,
+        filter: Filter | None = None,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Sequence[Document]:
+        del filter, limit, offset
+        return list(self.documents.values())
 
 
 @dataclass

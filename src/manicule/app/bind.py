@@ -34,11 +34,18 @@ from manicule.core.errors import PolicyError
 if TYPE_CHECKING:
     from manicule.config.settings import Settings
 
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "127.0.0.1/32", "::ffff:127.0.0.1"})
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"})
 """Addresses that reach only this machine.
 
-Matched by name rather than resolved, deliberately: a resolver can be told that ``localhost``
-is something else, and a bind decision that depends on ``/etc/hosts`` is not a decision.
+Matched by name rather than resolved, deliberately: a resolver can be told that
+``localhost`` is something else, and a bind decision that depends on ``/etc/hosts`` is not
+a decision.
+
+Bind *addresses* only — no CIDR forms. A netmask is a way of describing a range to a
+firewall, not something a socket can be bound to, and admitting one here would pass the
+loopback check and then fail at the bind with an error about the wrong thing. Other
+addresses in ``127.0.0.0/8`` are absent for a different reason: they are genuinely
+loopback and are refused anyway, which is the safe direction to be wrong in.
 """
 
 EVERY_INTERFACE = frozenset({"0.0.0.0", "::", "*", ""})  # noqa: S104 - named here so it is refusable

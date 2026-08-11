@@ -104,6 +104,11 @@ installation reports success at being broken.
 - **Exit status is 0 on success, 1 on a failed operation, 2 on a usage error** that Typer
   rejected before the service was reached.
 
+`start` is the one exception, and it is not a hedge: under the default stdio transport
+**stdout is the MCP protocol channel**, so an envelope written there would be a corrupt
+message rather than a result. Its address envelope goes to stderr under `--json` as well as
+without it.
+
 Without `--json`, `manicule ask` streams tokens to the terminal as they arrive — but only when
 stdout is a terminal. Into a pipe it does not, because interleaving tokens with whatever the
 consumer is doing helps nobody. Streaming is a *view*: the payload is identical either way,

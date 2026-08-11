@@ -61,13 +61,20 @@ def render_error(out: Console, op: str, error: r.ErrorInfo) -> None:
 # --- answers and search ---------------------------------------------------------------------
 
 
-def render_answer(out: Console, payload: r.AnswerResultPayload) -> None:
+def render_answer(
+    out: Console, payload: r.AnswerResultPayload, *, text_already_shown: bool = False
+) -> None:
     """The answer, then its citations, then what was true of the run.
 
     Citations are listed in full rather than summarised. A citation is the product here — an
     answer whose sources are collapsed into "3 sources" is an answer nobody can check.
+
+    ``text_already_shown`` is for the caller that streamed the tokens as they arrived. The
+    answer is the same either way — the payload is identical whether or not anything was
+    streamed — so printing it a second time would show a reader the same paragraph twice and
+    leave them wondering which one to trust.
     """
-    if payload.text:
+    if payload.text and not text_already_shown:
         out.print(Panel(Text(payload.text), title="answer", border_style="cyan"))
     if payload.error:
         out.print(f"[red]{escape(payload.error)}[/red]")

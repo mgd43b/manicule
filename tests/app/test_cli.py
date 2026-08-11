@@ -14,7 +14,9 @@ import pytest
 from typer.testing import CliRunner
 
 import manicule.cli.main as cli
+from manicule.app import results as r
 from manicule.app.dispatch import run_op
+from manicule.app.results import succeeded
 from manicule.app.service import ApplicationService
 from manicule.cli.shell import SHELLS, completion_script
 from manicule.core.errors import ConfigError
@@ -97,10 +99,10 @@ def test_a_human_readable_failure_goes_to_stderr(bound: ApplicationService) -> N
 
 def test_a_query_can_arrive_on_stdin(bound: ApplicationService) -> None:
     """``echo "..." | manicule search`` needs no flag: an absent argument and a pipe agree."""
+    del bound
     result = run(["--json", "search"], stdin="retry policy\n")
     assert result.exit_code == 0
     assert json.loads(result.stdout)["data"]["query"] == "retry policy"
-    assert bound  # the fixture is the subject; this keeps it referenced
 
 
 def test_an_empty_stdin_is_a_refusal_rather_than_an_empty_query(
@@ -189,3 +191,43 @@ def test_version_is_an_option_rather_than_a_twentieth_command() -> None:
     result = run(["--version"])
     assert result.exit_code == 0
     assert CORE_VERSION in result.stdout
+
+
+# --- streaming ------------------------------------------------------------------------------
+
+
+def _answer(text: str) -> Envelope:
+    return succeeded("ask", "default", r.AnswerResultPayload(question="q", text=text))
+
+
+def test_a_streamed_answer_is_not_printed_a_second_time(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``ask`` at a terminal writes the answer once, as it arrives — and then leaves it alone.
+
+    The renderer knows nothing about how the payload reached it, so without being told it
+    would print the whole answer again underneath the streamed copy. A reader seeing the same
+    paragraph twice has no way to know they are the same paragraph.
+    """
+    monkeypatch.setattr(cli.STATE, "json_output", False)
+    monkeypatch.setattr(cli.STATE, "text_already_streamed", True)
+    cli.print_envelope(_answer("The client retries twice."))
+    assert capsys.readouterr().out.count("retries twice") == 0
+
+
+def test_an_answer_that_was_not_streamed_is_printed_once(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The positive control: without streaming there is nothing on screen yet, so it prints."""
+    monkeypatch.setattr(cli.STATE, "json_output", False)
+    monkeypatch.setattr(cli.STATE, "text_already_streamed", False)
+    cli.print_envelope(_answer("The client retries twice."))
+    assert capsys.readouterr().out.count("retries twice") == 1
+
+
+def test_the_streaming_flag_is_cleared_between_invocations(bound: ApplicationService) -> None:
+    """It records what reached the screen, so a stale one would hide the next answer entirely."""
+    del bound
+    cli.STATE.text_already_streamed = True
+    run(["--json", "document", "list"])
+    assert cli.STATE.text_already_streamed is False

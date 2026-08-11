@@ -1,11 +1,23 @@
 """Knowing whether a server is running, and stopping it.
 
-A pid file, and it is deliberately not trusted on its own. A pid is reused by the operating
-system, so a stale file names a process that exists and is somebody else's — and a ``stop``
-that signals it has killed a stranger. So the file records the pid **and** the start time
-manicule saw for itself, and both must match before anything is signalled.
+A pid file, and what it is trusted for is worth stating exactly, because a pid is reused by
+the operating system and a stale file therefore names a process that exists and is somebody
+else's.
 
-The file lives in the data directory rather than in ``/var/run``: manicule installs per user
+**What is checked.** The recorded pid must exist *and* be signallable by this user:
+:func:`is_alive` reads ``PermissionError`` as "not ours", so another account's process is
+never signalled. The file lives in the data directory, so a second manicule serving a
+different directory has its own.
+
+**What is not.** A pid reused by *this* user, for this data directory, between the server
+exiting and ``stop`` running, is indistinguishable from the server. ``started_at`` is recorded
+so that a future check can compare it against the process's own start time — which needs a
+platform-specific read manicule does not currently take a dependency for — and until then it
+is a record rather than a guard. The exposure is a ``SIGTERM`` to one of this user's own
+processes in a window measured in the time between two commands; it is named here rather than
+papered over.
+
+The file is in the data directory rather than ``/var/run`` because manicule installs per user
 with no privileged component, and a path that needs root to write to is a path that does not
 work for the way this is actually installed.
 """
@@ -52,6 +64,8 @@ class Running(BaseModel):
 
     pid: int
     started_at: float
+    """When manicule saw itself start. Recorded, not yet compared — see the module docstring."""
+
     transport: str = "stdio"
     host: str = ""
     port: int | None = None
