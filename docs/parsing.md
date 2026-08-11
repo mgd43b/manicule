@@ -1457,14 +1457,69 @@ is recorded rather than inferred from a cache directory.
 grammar is permissively licensed — MIT, Apache-2.0, BSD, ISC or similar — and that copyleft
 licences (GPL, AGPL, LGPL, MPL) are not accepted. Individual grammar licences vary across
 those permissive terms, which is fine under any licence this project might carry. The
-packaging step still asserts
-the policy rather than trusting it: dump the licence list at build time and fail on any
-copyleft entry, so a change in upstream policy surfaces as a build failure instead of a
-licence problem discovered later.
+packaging step still asserts the policy rather than trusting it, and §8.1.1 is where that
+happens: a bundle build fails on any copyleft term, so a change in upstream policy surfaces as
+a build failure instead of a licence problem discovered later.
 
-**Filed, because it is the one weak point left:** an offline grammar bundle, so
-`uv tool install manicule` on a machine with no GitHub access can still parse code
-(§14).
+### 8.1.1 The offline bundle
+
+Pre-seeding closes the ordinary case and not the air-gapped one. `prefetch` still *fetches*,
+and a host with no route to the grammar release has nothing to fetch from; pointing the
+manifest URL at an internal mirror works and assumes somebody has a mirror, which is exactly
+the assumption an air-gapped site cannot make. So grammars can arrive with the install
+instead: **a bundle is a directory of grammar libraries plus a manifest**, built by
+`tools/build_grammar_bundle.py` on a machine that does have network access, and carried to the
+target by whatever moves the install itself.
+
+Three options were on the table and all three are settled here:
+
+| Option | Verdict |
+|---|---|
+| **Vendor a bundle** as a directory or an installable distribution | **taken.** Both, in fact — `--package` writes an importable `manicule_grammars` around the same bundle, so a site that installs software rather than copying directories needs no extra step |
+| **Build grammars at install time** | **rejected**, and recorded so it is not re-proposed: it needs a C toolchain on the user's machine, and the API for building a shared library was removed from `py-tree-sitter` at 0.22 |
+| **Ship the cache directory as a copyable artifact** | **taken, with a manifest.** A bare cache directory is a set of files with no statement of which release, which platform or which bytes they are. That statement is the whole difference between a copyable artifact and a copyable guess |
+
+**The bundle is a source, never the cache.** Seeding copies libraries out of it into the
+configured cache and the ordinary load path takes over. Two reasons: a bundle installed under
+`site-packages` is read-only on any sensibly built image, and one cache directory means one
+answer to "which grammars does this machine have" — the thing `missing_grammars` reports and
+the pre-seed asserts. The library directory is still laid out as a cache, so a read-only
+container can be pointed straight at it and skip the copy.
+
+**`prefetch` consults the bundle first and the network only for what is left.** That order is
+what makes an air-gapped install work rather than merely fail politely, and it is also the
+cheaper order everywhere else, since a file copy beats a release download.
+
+**Everything is recorded, and every recorded fact is checked on read.** The pack release, the
+platform tag, and per library a file name, a size and a SHA-256:
+
+- A bundle built for **another pack release** is refused, naming both. Grammars ship as one
+  bundle per release, so mixing them means the fingerprint records one release while the trees
+  came from another — the corpus-consistency hazard in its purest form.
+- A bundle built for **another platform** is refused, naming both. Libraries are compiled
+  objects, and the pack reports one as downloaded from its file name whatever it contains.
+- A **truncated** library is caught on read, which is a `stat` per language; a library **edited
+  without changing its length** is caught when it is copied, which reads every byte anyway.
+
+**The file name is discovered, not derived.** `csharp`'s library is `libtree_sitter_c_sharp`,
+so a builder constructing the name from the language key writes a bundle silently missing C#.
+Each candidate is offered to the pack alone in an empty directory and the pack says which
+language it answers for; the answer goes in the manifest, so nothing downstream needs a rule.
+
+**A grammar that is present and will not load now refuses through the same door as a missing
+one.** `downloaded_languages()` answers from file names, so a wrong-platform library is
+reported as present and then fails at `get_parser` with `Language 'python' not found` — which
+reaches the parser chain as an ordinary exception and *advances* it, handing the document to
+the next parser. `GrammarUnusableError` is a subclass of `GrammarUnavailableError`, so
+everything already written to stop on a missing grammar stops on a broken one unchanged.
+
+**The licence is asserted where redistribution starts.** The bundle build refuses any copyleft
+term and any term nobody has assessed, and records the expression it asserted. The scope of
+that assertion is stated rather than overstated: the pack enumerates no per-grammar licences —
+its manifest carries a group and a size per language, and the SBOM beside it describes the
+native extension's Rust build dependencies — so what is checked is the distribution that
+publishes them under a stated permissive-only policy. A release that changes that expression
+fails a bundle build instead of shipping.
 
 ### 8.2 Deriving `LineAnchor.symbol`
 
@@ -1924,7 +1979,6 @@ none of them depends on this document having been read.
 | Ticket | What | Why it is not in v1 |
 |---|---|---|
 | [#21](https://github.com/mgd43b/manicule/issues/21) | **`.msg` support** (§10) | either a BSD-licensed higher-level reader works, or it is a hand-written MAPI property reader — not a library call either way. `.eml` covers the common case. The route is specified; only the work is out of scope |
-| [#22](https://github.com/mgd43b/manicule/issues/22) | **Offline grammar bundle** (§8.1) | the grammar pack fetches grammars from GitHub on first use, so an air-gapped install cannot parse code until someone mirrors them. Pre-seeding covers the normal case; a vendored bundle is the real fix |
 | [#23](https://github.com/mgd43b/manicule/issues/23) | **OCR** (`PLAN.md` §5) | settled. `no_extractable_text` and the 5% `doctor` warning (§6.5) are the trigger for revisiting |
 | [#24](https://github.com/mgd43b/manicule/issues/24) | **`docling` / `marker` in the default PDF chain** (§7) | layout models are heavy and unmeasured; they belong behind #15 like every other quality change |
 | [#25](https://github.com/mgd43b/manicule/issues/25) | **PDF reading-order recovery for multi-column layouts** (§7) | any heuristic here risks emitting text that never appeared contiguously; needs the measured baseline first |
