@@ -41,6 +41,24 @@ a comma-separated list, or `all`. CI sets it to exactly what it pre-seeded. If y
 embeddings, run `REQUIRE_EMBEDDING_MODELS=all uv run pytest` at least once: a skipped
 conformance suite reports green while checking nothing.
 
+`REQUIRE_GRAMMAR_BUNDLE` is the same switch for the grammars. The offline-bundle suite builds a
+real bundle out of the pre-seeded cache and proves an air-gapped install can parse code; with an
+empty cache it skips. Set it to anything non-empty — CI does — and a missing grammar fails
+instead. If you are touching parsing, run `REQUIRE_GRAMMAR_BUNDLE=1 uv run pytest` at least once.
+
+To produce a bundle for a host with no network access, run this on a machine that has one, and
+copy the directory over:
+
+```bash
+uv run tools/build_grammar_bundle.py --output dist/grammars   # or --package to make it installable
+MANICULE_GRAMMAR_BUNDLE=/path/to/grammars uv run python -c \
+  "from manicule.parsers import grammars; print(grammars.prefetch(grammars.DECLARED_LANGUAGES))"
+```
+
+A bundle is valid for one platform and one `tree-sitter-language-pack` release, and manicule
+refuses one built for anything else rather than loading it. See
+[`docs/parsing.md`](docs/parsing.md#811-the-offline-bundle).
+
 It is not a `MANICULE_` variable, and that is deliberate — the test environment clears that
 whole namespace before each test, so a switch living inside it is deleted before it is read.
 

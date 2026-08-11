@@ -1365,7 +1365,7 @@ packaging step still asserts the policy rather than trusting it, and §8.1.1 is 
 happens: a bundle build fails on any copyleft term, so a change in upstream policy surfaces as
 a build failure instead of a licence problem discovered later.
 
-### 8.1.1 The offline bundle — an install that carries its own grammars
+### 8.1.1 The offline bundle
 
 Pre-seeding closes the ordinary case and not the air-gapped one. `prefetch` still *fetches*,
 and a host with no route to the grammar release has nothing to fetch from; pointing the

@@ -16,9 +16,10 @@ or build it straight into a distribution that ships the bundle as package data:
 
     python tools/build_grammar_bundle.py --output build/pkg --package
 
-which writes an importable ``manicule_grammars`` package — the ``manicule[grammars-offline]``
-shape, where the grammars travel through the same channel as every other dependency and no
-environment variable is needed at all.
+which writes an importable ``manicule_grammars`` package, so the grammars travel through the
+same channel as every other dependency and no environment variable is needed at all. That
+package is built rather than published, because a bundle is valid for exactly one platform and
+one pack release.
 
 **Why a bundle and not the two alternatives.** Building grammars at install time was rejected
 on sight: it needs a C toolchain on the user's machine, and the API for it was removed from
