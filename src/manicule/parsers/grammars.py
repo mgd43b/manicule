@@ -640,9 +640,9 @@ def _fetch_failure(languages: Sequence[str], detail: str, bundle_dir: Path | Non
         offline = f"the offline grammar bundle is unusable: {exc}"
     return (
         f"could not seed grammars for {list(languages)} from {url} into "
-        f"{cache_directory()}: {detail}. {offline}. Ship an offline grammar bundle (see "
-        f"docs/parsing.md §8.1) or set {MANIFEST_URL_ENV} to an internal mirror if this host "
-        f"has no route to the public manifest, or narrow the declared language set."
+        f"{cache_directory()}: {detail} — and {offline}. Set {MANIFEST_URL_ENV} to an internal "
+        f"mirror if this host has a route to one, or narrow the declared language set. "
+        f"docs/parsing.md §8.1 covers building a bundle for a host with neither."
     )
 
 
