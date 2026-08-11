@@ -153,6 +153,11 @@ COPY --from=build /opt/manicule/tiktoken /opt/manicule/tiktoken
 # scary-looking line about nothing.
 COPY --from=build --chown=manicule:manicule /opt/manicule/models /opt/manicule/models
 
+# `MANICULE_EMBEDDING__PROVIDER=onnx` is set here even though `manicule init` would choose it
+# anyway, so that the image is correct before anybody has run `init`. It is worth knowing that
+# the environment outranks the config file in manicule's settings sources, so this cannot be
+# changed with `manicule config set` from inside the container — which is the right way round:
+# `mlx` is Apple silicon and there is no Linux container in which it is a valid answer.
 ENV PATH=/opt/manicule/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     HOME=/home/manicule \

@@ -89,6 +89,11 @@ of every ancestor, so a directory nobody else can enter is one nobody else can r
 whatever the files inside it say — and walking the blob store would make a diagnostic cost one
 `stat` per retained document.
 
+That distinction is load-bearing rather than theoretical: **`manicule.db` and its `-wal` and
+`-shm` siblings are created `0644`**, because SQLite creates them and manicule does not chmod
+them afterwards. Unreachable inside a `0700` directory, and worth knowing before copying one
+of those files somewhere with a different parent.
+
 **Do not branch a script on `manicule doctor`'s exit status.** It exits **0** whenever it
 managed to produce a diagnosis, whatever the diagnosis says — which is the exit-status
 contract in `docs/surfaces.md` §2 working as written, because producing the diagnosis is the
@@ -146,11 +151,14 @@ is not invented under time pressure later.
 **Publish to host loopback, with authentication on.**
 
 ```bash
-docker run -p 127.0.0.1:8080:8080 …     # reachable from this machine
-docker run -p 8080:8080 …               # reachable from the network. Not this.
+docker run -p 127.0.0.1:PORT:PORT …     # reachable from this machine
+docker run -p PORT:PORT …               # reachable from the network. Not this.
 ```
 
-`-p 8080:8080` binds `0.0.0.0` on the host, which means every interface the machine has,
+`PORT` is a placeholder on purpose: nothing here has a port yet, and putting a number in this
+document would be inventing one before the surface that owns it exists.
+
+The bare form binds `0.0.0.0` on the host, which means every interface the machine has,
 including the one facing the office network. A search index over a verbatim copy of the corpus
 is precisely the service that must not be reachable by anyone who can route a packet to it.
 
@@ -185,6 +193,11 @@ What that buys, and what it costs:
   `no-new-privileges` in the compose file. A named volume mounted at `/data` inherits the
   ownership and mode from the image, which is what keeps `doctor` passing.
 - **No published port**, because there is nothing to publish. §4 applies when there is.
+
+The container puts its config file in the data directory too — `MANICULE_CONFIG_FILE` is
+`/data/config.toml` — so one named volume carries the whole installation. `MANICULE_CACHE_DIR`
+is `/data/cache` for the same reason; that subdirectory is regenerable and is the one thing
+under `/data` that is safe to delete.
 
 **The backend is ONNX.** MLX is Apple silicon and no Linux container can use it. That changes
 throughput and does not change output — the `backend parity (macOS)` CI job compares vectors

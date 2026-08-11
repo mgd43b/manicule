@@ -35,10 +35,9 @@ uv sync --all-extras
 uv run manicule --version
 ```
 
-`--all-extras` installs the parser stack, the storage stack, both embedding backends and the
-optional cross-encoder reranker. Drop it to `--extra storage --extra embeddings --extra
-parsers --extra retrieval --extra serve` for a smaller install without generation or
-connectors.
+`--all-extras` is the whole system: the parser stack, the storage stack, the embedding backend
+this machine can run, the connectors, and the optional cross-encoder reranker that comes with
+torch.
 
 Everything below writes `manicule`; from a checkout that is `uv run manicule`, or
 `.venv/bin/manicule` if you would rather not type `uv run` each time.
@@ -125,10 +124,11 @@ That cost is paid at `build`, where a long step is legible, rather than inside t
 `index`, where it looks like a hang. Indexing this repository's `docs/` — about 600 kB of
 markdown — takes something under four minutes on an M-series Mac running Docker Desktop.
 
-The container runs as an unprivileged user with a `0700` data directory, publishes no port,
-and drops every capability. It runs the ONNX backend, because MLX is Apple silicon and no
-Linux container can use it: **the same vectors, at a lower rate.** `manicule ask` needs a
-generator; the compose file points at an Ollama on the host, which is one line to change.
+The image runs as an unprivileged user with a `0700` data directory and publishes no port; the
+compose file additionally drops every capability. It runs the ONNX backend, because MLX is
+Apple silicon and no Linux container can use it: **the same vectors, at a lower rate.**
+`manicule ask` needs a generator; the compose file points at an Ollama on the host, which is
+one line to change.
 
 **MCP is better run natively.** Handing a container's stdio to an assistant means the client
 spawning `docker compose run`, and the failure modes of that — a stale container, a build that
