@@ -1,0 +1,22 @@
+# What the image build is allowed to see. Everything else is excluded, because a build
+# context is copied into the daemon before the first instruction runs: a stray `.venv` or a
+# populated data directory is minutes of transfer and, in the second case, a corpus baked
+# into a layer.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src
+!tools
+!packages
+
+# Re-excluded from the directories admitted above. `**` because these appear at any depth,
+# and the negations above would otherwise pull a workspace member's own build artefacts in.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.ruff_cache
+**/.venv
+**/*.egg-info

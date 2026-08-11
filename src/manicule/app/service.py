@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import platform
 import time
 import tomllib
@@ -526,6 +527,10 @@ class ApplicationService:
             self._plugin_check(),
         ]
         checks.append(await self._storage_check())
+        # After the storage check, which is what creates the data directory on a fresh
+        # install. Asking about the modes of a directory that does not exist yet would report
+        # "not created" on every first run, which reads as a fault and is not one.
+        checks.append(await self._permissions_check())
         checks.append(await self._index_check())
         checks.extend(await self._backend.component_checks())
         worst: r.CheckState = "ok"
@@ -593,6 +598,56 @@ class ApplicationService:
                 detail="the database carries no schema revision; run `manicule init`",
             )
         return r.Check(name="storage", state="ok", detail=f"schema at {revision}")
+
+    async def _permissions_check(self) -> r.Check:
+        """Whether anybody but the owner can read the data directory.
+
+        **Failing, not degraded, and the distinction is the whole point.** With retained
+        source bytes the data directory is a verbatim copy of the corpus (``docs/storage.md``
+        §7.1), so a group- or world-readable one has already published every document indexed
+        into it to everyone with an account on the machine. There is no reading of that which
+        is a warning: nothing downstream degrades, and the exposure does not announce itself.
+
+        The offending paths are named, because "your permissions are wrong" sends an operator
+        to ``chmod -R``, and a data directory is the last place to run a recursive mode change
+        from memory.
+        """
+        from manicule.storage.engine import exposure  # noqa: PLC0415 - a storage extra
+
+        data_dir = self.settings.data_dir
+        if os.name != "posix":
+            return r.Check(
+                name="permissions",
+                state="unknown",
+                detail=f"{data_dir} is on a platform with no POSIX file modes to check",
+            )
+        try:
+            exposed = await asyncio.to_thread(exposure, data_dir)
+        except OSError as exc:
+            # "Cannot be examined" is not "is exposed", and reporting it as the latter would
+            # send an operator to chmod a path that may not be there.
+            return r.Check(
+                name="permissions",
+                state="unknown",
+                detail=f"{data_dir} could not be examined: {exc}",
+            )
+        if not exposed:
+            return r.Check(
+                name="permissions",
+                state="ok",
+                detail=f"{data_dir} is readable only by the account running manicule",
+            )
+        return r.Check(
+            name="permissions",
+            state="failing",
+            detail=(
+                f"{data_dir} carries group or other permissions ({exposed:03o}), so it is "
+                f"reachable by accounts other than the one running manicule. It holds the "
+                f"retained source bytes of every indexed document, which makes this an "
+                f"exposure of the corpus rather than a tidiness problem. Run "
+                f"`chmod 0700 {data_dir}`."
+            ),
+        )
 
     async def _index_check(self) -> r.Check:
         try:
