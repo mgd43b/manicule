@@ -24,14 +24,14 @@ from manicule.api.security import MemberPrincipal, ViewerPrincipal
 router = APIRouter(prefix="/api/v1", tags=["collections", "tags"])
 
 
-@router.get("/collections", summary="Every collection in this workspace.")
+@router.get("/collections", name="collection_list", summary="Every collection in this workspace.")
 async def list_collections(service: Service, caller: ViewerPrincipal) -> Response:
     """Name, description and — where membership is rule-driven — the rule itself."""
     del caller
     return await respond("collection_list", service, service.collection_list)
 
 
-@router.post("/collections", summary="Create a collection.")
+@router.post("/collections", name="collection_create", summary="Create a collection.")
 async def create_collection(
     service: Service, caller: MemberPrincipal, body: CollectionBody
 ) -> Response:
@@ -44,7 +44,11 @@ async def create_collection(
     )
 
 
-@router.get("/collections/{collection_id}/documents", summary="A collection's documents.")
+@router.get(
+    "/collections/{collection_id}/documents",
+    name="collection_documents",
+    summary="A collection's documents.",
+)
 async def collection_documents(
     service: Service,
     caller: ViewerPrincipal,
@@ -68,6 +72,7 @@ async def collection_documents(
 
 @router.post(
     "/collections/{collection_id}/documents/{document_id}",
+    name="collection_add",
     summary="Add a document to a collection.",
 )
 async def add_to_collection(
@@ -82,6 +87,7 @@ async def add_to_collection(
 
 @router.delete(
     "/collections/{collection_id}/documents/{document_id}",
+    name="collection_remove",
     summary="Remove a document from a collection.",
 )
 async def remove_from_collection(
@@ -96,7 +102,9 @@ async def remove_from_collection(
     )
 
 
-@router.delete("/collections/{collection_id}", summary="Delete a collection.")
+@router.delete(
+    "/collections/{collection_id}", name="collection_delete", summary="Delete a collection."
+)
 async def delete_collection(
     service: Service, caller: MemberPrincipal, collection_id: str
 ) -> Response:
@@ -107,14 +115,16 @@ async def delete_collection(
     )
 
 
-@router.get("/tags", summary="Every tag in this workspace.")
+@router.get("/tags", name="tag_list", summary="Every tag in this workspace.")
 async def list_tags(service: Service, caller: ViewerPrincipal) -> Response:
     """Names are case-sensitive and normalised to NFKC, so two keyboards produce one tag."""
     del caller
     return await respond("tag_list", service, service.tag_list)
 
 
-@router.post("/tags", summary="Create a tag, or return the existing one of that name.")
+@router.post(
+    "/tags", name="tag_create", summary="Create a tag, or return the existing one of that name."
+)
 async def create_tag(service: Service, caller: MemberPrincipal, body: TagBody) -> Response:
     """Idempotent by design. There is no strict variant to reach for by mistake."""
     del caller
@@ -123,14 +133,18 @@ async def create_tag(service: Service, caller: MemberPrincipal, body: TagBody) -
     )
 
 
-@router.delete("/tags/{tag_id}", summary="Delete a tag.")
+@router.delete("/tags/{tag_id}", name="tag_delete", summary="Delete a tag.")
 async def delete_tag(service: Service, caller: MemberPrincipal, tag_id: str) -> Response:
     """Documents keep their other tags."""
     del caller
     return await respond("tag_delete", service, lambda: service.tag_delete(tag_id))
 
 
-@router.post("/documents/{document_id}/tags/{tag_id}", summary="Apply a tag to a document.")
+@router.post(
+    "/documents/{document_id}/tags/{tag_id}",
+    name="document_tag",
+    summary="Apply a tag to a document.",
+)
 async def tag_document(
     service: Service, caller: MemberPrincipal, document_id: str, tag_id: str
 ) -> Response:
@@ -141,7 +155,9 @@ async def tag_document(
     )
 
 
-@router.delete("/documents/{document_id}/tags/{tag_id}", summary="Remove a tag.")
+@router.delete(
+    "/documents/{document_id}/tags/{tag_id}", name="document_untag", summary="Remove a tag."
+)
 async def untag_document(
     service: Service, caller: MemberPrincipal, document_id: str, tag_id: str
 ) -> Response:

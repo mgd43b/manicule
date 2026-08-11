@@ -11,6 +11,14 @@ because an operator reading an empty one needs to know which they have.
 
 from __future__ import annotations
 
+import logging
+
+import pytest
+
+from manicule.app.results import Check
+from manicule.container import keys
+from manicule.plugins.manifest import PluginManifest
+from manicule.plugins.registry import ComponentRegistry, Discovery
 from tests.api.support import backend_with_a_document, client_for, envelope
 
 AUDITED = {"security": {"audit": {"enabled": True}}}
@@ -129,6 +137,57 @@ def test_minting_an_api_key_is_audited_without_the_secret() -> None:
     assert secret not in response.text
 
 
+def test_a_search_still_answers_when_telemetry_cannot_be_written() -> None:
+    """Retrieval is a read. Recording it is a write, and on SQLite a write can lose to a lock.
+
+    Letting that propagate would make a search that worked yesterday return 500 today because
+    an *observability* insert could not get the writer — a read made conditional on a write.
+    """
+    backend, _ = backend_with_a_document()
+    backend.telemetry_.fails = True
+    with client_for(backend) as client:
+        search = client.get("/api/v1/search", params={"q": "retry"})
+        answer = client.post("/api/v1/chat", json={"question": "does it retry"})
+    assert search.status_code == 200
+    assert envelope(search)["ok"] is True
+    assert answer.status_code == 200
+    assert envelope(answer)["ok"] is True
+
+
+def test_a_telemetry_failure_is_logged_rather_than_swallowed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Not raising is not the same as pretending it worked.
+
+    A telemetry backend that has stopped working has to be visible somewhere, or the admin
+    page reads as "nobody has searched" forever. The query text is deliberately **not** in the
+    line: it is user content, and a log is where `security.storage.redact_logs_content` says
+    it must not appear.
+    """
+    backend, _ = backend_with_a_document()
+    backend.telemetry_.fails = True
+    with caplog.at_level(logging.WARNING, logger="manicule.app"), client_for(backend) as client:
+        client.get("/api/v1/search", params={"q": "a private phrase"})
+    assert any("telemetry" in record.message for record in caplog.records)
+    assert "a private phrase" not in caplog.text
+
+
+def test_an_audit_write_that_fails_fails_the_operation_it_was_auditing() -> None:
+    """The opposite decision from telemetry, and deliberately so.
+
+    A trail with holes in it is worse than none, because the holes are invisible and the
+    operation reported success. So an audit entry that cannot be written stops the thing it
+    was recording.
+    """
+    backend, _ = backend_with_a_document(**AUDITED)
+    backend.conversations_.seed("conv_1")
+    backend.telemetry_.fails = True
+    with client_for(backend) as client:
+        response = client.post("/api/v1/conversations/conv_1/share", json={})
+    assert response.status_code == 500
+    assert envelope(response)["ok"] is False
+
+
 def test_search_quality_says_plainly_that_nothing_has_been_measured() -> None:
     """``available: false`` is the truth, and is not the same as a score of zero.
 
@@ -144,11 +203,57 @@ def test_search_quality_says_plainly_that_nothing_has_been_measured() -> None:
     assert "judged" in page["caveat"] or "judgements" in page["caveat"]
 
 
-def test_plugin_health_reports_unknown_for_a_component_nothing_has_built() -> None:
-    """A plugin nothing has asked for has not been proved healthy, and saying it is would be a
-    diagnostic that measured nothing."""
+def test_plugin_health_reports_nothing_when_nothing_is_installed() -> None:
+    """The empty case, stated separately from the one below so neither stands in for it."""
     backend, _ = backend_with_a_document()
     with client_for(backend) as client:
         page = envelope(client.get("/api/v1/admin/plugins"))["data"]
     assert page["count"] == 0
     assert page["plugins"] == []
+
+
+def _discovered() -> Discovery:
+    """One plugin registering one component, as discovery would report it."""
+    registry = ComponentRegistry().bind("example")
+    registry.add(keys.CHUNKER.named("structural"), lambda _: object(), summary="A chunker.")
+    return Discovery(
+        registry=registry,
+        manifests=(
+            PluginManifest(name="example", version="1.0.0", core_version=">=0.1", summary="x"),
+        ),
+    )
+
+
+def test_plugin_health_joins_a_component_check_to_the_plugin_that_registered_it() -> None:
+    """The join is the whole report, and it is name-shaped: ``component:{kind}:{name}``.
+
+    If those names stopped matching, every plugin would read ``unknown`` for ever and nothing
+    would say so — a health page that is green over a join it never makes. So this exercises
+    the match with a real registry record and a check named the way the runtime names one.
+    """
+    backend, _ = backend_with_a_document()
+    backend.discovery = _discovered()
+    backend.checks = [
+        Check(name="component:chunker:structural", state="degraded", detail="rebuilding")
+    ]
+    with client_for(backend) as client:
+        page = envelope(client.get("/api/v1/admin/plugins"))["data"]
+    assert page["count"] == 1
+    plugin = page["plugins"][0]
+    assert plugin["name"] == "example"
+    assert plugin["components"] == 1
+    assert plugin["state"] == "degraded", "the component check was not joined to its plugin"
+    assert "rebuilding" in plugin["detail"]
+
+
+def test_a_component_nothing_has_constructed_is_unknown_rather_than_ok() -> None:
+    """The negative half. A plugin nothing has asked for has not been proved healthy, and
+    saying it is would be a diagnostic that measured nothing."""
+    backend, _ = backend_with_a_document()
+    backend.discovery = _discovered()
+    backend.checks = []
+    with client_for(backend) as client:
+        page = envelope(client.get("/api/v1/admin/plugins"))["data"]
+    plugin = page["plugins"][0]
+    assert plugin["state"] == "unknown"
+    assert "has been constructed yet" in plugin["detail"]

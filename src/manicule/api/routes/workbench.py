@@ -24,7 +24,7 @@ from manicule.api.security import ViewerPrincipal
 router = APIRouter(prefix="/api/v1", tags=["workbench"])
 
 
-@router.get("/workbench", summary="One document as it was chunked.")
+@router.get("/workbench", name="workbench", summary="One document as it was chunked.")
 async def workbench(
     service: Service,
     caller: ViewerPrincipal,

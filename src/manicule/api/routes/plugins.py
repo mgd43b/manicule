@@ -24,14 +24,14 @@ from manicule.api.security import AdminPrincipal, ViewerPrincipal
 router = APIRouter(prefix="/api/v1/plugins", tags=["plugins"])
 
 
-@router.get("", summary="Installed plugins and the components each registers.")
+@router.get("", name="plugin_list", summary="Installed plugins and the components each registers.")
 async def list_plugins(service: Service, caller: ViewerPrincipal) -> Response:
     """What is installed, and what each plugin contributed to the container."""
     del caller
     return await respond("plugin_list", service, lambda: service.plugin_list(registry=False))
 
 
-@router.get("/search", summary="Browse the community registry.")
+@router.get("/search", name="plugin_list", summary="Browse the community registry.")
 async def search_registry(
     service: Service,
     caller: AdminPrincipal,
@@ -52,7 +52,7 @@ async def search_registry(
     )
 
 
-@router.post("/{name}", summary="Enable an installed plugin.")
+@router.post("/{name}", name="plugin_add", summary="Enable an installed plugin.")
 async def enable_plugin(service: Service, caller: AdminPrincipal, name: str) -> Response:
     """Enable a plugin that is **already installed**. This never fetches or runs code.
 
@@ -63,7 +63,7 @@ async def enable_plugin(service: Service, caller: AdminPrincipal, name: str) -> 
     return await respond("plugin_add", service, lambda: service.plugin_add(name))
 
 
-@router.delete("/{name}", summary="Disable a plugin.")
+@router.delete("/{name}", name="plugin_remove", summary="Disable a plugin.")
 async def disable_plugin(service: Service, caller: AdminPrincipal, name: str) -> Response:
     """Disable a plugin. The distribution stays installed and is not touched."""
     del caller

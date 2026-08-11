@@ -26,7 +26,9 @@ from manicule.api.security import AnonymousPrincipal, MemberPrincipal, ViewerPri
 router = APIRouter(tags=["conversations"])
 
 
-@router.get("/api/v1/conversations", summary="This workspace's conversations.")
+@router.get(
+    "/api/v1/conversations", name="conversation_list", summary="This workspace's conversations."
+)
 async def list_conversations(
     service: Service,
     caller: ViewerPrincipal,
@@ -48,7 +50,7 @@ async def list_conversations(
     )
 
 
-@router.post("/api/v1/conversations", summary="Start a conversation.")
+@router.post("/api/v1/conversations", name="conversation_create", summary="Start a conversation.")
 async def create_conversation(
     service: Service, caller: MemberPrincipal, body: ConversationBody
 ) -> Response:
@@ -59,7 +61,11 @@ async def create_conversation(
     )
 
 
-@router.get("/api/v1/conversations/{conversation_id}/messages", summary="A conversation's turns.")
+@router.get(
+    "/api/v1/conversations/{conversation_id}/messages",
+    name="conversation_messages",
+    summary="A conversation's turns.",
+)
 async def messages(
     service: Service,
     caller: ViewerPrincipal,
@@ -81,7 +87,11 @@ async def messages(
     )
 
 
-@router.patch("/api/v1/conversations/{conversation_id}", summary="Retitle a conversation.")
+@router.patch(
+    "/api/v1/conversations/{conversation_id}",
+    name="conversation_rename",
+    summary="Retitle a conversation.",
+)
 async def patch_conversation(
     service: Service, caller: MemberPrincipal, conversation_id: str, body: ConversationPatch
 ) -> Response:
@@ -94,7 +104,11 @@ async def patch_conversation(
     )
 
 
-@router.delete("/api/v1/conversations/{conversation_id}", summary="Delete a conversation.")
+@router.delete(
+    "/api/v1/conversations/{conversation_id}",
+    name="conversation_delete",
+    summary="Delete a conversation.",
+)
 async def delete_conversation(
     service: Service, caller: MemberPrincipal, conversation_id: str
 ) -> Response:
@@ -109,7 +123,11 @@ async def delete_conversation(
     )
 
 
-@router.post("/api/v1/conversations/{conversation_id}/share", summary="Mint a share link.")
+@router.post(
+    "/api/v1/conversations/{conversation_id}/share",
+    name="conversation_share",
+    summary="Mint a share link.",
+)
 async def share_conversation(
     service: Service, caller: MemberPrincipal, conversation_id: str, body: ShareBody
 ) -> Response:
@@ -128,7 +146,11 @@ async def share_conversation(
     )
 
 
-@router.delete("/api/v1/conversations/{conversation_id}/share", summary="Revoke a share link.")
+@router.delete(
+    "/api/v1/conversations/{conversation_id}/share",
+    name="conversation_unshare",
+    summary="Revoke a share link.",
+)
 async def unshare_conversation(
     service: Service, caller: MemberPrincipal, conversation_id: str
 ) -> Response:
@@ -140,7 +162,11 @@ async def unshare_conversation(
     )
 
 
-@router.get("/shared/{token}", summary="Read a shared conversation. No credential.")
+@router.get(
+    "/shared/{token}",
+    name="shared_conversation",
+    summary="Read a shared conversation. No credential.",
+)
 async def shared(service: Service, caller: AnonymousPrincipal, token: str) -> Response:
     """The anonymous view of a shared conversation.
 

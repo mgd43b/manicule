@@ -29,7 +29,7 @@ from manicule.api.security import MemberPrincipal, ViewerPrincipal
 router = APIRouter(prefix="/api/v1", tags=["documents"])
 
 
-@router.get("/documents", summary="A page of this workspace's documents.")
+@router.get("/documents", name="document_list", summary="A page of this workspace's documents.")
 async def list_documents(
     service: Service,
     caller: ViewerPrincipal,
@@ -50,7 +50,7 @@ async def list_documents(
     )
 
 
-@router.get("/documents/trash", summary="What is in the trash.")
+@router.get("/documents/trash", name="document_trash", summary="What is in the trash.")
 async def trash(
     service: Service,
     caller: ViewerPrincipal,
@@ -70,7 +70,11 @@ async def trash(
     )
 
 
-@router.get("/documents/{document_id}", summary="One document, optionally with its chunks.")
+@router.get(
+    "/documents/{document_id}",
+    name="document_get",
+    summary="One document, optionally with its chunks.",
+)
 async def get_document(
     service: Service,
     caller: ViewerPrincipal,
@@ -89,7 +93,9 @@ async def get_document(
     )
 
 
-@router.delete("/documents/{document_id}", summary="Move a document to the trash.")
+@router.delete(
+    "/documents/{document_id}", name="document_delete", summary="Move a document to the trash."
+)
 async def delete_document(service: Service, caller: MemberPrincipal, document_id: str) -> Response:
     """Soft delete, always.
 
@@ -102,7 +108,11 @@ async def delete_document(service: Service, caller: MemberPrincipal, document_id
     )
 
 
-@router.post("/documents/{document_id}/restore", summary="Take a document out of the trash.")
+@router.post(
+    "/documents/{document_id}/restore",
+    name="document_restore",
+    summary="Take a document out of the trash.",
+)
 async def restore_document(service: Service, caller: MemberPrincipal, document_id: str) -> Response:
     """Restore, and say what that achieved.
 
@@ -114,7 +124,9 @@ async def restore_document(service: Service, caller: MemberPrincipal, document_i
     return await respond("document_restore", service, lambda: service.document_restore(document_id))
 
 
-@router.post("/documents/{document_id}/reindex", summary="Re-parse one document.")
+@router.post(
+    "/documents/{document_id}/reindex", name="document_reindex", summary="Re-parse one document."
+)
 async def reindex_document(service: Service, caller: MemberPrincipal, document_id: str) -> Response:
     """Re-parse from the bytes ingest retained. Touches no network.
 
@@ -124,7 +136,7 @@ async def reindex_document(service: Service, caller: MemberPrincipal, document_i
     return await respond("document_reindex", service, lambda: service.document_reindex(document_id))
 
 
-@router.get("/search", summary="Rank passages without asking a model anything.")
+@router.get("/search", name="search", summary="Rank passages without asking a model anything.")
 async def search(
     service: Service,
     caller: ViewerPrincipal,

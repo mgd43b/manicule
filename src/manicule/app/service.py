@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import platform
 import time
 import tomllib
@@ -60,6 +61,13 @@ if TYPE_CHECKING:
     from manicule.ingest.pipeline import RunReport
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
+
+_log = logging.getLogger("manicule.app")
+"""For the one thing here that is reported rather than raised: a telemetry write that failed.
+
+A module logger rather than a print or a swallowed exception, so an operator who has configured
+logging sees it and one who has not is not spammed by a library.
+"""
 
 DEFAULT_SOURCE = "local"
 """The source name ``index_path`` uses when none is given.
@@ -525,6 +533,24 @@ class ApplicationService:
             schema_revision=await maintenance.schema_revision(),
             data_dir=str(self.settings.data_dir),
         )
+
+    async def ready(self) -> bool:
+        """Whether this installation can actually serve a question.
+
+        Deliberately a **boolean**, and deliberately here rather than in the surface that asks.
+        "Ready" is a decision — it means the store opens and answers — and a readiness probe
+        that decided it for itself would be a second opinion about what a working installation
+        is, on the one endpoint an orchestrator uses to restart things.
+
+        It reports nothing about the corpus. A probe is reachable by whatever can reach the
+        port, and "412 documents" is a corpus fingerprint.
+        """
+        try:
+            store = await self._backend.documents()
+            await store.count_documents()
+        except (ManiculeError, ValueError, OSError):
+            return False
+        return True
 
     async def stats(self) -> r.Stats:
         """Counts, grouped the three ways anybody asks for."""
@@ -1765,6 +1791,9 @@ class ApplicationService:
         if audit.events and event_type not in audit.events:
             return
         telemetry = await self._backend.telemetry()
+        # Deliberately **not** wrapped the way `_record_query` is. An audit entry that cannot
+        # be written must fail the operation it was auditing: a trail with holes in it is worse
+        # than none, because the holes are invisible and the operation reported success.
         await telemetry.record_audit(event_type, details=details)
 
     async def _record_query(
@@ -1772,19 +1801,32 @@ class ApplicationService:
     ) -> None:
         """Write one retrieval into ``query_logs``.
 
-        In the service rather than in a surface, and unconditionally rather than behind a
-        switch: this is the row the admin surface pages through, and telemetry that only
-        records the traffic of whichever surface remembered to write it describes nothing.
+        In the service rather than in a surface: this is the row the admin surface pages
+        through, and telemetry that only records the traffic of whichever surface remembered to
+        write it describes nothing.
+
+        **A failure here does not fail the query.** Retrieval is a read; recording it is a
+        write, and on SQLite that write can lose to a lock or a busy timeout. Letting it
+        propagate would mean a search that worked yesterday returns 500 today because an
+        *observability* insert could not get the writer — a read made conditional on a write.
+        It is logged at warning rather than swallowed, so a telemetry backend that has stopped
+        working is visible instead of merely quiet.
         """
-        telemetry = await self._backend.telemetry()
-        confidence = retrieved.confidence
-        await telemetry.record_query(
-            query.text,
-            profile=query.profile.value,
-            chunk_ids=[candidate.chunk.id for candidate in retrieved.context.passages],
-            confidence=confidence.score if confidence else None,
-            elapsed_ms=_millis(started),
-        )
+        try:
+            telemetry = await self._backend.telemetry()
+            confidence = retrieved.confidence
+            await telemetry.record_query(
+                query.text,
+                profile=query.profile.value,
+                chunk_ids=[candidate.chunk.id for candidate in retrieved.context.passages],
+                confidence=confidence.score if confidence else None,
+                elapsed_ms=_millis(started),
+            )
+        except (ManiculeError, ValueError, OSError) as exc:
+            # The query text is deliberately not in the message. It is user content, and a
+            # log line is exactly where `security.storage.redact_logs_content` says it must
+            # not appear.
+            _log.warning("could not record query telemetry: %s: %s", type(exc).__name__, exc)
 
     def _query(
         self,

@@ -24,7 +24,9 @@ from manicule.app.dispatch import run_op
 router = APIRouter(tags=["auth"])
 
 
-@router.get("/auth/providers", summary="Which identity providers are configured.")
+@router.get(
+    "/auth/providers", name="auth_providers", summary="Which identity providers are configured."
+)
 async def providers(service: Service, caller: AnonymousPrincipal) -> Response:
     """Names and types only, never a client secret.
 
@@ -36,7 +38,7 @@ async def providers(service: Service, caller: AnonymousPrincipal) -> Response:
     return as_response(await run_op("auth_providers", service.workspace, service.auth_providers))
 
 
-@router.get("/auth/session", summary="Who this request is.")
+@router.get("/auth/session", name="auth_session", summary="Who this request is.")
 async def session(service: Service, caller: AnonymousPrincipal) -> Response:
     """The caller's identity, as this installation resolved it.
 
@@ -56,7 +58,7 @@ async def session(service: Service, caller: AnonymousPrincipal) -> Response:
     )
 
 
-@router.post("/api/v1/auth/keys", summary="Mint an API key.")
+@router.post("/api/v1/auth/keys", name="api_key_create", summary="Mint an API key.")
 async def create_key(service: Service, caller: AdminPrincipal, body: KeyBody) -> Response:
     """Return the only copy of a key's secret.
 
@@ -76,14 +78,14 @@ async def create_key(service: Service, caller: AdminPrincipal, body: KeyBody) ->
     )
 
 
-@router.get("/api/v1/auth/keys", summary="Every key in this workspace.")
+@router.get("/api/v1/auth/keys", name="api_key_list", summary="Every key in this workspace.")
 async def list_keys(service: Service, caller: AdminPrincipal) -> Response:
     """Records, never secrets. Only digests are stored, so there is no secret to return."""
     del caller
     return as_response(await run_op("api_key_list", service.workspace, service.api_key_list))
 
 
-@router.delete("/api/v1/auth/keys/{name_or_id}", summary="Revoke a key.")
+@router.delete("/api/v1/auth/keys/{name_or_id}", name="api_key_revoke", summary="Revoke a key.")
 async def revoke_key(service: Service, caller: AdminPrincipal, name_or_id: str) -> Response:
     """Immediate, and scoped to this workspace.
 

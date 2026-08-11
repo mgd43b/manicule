@@ -207,3 +207,43 @@ def test_the_demo_page_embeds_the_widget_and_reflects_nothing() -> None:
     assert response.status_code == 200
     assert "/widget/widget.js" in response.text
     assert marker not in response.text
+
+
+def test_the_demo_page_may_actually_load_the_script_it_embeds() -> None:
+    """The application-wide policy is ``default-src 'none'``, which a browser applies to a
+    *document* and which refuses its ``<script src>``.
+
+    So the one route that returns HTML states its own policy. Without this the demo page is a
+    page that cannot work, and a test asserting only that the markup mentions the script would
+    never see it — which is exactly what happened before this assertion existed.
+    """
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client:
+        policy = client.get("/widget").headers["content-security-policy"]
+    assert "script-src 'self'" in policy
+    assert "connect-src 'self'" in policy
+    assert "default-src 'none'" in policy
+
+
+def test_the_demo_page_still_refuses_framing_and_inline_script() -> None:
+    """Its own policy is narrower, not looser.
+
+    ``script-src 'self'`` with no ``'unsafe-inline'`` means the page cannot execute anything
+    this installation did not serve, and framing is refused exactly as everywhere else.
+    """
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client:
+        policy = client.get("/widget").headers["content-security-policy"]
+    assert "frame-ancestors 'none'" in policy
+    assert "script-src 'self'" in policy
+    script = policy.split("script-src")[1].split(";")[0]
+    assert "unsafe-inline" not in script
+    assert "unsafe-eval" not in script
+
+
+def test_the_json_surface_keeps_the_strict_policy() -> None:
+    """The exception is one page, not a loosening of the default."""
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client:
+        policy = client.get("/api/v1/documents").headers["content-security-policy"]
+    assert policy == "default-src 'none'; frame-ancestors 'none'"

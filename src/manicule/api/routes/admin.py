@@ -34,7 +34,7 @@ from manicule.api.security import AdminPrincipal
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
 
 
-@router.get("/stats", summary="Index counts and fingerprints.")
+@router.get("/stats", name="index_status", summary="Index counts and fingerprints.")
 async def stats(service: Service, caller: AdminPrincipal) -> Response:
     """What is in the index and what it was built with.
 
@@ -46,7 +46,7 @@ async def stats(service: Service, caller: AdminPrincipal) -> Response:
     return await respond("index_status", service, service.index_status)
 
 
-@router.get("/query-logs", summary="Retrieval telemetry, newest first.")
+@router.get("/query-logs", name="query_logs", summary="Retrieval telemetry, newest first.")
 async def query_logs(
     service: Service,
     caller: AdminPrincipal,
@@ -67,7 +67,7 @@ async def query_logs(
     )
 
 
-@router.get("/audit-logs", summary="The audit trail, newest first.")
+@router.get("/audit-logs", name="audit_log", summary="The audit trail, newest first.")
 async def audit_logs(
     service: Service,
     caller: AdminPrincipal,
@@ -90,7 +90,9 @@ async def audit_logs(
     )
 
 
-@router.get("/search-quality", summary="What the evaluation harness has recorded.")
+@router.get(
+    "/search-quality", name="search_quality", summary="What the evaluation harness has recorded."
+)
 async def search_quality(service: Service, caller: AdminPrincipal) -> Response:
     """The pairwise harness's own report, verbatim, or an honest statement that there is none.
 
@@ -102,7 +104,7 @@ async def search_quality(service: Service, caller: AdminPrincipal) -> Response:
     return await respond("search_quality", service, service.search_quality)
 
 
-@router.get("/plugins", summary="Plugin health.")
+@router.get("/plugins", name="plugin_health", summary="Plugin health.")
 async def plugin_health(service: Service, caller: AdminPrincipal) -> Response:
     """Installed plugins and the health of whatever each one has constructed.
 
@@ -113,14 +115,20 @@ async def plugin_health(service: Service, caller: AdminPrincipal) -> Response:
     return await respond("plugin_health", service, service.plugin_health)
 
 
-@router.get("/connectors", summary="Configured sources and what their last run recorded.")
+@router.get(
+    "/connectors",
+    name="connector_list",
+    summary="Configured sources and what their last run recorded.",
+)
 async def connectors(service: Service, caller: AdminPrincipal) -> Response:
     """Every configured connector, whether its implementation is installed, and its watermark."""
     del caller
     return await respond("connector_list", service, service.connector_list)
 
 
-@router.post("/connectors/{name}/sync", summary="Run one configured connector.")
+@router.post(
+    "/connectors/{name}/sync", name="connector_sync", summary="Run one configured connector."
+)
 async def sync_connector(
     service: Service, caller: AdminPrincipal, name: str, body: SyncBody
 ) -> Response:

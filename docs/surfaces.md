@@ -369,6 +369,11 @@ answer a probe rather than a person. They also answer different questions: `/hea
 nothing, `/readyz` asks the store whether the index is usable. Collapsing them gives you a
 liveness probe that restarts a healthy process because a database file is briefly locked.
 
+Both are unauthenticated, so both carry `{"status": …}` and nothing else — no counts, no
+configuration and no reason for an unready answer. "412 documents, chunker structural" is a
+corpus fingerprint, and so, more quietly, is the text of a database error. What "ready" *means*
+is the service's decision (`ApplicationService.ready`), not the route's.
+
 ### 9.2 Identity
 
 `security.auth.mode` decides. With `api_key`, a key is presented on **every** request as
@@ -380,6 +385,13 @@ subprotocol back.
 
 Roles are a floor: `viewer` reads, `member` writes, `admin` administers. A route asks for the
 least it needs.
+
+**A refusal names the same operation a success would.** A refused request never reaches its
+service call, so `op` comes from the matched route — and every route therefore carries an
+explicit `name=` equal to the service method it calls. Without that it would be the handler's
+Python function name (`list_documents` rather than `document_list`), and an access log of
+refusals would be unjoinable to one of successes. `tests/api/test_contract.py` enumerates the
+mounted routes and fails on a name that is not an operation.
 
 With `security.auth.mode = none` there is no credential and the caller is treated as the
 operator — which is only tolerable because that configuration cannot be reached from anywhere
@@ -421,6 +433,12 @@ deliberately cross-origin.
 - **A widget key is as public as the page it is on.** manicule does not pretend otherwise: mint
   a dedicated key, give it the least role that works, and revoke it on its own.
 
+The application-wide policy is `default-src 'none'`, which is right for JSON and for the script
+and **wrong for the one page that loads the script** — a browser applies it to the document and
+refuses the `<script src>`. So `GET /widget` states its own, narrower policy: `script-src
+'self'`, `connect-src 'self'`, inline styles for the shadow root, and still `frame-ancestors
+'none'`. Nothing else on the surface is loosened.
+
 ### 9.5 Streaming
 
 `POST /api/v1/chat/stream` emits `delta`, `citation`, `drop` and one `final` event. The `final`
@@ -456,7 +474,22 @@ unattended caller reaches, so each of them is absent rather than merely guarded:
 `tests/api/test_routes.py` asserts each absence by name. An absence with no test is an absence
 that comes back.
 
-### 9.7 Search quality
+### 9.7 Telemetry, and what a failed write costs
+
+`search` and `ask` record a row in `query_logs`, and that recording is the **service's** rather
+than a surface's: telemetry written only by whichever surface remembered to write it describes
+that surface's traffic instead of the installation's.
+
+The two writes this surface makes are treated **differently on purpose**:
+
+- **A failed query-log write does not fail the query.** Retrieval is a read; recording it is a
+  write, and on SQLite a write can lose to a lock. Letting it propagate would make a search that
+  worked yesterday return 500 today because an observability insert could not get the writer. It
+  is logged at warning — without the query text, which is user content — rather than swallowed.
+- **A failed audit write fails the operation it was auditing.** A trail with holes in it is
+  worse than none, because the holes are invisible and the operation reported success.
+
+### 9.8 Search quality
 
 `GET /api/v1/admin/search-quality` **reports**; it does not measure. `manicule.evaluation` is
 the only thing in this project that decides whether one retrieval configuration beats another,

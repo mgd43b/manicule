@@ -25,7 +25,7 @@ from manicule.api.streaming import SSE_HEADERS, SSE_MEDIA_TYPE, answer_frames, s
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 
 
-@router.post("", summary="Answer a question, and wait for it.")
+@router.post("", name="ask", summary="Answer a question, and wait for it.")
 async def chat(service: Service, caller: MemberPrincipal, body: AskBody) -> Response:
     """One answer with citations that resolve.
 
@@ -46,7 +46,7 @@ async def chat(service: Service, caller: MemberPrincipal, body: AskBody) -> Resp
     )
 
 
-@router.post("/stream", summary="The same answer, as it is written.")
+@router.post("/stream", name="ask", summary="The same answer, as it is written.")
 async def chat_stream(
     service: Service, caller: MemberPrincipal, body: AskBody
 ) -> StreamingResponse:
@@ -80,7 +80,7 @@ async def chat_stream(
     )
 
 
-@router.post("/feedback", summary="Rate one answer.")
+@router.post("/feedback", name="chat_feedback", summary="Rate one answer.")
 async def feedback(service: Service, caller: MemberPrincipal, body: FeedbackBody) -> Response:
     """Rate an answer by its message id.
 

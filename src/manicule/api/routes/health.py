@@ -21,12 +21,11 @@ from fastapi.responses import JSONResponse
 from manicule.api.context import Service
 from manicule.api.envelopes import OK, SERVER_ERROR, respond
 from manicule.api.security import AnonymousPrincipal, ViewerPrincipal
-from manicule.core.errors import ManiculeError
 
 router = APIRouter(tags=["health"])
 
 
-@router.get("/healthz", summary="Liveness. Opens nothing.")
+@router.get("/healthz", name="healthz", summary="Liveness. Opens nothing.")
 async def healthz(caller: AnonymousPrincipal) -> Response:
     """Whether this process is up. Deliberately unauthenticated and deliberately cheap.
 
@@ -37,31 +36,27 @@ async def healthz(caller: AnonymousPrincipal) -> Response:
     return JSONResponse(content={"status": "ok"}, status_code=OK)
 
 
-@router.get("/readyz", summary="Readiness. Asks the index whether it can serve.")
+@router.get("/readyz", name="readyz", summary="Readiness. Asks the index whether it can serve.")
 async def readyz(service: Service, caller: AnonymousPrincipal) -> Response:
     """Whether this installation can actually answer a question.
 
-    Counts documents, which opens the store and runs a query. A failure here is a **503 in
-    spirit and a 500 in status**: the process is alive and the index is not usable, and a
-    probe that reads the status code learns the right thing either way.
+    What "ready" means is the **service's** decision, not this route's: a probe that decided it
+    here would be a second opinion about what a working installation is, on the one endpoint an
+    orchestrator uses to restart things.
 
-    It reports no counts and no configuration. An unauthenticated endpoint that said "412
+    A failure is a **503 in spirit and a 500 in status**: the process is alive and the index is
+    not usable, and a probe reading the status code learns the right thing either way. It
+    reports no counts, no configuration and no reason — an unauthenticated endpoint saying "412
     documents, chunker structural" would be a corpus fingerprint for anyone who can reach the
-    port.
+    port, and so, more quietly, would the text of a database error.
     """
     del caller
-    try:
-        store = await service.backend.documents()
-        await store.count_documents()
-    except (ManiculeError, ValueError, OSError) as exc:
-        return JSONResponse(
-            content={"status": "unready", "detail": f"{type(exc).__name__}: {exc}"},
-            status_code=SERVER_ERROR,
-        )
+    if not await service.ready():
+        return JSONResponse(content={"status": "unready"}, status_code=SERVER_ERROR)
     return JSONResponse(content={"status": "ready"}, status_code=OK)
 
 
-@router.get("/api/v1/health", summary="Diagnostics, in the ordinary envelope.")
+@router.get("/api/v1/health", name="doctor", summary="Diagnostics, in the ordinary envelope.")
 async def health(service: Service, caller: ViewerPrincipal) -> Response:
     """Everything ``manicule doctor`` checks, as the same envelope every other surface emits.
 
@@ -73,14 +68,16 @@ async def health(service: Service, caller: ViewerPrincipal) -> Response:
     return await respond("doctor", service, service.doctor)
 
 
-@router.get("/api/v1/stats", summary="Counts, grouped three ways.")
+@router.get("/api/v1/stats", name="stats", summary="Counts, grouped three ways.")
 async def stats(service: Service, caller: ViewerPrincipal) -> Response:
     """Documents and chunks by source, media type and status."""
     del caller
     return await respond("stats", service, service.stats)
 
 
-@router.get("/api/v1/workspaces", summary="Workspaces this installation knows about.")
+@router.get(
+    "/api/v1/workspaces", name="workspace_list", summary="Workspaces this installation knows about."
+)
 async def workspaces(service: Service, caller: ViewerPrincipal) -> Response:
     """Every workspace, with the active one marked.
 

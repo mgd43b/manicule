@@ -195,10 +195,27 @@ Served from this installation's own origin so it needs no CORS entry, which also
 usable check that the widget works before an operator starts configuring origins.
 """
 
+DEMO_POLICY = (
+    "default-src 'none'; script-src 'self'; connect-src 'self'; "
+    "style-src 'unsafe-inline'; frame-ancestors 'none'"
+)
+"""The one page on this surface that is a document rather than data, so the one exception.
+
+Every other response carries ``default-src 'none'``, which is correct for JSON and correct for
+the script itself — and **wrong for the page that loads the script**, because a browser applies
+it to the document and refuses the ``<script src>``. The demo page therefore states its own
+policy: its own origin for the script and for the call it makes, inline styles because the
+widget writes a ``<style>`` element into its shadow root, and still no framing.
+
+Narrow on purpose. `script-src 'self'` and no `'unsafe-inline'` for script means this page
+cannot execute anything that was not served by this installation, which is the property that
+matters on the one route that returns HTML.
+"""
+
 router = APIRouter(prefix="/widget", tags=["widget"])
 
 
-@router.get("/widget.js", summary="The embeddable chat widget.")
+@router.get("/widget.js", name="widget_script", summary="The embeddable chat widget.")
 async def widget_script() -> PlainTextResponse:
     """The widget script.
 
@@ -212,10 +229,19 @@ async def widget_script() -> PlainTextResponse:
     )
 
 
-@router.get("", summary="A page that embeds the widget, for looking at it.")
+@router.get("", name="widget_demo", summary="A page that embeds the widget, for looking at it.")
 async def widget_demo() -> HTMLResponse:
-    """A static page. No request value reaches it."""
-    return HTMLResponse(content=DEMO_PAGE, headers={"Cache-Control": "no-cache"})
+    """A static page. No request value reaches it.
+
+    It sets its **own** ``Content-Security-Policy``, because the application-wide one is
+    ``default-src 'none'`` — right for JSON and for the script, and wrong for the document that
+    loads the script, which a browser would refuse. The middleware uses ``setdefault``, so a
+    route that states a policy keeps it.
+    """
+    return HTMLResponse(
+        content=DEMO_PAGE,
+        headers={"Cache-Control": "no-cache", "Content-Security-Policy": DEMO_POLICY},
+    )
 
 
-__all__ = ["DEMO_PAGE", "WIDGET_SCRIPT", "router"]
+__all__ = ["DEMO_PAGE", "DEMO_POLICY", "WIDGET_SCRIPT", "router"]

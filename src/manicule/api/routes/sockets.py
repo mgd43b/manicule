@@ -27,6 +27,7 @@ from pydantic import ValidationError
 
 from manicule.api.context import policy_of, service_of
 from manicule.api.models import AskBody
+from manicule.api.proxy import FORWARDED_FOR
 from manicule.api.security import Principal, require, websocket_token
 from manicule.api.streaming import answer_frames
 from manicule.app.dispatch import error_info
@@ -66,7 +67,7 @@ async def chat_socket(websocket: WebSocket) -> None:
         identity=await service.authenticate(token),
         address=policy.client_address(
             peer=client.host if client is not None else None,
-            forwarded_for=websocket.headers.get("x-forwarded-for"),
+            forwarded_for=websocket.headers.get(FORWARDED_FOR),
         ),
     )
     try:

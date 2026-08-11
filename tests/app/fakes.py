@@ -536,10 +536,21 @@ class FakeConversations:
 
 @dataclass
 class FakeTelemetry:
-    """Query logs and audit entries, recorded in memory."""
+    """Query logs and audit entries, recorded in memory.
+
+    ``fails`` makes every write raise, which is what a busy SQLite writer looks like from
+    here. It exists so that "a search does not fail because a telemetry insert did" is a
+    property a test can watch rather than a claim in a docstring.
+    """
 
     queries: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
     audits: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+    fails: bool = False
+
+    def _refuse(self) -> None:
+        if self.fails:
+            msg = "database is locked"
+            raise OSError(msg)
 
     async def record_query(
         self,
@@ -550,6 +561,7 @@ class FakeTelemetry:
         confidence: float | None,
         elapsed_ms: int,
     ) -> str:
+        self._refuse()
         identifier = f"q-{len(self.queries)}"
         self.queries.append(
             {
@@ -578,6 +590,7 @@ class FakeTelemetry:
         actor: str | None = None,
         ip_address: str | None = None,
     ) -> None:
+        self._refuse()
         self.audits.append(
             {
                 "id": f"a-{len(self.audits)}",

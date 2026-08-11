@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Depends, Request, WebSocket
 
+from manicule.api.proxy import FORWARDED_FOR
 from manicule.app.results import Identity
 from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import ManiculeError
@@ -143,7 +144,10 @@ async def resolve(
         identity=await service.authenticate(token_of(request)),
         address=policy.client_address(
             peer=client.host if client is not None else None,
-            forwarded_for=request.headers.get("x-forwarded-for"),
+            # Through the constant, not a literal. The header manicule reads is a decision
+            # `manicule.api.proxy` makes once, and a second spelling here is how a rename ends
+            # up reading a header nothing sends.
+            forwarded_for=request.headers.get(FORWARDED_FOR),
         ),
     )
 
