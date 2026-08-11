@@ -6,9 +6,11 @@ most common way a SQLite schema full of ``REFERENCES`` clauses turns out to enfo
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -103,6 +105,47 @@ def prepare_data_dir(data_dir: Path) -> Path:
     ):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
     return data_dir
+
+
+EXPOSED_MODE_BITS: Final = 0o077
+"""Every group and other permission bit.
+
+One constant for directories and files together, because the rule is the same for both:
+``0700`` and ``0600`` are what :func:`prepare_data_dir` and the blob store write, and both
+mean *nobody outside the owning account*. Testing for exactly ``0700`` would report ``0600``
+on a directory — an unusable mode, but not an exposure — as the same problem as ``0755``.
+"""
+
+
+def exposure(path: Path) -> int:
+    """The group and other permission bits set on ``path``. ``0`` means only its owner reaches it.
+
+    **This is asked of the data directory, and only of the directory.** POSIX gates every
+    read on the modes of every ancestor, so a directory nobody else can enter is a directory
+    nobody else can read *through*, whatever the files inside it say. Walking the tree would
+    cost one ``stat`` per retained document — a diagnostic proportional to the corpus — to
+    report paths that are already unreachable.
+
+    The data directory holds retained source bytes, so it is a verbatim copy of everything
+    indexed (``docs/storage.md`` §7.1). :func:`prepare_data_dir` creates it ``0700``; a looser
+    mode means an installer, a ``umask`` or a container run as root got there first, and the
+    consequence is that the corpus is readable by whoever else has an account on the machine.
+
+    Args:
+        path: The directory to inspect. Must exist and be readable.
+
+    Returns:
+        The bits, so a caller can print the mode it objected to. Always ``0`` where POSIX
+        modes do not apply, because ``st_mode`` is synthesised there and would report a
+        healthy directory as world-readable.
+
+    Raises:
+        OSError: ``path`` cannot be stat'ed. Left to the caller: "the data directory cannot
+            be examined" is a different diagnosis from "its modes are wrong".
+    """
+    if os.name != "posix":
+        return 0
+    return stat.S_IMODE(path.stat().st_mode) & EXPOSED_MODE_BITS
 
 
 def create_engine(data_dir: Path, *, echo: bool = False) -> AsyncEngine:

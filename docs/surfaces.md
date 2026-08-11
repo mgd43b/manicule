@@ -122,8 +122,10 @@ installation reports success at being broken.
 `--json` is not on the command line's exit status alone:
 
 - **stdout carries the envelope and nothing else.** No banner, no progress, no prose.
-- **Everything human goes to stderr.** `manicule search x --json | jq` on a failed run reads
-  an empty stream rather than an error message `jq` cannot parse.
+- **Everything human goes to stderr.** `manicule --json search x | jq` on a failed run reads
+  an empty stream rather than an error message `jq` cannot parse. `--json` is an option of
+  `manicule`, not of each command, so it goes **before** the command name; after it, Typer
+  rejects it as an unknown option with exit status 2.
 - **Exit status is 0 on success, 1 on a failed operation, 2 on a usage error** that Typer
   rejected before the service was reached.
 

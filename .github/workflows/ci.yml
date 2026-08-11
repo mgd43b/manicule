@@ -194,6 +194,42 @@ jobs:
           REQUIRE_GRAMMAR_BUNDLE: "1"
         run: uv run pytest tests/parsers/test_grammar_bundle.py tests/parsers/test_grammars.py -q -rs
 
+  # The image build, which is also the image's test.
+  #
+  # The Dockerfile's last stage runs `doctor`, an ingest and a search with `--network=none`,
+  # so `docker build` succeeding *is* the assertion that the image needs no network and that
+  # its data directory is one only its own account can read. Nothing here re-states those; a
+  # second copy of an assertion is a second thing to keep in step.
+  #
+  # What this job adds is the two checks that can only be made from outside the build: the
+  # **shipped** image runs as a non-root account, and the `/data` it carries is `0700`. Both
+  # are properties of the final image rather than of any layer, and a `USER` line dropped in a
+  # later edit would leave every in-build check passing.
+  #
+  # Unconditional rather than path-filtered. The build depends on `uv.lock`, the extras in
+  # `pyproject.toml`, the grammar bundle tool and every module the smoke test imports, and a
+  # filter listing those is a list that goes stale silently — which is the failure this
+  # repository keeps having.
+  container:
+    name: container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: docker build (the offline smoke test runs inside it)
+        run: docker build --progress=plain --tag manicule:ci .
+      - name: the shipped image does not run as root
+        run: |
+          uid=$(docker run --rm --entrypoint id manicule:ci -u)
+          echo "uid: ${uid}"
+          test "${uid}" -ne 0
+      - name: the data directory the image ships is 0700
+        # Read from the image rather than from the build, because a named volume takes its
+        # ownership and mode from exactly this directory the first time it is mounted.
+        run: |
+          mode=$(docker run --rm --entrypoint stat manicule:ci -c '%a %U' /data)
+          echo "/data: ${mode}"
+          test "${mode}" = "700 manicule"
+
   # Runs on every pull request, including ones that touch no Python at all. The repository
   # is mostly cross-referenced design documents, and a heading renumbered in one file
   # silently invalidates every inbound reference to it. Nothing else catches that.

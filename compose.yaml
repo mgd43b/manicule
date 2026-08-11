@@ -1,0 +1,50 @@
+# manicule, containerised: one service, one volume, no published ports.
+#
+#   docker compose build                                  # ~2.3 GB of model weights, once
+#   docker compose run --rm manicule doctor
+#   docker compose run --rm manicule index /corpus/docs
+#   docker compose run --rm manicule search "how are citations verified"
+#
+# `/corpus` is this repository, read-only, so the first run has something real to index
+# without asking anybody to choose a directory first. Point it somewhere else with
+# `MANICULE_CORPUS=~/Documents docker compose run …`.
+
+services:
+  manicule:
+    build:
+      context: .
+    image: manicule:local
+    # `run` rather than `up`: every command is a short-lived process, and manicule serves MCP
+    # over stdio, so there is no daemon here to keep alive. `init: true` gives that process a
+    # reaper for pid 1 so ^C during a long ingest is not swallowed.
+    init: true
+    volumes:
+      # The data directory: the database, the vector index, and — because ingest retains
+      # source bytes — a byte-identical copy of everything indexed. Treat it as the corpus
+      # itself. docs/deployment.md §1.
+      - manicule-data:/data
+      # Read-only, so an indexing run cannot write to what it is reading.
+      - ${MANICULE_CORPUS:-.}:/corpus:ro
+    environment:
+      # `manicule search` needs no model beyond the embedder in the image. `manicule ask`
+      # needs a generator, and this is the one line that points the container at an Ollama
+      # running on the host. Without one, `ask` fails with a connection error and everything
+      # else is unaffected.
+      MANICULE_LLM__BASE_URL: ${MANICULE_LLM_BASE_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      # Docker Desktop resolves this name already; on a Linux daemon it does not exist unless
+      # it is mapped, and an unresolvable host is a worse error message than a refused one.
+      - "host.docker.internal:host-gateway"
+    security_opt:
+      # Nothing in manicule needs to gain privileges, and a container that cannot is one fewer
+      # thing to reason about if a parser is ever handed a hostile document.
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Deliberately no `ports:`. The default command serves MCP over stdio, which opens no
+    # socket at all. `manicule start --transport http` serves the HTTP API, and publishing
+    # that is an operator's decision: docs/deployment.md §4 says what it costs, and manicule
+    # refuses a non-loopback bind without authentication either way.
+
+volumes:
+  manicule-data:

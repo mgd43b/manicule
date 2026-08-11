@@ -236,6 +236,7 @@ async def test_doctor_checks_configuration_transport_plugins_storage_and_the_ind
         "transport",
         "plugins",
         "storage",
+        "permissions",
         "index",
     }
     assert diagnosis.state in {"ok", "degraded", "failing", "unknown"}
@@ -263,6 +264,69 @@ async def test_doctor_names_an_unauthenticated_public_bind_as_failing(
     transport = next(check for check in diagnosis.checks if check.name == "transport")
     assert transport.state == "failing"
     assert "security.auth.mode" in transport.detail
+
+
+async def test_doctor_fails_on_a_data_directory_other_accounts_can_read(
+    backend: FakeBackend, tmp_path: Path
+) -> None:
+    """Failing, not degraded. The data directory holds the corpus, so this is an exposure.
+
+    ``chmod`` after ``mkdir`` rather than ``mkdir(mode=...)``, because ``mkdir``'s mode is
+    masked by the process ``umask`` — under ``umask 077`` the directory would come out
+    ``0700`` and this test would pass having created nothing to object to.
+    """
+    data_dir = tmp_path / "exposed"
+    data_dir.mkdir()
+    data_dir.chmod(0o755)
+    backend.settings = Settings(data_dir=data_dir)
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "permissions")
+    assert check.state == "failing"
+    assert str(data_dir) in check.detail
+    assert "chmod 0700" in check.detail
+    assert diagnosis.state == "failing"
+
+
+@pytest.mark.parametrize("mode", [0o750, 0o705, 0o701, 0o770])
+async def test_doctor_objects_to_any_group_or_other_bit(
+    backend: FakeBackend, tmp_path: Path, mode: int
+) -> None:
+    """Not only ``0755``. Execute alone on a directory is enough to read a named path through it."""
+    data_dir = tmp_path / f"mode-{mode:o}"
+    data_dir.mkdir()
+    data_dir.chmod(mode)
+    backend.settings = Settings(data_dir=data_dir)
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "permissions")
+    assert check.state == "failing"
+
+
+async def test_doctor_accepts_the_mode_the_storage_layer_writes(
+    backend: FakeBackend, tmp_path: Path
+) -> None:
+    """``0700`` is what ``prepare_data_dir`` creates, so a stock install must pass.
+
+    The check earns nothing if it fails on a correct installation: an operator who sees
+    ``doctor`` fail on a healthy machine learns to ignore it.
+    """
+    data_dir = tmp_path / "private"
+    data_dir.mkdir()
+    data_dir.chmod(0o700)
+    (data_dir / "manicule.db").write_bytes(b"")
+    backend.settings = Settings(data_dir=data_dir)
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "permissions")
+    assert check.state == "ok"
+
+
+async def test_doctor_says_it_does_not_know_when_the_data_directory_is_not_there(
+    backend: FakeBackend, tmp_path: Path
+) -> None:
+    """Absent is not exposed, and reporting it as one sends an operator to chmod nothing."""
+    backend.settings = Settings(data_dir=tmp_path / "never-created")
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "permissions")
+    assert check.state == "unknown"
 
 
 async def test_doctor_builds_nothing_expensive(
