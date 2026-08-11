@@ -13,7 +13,9 @@ amount of testing this module would notice that, so the source tree itself is ch
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -26,6 +28,9 @@ from manicule.app.bind import (
 )
 from manicule.config.settings import Settings
 from manicule.core.errors import PolicyError
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 SOURCE = Path(__file__).resolve().parents[2] / "src" / "manicule"
 
@@ -139,7 +144,49 @@ Enumerated per module with the reason, rather than loosening the search. ``::`` 
 ``parsers/grammars.py`` is C++'s scope separator, used to join a symbol path. An exemption
 that has to be written down here is one a reviewer sees; a regex that stopped matching would
 not be.
+
+Keys are **posix** relative paths, so the table does not depend on which platform is running
+the suite. Every entry is checked against the tree by
+:func:`test_every_exemption_is_still_earning_its_place`, so one that stops applying fails
+rather than sitting here forever quietly widening the search.
 """
+
+LANDMARKS: frozenset[str] = frozenset(
+    {
+        "mcp/serve.py",
+        "cli/main.py",
+        "cli/serving.py",
+        "app/runtime.py",
+        "core/protocols.py",
+    }
+)
+"""Modules the scan must have read, named individually.
+
+A count alone can be satisfied by scanning the wrong tree. These are the files a wide bind
+would actually regress in — the two that resolve an address, the two that start a server, and
+one deep in the package to prove the walk recursed — plus ``core/protocols.py`` for a
+directory the others do not reach. ``app/bind.py`` is deliberately absent: it is the one
+module the scan skips.
+"""
+
+MINIMUM_MODULES = 50
+"""A floor, far below the real count, on how many modules the scan must have read.
+
+Present to catch a scan that collapsed — a moved test file, a changed layout, a suite running
+against an installed wheel rather than the source tree — not to track the size of the package.
+A number that tracked the real count would need editing every time a module was added, and a
+check nobody can add a file without editing is a check people learn to edit.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class Scan:
+    """What one pass over the source tree read, and what it objected to."""
+
+    scanned: frozenset[str]
+    """Posix relative paths of every module actually parsed. The evidence the scan ran."""
+
+    offenders: Mapping[str, frozenset[str]]
 
 
 def _literal_strings(path: Path) -> set[str]:
@@ -152,6 +199,42 @@ def _literal_strings(path: Path) -> set[str]:
     }
 
 
+def scan_for_wide_addresses(root: Path) -> Scan:
+    """Read every module under ``root`` and report the ones naming an all-interfaces address.
+
+    Returns what it *scanned* as well as what it found, because "found nothing" and "read
+    nothing" are the same result otherwise — and the second one is the failure this whole
+    check exists to not have.
+    """
+    wide = {EVERYWHERE, "::"}
+    scanned: set[str] = set()
+    offenders: dict[str, frozenset[str]] = {}
+    for module in sorted(root.rglob("*.py")):
+        if module.name == "bind.py" and module.parent.name == "app":
+            continue
+        relative = module.relative_to(root).as_posix()
+        scanned.add(relative)
+        found = frozenset(_literal_strings(module) & wide) - NOT_AN_ADDRESS.get(
+            relative, frozenset()
+        )
+        if found:
+            offenders[relative] = found
+    return Scan(scanned=frozenset(scanned), offenders=offenders)
+
+
+def test_the_source_tree_this_check_reads_is_where_it_thinks_it_is() -> None:
+    """The path is computed from this file's location, so a move silently repoints it.
+
+    Asserted on its own as well as inside the scan, because this is the failure that turns a
+    security check into a green tick over an empty set.
+    """
+    assert SOURCE.is_dir(), (
+        f"{SOURCE} is not a directory, so the scan below would read no modules and pass. "
+        f"This path is derived from this test file's location — if the file moved, fix the "
+        f"derivation rather than the assertion."
+    )
+
+
 def test_no_module_but_the_bind_policy_names_an_all_interfaces_address() -> None:
     """A wide bind cannot arrive by a route that never asks.
 
@@ -159,19 +242,51 @@ def test_no_module_but_the_bind_policy_names_an_all_interfaces_address() -> None
     that passed ``"0.0.0.0"`` to a listener directly. So this reads the source: the literal
     lives in :mod:`manicule.app.bind`, where it exists to be *refused*, and nowhere else.
 
+    **The scan proves it ran before it reports what it found.** An empty result from a walk
+    over nothing is indistinguishable from a clean tree, and this guards a security property —
+    so the coverage assertions come first, in this test rather than beside it, and a scan that
+    collapsed fails here instead of passing quietly.
+
     Deleting this test restores a defect that no other test in the suite can see.
     """
-    wide = {EVERYWHERE, "::"}
-    offenders: dict[str, set[str]] = {}
-    for module in sorted(SOURCE.rglob("*.py")):
-        if module.name == "bind.py" and module.parent.name == "app":
-            continue
-        relative = str(module.relative_to(SOURCE))
-        found = (_literal_strings(module) & wide) - NOT_AN_ADDRESS.get(relative, frozenset())
-        if found:
-            offenders[relative] = found
-    assert offenders == {}, (
-        f"these modules name an all-interfaces address directly: {offenders}. Every bind goes "
-        f"through manicule.app.bind.resolve_bind, which refuses one that was not asked for "
-        f"three separate times."
+    assert SOURCE.is_dir(), f"{SOURCE} is not a directory; the scan would read nothing"
+    scan = scan_for_wide_addresses(SOURCE)
+
+    assert len(scan.scanned) >= MINIMUM_MODULES, (
+        f"the scan read {len(scan.scanned)} module(s) under {SOURCE}, below the floor of "
+        f"{MINIMUM_MODULES}. It is walking the wrong tree, and an empty walk reports success."
     )
+    missing = sorted(LANDMARKS - scan.scanned)
+    assert missing == [], (
+        f"the scan did not read {missing}, which are modules that must exist under {SOURCE}. "
+        f"Whatever it walked, it was not this package."
+    )
+
+    assert scan.offenders == {}, (
+        f"these modules name an all-interfaces address directly: {dict(scan.offenders)}. "
+        f"Every bind goes through manicule.app.bind.resolve_bind, which refuses one that was "
+        f"not asked for three separate times."
+    )
+
+
+def test_every_exemption_is_still_earning_its_place() -> None:
+    """An exemption that no longer applies is a hole in the search that nothing reports.
+
+    ``NOT_AN_ADDRESS`` widens what the scan tolerates. If ``parsers/grammars.py`` stops using
+    ``::`` as a scope separator, the entry keeps excusing a literal nobody is writing — and
+    the day somebody writes one there for a different reason, the scan says nothing. So each
+    entry has to still be true of the tree.
+    """
+    assert SOURCE.is_dir(), f"{SOURCE} is not a directory; there is nothing to check against"
+    for relative, excused in NOT_AN_ADDRESS.items():
+        module = SOURCE / relative
+        assert module.is_file(), (
+            f"NOT_AN_ADDRESS exempts {relative}, which does not exist. Delete the entry."
+        )
+        present = _literal_strings(module)
+        stale = sorted(excused - present)
+        assert stale == [], (
+            f"NOT_AN_ADDRESS excuses {stale} in {relative}, which no longer contains "
+            f"{'it' if len(stale) == 1 else 'them'}. Delete the entry: an exemption that "
+            f"applies to nothing still widens the search."
+        )
