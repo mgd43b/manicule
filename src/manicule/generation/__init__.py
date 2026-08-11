@@ -23,6 +23,7 @@ from manicule.generation.answering import (
     Answerer,
     AnswerRequest,
     AnswerResult,
+    SupportsAnswer,
     accepted_extras,
     answering,
 )
@@ -131,6 +132,7 @@ __all__ = [
     "ShareStore",
     "SharedTurn",
     "StoredMessage",
+    "SupportsAnswer",
     "TokenEstimator",
     "Turn",
     "UnverifiableSource",

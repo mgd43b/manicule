@@ -125,11 +125,16 @@ def test_a_factory_handed_the_wrong_configuration_refuses_it() -> None:
         build_confluence(context)
 
 
-def test_the_plugin_registers_exactly_one_connector() -> None:
+def test_the_plugin_registers_the_sources_this_build_ships() -> None:
+    """Confluence for v1, and the local filesystem that ``manicule index <path>`` walks.
+
+    Asserted as an exact list rather than a membership check: a connector registered and
+    never mentioned anywhere is a source nobody knows they can configure.
+    """
     registry = ComponentRegistry()
     PLUGIN.register(registry.bind("connectors"))
 
-    assert registry.names(ComponentKind.CONNECTOR) == ["confluence"]
+    assert registry.names(ComponentKind.CONNECTOR) == ["confluence", "filesystem"]
 
 
 def test_a_cloud_token_without_an_email_is_refused_before_anything_is_built() -> None:

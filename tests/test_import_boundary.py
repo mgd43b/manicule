@@ -287,6 +287,14 @@ torch. Neither has any business being loaded by discovery, which runs in every p
 starts — including one whose profile is ``fast`` and will never construct a reranker at all.
 """
 
+STORAGE_LIBRARIES = ("sqlalchemy", "alembic", "aiosqlite", "lancedb", "pyarrow")
+"""What the built-in stores are built on, and none of them cheap.
+
+Alembic drags in Mako, LanceDB drags in PyArrow, and every process that starts runs discovery
+— including one that is printing a completion script. What registration needs eagerly is a
+configuration model, and that lives in ``manicule.storage.config``.
+"""
+
 GENERATION_LIBRARIES = ("litellm", "openai", "anthropic", "httpx", "tiktoken")
 """What the built-in generator is built on.
 
@@ -339,6 +347,28 @@ def test_registering_the_built_in_generator_loads_no_provider_library() -> None:
 
 
 @pytest.mark.contract
+def test_registering_the_built_in_stores_loads_no_database() -> None:
+    """Discovery runs in every process that starts, and a database is not a cheap import.
+
+    Alembic, SQLAlchemy, LanceDB and PyArrow are tens of megabytes between them and two of
+    them pull in native libraries. None of that has any business happening in order to find
+    out that a store named ``sqlite`` exists — which is what ``manicule completion`` and
+    ``manicule doctor`` both do before deciding whether to open anything.
+    """
+    loaded = _modules_added_by_discovery()
+    leaked = sorted(
+        name
+        for name in STORAGE_LIBRARIES
+        if any(module == name or module.startswith(f"{name}.") for module in loaded)
+    )
+    assert leaked == [], (
+        f"plugin discovery loaded {', '.join(leaked)}. A store's library belongs inside the "
+        f"factory that builds the store; what registration needs eagerly — a config model — "
+        f"belongs in manicule.storage.config"
+    )
+
+
+@pytest.mark.contract
 def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
     """The built-in parsers take the same route a third-party plugin takes.
 
@@ -350,6 +380,7 @@ def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
     found = {point.name: point.value for point in installed_entry_points(ENTRY_POINT_GROUP)}
 
     assert found.get("parsing") == "manicule.parsers.plugin:PLUGIN", STALE_INSTALL
+    assert found.get("storage") == "manicule.storage.plugin:PLUGIN", STALE_INSTALL
     assert found.get("embedding") == "manicule.embedding.plugin:PLUGIN", STALE_INSTALL
     assert found.get("retrieval") == "manicule.retrieval.plugin:PLUGIN", STALE_INSTALL
     assert found.get("generation") == "manicule.generation.plugin:PLUGIN", STALE_INSTALL

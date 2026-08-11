@@ -23,6 +23,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Protocol, runtime_checkable
 
 from manicule.config.profiles import profile_config
 from manicule.config.settings import Settings
@@ -76,6 +77,22 @@ def accepted_extras(generator: Generator) -> frozenset[str]:
         for name, parameter in signature.parameters.items()
         if parameter.kind is inspect.Parameter.KEYWORD_ONLY
     )
+
+
+@runtime_checkable
+class SupportsAnswer(Protocol):
+    """The one method :func:`answering` calls.
+
+    Stated as a protocol so that a caller holding an answerer through its own narrow
+    port — the application service does — can still use the context manager that owns
+    the persistence guarantee. Demanding the concrete class instead would push every
+    such caller into hand-rolling the ``aclose`` in a ``finally``, which is exactly the
+    line this function exists so that nobody has to write twice.
+    """
+
+    def answer(
+        self, request: AnswerRequest, result: AnswerResult | None = None
+    ) -> AsyncIterator[AnswerEvent]: ...
 
 
 @dataclass(slots=True)
@@ -641,7 +658,7 @@ class Answerer:
 
 @asynccontextmanager
 async def answering(
-    answerer: Answerer, request: AnswerRequest, result: AnswerResult | None = None
+    answerer: SupportsAnswer, request: AnswerRequest, result: AnswerResult | None = None
 ) -> AsyncGenerator[AsyncIterator[AnswerEvent]]:
     """Consume an answer, closing it on **every** exit path.
 
@@ -699,6 +716,7 @@ __all__ = [
     "AnswerRequest",
     "AnswerResult",
     "Answerer",
+    "SupportsAnswer",
     "accepted_extras",
     "answering",
 ]

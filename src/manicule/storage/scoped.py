@@ -109,6 +109,18 @@ class WorkspaceScoped:
         return self._workspace_id
 
     @property
+    def engine(self) -> AsyncEngine:
+        """The engine this handle reads and writes through.
+
+        Public because a process's composition root needs it and building a second one would
+        be worse: two engines on the same file are two connection pools, two sets of pragmas
+        and — for the migration that has to run before any query — two opinions about whether
+        it already has. Migrations, backups and the sibling stores on this database all take
+        the engine from whoever opened it.
+        """
+        return self._engine
+
+    @property
     def generation(self) -> int:
         """Bumped by every committed transaction on this store's engine.
 
