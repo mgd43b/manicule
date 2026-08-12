@@ -111,8 +111,14 @@ interpreted, and interpreting half of it is worse than refusing all of it.
 """
 
 
-def _printable(value: str, *, field: str) -> str:
-    """``value`` with its surrounding space removed, refused if it holds a control character.
+def _require_printable(value: str, *, field: str) -> None:
+    """Refuse ``value`` if it is over-long or holds a control character.
+
+    **A check, and only a check.** An earlier version returned ``value.strip()``, which every
+    caller discarded — so the signature advertised a normalisation that never reached a stored
+    field, and ``title="  Retry policy  "`` was stored with its padding while the code read as
+    though it had been trimmed. Either normalise or verify; doing one and appearing to do both is
+    how a reader comes to rely on the half that is not happening.
 
     Control characters in a declared string are not a hypothetical. ``\\x1b`` is the opening
     byte of an ANSI escape sequence, and every one of these fields is printed to a terminal by
@@ -137,7 +143,6 @@ def _printable(value: str, *, field: str) -> str:
                 f"appear in a citation. Remove it from the manifest."
             )
             raise ValueError(msg)
-    return value.strip()
 
 
 def _aware(value: datetime | None, *, field: str) -> datetime | None:
@@ -229,9 +234,9 @@ class SourceMetadata(BaseModel):
         it came from — a manifest author reading "invalid" learns nothing, and this is the
         error they will actually see.
         """
-        _printable(self.title, field="title")
-        _printable(self.source_id, field="source_id")
-        _printable(self.version, field="version")
+        _require_printable(self.title, field="title")
+        _require_printable(self.source_id, field="source_id")
+        _require_printable(self.version, field="version")
         _aware(self.created_at, field="created_at")
         _aware(self.modified_at, field="modified_at")
         self._validate_canonical_uri()
@@ -242,7 +247,7 @@ class SourceMetadata(BaseModel):
     def _validate_canonical_uri(self) -> None:
         if not self.canonical_uri:
             return
-        _printable(self.canonical_uri, field="canonical_uri")
+        _require_printable(self.canonical_uri, field="canonical_uri")
         parsed = urlsplit(self.canonical_uri)
         scheme = parsed.scheme.lower()
         if scheme not in CITABLE_SCHEMES:
@@ -275,7 +280,8 @@ class SourceMetadata(BaseModel):
             )
             raise ValueError(msg)
         for index, element in enumerate(self.section_path):
-            if not _printable(element, field=f"section_path[{index}]"):
+            _require_printable(element, field=f"section_path[{index}]")
+            if not element.strip():
                 msg = f"section_path[{index}] is empty; a hierarchy has no anonymous levels"
                 raise ValueError(msg)
 
@@ -296,16 +302,6 @@ class SourceMetadata(BaseModel):
             )
             raise ValueError(msg)
         return self
-
-    @property
-    def section_elements(self) -> tuple[str, ...]:
-        """:attr:`section_path`, for the breadcrumb the chunker builds.
-
-        A named accessor rather than the tuple itself because this is the *only* thing that
-        propagates from the document's source record into what an embedder reads, and the chunk
-        does not copy it — see :meth:`manicule.core.content.Document.provenance`.
-        """
-        return self.section_path
 
 
 class LocalSnapshot(BaseModel):
@@ -352,7 +348,7 @@ class LocalSnapshot(BaseModel):
 
     @model_validator(mode="after")
     def _validated(self) -> Self:
-        _printable(self.path, field="snapshot path")
+        _require_printable(self.path, field="snapshot path")
         _aware(self.retrieved_at, field="retrieved_at")
         return self
 

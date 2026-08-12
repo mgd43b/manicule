@@ -485,13 +485,17 @@ class StructuralChunker:
     def _render(self, document: Document, groups: Sequence[Sequence[_Unit]]) -> list[Chunk]:
         chunks: list[Chunk] = []
         previous: Sequence[_Unit] | None = None
+        # Resolved once per document rather than once per chunk. It is a fact about the document,
+        # and reading it validates the stored source record — so inside the loop a document of two
+        # hundred chunks paid for two hundred identical validations of one JSON blob.
+        hierarchy = _source_hierarchy(document)
         for position, group in enumerate(groups):
             text = BLOCK_SEPARATOR.join(unit.text for unit in group)
             overlap = self._overlap_from(previous, group)
             if overlap.text:
                 text = f"{overlap.text}{BLOCK_SEPARATOR}{text}"
             heading_path = group[0].heading_path
-            crumb = self._breadcrumb(document, heading_path)
+            crumb = self._breadcrumb(document, hierarchy, heading_path)
             embed_text = f"{crumb}{BLOCK_SEPARATOR}{text}" if crumb else text
             # The overlap window extends the anchor with it (docs/parsing.md §4.3). A chunk
             # that opens with the previous chunk's last sentences and names only its own lines
@@ -580,10 +584,13 @@ class StructuralChunker:
                 break
         return _Overlap(" ".join(taken), tuple(used))
 
-    def _breadcrumb(self, document: Document, heading_path: Sequence[str]) -> str:
+    def _breadcrumb(
+        self, document: Document, hierarchy: Sequence[str], heading_path: Sequence[str]
+    ) -> str:
+        """One chunk's breadcrumb. ``hierarchy`` is the document's, resolved by the caller once."""
         parts = breadcrumb.elements(
             _string_list(document.metadata.get("breadcrumb_prefix")) or (),
-            _source_hierarchy(document),
+            hierarchy,
             (document.title,),
             heading_path,
         )
@@ -611,7 +618,7 @@ def _source_hierarchy(document: Document) -> tuple[str, ...]:
     """
     record = document.provenance
     if record is not None and record.source is not None and record.source.section_path:
-        return record.source.section_elements
+        return record.source.section_path
     return tuple(_string_list(document.metadata.get("ancestors")) or ())
 
 
