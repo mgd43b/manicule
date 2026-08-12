@@ -899,8 +899,10 @@ class ApplicationService:
                     if documents == 0
                     else f"{documents} document(s) but no recorded fingerprints"
                 ),
+                # No remedy. "Documents but no fingerprints" is a state whose repair depends on
+                # how it was reached, and a `remedy` naming a command with a `<path>` in it is
+                # neither runnable by a script nor certain to be the right advice.
                 facts={"documents": documents, "vector_table": None},
-                remedy="" if documents == 0 else "manicule index <path> --reindex",
             )
         return r.Check(
             name="index",
@@ -2874,7 +2876,9 @@ def _weights_check(plan: WeightsPlan | None) -> r.Check:
                 "the embeddings extra is not installed, so there is no backend here to have "
                 "weights. Install `manicule[embeddings]`."
             ),
-            remedy="pip install 'manicule[embeddings]'",
+            # The idiom this project documents (README, "Install"). `pip install` would be
+            # advice for a distribution nobody installs that way — this is a checkout and uv.
+            remedy="uv sync --all-extras",
         )
     if plan.present:
         return r.Check(

@@ -282,8 +282,10 @@ Checks: `configuration`, `transport`, `plugins`, `storage`, `permissions`, `inde
 **`name` is the stable identifier.** It is what a monitor selects on, so it is chosen once and
 does not move with the wording. `detail` is the sentence a person reads and is free to be
 reworded; `facts` is the same finding as data, so that nobody has to recover a number by
-parsing English; `remedy` is the suggested fix as a command, empty on a healthy check and on
-one whose fix is not a command.
+parsing English; `remedy` is what to do about it — a command where there is one, otherwise the
+shortest actionable instruction. `remedy` is empty on a healthy check, and on one whose repair
+depends on how the state was reached rather than on a step that can be named: an empty `remedy`
+means manicule has nothing specific to suggest, never that the check is fine.
 
 **These four states are the only status vocabulary manicule has**, and `--json` reports exactly
 the words the terminal prints. A contract spelling its statuses differently from the human

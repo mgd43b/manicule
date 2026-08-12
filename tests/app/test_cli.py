@@ -762,7 +762,17 @@ def _called_names(node: ast.AST) -> set[str]:
 
 
 def _call_graph() -> dict[str, set[str]]:
-    """Every function the command line defines, and the bare names each one calls."""
+    """Every function the command line defines, and the bare names each one calls.
+
+    One flat namespace across the package, deliberately. A call is a bare name resolved through
+    an import — ``main.py`` names ``serve_forever``, which ``serving.py`` defines — so
+    qualifying by module would break the cross-module hop this graph exists to follow.
+
+    The cost is that two modules defining the same function name would be merged, and a
+    non-emitting one would inherit its namesake's verdict. That is a false *positive*: it can
+    only make a command look like it emits data, which is the direction that adds an assertion
+    rather than dropping one. There are no such collisions today.
+    """
     package = Path(cli.__file__).parent
     graph: dict[str, set[str]] = {}
     for module in sorted(package.rglob("*.py")):

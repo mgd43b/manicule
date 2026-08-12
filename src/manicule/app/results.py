@@ -760,8 +760,9 @@ class Check(Payload):
     )
     remedy: str = Field(
         default="",
-        description="What to do about it, when there is something specific to do. Empty on a "
-        "healthy check and on one whose fix is not a command.",
+        description="What to do about it — a command where there is one, otherwise the "
+        "shortest actionable instruction. Empty on a healthy check, and on one whose repair "
+        "depends on how the state was reached rather than on a step that can be named.",
     )
 
 
