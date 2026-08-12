@@ -1,0 +1,34 @@
+{#
+  A page that is not here, as a page rather than as a JSON envelope.
+
+  Standalone, and for the same reason `refused.html` is: this renders before anything has
+  decided whether the reader may see this workspace, so it must not carry the navigation. A
+  listing of the eleven areas is a description of what this installation holds, and a request
+  that reached a 404 has not established that it is allowed one.
+
+  So the only route back is `/ui` itself, which is where an unauthorised reader would be
+  refused properly by the page they land on.
+#}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{{ title }} · manicule</title>
+<link rel="stylesheet" href="{{ stylesheet }}">
+</head>
+<body class="bare">
+<main id="main">
+  <h1>{{ status }} · {{ title }}</h1>
+  <div class="panel bad">
+    <p class="message">There is no page at this address.</p>
+    <p class="hint">
+      The browser surface reads; it never creates. If you followed a link from inside manicule
+      rather than typing this, that is a defect worth reporting.
+    </p>
+    <p class="muted">{{ path }}</p>
+  </div>
+  <p><a class="ghost" href="/ui">Back to the dashboard</a></p>
+</main>
+</body>
+</html>

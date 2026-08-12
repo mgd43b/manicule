@@ -261,11 +261,30 @@ async def search(
     service: Service,
     caller: Reader,
     *,
-    q: Annotated[str, Query(min_length=1)],
+    q: Annotated[str, Query()] = "",
     limit: Annotated[int, Query(ge=1, le=100)] = 10,
     profile: Annotated[str | None, Query()] = None,
 ) -> HTMLResponse:
-    """The cheap half of ``ask``: ranked passages, each with the score every stage gave it."""
+    """The cheap half of ``ask``: ranked passages, each with the score every stage gave it.
+
+    **An absent or blank query is a page, not an error.** The frame's search box carries no
+    ``required`` attribute and submits on Enter, so ``GET /ui/search?q=`` is one keystroke away
+    from every page on this surface; and ``/ui/search`` with no query at all is what a bookmark
+    or a typed URL produces. Rejecting either at validation returned the raw JSON envelope —
+    with a traceback frame naming this file's path on the server — into a browser window, which
+    is both a dead end for the reader and an unnecessary disclosure. Blank renders the form with
+    nothing under it instead, which is the state the page is *for* before a query is typed.
+    """
+    if not q.strip():
+        return render(
+            "search.html",
+            area="documents",
+            title="Search",
+            service=service,
+            caller=caller,
+            panels={},
+            extra={"query": "", "profile": profile or ""},
+        )
     return render(
         "search.html",
         area="documents",

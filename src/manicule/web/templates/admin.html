@@ -57,7 +57,7 @@
           <td>{{ row.query }}</td>
           <td>{{ row.profile }}</td>
           <td>{{ row.chunks }}</td>
-          <td>{{ row.confidence if row.confidence is not none else '—' }}</td>
+          <td>{{ "%.2f" | format(row.confidence) if row.confidence is not none else '—' }}</td>
           <td>{{ row.elapsed_ms if row.elapsed_ms is not none else '—' }}</td>
         </tr>
         {% endfor %}

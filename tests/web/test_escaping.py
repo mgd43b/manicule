@@ -44,14 +44,29 @@ PLANTED: tuple[tuple[str, tuple[str, ...]], ...] = (
             "/ui/documents/{document}",
             f"/ui/chat/{CONVERSATION}",
             f"/ui/shared/{SHARE_TOKEN}",
+            # Both of these render a document title and neither was listed here. The fixture
+            # left the retriever with no candidates and the trash empty, so both pages rendered
+            # their *empty* branch — `Nothing matched` and `The trash is empty` — and the
+            # markup they would have shown was never produced by any test. A title is whatever
+            # was in the file that got indexed, which makes these the two cheapest routes to
+            # attacker-controlled text on this surface.
+            "/ui/search?q=retry",
+            "/ui/documents/trash",
         ),
     ),
     (
         "heading",
-        ("/ui/documents/{document}", f"/ui/chat/{CONVERSATION}", f"/ui/shared/{SHARE_TOKEN}"),
+        (
+            "/ui/documents/{document}",
+            f"/ui/chat/{CONVERSATION}",
+            f"/ui/shared/{SHARE_TOKEN}",
+            "/ui/search?q=retry",
+        ),
     ),
     ("answer", (f"/ui/chat/{CONVERSATION}", f"/ui/shared/{SHARE_TOKEN}")),
-    ("quote", ("/ui/documents/{document}", f"/ui/chat/{CONVERSATION}")),
+    # The passage text a search hit shows is the chunk's own bytes, which is the same string
+    # the citation quote carries.
+    ("quote", ("/ui/documents/{document}", f"/ui/chat/{CONVERSATION}", "/ui/search?q=retry")),
 )
 
 SENTINELS = ("window.__title", "window.__heading", "window.__answer", "window.__quote")
@@ -118,8 +133,13 @@ def test_the_environment_escapes_and_refuses_undefined_names() -> None:
     assert rendering.ENVIRONMENT.undefined.__name__ == "StrictUndefined"
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["/ui/documents/{document}", "/ui/search?q=retry", "/ui/documents/trash"],
+    ids=["document", "search hit", "trash entry"],
+)
 def test_switching_the_escaping_off_lets_the_markup_through(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, path: str
 ) -> None:
     """The evidence that the assertions above are load-bearing.
 
@@ -130,6 +150,12 @@ def test_switching_the_escaping_off_lets_the_markup_through(
     Deliberately a monkeypatched environment rather than a switch on
     :func:`~manicule.web.rendering.build_environment`. An off-switch that ships is an off-switch
     somebody can reach; this one exists only for the length of this test.
+
+    **Parametrised over the two pages that were added to** :data:`PLANTED`. Proving the control
+    on one page and then trusting it for two more that render through different templates is
+    exactly the assumption that left those two untested in the first place — a page whose
+    fixture gives it nothing to render also carries no raw markup with the escaping off, and
+    would look identical to a page that escaped correctly.
     """
     unsafe = Environment(
         loader=rendering.ENVIRONMENT.loader,
@@ -141,10 +167,10 @@ def test_switching_the_escaping_off_lets_the_markup_through(
     monkeypatch.setattr(rendering, "ENVIRONMENT", unsafe)
     backend, document = backend_with_hostile_text()
     with client_for(backend) as client:
-        body = client.get(f"/ui/documents/{document.id}").text
+        body = client.get(path.format(document=document.id)).text
     assert MARKUP["title"] in body, (
-        "the escaping was switched off and the page *still* did not carry raw markup, so the "
-        "tests above are not testing the escaping. Find out what else is stripping it before "
-        "trusting them."
+        f"the escaping was switched off and {path} *still* did not carry raw markup, so the "
+        "assertions above are not testing the escaping on this page. Find out what else is "
+        "stripping it — or whether the fixture leaves this page with nothing to render."
     )
     assert "<script>" in body

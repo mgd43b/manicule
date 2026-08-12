@@ -66,15 +66,18 @@ def application(
     host: str | None = None,
     port: int | None = None,
     allow_public: bool = False,
+    web: bool = True,
 ) -> tuple[FastAPI, ServerAddress]:
     """The application and the address it is about to be served on.
 
     The bind is resolved **first** and handed to :func:`~manicule.api.app.build_app`, so the
     "unauthenticated surface on a routable address" refusal sees the address that was actually
     decided rather than the one configuration happens to hold.
+
+    ``web`` is passed straight through: ``--no-web`` has to reach the mount to mean anything.
     """
     bind, address = address_for(service, host=host, port=port, allow_public=allow_public)
-    return build_app(service, bind=bind), address
+    return build_app(service, bind=bind, web=web), address
 
 
 async def serve(
@@ -83,11 +86,12 @@ async def serve(
     host: str | None = None,
     port: int | None = None,
     allow_public: bool = False,
+    web: bool = True,
 ) -> None:
     """Run the HTTP API until it is stopped."""
     import uvicorn  # noqa: PLC0415 - a server library, imported by the one path that serves
 
-    app, address = application(service, host=host, port=port, allow_public=allow_public)
+    app, address = application(service, host=host, port=port, allow_public=allow_public, web=web)
     if address.port is None:  # pragma: no cover - resolve_bind always decides a port
         from manicule.core.errors import PolicyError  # noqa: PLC0415
 
