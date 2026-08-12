@@ -326,12 +326,21 @@ once the bundle arrives. `doctor` then reports it as **failing** — not degrade
 a missing grammar is, because a corpus of Markdown works fine without a grammar and nothing
 works without a vocabulary.
 
-**Set `TIKTOKEN_CACHE_DIR` on any host you pre-seed.** With nothing set, `tiktoken` caches
-under the system temporary directory, and a temp sweep that removes 5 MB turns a working
-air-gapped install back into a broken one at the next question. The image sets it to
-`/opt/manicule/tiktoken`; a native install wants something equally durable. A read-only
-deployment can point it straight at a bundle's `vocab/` directory, which is laid out as a
-`tiktoken` cache and needs no copy.
+**Where the vocabularies live, and why it is not where `tiktoken` would put them.** With
+nothing set, `tiktoken` caches under the system temporary directory — and a temp sweep that
+removes 5 MB turns a working install into one that refuses every question, weeks later, with
+nothing having changed and nothing having said so. macOS sweeps `$TMPDIR` on a schedule. So
+manicule's default is `$XDG_CACHE_HOME/manicule/data-gym-cache`, which nothing reclaims on a
+timer, and it points `TIKTOKEN_CACHE_DIR` at that directory for the duration of every call
+that reads or writes the cache — because `tiktoken` is the reader, and a manicule that merely
+*answered* differently would seed one directory and leave the library looking in another.
+
+**`TIKTOKEN_CACHE_DIR` still wins wherever it is set**, and remains how a deployment moves the
+cache: the image sets it to `/opt/manicule/tiktoken`, and a read-only deployment can point it
+straight at a bundle's `vocab/` directory, which is laid out as a `tiktoken` cache and needs no
+copy. `manicule doctor` reports the cache as **degraded** when it resolves to somewhere under
+the system temporary directory — which, after this default, takes somebody having put it
+there.
 
 manicule does not redistribute these files and will not: OpenAI publishes them with no SPDX
 licence expression, so manicule cannot state the terms under which it would be handing them

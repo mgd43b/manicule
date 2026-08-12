@@ -848,3 +848,45 @@ def test_a_run_that_failed_says_how_to_resume_rather_than_what_to_do_next(
     out = _ingest_output(capsys, ingested=4, error="the connector stopped")
     assert "running it again resumes" in out
     assert "next:" not in out
+
+
+def _address_output(capsys: pytest.CaptureFixture[str], *, transport: str, stopped: bool) -> str:
+    render.render_address(
+        render.console(),
+        r.ServerAddress(transport=transport, host="127.0.0.1", port=8765, tools=19),
+        stopped=stopped,
+    )
+    return " ".join(capsys.readouterr().out.split())
+
+
+def test_stopping_a_server_does_not_read_like_starting_one(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An address reads the same whichever direction the server was going; the op does not.
+
+    `manicule stop` printed the start banner — the bind line and then the URL of a browser
+    surface that had just gone away.
+    """
+    out = _address_output(capsys, transport=render.API_TRANSPORT, stopped=True)
+
+    assert "stopped the HTTP API" in out
+    assert "/ui" not in out
+    assert "API documentation" not in out
+
+
+def test_stopping_an_mcp_server_says_which_kind_it_was(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out = _address_output(capsys, transport="http", stopped=True)
+
+    assert "stopped the MCP server" in out
+
+
+def test_starting_still_announces_where_it_is_listening(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The banner the `stopped` branch must not have taken away."""
+    out = _address_output(capsys, transport=render.API_TRANSPORT, stopped=False)
+
+    assert "HTTP API on http://127.0.0.1:8765" in out
+    assert "API documentation" in out

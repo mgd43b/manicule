@@ -116,6 +116,7 @@ def render_answer(
         facts.append("personal data was redacted before sending")
     facts.append(f"{payload.elapsed_ms} ms")
     out.print(f"[dim]{' · '.join(facts)}[/dim]")
+    _render_confidence_reason(out, payload.confidence_band, payload.confidence_reason)
 
 
 def render_search(out: Console, payload: r.SearchResult) -> None:
@@ -168,9 +169,8 @@ def _render_confidence_reason(out: Console, band: str | None, reason: str | None
     three plausible-looking excerpts in the other. The band gates it because a reason nobody
     needed, printed every time, is how a reader learns to skip the last line.
 
-    ``ask`` still shows a band with no reason: ``AnswerResultPayload`` has no
-    ``confidence_reason`` to render, and inventing one here would mean a renderer deciding
-    something the service did not say.
+    Both commands now, which is the point: the number is the same judgement whether it is
+    printed under passages or under an answer, and it was legible in one place only.
     """
     if reason and band in UNCONVINCED_BANDS:
         out.print(f"[yellow]{escape(reason)}[/yellow]")
@@ -478,7 +478,9 @@ the two strings agree so the mirror cannot drift.
 """
 
 
-def render_address(out: Console, payload: r.ServerAddress, *, web: bool | None = None) -> None:
+def render_address(
+    out: Console, payload: r.ServerAddress, *, web: bool | None = None, stopped: bool = False
+) -> None:
     """Where the server is listening, and which surface is on it.
 
     **Which surface is read off the transport, not passed in.** The MCP server records
@@ -492,7 +494,17 @@ def render_address(out: Console, payload: r.ServerAddress, *, web: bool | None =
     ``web`` is the one fact the payload cannot carry, because ``--no-web`` is not recorded
     anywhere. ``None`` means nobody said — which is the honest answer for ``stop``, reading a
     pid file written by a process whose flags it never saw — and prints no claim either way.
+
+    ``stopped`` is the other thing the payload cannot carry: it describes an address, and an
+    address reads the same whether a server has just arrived at it or just left it. Without
+    this, ``manicule stop`` printed a start banner — "HTTP API on http://127.0.0.1:8765 (this
+    machine only)", then the URLs of a browser surface that is no longer there.
     """
+    if stopped:
+        where = "stdio" if payload.transport == "stdio" else f"http://{payload.host}:{payload.port}"
+        what = "the HTTP API" if payload.transport == API_TRANSPORT else "the MCP server"
+        out.print(f"stopped {what} [dim]that was on {where}[/dim]")
+        return
     if payload.transport == "stdio":
         out.print(f"MCP server on stdio, {payload.tools} tool(s). [dim]No socket is open.[/dim]")
         return

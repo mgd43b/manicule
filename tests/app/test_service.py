@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import huggingface_hub
 import pytest
 
+from manicule import vocabularies
 from manicule.app.results import CheckState
 from manicule.app.service import ApplicationService, hardware
 from manicule.config.settings import Settings, config_file
@@ -112,6 +114,26 @@ async def test_an_answer_reports_the_confidence_band_as_well_as_the_score(
     assert answered.confidence == 0.5
     assert answered.confidence_band == "medium"
     assert answered.text
+
+
+async def test_an_answer_carries_the_reason_for_its_confidence_as_a_search_does(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The same judgement, from the same object, and it reached only one of the two commands.
+
+    ``search`` has printed the reason since retrieval learned to admit ignorance; ``ask`` had
+    the band and not the sentence that makes a small number legible, so an answer over
+    passages the corpus does not really have showed a bare score above prose that reads like
+    an answer.
+    """
+    document = next(iter(backend.store.documents.values()))
+    backend.retriever_.candidates = [Candidate(chunk=make_chunk(document), score=0.9)]
+
+    answered = await service.ask("what is the retry policy")
+    found = await service.search("what is the retry policy")
+
+    assert answered.confidence_reason == found.confidence_reason
+    assert answered.confidence_reason
 
 
 async def test_streaming_and_collecting_produce_the_same_answer(
@@ -1121,3 +1143,50 @@ async def test_doctor_never_downloads_a_model_to_report_on_one(
     assert any(check.name == "models" for check in diagnosis.checks)
     assert calls, "the models check answered without consulting the cache at all"
     assert all(calls), "the cache probe was allowed to reach the hub"
+
+
+# --- a cache the operating system will take back ---------------------------------------------
+
+
+async def test_doctor_will_not_call_an_impermanent_vocabulary_cache_healthy(
+    backend: FakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Everything is present, everything works, and it will stop working with no warning.
+
+    ``ok`` here would be a check reporting health about a machine one temp sweep away from
+    refusing every question — a check whose name outruns what it verifies. It says so instead,
+    and names the variable that fixes it.
+    """
+    swept = Path(tempfile.gettempdir()) / "swept-away"
+    monkeypatch.setenv(vocabularies.CACHE_DIR_ENV, str(swept))
+
+    def nothing_missing(_encodings: Sequence[str]) -> tuple[str, ...]:
+        return ()
+
+    monkeypatch.setattr(vocabularies, "missing_vocabularies", nothing_missing)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vocabularies")
+
+    assert check.state == "degraded"
+    assert vocabularies.CACHE_DIR_ENV in check.detail
+    assert "reclaimed" in check.detail
+
+
+async def test_doctor_is_quiet_about_a_vocabulary_cache_that_will_survive(
+    backend: FakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The steady state, which must stay ``ok`` or the warning above teaches nothing."""
+    durable = tmp_path.anchor + "durable-vocabularies"
+    monkeypatch.setenv(vocabularies.CACHE_DIR_ENV, durable)
+
+    def nothing_missing(_encodings: Sequence[str]) -> tuple[str, ...]:
+        return ()
+
+    monkeypatch.setattr(vocabularies, "missing_vocabularies", nothing_missing)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vocabularies")
+
+    assert check.state == "ok"
+    assert "reclaimed" not in check.detail

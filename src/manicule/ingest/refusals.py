@@ -88,10 +88,42 @@ async def check_before_run(
         if held is not None:
             await _refuse_embed_mismatch(held, embed, store)
 
-    committed = IndexFingerprints(embed=embed, chunk=chunk, vector_table=stored.vector_table)
+    committed = IndexFingerprints(
+        embed=embed, chunk=chunk, vector_table=_vector_table(embed, vectors)
+    )
     if stored != committed:
         await store.record_index_fingerprints(committed)
     return committed
+
+
+def _vector_table(embed: EmbedFingerprint, vectors: VectorStore | None) -> str | None:
+    """Which table this index's vectors are in, for ``index_state.vector_table``.
+
+    ``docs/storage.md`` §6.5 says a first ingest "creates ``chunks__<fp8>`` … and sets
+    ``index_state.vector_table`` in the same SQLite transaction that records the fingerprint".
+    Nothing did. The caller carried ``stored.vector_table`` forward, which is ``NULL`` on a
+    first ingest and therefore ``NULL`` for ever: the column shipped, the backup manifest
+    carried it, the retrieval trace reported it, and ``doctor`` printed a healthy index as
+    "13 document(s) in no vector table" — with no code path anywhere that had ever written a
+    value into it.
+
+    **Derived through the same function the store names the table with.**
+    ``LanceVectorStore.ensure_ready`` calls ``table_name(fingerprint)``; so does this. Two
+    callers of one function are not two answers to one question, which is what a second naming
+    rule here would have been.
+
+    Returns:
+        The table name, or ``None`` when there is no vector store — because then there is no
+        table, and recording a name for one would be describing something that does not exist.
+        A previously stored name is deliberately not preferred over this: it can only disagree
+        when the embedding fingerprint changed, and the refusals above have already stopped
+        that from reaching here.
+    """
+    if vectors is None:
+        return None
+    from manicule.storage.vectors import table_name  # noqa: PLC0415 - a storage extra
+
+    return table_name(embed)
 
 
 def require_measured(chunk: ChunkFingerprint) -> None:

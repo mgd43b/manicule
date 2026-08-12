@@ -18,6 +18,7 @@ from manicule.ingest.refusals import (
     require_coherent,
     require_measured,
 )
+from manicule.storage.vectors import table_name
 from tests.ingest import fakes
 
 
@@ -194,3 +195,32 @@ def _chunks() -> list[Chunk]:
     from tests.fakes import make_chunks, make_document  # noqa: PLC0415
 
     return make_chunks(make_document(), count=2)
+
+
+# --- the pointer `doctor` prints ---------------------------------------------------------------
+
+
+async def test_a_first_ingest_records_which_table_its_vectors_are_in() -> None:
+    """``docs/storage.md`` §6.5 promised this and nothing did it.
+
+    The column shipped, the backup manifest carried it, the retrieval trace reported it, and
+    ``doctor`` printed a healthy index as "N document(s) in no vector table" — because the
+    only assignment carried the stored value forward, and the stored value starts ``NULL``.
+    """
+    store = fakes.MemoryIngestStore()
+
+    committed = await check_before_run(
+        embed=embed(), chunk=chunk(), store=store, vectors=fakes.MemoryVectors()
+    )
+
+    assert committed.vector_table == table_name(embed())
+    assert store.state.vector_table == table_name(embed())
+
+
+async def test_an_index_with_no_vector_store_records_no_table() -> None:
+    """There is no table, and naming one would describe something that does not exist."""
+    store = fakes.MemoryIngestStore()
+
+    committed = await check_before_run(embed=embed(), chunk=chunk(), store=store)
+
+    assert committed.vector_table is None

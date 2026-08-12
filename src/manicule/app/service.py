@@ -73,6 +73,14 @@ A module logger rather than a print or a swallowed exception, so an operator who
 logging sees it and one who has not is not spammed by a library.
 """
 
+_LANGUAGES_NAMED = 6
+"""How many missing grammars ``doctor`` names before it counts the rest.
+
+Named at all because "seed the grammars" without saying which is a fix nobody can check;
+bounded because all twenty-four of them is a paragraph, and the sentence that says what to do
+was being lost inside it.
+"""
+
 DEFAULT_SOURCE = "local"
 """The source name ``index_path`` uses when none is given.
 
@@ -95,6 +103,14 @@ class AskAside:
 
     confidence_band: str | None = None
     """The retrieval's confidence band. Not on the envelope, which carries only the score."""
+
+    confidence_reason: str = ""
+    """Why the band is what it is, in the words retrieval used.
+
+    Carried for the same reason the band is: the envelope has the score and nothing that makes
+    a small score legible. ``search`` has said this since retrieval learned to admit ignorance,
+    and ``ask`` showed the number alone — so the same underlying judgement was explained in one
+    command and bare in the other."""
 
     message_id: str | None = None
     """Where the answer was persisted, when there was a conversation to persist it to."""
@@ -225,6 +241,7 @@ class ApplicationService:
         record = aside if aside is not None else AskAside()
         if confidence is not None:
             record.confidence_band = confidence.band.value
+            record.confidence_reason = confidence.reason
         envelope: AnswerEnvelope | None = None
         try:
             async with answering(answerer, request, result) as events:
@@ -942,13 +959,24 @@ class ApplicationService:
 
         cache = grammars.cache_directory()
         if missing:
+            # The action first, then the detail, and the offline-bundle paragraph only when a
+            # bundle is actually installed. On a fresh machine this fired with the fix buried
+            # mid-sentence between all twenty-four language names and three lines about
+            # building a bundle on another host — advice for an air-gapped operator, shown to
+            # everyone who had simply not run `init` yet. A host with no route to anything
+            # reaches the *failing* branch above, whose message carries the search path.
+            over = len(missing) - _LANGUAGES_NAMED
+            named = ", ".join(missing[:_LANGUAGES_NAMED]) + (
+                f" and {over} more" if over > 0 else ""
+            )
+            carried = f" — {offline}" if located is not None else ""
             return r.Check(
                 name="grammars",
                 state="degraded",
                 detail=(
-                    f"no grammar for {list(missing)} in {cache}, so documents in those "
-                    f"languages are refused rather than line-split. Run `manicule doctor "
-                    f"--fix` to seed them — {offline}"
+                    f"run `manicule doctor --fix` to seed {len(missing)} missing grammar(s) "
+                    f"into {cache}: {named}. Until then a document in one of those languages "
+                    f"is refused rather than line-split{carried}"
                 ),
             )
         settled = f"seeded {list(seeded)}; " if seeded else ""
@@ -1056,14 +1084,28 @@ class ApplicationService:
             )
         settled = f"seeded {list(seeded)}; " if seeded else ""
         carried = f"; {offline}" if offline else ""
-        return r.Check(
-            name="vocabularies",
-            state="ok",
-            detail=(
-                f"{settled}{len(wanted)} vocabulary(ies) {list(wanted)} in {cache} "
-                f"(tiktoken {vocabularies.tiktoken_version()}){carried}"
-            ),
+        here = (
+            f"{settled}{len(wanted)} vocabulary(ies) {list(wanted)} in {cache} "
+            f"(tiktoken {vocabularies.tiktoken_version()})"
         )
+        # Present, and in a directory the operating system reclaims. `ok` there would be a
+        # check reporting health about a machine that will refuse every question the week
+        # after a temp sweep, with nothing having changed and nothing having said so — a check
+        # whose name outruns what it verifies. Degraded rather than failing: it works today,
+        # and the remedy is a setting rather than a repair.
+        if vocabularies.is_impermanent(cache):
+            return r.Check(
+                name="vocabularies",
+                state="degraded",
+                detail=(
+                    f"{here}, which is under the system temporary directory and is reclaimed "
+                    f"on a schedule. Everything works until it is swept, and then every "
+                    f"search refuses. Point {vocabularies.CACHE_DIR_ENV} at a durable "
+                    f"directory — with it unset manicule uses "
+                    f"{vocabularies.default_cache_directory()}{carried}"
+                ),
+            )
+        return r.Check(name="vocabularies", state="ok", detail=f"{here}{carried}")
 
     async def _model_check(self, *, provider: str | None = None) -> r.Check:
         """Whether the embedding weights are on this machine, and what it costs if not.
@@ -2459,6 +2501,7 @@ class ApplicationService:
             dropped=len(envelope.dropped),
             confidence=envelope.confidence,
             confidence_band=aside.confidence_band,
+            confidence_reason=aside.confidence_reason,
             corpus_consulted=envelope.corpus_consulted,
             ungrounded=envelope.ungrounded,
             context_truncated=envelope.context_truncated,

@@ -466,9 +466,33 @@ async def test_doctor_reports_a_missing_grammar_the_way_missing_grammars_claims_
     check = next(check for check in diagnosis.checks if check.name == "grammars")
 
     assert check.state == "degraded"
-    assert "python" in check.detail
     assert grammars.PRESEED_COMMAND in check.detail
     assert str(tmp_path / "cache") in check.detail, "the configured cache is not what was checked"
+    # Every declared language is missing here, and naming all twenty-four is the paragraph
+    # that used to bury the fix. The count is the claim; a sample of the names makes it
+    # checkable, and `_a_short_list_is_named_in_full` below covers the case where the whole
+    # set fits.
+    assert f"{len(grammars.DECLARED_LANGUAGES)} missing grammar(s)" in check.detail
+    assert "and 18 more" in check.detail
+
+
+async def test_doctor_names_a_short_list_of_missing_grammars_in_full(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Counting is for the paragraph case. Two missing grammars are two names."""
+    service = _service_over_an_empty_cache(tmp_path / "cache")
+    monkeypatch.setattr(grammars, "prefetch", _must_not_fetch)
+
+    def two_missing(_languages: Sequence[str]) -> tuple[str, ...]:
+        return ("python", "rust")
+
+    monkeypatch.setattr(grammars, "missing_grammars", two_missing)
+
+    diagnosis = await service.doctor()
+    check = next(check for check in diagnosis.checks if check.name == "grammars")
+
+    assert "python, rust" in check.detail
+    assert "more" not in check.detail
 
 
 def _must_not_fetch(languages: Sequence[str], **_: object) -> tuple[str, ...]:
