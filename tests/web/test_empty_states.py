@@ -92,6 +92,57 @@ def test_scores_are_not_rendered_at_full_float_precision() -> None:
     )
 
 
+def test_a_page_that_is_not_there_is_a_page_and_still_a_404() -> None:
+    """A mistyped ``/ui`` URL answered ``{"detail":"Not Found"}`` in a browser window."""
+    backend, _ = backend_with_a_document()
+    response = client_for(backend).get("/ui/nonexistent-page", headers={"accept": "text/html"})
+    assert response.status_code == NOT_FOUND, (
+        "a page that is not there must say so to the client too, not answer 200 with an apology"
+    )
+    assert "text/html" in response.headers["content-type"]
+    assert "There is no page at this address" in response.text
+    assert "/ui" in response.text, "the page offers no route back"
+
+
+@pytest.mark.parametrize(
+    ("path", "accept"),
+    [
+        ("/api/v1/nope", "application/json"),
+        # The surface's own script sends this. It parses envelopes, not pages.
+        ("/ui/nope", "application/json"),
+    ],
+    ids=["the JSON API", "a fetch() from the browser surface"],
+)
+def test_only_a_browser_navigation_gets_the_page(path: str, accept: str) -> None:
+    """Everything that is not a browser looking at ``/ui`` keeps the envelope it had."""
+    backend, _ = backend_with_a_document()
+    response = client_for(backend).get(path, headers={"accept": accept})
+    assert response.status_code == NOT_FOUND
+    assert response.json() == {"detail": "Not Found"}, (
+        "a 404 outside the browser surface changed shape; a program parsing it would break"
+    )
+
+
+def test_rendering_the_404_as_a_page_did_not_make_anything_exist() -> None:
+    """The absence assertions still mean *absent*, not *wrong method*.
+
+    This is the trap a catch-all ``GET /ui/{rest:path}`` route would have sprung. It would make
+    every path under ``/ui`` match something, so ``POST /ui/index`` would answer 405 rather than
+    404 — and ``tests/web/test_boundaries.py`` accepts either, so it would have gone on passing
+    for the new and worthless reason that everything under ``/ui`` exists.
+
+    An exception handler changes no routing, and this asserts that: the two paths that have no
+    page at all must still resolve to nothing, by status code.
+    """
+    backend, _ = backend_with_a_document()
+    client = client_for(backend)
+    for path in ("/ui/index", "/ui/config"):
+        assert client.post(path).status_code == NOT_FOUND, (
+            f"POST {path} stopped answering 404. Something now matches that path, so "
+            "`test_the_browser_surface_adds_no_write_route` no longer means what it says."
+        )
+
+
 def test_a_missing_document_offers_a_way_back() -> None:
     """The refusal page is where a reader is most likely to be stuck.
 

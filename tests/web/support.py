@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from manicule.core.anchors import HeadingAnchor
 from manicule.core.content import BlockKind
+from manicule.core.retrieval import Candidate
 from manicule.generation.answers import Citation, Verification
 from manicule.generation.history import Turn
 from manicule.generation.sharing import hash_token
@@ -73,20 +74,35 @@ def _hostile_citation(document: Document) -> Citation:
 
 
 def backend_with_hostile_text() -> tuple[FakeBackend, Document]:
-    """A backend whose one document, one conversation and one share link are all hostile.
+    """A backend whose document, conversation, share link, search hits and trash are hostile.
 
     The document is indexed with markup in its title and in its chunk's heading path; a
     conversation holds an answer with markup in the body and a citation with markup in its
     label and quote; and that conversation is shared, so the anonymous page renders the same
     citation through the redaction rather than through a second path.
+
+    **The retrieval candidate and the trash entry are seeded here deliberately.** Without them
+    the fake retriever returns nothing and the trash is empty, so ``/ui/search`` renders *no
+    hits* and ``/ui/documents/trash`` renders *the trash is empty* — and every assertion about
+    those two pages walks past the markup it means to check. Both render a **document title**,
+    which is the field an attacker controls by naming a file, so leaving them on their empty
+    branch left the two cheapest routes to a title on this surface unexercised.
     """
     backend, document = backend_with_a_document()
     hostile = make_document(
         backend.settings.workspace, source_id="hostile.md", title=MARKUP["title"]
     )
-    chunk = make_chunk(hostile, text=MARKUP["quote"])
-    backend.store.add(hostile, chunk.model_copy(update={"heading_path": (MARKUP["heading"],)}))
+    chunk = make_chunk(hostile, text=MARKUP["quote"]).model_copy(
+        update={"heading_path": (MARKUP["heading"],)}
+    )
+    backend.store.add(hostile, chunk)
     backend.organisation_.documents[hostile.id] = hostile
+
+    # What `/ui/search` ranks. The same chunk the store holds, so the hit's title, heading path
+    # and text are the hostile document's own rather than a second fixture that could drift.
+    backend.retriever_.candidates = [Candidate(chunk=chunk, score=0.5)]
+    # What `/ui/documents/trash` lists.
+    backend.organisation_.trash[hostile.id] = hostile
 
     turn = Turn(role="assistant", content=MARKUP["answer"], citations=(_hostile_citation(hostile),))
     backend.conversations_.seed(CONVERSATION, Turn(role="user", content="what happens"), turn)

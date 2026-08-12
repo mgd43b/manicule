@@ -34,12 +34,14 @@ on another origin can spend on the user's behalf.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from manicule.api.envelopes import AUTH_ERRORS, malformed, refusal
 from manicule.api.origins import FETCH_SITE, ORIGIN, REFUSAL, permitted
@@ -62,6 +64,8 @@ from manicule.app.bind import is_loopback
 from manicule.config.settings import AuthMode
 from manicule.core.errors import PolicyError
 from manicule.core.version import CORE_VERSION
+
+NOT_FOUND = 404
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -158,7 +162,12 @@ def build_app(
     # `manicule.api` and `manicule.web` import each other — and which one won would depend on
     # which a caller reached for first.
     from manicule.web.pages import router as web_router  # noqa: PLC0415
-    from manicule.web.security import PageRefusedError, refused_page  # noqa: PLC0415
+    from manicule.web.security import (  # noqa: PLC0415
+        PageRefusedError,
+        is_page_request,
+        not_found_page,
+        refused_page,
+    )
 
     settings = service.settings
     _require_auth_for_wide_bind(service, bind)
@@ -238,6 +247,19 @@ def build_app(
     # `manicule.web` because an exception handler belongs to the application, and there is one
     # application.
     app.add_exception_handler(PageRefusedError, refused_page)
+
+    async def missing(request: Request, exc: Exception) -> Response:
+        """A 404 under ``/ui`` is a page; everywhere else it stays the framework's envelope.
+
+        Registered only when the browser surface is mounted — with ``--no-web`` there is no
+        browser surface, so a ``/ui`` path is as absent as any other and says so in JSON.
+        """
+        if is_page_request(request):
+            return not_found_page(request, exc)
+        return await http_exception_handler(request, cast("StarletteHTTPException", exc))
+
+    if web:
+        app.add_exception_handler(NOT_FOUND, missing)
 
     routers = [
         health_routes.router,
