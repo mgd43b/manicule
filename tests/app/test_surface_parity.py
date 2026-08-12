@@ -133,6 +133,37 @@ def test_the_command_line_offers_exactly_nineteen_commands() -> None:
     assert len(names) == 19
 
 
+def test_only_the_command_line_can_ask_doctor_to_repair_anything(
+    service: ApplicationService,
+) -> None:
+    """Parity is about the same call producing the same answer, not about every surface being
+    able to do everything — and this is the one asymmetry, deliberately.
+
+    ``doctor --fix`` seeds the declared code grammars: it writes to the machine and may fetch
+    from the network. That is a thing an operator asks for. An assistant holding a tool call and
+    an authenticated HTTP client both reach ``doctor`` as a *report*, and a health endpoint that
+    could be made to start an 80 MB download by adding a query parameter is a health endpoint
+    with a side effect nobody asked for. So the argument exists on the service and is passed by
+    exactly one surface.
+    """
+    import inspect  # noqa: PLC0415 - only this assertion reads a signature
+
+    import typer.main  # noqa: PLC0415 - only this assertion needs the click tree
+
+    from manicule.api.routes import health  # noqa: PLC0415 - keeps FastAPI out of the CLI path
+
+    assert "fix" in inspect.signature(service.doctor).parameters
+
+    offered = asyncio.run(build_server(service).list_tools())
+    tool = next(tool for tool in offered if tool.name == "doctor")
+    assert "fix" not in tool.parameters.get("properties", {})
+    assert "fix" not in inspect.signature(health.health).parameters
+
+    commands: dict[str, object] = getattr(typer.main.get_command(cli.app), "commands", {})
+    params: list[object] = getattr(commands["doctor"], "params", [])
+    assert "--fix" in {str(opt) for parameter in params for opt in getattr(parameter, "opts", [])}
+
+
 def test_every_tool_describes_itself_and_its_arguments(service: ApplicationService) -> None:
     """A tool with no description is a tool nothing knows when to call.
 

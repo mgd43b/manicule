@@ -39,7 +39,14 @@ _HINTS: dict[type[Exception], str] = {
         "Nothing installed provides that component. Install the distribution that does, or "
         "run `manicule plugin list` to see what is available."
     ),
-    UnknownEntityError: "Run the matching `list` command to see what this workspace holds.",
+    # True of every entity this error covers, which is not only rows in this workspace: the
+    # same type is raised for a path that does not exist, where "run the matching `list`
+    # command to see what this workspace holds" named an action that does not apply and an
+    # object the caller was not asking about.
+    UnknownEntityError: (
+        "Check the name or path in the message above. The matching `list` command — "
+        "`manicule document list`, `connector list`, `workspace list` — shows what exists."
+    ),
     FingerprintMismatchError: (
         "The index was built by a different chunker or embedder. Re-index, or point at the "
         "data directory that matches this configuration."

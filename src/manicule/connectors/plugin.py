@@ -37,7 +37,11 @@ def build_confluence(context: BuildContext) -> Connector:
 
     The credential is resolved and checked **here**, before construction, because a connector
     that discovers its missing token at the first page of the first sync produces a run that
-    reports progress and indexes nothing.
+    reports progress and indexes nothing. It happens in two steps for two kinds of credential:
+    :func:`~manicule.connectors.config.resolve_credentials` fills a token in from the
+    environment, and :func:`~manicule.connectors.credentials.credential_for` builds the object
+    each request will be made with — which for a browser session means reading the keychain and
+    refusing a session already too old to use.
 
     Raises:
         ConfigError: The context carries configuration of some other type, or the credential
@@ -45,9 +49,13 @@ def build_confluence(context: BuildContext) -> Connector:
             model before calling a factory, so the first case is reachable only by a caller
             building this some other way — and substituting defaults there would build a
             connector whose settings appear to be in force and are not.
+        SessionExpiredError: A browser session was captured for this instance and manicule will
+            not use one that old. A startup refusal on purpose: the answer is a person going to
+            a browser, and hearing that at the first page of a sync wastes the run.
     """
     from manicule.connectors.client import ConfluenceClient  # noqa: PLC0415 - see module docstring
     from manicule.connectors.confluence import ConfluenceConnector  # noqa: PLC0415
+    from manicule.connectors.credentials import credential_for  # noqa: PLC0415
 
     settings = context.config
     if not isinstance(settings, ConfluenceConfig):
@@ -59,7 +67,8 @@ def build_confluence(context: BuildContext) -> Connector:
         )
         raise ConfigError(msg)
     resolved = resolve_credentials(settings)
-    return ConfluenceConnector(resolved, ConfluenceClient(resolved))
+    credential = credential_for(resolved)
+    return ConfluenceConnector(resolved, ConfluenceClient(resolved, credential=credential))
 
 
 def build_filesystem(context: BuildContext) -> Connector:

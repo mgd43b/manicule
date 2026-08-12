@@ -2,27 +2,129 @@
 
 Design for the Confluence connector. Ticket [#9](https://github.com/mgd43b/manicule/issues/9).
 
-OpenDocuments fetches `body.storage` and runs `html.replace(/<[^>]+>/g, ' ')` over it —
-every table, code block and heading collapses into a run of words. This is the subsystem
-with the widest gap between what it should do and what it does.
+The structure of a Confluence page is most of what makes it retrievable, and it is thrown away
+by the obvious implementation: fetch `body.storage`, strip the angle brackets, index the words.
+Every table, code block and heading collapses into one run of prose, and nothing downstream can
+tell that it happened. manicule fetches a typed document tree where one exists and parses the
+markup with a real parser where one does not, so a table stays a table.
 
 ---
 
 ## 1. Auth
 
-| Deployment | Method | Header |
-|---|---|---|
-| Cloud | email + API token | Basic `base64(email:token)` |
-| Cloud (multi-user) | OAuth 2.0 3LO | Bearer |
-| Server / Data Center | Personal Access Token | Bearer |
+Two axes, not one. **Which Confluence this is** (`deployment`) decides how a body is read —
+Atlassian Document Format on Cloud, storage format on Server and Data Center. **What a request
+proves the account with** (`auth`) is a separate question, because a self-hosted instance behind
+an identity provider is Server or Data Center in every respect that touches a body while having
+no personal access token to offer.
 
-Config: base URL, credentials, and an optional space allowlist. Everything is fetched as
-the token's user — see §9.
+| `deployment` | `auth` | Credential | Sent as |
+|---|---|---|---|
+| `cloud` | `api_token` (default) | `email` + API token | `Authorization: Basic base64(email:token)` |
+| `server` | `personal_access_token` (default) | Personal access token | `Authorization: Bearer <token>` |
+| `server` | `browser_session` | Cookies from a signed-in browser | `Cookie: JSESSIONID=…` |
 
-The credential is resolved and checked **before the connector is constructed**: a token
-missing from both configuration and `$CONFLUENCE_API_TOKEN`, or a Cloud token with no email
-beside it, is a startup refusal naming what to set. Discovering it at the first page of the
-first sync produces a run that reports progress and indexes nothing.
+`auth` may be left unset, and then it is the deployment's usual credential — an existing
+configuration keeps working without naming it.
+
+Config: base URL, credentials, and an optional space allowlist. Everything is fetched as the
+credential's user — see §9.
+
+**There is no OAuth 2.0 3LO.** An earlier version of this table listed a "Cloud (multi-user) ·
+OAuth 2.0 3LO · Bearer" row that nothing implemented. 3LO is the multi-user arrangement — a
+registered Atlassian app, a client secret, a redirect URI and a token exchange, so that each
+person's own grant fetches what they may see — and manicule's index is deliberately not
+permission-aware (§9). Building the credential without the index that would justify it would
+buy nothing, so the row is gone rather than half-built. Per-user visibility is
+[#13](https://github.com/mgd43b/manicule/issues/13).
+
+### 1.1 Browser sessions, for an instance behind an identity provider
+
+Self-hosted Confluence fronted by Okta, ADFS, Azure AD or similar commonly has personal access
+tokens disabled by policy, and then the only credential its users can obtain is the session
+their browser already holds. Five decisions carry it.
+
+**manicule never sees the password.** The person signs in to their own browser, against their
+own identity provider, with whatever second factor it demands, and pastes the resulting `Cookie`
+header into `manicule connector login <source>`. No password, no one-time code and no device
+approval passes through manicule — and that is a property of the design rather than a promise
+about the code, because there is no parameter and no code path that could accept one.
+
+**No browser is driven.** A driven Playwright browser would be more ergonomic and its licence
+(Apache-2.0) is compatible, so the objection is not licensing. It is that a driven browser is
+one manicule controls the DOM of, and the person is asked to type a corporate password into it:
+"manicule never sees the password" would become a matter of restraint rather than of capability.
+Two practical arguments run the same way — a driven Chromium is an unfamiliar device to a
+conditional-access policy and is often refused outright, and a browser download is a heavy
+dependency for a paste.
+
+**The session lives in the macOS Keychain.** Not `config.toml`, even at `0600`: a session cookie
+is the sync account's whole identity at that company rather than a scoped grant, and a
+configuration file reaches version control eventually. The configuration model forbids unknown
+keys, so a `session_cookie` written there is a startup error rather than a working setting.
+Nothing lands under `<data_dir>`, so `docs/storage.md` §7.1 and the `doctor` permissions check
+do not come into it. On a machine with no Keychain the fallback is `$CONFLUENCE_SESSION_COOKIE`,
+a per-run credential manicule never writes down.
+
+Two things about the Keychain are worth recording because neither is guessable. Items are
+created with `-T /usr/bin/security`, which is the narrowest grant that still lets an unattended
+sync read them without raising a dialog; `-A`, which would let anything read them silently, is
+not used. And **`security` truncates a secret read from stdin at 128 bytes, silently, reporting
+success** — measured, not assumed. A session record is longer than that and an instance behind
+single sign-on issues cookies of its own besides Confluence's, so the record is written in
+120-byte pieces across numbered items and read back and compared before the capture is called
+done. Passing the secret as a command-line argument would avoid the chunking and put a live
+corporate session into a process listing.
+
+**Capture proves the session before storing it.** A cookie copied short, copied from the wrong
+tab, or copied from a session that had already timed out is indistinguishable from a working one
+until something uses it — and otherwise the first thing to use it would be the first page of the
+next sync. So `connector login` makes one request as the session, reads back who the instance
+says that is, and stores nothing at all if the answer is anybody other than a signed-in user.
+
+**A dead session stops the run; it does not pause it.** Renewal is an out-of-band act — a person
+goes to a browser — so there is no interval a sync could usefully wait, and the cursor it was
+holding would expire first (§2). Stopping leaves the watermark unadvanced, so a re-run after a
+fresh sign-in resumes rather than starting over. `session_max_age_hours` (default 12) is
+manicule's own ceiling on how long it will keep using one: a cookie carries no expiry a client
+can read, and an age manicule measures itself is the only thing that can turn "too old to try"
+into a **startup** refusal rather than something the first page of a sync discovers.
+
+### 1.2 The credential is checked before the connector is constructed
+
+A missing token, a Cloud token with no email beside it, and a browser session that is absent or
+older than `session_max_age_hours` are all startup refusals naming what to set or what to do.
+Discovering any of them at the first page of the first sync produces a run that reports progress
+and indexes nothing.
+
+### 1.3 A sign-in page is never content
+
+This is the failure mode the whole arrangement is built around, and it is not "the credential
+was rejected". A rejected credential announces itself with a 401 and stops the run. An instance
+behind an identity provider answers a request it will not serve by **redirecting to that
+provider**, and a client that follows the redirect gets a sign-in page with status 200: a
+successful response, of a plausible content type, carrying several kilobytes of real text.
+Indexing it would put one copy of that page in place of every page the sync tried to read —
+plausible, retrievable, citable documents that nothing downstream can tell from the corpus, and
+a run that looks from every metric like one that worked.
+
+Two independent layers refuse it, and they run for **every** credential, because a reverse proxy
+answers a personal access token exactly as it answers a dead session.
+
+- **Redirects are followed by this connector rather than by the HTTP client.** A redirect off
+  the configured origin is refused as an untrusted link — nothing is requested from the identity
+  provider and no sign-in page is fetched at all — and a redirect to this instance's own
+  `/login.action` or SSO servlet is refused as a dead session. An ordinary same-origin redirect
+  is followed, up to five hops.
+- **Every response is read for the marks of a sign-in.** Confluence's own authentication filter
+  reports the outcome in `X-Seraph-LoginReason`; every REST response names the authenticated
+  user in `X-AUSERNAME`, and `anonymous` — or somebody other than the account the session was
+  captured as — is a session that has stopped being this one whatever the status says; and
+  failing both, an HTML body carrying a sign-in form's own field names is refused.
+
+The second layer matters most on **attachment downloads**, which is where a sign-in page has no
+JSON decoder to fall foul of: it arrives as perfectly good `text/html` that the parser chain
+would parse, chunk, embed and serve.
 
 ## 2. Discovery and change detection
 
@@ -247,7 +349,8 @@ Two details worth stating:
   `metadata.mediaType` first, the response's `Content-Type` next, and the filename extension
   last; nothing is guessed ahead of what was actually said.
 
-OpenDocuments ignores attachments entirely.
+Attachments are documents. A connector that indexed only page bodies would leave the diagram,
+the spreadsheet and the specification PDF unsearchable while reporting that the space was synced.
 
 ## 7. Chunking and breadcrumbs
 
@@ -280,8 +383,9 @@ carry.
 ```
 
 Confluence derives heading anchors from heading text, so a citation can deep-link to the
-**exact section**, not just the page. This is strictly better than the page-level citation
-OpenDocuments produces, and it costs nothing since the heading is already known from §5.
+**exact section**, not just the page. It costs nothing, since the heading is already known from
+§5, and it is the difference between an answer a reader can check in one click and one that
+hands them a page to search.
 
 The page URL is taken from the source's own `_links.webui`, joined to `_links.base`, rather
 than assembled from a slug. `storage.md` §4.2 declines to claim the slug is title-derived and
@@ -338,23 +442,34 @@ differ, it is here — check these first when one is available:
 | `metadata.mediaType` is present on attachment search results | One attachment's discovered media type | Falls back to `Content-Type`, then the filename — already the design |
 | Search cursors survive at least `cursor_lifetime_seconds` | A slow sync of a large space | Lower the setting; the failure is a refusal, not corruption |
 | A page in the trash stops appearing in CQL results | Trash a page, re-run reconciliation | Deletion is never detected, and the index serves the page forever |
+| `/rest/api/user/current` exists and names the user | `manicule connector login` reports an account | Capture refuses rather than storing an unproven session; the probe endpoint is the thing to change |
+| `X-AUSERNAME` is on REST responses, and is the account `user/current` reported | A sync runs rather than refusing as "a different account" | The account check misfires; it is one of three sign-in signals, so removing it costs the weakest of them |
+| Sign-in redirects go to `/login.action` or a listed SSO servlet | Let a session expire and re-run | Caught by origin or by the body markers instead; add the path |
+| Nothing legitimate redirects off the configured origin | A full sync including attachments | An attachment download refuses instead of following. Cloud is the case to watch: if its `_links.download` redirects to a media CDN, that redirect is now refused loudly rather than followed |
+| `security` still truncates a stdin secret at 128 bytes | The Keychain round-trip test | The chunk size is wrong; the read-back comparison turns it into a refusal rather than a truncated credential |
 
 ---
 
-## Summary of what changes
+## Summary
 
-| | OpenDocuments | manicule |
+Each row is a property this connector holds, beside the thing that happens without it. The
+right-hand column is what a Confluence sync looks like when each decision above is skipped —
+and every one of those failures is quiet, which is why they are worth listing.
+
+| | manicule | Without it |
 |---|---|---|
-| Discovery | full space walk every sync | CQL watermark, cursor pagination |
-| Deletions | never detected | reconciliation diff |
-| Body format | `body.storage` XHTML | ADF on Cloud, parsed storage on Server |
-| Extraction | `replace(/<[^>]+>/g, ' ')` | typed ADF node walk |
-| Tables | destroyed | preserved whole |
-| Code blocks | destroyed | preserved, language-tagged |
-| Macros | ignored | resolved, with cycle detection |
-| Attachments | ignored | parser chain |
-| Context | page title | full ancestor breadcrumb |
-| Citation | page URL | deep link to heading anchor |
+| Discovery | CQL watermark, cursor pagination | a full space walk every sync |
+| Deletions | reconciliation diff | removed pages served forever |
+| Body format | ADF on Cloud, parsed storage on Server | one dialect handled, the other guessed at |
+| Extraction | typed node walk | markup stripped to a run of words |
+| Tables | preserved whole | split across chunks, or flattened |
+| Code blocks | preserved, language-tagged | prose-chunked |
+| Macros | resolved, with cycle detection | content visible in the UI and absent from the index |
+| Attachments | routed through the parser chain | unsearchable |
+| Context | full ancestor breadcrumb | a section called "Configuration", of nothing |
+| Citation | deep link to a heading anchor | a page URL to search by hand |
+| Credential | token, or a browser session behind SSO | an instance nobody can authenticate to |
+| A sign-in page | refused, twice over | indexed once per page the sync tried to read |
 
 ---
 
@@ -363,9 +478,12 @@ differ, it is here — check these first when one is available:
 | Concern | Module |
 |---|---|
 | Configuration and the credential refusal | `manicule/connectors/config.py` |
+| The credential seam: tokens, sessions, expiry | `manicule/connectors/credentials.py` |
+| Capturing a session, and the Keychain | `manicule/connectors/sessions.py` |
+| Telling an answer from a sign-in page | `manicule/connectors/intercept.py` |
 | CQL construction, quoting, watermark timestamps | `manicule/connectors/cql.py` |
 | `_links.next`, the `%2B` rule, origin checking | `manicule/connectors/pagination.py` |
-| Auth headers, 429/5xx retry, downloads, paging | `manicule/connectors/client.py` |
+| Auth headers, redirects, 429/5xx retry, downloads, paging | `manicule/connectors/client.py` |
 | `include`/`excerpt-include`, both body formats | `manicule/connectors/macros.py` |
 | `discover`, `fetch`, `reconcile`, watermarks | `manicule/connectors/confluence.py` |
 | Registration through the `manicule.plugins` entry point | `manicule/connectors/plugin.py` |

@@ -15,11 +15,24 @@ The result is a directory. Copy it to the air-gapped host and point manicule at 
 or build it straight into a distribution that ships the bundle as package data:
 
     python tools/build_grammar_bundle.py --output build/pkg --package
+    uv pip install build/pkg
 
-which writes an importable ``manicule_grammars`` package, so the grammars travel through the
-same channel as every other dependency and no environment variable is needed at all. That
-package is built rather than published, because a bundle is valid for exactly one platform and
-one pack release.
+which writes an importable ``manicule_grammars`` package **and the packaging metadata that
+makes it installable**, so the grammars travel through the same channel as every other
+dependency and no environment variable is needed at all. That package is built rather than
+published, because a bundle is valid for exactly one platform and one pack release — which is
+also why its version carries both: ``1.14.3+macos.arm64`` says, in ``pip list``, exactly what
+the thing on this machine is good for. :func:`package_version` writes that string, separators
+already normalised the way PEP 440 will normalise them, so the file and the installed
+distribution report the same version on every platform rather than on the one it was written on.
+
+**The metadata is written here rather than by whoever consumes the output.** It was not, once,
+and the deployment that needed it supplied a ``pyproject.toml`` of its own — which meant the
+one file describing which release and which platform a bundle is for was maintained somewhere
+that could not see either. ``artifacts`` in that metadata is the load-bearing line: the payload
+is compiled shared libraries, hatchling honours a ``.gitignore`` next to the project it builds,
+and ``*.so`` is about the most commonly ignored pattern there is. Without it such a build
+succeeds, installs, and lands a manifest describing libraries that are not in the wheel.
 
 **Why a bundle and not the two alternatives.** Building grammars at install time was rejected
 on sight: it needs a C toolchain on the user's machine, and the API for it was removed from
@@ -36,6 +49,7 @@ anything absent.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -59,6 +73,79 @@ def bundle_root() -> Path:
     """The bundle directory carried by this distribution."""
     return Path(__file__).parent / "bundle"
 '''
+
+PACKAGE_METADATA = '''\
+# Written by tools/build_grammar_bundle.py. Edit the builder, not this file: it is rewritten
+# every time a bundle is built, and a hand-edit here would describe a bundle nobody has.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "{distribution}"
+version = "{version}"
+description = "{description}"
+license = "{licence}"
+requires-python = ">=3.12"
+
+# No dependencies, deliberately. This is data — compiled grammar libraries and a manifest —
+# and a dependency on manicule would make the two version-locked in the one direction that
+# does not hold: a bundle is valid for a `tree-sitter-language-pack` release and a platform,
+# neither of which is a manicule version.
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/{module}"]
+# The load-bearing line. Every byte of the payload is a compiled shared library, hatchling
+# honours a `.gitignore` beside this file, and `*.so` is one of the most commonly ignored
+# patterns in existence. Without this the build still succeeds and still installs — and the
+# wheel carries a manifest describing libraries that are not in it, which surfaces on the
+# air-gapped host as a bundle that is present and empty.
+artifacts = ["*.so", "*.dylib", "*.dll"]
+'''
+"""The packaging metadata that makes ``--package`` output an installable distribution.
+
+Formatted from the bundle that was just written, so what ``pip show`` reports is what is in
+the directory rather than a constant that drifts from it.
+"""
+
+
+def package_version(pack_version: str, platform: str) -> str:
+    """The distribution version for a bundle: the pack release, then the platform.
+
+    ``1.14.3+macos.arm64``. The platform goes in a PEP 440 **local version segment** because
+    those two facts are exactly what decides whether an installed bundle is usable, and a
+    distribution whose version says ``0.0.0`` makes an operator open the manifest to find out
+    what they have. A local segment is the right home for it: it is never published to an
+    index, which is the correct treatment for a distribution built per platform.
+
+    **Separators are normalised here rather than left to the installer**, and that is not
+    tidiness. PEP 440 folds both ``-`` and ``_`` in a local segment to ``.``, so writing
+    ``linux-x86_64`` produces a file that says one version and an installed distribution that
+    reports another — the artifact describing something the machine does not have. It is
+    invisible on macOS, whose tag has no underscore in it, and it is the platform-dependent
+    difference this whole subsystem exists to refuse. One function, so the metadata, the
+    installed distribution and the test all name the same string.
+    """
+    return f"{pack_version}+{re.sub(r'[-_]', '.', platform)}"
+
+
+def package_metadata(bundle: grammar_bundle.GrammarBundle) -> str:
+    """``pyproject.toml`` for the distribution around ``bundle``."""
+    return PACKAGE_METADATA.format(
+        distribution=grammar_bundle.BUNDLE_MODULE.replace("_", "-"),
+        module=grammar_bundle.BUNDLE_MODULE,
+        version=package_version(bundle.pack_version, bundle.platform),
+        description=(
+            f"Offline tree-sitter grammars for manicule: "
+            f"{grammars.PACK_DISTRIBUTION} {bundle.pack_version}, {bundle.platform}, "
+            f"{len(bundle.languages)} languages."
+        ),
+        # The licence the bundle asserted at build time, not a constant. `check_licence` has
+        # already refused anything copyleft or unassessed, so what reaches here is a term
+        # manicule may redistribute — and recording it in the metadata is what carries that
+        # assertion to the machine the wheel is installed on.
+        licence=bundle.licence,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -93,8 +180,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--package",
         action="store_true",
-        help="Write an importable manicule_grammars package around the bundle, so it can be "
-        "installed rather than copied.",
+        help="Write an installable manicule-grammars distribution around the bundle — an "
+        "importable package, and the pyproject.toml that makes `uv pip install <output>` "
+        "work — so it can be installed rather than copied.",
     )
     args = parser.parse_args(argv)
 
@@ -104,14 +192,19 @@ def main(argv: list[str] | None = None) -> int:
             seeded = grammars.prefetch(languages)
             print(f"seeded: {list(seeded)}")
         source = Path(args.source) if args.source is not None else grammars.cache_directory()
-        destination = Path(args.output)
-        if args.package:
-            destination = destination / "src" / grammar_bundle.BUNDLE_MODULE / "bundle"
+        root = Path(args.output)
+        package = root / "src" / grammar_bundle.BUNDLE_MODULE / "bundle"
+        destination = package if args.package else root
         bundle = grammar_bundle.build(languages, destination, source=source)
         if args.package:
             module = destination.parent
             (module / "__init__.py").write_text(PACKAGE_INIT, encoding="utf-8")
             (module / "py.typed").write_text("", encoding="utf-8")
+            # Written after the bundle rather than before it, and from the bundle that was read
+            # back off disk: the version and the description state a pack release, a platform
+            # and a language count, and metadata written from the *arguments* would describe a
+            # build that had not happened yet.
+            (root / "pyproject.toml").write_text(package_metadata(bundle), encoding="utf-8")
     except ManiculeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -125,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     for language in bundle.languages:
         entry = bundle.grammars[language]
         print(f"  {language:<12} {entry.filename:<36} {entry.sha256[:16]} {entry.size:>10}")
+    if args.package:
+        print(f"install:  uv pip install {root}")
     return 0
 
 

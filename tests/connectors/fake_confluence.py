@@ -16,9 +16,14 @@ asks for, it is a server that **behaves badly in the specific ways Confluence do
   that arrive.
 - **Deletion.** Pages can be removed between one sync and the next, which is invisible to a
   watermark query by construction.
+- **Signing out.** An instance behind an identity provider answers a request it will not serve
+  with a **sign-in page carrying status 200**, or with a redirect to the provider. Both are
+  available per path prefix, so a test can sign out only the attachment endpoint — where a
+  sign-in page has no JSON decoder to fall foul of and would otherwise be indexed as a document.
 
 The transport records every request, so a test can assert on what actually went over the wire —
-the raw query string included, which is where the ``%2B`` either is or is not.
+the raw query string included, which is where the ``%2B`` either is or is not, and the hosts
+that were never asked, which is where an identity provider either was or was not contacted.
 """
 
 from __future__ import annotations
@@ -33,6 +38,26 @@ import httpx
 
 CLOUD_BASE = "https://example.atlassian.net/wiki"
 SERVER_BASE = "https://wiki.example.com/confluence"
+
+IDENTITY_PROVIDER = "https://idp.example.com"
+"""Where an instance behind single sign-on sends a client it no longer recognises."""
+
+SIGNIN_PAGE = (
+    "<!DOCTYPE html><html><head><title>Log in - Confluence</title></head><body>"
+    '<form name="loginform" action="/dologin.action" method="post">'
+    '<input type="text" name="os_username" id="os_username">'
+    '<input type="password" name="os_password" id="os_password">'
+    '<input type="submit" name="login" value="Log in">'
+    "</form></body></html>"
+)
+"""What an instance serves instead of an answer once the session is gone.
+
+Deliberately a *complete, plausible* page rather than a stub. It has a title, a form and real
+markup; parsed, chunked and embedded it would produce a perfectly ordinary-looking document,
+which is the entire reason indexing one is the worst available outcome. It carries no
+authentication headers, so a test that uses it exercises the check that reads the **body** —
+the header signals are tested separately, and each has to be able to fail on its own.
+"""
 
 _SPACE = re.compile(r'space\s*=\s*"((?:[^"\\]|\\.)*)"')
 _TITLE = re.compile(r'title\s*=\s*"((?:[^"\\]|\\.)*)"')
@@ -166,6 +191,20 @@ class FakeConfluence:
         self.throttles: list[Mapping[str, str]] = []
         """Queued 429 responses; each request consumes one before being served normally."""
 
+        self.signed_out_paths: list[str] = []
+        """Path prefixes answered with :data:`SIGNIN_PAGE` and status 200."""
+
+        self.redirected_paths: list[tuple[str, str]] = []
+        """Path prefixes answered with a 302 to the second element."""
+
+        self.user = "sync.user"
+        """Who ``/rest/api/user/current`` says this session is."""
+
+        self.headers: dict[str, str] = {}
+        """Extra headers on every response — ``X-AUSERNAME`` and Seraph's, in the tests that
+        exercise them. Empty by default, so a fixture that signs out has to be caught by
+        something other than a header it did not set."""
+
         self.body_calls: dict[str, int] = {}
         self._cursors: dict[str, tuple[str, int]] = {}
         self._cursor_seed = cursor_seed
@@ -178,6 +217,19 @@ class FakeConfluence:
 
     def throttle(self, times: int = 1, retry_after: str = "2") -> None:
         self.throttles.extend({"Retry-After": retry_after} for _ in range(times))
+
+    def sign_out(self, path: str = "/") -> None:
+        """Answer everything under ``path`` with a sign-in page and status 200.
+
+        The default signs out the whole instance. Passing ``/download/`` signs out only the
+        attachment endpoint, which is the case with no JSON decoder standing between a sign-in
+        page and the index.
+        """
+        self.signed_out_paths.append(path)
+
+    def redirect(self, location: str, path: str = "/") -> None:
+        """Answer everything under ``path`` with a 302 to ``location``."""
+        self.redirected_paths.append((path, location))
 
     def delete(self, page_id: str) -> None:
         """Remove a page the way a user does: it simply stops appearing in CQL results."""
@@ -204,11 +256,28 @@ class FakeConfluence:
         if self.context and path.startswith(self.context):
             path = path[len(self.context) :]
 
-        return self._route(request, path)
+        for prefix, location in self.redirected_paths:
+            if path.startswith(prefix):
+                return httpx.Response(302, headers={"location": location, **self.headers})
+        if any(path.startswith(prefix) for prefix in self.signed_out_paths):
+            # 200, not 401 and not 403. This is what makes the failure worth guarding: every
+            # ordinary check a client makes passes, and what it has is a document.
+            return httpx.Response(
+                200,
+                text=SIGNIN_PAGE,
+                headers={"content-type": "text/html;charset=UTF-8", **self.headers},
+            )
 
-    def _route(self, request: httpx.Request, path: str) -> httpx.Response:
+        response = self._route(request, path)
+        if self.headers:
+            response.headers.update(self.headers)
+        return response
+
+    def _route(self, request: httpx.Request, path: str) -> httpx.Response:  # noqa: PLR0911
         if path == "/rest/api/space":
             return self._spaces(request)
+        if path == "/rest/api/user/current":
+            return httpx.Response(200, json={"type": "known", "username": self.user})
         if path == "/rest/api/content/search":
             return self._search(request)
         if path.startswith("/api/v2/pages/"):
