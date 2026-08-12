@@ -485,13 +485,17 @@ class StructuralChunker:
     def _render(self, document: Document, groups: Sequence[Sequence[_Unit]]) -> list[Chunk]:
         chunks: list[Chunk] = []
         previous: Sequence[_Unit] | None = None
+        # Resolved once per document rather than once per chunk. It is a fact about the document,
+        # and reading it validates the stored source record — so inside the loop a document of two
+        # hundred chunks paid for two hundred identical validations of one JSON blob.
+        hierarchy = _source_hierarchy(document)
         for position, group in enumerate(groups):
             text = BLOCK_SEPARATOR.join(unit.text for unit in group)
             overlap = self._overlap_from(previous, group)
             if overlap.text:
                 text = f"{overlap.text}{BLOCK_SEPARATOR}{text}"
             heading_path = group[0].heading_path
-            crumb = self._breadcrumb(document, heading_path)
+            crumb = self._breadcrumb(document, hierarchy, heading_path)
             embed_text = f"{crumb}{BLOCK_SEPARATOR}{text}" if crumb else text
             # The overlap window extends the anchor with it (docs/parsing.md §4.3). A chunk
             # that opens with the previous chunk's last sentences and names only its own lines
@@ -580,14 +584,42 @@ class StructuralChunker:
                 break
         return _Overlap(" ".join(taken), tuple(used))
 
-    def _breadcrumb(self, document: Document, heading_path: Sequence[str]) -> str:
+    def _breadcrumb(
+        self, document: Document, hierarchy: Sequence[str], heading_path: Sequence[str]
+    ) -> str:
+        """One chunk's breadcrumb. ``hierarchy`` is the document's, resolved by the caller once."""
         parts = breadcrumb.elements(
             _string_list(document.metadata.get("breadcrumb_prefix")) or (),
-            _string_list(document.metadata.get("ancestors")) or (),
+            hierarchy,
             (document.title,),
             heading_path,
         )
         return breadcrumb.render(parts, self._counter, self._breadcrumb_tokens)
+
+
+def _source_hierarchy(document: Document) -> tuple[str, ...]:
+    """Where a document sits in its source, coarsest first.
+
+    Two spellings of one fact, in precedence order, because they arrived in that order. A
+    validated :class:`~manicule.core.provenance.SourceMetadata` is preferred when the document
+    carries one; ``metadata["ancestors"]`` is the older untyped convention that connectors
+    without a record still fill in, and it keeps working exactly as it did.
+
+    **The record wins where both are present, and that is the safe way round.** Its
+    ``section_path`` has been through depth, length and control-character validation;
+    ``ancestors`` has been through none. Preferring the unvalidated spelling would mean a
+    connector that supplied both got the weaker of its own two answers embedded into every
+    vector — and a breadcrumb is not something anybody reads afterwards to check.
+
+    This is also the whole of what propagates from a document's source record into a chunk, and
+    it propagates as *text the embedder reads* rather than as a copy on the chunk row. Nothing
+    document-level is duplicated per chunk; ``docs/contracts.md`` §2 fixes what a chunk is, and
+    a citation resolves the rest through ``document_id``.
+    """
+    record = document.provenance
+    if record is not None and record.source is not None and record.source.section_path:
+        return record.source.section_path
+    return tuple(_string_list(document.metadata.get("ancestors")) or ())
 
 
 # --- anchor merging ----------------------------------------------------------------------

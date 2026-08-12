@@ -25,6 +25,37 @@
   </div>
 </section>
 
+{#
+  Both identities, side by side, for a document that carries authoritative source metadata. The
+  section above describes the *file*; this describes what the file is a copy of, and the two are
+  shown apart rather than merged so that neither can be read as the other.
+
+  Every value here is rendered as text, including the canonical URI. It is restricted to http and
+  https before it can be stored, so a link would be safe — but a URI that is never an `href` has
+  no sink to get wrong, and the URI above it is plain text for the same reason.
+#}
+{% if doc.provenance %}
+{% set src = doc.provenance %}
+<section class="panel">
+  <h2>Source</h2>
+  {% if src.unavailable_reason %}
+  <p class="muted">This document has a manifest that could not be used, so it is cited by its
+    local filename. {{ src.unavailable_reason }}</p>
+  {% endif %}
+  <dl class="facts">
+    {% if src.title %}<dt>Title at source</dt><dd>{{ src.title }}</dd>{% endif %}
+    {% if src.canonical_uri %}<dt>Canonical URI</dt><dd>{{ src.canonical_uri }}</dd>{% endif %}
+    {% if src.source_id %}<dt>Source identifier</dt><dd><code>{{ src.source_id }}</code></dd>{% endif %}
+    {% if src.version %}<dt>Source version</dt><dd>{{ src.version }}</dd>{% endif %}
+    {% if src.section_path %}<dt>Section</dt><dd>{{ m.trail(src.section_path) }}</dd>{% endif %}
+    {% if src.modified_at %}<dt>Modified at source</dt><dd>{{ src.modified_at }}</dd>{% endif %}
+    {% if src.snapshot_path %}<dt>Local snapshot</dt><dd><code>{{ src.snapshot_path }}</code></dd>{% endif %}
+    {% if src.retrieved_at %}<dt>Snapshot taken</dt><dd>{{ src.retrieved_at }}</dd>{% endif %}
+    {% if src.indexed_at %}<dt>Indexed here</dt><dd>{{ src.indexed_at }}</dd>{% endif %}
+  </dl>
+</section>
+{% endif %}
+
 <section class="panel">
   <h2>Blocks</h2>
   {% if panels.workbench.data.blocks %}

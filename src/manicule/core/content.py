@@ -8,12 +8,14 @@ cannot, and any attempt to recover it there is guesswork.
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from manicule.core.anchors import Anchor
+from manicule.core.provenance import Provenance
 
 Metadata = dict[str, JsonValue]
 """Free-form per-item metadata. JSON-shaped so it survives the round trip to storage."""
@@ -379,6 +381,20 @@ class Document(_Content):
         "chain has chosen a parser.",
     )
 
+    indexed_at: datetime | None = Field(
+        default=None,
+        description="When this document last reached ``indexed``, or ``None`` when it never "
+        "has. **Read here, written only by the store** — like ``parse_fp`` above, and for the "
+        "same reason: the pipeline builds a fresh document per run, so a value carried in from "
+        "here would either be absent or be a guess, and "
+        ":func:`~manicule.storage.rows.apply_document` stamps the column itself. It is on this "
+        "model because a citation reports it: ``docs/storage.md`` distinguishes three "
+        "timestamps that mirrored documents make it easy to conflate — the source's own "
+        "modification time, the moment a local snapshot was taken, and this, which is the only "
+        "one that is a fact about *this installation*. A citation that offered one of the "
+        "others under this name would claim the corpus was fresher than it is.",
+    )
+
     @model_validator(mode="after")
     def _failures_are_explained(self) -> Self:
         if self.status in NEEDS_ATTENTION and not self.status_detail:
@@ -401,6 +417,33 @@ class Document(_Content):
     def expects_chunks(self) -> bool:
         """True when this document should have chunks stored against it."""
         return self.status not in CHUNKLESS_BY_DESIGN
+
+    @property
+    def provenance(self) -> Provenance | None:
+        """The authoritative source record this document carries, or ``None`` if it carries none.
+
+        Read through :attr:`metadata` rather than stored as a field of its own, for the reason
+        :attr:`Chunk.lang` is read that way: there is one copy of the fact, so the accessor and
+        the stored value cannot come to disagree. ``docs/storage.md`` §6.4 is the test for
+        whether something earns a column — whether change detection or document selection has to
+        *query* it — and nothing queries this. It is read at citation time from a row that has
+        already been loaded.
+
+        ``None`` is the ordinary answer and the backward-compatible one. A local file with no
+        sidecar manifest carries no record at all, takes no new code path, and cites exactly as
+        it did before.
+
+        **Nothing here needs to be copied onto a chunk.** A chunk resolves its citation through
+        ``document_id``, so the canonical title, URI, version and hierarchy are one row away
+        rather than repeated per chunk — which for a document of two hundred chunks is the
+        difference between one copy and two hundred. What is genuinely chunk-level already lives
+        on the chunk: :attr:`Chunk.heading_path` is where *this passage* sits inside the
+        document, and the source's own hierarchy above the document is
+        :attr:`~manicule.core.provenance.SourceMetadata.section_path`. Joining the two at
+        citation time is what produces a section path that is complete without being stored
+        twice.
+        """
+        return Provenance.from_metadata(self.metadata)
 
 
 __all__ = [

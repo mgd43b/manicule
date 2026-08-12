@@ -38,6 +38,11 @@ def to_document(row: models.Document) -> Document:
         failed_stage=row.failed_stage,
         metadata=cast("Metadata", row.doc_metadata or {}),
         parse_fp=row.parse_fp,
+        # Read out, never written back — `apply_document` below stamps the column itself, on the
+        # same rule as `parse_fp`. A citation reports it, and of the three timestamps a mirrored
+        # document makes it easy to confuse it is the only one that is a fact about *this*
+        # installation rather than about the source or about whoever took the snapshot.
+        indexed_at=row.indexed_at,
     )
 
 

@@ -37,6 +37,7 @@ from manicule.core.errors import NameInUseError, UnknownEntityError
 from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.core.organisation import Collection as DocumentCollection
 from manicule.core.organisation import CollectionRule, Restoration, Tag, TrashEntry
+from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.core.retrieval import Candidate, Confidence, ConfidenceBand, Context, Query
 from manicule.generation.answers import AnswerEnvelope, AnswerEvent, EventKind
 from manicule.generation.history import Turn
@@ -67,11 +68,17 @@ def make_document(
     source_id: str = "notes.md",
     title: str = "Notes",
     status: DocumentStatus = DocumentStatus.INDEXED,
+    provenance: Provenance | None = None,
+    indexed_at: datetime | None = None,
 ) -> Document:
     """A document whose id is derived the way the real one is.
 
     Derived rather than written down, so a test cannot be made to pass by editing a literal
     id until it matches. The identity under test *is* this function's second line.
+
+    ``provenance`` goes into ``metadata`` under the reserved key rather than onto a field of its
+    own, because that is where the real pipeline puts it and where every reader looks — a fixture
+    that supplied it any other way would be exercising a path production does not have.
     """
     return Document(
         id=document_id(workspace, source, source_id),
@@ -82,6 +89,8 @@ def make_document(
         content_hash=content_hash(f"{workspace}/{source_id}"),
         media_type="text/markdown",
         status=status,
+        metadata={PROVENANCE_KEY: provenance.as_metadata_value()} if provenance else {},
+        indexed_at=indexed_at,
     )
 
 
@@ -690,6 +699,16 @@ class FakeAnswerer:
 
     text: str = "The client retries twice."
     calls: list[object] = field(default_factory=list[object])
+    envelope: AnswerEnvelope | None = None
+    """The final envelope, for a test the default cannot express.
+
+    The default carries **no citations**, which is right for the tests about confidence, streaming
+    and tenancy and wrong for anything asserting what a citation *reports* — and the difference was
+    invisible until a guard was disabled and nothing went red, because no test on any surface had
+    ever constructed an ``AnswerCitation`` through this path. A test needing a real citation sets
+    one here rather than reaching past the service, so the payload is assembled by the code that
+    assembles it in production.
+    """
 
     def answer(
         self, request: AnswerRequest, result: AnswerResult | None = None
@@ -707,11 +726,11 @@ class FakeAnswerer:
         return self._events()
 
     async def _events(self) -> AsyncIterator[AnswerEvent]:
-        yield AnswerEvent(kind=EventKind.DELTA, text=self.text)
-        yield AnswerEvent(
-            kind=EventKind.FINAL,
-            envelope=AnswerEnvelope(text=self.text, corpus_consulted=True, confidence=0.5),
+        final = self.envelope or AnswerEnvelope(
+            text=self.text, corpus_consulted=True, confidence=0.5
         )
+        yield AnswerEvent(kind=EventKind.DELTA, text=final.text)
+        yield AnswerEvent(kind=EventKind.FINAL, envelope=final)
 
 
 @dataclass

@@ -22,6 +22,7 @@ from manicule.core.content import BlockKind, Document, DocumentStatus, Metadata,
 from manicule.core.embedding import EmbedFingerprint, Pooling, Vector
 from manicule.core.errors import ConfigError, ContextOverflowError
 from manicule.core.fingerprints import PROVISIONAL_TOKENIZER_PREFIX
+from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
 from manicule.testing import assert_chunker_contract
 
 TOKENIZER_ID = "test/whitespace"
@@ -453,6 +454,95 @@ def test_a_document_with_no_hierarchy_gets_no_breadcrumb_rather_than_an_invented
     """A fabricated breadcrumb is a fabricated signal in the vector."""
     chunks = make_chunker().chunk(document(title=""), [prose("Just some text.")])
     assert chunks[0].embed_text == chunks[0].text
+
+
+# --- hierarchy from a source record ----------------------------------------------------------
+
+
+def _with_record(section_path: tuple[str, ...], **extra: object) -> Document:
+    """A document carrying a validated source record declaring ``section_path``."""
+    record = Provenance(
+        source=SourceMetadata(
+            title="Retry policy",
+            canonical_uri="https://docs.example.test/pages/123456",
+            section_path=section_path,
+        )
+    )
+    return document(title="Retry policy", **{PROVENANCE_KEY: record.as_metadata_value()}, **extra)
+
+
+def test_a_source_records_hierarchy_reaches_the_breadcrumb() -> None:
+    """Chunk-level section citations: the document's place in its source, plus the chunk's own.
+
+    This is the whole of what propagates from a document's source record into a chunk, and it
+    propagates as *text the embedder reads* rather than as a copy on the chunk row. A section
+    titled "Configuration" is unretrievable without knowing what it configures, and for a
+    mirrored page the answer to "what" lives in the manifest rather than anywhere in the bytes.
+
+    The two halves stay distinguishable: ``Engineering > Runbooks`` is where the *document* sits
+    at its source, and ``Retry policy > Timeouts`` is where this *passage* sits inside the
+    document. Concatenated for the embedder, kept apart in the record and on the chunk.
+    """
+    chunks = make_chunker().chunk(
+        _with_record(("Engineering", "Runbooks")),
+        [prose("Twice, with backoff.", path=("Retry policy", "Timeouts"))],
+    )
+
+    assert chunks[0].embed_text.startswith("Engineering > Runbooks > Retry policy > Timeouts")
+    assert chunks[0].heading_path == ("Retry policy", "Timeouts"), (
+        "the chunk keeps its own position and does not absorb the document's"
+    )
+    assert PROVENANCE_KEY not in chunks[0].metadata, (
+        "the record is resolved through document_id at citation time, never copied per chunk — "
+        "for a document of two hundred chunks that is one copy rather than two hundred"
+    )
+
+
+def test_a_validated_hierarchy_wins_over_the_untyped_ancestors_key() -> None:
+    """Where both spellings are present, the checked one is used.
+
+    ``section_path`` has been through depth, length and control-character validation and
+    ``ancestors`` has been through none, so preferring ``ancestors`` would embed the weaker of a
+    connector's own two answers into every vector — and a breadcrumb is not something anybody
+    reads afterwards to check.
+    """
+    chunks = make_chunker().chunk(
+        _with_record(("Engineering", "Runbooks"), ancestors=["Unvalidated", "Legacy"]),
+        [prose("Twice, with backoff.", path=("Timeouts",))],
+    )
+
+    assert chunks[0].embed_text.startswith("Engineering > Runbooks")
+    assert "Unvalidated" not in chunks[0].embed_text
+
+
+def test_a_document_with_only_the_ancestors_key_keeps_working() -> None:
+    """The older convention is untouched, so a connector that has not adopted the record is fine.
+
+    Without this, adding the record would silently empty the breadcrumb of every document from
+    every connector that fills in ``ancestors`` — and an empty breadcrumb is not a visible
+    failure, it is a section nobody can retrieve.
+    """
+    chunks = make_chunker().chunk(
+        document(title="Retry policy", ancestors=["Engineering", "Runbooks"]),
+        [prose("Twice, with backoff.", path=("Timeouts",))],
+    )
+
+    assert chunks[0].embed_text.startswith("Engineering > Runbooks > Retry policy > Timeouts")
+
+
+def test_a_record_with_no_hierarchy_falls_back_to_the_ancestors_key() -> None:
+    """An empty ``section_path`` is not an instruction to discard a hierarchy that is there.
+
+    A manifest may know a page's title and URL and nothing about where it sits. Treating the
+    record's presence as authoritative about a field it never filled in would throw away the
+    connector's own answer for no reason.
+    """
+    chunks = make_chunker().chunk(
+        _with_record((), ancestors=["Engineering", "Runbooks"]),
+        [prose("Twice, with backoff.", path=("Timeouts",))],
+    )
+
+    assert chunks[0].embed_text.startswith("Engineering > Runbooks")
 
 
 def test_an_over_long_breadcrumb_is_elided_from_the_middle() -> None:

@@ -250,6 +250,11 @@ That sounds like a small thing. It decides most of the architecture:
 - Every parser must pass a round-trip check: resolving an anchor returns the text the chunk
   claims. It is a test, not a convention, because the failure is silent — a citation pointing at
   a page that does not exist looks exactly like one that does.
+- A locally mirrored page can say what it is a copy of. A file named `123456.html` cites as
+  `123456.html` unless something supplies the document's real title and address, so an adjacent
+  `123456.html.source.json` may — and the canonical identity and the local snapshot are then
+  *both* kept, in two types neither of which is able to hold the other's fields. A citation that
+  is precise about a file nobody else has is a correct location for the wrong thing.
 
 The same instinct runs through the rest. Wherever something can be wrong quietly, there is a
 guard that makes it loud: a mismatched embedding model, a chunk budget past what the model

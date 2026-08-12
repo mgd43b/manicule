@@ -381,6 +381,63 @@ Indexes: `(workspace_id, status)`, `(workspace_id, uri)`, `(content_hash)`,
 fold `deleted_at IS NULL` into the partial indexes above), `(connector_id)`,
 `(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`.
 
+### 4.2.1 Authoritative source metadata, and why it is not a column
+
+A locally mirrored page may be stored as `123456.html`. Generic filesystem ingestion then cites
+the filename and a `file://` URI — accurate about a file nobody else has, and silent about the
+document. `manicule.core.provenance` closes that: a connector, or a sidecar manifest beside the
+file, may supply the document's own title, canonical URI, immutable source identity, version,
+created and modified times, content type and place in its source's hierarchy, alongside where the
+local snapshot sits and when it was taken.
+
+**Both identities are kept and neither is representable as the other.** That is enforced by the
+shape rather than by convention: `SourceMetadata` has nowhere to put a local path and
+`LocalSnapshot` has nowhere to put a canonical URI, on the same principle as
+`SharedCitationLabel` in §11 of [`surfaces.md`](surfaces.md) — a *different shape*, not the same
+shape with fields blanked, because a field that does not exist cannot be filled in by a caller who
+forgot which one they were holding.
+
+**Where a citation reads it from is `documents.uri` and `documents.title`.** When a record
+supplies them, the pipeline writes the canonical values into those two columns. Every citation
+surface already reads them, so one write makes the command line, the MCP tool, the HTTP payload,
+the browser page and the slot label the model itself is shown all correct at once — including a
+surface added later that nobody remembers to teach. The local identity is not lost: `source_id` is
+still the artefact the connector fetched by, `content_hash` still digests those bytes, and the
+snapshot's location is in the record.
+
+**The record itself lives in `documents.metadata`, under `source_provenance`. It is not a column,
+and §6.4 is the reason.** What earns a column there is being *queried* — `parse_fp` has one
+because change detection and `select_documents` have to ask about it per document. Nothing queries
+this. It is read at citation time from a row that has already been loaded, so nine mostly-absent
+columns would buy nothing that the JSON column does not already provide, and `metadata` is where
+the existing per-document connector facts (`ancestors`, `parser_used`, `last_ingest_error`)
+already live. It is read back through `Document.provenance`, which is the
+`Chunk.lang` shape and has its reason: one copy of the fact, so the accessor and the stored value
+cannot come to disagree.
+
+**It is validated on every read, not only on write.** The record originates in a file inside the
+corpus and then sits in a database, so "it was checked on the way in" is not a property of the
+value being read now — a hand-edited row, a restored backup or a future bug in the write path all
+produce bytes that never passed the check. An unusable record reads as *absent*, which degrades
+that document's citation to its filename: exactly where it would have been with no manifest, and
+one malformed row cannot break every listing that touches it.
+
+**Nothing is copied onto a chunk.** A chunk resolves its citation through `document_id`, so for a
+document of two hundred chunks that is one copy of the canonical title rather than two hundred.
+What is genuinely chunk-level is already on the chunk: `heading_path` is where the *passage* sits
+inside the document, and the record's `section_path` is where the *document* sits in its source.
+The chunker joins the two into the breadcrumb an embedder reads and stores neither on the chunk
+row.
+
+**Three timestamps, three names, never folded together.** The record's `modified_at` is when the
+document was edited at its source; its `retrieved_at` is when this copy was taken; `indexed_at` is
+when manicule indexed it. They routinely differ by months, and collapsing any two produces a
+corpus that looks freshly revised because somebody re-ran an import. `indexed_at` is read onto
+`Document` but never written from it — `apply_document` stamps the column, on the same rule as
+`parse_fp`.
+
+**No migration.** Every one of these facts lands in a column or a JSON value that already exists.
+
 ### 4.3 `chunks`
 
 ```python

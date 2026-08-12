@@ -45,11 +45,26 @@ async def test_the_store_satisfies_the_docstore_protocol(store: SqliteDocStore) 
 
 
 async def test_a_document_round_trips_through_storage_unchanged(store: SqliteDocStore) -> None:
-    """Anything storage silently drops is a field nothing downstream can rely on."""
+    """Anything storage silently drops is a field nothing downstream can rely on.
+
+    ``indexed_at`` is held out of the equality and asserted on its own line, because it is the
+    one field on the model that storage **writes** rather than round-trips:
+    :func:`~manicule.storage.rows.apply_document` stamps it when a document arrives ``indexed``,
+    and the domain object the pipeline built cannot know it. Inside the equality it would compare
+    a value nothing supplied against one storage invented. The honest claim is two claims — every
+    other field survives the trip, and this one comes back filled in — and splitting them is what
+    lets the second one fail on its own if the stamp ever stops happening.
+    """
     document = make_document()
+    assert document.indexed_at is None, "the fixture must not pre-supply the stamped field"
     await store.upsert_document(document)
     loaded = await store.get_document(document.id)
-    assert loaded == document
+    assert loaded is not None
+    assert loaded.model_copy(update={"indexed_at": None}) == document
+    assert loaded.indexed_at is not None, (
+        "storage stamps indexed_at for an indexed document, and a citation reports it as the one "
+        "of a mirrored document's three timestamps that describes this installation"
+    )
 
 
 async def test_a_document_is_found_by_source_identity_not_by_uri(

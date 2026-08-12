@@ -158,6 +158,79 @@ def redacted_path(path: str | Path) -> str:
 # --- retrieval and answers -----------------------------------------------------------------
 
 
+class SourceReference(Payload):
+    """Where a cited document was published, and where this installation keeps its copy.
+
+    Present only for a document that carries authoritative source metadata — a locally mirrored
+    page with a sidecar manifest, or any connector that supplies the same record. ``None``
+    everywhere else, which is the honest answer for an ordinary file: there is no canonical
+    address to report, and an empty string would read as one that had been looked for and found
+    blank.
+
+    **Both identities are here, and neither is presented as the other.** ``title``,
+    ``canonical_uri``, ``source_id``, ``version`` and ``modified_at`` describe the *publication*.
+    ``snapshot_path``, ``snapshot_checksum`` and ``retrieved_at`` describe *this machine's copy*.
+    ``indexed_at`` is neither — it is when manicule indexed the copy. A consumer that wants to
+    show a reader where to go uses the first group; an audit that wants to know what was actually
+    read uses the second; and reproducing a result months later needs both, which is why the
+    citation carries both rather than choosing.
+
+    The flat shape is deliberate over nesting the two groups. These fields are rendered into
+    one-line citations by three surfaces and a template, and a consumer reaching
+    ``provenance.snapshot.path`` through two optional levels has two places to get a null check
+    wrong.
+
+    Carried as ``provenance`` on every payload that has one — **not** as ``source``, which is
+    already taken on :class:`DocumentSummary` and means the name of the connector that owns the
+    document. Two different senses of one word on one model is a field somebody reads wrong once
+    and then relies on.
+    """
+
+    title: str = Field(default="", description="The document's own title, as its source has it.")
+    canonical_uri: str = Field(
+        default="", description="Where a reader goes to see the published document."
+    )
+    source_id: str = Field(
+        default="", description="The identifier the publisher assigns and does not recycle."
+    )
+    version: str = Field(default="", description="The source's own version, compared as a string.")
+    modified_at: str | None = Field(
+        default=None,
+        description="When the document was last edited **at its source**. Never this "
+        "installation's ingestion time; see ``indexed_at``, which is that and is separate.",
+    )
+    section_path: tuple[str, ...] = Field(
+        default=(),
+        description="Where the document sits in its source's hierarchy, coarsest first. The "
+        "passage's own position within the document is ``heading_path`` on the citation, and the "
+        "two are not concatenated here — a consumer that wants a full section path joins them, "
+        "and one that wants to say which manual a page came from does not have to unpick it.",
+    )
+    snapshot_path: str = Field(
+        default="",
+        description="Where the local copy sits, relative to the ingestion root. Relative so a "
+        "citation reproduces elsewhere and does not publish this machine's directory layout.",
+    )
+    snapshot_checksum: str = Field(
+        default="",
+        description="Digest of the local copy's bytes — the same value as the document's "
+        "``content_hash``, reported here so an audit reading a citation has it in hand.",
+    )
+    retrieved_at: str | None = Field(
+        default=None, description="When the local copy was taken, as whoever took it declared."
+    )
+    indexed_at: str | None = Field(
+        default=None, description="When this installation last indexed the copy."
+    )
+    unavailable_reason: str = Field(
+        default="",
+        description="Why there is no authoritative record, when one was attempted and refused — "
+        "a malformed manifest, an unusable canonical URI. Reported rather than swallowed: the "
+        "symptom of a silently ignored manifest is a citation that names a file, which is "
+        "indistinguishable from having written no manifest at all.",
+    )
+
+
 class Anchored(Payload):
     """A location in a document, as a citation or a search hit reports it."""
 
@@ -172,6 +245,13 @@ class Anchored(Payload):
         description="The anchor, dumped as it is stored. Never reformatted for display: a "
         "citation's value is that it resolves, and a prettied location is one nobody can "
         "resolve back.",
+    )
+    provenance: SourceReference | None = Field(
+        default=None,
+        description="The document's authoritative source metadata, when it has any. ``title`` "
+        "and ``uri`` above are already the canonical ones where a record exists — this is the "
+        "structured form, for a consumer that needs the version it cited or the snapshot it "
+        "was read from rather than a line to display.",
     )
 
 
@@ -265,6 +345,12 @@ class DocumentSummary(Payload):
     failed_stage: str | None = None
     content_hash: str = ""
     chunk_count: int | None = Field(default=None, ge=0)
+    provenance: SourceReference | None = Field(
+        default=None,
+        description="The document's authoritative source metadata, when it has any. On the "
+        "summary as well as on a citation, because ``document list`` is where an operator looks "
+        "to find out whether a manifest was honoured — and a refused one says so here.",
+    )
 
 
 class DocumentList(Payload):
@@ -1186,6 +1272,7 @@ __all__ = [
     "SharedCitationLabel",
     "SharedConversation",
     "SharedTurnPayload",
+    "SourceReference",
     "Stats",
     "TagDeleted",
     "TagList",

@@ -49,6 +49,7 @@ from manicule.core.errors import (
     MiddlewareViolationError,
 )
 from manicule.core.ids import content_hash, document_id
+from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.ingest.embedding import embed_chunks
 from manicule.ingest.refusals import require_measured
 from manicule.ingest.workers import AttemptResult
@@ -416,7 +417,7 @@ class IngestPipeline:
         if existing is None:
             existing = await self._store.find_document(source, raw.source_id)
 
-        if not force and self._unchanged_by_hash(existing, digest):
+        if not force and self._unchanged_by_hash(existing, digest, raw):
             await self._store.record_seen(existing.id, version_token=version_token)  # pyright: ignore[reportOptionalMemberAccess]
             return (
                 DocumentOutcome(
@@ -766,19 +767,53 @@ class IngestPipeline:
             and self._parse_lineage_is_current(existing)
         )
 
-    def _unchanged_by_hash(self, existing: Document | None, digest: str) -> bool:
+    def _unchanged_by_hash(
+        self, existing: Document | None, digest: str, raw: RawDocument | None = None
+    ) -> bool:
         """Level 2: the bytes are identical, whatever the source claimed.
 
         Level 1 can lie — a source that touches its modification date on every save reports a
         new token for an unchanged body — and this catches it before the expensive part, which
         is parse, chunk and embed rather than the fetch.
+
+        ``raw`` is the fetched document, so that the source record can be compared as well; it is
+        optional only for callers that have no fetch in hand, and those cannot have a changed
+        record either.
         """
         return (
             existing is not None
             and existing.status in SETTLED
             and existing.content_hash == digest
             and self._parse_lineage_is_current(existing)
+            and self._source_record_is_current(existing, raw)
         )
+
+    @staticmethod
+    def _source_record_is_current(existing: Document, raw: RawDocument | None) -> bool:
+        """Whether the stored source record is the one this fetch just brought back.
+
+        **Identical bytes are not an unchanged document when the metadata is what moved**, and
+        this is the same trap ``_parse_lineage_is_current`` exists for, one field along. A
+        mirrored page whose manifest is corrected — a title fixed, a new source version declared
+        — has byte-for-byte the same body, so the hash agrees and level 2 skips. Worse than
+        merely skipping: the skip path calls ``record_seen`` with the *new* version token, so the
+        corrected record is never read again on any later sync either. The corpus cites a version
+        it was told about and then declined to look at, and nothing anywhere reports a problem.
+
+        Compared through the validating accessor on both sides, so an unusable record on either
+        one reads as absent and compares equal to another absent one — which is right: two
+        documents about which nothing authoritative is known are not different documents.
+
+        A fetch that brings no record leaves a stored one alone rather than counting as a change,
+        matching the assignment rule in ``_store_record``. Otherwise a connector that supplies
+        metadata on only some paths would re-ingest its whole corpus on every run.
+        """
+        if raw is None:
+            return True
+        fresh = Provenance.from_metadata(raw.metadata)
+        if fresh is None:
+            return True
+        return fresh == existing.provenance
 
     def _parse_lineage_is_current(self, existing: Document) -> bool:
         """Whether the stored text was produced by the parser version installed now.
@@ -887,6 +922,17 @@ class IngestPipeline:
             **(existing.metadata if existing else {}),
             **result.metadata,
         }
+        # **The source record is this run's conclusion, so it is assigned rather than merged.**
+        # The layers above put `existing.metadata` over `raw.metadata`, which is right for
+        # accumulated per-document state and wrong for anything a connector re-derives on every
+        # fetch: under the merge alone a record read now loses to the one already stored, so a
+        # manifest edited to declare a higher source version would be found, validated, and then
+        # discarded in favour of the version it supersedes. The document would cite the old one
+        # for ever and nothing would look wrong. A connector that supplies no record leaves
+        # whatever is stored alone, so this cannot erase one either.
+        fresh = Provenance.from_metadata(raw.metadata)
+        if fresh is not None:
+            metadata[PROVENANCE_KEY] = fresh.as_metadata_value()
         if keep_status:
             # The document keeps everything a reader can see, and the failure still goes on the
             # record. It simply does not cost anybody a document that was working.
@@ -895,12 +941,32 @@ class IngestPipeline:
                 "detail": result.status_detail,
             }
         settled = existing if keep_status and existing else None
+        # **What a citation shows comes from the record when there is one.** Read back out of
+        # `metadata` rather than from `fresh`, so that the record which decides the citation is
+        # by construction the record that gets stored — reading one and storing the other is how
+        # a corpus ends up citing a title nothing in it holds. The local facts are not lost:
+        # `source_id` is still the path this connector fetched by, `content_hash` still digests
+        # these bytes, and the snapshot's location is in the record's own snapshot half.
+        # `raw.uri` is deliberately left alone upstream of here, so on the **fetch** path a
+        # parser's diagnostics still name the artefact it actually read rather than a web page
+        # nobody can open locally. That is a property of this path only, and the exception is
+        # worth stating rather than discovering: `reindex.re_parse` rebuilds a `RawDocument` from
+        # `document.uri`, which by then *is* the canonical address — so a re-parse diagnostic
+        # names the document rather than the bytes. Defensible, because on that path the bytes
+        # came from the blob store and neither URI describes where they were read from, but not
+        # the same claim.
+        record = Provenance.from_metadata(metadata)
+        canonical = record.source if record is not None else None
         document = Document(
             id=identifier,
             source=source,
             source_id=raw.source_id,
-            uri=raw.uri,
-            title=title or (existing.title if existing else ""),
+            uri=(canonical.canonical_uri if canonical and canonical.canonical_uri else raw.uri),
+            title=(
+                canonical.title
+                if canonical and canonical.title
+                else title or (existing.title if existing else "")
+            ),
             content_hash=settled.content_hash if settled else digest,
             version_token=version_token,
             original_ref=settled.original_ref if settled else retention.ref,

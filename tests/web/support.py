@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from manicule.core.anchors import HeadingAnchor
 from manicule.core.content import BlockKind
+from manicule.core.provenance import LocalSnapshot, Provenance, SourceMetadata
 from manicule.core.retrieval import Candidate
 from manicule.generation.answers import Citation, Verification
 from manicule.generation.history import Turn
@@ -37,6 +38,7 @@ __all__ = [
     "backend_with_a_document",
     "backend_with_hostile_text",
     "client_for",
+    "hostile_provenance",
     "pages_of",
 ]
 
@@ -45,6 +47,8 @@ MARKUP: dict[str, str] = {
     "heading": "<img src=x onerror=window.__heading=1>Retry policy",
     "answer": "The client retries twice.<script>window.__answer=1</script>",
     "quote": "<svg onload=window.__quote=1>the client retries twice",
+    "canonical": "<script>window.__canonical=1</script>Retry policy",
+    "section": "<iframe srcdoc='<script>window.__section=1</script>'>Runbooks",
 }
 """One hostile string per place model output or corpus content reaches HTML.
 
@@ -52,10 +56,40 @@ Each carries a distinct payload so a test can say *which* field escaped rather t
 something did. They are deliberately different shapes — an element, an attribute handler on an
 image, a trailing script, an SVG — because a template that escaped one and not another is the
 realistic failure, not one that escaped nothing.
+
+``canonical`` is the **authoritative source title**, and it belongs here for exactly the reason
+``title`` does: it is a string somebody else wrote that arrives on this surface. It is not a
+duplicate of ``title``. A sidecar manifest is a file in the corpus, so anybody who can get a
+document indexed can supply one — and unlike a filename, which a filesystem constrains to no
+slashes and a length limit, a manifest field is arbitrary JSON text. It reaches the same pages by
+a different route: ``title`` is what the connector discovered, ``canonical`` is what the manifest
+declared and the pipeline preferred over it. A test that only planted ``title`` would be
+exercising the route that is now the *fallback*.
 """
 
 CONVERSATION = "conv-hostile"
 SHARE_TOKEN = "a-token-that-resolves"  # noqa: S105 - a share token, and a fixture one
+
+
+def hostile_provenance() -> Provenance:
+    """A source record whose every free-text field is hostile.
+
+    The canonical URI is **not** hostile, and cannot be: the interface restricts it to ``http``
+    and ``https`` before it can be stored, and re-validates on every read, so there is no way to
+    get a ``javascript:`` address into a record that a page will render. That refusal is asserted
+    in ``tests/test_provenance.py``; what is left for this surface to prove is the fields that
+    are legitimately arbitrary text — a title and a hierarchy somebody wrote in a JSON file.
+    """
+    return Provenance(
+        source=SourceMetadata(
+            title=MARKUP["canonical"],
+            canonical_uri="https://docs.example.test/pages/123456/retry-policy",
+            source_id="123456",
+            version="7",
+            section_path=(MARKUP["section"],),
+        ),
+        snapshot=LocalSnapshot(path="mirror/123456.html"),
+    )
 
 
 def _hostile_citation(document: Document) -> Citation:
@@ -90,7 +124,15 @@ def backend_with_hostile_text() -> tuple[FakeBackend, Document]:
     """
     backend, document = backend_with_a_document()
     hostile = make_document(
-        backend.settings.workspace, source_id="hostile.md", title=MARKUP["title"]
+        backend.settings.workspace,
+        source_id="hostile.md",
+        title=MARKUP["title"],
+        # A sidecar manifest is a file in the corpus, so its fields are attacker-controlled text
+        # arriving by a *different* route from the filename — and unlike a filename, arbitrary
+        # JSON rather than something a filesystem constrains. The title here is deliberately not
+        # the same string as `title` above so that a page which escaped one and not the other
+        # says which.
+        provenance=hostile_provenance(),
     )
     chunk = make_chunk(hostile, text=MARKUP["quote"]).model_copy(
         update={"heading_path": (MARKUP["heading"],)}

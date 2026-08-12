@@ -1,7 +1,7 @@
 """Model output and corpus content reach HTML here, and they reach it inert.
 
 This is the security property the browser surface introduces, so it is asserted in the way that
-can fail: hostile strings are planted in **four different fields**, each on the path a real
+can fail: hostile strings are planted in **six different fields**, each on the path a real
 attacker would use, and every page that renders them is checked against what the route actually
 returned rather than against a template read off disk.
 
@@ -9,7 +9,20 @@ returned rather than against a template read off disk.
 - a **heading path** — whatever the parser found inside it;
 - an **answer body** — a model writing about that document;
 - a **citation quote and label** — the document's own words, travelling back out under
-  manicule's name.
+  manicule's name;
+- an **authoritative source title** and **source hierarchy** — whatever an adjacent sidecar
+  manifest declared, and preferred over the filename.
+
+The last two arrive by a different route from the first, which is why they are separate entries
+rather than covered by it. A filename is attacker-controlled but a filesystem constrains its
+length and its character set; a manifest field is arbitrary JSON text in a file anybody who can
+get a document indexed can also write. And since the pipeline *prefers* the manifest's title, the
+filename is now the fallback — so a suite that planted only in the filename would be exercising
+the path that is taken second.
+
+A refused manifest's diagnostic is checked too, on its own, and it is the easiest of these to
+overlook: an error message feels like manicule's own words, and it is not — it quotes a filename
+and a validation failure straight out of the file.
 
 The last test is the one that makes the rest mean anything. It switches autoescaping off and
 asserts the same page then *does* carry raw markup — so the assertions above are known to be
@@ -24,6 +37,7 @@ import pytest
 from jinja2 import Environment
 from markupsafe import escape
 
+from manicule.core.provenance import PROVENANCE_KEY, LocalSnapshot, Provenance
 from manicule.web import rendering
 from tests.web.support import (
     CONVERSATION,
@@ -67,9 +81,23 @@ PLANTED: tuple[tuple[str, tuple[str, ...]], ...] = (
     # The passage text a search hit shows is the chunk's own bytes, which is the same string
     # the citation quote carries.
     ("quote", ("/ui/documents/{document}", f"/ui/chat/{CONVERSATION}", "/ui/search?q=retry")),
+    # The authoritative source title and hierarchy, out of a sidecar manifest. A manifest is a
+    # file in the corpus, so these are attacker-controlled on the same terms as a filename — and
+    # arbitrary JSON text rather than something a filesystem constrains in length or character
+    # set. They render on the document page's source panel, which is the only place either
+    # appears, so this pair is the whole of their coverage.
+    ("canonical", ("/ui/documents/{document}",)),
+    ("section", ("/ui/documents/{document}",)),
 )
 
-SENTINELS = ("window.__title", "window.__heading", "window.__answer", "window.__quote")
+SENTINELS = (
+    "window.__title",
+    "window.__heading",
+    "window.__answer",
+    "window.__quote",
+    "window.__canonical",
+    "window.__section",
+)
 """What each hostile string would set if it ever executed.
 
 Named so an assertion can say which field escaped. They are checked for their *raw* forms
@@ -104,6 +132,45 @@ def test_hostile_text_renders_inert(field: str, path: str) -> None:
     for sentinel in SENTINELS:
         raw = "<script>" + sentinel
         assert raw not in body, f"{sentinel} reached the page as executable markup"
+
+
+def test_a_refused_manifests_reason_reaches_the_page_inert() -> None:
+    """The diagnostic quotes the manifest, so the diagnostic is attacker-controlled too.
+
+    A separate test rather than a sixth row in :data:`PLANTED`, because a record carries either a
+    source or a reason and never both — one fixture cannot plant in both fields, and a row that
+    silently rendered nothing would be the exact failure the ``escape`` assertion above exists to
+    catch.
+
+    Worth having at all because it is the easiest of these to overlook: the source title is
+    obviously corpus text, while an error message feels like manicule's own words. It is not. It
+    quotes a filename and pydantic's report of what was wrong with a field, and both come
+    straight out of the file.
+    """
+    hostile = "<script>window.__reason=1</script>bad manifest"
+    backend, document = backend_with_hostile_text()
+    refused = document.model_copy(
+        update={
+            "metadata": {
+                PROVENANCE_KEY: Provenance(
+                    snapshot=LocalSnapshot(path="mirror/123456.html"),
+                    unavailable_reason=hostile,
+                ).as_metadata_value()
+            }
+        }
+    )
+    backend.store.documents[refused.id] = refused
+    backend.organisation_.documents[refused.id] = refused
+
+    with client_for(backend) as client:
+        body = client.get(f"/ui/documents/{refused.id}").text
+
+    assert hostile not in body, "the refusal reason reached the page unescaped"
+    assert str(escape(hostile)) in body, (
+        "the refusal reason does not appear on this page at all, so this test asserts nothing — "
+        "an operator with a broken manifest would have no way to find out why"
+    )
+    assert "<script>window.__reason" not in body
 
 
 def test_no_template_marks_anything_safe() -> None:

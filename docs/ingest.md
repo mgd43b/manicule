@@ -322,12 +322,12 @@ original beside it satisfies nobody.
 
 ## 4. Change detection
 
-Two levels, cheapest first, and one condition both of them carry.
+Two levels, cheapest first, and the conditions they carry.
 
 ```
-1. version_token differs?   no, and parse lineage current  -> skip, record liveness, done
-2. content_hash differs?    no, and parse lineage current  -> skip, record liveness, update token
-3. otherwise                                               -> full ingest
+1. version_token differs?  no, parse lineage current                      -> skip, record liveness, done
+2. content_hash differs?   no, parse lineage current, source record same  -> skip, record liveness, update token
+3. otherwise                                                              -> full ingest
 ```
 
 **"Unchanged" is a claim about the stored text, not only about the bytes.** Both levels
@@ -341,7 +341,31 @@ one that matters: a source whose version token has not moved never reaches the b
 comparison at all, so a check placed only at level 2 would leave every well-behaved
 connector's corpus permanently stale.
 
-It is selective by construction — the comparison is against the parser *this document* used,
+**And it is a claim about the metadata, not only about the text.** The same trap, one field
+along. A document may carry an authoritative source record ([`storage.md`](storage.md) §4.2.1) —
+a mirrored page's real title, canonical URL, source identity and version, out of an adjacent
+sidecar manifest. Correcting that manifest changes what every citation of the document *says*
+while leaving the page's own bytes byte-for-byte identical, so `content_hash` agrees and level 2
+skips. Worse than merely skipping: the skip path then records the **new** `version_token`, so the
+corrected record is never read again on any later sync either, and the corpus cites a version it
+was told about and then declined to look at. Level 2 therefore also compares the record the fetch
+just brought back against the stored one.
+
+The condition sits on level 2 alone, and that asymmetry is deliberate rather than an oversight:
+level 1 runs *before* the fetch, so there is no record in hand to compare. What covers level 1 is
+the connector's own change token — the filesystem connector folds the manifest's size and
+modification time into it, so an edit to either half of a document-plus-manifest pair moves the
+token. A connector that supplies records must move its token when its metadata moves, for the same
+reason any connector must move it when its bytes do.
+
+Both comparisons go through the validating accessor, so an unusable record on either side reads as
+absent and compares equal to another absent one — two documents about which nothing authoritative
+is known are not different documents. And a fetch that brings *no* record leaves a stored one
+alone rather than counting as a change, so a connector that supplies metadata on only some of its
+paths does not re-ingest its corpus on every run.
+
+Parse lineage is selective by construction — the comparison is against the parser *this document*
+used,
 so a PDF library bump re-parses the PDFs and leaves the Markdown untouched — and it costs a
 re-parse rather than a re-fetch, because level 2 has already fetched. A parser manicule does
 not ship records no lineage and expects none, so a plugin corpus does not re-parse forever to
