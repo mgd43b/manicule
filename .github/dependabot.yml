@@ -158,6 +158,14 @@ updates:
       # the fingerprint and ingest says so. It is grouped here because that is what a bump
       # costs, not because nothing would notice: provisional chunks are refused by ingest
       # outright, so the practical effect is on dry-run parses and fixture builds.
+      #
+      # A `tiktoken` bump also touches the offline vocabulary bundle, and does so in a way
+      # that is checked rather than assumed. Bundles are *not* refused on a version mismatch,
+      # because the `.tiktoken` files have not moved across releases and forcing a rebuild
+      # that changes nothing would land on the hosts least able to rebuild anything. What is
+      # checked is the thing that would actually break: a release asking for a different URL,
+      # or declaring a different digest, fails the offline suite here rather than on an
+      # air-gapped host at its first question.
       index-affecting-chunking:
         patterns:
           - "tiktoken"
