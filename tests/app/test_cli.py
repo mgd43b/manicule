@@ -545,9 +545,16 @@ EMITTED_OP_LANDMARKS: frozenset[str] = frozenset(
 The scan reads string literals out of an AST, which is the kind of derivation that returns an
 empty set when it is pointed at the wrong thing — and an empty set satisfies a subset check.
 
-The last four are the reason this list is not just the obvious commands. They reach
-``print_envelope`` through call shapes ``emit`` is not one of, in files ``main.py`` is not one
-of, and a scan that lost them would still find twenty-nine ops and look healthy.
+``start``, ``stop``, ``completion`` and ``index_changes`` are why this is not just the obvious
+commands. Each reaches ``print_envelope`` through a call shape that is not ``emit``, from a
+file that is not ``main.py`` in three of the four cases — and a scan that lost all four would
+still find the large majority of the operations and look perfectly healthy.
+"""
+
+MINIMUM_CLI_MODULES = 5
+"""A floor on how many modules the surface has, far below the real count.
+
+Present to catch a scan reading the wrong directory, not to track the package's size.
 """
 
 OP_TAKING_CALLS: frozenset[str] = frozenset({"emit", "run_op", "succeeded", "failed"})
@@ -564,6 +571,13 @@ def _op_literals(tree: ast.AST) -> set[str]:
 
     Deliberately only literals. A computed op name would not be found, and a scan that guessed
     at one would report a name nothing emits.
+
+    Deliberately only *bare-name* calls, too — ``emit(...)`` and not ``something.emit(...)``.
+    That narrowing is safe in the direction that matters: an operation reached through an
+    attribute call is one this scan does not find, which makes its ``PAYLOADS`` entry
+    unaccounted for and fails :func:`test_the_scan_accounts_for_every_payload_entry`. A missed
+    shape is a loud failure rather than a quiet hole, which is the whole reason that test
+    exists.
     """
     found: set[str] = set()
     for node in ast.walk(tree):
@@ -609,13 +623,6 @@ def _emitted_ops() -> set[str]:
     for module in modules:
         found |= _op_literals(ast.parse(module.read_text(encoding="utf-8")))
     return found
-
-
-MINIMUM_CLI_MODULES = 5
-"""A floor on how many modules the surface has, far below the real count.
-
-Present to catch a scan reading the wrong directory, not to track the package's size.
-"""
 
 
 def test_every_operation_the_command_line_emits_has_a_payload_type() -> None:
