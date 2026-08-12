@@ -512,17 +512,22 @@ def _fetch(encoding: str, bundle_dir: Path | None) -> None:
 
 
 def _unavailable(encoding: str, blobpath: str) -> str:
-    """What a query says when a vocabulary was never pre-seeded onto this machine."""
+    """What a query says when a vocabulary was never pre-seeded onto this machine.
+
+    It names one command, and the command exists: ``manicule doctor --fix`` seeds the
+    vocabularies alongside the grammars, from an offline bundle first. A message that told an
+    operator to run a Python one-liner would be describing manicule's internals to somebody
+    who wants their search to work.
+    """
     return (
         f"the {encoding!r} vocabulary is not on this machine: tiktoken needs "
         f"{blobpath.rsplit('/', 1)[-1]} and the cache at {cache_directory()} does not hold it "
         f"(or the copy there does not match the digest tiktoken expects). manicule never "
         f"downloads a vocabulary while answering a question, because that turns an install "
-        f'step into an intermittent query failure. Pre-seed it — `python -c "from manicule '
-        f"import vocabularies; vocabularies.prefetch(['{encoding}'])\"` on a host with "
-        f"network access — or carry an offline bundle built by "
-        f"tools/build_vocabulary_bundle.py. {_offline_summary(None)}. Set {CACHE_DIR_ENV} to "
-        f"a durable directory if the cache above is under a temporary directory."
+        f"step into an intermittent query failure. Run `manicule doctor --fix` to seed it, or "
+        f"carry an offline bundle built by tools/build_vocabulary_bundle.py. "
+        f"{_offline_summary(None)}. Set {CACHE_DIR_ENV} to a durable directory if the cache "
+        f"above is under a temporary directory."
     )
 
 

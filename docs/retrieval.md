@@ -826,6 +826,19 @@ that was read and where a bundle was looked for. The counter resolves at constru
 is while `build_retriever` is assembling retrieval, so the refusal arrives at startup rather
 than inside a query.
 
+**Something runs that pre-seed, and it is the same something that seeds the grammars.**
+`manicule init` seeds both, and `manicule doctor --fix` repairs both — one call each, so an
+install and a repair cannot drift into meaning different things. A pre-seed that fails is a
+note rather than an exception, exactly as [`parsing.md`](parsing.md) §8.1 has it: the
+configuration is already written and an air-gapped host must still be able to finish
+installing. `doctor` reports a missing vocabulary as **failing** where it reports a missing
+grammar as **degraded**, and the asymmetry is deliberate. A corpus of Markdown and PDFs works
+perfectly with no grammars, so a red check there would be a red check on a healthy machine —
+which teaches an operator to ignore `doctor`. There is no corpus that works without a
+vocabulary: every context is measured with it, so a machine without one cannot answer at all.
+`--fix` is offered by the command line and by nothing else — an assistant holding a tool call
+and a health endpoint must not be able to start a download.
+
 The recorded identity is unchanged and that is the point: `provisional:x1.5:tiktoken/…@0.13.0`
 names a release, and the release was only ever a *claim* about the bytes while those bytes
 arrived from a URL nobody checked. Every byte the pre-seed writes is now verified against the

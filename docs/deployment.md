@@ -267,18 +267,28 @@ connection error naming a blob storage host. Three things fix it, in increasing 
 effort:
 
 ```sh
-# 1. On a host that has a network — the ordinary case. 5.3 MB, once.
-python -c "from manicule import vocabularies; vocabularies.prefetch(vocabularies.required_encodings())"
+# 1. On a host that has a network — the ordinary case, and `manicule init` already did it.
+#    5.3 MB, once. The same command repairs an install that was made before it had a route.
+manicule doctor --fix
 
 # 2. On a host that never will. Build the bundle where there is a network:
 python tools/build_vocabulary_bundle.py --output dist/vocabularies
-#    copy `dist/vocabularies` across, and point manicule at it:
+#    copy `dist/vocabularies` across, point manicule at it, and seed from it:
 export MANICULE_VOCABULARY_BUNDLE=/opt/manicule/vocabularies
+manicule doctor --fix
 
 # 3. Or build it into a distribution, so it installs like any other dependency
 #    and needs no environment variable at all:
 python tools/build_vocabulary_bundle.py --output build/pkg --package
 ```
+
+`init` and `doctor --fix` seed the vocabularies through the same call, alongside the grammars,
+so an install and a repair cannot come to mean different things. A pre-seed that could not
+complete is a **note in the report, not a refusal to finish**: the configuration is written,
+and an air-gapped host with no bundle can still install software it is perfectly able to run
+once the bundle arrives. `doctor` then reports it as **failing** — not degraded, which is what
+a missing grammar is, because a corpus of Markdown works fine without a grammar and nothing
+works without a vocabulary.
 
 **Set `TIKTOKEN_CACHE_DIR` on any host you pre-seed.** With nothing set, `tiktoken` caches
 under the system temporary directory, and a temp sweep that removes 5 MB turns a working

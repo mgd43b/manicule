@@ -209,6 +209,10 @@ if bad:
 # The state is read out of the envelope, and `ok` specifically: a missing grammar is *degraded*
 # — an installation with no code in its corpus is fine as it is — so `assert_healthy` below
 # would not catch an image that shipped without them, and this image is meant to have them.
+#
+# The vocabularies `doctor --fix` also seeds need no equivalent line here, and the reason is
+# the severity: a missing vocabulary is *failing*, because no corpus can be searched without
+# one, so `assert_healthy` catches an image that shipped without them on its own.
 manicule --json doctor --fix | python -c "
 import json, sys
 checks = {check['name']: check for check in json.load(sys.stdin)['data']['checks']}

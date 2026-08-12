@@ -164,6 +164,35 @@ def test_only_the_command_line_can_ask_doctor_to_repair_anything(
     assert "--fix" in {str(opt) for parameter in params for opt in getattr(parameter, "opts", [])}
 
 
+def test_the_repair_flag_reaches_the_service_rather_than_merely_existing(
+    service: ApplicationService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The half a declaration cannot prove: that ``--fix`` is *wired*, not just offered.
+
+    The assertion above establishes that exactly one surface offers the flag. It stays green
+    if the option is declared and never passed — a flag an operator types, that reports a
+    healthy-looking diagnosis, and repairs nothing. Found by disabling the pass-through and
+    watching that test stay green, which is the only way this kind of gap is ever found.
+
+    Through the real Typer command and the real dispatch, with only the service's own method
+    recorded, so what is observed is the argument arriving rather than a mock being called.
+    """
+    from manicule.app import results  # noqa: PLC0415 - only this assertion needs the model
+
+    asked: list[bool] = []
+
+    async def record(*, fix: bool = False) -> results.Diagnosis:
+        asked.append(fix)
+        return results.Diagnosis(state="ok")
+
+    monkeypatch.setattr(service, "doctor", record)
+
+    _cli(monkeypatch, service, ["doctor", "--fix"])
+    _cli(monkeypatch, service, ["doctor"])
+
+    assert asked == [True, False], "the flag is declared and does not reach the service"
+
+
 def test_every_tool_describes_itself_and_its_arguments(service: ApplicationService) -> None:
     """A tool with no description is a tool nothing knows when to call.
 

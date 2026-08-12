@@ -266,20 +266,30 @@ it again resumes.
 and `unknown` — the last is a check that could not run, which is deliberately not `ok`.
 
 Checks: `configuration`, `transport`, `plugins`, `storage`, `permissions`, `index`, `grammars`,
-and `component:<kind>:<name>` for anything already constructed.
+`vocabularies`, and `component:<kind>:<name>` for anything already constructed.
 
 **`doctor` builds nothing expensive.** No model runtime is loaded and no document is read, so
 it is safe on an installation that is not working — which is the only time anybody runs it.
 
 **`manicule doctor --fix` is the one exception, and it is a flag for that reason.** It performs
-the repairs `doctor` knows how to perform — today exactly one, seeding the declared tree-sitter
-grammars from an offline bundle if one is installed and from the grammar release otherwise
-([`parsing.md`](parsing.md#81-grammar-packaging-is-the-real-problem) §8.1) — and then reports
-the state that resulted. It is the only part of this command that writes to the machine or uses
-the network, and it is passed by **the command line alone**: the MCP tool and `GET
-/api/v1/health` call the report, because a diagnostic an assistant can reach should not be able
-to start a download. `manicule init` runs the same repair, which is how a fresh install ends up
-with grammars rather than discovering at first index that it has none.
+the repairs `doctor` knows how to perform — today two, and they are one repair against two
+libraries with the same gap: seeding the declared tree-sitter grammars
+([`parsing.md`](parsing.md#81-grammar-packaging-is-the-real-problem) §8.1) and the BPE
+vocabularies every search measures a context with
+([`retrieval.md`](retrieval.md#72-two-token-counters-and-using-the-wrong-one-is-a-category-error) §7.2), each from an offline
+bundle if one is installed and from its upstream otherwise — and then reports the state that
+resulted. They are the only parts of this command that write to the machine or use the network,
+and the flag is passed by **the command line alone**: the MCP tool and `GET /api/v1/health`
+call the report, because a diagnostic an assistant can reach should not be able to start a
+download. `manicule init` runs the same repairs, which is how a fresh install ends up able to
+parse code and answer a question rather than discovering at first index, or at first search,
+that it cannot.
+
+The two absences are reported at different severities on purpose. **Missing grammars are
+`degraded`**: a corpus of Markdown and PDFs works perfectly without one, and a red check on a
+healthy machine teaches an operator to ignore `doctor`. **A missing vocabulary is `failing`**:
+every context is measured with it whatever the corpus holds, so a machine without one cannot
+answer a question at all.
 
 `stats`, `index_status` and `doctor` are deliberately thin. Trends, history and alerting
 belong to Operations ([#14](https://github.com/mgd43b/manicule/issues/14)); a surface that

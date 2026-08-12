@@ -229,6 +229,10 @@ def test_the_query_path_refuses_rather_than_downloading_what_it_was_not_given(
     assert vocabularies.CACHE_DIR_ENV in message
     assert bundles.BUNDLE_DIR_ENV in message
     assert "tools/build_vocabulary_bundle.py" in message
+    # The command, and it exists: `manicule doctor --fix` seeds vocabularies alongside
+    # grammars. A refusal that named a Python one-liner would be describing manicule's
+    # internals to somebody who wants their search to work.
+    assert "manicule doctor --fix" in message
     assert no_network == []
 
 
