@@ -1424,6 +1424,21 @@ guardrail. So it is closed in three moves:
    fixed via `configure(PackConfig(...))`). Container images prefetch at build time. The
    manifest URL is overridable, so an air-gapped deployment can point at an internal mirror.
 
+   Both commands reach it through one method — `ApplicationService._grammar_check(fix=True)` —
+   and `doctor` without `--fix` runs the same check as a **report**: a `grammars` check that
+   names what is absent, against the *configured* cache directory rather than the per-user
+   default, because those differ on exactly the deployments that care. `--fix` is the only
+   part of `doctor` that writes to the machine or uses the network, which is why it is a flag
+   and why it is passed by the command line alone — the MCP tool and the HTTP route call the
+   report. A pre-seed that fails during `init` is a note on the report rather than an error:
+   the configuration file is written by then, and a corpus of Markdown needs no grammar at all.
+
+   None of that was true when it was first written down. `prefetch` had no caller, `doctor`
+   reported nothing about grammars, and `--fix` did not exist — while the refusal every
+   unparsed source document carries said to run it. `tests/parsers/test_grammars.py` now runs
+   every command this subsystem names and fails if it is absent, if its flag is absent, or if
+   running it does not reach `prefetch`.
+
    **Two things about the pack's own API make this less obvious than it reads**, and both
    were found by observation rather than from its documentation:
 
@@ -1475,7 +1490,7 @@ Three options were on the table and all three are settled here:
 
 | Option | Verdict |
 |---|---|
-| **Vendor a bundle** as a directory or an installable distribution | **taken.** Both, in fact — `--package` writes an importable `manicule_grammars` around the same bundle, so a site that installs software rather than copying directories needs no extra step |
+| **Vendor a bundle** as a directory or an installable distribution | **taken.** Both, in fact — `--package` writes an importable `manicule_grammars` around the same bundle *and the `pyproject.toml` that makes it installable*, so a site that installs software rather than copying directories needs no extra step |
 | **Build grammars at install time** | **rejected**, and recorded so it is not re-proposed: it needs a C toolchain on the user's machine, and the API for building a shared library was removed from `py-tree-sitter` at 0.22 |
 | **Ship the cache directory as a copyable artifact** | **taken, with a manifest.** A bare cache directory is a set of files with no statement of which release, which platform or which bytes they are. That statement is the whole difference between a copyable artifact and a copyable guess |
 
@@ -1512,6 +1527,24 @@ reported as present and then fails at `get_parser` with `Language 'python' not f
 reaches the parser chain as an ordinary exception and *advances* it, handing the document to
 the next parser. `GrammarUnusableError` is a subclass of `GrammarUnavailableError`, so
 everything already written to stop on a missing grammar stops on a broken one unchanged.
+
+**`--package` output is a distribution, and the test proves it by installing it.** The metadata
+is written by the builder rather than by whoever consumes its output — it was not, once, and the
+deployment that needed it had to supply a `pyproject.toml` of its own, which put the one file
+naming the pack release and the platform somewhere that could see neither. The version now says
+both (`1.14.3+macos.arm64`, a PEP 440 local segment, so it describes what the thing is good for
+in `pip list`). Two lines in it are load-bearing rather than boilerplate:
+
+- `artifacts = ["*.so", "*.dylib", "*.dll"]`. The payload is entirely compiled shared libraries,
+  hatchling honours a `.gitignore` beside the project it builds, and `*.so` is one of the most
+  commonly ignored patterns in existence. Without it the wheel builds, installs, and carries a
+  manifest describing libraries that are not in it — demonstrated, not theorised.
+- No dependency on `manicule`. A bundle is valid for a `tree-sitter-language-pack` release and a
+  platform, and neither of those is a manicule version.
+
+Because a test that listed the files the builder wrote would have passed against output that was
+not installable at all, `tests/parsers/test_grammar_bundle.py` installs the distribution with
+`uv pip install --offline` and seeds and parses out of what was *installed*.
 
 **The licence is asserted where redistribution starts.** The bundle build refuses any copyleft
 term and any term nobody has assessed, and records the expression it asserted. The scope of

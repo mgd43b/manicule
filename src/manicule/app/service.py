@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
     from manicule.generation.ports import ConversationRecord
     from manicule.ingest.pipeline import RunReport
+    from manicule.parsers.config import SourceCodeConfig
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
 
@@ -565,12 +566,24 @@ class ApplicationService:
             by_status=dict(statistics.get("by_status", {})),
         )
 
-    async def doctor(self) -> r.Diagnosis:
+    async def doctor(self, *, fix: bool = False) -> r.Diagnosis:
         """Check what can be checked without building anything expensive.
 
         Every check answers one question and says what to do when the answer is bad. It does
         not load a model runtime, does not open a provider connection and does not read a
         document — a diagnostic that needs the system working is not a diagnostic.
+
+        Args:
+            fix: Perform the repairs this command knows how to perform, and then report the
+                state that resulted. Exactly one repair exists — seeding the declared code
+                grammars, :meth:`_grammar_check` — and it is the only thing here that writes
+                to the machine or may use the network.
+
+                **Off by default, and passed only by the command line.** The MCP tool and the
+                HTTP route both call this with no arguments, deliberately: a diagnostic an
+                assistant can reach should not be able to start a download, and a repair is a
+                thing an operator asks for rather than something a health page does on their
+                behalf. ``tests/app/test_surface_parity.py`` holds that line.
         """
         checks: list[r.Check] = [
             self._configuration_check(),
@@ -583,6 +596,7 @@ class ApplicationService:
         # "not created" on every first run, which reads as a fault and is not one.
         checks.append(await self._permissions_check())
         checks.append(await self._index_check())
+        checks.append(await self._grammar_check(fix=fix))
         checks.extend(await self._backend.component_checks())
         worst: r.CheckState = "ok"
         for check in checks:
@@ -637,6 +651,15 @@ class ApplicationService:
         )
 
     async def _storage_check(self) -> r.Check:
+        """Whether the database is at a schema revision, and what it means when it is not.
+
+        The remedy used to be "run ``manicule init``", and that was a repair nobody had
+        written: ``init`` chooses an embedding backend and writes a configuration file, and it
+        does not open the database at all. Migrations run when the document store is first
+        built — which is what asking this question just did, one line above. So an answer of
+        "no revision" is not a step somebody skipped; it is migrations that ran and did not
+        stick, and the fixes for that are about the directory rather than about a command.
+        """
         try:
             maintenance = await self._backend.maintenance()
             revision = await maintenance.schema_revision()
@@ -646,7 +669,12 @@ class ApplicationService:
             return r.Check(
                 name="storage",
                 state="degraded",
-                detail="the database carries no schema revision; run `manicule init`",
+                detail=(
+                    f"the database in {self.settings.data_dir} carries no schema revision. "
+                    f"Opening it applies them, and opening it is what this check just did, so "
+                    f"they did not take: check the directory is writable by the account "
+                    f"running manicule and that the database file is not from a later version."
+                ),
             )
         return r.Check(name="storage", state="ok", detail=f"schema at {revision}")
 
@@ -722,6 +750,148 @@ class ApplicationService:
             state="ok",
             detail=f"{documents} document(s) in {fingerprints.vector_table or 'no vector table'}",
         )
+
+    async def _grammar_check(self, *, fix: bool = False) -> r.Check:
+        """Whether the declared code grammars are on this machine — and, with ``fix``, seed them.
+
+        The grammars are **not in the grammar pack's wheel**: it downloads them per language on
+        first use, so a fresh install has none and every source file it is offered is refused
+        (``docs/parsing.md`` §8.1). That refusal is deliberate — a silent line-splitting
+        fallback is how two machines end up with two chunkings of one corpus — but it is only
+        actionable if something says so before a person indexes their code and finds every
+        ``.py`` file marked unsupported. This is that something.
+
+        **Degraded rather than failing when grammars are absent**, and the distinction is a
+        judgement about what a bad answer means. Nothing here is broken: an installation whose
+        corpus is Markdown and PDFs works perfectly with no grammars at all, and reporting a
+        red check on it would teach an operator to ignore ``doctor``. What is true is that
+        source files will be refused, which is a capability this installation does not
+        currently have. The two states that *are* failing are a bundle that is present and
+        unusable, and a declared set that does not validate: both are misconfigurations
+        somebody made, and both are invisible until something tries to parse code.
+
+        **The configured cache is applied before the question is asked**, which is the whole
+        reason this is not two lines. The grammar pack keeps one process-global registry and
+        ``doctor`` runs before any parser is constructed, so a check that simply asked would
+        answer about the per-user cache while the installation reads an image-local one — and
+        would report an image full of grammars as empty. That is the same shape as the macOS
+        cache-redirect bug this area has already been burned by, so the configuration is
+        applied here explicitly, with the values the parser itself would use. It is the same
+        call the parser's own factory makes with the same values read from the same settings,
+        so a ``doctor`` run alongside an ingest repoints nothing: the cost of the overlap is
+        that the pack's per-language parser cache is rebuilt, not that it is rebuilt differently.
+
+        Args:
+            fix: Seed what is missing before reporting, from the offline bundle first and the
+                network only for what the bundle did not supply. A failed seed is ``failing``
+                rather than ``degraded``: a repair was asked for and did not happen.
+
+        Returns:
+            One check. It never raises — every way this can go wrong is a diagnosis, and a
+            ``doctor`` that crashed on a broken bundle would be a diagnostic that only works
+            on a healthy machine.
+        """
+        return await asyncio.to_thread(self._inspect_grammars, fix=fix)
+
+    def _inspect_grammars(self, *, fix: bool) -> r.Check:
+        """The blocking half of :meth:`_grammar_check`, off the event loop.
+
+        Blocking because it lists a directory, reads a bundle manifest, and — under ``fix`` —
+        copies libraries or fetches a release. The import is lazy for the reason every parsing
+        import in this file is: an installation without the parsing extra still runs ``doctor``,
+        and it must not be the command that discovers the extra is missing by failing to start.
+        """
+        from manicule.parsers import grammar_bundle, grammars  # noqa: PLC0415 - a parsing extra
+
+        try:
+            config = self._source_code_config()
+        except ValidationError as exc:
+            return r.Check(
+                name="grammars",
+                state="failing",
+                detail=(
+                    f'the code parser\'s configuration (plugins.config."parser.sourcecode") '
+                    f"does not validate, so nothing can say which grammars this installation "
+                    f"needs: {exc}"
+                ),
+            )
+
+        seeded: tuple[str, ...] = ()
+        try:
+            languages = grammars.validate_languages(config.languages)
+            grammars.configure_pack(
+                languages,
+                cache_dir=config.grammar_cache_dir,
+                manifest_url=config.grammar_manifest_url,
+            )
+            # `locate` rather than `resolve`: it answers "is there a bundle here at all" from
+            # an environment variable and a module spec, where resolving reads the manifest and
+            # stats every library in it. That matters because the browser surface renders this
+            # check on a page, and `bundle_status` below reads the bundle anyway — so resolving
+            # here would read it twice per request to say one thing.
+            located = grammar_bundle.locate()
+            missing = grammars.missing_grammars(languages)
+            if missing and fix:
+                seeded = grammars.prefetch(languages)
+                # Asked of the cache again rather than taken from what the seed returned. The
+                # pack's own prefetch reports success for a language in its process-global
+                # registry whatever the configured cache holds, which is how an image ships
+                # with no grammars in it and is told it succeeded.
+                missing = grammars.missing_grammars(languages)
+            # Quoted when it is actionable — something is absent, or a bundle is installed and
+            # is therefore a fact about this machine worth stating. On a healthy install with no
+            # bundle it is three lines of advice about a thing nobody needs, and this check is
+            # read on a page. A bundle that is present and unusable raises out of here, which is
+            # the one case where "no bundle" would be a lie.
+            offline = grammars.bundle_status() if missing or located is not None else ""
+        except ImportError:
+            return r.Check(
+                name="grammars",
+                state="unknown",
+                detail=(
+                    "the parsing extra is not installed, so there are no grammars to check "
+                    "and no source file would be parsed here. Install `manicule[parsers]`."
+                ),
+            )
+        except ManiculeError as exc:
+            # ConfigError for a language key that is not in the manifest, GrammarBundleError
+            # for a bundle that is installed and wrong, GrammarFetchError for a seed that
+            # could not complete. Each already says what to do about itself.
+            return r.Check(name="grammars", state="failing", detail=str(exc))
+
+        cache = grammars.cache_directory()
+        if missing:
+            return r.Check(
+                name="grammars",
+                state="degraded",
+                detail=(
+                    f"no grammar for {list(missing)} in {cache}, so documents in those "
+                    f"languages are refused rather than line-split. Run `manicule doctor "
+                    f"--fix` to seed them — {offline}"
+                ),
+            )
+        settled = f"seeded {list(seeded)}; " if seeded else ""
+        carried = f"; {offline}" if offline else ""
+        return r.Check(
+            name="grammars",
+            state="ok",
+            detail=(
+                f"{settled}{len(languages)} declared grammar(s) in {cache} "
+                f"({grammars.PACK_DISTRIBUTION} {grammars.pack_version()}){carried}"
+            ),
+        )
+
+    def _source_code_config(self) -> SourceCodeConfig:
+        """The code parser's configuration, validated the way the parser's own factory does.
+
+        Read from settings rather than defaulted, because the declared language set and both
+        grammar overrides are configuration: a container image points the cache inside the
+        image and an air-gapped site points the manifest at a mirror, and a diagnostic that
+        checked manicule's defaults would be describing a different installation.
+        """
+        from manicule.parsers.config import SourceCodeConfig as Model  # noqa: PLC0415 - see above
+
+        return Model.model_validate(self.settings.plugins.config.get("parser.sourcecode", {}))
 
     # --- configuration --------------------------------------------------------------------
 
@@ -1112,6 +1282,21 @@ class ApplicationService:
         The hardware probe picks the embedding backend rather than recommending one, because
         a default that is wrong for the machine is discovered at the first ingest, and by then
         a corpus has been indexed with it.
+
+        **It also pre-seeds the declared code grammars**, through the same call ``doctor
+        --fix`` makes, so the two cannot come to mean different things. The grammar pack ships
+        none in its wheel and fetches them per language on first use, which would make a file
+        chunk one way on a machine that reached the network and another way on a machine that
+        did not; ``docs/parsing.md`` §8.1 closes that by pre-seeding at install time, and
+        ``init`` is install time. The offline bundle is consulted first, so a host carrying one
+        needs no network here at all.
+
+        A pre-seed that fails is **reported, not raised.** The configuration file is written by
+        then, so raising would leave a config on disk and a command that says it failed, and the
+        retry would need ``--force``; the note carries the whole failure, ``doctor`` reports it
+        as degraded afterwards, and every source document refused says which command fixes it.
+        An installation with no grammars is a real state — a Markdown corpus never needs one —
+        and it is one this reports rather than one it prevents by refusing to finish.
         """
         path = config_file()
         if await asyncio.to_thread(path.exists) and not force:
@@ -1121,9 +1306,11 @@ class ApplicationService:
         settings = self.settings
         provider = "mlx" if probe["apple_silicon"] else "onnx"
         await asyncio.to_thread(_update_config, path, _initial_configuration(settings, provider))
+        pre_seed = await self._grammar_check(fix=True)
         notes = [
             f"embedding backend {provider!r} chosen for {probe['machine']} on {probe['system']}",
             "bind host written as 127.0.0.1; a wider bind needs auth and an explicit flag",
+            f"grammars ({pre_seed.state}): {pre_seed.detail}",
         ]
         return r.InitReport(
             path=str(path),

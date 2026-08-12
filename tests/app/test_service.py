@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -329,6 +330,164 @@ async def test_doctor_says_it_does_not_know_when_the_data_directory_is_not_there
     assert check.state == "unknown"
 
 
+@pytest.fixture
+def grammar_seeds(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """Record what the pre-seed is asked for instead of fetching it.
+
+    Every test here that reaches ``init`` or ``doctor --fix`` goes through this. Without it a
+    suite run on a machine with an empty grammar cache would download the declared set — 80-odd
+    megabytes, from a unit test, on the first checkout — and one run on a machine that has them
+    would prove nothing about the call ever happening. That the seeding *works* is proved
+    against a real bundle in ``tests/parsers/test_grammar_bundle.py``; what is asserted here is
+    which operations ask for it and what they do with the answer.
+    """
+    from manicule.parsers import grammars  # noqa: PLC0415 - a parsing extra, not core
+
+    asked: list[tuple[str, ...]] = []
+
+    def spy(languages: Sequence[str], **_: object) -> tuple[str, ...]:
+        asked.append(tuple(languages))
+        return tuple(languages)
+
+    monkeypatch.setattr(grammars, "prefetch", spy)
+    return asked
+
+
+def _empty_grammar_cache(cache: Path) -> Settings:
+    """Settings whose code parser reads a cache directory with nothing in it.
+
+    Configured rather than pointed at the pack directly: ``doctor`` applies the configured cache
+    before it asks what is present, and a test that redirected the pack would be answered about
+    a directory the service never reads.
+    """
+    return Settings(
+        plugins={  # pyright: ignore[reportArgumentType] - validated on the way in
+            "config": {"parser.sourcecode": {"grammar_cache_dir": str(cache)}}
+        }
+    )
+
+
+async def test_doctor_reports_grammars_it_cannot_find_without_fetching_them(
+    backend: FakeBackend, tmp_path: Path, grammar_seeds: list[tuple[str, ...]]
+) -> None:
+    """A report is a report. ``doctor`` on its own must not start an 80 MB download."""
+    backend.settings = _empty_grammar_cache(tmp_path / "cache")
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "grammars")
+
+    assert check.state == "degraded"
+    assert grammar_seeds == []
+
+
+async def test_doctor_fix_asks_the_pre_seed_for_the_whole_declared_set(
+    backend: FakeBackend, tmp_path: Path, grammar_seeds: list[tuple[str, ...]]
+) -> None:
+    """The repair, and the only thing in this command that writes to the machine.
+
+    The declared set, not the missing subset: what a machine is asked to hold is a decision made
+    in configuration, and the pre-seed is the one that works out what is already there. Asking
+    for the difference would put that arithmetic in two places.
+
+    What is asserted here is the wiring. That a seed actually populates a cache — and that the
+    check then reports ``ok`` and says what it seeded — is proved against a real bundle with no
+    network in ``tests/parsers/test_grammar_bundle.py``, because a double that claims to have
+    seeded and writes nothing is exactly the state ``prefetch`` exists to catch.
+    """
+    from manicule.parsers.grammars import DECLARED_LANGUAGES  # noqa: PLC0415 - a parsing extra
+
+    backend.settings = _empty_grammar_cache(tmp_path / "cache")
+
+    await ApplicationService(backend).doctor(fix=True)
+
+    assert grammar_seeds == [DECLARED_LANGUAGES]
+
+
+async def test_a_repair_is_reported_from_the_cache_rather_than_from_what_the_seed_returned(
+    backend: FakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ok`` means the grammars are there, not that something said it put them there.
+
+    The pre-seed has its own version of this assertion for a reason that is not hypothetical:
+    the grammar pack's own ``prefetch`` returns successfully for a language already in its
+    process-global registry **whatever the configured cache holds**, which is how a container
+    build ships an image with no grammars in it and is told it succeeded. This is the same
+    check one layer up, and it costs a directory listing. The double here is that failure with
+    the honesty removed: it reports success and writes nothing.
+    """
+    from manicule.parsers import grammars  # noqa: PLC0415 - a parsing extra, not core
+
+    def claim_success(languages: Sequence[str], **_: object) -> tuple[str, ...]:
+        return tuple(languages)
+
+    monkeypatch.setattr(grammars, "prefetch", claim_success)
+    backend.settings = _empty_grammar_cache(tmp_path / "cache")
+
+    diagnosis = await ApplicationService(backend).doctor(fix=True)
+    check = next(check for check in diagnosis.checks if check.name == "grammars")
+
+    assert check.state == "degraded", "doctor believed a pre-seed that wrote nothing"
+
+
+async def test_a_repair_that_could_not_complete_is_failing_rather_than_degraded(
+    backend: FakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Asked for and not done. Without ``--fix`` the same state is degraded, and rightly so:
+    nothing was attempted, and an installation with no code in its corpus is fine as it is."""
+    from manicule.parsers import grammars  # noqa: PLC0415 - a parsing extra, not core
+
+    def refuse(languages: Sequence[str], **_: object) -> tuple[str, ...]:
+        raise grammars.GrammarFetchError(f"no route to the grammar release for {list(languages)}")
+
+    monkeypatch.setattr(grammars, "prefetch", refuse)
+    backend.settings = _empty_grammar_cache(tmp_path / "cache")
+
+    diagnosis = await ApplicationService(backend).doctor(fix=True)
+    check = next(check for check in diagnosis.checks if check.name == "grammars")
+
+    assert check.state == "failing"
+    assert "no route to the grammar release" in check.detail
+    assert diagnosis.state == "failing"
+
+
+async def test_doctor_says_it_does_not_know_when_the_parsing_extra_is_not_installed(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Core installs without the parsing extra, and ``doctor`` is not the command that
+    discovers that by failing to run. There are no grammars to check and nothing is wrong."""
+    from manicule.parsers import grammars  # noqa: PLC0415 - a parsing extra, not core
+
+    def absent(languages: Sequence[str]) -> tuple[str, ...]:
+        del languages
+        raise ImportError("No module named 'tree_sitter_language_pack'")
+
+    monkeypatch.setattr(grammars, "missing_grammars", absent)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "grammars")
+
+    assert check.state == "unknown"
+    assert "manicule[parsers]" in check.detail
+
+
+async def test_a_code_parser_configuration_that_does_not_validate_is_reported(
+    backend: FakeBackend,
+) -> None:
+    """The declared language set decides what this installation parses at all, and a
+    configuration nothing can read is a diagnosis rather than a traceback out of ``doctor``."""
+    backend.settings = Settings(
+        plugins={  # pyright: ignore[reportArgumentType] - deliberately wrong, one layer down
+            "config": {"parser.sourcecode": {"languages": "python"}}
+        }
+    )
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "grammars")
+
+    assert check.state == "failing"
+    assert "parser.sourcecode" in check.detail
+
+
 async def test_doctor_builds_nothing_expensive(
     service: ApplicationService, backend: FakeBackend
 ) -> None:
@@ -515,9 +674,10 @@ def test_the_hardware_probe_says_what_it_actually_measured() -> None:
 
 
 async def test_init_writes_a_loopback_bind_explicitly(
-    service: ApplicationService, config_home: Path
+    service: ApplicationService, config_home: Path, grammar_seeds: list[tuple[str, ...]]
 ) -> None:
     """Written out rather than left to the default, so an operator can see it is loopback."""
+    del grammar_seeds
     report = await service.initialise()
     assert report.path == str(config_file())
     assert "127.0.0.1" in await asyncio.to_thread(config_home.read_text, "utf-8")
@@ -525,12 +685,61 @@ async def test_init_writes_a_loopback_bind_explicitly(
 
 
 async def test_init_refuses_to_overwrite_an_existing_configuration(
-    service: ApplicationService, config_home: Path
+    service: ApplicationService, config_home: Path, grammar_seeds: list[tuple[str, ...]]
 ) -> None:
+    del grammar_seeds
     await service.initialise()
     with pytest.raises(ConfigError):
         await service.initialise()
     assert (await service.initialise(force=True)).path == str(config_home)
+
+
+async def test_init_pre_seeds_the_declared_grammars_and_reports_what_it_did(
+    backend: FakeBackend, config_home: Path, tmp_path: Path, grammar_seeds: list[tuple[str, ...]]
+) -> None:
+    """Install time is when grammars arrive, because they must never arrive during ingest.
+
+    The pack ships none in its wheel and fetches them per language on first use, which would
+    make a file chunk one way on a machine that reached the network and another way on a
+    machine that did not (``docs/parsing.md`` §8.1). Pre-seeding here is what makes an install
+    with grammars missing something a person is told about rather than something they discover
+    when every ``.py`` file in their corpus comes back unsupported.
+    """
+    del config_home
+    from manicule.parsers.grammars import DECLARED_LANGUAGES  # noqa: PLC0415 - a parsing extra
+
+    backend.settings = _empty_grammar_cache(tmp_path / "cache")
+
+    report = await ApplicationService(backend).initialise()
+
+    assert grammar_seeds == [DECLARED_LANGUAGES]
+    assert any("grammars" in note for note in report.notes)
+
+
+async def test_a_pre_seed_that_fails_leaves_init_finished_and_says_so(
+    backend: FakeBackend, config_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A note, not an exception, and the configuration file is on disk either way.
+
+    Raising here would leave a written config beside a command that reported failure — so the
+    retry would need ``--force`` — and would make an air-gapped host with no bundle unable to
+    finish installing software it is perfectly able to run over a corpus of Markdown. The
+    failure is not hidden: it is in the report, ``doctor`` repeats it, and every source
+    document refused names the command that fixes it.
+    """
+    from manicule.parsers import grammars  # noqa: PLC0415 - a parsing extra, not core
+
+    def refuse(languages: Sequence[str], **_: object) -> tuple[str, ...]:
+        del languages
+        raise grammars.GrammarFetchError("no route to the grammar release")
+
+    monkeypatch.setattr(grammars, "prefetch", refuse)
+    backend.settings = _empty_grammar_cache(tmp_path / "cache")
+
+    report = await ApplicationService(backend).initialise()
+
+    assert await asyncio.to_thread(config_home.exists)
+    assert any("no route to the grammar release" in note for note in report.notes)
 
 
 async def test_upgrade_backs_up_and_then_refuses_to_run_a_package_manager(
