@@ -1407,3 +1407,126 @@ async def test_a_diagnosis_never_prints_the_value_of_an_environment_variable(
     assert private_value not in dumped, "an environment variable's value reached the diagnosis"
     assert OFFLINE_ENV in check.detail, "the switch that caused this has to be named"
     assert check.facts["offline_env_set"] is True
+
+
+# --- collections ------------------------------------------------------------------------------
+
+
+async def test_the_orphan_sweep_reports_without_deleting_unless_asked(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Reporting is the default, and the default is the whole safety argument.
+
+    In a corpus where collections are optional, "in no collection" describes most of it. A
+    verb that deleted on sight would be one keystroke from emptying the workspace, so the run
+    that happens by default names what *would* go and moves nothing.
+    """
+    document = next(iter(backend.store.documents.values()))
+    backend.organisation_.documents[document.id] = document
+
+    reported = await service.collection_orphans()
+
+    assert reported.count == 1
+    assert reported.deleted is False
+    assert reported.document_ids == (document.id,)
+    assert backend.store.deleted == [], "the report deleted something"
+
+
+async def test_the_orphan_sweep_trashes_rather_than_destroys(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """A soft delete, so an explicit cleanup is recoverable and an irreversible one is not here.
+
+    Emptying the trash is a separate verb that already exists, and it stays separate: two
+    decisions, taken at two moments, rather than one flag that means both.
+    """
+    document = next(iter(backend.store.documents.values()))
+    backend.organisation_.documents[document.id] = document
+
+    swept = await service.collection_orphans(delete=True)
+
+    assert swept.deleted is True
+    assert swept.document_ids == (document.id,)
+    assert backend.store.deleted == [(document.id, "soft")], (
+        "the sweep hard-deleted, so what it removed cannot be restored"
+    )
+
+
+async def test_a_document_in_a_collection_is_not_an_orphan(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The positive control. A sweep that reported everything would pass the tests above."""
+    document = next(iter(backend.store.documents.values()))
+    backend.organisation_.documents[document.id] = document
+    collection = await backend.organisation_.create_collection("alpha")
+    await backend.organisation_.add_to_collection(collection.id, [document.id])
+
+    reported = await service.collection_orphans(delete=True)
+
+    assert reported.count == 0
+    assert backend.store.deleted == []
+
+
+async def test_renaming_reports_the_new_name_and_keeps_the_id(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Rename is an update, not a replace: the id a caller already holds keeps working."""
+    made = await service.collection_create("alpha")
+
+    renamed = await service.collection_rename(made.id, "alpha runbooks")
+
+    assert renamed.id == made.id
+    assert renamed.name == "alpha runbooks"
+    assert (await backend.organisation_.get_collection(made.id)) is not None
+
+
+async def test_a_search_names_the_collections_it_was_scoped_to(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Diagnostics carry the scope, so a scoped search is distinguishable from a wide one.
+
+    Two searches returning the same passages — one restricted to a collection that happens to
+    contain everything, one unrestricted — are otherwise identical in a log.
+    """
+    await service.collection_create("alpha")
+
+    scoped = await service.search("anything", collections=["alpha"])
+    wide = await service.search("anything")
+
+    assert scoped.collections == ("alpha",)
+    assert wide.collections == ()
+    del backend
+
+
+async def test_updating_a_description_cannot_erase_one_by_omission(
+    service: ApplicationService,
+) -> None:
+    """A set, not a merge — so the field is required and omission is a call that fails.
+
+    This is a defect this branch shipped and this test is what found it, so it is worth being
+    exact about. ``describe_collection`` writes whatever it is handed, and ``description``
+    defaulted to ``None``; every surface could therefore reach the verb without mentioning the
+    field, and ``collection update <id>`` with no arguments silently erased the description it
+    is named for changing. Nothing raised and nothing rendered differently — the value was
+    simply gone.
+
+    Required, so a surface that forgets is a ``TypeError`` at the call rather than a caller
+    who has to have been careful. Clearing is still possible and now has to be asked for.
+    """
+    import inspect  # noqa: PLC0415 - only this assertion reads a signature
+
+    made = await service.collection_create("alpha", description="worked examples")
+    parameter = inspect.signature(service.collection_update).parameters["description"]
+    assert parameter.default is inspect.Parameter.empty, (
+        "description has a default again, so `collection update <id>` with no arguments "
+        "erases the description instead of failing to call"
+    )
+
+    kept = await service.collection_update(made.id, description="still worked examples")
+    assert kept.description == "still worked examples"
+
+    cleared = await service.collection_update(made.id, description="")
+    assert cleared.description is None, (
+        "an empty string neither cleared the description nor was rejected; 'no description' "
+        "now has two spellings on the wire"
+    )

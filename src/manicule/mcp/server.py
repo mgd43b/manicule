@@ -1,4 +1,4 @@
-"""The MCP server: nineteen tools, each a few lines over the application service.
+"""The MCP server: twenty-eight tools, each a few lines over the application service.
 
 FastMCP derives every tool's schema from the function's type hints and its description from
 the docstring, so what an assistant sees is what the signature says. There is no protocol
@@ -70,12 +70,169 @@ TOOL_NAMES: tuple[str, ...] = (
     "plugin_list",
     "plugin_add",
     "plugin_remove",
+    "collection_create",
+    "collection_list",
+    "collection_rename",
+    "collection_update",
+    "collection_delete",
+    "collection_add",
+    "collection_remove",
+    "collection_documents",
+    "collection_counts",
 )
 """The tool surface, named once.
 
 Here as data as well as decorators so that "the server offers exactly these" is a test rather
 than a count somebody keeps in their head.
 """
+
+
+def _register_collections(
+    mcp: FastMCP,
+    service: ApplicationService,
+    dispatch: Callable[[str, Callable[[], Awaitable[Payload]]], Awaitable[dict[str, Any]]],
+) -> tuple[Any, ...]:
+    """Register the collection tools and hand back what was registered.
+
+    Split out of :func:`build_server` because nine more tools pushed one function past the
+    point where a reader can hold it, not because collections are a different kind of thing.
+    The registered functions are *returned* rather than dropped, so they reach the same
+    surface-versus-``TOOL_NAMES`` comparison every other tool is held to — a group registered
+    here and forgotten there would be exactly the drift that check exists to catch.
+
+    Note the one operation deliberately absent: there is no tool that deletes documents left
+    in no collection. It destroys data, so it stays on the command line with the rest of that
+    class -- ``reset-index``, ``backup``, ``import`` -- where a person is present.
+    """
+
+    @mcp.tool
+    async def collection_create(name: str, description: str | None = None) -> dict[str, Any]:
+        """Create a named set of documents.
+
+        A collection groups documents that are already indexed. It never copies them: a
+        document in two collections is still one document with one set of embeddings.
+
+        Args:
+            name: What to call it. A name already in use is refused rather than merged.
+            description: What the collection is for.
+        """
+        return await dispatch(
+            "collection_create", lambda: service.collection_create(name, description=description)
+        )
+
+    @mcp.tool
+    async def collection_list() -> dict[str, Any]:
+        """List every collection in this workspace, with the rule each one carries."""
+        return await dispatch("collection_list", service.collection_list)
+
+    @mcp.tool
+    async def collection_rename(collection_id: str, name: str) -> dict[str, Any]:
+        """Rename a collection. Nothing is re-indexed and no membership moves.
+
+        Args:
+            collection_id: The collection to rename.
+            name: The new name. Another collection already using it is refused.
+        """
+        return await dispatch(
+            "collection_rename", lambda: service.collection_rename(collection_id, name)
+        )
+
+    @mcp.tool
+    async def collection_update(collection_id: str, description: str) -> dict[str, Any]:
+        """Set a collection's description, leaving its membership alone.
+
+        The write is a set, not a merge. ``description`` is required for that reason: as an
+        optional argument, calling this tool without one erased the description rather than
+        leaving it alone, which is a destructive default nobody would ask for.
+
+        Args:
+            collection_id: The collection to describe.
+            description: What it is for. An empty string clears it.
+        """
+        return await dispatch(
+            "collection_update",
+            lambda: service.collection_update(collection_id, description=description),
+        )
+
+    @mcp.tool
+    async def collection_delete(collection_id: str) -> dict[str, Any]:
+        """Delete a collection. **The documents in it are untouched.**
+
+        A collection is a grouping, so deleting one removes the grouping and stops there.
+        Documents left in no collection can be listed, and removed, from the command line.
+
+        Args:
+            collection_id: The collection to delete.
+        """
+        return await dispatch("collection_delete", lambda: service.collection_delete(collection_id))
+
+    @mcp.tool
+    async def collection_add(collection_id: str, document_ids: list[str]) -> dict[str, Any]:
+        """Add documents to a collection.
+
+        Membership is metadata. Nothing is re-parsed, re-chunked or re-embedded, and a
+        document already in the collection is not added twice.
+
+        Args:
+            collection_id: The collection to add to.
+            document_ids: Documents to add, as ``document_list`` or a citation reported them.
+        """
+        return await dispatch(
+            "collection_add", lambda: service.collection_add(collection_id, tuple(document_ids))
+        )
+
+    @mcp.tool
+    async def collection_remove(collection_id: str, document_ids: list[str]) -> dict[str, Any]:
+        """Remove documents from a collection. The documents themselves survive.
+
+        Args:
+            collection_id: The collection to remove from.
+            document_ids: Documents to drop from it.
+        """
+        return await dispatch(
+            "collection_remove",
+            lambda: service.collection_remove(collection_id, tuple(document_ids)),
+        )
+
+    @mcp.tool
+    async def collection_documents(
+        collection_id: str, limit: int = 50, offset: int = 0
+    ) -> dict[str, Any]:
+        """List a collection's documents, those added by hand and those a rule selects alike.
+
+        Args:
+            collection_id: The collection to read.
+            limit: Page size.
+            offset: How many to skip.
+        """
+        return await dispatch(
+            "collection_documents",
+            lambda: service.collection_documents(collection_id, limit=limit, offset=offset),
+        )
+
+    @mcp.tool
+    async def collection_counts(collection_id: str) -> dict[str, Any]:
+        """Count a collection's documents and chunks, as they are now.
+
+        Both are computed on the call. A rule-driven collection has no stored membership, so
+        there is no total to remember and none is reported.
+
+        Args:
+            collection_id: The collection to count.
+        """
+        return await dispatch("collection_counts", lambda: service.collection_counts(collection_id))
+
+    return (
+        collection_create,
+        collection_list,
+        collection_rename,
+        collection_update,
+        collection_delete,
+        collection_add,
+        collection_remove,
+        collection_documents,
+        collection_counts,
+    )
 
 
 def build_server(service: ApplicationService) -> FastMCP:
@@ -99,9 +256,11 @@ def build_server(service: ApplicationService) -> FastMCP:
     @mcp.tool
     async def ask(
         question: str,
+        *,
         profile: str | None = None,
         limit: int | None = None,
         sources: list[str] | None = None,
+        collections: list[str] | None = None,
         conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """Answer a question from the indexed corpus, with citations that resolve.
@@ -111,6 +270,9 @@ def build_server(service: ApplicationService) -> FastMCP:
             profile: ``fast``, ``balanced`` or ``precise``. Omit to use the configured one.
             limit: How many passages to retrieve before answering.
             sources: Restrict to these source names. Omit to search everything.
+            collections: Restrict to these collections, named as ``collection_list`` reports
+                them. Several union. A name that is not a collection here refuses the call
+                rather than answering over the whole workspace.
             conversation_id: Continue an existing conversation, and persist this turn to it.
 
         Returns:
@@ -125,6 +287,7 @@ def build_server(service: ApplicationService) -> FastMCP:
                 profile=profile,
                 limit=limit,
                 sources=tuple(sources or ()),
+                collections=tuple(collections or ()),
                 conversation_id=conversation_id,
             ),
         )
@@ -132,10 +295,12 @@ def build_server(service: ApplicationService) -> FastMCP:
     @mcp.tool
     async def search(
         query: str,
+        *,
         limit: int = 10,
         profile: str | None = None,
         sources: list[str] | None = None,
         media_types: list[str] | None = None,
+        collections: list[str] | None = None,
     ) -> dict[str, Any]:
         """Rank passages for a query without asking a model anything.
 
@@ -148,10 +313,15 @@ def build_server(service: ApplicationService) -> FastMCP:
             profile: ``fast``, ``balanced`` or ``precise``.
             sources: Restrict to these source names.
             media_types: Restrict to these IANA media types, e.g. ``application/pdf``.
+            collections: Restrict to these collections, named as ``collection_list`` reports
+                them. Several union; a collection combined with a source keeps only what is in
+                both. A name that is not a collection here refuses the call rather than
+                searching the whole workspace.
 
         Returns:
             An envelope whose ``data.hits`` are ranked passages, each with its document, its
-            anchor and the score every pipeline stage gave it.
+            anchor and the score every pipeline stage gave it. ``data.collections`` repeats
+            the scope the search ran under.
         """
         return await dispatch(
             "search",
@@ -161,6 +331,7 @@ def build_server(service: ApplicationService) -> FastMCP:
                 profile=profile,
                 sources=tuple(sources or ()),
                 media_types=tuple(media_types or ()),
+                collections=tuple(collections or ()),
             ),
         )
 
@@ -385,6 +556,8 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("plugin_remove", lambda: service.plugin_remove(name))
 
+    collections = _register_collections(mcp, service, dispatch)
+
     # Every tool, named twice — once by its decorator and once in `TOOL_NAMES` — and the two
     # are compared here rather than in a test. A tool added without being listed would
     # otherwise be a surface nothing describes, and a name listed without a tool would be a
@@ -414,6 +587,7 @@ def build_server(service: ApplicationService) -> FastMCP:
             plugin_list,
             plugin_add,
             plugin_remove,
+            *collections,
         )
     }
     if registered != set(TOOL_NAMES):

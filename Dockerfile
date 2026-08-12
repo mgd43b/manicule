@@ -80,7 +80,44 @@ ENV PATH=/opt/manicule/venv/bin:$PATH
 # `MANICULE_GRAMMAR_BUNDLE` environment variable is that an installed distribution is what
 # `grammar_bundle.locate()` finds with nothing configured, and nothing configured is one fewer
 # thing for a deployment to get wrong.
-RUN python tools/build_grammar_bundle.py --output /build/grammars --package --prefetch
+#
+# **Where the libraries come from is the build's choice, and both answers build the same
+# bundle.** Until #80 there was only one: download the release, here, on every build. That made
+# every merge in the repository depend on a third-party host being reachable at that moment,
+# and when it was not — a transfer dropping part-way, three times in an hour — nothing could be
+# merged. So a caller that already has the pack may stage it into the context and the build will
+# use it, which is what CI does; `.github/workflows/ci.yml` restores it from a cache keyed on
+# the pack release, so the release is fetched once per version rather than once per pull request.
+#
+# The staged directory is named for the pack release it holds, and this looks for the release
+# *this image installs*. That is the whole safety argument: a cache left over from another
+# version is not a directory this can find, so it falls through to the download rather than
+# packaging libraries under a version they are not. It is the same reason the pack's own cache
+# carries a version in its path.
+#
+# Neither branch can produce a partial bundle, which is the property worth more than the cache.
+# `build_grammar_bundle.py` downloads only when asked with `--prefetch`, so the staged branch is
+# a copy and a hash; and a staged directory missing a language fails naming it rather than
+# writing a bundle without it. An image shipping twenty-three of twenty-four grammars would
+# build, pass every check below, and silently parse the twenty-fourth as plain text.
+COPY .ci/grammars /build/grammar-cache
+RUN <<'GRAMMARS'
+set -eu
+installed=$(python -c 'from manicule.parsers import grammars; print(grammars.pack_version())')
+staged="/build/grammar-cache/${installed}"
+# Libraries, not merely a directory. A staged directory can exist and hold nothing this image
+# can load — most obviously one staged on a developer's macOS machine, which is `.dylib` — and
+# "there is nothing here I can use" and "there is nothing here" deserve the same answer: fetch
+# it. What this deliberately does *not* do is second-guess a directory that does hold Linux
+# libraries but is short of a language; that one goes to the builder and fails naming it.
+if ls "${staged}"/*.so >/dev/null 2>&1; then
+  echo "grammars: building from the staged pack for ${installed}; nothing is downloaded"
+  python tools/build_grammar_bundle.py --output /build/grammars --package --source "${staged}"
+else
+  echo "grammars: nothing usable staged for ${installed}; fetching the release"
+  python tools/build_grammar_bundle.py --output /build/grammars --package --prefetch
+fi
+GRAMMARS
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/manicule/venv/bin/python /build/grammars
 

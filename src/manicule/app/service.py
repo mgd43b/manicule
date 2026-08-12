@@ -81,6 +81,15 @@ bounded because all twenty-four of them is a paragraph, and the sentence that sa
 was being lost inside it.
 """
 
+_COUNT_PAGE = 500
+"""How many documents a counting or sweeping walk reads per round trip.
+
+A page size, deliberately not a limit: both callers loop until the corpus ends, so this
+changes how many statements a count costs and never what it reports. A cap here would make
+``collection_counts`` report a floor and ``collection_orphans`` claim a cleanup it had only
+partly done.
+"""
+
 DEFAULT_SOURCE = "local"
 """The source name ``index_path`` uses when none is given.
 
@@ -161,6 +170,7 @@ class ApplicationService:
         profile: str | None = None,
         limit: int | None = None,
         sources: Sequence[str] = (),
+        collections: Sequence[str] = (),
         conversation_id: str | None = None,
         on_event: Callable[[AnswerEvent], None] | None = None,
     ) -> r.AnswerResultPayload:
@@ -181,6 +191,7 @@ class ApplicationService:
             profile=profile,
             limit=limit,
             sources=sources,
+            collections=collections,
             conversation_id=conversation_id,
             aside=aside,
         ):
@@ -198,6 +209,7 @@ class ApplicationService:
         profile: str | None = None,
         limit: int | None = None,
         sources: Sequence[str] = (),
+        collections: Sequence[str] = (),
         conversation_id: str | None = None,
         aside: AskAside | None = None,
     ) -> AsyncIterator[AnswerEvent]:
@@ -219,7 +231,13 @@ class ApplicationService:
         )
 
         started = time.monotonic()
-        query = self._query(question, limit=limit or 8, profile=profile, sources=sources)
+        query = self._query(
+            question,
+            limit=limit or 8,
+            profile=profile,
+            sources=sources,
+            collection_ids=sorted(await self._collection_scope(collections)),
+        )
         retriever = await self._backend.retriever()
         retrieved = await retriever.retrieve(query)
         await self._require_scoped_context(retrieved)
@@ -268,11 +286,23 @@ class ApplicationService:
         profile: str | None = None,
         sources: Sequence[str] = (),
         media_types: Sequence[str] = (),
+        collections: Sequence[str] = (),
     ) -> r.SearchResult:
-        """Rank passages without asking a model anything."""
+        """Rank passages without asking a model anything.
+
+        ``collections`` names collections to search within, and combines with ``sources`` and
+        ``media_types`` the way :class:`~manicule.core.retrieval.Filter` says every field
+        does — disjunction within a field, conjunction between them. So two collections union,
+        and a collection together with a source keeps only what is in both.
+        """
         started = time.monotonic()
         query = self._query(
-            query_text, limit=limit, profile=profile, sources=sources, media_types=media_types
+            query_text,
+            limit=limit,
+            profile=profile,
+            sources=sources,
+            media_types=media_types,
+            collection_ids=sorted(await self._collection_scope(collections)),
         )
         retriever = await self._backend.retriever()
         retrieved = await retriever.retrieve(query)
@@ -308,6 +338,7 @@ class ApplicationService:
             cached=retrieved.trace.cached,
             truncated=retrieved.context.truncated,
             elapsed_ms=_millis(started),
+            collections=tuple(collections),
         )
 
     # --- ingest ---------------------------------------------------------------------------
@@ -2041,6 +2072,140 @@ class ApplicationService:
             collection_id=collection_id, changed=changed, document_ids=tuple(document_ids)
         )
 
+    async def collection_rename(self, collection_id: str, name: str) -> r.CollectionSummary:
+        """Rename a collection. Nothing is re-indexed and no membership moves.
+
+        A name is a label on a row. The documents, their chunks and their embeddings are
+        reached through ``collection_documents`` and the rule, neither of which mentions the
+        name — so renaming cannot invalidate an embedding, and there is deliberately no
+        re-index path from here for a later change to accidentally wire one up.
+
+        Raises:
+            ValueError: The name is empty once normalised.
+            UnknownEntityError: No such collection in this workspace.
+            NameInUseError: Another collection here already has that name.
+        """
+        store = await self._backend.organisation()
+        return _collection(await store.rename_collection(collection_id, name))
+
+    async def collection_update(
+        self, collection_id: str, *, description: str
+    ) -> r.CollectionSummary:
+        """Set a collection's description, leaving its membership alone.
+
+        **``description`` has no default, and that is the whole point.** It used to default to
+        ``None``, which meant every surface could reach this verb without mentioning the field
+        — and ``describe_collection`` writes whatever it is given, so ``collection update <id>``
+        with no arguments silently erased the description it was named for changing. A verb
+        that destroys by omission is one the caller cannot be careful about. Required here, so
+        a surface that forgets to pass it fails to call rather than quietly clearing.
+
+        An empty string clears it, and clearing is therefore something asked for rather than
+        something that happens. It is stored as ``None`` so that "no description" has one
+        spelling on the wire instead of two that render differently.
+
+        Raises:
+            UnknownEntityError: No such collection in this workspace.
+        """
+        store = await self._backend.organisation()
+        return _collection(await store.describe_collection(collection_id, description or None))
+
+    async def collection_counts(self, collection_id: str) -> r.CollectionCounts:
+        """How many documents and chunks a collection holds, counted now.
+
+        Both numbers are computed rather than stored. A rule-driven collection has no
+        materialised membership to count, and a remembered total would keep reporting the day
+        it was written.
+
+        Raises:
+            UnknownEntityError: No such collection in this workspace.
+            CrossWorkspaceError: A document came back whose id was not minted here.
+        """
+        store = await self._backend.organisation()
+        collection = await store.get_collection(collection_id)
+        if collection is None:
+            msg = f"no collection {collection_id!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+
+        # Counted by paging the membership rather than by a second ``COUNT`` statement.
+        # ``collection_documents`` is built on the one clause that expresses membership —
+        # manual rows unioned with whatever the rule selects — and a bespoke counting query
+        # would be a second reader of the same rule, free to drift from it. A number that
+        # disagrees with the list it claims to count is worse than a slower number.
+        chunks = await self._backend.documents()
+        documents = 0
+        counted = 0
+        offset = 0
+        while True:
+            page = require_owned(
+                self.workspace,
+                await store.collection_documents(collection_id, limit=_COUNT_PAGE, offset=offset),
+            )
+            if not page:
+                break
+            documents += len(page)
+            for document in page:
+                counted += await chunks.count_chunks(document.id)
+            if len(page) < _COUNT_PAGE:
+                break
+            offset += len(page)
+        return r.CollectionCounts(
+            collection_id=collection_id,
+            name=collection.name,
+            documents=documents,
+            chunks=counted,
+        )
+
+    async def collection_orphans(self, *, delete: bool = False) -> r.CollectionOrphans:
+        """Live documents belonging to no collection, reported and optionally trashed.
+
+        **Reporting is the default and deletion has to be asked for by name.** In a corpus
+        where collections are optional, "in no collection" describes most of it, so a verb
+        that deleted on sight would be one keystroke from emptying the workspace. The report
+        is what a caller sees first, and it names what would go.
+
+        **Deletion is into the trash**, the same soft delete ``document_delete`` performs
+        without ``hard``. So this operation removes documents from the live corpus and from
+        search, and every one of them can still be restored — which is the difference between
+        an explicit cleanup and an irreversible one. Emptying the trash is a separate verb
+        that already exists, and it stays separate.
+
+        This is deliberately not on the HTTP API and not an MCP tool. It destroys data, and
+        this project keeps that class of operation on the command line, where a person is
+        present — the same rule that keeps ``reset-index``, ``backup`` and ``import`` off
+        both surfaces.
+
+        Raises:
+            CrossWorkspaceError: A document came back whose id was not minted here.
+        """
+        store = await self._backend.organisation()
+        documents = await self._backend.documents()
+        scope = Filter(workspace_ids=frozenset({self.workspace}))
+
+        # The whole workspace, paged, with no cap. A capped sweep would report a count that
+        # is a floor rather than a total, and ``deleted: true`` beside it would say the
+        # cleanup was done when it had run out of page. This walks until the corpus ends.
+        orphans: list[str] = []
+        offset = 0
+        while True:
+            page = require_owned(
+                self.workspace,
+                await documents.list_documents(scope, limit=_COUNT_PAGE, offset=offset),
+            )
+            if not page:
+                break
+            for document in page:
+                if not await store.collections_for(document.id):
+                    orphans.append(document.id)
+            if len(page) < _COUNT_PAGE:
+                break
+            offset += len(page)
+
+        if delete:
+            for document_id in orphans:
+                await documents.soft_delete_document(document_id)
+        return r.CollectionOrphans(count=len(orphans), deleted=delete, document_ids=tuple(orphans))
+
     async def collection_documents(
         self, collection_id: str, *, limit: int = 50, offset: int = 0
     ) -> r.DocumentList:
@@ -2489,11 +2654,17 @@ class ApplicationService:
         profile: str | None,
         sources: Sequence[str] = (),
         media_types: Sequence[str] = (),
+        collection_ids: Sequence[str] = (),
     ) -> Query:
         """Build a query already carrying this workspace.
 
         The filter has no default workspace and cannot be built without one, so there is no
         path from here to an unscoped search.
+
+        ``collection_ids`` are ids, already resolved from whatever the caller named by
+        :meth:`_collection_scope`. Resolution happens before this rather than inside it
+        because a name that names nothing must refuse the search, and a query builder that
+        cannot reach the store could only drop it.
         """
         stripped = text.strip()
         if not stripped:
@@ -2515,8 +2686,42 @@ class ApplicationService:
                 workspace_ids=frozenset({self.workspace}),
                 sources=frozenset(sources),
                 media_types=frozenset(media_types),
+                collection_ids=frozenset(collection_ids),
             ),
         )
+
+    async def _collection_scope(self, names: Sequence[str]) -> frozenset[str]:
+        """Resolve collection names to ids, refusing any name that is not a collection here.
+
+        Names rather than ids, because a name is what a person types and what an assistant
+        has to hand; ids are uuids nobody quotes. Lookup goes through ``find_collection``, so
+        the normalisation that applied when the collection was created applies here too and a
+        label typed with a trailing space finds the collection it names.
+
+        **An unknown name is refused, never dropped.** Dropping it would leave the filter
+        with no collection restriction at all, and an empty field restricts nothing — so a
+        search scoped to a misspelt collection would quietly return the whole workspace,
+        ranked and plausible. That is the same inversion ``resolve_filter`` returns ``None``
+        to prevent, arriving one layer earlier.
+
+        Raises:
+            UnknownEntityError: A name that is not a collection in this workspace.
+        """
+        if not names:
+            return frozenset()
+        store = await self._backend.organisation()
+        resolved: set[str] = set()
+        for name in names:
+            found = await store.find_collection(name)
+            if found is None:
+                msg = (
+                    f"no collection {name!r} in workspace {self.workspace!r}. The search is "
+                    f"refused rather than run unscoped: a restriction that silently vanished "
+                    f"would return every document in the workspace."
+                )
+                raise UnknownEntityError(msg)
+            resolved.add(found.id)
+        return frozenset(resolved)
 
     async def _require_scoped_context(self, retrieved: RetrievalResult) -> None:
         """Prove every retrieved passage belongs to this workspace, before anything leaves."""

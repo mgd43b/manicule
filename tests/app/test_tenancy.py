@@ -35,7 +35,13 @@ from manicule.config.settings import Settings
 from manicule.core.errors import UnknownEntityError
 from manicule.core.ids import document_id
 from manicule.core.retrieval import Candidate
-from tests.app.fakes import FakeBackend, LeakyStore, make_chunk, make_document
+from tests.app.fakes import (
+    FakeBackend,
+    LeakyOrganisation,
+    LeakyStore,
+    make_chunk,
+    make_document,
+)
 
 OURS = "acme"
 THEIRS = "globex"
@@ -236,3 +242,83 @@ async def test_a_document_this_workspace_has_never_seen_is_not_reported_as_exist
     with pytest.raises(UnknownEntityError) as caught:
         await service.document_get(document_id(THEIRS, "hr", "comp.md"))
     assert THEIRS not in str(caught.value)
+
+
+# --- collections ----------------------------------------------------------------------------
+#
+# Collections are a *join*: membership is the set a search resolves into document ids, so a
+# foreign member is a cross-tenant result with a perfectly ordinary explanation. Both reads
+# added for collections go through `require_owned` for that reason, and both are driven here
+# by a deliberately broken store so the surface's own check is what is being observed.
+
+
+def _leaky_organisation() -> tuple[LeakyOrganisation, LeakyStore, str]:
+    """An organisation store and a document store, each holding one of ours and one of theirs."""
+    store = LeakyStore(workspace_id=OURS)
+    ours = make_document(OURS, source_id="ours.md", title="Our runbook")
+    foreign = make_document(THEIRS, source="hr", source_id="comp.md", title=THEIR_TITLE)
+    store.add(ours)
+    store.add(foreign, make_chunk(foreign, text=THEIR_TEXT))
+
+    organisation = LeakyOrganisation(workspace_id=OURS)
+    organisation.documents[ours.id] = ours
+    organisation.documents[foreign.id] = foreign
+    return organisation, store, foreign.id
+
+
+def _service_with(organisation: LeakyOrganisation, store: LeakyStore) -> ApplicationService:
+    return ApplicationService(
+        FakeBackend(settings=Settings(workspace=OURS), store=store, organisation_=organisation)
+    )
+
+
+async def test_counting_a_collection_refuses_a_foreign_member_rather_than_counting_it() -> None:
+    """A count is a read, and this one walks the membership to produce it.
+
+    A leaked member would inflate a number rather than print a title, which is the quiet
+    version of the same disclosure: it tells a caller how much another tenant has.
+    """
+    organisation, store, foreign_id = _leaky_organisation()
+    collection = await organisation.create_collection("mixed")
+    ours = document_id(OURS, "local", "ours.md")
+    organisation.members[collection.id] = [ours, foreign_id]
+    service = _service_with(organisation, store)
+
+    with pytest.raises(CrossWorkspaceError):
+        await service.collection_counts(collection.id)
+
+    organisation.members[collection.id] = [ours]
+    counted = await service.collection_counts(collection.id)
+    assert counted.documents == 1
+
+
+async def test_the_orphan_sweep_refuses_a_foreign_document_rather_than_trashing_it() -> None:
+    """The most dangerous read here, because what follows it is a delete.
+
+    ``LeakyStore.list_documents`` ignores the filter *and* the limit, so the sweep is offered
+    another tenant's document as an ordinary row. Refusing before anything is written is the
+    property: a guard that raised after the loop had already soft-deleted would have destroyed
+    somebody else's corpus and then reported an error about it.
+    """
+    organisation, store, foreign_id = _leaky_organisation()
+    service = _service_with(organisation, store)
+
+    with pytest.raises(CrossWorkspaceError):
+        await service.collection_orphans(delete=True)
+    assert store.deleted == [], "a foreign document was trashed before the check fired"
+    del foreign_id
+
+
+async def test_a_search_scoped_to_a_collection_that_does_not_exist_is_refused() -> None:
+    """Refused, never widened.
+
+    An unknown name resolving to "no collections" would leave the filter unrestricted, and an
+    empty field restricts nothing — so a misspelt collection would return the whole workspace,
+    ranked and plausible. The refusal is what stops a typo becoming a wider search than the
+    one anybody asked for.
+    """
+    organisation, store, _ = _leaky_organisation()
+    service = _service_with(organisation, store)
+
+    with pytest.raises(UnknownEntityError):
+        await service.search("anything", collections=["no-such-collection"])

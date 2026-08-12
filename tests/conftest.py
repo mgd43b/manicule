@@ -11,6 +11,7 @@ which is a manicule-internal concern rather than something a plugin author needs
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ __all__ = [
     "data_dir",
     "engine",
     "grammar_cache",
+    "grammar_fetch_never_sleeps",
     "manicule_environment",
     "model_cache",
     "settings",
@@ -79,6 +81,27 @@ def grammar_cache() -> None:
     from manicule.parsers import grammars  # noqa: PLC0415 - a parsing extra, not core
 
     grammars.configure_pack(grammars.DECLARED_LANGUAGES)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def grammar_fetch_never_sleeps() -> Iterator[None]:
+    """Take the backoff out of :func:`~manicule.parsers.grammars.prefetch` for the suite.
+
+    Several tests point the manifest at the discard port precisely so that a fetch fails at
+    once, and they would each now wait out the real retry policy instead — five seconds apiece
+    to re-observe a message they already have. The waiting is the only part being removed: the
+    retry still runs, it simply runs its attempts back to back.
+
+    The tests that are *about* the retry set their own policy over this one, which is the point
+    of it being read at call time rather than captured. Nothing here can make a fetch succeed
+    that would otherwise fail, so a suite arranged this way cannot report a working download
+    that a real one would not perform.
+    """
+    from manicule.parsers import grammars  # noqa: PLC0415 - a parsing extra, not core
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(grammars, "FETCH_RETRY_DELAYS", (0.0, 0.0))
+        yield
 
 
 @pytest.fixture(scope="session", autouse=True)

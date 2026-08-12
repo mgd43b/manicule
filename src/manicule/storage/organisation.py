@@ -727,8 +727,10 @@ def _refuse_if_truncated(found: int, what: str) -> None:
     msg = (
         f"{what} holds more than {MAX_RESOLVED_DOCUMENTS} documents, which is more than a "
         f"filter can carry as an id list. Truncating it would return a filter that looks "
-        f"complete while excluding members of the collection; search it with the "
-        f"over-fetch-and-post-filter plan instead."
+        f"complete while quietly excluding members of the collection, so this is refused "
+        f"instead. To search it now: drop the collection and restrict by source, media type "
+        f"or date, or split the collection into smaller ones — membership is metadata, so "
+        f"splitting re-indexes nothing and re-embeds nothing."
     )
     raise ValueError(msg)
 

@@ -10,6 +10,12 @@
 !src
 !tools
 !packages
+# Where a caller may stage the tree-sitter pack so that the build does not download it, named
+# for the pack release it holds. Empty in the repository — it carries one committed placeholder
+# so the Dockerfile's `COPY` resolves on a clean clone — and filled by CI from a cache. Admitted
+# as a whole directory because that is how every other entry here reads; nothing else belongs
+# under it, and anything that did would be copied into the daemon on every build.
+!.ci
 
 # Re-excluded from the directories admitted above. `**` because these appear at any depth,
 # and the negations above would otherwise pull a workspace member's own build artefacts in.
