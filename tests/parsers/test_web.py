@@ -26,7 +26,7 @@ from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.core.protocols import Parser, read_blocks
 from manicule.parsers.base import slugify
-from manicule.parsers.web import WebConfig, WebParser
+from manicule.parsers.web import WebConfig, WebParser, recover_cdata
 from manicule.testing import assert_round_trip
 from tests.parsers.support import check_corpus, check_fixture, raw_from, raw_of
 
@@ -428,3 +428,160 @@ async def test_anchoring_each_block_to_the_next_section_fails_the_round_trip(
     raw = raw_from(corpus / "web" / "typical.html", MEDIA_TYPE)
     with pytest.raises(AssertionError):
         await assert_round_trip(_NextSectionParser(WebConfig()), raw, fixture="shifted")
+
+
+# --- CDATA sections, which an HTML parser turns into comments --------------------------------
+
+CODE_MACRO = (
+    "<h2>Retry policy</h2>"
+    '<ac:structured-macro ac:name="code">'
+    '<ac:parameter ac:name="language">python</ac:parameter>'
+    "<ac:plain-text-body><![CDATA[def retry(attempts):\n"
+    "    return attempts > 0]]></ac:plain-text-body>"
+    "</ac:structured-macro>"
+)
+"""A Confluence code macro, in the shape Server and Data Center actually serve.
+
+Invented here — no real page, no real host. What matters is the ``<![CDATA[…]]>`` wrapper, which
+Confluence puts around the body of every ``code``, ``noformat`` and ``graphviz`` macro.
+"""
+
+GRAPHVIZ_MACRO = (
+    "<h2>Topology</h2>"
+    '<ac:structured-macro ac:name="graphviz">'
+    '<ac:plain-text-body><![CDATA[digraph G { client -> server [label="retry"]; }]]>'
+    "</ac:plain-text-body></ac:structured-macro>"
+)
+"""The same wrapper around DOT source, which fails differently and worse.
+
+``->`` inside the body terminates the bogus comment early, so part of the DOT leaks into the
+document as prose and the rest is eaten — a corruption rather than a clean loss.
+"""
+
+
+async def test_a_cdata_section_reaches_the_document_as_text() -> None:
+    """CDATA content is content, and an HTML parser silently deletes it.
+
+    ``<![CDATA[…]]>`` is not a construct HTML has outside foreign content, so a conforming HTML
+    parser reparses it as a **bogus comment** — lexbor produces ``<!--[CDATA[…]]-->`` — and the
+    text inside is gone. Not degraded: absent.
+
+    This is the whole of a live defect. Confluence Server and Data Center wrap the body of every
+    ``code``, ``noformat`` and ``graphviz`` macro in CDATA, storage-format bodies are routed as
+    ``text/html``, and so every code block on every one of those pages has been missing from the
+    index while a fragment of it sits there quotable as prose.
+
+    The second assertion is the sharper one. A test that only checked the body was present would
+    pass for a parser that emitted the raw ``]]>`` delimiter along with it, which is what the
+    broken behaviour already does.
+    """
+    blocks = await read_blocks(WebParser(WebConfig()), raw_of(CODE_MACRO, MEDIA_TYPE))
+    text = "\n".join(block.text for block in blocks)
+
+    assert "def retry(attempts):" in text, (
+        "the macro body is absent from the document: an HTML parser reparsed its CDATA wrapper as "
+        "a comment, so every Confluence code block is missing from the index"
+    )
+    assert "]]>" not in text, "a CDATA delimiter leaked into the document as content"
+    assert "<![CDATA[" not in text
+
+
+async def test_dot_source_in_a_cdata_section_is_not_corrupted() -> None:
+    """The Graphviz case, which fails differently: partly eaten, partly leaked.
+
+    ``->`` inside a bogus comment terminates it early, so the DOT is split — the opening is
+    swallowed with the comment and the tail escapes into the document as prose. A reader gets a
+    fragment of a diagram definition presented as the page's words.
+
+    Asserted separately from the code macro because the mechanism is different and a fix for one
+    does not obviously cover the other.
+    """
+    blocks = await read_blocks(WebParser(WebConfig()), raw_of(GRAPHVIZ_MACRO, MEDIA_TYPE))
+    text = "\n".join(block.text for block in blocks)
+
+    assert "digraph G {" in text, "the DOT source was eaten by the bogus-comment reparse"
+    assert "]]>" not in text, "the tail of the DOT leaked out as prose with its delimiter"
+
+
+async def test_markup_inside_a_cdata_section_stays_inert() -> None:
+    """Recovering CDATA must not *promote* text into markup, which is the risk the fix creates.
+
+    CDATA exists so a body can contain ``<`` and ``&`` without being parsed as markup, so a
+    recovery that pasted the text back unescaped would turn ``<![CDATA[<script>…]]>`` from inert
+    content into a live element — trading a content-loss bug for an execution one, on a corpus
+    whose pages anybody with write access to a wiki can edit.
+
+    Both halves are asserted: the text is *present* as text, and it did not become an element. The
+    presence half is what stops this passing for a parser that went back to deleting the section.
+    """
+    hostile = (
+        "<h2>Retry policy</h2>"
+        "<ac:plain-text-body><![CDATA[<script>window.__owned=1</script>"
+        "if a < b && c > d: pass]]></ac:plain-text-body>"
+    )
+    parser = WebParser(WebConfig())
+    raw = raw_of(hostile, MEDIA_TYPE)
+    blocks = await read_blocks(parser, raw)
+    text = "\n".join(block.text for block in blocks)
+
+    assert "window.__owned=1" in text, "the recovered text is missing, so nothing is asserted here"
+    assert "if a < b && c > d: pass" in text, "the escaped characters did not survive as characters"
+    assert not any(block.kind is BlockKind.MEDIA for block in blocks), (
+        "the recovered markup became an element rather than text"
+    )
+    # The document the parser actually saw: a text node, not a script element.
+    assert "<script>" not in _rendered(hostile), (
+        "the recovery pasted markup back unescaped, promoting inert content to a live element"
+    )
+
+
+def _rendered(document: str) -> str:
+    """What the CDATA recovery hands to the HTML engine, for asserting on directly."""
+    return recover_cdata(document)
+
+
+async def test_an_unterminated_cdata_section_is_left_alone() -> None:
+    """A malformed document is not an invitation to invent where its content ended.
+
+    Guessing a terminator would fabricate a block boundary out of nothing, so an unclosed section
+    is handed to the HTML engine exactly as it arrived and its own error recovery decides.
+
+    **The assertion is on the rendered string, not on the blocks.** An earlier version checked only
+    the first two blocks, which left the unterminated section free to be escaped and appended as a
+    third — so the test passed with the "leave it alone" branch removed entirely. Found by removing
+    it. What pins the behaviour is that the marker is still there, untransformed.
+    """
+    document = "<h2>Retry policy</h2><p>x</p><ac:body><![CDATA[never closed"
+
+    assert _rendered(document) == document, (
+        "an unterminated section was transformed; the recovery guessed where it ended"
+    )
+    blocks = await read_blocks(WebParser(WebConfig()), raw_of(document, MEDIA_TYPE))
+    assert [block.text for block in blocks][:2] == ["Retry policy", "x"]
+
+
+async def test_ordinary_html_passes_through_the_recovery_unchanged() -> None:
+    """Every document without a CDATA section — which is almost all of them — is untouched.
+
+    The property that matters is that the recovery cannot corrupt ordinary HTML: no escaping
+    applied outside a section, nothing reordered, nothing dropped. A document containing ``&`` and
+    ``<`` in text is the case that would break if the escape were applied to the whole input rather
+    than to recovered bodies.
+
+    **Deliberately not asserted on identity.** An earlier version checked
+    ``_rendered(document) is document`` to prove the early return was taken — and that assertion
+    can never fail, because CPython's ``"".join([x])`` returns ``x`` itself. The early return is a
+    performance detail with no observable behaviour, so there is nothing honest to assert about it;
+    this asserts the observable property instead.
+    """
+    plain = "<h1>Retry policy &amp; backoff</h1><p>Use a &lt; b for the bound.</p>"
+    assert _rendered(plain) == plain
+
+    # And the same claim for text *beside* a section, which is the case the fast path above does
+    # not exercise: an earlier version of this test used only a CDATA-free document, so escaping
+    # the surrounding markup as well would have left it green. Found by trying exactly that.
+    mixed = f"{plain}<ac:body><![CDATA[a < b]]></ac:body>{plain}"
+    rendered = _rendered(mixed)
+    assert rendered.startswith(plain), "markup before a section was escaped"
+    assert rendered.endswith(plain), "markup after a section was escaped"
+    assert "a &lt; b" in rendered, "the recovered body was not escaped"

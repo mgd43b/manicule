@@ -73,7 +73,11 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     "archive": ParserVersions(rules="1"),
     "docx": ParserVersions(rules="1", distributions=("python-docx", "lxml")),
     "email": ParserVersions(rules="1", distributions=("selectolax",)),
-    "html": ParserVersions(rules="1", distributions=("selectolax",)),
+    # 1 -> 2: CDATA sections are recovered as text rather than deleted by the HTML parser's
+    # bogus-comment reparse. Every document containing one produces different text now, and
+    # the bump is what re-parses them from retained bytes instead of leaving a corpus that is
+    # wrong behind a fingerprint claiming it is current.
+    "html": ParserVersions(rules="2", distributions=("selectolax",)),
     "markdown": ParserVersions(rules="1", distributions=("markdown-it-py",)),
     "notebook": ParserVersions(rules="1", distributions=("nbformat",)),
     "pdf": ParserVersions(rules="1", distributions=("pypdfium2",)),
