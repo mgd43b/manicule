@@ -63,13 +63,14 @@
         {% endfor %}
       </tbody>
     </table>
+    {% else %}{{ m.empty('Nothing has been asked yet.') }}{% endif %}
+    {# Outside the "are there rows" branch, so paging past the end is not a dead end. #}
     <nav class="pager" aria-label="Query log pages">
       {% if offset > 0 %}<a href="/ui/admin?limit={{ limit }}&amp;offset={{ [offset - limit, 0] | max }}">Previous</a>{% endif %}
       {% if panels.queries.data.offset + panels.queries.data.count < panels.queries.data.total %}
       <a href="/ui/admin?limit={{ limit }}&amp;offset={{ offset + limit }}">Next</a>
       {% endif %}
     </nav>
-    {% else %}{{ m.empty('Nothing has been asked yet.') }}{% endif %}
   {% else %}{{ m.failed(panels.queries) }}{% endif %}
 </section>
 

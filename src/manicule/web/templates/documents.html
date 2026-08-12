@@ -34,6 +34,10 @@
     {% endfor %}
   </tbody>
 </table>
+{% else %}{{ m.empty('Nothing indexed matches this filter.') }}{% endif %}
+{# Outside the "is there anything" branch on purpose. Paging past the end renders an empty
+   table, and a Previous link that only appeared when the page had rows would strand whoever
+   went one page too far. #}
 <nav class="pager" aria-label="Pages">
   {% if offset > 0 %}
   <a href="/ui/documents?limit={{ limit }}&amp;offset={{ [offset - limit, 0] | max }}">Previous</a>
@@ -42,7 +46,6 @@
   <a href="/ui/documents?limit={{ limit }}&amp;offset={{ offset + limit }}">Next</a>
   {% endif %}
 </nav>
-{% else %}{{ m.empty('Nothing indexed matches this filter.') }}{% endif %}
 {% else %}{{ m.failed(panels.documents) }}{% endif %}
 
 <section class="panel">

@@ -53,11 +53,15 @@
   /* Reload after a mutation rather than patching the table in place. The page is rendered by
    * the server from one envelope; re-rendering it there keeps one description of what a
    * listing is, instead of a second one written in this file that can disagree. */
-  function afterChange(node, result) {
+  function afterChange(element, node, result) {
     if (result.envelope && result.envelope.ok) {
       window.location.reload();
       return;
     }
+    /* Re-enabled on a refusal. `json()` resolves for a 4xx as well as a 2xx — an envelope is
+     * an envelope — so a failure that only re-enabled on a rejected promise would leave the
+     * button disabled for good, with the reason printed beside a control nobody can retry. */
+    if (element) { element.disabled = false; }
     say(node, failure(result));
   }
 
@@ -174,7 +178,8 @@
     });
 
     document.addEventListener("keydown", function (event) {
-      var typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
+      var focused = document.activeElement;
+      var typing = !!focused && /^(INPUT|TEXTAREA|SELECT)$/.test(focused.tagName);
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         open();
         event.preventDefault();
@@ -374,17 +379,17 @@
 
     act("[data-reindex]", function (element) {
       return json("POST", "/api/v1/documents/" + encodeURIComponent(element.getAttribute("data-reindex")) + "/reindex")
-        .then(function (result) { afterChange(documentStatus, result); });
+        .then(function (result) { afterChange(element, documentStatus, result); });
     });
 
     act("[data-trash]", function (element) {
       return json("DELETE", "/api/v1/documents/" + encodeURIComponent(element.getAttribute("data-trash")))
-        .then(function (result) { afterChange(documentStatus, result); });
+        .then(function (result) { afterChange(element, documentStatus, result); });
     });
 
     act("[data-restore]", function (element) {
       return json("POST", "/api/v1/documents/" + encodeURIComponent(element.getAttribute("data-restore")) + "/restore")
-        .then(function (result) { afterChange(documentStatus, result); });
+        .then(function (result) { afterChange(element, documentStatus, result); });
     });
 
     var syncStatus = document.querySelector("[data-sync-status]");
@@ -403,11 +408,11 @@
     var pluginStatus = document.querySelector("[data-plugin-status]");
     act("[data-plugin-enable]", function (element) {
       return json("POST", "/api/v1/plugins/" + encodeURIComponent(element.getAttribute("data-plugin-enable")))
-        .then(function (result) { afterChange(pluginStatus, result); });
+        .then(function (result) { afterChange(element, pluginStatus, result); });
     });
     act("[data-plugin-disable]", function (element) {
       return json("DELETE", "/api/v1/plugins/" + encodeURIComponent(element.getAttribute("data-plugin-disable")))
-        .then(function (result) { afterChange(pluginStatus, result); });
+        .then(function (result) { afterChange(element, pluginStatus, result); });
     });
 
     var collectionStatus = document.querySelector("[data-collection-status]");
@@ -416,12 +421,12 @@
       collectionForm.addEventListener("submit", function (event) {
         event.preventDefault();
         json("POST", "/api/v1/collections", { name: collectionForm.elements.name.value })
-          .then(function (result) { afterChange(collectionStatus, result); });
+          .then(function (result) { afterChange(null, collectionStatus, result); });
       });
     }
     act("[data-delete-collection]", function (element) {
       return json("DELETE", "/api/v1/collections/" + encodeURIComponent(element.getAttribute("data-delete-collection")))
-        .then(function (result) { afterChange(collectionStatus, result); });
+        .then(function (result) { afterChange(element, collectionStatus, result); });
     });
 
     var tagStatus = document.querySelector("[data-tag-status]");
@@ -430,12 +435,12 @@
       tagForm.addEventListener("submit", function (event) {
         event.preventDefault();
         json("POST", "/api/v1/tags", { name: tagForm.elements.name.value })
-          .then(function (result) { afterChange(tagStatus, result); });
+          .then(function (result) { afterChange(null, tagStatus, result); });
       });
     }
     act("[data-delete-tag]", function (element) {
       return json("DELETE", "/api/v1/tags/" + encodeURIComponent(element.getAttribute("data-delete-tag")))
-        .then(function (result) { afterChange(tagStatus, result); });
+        .then(function (result) { afterChange(element, tagStatus, result); });
     });
 
     var keyStatus = document.querySelector("[data-key-status]");
@@ -459,7 +464,7 @@
     }
     act("[data-revoke]", function (element) {
       return json("DELETE", "/api/v1/auth/keys/" + encodeURIComponent(element.getAttribute("data-revoke")))
-        .then(function (result) { afterChange(keyStatus, result); });
+        .then(function (result) { afterChange(element, keyStatus, result); });
     });
   }
 

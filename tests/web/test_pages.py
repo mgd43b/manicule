@@ -176,20 +176,47 @@ def test_a_missing_document_is_a_404_page_rather_than_an_empty_one() -> None:
 def test_a_panel_that_failed_does_not_take_the_rest_of_the_page_with_it() -> None:
     """A dashboard is several operations and they fail independently.
 
-    The counts fail; the diagnosis and the workspaces still render. A page that collapsed to
-    one error would be hiding two answers it had.
+    The counts fail; the diagnosis still renders, and the failure is **shown** rather than
+    swallowed. A page that collapsed to one error would be hiding the answers it had, and one
+    that rendered nothing where the counts were would be hiding the failure.
+
+    The broken method is the one ``stats`` actually calls. An earlier version of this test
+    broke ``list_documents``, which the dashboard never reaches — so it asserted that a page
+    with nothing wrong with it still worked.
     """
     backend, _ = backend_with_a_document()
+    failure = "the store is unavailable"
 
-    async def broken() -> None:
-        msg = "the store is unavailable"
-        raise OSError(msg)
+    async def broken() -> int:
+        raise OSError(failure)
 
-    backend.store.list_documents = broken  # pyright: ignore[reportAttributeAccessIssue]
+    backend.store.count_documents = broken  # pyright: ignore[reportAttributeAccessIssue]
     with client_for(backend) as client:
         response = client.get("/ui")
     assert response.status_code == 200
+    assert "stats failed" in response.text, "the failed panel was rendered as though it worked"
+    assert failure in response.text, "the failure was swallowed rather than shown"
     assert "Checks" in response.text, "the diagnosis panel went missing with the counts"
+
+
+@pytest.mark.parametrize(
+    "path", ["/ui/documents?offset=50&limit=50", "/ui/admin?offset=25&limit=25"]
+)
+def test_a_second_page_of_a_listing_renders(path: str) -> None:
+    """The pagers use Jinja's ``max`` filter over a list to clamp the previous offset.
+
+    Only reachable at a non-zero offset, which every other test in this file is not at — so a
+    template error in the one branch nobody visits would ship.
+
+    The offsets here are past the end of the fixture's single document on purpose. A ``Previous``
+    link that only rendered when the page had rows would strand whoever paged one page too far,
+    which is exactly the state this asserts against.
+    """
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client:
+        response = client.get(path)
+    assert response.status_code == 200
+    assert "Previous" in response.text
 
 
 def test_a_browser_that_presents_no_key_is_refused_as_a_page() -> None:

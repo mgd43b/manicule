@@ -24,6 +24,13 @@ browsers create.
 Scheme is deliberately **not** compared. Behind a TLS-terminating proxy the request arrives as
 ``http`` while the browser's ``Origin`` says ``https``, and a check that failed there would be a
 policy operators disable rather than one that holds.
+
+**The websocket is checked too, and it is the worse case.** A browser applies no cross-origin
+policy to ``WebSocket`` at all: there is no preflight, the connection is made, and the page can
+**read** every frame that comes back. So a cross-origin socket to an installation with no
+credential is not a write it cannot see the answer to — it is the corpus, answering questions,
+to a page the operator merely visited. :func:`handshake_permitted` is the same decision applied
+where the handshake is, because middleware never sees a websocket scope.
 """
 
 from __future__ import annotations
@@ -64,6 +71,25 @@ def host_of(origin: str) -> str:
     return remainder.lower()
 
 
+def from_this_site(origin: str | None, host: str | None, allowed_origins: tuple[str, ...]) -> bool:
+    """Whether an ``Origin`` header is this installation's own, or one an operator listed.
+
+    No ``Origin`` at all means a client that is not a browser, which is admitted — see this
+    module's docstring for why that is a decision rather than a gap.
+
+    Args:
+        origin: The ``Origin`` header, if the client sent one.
+        host: The ``Host`` the request was addressed to.
+        allowed_origins: ``security.transport.allowed_origins``.
+    """
+    if not origin:
+        return True
+    if origin in allowed_origins:
+        return True
+    theirs = host_of(origin)
+    return theirs != "" and theirs == (host or "").strip().lower()
+
+
 def permitted(
     method: str,
     *,
@@ -94,9 +120,23 @@ def permitted(
         if fetch_site.strip().lower() in SAME_SITE_VALUES:
             return True
         return bool(origin) and origin in allowed_origins
-    if not origin:
-        return True
-    return origin in allowed_origins or (host_of(origin) == (host or "").strip().lower() != "")
+    return from_this_site(origin, host, allowed_origins)
+
+
+def handshake_permitted(
+    *, origin: str | None, host: str | None, allowed_origins: tuple[str, ...]
+) -> bool:
+    """Whether a websocket handshake may proceed.
+
+    The same decision as :func:`permitted`, over the one header a websocket handshake carries.
+    ``Sec-Fetch-Site`` is not sent on one, and there is no preflight and no CORS to fall back
+    on — a browser makes the connection and the page reads every frame. So the ``Origin``
+    comparison is not a second line of defence here; it is the only one.
+
+    Named separately rather than reached by calling ``permitted("POST", ...)``, because a
+    handshake is not a POST and a call site that pretended otherwise would read as a mistake.
+    """
+    return from_this_site(origin, host, allowed_origins)
 
 
 REFUSAL = (
@@ -109,12 +149,23 @@ REFUSAL = (
 an operator needs to decide whether to add an entry or to go and look at a page."""
 
 
+HANDSHAKE_REFUSAL = (
+    "refusing a websocket handshake from {origin!r}. A browser applies no cross-origin policy "
+    "to a websocket, so this connection would have read every answer it asked for. List the "
+    "origin in security.transport.allowed_origins if it is yours."
+)
+"""What a refused handshake is closed with. Short: a close reason is capped at 123 bytes."""
+
+
 __all__ = [
     "FETCH_SITE",
+    "HANDSHAKE_REFUSAL",
     "ORIGIN",
     "REFUSAL",
     "SAME_SITE_VALUES",
     "UNSAFE_METHODS",
+    "from_this_site",
+    "handshake_permitted",
     "host_of",
     "permitted",
 ]

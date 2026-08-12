@@ -5,10 +5,14 @@ loopback with ``security.auth.mode = none``: there is no credential, so *any* re
 reaches the port is the operator's. A page on the internet cannot read the response — there is
 no CORS header to let it — but with a "simple" request it does not need to. The effect happens.
 
-Two halves are tested. :func:`~manicule.api.origins.permitted` is a pure function of four header
-values and is exercised directly, including the cases a browser would send; and the middleware
-is driven through the real application, because a decision function nothing consults is a
-decision nobody makes.
+Three halves, which is one more than the obvious two.
+:func:`~manicule.api.origins.permitted` is a pure function of four header values and is
+exercised directly, including the cases a browser would send; the middleware is driven through
+the real application, because a decision function nothing consults is a decision nobody makes;
+and **the websocket is driven separately**, because an HTTP middleware never sees a websocket
+scope. That last one is not a completeness exercise: a browser applies no cross-origin policy to
+a ``WebSocket`` — no preflight, no CORS — so the page **reads** every frame, which makes the
+socket the one place a cross-origin connection gets the corpus rather than only an effect.
 
 The control runs through every one of these: a request from a **program** — which sends neither
 header — is admitted. Refusing those would break every non-browser client to defend against a
@@ -17,10 +21,21 @@ threat only browsers create, and a guard that refuses everything is not a guard.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
-from manicule.api.origins import UNSAFE_METHODS, host_of, permitted
+from manicule.api.origins import (
+    UNSAFE_METHODS,
+    handshake_permitted,
+    host_of,
+    permitted,
+)
+from manicule.api.routes.sockets import POLICY_VIOLATION
 from tests.api.support import backend_with_a_document, client_for, envelope
+
+if TYPE_CHECKING:
+    from fastapi.testclient import TestClient
 
 FORBIDDEN = 403
 HOST = "127.0.0.1:8765"
@@ -187,6 +202,75 @@ def test_a_read_from_anywhere_is_still_answered() -> None:
             "/api/v1/documents", headers={"Origin": EVIL, "Sec-Fetch-Site": "cross-site"}
         )
     assert response.status_code == 200
+
+
+# --- the websocket, which middleware never sees -------------------------------------------------
+
+
+def test_a_websocket_handshake_from_another_origin_is_refused() -> None:
+    """The worst case on this surface, and the one middleware cannot cover.
+
+    A browser applies no cross-origin policy to a ``WebSocket``: no preflight, no CORS, and the
+    page **reads** every frame. On the shipped posture — loopback, no credential — an unchecked
+    handshake is any page the operator visits asking the corpus questions and getting answers.
+
+    Refused before ``accept``, so the connection never reaches a state in which a question could
+    be queued.
+    """
+    from starlette.websockets import WebSocketDisconnect  # noqa: PLC0415 - only this test needs it
+
+    def ask(client: TestClient) -> None:
+        """Open the socket and try to use it, which is what a hostile page would do."""
+        with client.websocket_connect("/api/v1/chat/ws", headers={"Origin": EVIL}) as socket:
+            socket.send_text('{"question": "what is in the corpus"}')
+            socket.receive_json()
+
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client, pytest.raises(WebSocketDisconnect) as refused:
+        ask(client)
+    assert refused.value.code == POLICY_VIOLATION
+    assert "websocket" in refused.value.reason
+
+
+def test_a_same_origin_websocket_handshake_is_accepted() -> None:
+    """The control. Without it the refusal above would pass for a socket nobody can open."""
+    backend, _ = backend_with_a_document()
+    with (
+        client_for(backend) as client,
+        client.websocket_connect(
+            "/api/v1/chat/ws", headers={"Origin": SAME, "Host": HOST}
+        ) as socket,
+    ):
+        socket.send_text('{"question": "does the client retry"}')
+        assert socket.receive_json()["event"]
+
+
+def test_a_websocket_client_that_is_not_a_browser_is_unaffected() -> None:
+    """No ``Origin`` at all: a script, or an assistant holding a key."""
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client, client.websocket_connect("/api/v1/chat/ws") as socket:
+        socket.send_text('{"question": "does the client retry"}')
+        assert socket.receive_json()["event"]
+
+
+def test_a_configured_origin_may_still_open_a_websocket() -> None:
+    """An operator who listed an origin for the widget gets the socket too."""
+    backend, _ = backend_with_a_document(security={"transport": {"allowed_origins": [EMBEDDER]}})
+    with (
+        client_for(backend) as client,
+        client.websocket_connect("/api/v1/chat/ws", headers={"Origin": EMBEDDER}) as socket,
+    ):
+        socket.send_text('{"question": "does the client retry"}')
+        assert socket.receive_json()["event"]
+
+
+def test_the_handshake_decision_is_the_same_one_the_middleware_makes() -> None:
+    """One rule, reached by two names, so the two cannot drift apart."""
+    assert handshake_permitted(origin=None, host=HOST, allowed_origins=())
+    assert handshake_permitted(origin=SAME, host=HOST, allowed_origins=())
+    assert not handshake_permitted(origin=EVIL, host=HOST, allowed_origins=())
+    assert handshake_permitted(origin=EMBEDDER, host=HOST, allowed_origins=(EMBEDDER,))
+    assert not handshake_permitted(origin="null", host=HOST, allowed_origins=())
 
 
 def test_a_refused_request_still_carries_the_surfaces_headers() -> None:

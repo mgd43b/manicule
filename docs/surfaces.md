@@ -511,6 +511,11 @@ effect. `Sec-Fetch-Site` is the primary signal because page script cannot set it
 compared against `Host` is the fallback. A request with neither header — every non-browser
 client — is unaffected.
 
+**The websocket gets the same check, at the handshake**, because middleware never sees a
+websocket scope — and it is the more serious case: a browser applies no cross-origin policy to a
+`WebSocket` at all, so the page reads every frame rather than only causing an effect it cannot
+see. It is refused before `accept` and before the credential is read.
+
 ### 9.7 Telemetry, and what a failed write costs
 
 `search` and `ask` record a row in `query_logs`, and that recording is the **service's** rather

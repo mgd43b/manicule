@@ -36,8 +36,8 @@ A single-page application fails that in a way that cannot be worked around hones
 
 That rules out Tailwind as well, and for the same reason rather than a different one. The
 standalone binary avoids Node but is still a platform-specific executable run at build time to
-produce a file — a build toolchain that happens not to be Node's. A hand-written stylesheet is
-about four hundred lines, is reviewable, and is a file this repository owns.
+produce a file — a build toolchain that happens not to be Node's. The hand-written stylesheet is
+245 lines, is reviewable, and is a file this repository owns.
 
 It also rules out fetching a hypermedia library — htmx or anything like it — as a vendored
 minified blob. The interactions this surface actually needs are a streaming answer, a command
@@ -275,6 +275,15 @@ create.
 An origin listed in `security.transport.allowed_origins` may still write, because the widget is
 the one part of manicule that is meant to be cross-origin and a widget asks questions, which is a
 `POST`.
+
+**The websocket is checked separately, and it is the worse case.** An HTTP middleware never sees
+a websocket scope, and a browser applies *no* cross-origin policy to a `WebSocket`: no preflight,
+no CORS, and the page reads every frame that comes back. So a cross-origin socket to an
+installation with no credential is not a write whose answer is hidden — it is the corpus,
+answering questions, to a page the operator merely visited. `manicule.api.routes.sockets` checks
+the handshake's `Origin` through the same decision, before `accept` and before the credential is
+looked at, and closes with a policy-violation code. A handshake with no `Origin` — a script, an
+assistant — is admitted, exactly as over HTTP.
 
 ---
 
