@@ -1074,16 +1074,25 @@ class ApplicationService:
             files=len(_as_list(manifest.get("files"))),
         )
 
-    async def export_corpus(self, target: Path | str) -> r.ExportReport:
+    async def export_corpus(
+        self, target: Path | str, *, allow_insecure_target: bool = False
+    ) -> r.ExportReport:
         """Write a portable archive: retained bytes and metadata, never chunks or vectors.
 
         An archive that carried chunks would carry an index built by another chunker and
         another embedder, and dropping it into a store whose fingerprints say otherwise is
         the silent-mismatch failure the fingerprints exist to prevent. The importing
         installation re-derives both.
+
+        A group- or world-readable target is refused, with the same escape hatch ``backup``
+        has and for the same reason it has one: an operator writing an archive onto a volume
+        whose permissions are somebody else's decision has a real errand, and refusing it
+        outright only moves the copy to a `cp -r` that nothing checks and nothing records.
         """
         maintenance = await self._backend.maintenance()
-        documents, chunks = await maintenance.export_corpus(_local(target))
+        documents, chunks = await maintenance.export_corpus(
+            _local(target), allow_insecure_target=allow_insecure_target
+        )
         return r.ExportReport(path=str(_local(target)), documents=documents, chunks=chunks)
 
     async def import_corpus(self, source: Path | str, *, force: bool = False) -> r.IngestReport:
@@ -1150,7 +1159,14 @@ class ApplicationService:
         target = version or "latest"
         backup_path: str | None = None
         if not skip_backup:
-            destination = self.settings.data_dir / "backups" / f"pre-upgrade-{int(time.time())}"
+            destination = pre_upgrade_destination(self.settings.data_dir, moment=int(time.time()))
+            # The snapshot directory is created and verified 0700 by `backup` itself. This
+            # creates the one above it, which is not the guarantee and is not treated as one:
+            # it keeps a fresh installation from leaving a listable `…-backups` behind at
+            # whatever the umask said.
+            await asyncio.to_thread(
+                lambda: destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            )
             backup_path = (await self.backup(destination)).path
         specifier = f"manicule=={version}" if version else "manicule"
         return r.UpgradeReport(
@@ -2291,6 +2307,35 @@ def _parse_value(value: str) -> JsonValue:
     except json.JSONDecodeError:
         return value
     return parsed
+
+
+def pre_upgrade_destination(data_dir: Path, *, moment: int) -> Path:
+    """Where ``upgrade`` writes the snapshot it takes before anybody installs anything.
+
+    **A sibling of the data directory, never inside it.** The obvious place —
+    ``<data_dir>/backups/`` — is refused by :func:`~manicule.storage.backup.create_backup`,
+    which will not write a snapshot into the directory it is snapshotting because the copy
+    would include itself. That guard is right and the caller was wrong, and the result was a
+    command whose documented default form failed every time it ran
+    ([#66](https://github.com/mgd43b/manicule/issues/66)): the only way to upgrade was to pass
+    ``--skip-backup``, which skips the part that is dangerous to skip.
+
+    Named from the data directory rather than fixed, so two installations on one machine do
+    not write into each other's, and placed beside it rather than under ``$XDG_STATE_HOME``
+    because a pre-upgrade snapshot is a copy of the corpus — not state, not cache, and not
+    something to put where a cleaner might reasonably delete it. The trade is that ``doctor``
+    examines ``<data_dir>`` and does not look here; the snapshot directory is created and
+    verified ``0700`` by ``backup`` itself, and ``upgrade`` reports the path it used.
+
+    Args:
+        data_dir: The directory being backed up.
+        moment: Unix seconds, which becomes the leaf name. Passed in rather than read here,
+            so the caller — and a test — can say what it is.
+
+    Returns:
+        An absent directory, ready to be created by whoever writes into it.
+    """
+    return data_dir.parent / f"{data_dir.name}-backups" / f"pre-upgrade-{moment}"
 
 
 def _local(path: Path | str) -> Path:

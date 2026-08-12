@@ -615,9 +615,19 @@ def backup(
 @app.command("export")
 def export_corpus(
     output: Annotated[Path, typer.Option("--output", "-o", help="Directory to write.")],
+    allow_insecure_target: Annotated[
+        bool,
+        typer.Option(
+            "--allow-insecure-target",
+            help="Write into a group- or world-readable directory. It holds the whole corpus.",
+        ),
+    ] = False,
 ) -> None:
     """Write a portable archive: retained source bytes and metadata, never chunks or vectors."""
-    emit("export", lambda service: service.export_corpus(output))
+    emit(
+        "export",
+        lambda service: service.export_corpus(output, allow_insecure_target=allow_insecure_target),
+    )
 
 
 @app.command("import")

@@ -13,25 +13,26 @@ none of them has any business loading a multi-gigabyte model to answer.
 from __future__ import annotations
 
 import os
+import stat
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 from manicule.app.runtime import Runtime
-from manicule.app.service import ApplicationService
+from manicule.app.service import ApplicationService, pre_upgrade_destination
 from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.container.container import build_container, check_wiring
+from manicule.core.errors import InsecureTargetError
 from manicule.generation.config import GENERATOR_NAME
 from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
 from manicule.plugins.manifest import ComponentKind
 from manicule.plugins.registry import discover
-from manicule.storage.backup import BackupError
 from manicule.storage.config import DOC_STORE_NAME, VECTOR_STORE_NAME
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-    from pathlib import Path
 
 STALE_INSTALL = (
     "an entry point declared in pyproject.toml is missing from the installed distribution. "
@@ -151,13 +152,146 @@ async def test_a_backup_into_a_pre_existing_exposed_directory_is_refused_end_to_
     target.chmod(0o755)
     service = ApplicationService(runtime)
 
-    with pytest.raises(BackupError, match="group or other permissions") as refusal:
+    with pytest.raises(InsecureTargetError, match="group or other permissions") as refusal:
         await service.backup(target)
     assert str(target) in str(refusal.value)
     assert not any(target.iterdir()), "a refused backup leaves the corpus where it was"
 
     report = await service.backup(target, allow_insecure_target=True)
     assert report.files, "the escape hatch is an escape hatch, not a second refusal"
+
+
+async def _retain_one_document(runtime: Runtime, data_dir: Path) -> None:
+    """Put one document with retained source bytes into a real runtime's stores.
+
+    Export copies retained bytes and nothing else, so an empty corpus exercises the manifest
+    and none of the files that actually carry the documents.
+    """
+    from manicule.storage.blobs import BlobStore, StoredBlob  # noqa: PLC0415
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    # Resolving the document store is what opens the engine; asking for the engine first is
+    # the out-of-order call the runtime refuses.
+    await runtime.documents()
+    engine = runtime.require_engine()
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    body = b"# Auth\n\nthe service handles authentication"
+    stored = await BlobStore(engine, data_dir).put(body, "text/markdown")
+    assert isinstance(stored, StoredBlob)
+    document = make_document(body=body).model_copy(update={"original_ref": stored.hash})
+    await store.upsert_document(document)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_an_export_is_private_by_default_down_to_the_files(
+    runtime: Runtime, manicule_environment: Path
+) -> None:
+    """An archive is written in order to be carried, so its files carry their own modes.
+
+    The directory being ``0700`` is what stops another account reading it *here*. It stops
+    nothing once a file is copied out, and copying it out is the entire purpose of an export
+    (#68). Every file in it is asserted, not just the manifest.
+    """
+    await _retain_one_document(runtime, manicule_environment / "data")
+    target = manicule_environment / "archive"
+
+    report = await ApplicationService(runtime).export_corpus(target)
+
+    assert report.documents == 1, "an export of nothing would assert nothing"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    written = [path for path in target.rglob("*") if path.is_file()]
+    assert written, "the archive is empty; this test would pass on a broken export"
+    for path in written:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600, path
+    for directory in (path for path in target.rglob("*") if path.is_dir()):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_an_export_into_a_pre_existing_exposed_directory_is_refused_end_to_end(
+    runtime: Runtime, manicule_environment: Path
+) -> None:
+    """Same refusal as `backup`, from the same function, reached by a different command."""
+    await _retain_one_document(runtime, manicule_environment / "data")
+    target = manicule_environment / "shared-archive"
+    target.mkdir()
+    target.chmod(0o755)
+    service = ApplicationService(runtime)
+
+    with pytest.raises(InsecureTargetError, match="group or other permissions") as refusal:
+        await service.export_corpus(target)
+    assert str(target) in str(refusal.value)
+    assert str(refusal.value).startswith("export target "), "the message names this command"
+    assert not any(target.iterdir()), "a refused export writes nothing"
+
+    report = await service.export_corpus(target, allow_insecure_target=True)
+    assert report.documents == 1, "the escape hatch is an escape hatch, not a second refusal"
+    manifest = target / "manicule-export.json"
+    assert stat.S_IMODE(manifest.stat().st_mode) == 0o600, (
+        "consenting to a reachable directory is the case where the file's own mode is the "
+        "only thing left protecting it"
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_re_exporting_over_yesterdays_archive_does_not_keep_yesterdays_modes(
+    runtime: Runtime, manicule_environment: Path
+) -> None:
+    """The trap again, one level down: a mode passed to ``open`` applies only on creation.
+
+    An archive written by a build without this fix, re-exported by one with it, would keep
+    its ``0644`` files and look repaired.
+    """
+    await _retain_one_document(runtime, manicule_environment / "data")
+    target = manicule_environment / "archive"
+    service = ApplicationService(runtime)
+    await service.export_corpus(target)
+    for path in target.rglob("*"):
+        if path.is_file():
+            path.chmod(0o644)
+
+    await service.export_corpus(target)
+
+    for path in target.rglob("*"):
+        if path.is_file():
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600, path
+
+
+async def test_upgrade_takes_its_backup_somewhere_the_backup_guard_accepts(
+    runtime: Runtime, manicule_environment: Path
+) -> None:
+    """The default form of `upgrade`, against a real runtime, which is what #66 needed.
+
+    It targeted ``<data_dir>/backups/…`` and `create_backup` refuses to snapshot a directory
+    into itself, so every `manicule upgrade` failed unless the operator passed
+    ``--skip-backup`` — which skips the part the command exists to do. The service test
+    covering `upgrade` ran against a fake whose ``backup`` resolved no paths at all.
+    """
+    from manicule.storage.backup import verify_backup  # noqa: PLC0415
+    from manicule.storage.engine import exposure  # noqa: PLC0415
+
+    data_dir = manicule_environment / "data"
+    report = await ApplicationService(runtime).upgrade()
+
+    assert report.backup is not None, "the default form takes a backup"
+    written = Path(report.backup)
+    assert data_dir not in written.parents, "a snapshot inside the data directory copies itself"
+    # Not merely "a directory appeared": every inventoried file, hashed against the manifest.
+    verify_backup(written)
+    assert exposure(written) == 0, "nobody chose this path, so manicule owes it 0700"
+
+
+def test_the_pre_upgrade_destination_is_a_sibling_of_the_data_directory() -> None:
+    """Path arithmetic, asserted without running an upgrade, because it is a decision.
+
+    Derived from the data directory's name so two installations on one machine do not write
+    into each other's, and outside it so the snapshot is not part of what it snapshots.
+    """
+    destination = pre_upgrade_destination(Path("/srv/corpus"), moment=1234567890)
+    assert destination == Path("/srv/corpus-backups/pre-upgrade-1234567890")
+    assert Path("/srv/corpus") not in destination.parents
 
 
 async def test_the_vector_store_is_prepared_before_anything_writes_a_vector(

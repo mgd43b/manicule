@@ -9,11 +9,14 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+
+from manicule.core.errors import InsecureTargetError
 
 if TYPE_CHECKING:
     from sqlalchemy.engine.interfaces import DBAPIConnection
@@ -148,6 +151,65 @@ def exposure(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode) & EXPOSED_MODE_BITS
 
 
+def secure_output_dir(target: Path, *, operation: str, allow_insecure: bool = False) -> None:
+    """Create ``target`` ``0700``, then check that is what it actually is.
+
+    **Asking for a mode is not having one.** ``Path.mkdir(mode=0o700, exist_ok=True)`` applies
+    ``mode`` only when it creates the directory: a pre-existing group- or world-readable one is
+    used exactly as found. That is not the rare path, it is the ordinary one — an operator who
+    writes into the same place twice creates it once — so the mode is requested and then
+    *verified*. Verifying also covers the case creation alone cannot: a default POSIX ACL on
+    the parent can hand back a directory wider than the one that was asked for. Both halves of
+    that were learned the expensive way in
+    [#60](https://github.com/mgd43b/manicule/issues/60).
+
+    One function for `backup` and `export` both, because it is one rule about one kind of
+    directory: whatever manicule writes there is a complete copy of the corpus, retained source
+    bytes and all (``docs/storage.md`` §7.1). ``doctor`` fails rather than warns on that
+    exposure of the data directory; a second and third copy of the same bytes get the same
+    answer, in the same words, because two versions of this check would eventually be two
+    different checks.
+
+    Only the target directory is examined, for the reason :func:`exposure` gives: POSIX gates
+    every read on every ancestor, so a directory nobody else may enter is one nobody else may
+    read *through*, whatever the permissions on the path leading to it.
+
+    Args:
+        target: Where the copy will be written. Created, with its parents, if absent.
+        operation: What is being written, as the operator typed it — ``"backup"``,
+            ``"export"``. It opens the message, so the refusal names the command that stopped.
+        allow_insecure: Write into an exposed target anyway. The operator asked for it in so
+            many words; manicule still refuses to be the one that decided.
+
+    Raises:
+        InsecureTargetError: The target is group- or world-readable and ``allow_insecure`` was
+            not given, or its mode could not be read at all.
+    """
+    existed = target.exists()
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        exposed = exposure(target)
+    except OSError as error:
+        msg = f"{operation} target {target} cannot be examined: {error}"
+        raise InsecureTargetError(msg) from error
+    if not exposed or allow_insecure:
+        return
+    if not existed:
+        # Created a moment ago and refused a moment later: leave nothing behind, so the next
+        # run meets the directory it would have met anyway.
+        with suppress(OSError):
+            target.rmdir()
+    msg = (
+        f"{operation} target {target} carries group or other permissions ({exposed:03o}), so "
+        f"what manicule writes into it would be readable by accounts other than the one "
+        f"running manicule. A {operation} holds the retained source bytes of every indexed "
+        f"document, which makes this an exposure of the corpus rather than a tidiness problem. "
+        f"Run `chmod 0700 {target}`, choose a target only this account can read, or pass "
+        f"--allow-insecure-target to write it there knowingly."
+    )
+    raise InsecureTargetError(msg)
+
+
 def create_engine(data_dir: Path, *, echo: bool = False) -> AsyncEngine:
     """Build the async engine for a data directory, with the pragmas attached.
 
@@ -212,5 +274,6 @@ __all__ = [
     "database_path",
     "prepare_data_dir",
     "require_supported_sqlite",
+    "secure_output_dir",
     "session_factory",
 ]

@@ -92,9 +92,9 @@ whatever the files inside it say — and walking the blob store would make a dia
 That distinction is load-bearing rather than theoretical: **`manicule.db` and its `-wal` and
 `-shm` siblings are created `0644`**, because SQLite creates them and manicule does not chmod
 them afterwards. Unreachable inside a `0700` directory, and worth knowing before copying one
-of those files somewhere with a different parent. The one copy manicule makes itself is the
-exception: `backup` writes its snapshot database `0600` (§3), because that copy is made to be
-moved.
+of those files somewhere with a different parent. The copies manicule makes itself are the
+exception: `backup` writes its snapshot database `0600` and `export` writes every file in an
+archive `0600` (§3), because those copies are made to be moved.
 
 **Do not branch a script on `manicule doctor`'s exit status.** It exits **0** whenever it
 managed to produce a diagnosis, whatever the diagnosis says — which is the exit-status
@@ -134,9 +134,9 @@ rule to where you send it:
 
 ```console
 $ manicule backup --output /srv/share/manicule
-backup failed: BackupError
-backup target /srv/share/manicule carries group or other permissions (055), so the
-snapshot written into it would be readable by accounts other than the one running
+backup failed: InsecureTargetError
+backup target /srv/share/manicule carries group or other permissions (055), so what
+manicule writes into it would be readable by accounts other than the one running
 manicule. … Run `chmod 0700 /srv/share/manicule`, choose a target only this account
 can read, or pass --allow-insecure-target to write it there knowingly.
 ```
@@ -158,10 +158,46 @@ Two habits are still worth having:
   that is exported over NFS, replicated to an object store, or backed up by something else.
 - Treat an off-machine backup as an export of the corpus, because that is what it is.
 
+### 3.1 `export` is held to the same rule
+
 `manicule export --output <dir>` is a different thing and is not a backup: it writes retained
 bytes and metadata but never chunks or vectors, so the importing machine re-derives both with
 its own fingerprints. It is how a corpus moves between installations. It is also a complete
-copy of the source documents.
+copy of the source documents — which is why it refuses a group- or world-readable target in
+the same words, with the same `--allow-insecure-target` to override it, from the same function
+that decides for `backup`.
+
+It is held to a **stricter** rule about the files inside, not a looser one. The archive
+directory is `0700`, its `blobs/` shard `0700`, and **every file in it `0600`** — the manifest
+and every retained document alike. A backup is written to sit still; an archive is written to
+be carried, and a file copied out of a `0700` directory takes its own mode with it, not the
+directory's. Until [#68](https://github.com/mgd43b/manicule/issues/68) an export asked for no
+mode at all, so a fresh archive of the entire corpus landed `0755`/`0644` under the usual
+`umask` — weaker than the backup path even before that was fixed.
+
+### 3.2 `upgrade` takes one first, and you do not choose where
+
+`manicule upgrade` takes a snapshot before it tells you how to upgrade. It writes to a sibling
+of the data directory — `<data_dir>-backups/pre-upgrade-<unix-seconds>`, so
+`~/.local/share/manicule-backups/…` for a default install — and reports the path it used:
+
+```console
+$ manicule --json upgrade | jq -r .data.backup
+/home/manicule/.local/share/manicule-backups/pre-upgrade-1786539202
+```
+
+Beside the data directory rather than inside it, because `backup` refuses to snapshot a
+directory into itself — the copy would include itself — and for a while that refusal met a
+caller that asked for exactly that, so every `manicule upgrade` failed unless `--skip-backup`
+was passed ([#66](https://github.com/mgd43b/manicule/issues/66)). Two consequences worth
+knowing:
+
+- **These accumulate.** One directory per upgrade, each a full copy of the corpus, each
+  `0700`. Nothing prunes them; delete the old ones when you are satisfied the new version
+  works.
+- **`doctor` does not look there.** Its permissions check is about `<data_dir>`. The snapshot
+  directory is created and verified `0700` by `backup` itself, but if you move one somewhere
+  else, §1 applies to it from then on.
 
 ---
 

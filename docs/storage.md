@@ -1132,6 +1132,14 @@ mounted volume, the second run into the same place — never received. `create_b
 the mode as `doctor` does. Checking afterwards also covers what creation alone cannot: a
 default POSIX ACL can hand back a directory wider than the one requested.
 
+**One check, not one per command.** The rule lives in
+`manicule.storage.engine.secure_output_dir` and both `backup` and `export` call it, because
+`export` writes the same bytes to the same kind of directory and had none of this — it asked
+for no mode at all ([#68](https://github.com/mgd43b/manicule/issues/68)). Two copies of a
+security check are two checks that eventually differ, and the one that differs is the one
+nobody reads. It raises `InsecureTargetError`, which describes the *destination* rather than
+the operation carrying the bytes, so a caller has one thing to catch for both.
+
 **What is genuinely not storage's to decide** stays with the security surface
 ([#13](https://github.com/mgd43b/manicule/issues/13),
 [#19](https://github.com/mgd43b/manicule/issues/19)): encryption at rest and its key

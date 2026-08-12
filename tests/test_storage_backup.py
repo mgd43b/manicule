@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from manicule.core.errors import InsecureTargetError
 from manicule.storage.backup import (
     MANIFEST_NAME,
     BackupError,
@@ -214,7 +215,7 @@ async def test_backing_up_into_a_pre_existing_world_readable_directory_is_refuse
     target.mkdir()
     target.chmod(0o755)
 
-    with pytest.raises(BackupError, match="group or other permissions") as refusal:
+    with pytest.raises(InsecureTargetError, match="group or other permissions") as refusal:
         await create_backup(engine, data_dir, target)
 
     assert str(target) in str(refusal.value), "an unnamed path sends an operator hunting"
@@ -232,7 +233,7 @@ async def test_a_group_readable_target_is_refused_too(
     target.mkdir()
     target.chmod(0o750)
 
-    with pytest.raises(BackupError, match="group or other permissions"):
+    with pytest.raises(InsecureTargetError, match="group or other permissions"):
         await create_backup(engine, data_dir, target)
 
 
@@ -276,49 +277,6 @@ async def test_a_target_manicule_creates_for_itself_is_not_readable_by_anyone_el
 
     assert stat.S_IMODE(target.stat().st_mode) == 0o700
     verify_backup(target)
-
-
-async def test_a_target_that_came_back_wider_than_it_was_asked_for_is_refused(
-    engine: AsyncEngine, data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``mkdir(mode=0o700)`` is a request, and a default POSIX ACL can answer it with more.
-
-    Simulated rather than staged: a default ACL needs ``setfacl`` and a filesystem mounted to
-    honour it, neither of which a suite can assume. What is exercised for real is the
-    consequence — the mode is *checked after* creation rather than asserted before it, so even
-    a directory manicule created itself can be refused, and is then removed again.
-    """
-    await _populate(engine, data_dir)
-    target = tmp_path / "widened"
-
-    def widened(_: Path) -> int:
-        return 0o055
-
-    monkeypatch.setattr("manicule.storage.backup.exposure", widened)
-
-    with pytest.raises(BackupError, match="group or other permissions"):
-        await create_backup(engine, data_dir, target)
-
-    assert not target.exists(), "created here and refused here: leave nothing behind"
-
-
-async def test_a_target_whose_mode_cannot_be_read_is_a_different_diagnosis(
-    engine: AsyncEngine, data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A target that cannot be examined is not a target that is exposed, and ``doctor`` agrees.
-
-    Reporting the second for the first sends an operator to ``chmod`` a path whose real
-    problem is that it is not there, or not theirs.
-    """
-    await _populate(engine, data_dir)
-
-    def unreadable(_: Path) -> int:
-        raise PermissionError("no")
-
-    monkeypatch.setattr("manicule.storage.backup.exposure", unreadable)
-
-    with pytest.raises(BackupError, match="cannot be examined"):
-        await create_backup(engine, data_dir, tmp_path / "opaque")
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")

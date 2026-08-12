@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -9,8 +10,14 @@ from typing import TYPE_CHECKING
 import pytest
 from sqlalchemy import select, text
 
+from manicule.core.errors import InsecureTargetError
 from manicule.storage import models
-from manicule.storage.engine import PRAGMAS, create_engine, prepare_data_dir
+from manicule.storage.engine import (
+    PRAGMAS,
+    create_engine,
+    prepare_data_dir,
+    secure_output_dir,
+)
 from manicule.storage.migrator import current, head_revision, upgrade
 from manicule.storage.types import UtcDateTime, utcnow
 from tests.storage_helpers import make_document
@@ -277,6 +284,89 @@ async def test_the_data_directory_is_created_private(tmp_path: Path) -> None:
     assert root.stat().st_mode & 0o777 == 0o700
     assert (root / "vectors").stat().st_mode & 0o777 == 0o700
     assert (root / "blobs").stat().st_mode & 0o777 == 0o700
+
+
+async def test_an_output_directory_is_created_private(tmp_path: Path) -> None:
+    """The ordinary path: a directory manicule makes for a copy of the corpus is ``0700``."""
+    target = tmp_path / "archive"
+    secure_output_dir(target, operation="export")
+    assert target.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_a_pre_existing_exposed_output_directory_is_refused(tmp_path: Path) -> None:
+    """The case ``mkdir(mode=…, exist_ok=True)`` never reaches, and the reason #60 existed.
+
+    The refusal names the operation, the path and the mode, because each of the three is a
+    question an operator would otherwise have to answer by hand.
+    """
+    target = tmp_path / "shared"
+    target.mkdir()
+    target.chmod(0o755)
+
+    with pytest.raises(InsecureTargetError) as refusal:
+        secure_output_dir(target, operation="export")
+
+    message = str(refusal.value)
+    assert message.startswith("export target "), "the refusal says which command stopped"
+    assert str(target) in message
+    assert "055" in message
+    assert "--allow-insecure-target" in message, "a refusal with no way past it is a wall"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_consent_writes_into_an_exposed_directory_and_changes_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """The escape hatch permits; it does not silently tighten what the operator set."""
+    target = tmp_path / "shared"
+    target.mkdir()
+    target.chmod(0o755)
+
+    secure_output_dir(target, operation="backup", allow_insecure=True)
+
+    assert target.stat().st_mode & 0o777 == 0o755
+
+
+async def test_a_directory_that_came_back_wider_than_it_was_asked_for_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mkdir(mode=0o700)`` is a request, and a default POSIX ACL can answer it with more.
+
+    Simulated rather than staged: a default ACL needs ``setfacl`` and a filesystem mounted to
+    honour it, neither of which a suite can assume. What is exercised for real is the
+    consequence — the mode is *checked after* creation rather than asserted before it, so even
+    a directory manicule created itself can be refused, and is then removed again.
+    """
+    target = tmp_path / "widened"
+
+    def widened(_: Path) -> int:
+        return 0o055
+
+    monkeypatch.setattr("manicule.storage.engine.exposure", widened)
+
+    with pytest.raises(InsecureTargetError, match="group or other permissions"):
+        secure_output_dir(target, operation="backup")
+
+    assert not target.exists(), "created here and refused here: leave nothing behind"
+
+
+async def test_a_directory_whose_mode_cannot_be_read_is_a_different_diagnosis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory that cannot be examined is not one that is exposed, and ``doctor`` agrees.
+
+    Reporting the second for the first sends an operator to ``chmod`` a path whose real
+    problem is that it is not there, or not theirs.
+    """
+
+    def unreadable(_: Path) -> int:
+        raise PermissionError("no")
+
+    monkeypatch.setattr("manicule.storage.engine.exposure", unreadable)
+
+    with pytest.raises(InsecureTargetError, match="cannot be examined"):
+        secure_output_dir(tmp_path / "opaque", operation="export")
 
 
 async def test_every_model_is_reachable_from_the_metadata() -> None:

@@ -167,10 +167,16 @@ class Maintenance(Protocol):
         """Empty the index. Returns documents removed, chunks removed, vectors removed."""
         ...
 
-    async def export_corpus(self, target: Path) -> tuple[int, int]:
+    async def export_corpus(
+        self, target: Path, *, allow_insecure_target: bool = False
+    ) -> tuple[int, int]:
         """Write a portable archive of this workspace's retained bytes and metadata.
 
         Returns the number of documents written and the number of bytes they occupy.
+
+        A group- or world-readable ``target`` is refused on the same terms as :meth:`backup`,
+        and for a stronger reason: an archive is written *in order to be carried somewhere*,
+        so it is the copy most likely to be read by somebody the corpus was never shared with.
         """
         ...
 
