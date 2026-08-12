@@ -713,14 +713,15 @@ def doctor(
         bool,
         typer.Option(
             "--fix",
-            help="Repair what can be repaired, then report. Today that is one thing: seeding "
-            "the declared code grammars, from an offline bundle if one is installed and from "
-            "the grammar release otherwise. It is the only part of this command that writes "
-            "to the machine or uses the network, which is why it is a flag.",
+            help="Repair what can be repaired, then report. Today that is the two artifacts "
+            "no wheel ships: the declared code grammars, and the BPE vocabularies every "
+            "search measures a context with. Each is seeded from an offline bundle if one is "
+            "installed and from its upstream otherwise. It is the only part of this command "
+            "that writes to the machine or uses the network, which is why it is a flag.",
         ),
     ] = False,
 ) -> None:
-    """Check configuration, plugins, storage, the index, grammars and the network bind."""
+    """Check configuration, plugins, storage, the index, grammars, vocabularies and the bind."""
     emit("doctor", lambda service: service.doctor(fix=fix))
 
 

@@ -30,6 +30,14 @@ estimate. Four rules keep an estimate honest:
 * **Then stop guessing.** Ollama's response carries ``prompt_eval_count`` — the true count,
   from the model that counts — and :meth:`ContextTokenCounter.observe` compares the estimate
   against it. Measuring once beats a safety factor forever.
+
+**And the vocabulary itself comes off this machine, never off a query.** ``tiktoken`` ships no
+vocabularies in its wheel and downloads them on first use, so this counter used to open a
+connection to a blob store the first time a context was assembled — on an install that had
+indexed its corpus perfectly well offline. It is resolved through
+:mod:`manicule.vocabularies` now, at construction, and that module cannot fetch: a vocabulary
+this host was never given is a refusal while retrieval is being assembled, naming the pre-seed
+that supplies it.
 """
 
 from __future__ import annotations
@@ -93,8 +101,14 @@ class ContextTokenCounter:
         self.safety_factor = safety_factor
         self.drift_tolerance = drift_tolerance
         self.drift: dict[str, float] = {}
-        self._encoding: Any = None
         self._counts: dict[str, int] = {}
+        # Resolved here rather than on the first count, and that is the whole of the fix for
+        # #61. The vocabulary is a file this install either has or does not, and finding out
+        # which at the first *question* meant an air-gapped host that indexed a corpus
+        # successfully and then failed to answer, with an error naming a blob storage host.
+        # Constructing the counter is what `build_retriever` does while assembling retrieval,
+        # so a missing vocabulary is now a startup refusal naming the pre-seed.
+        self._encoding = _load(encoding)
 
     @property
     def identity(self) -> str:
@@ -160,13 +174,21 @@ class ContextTokenCounter:
         return relative
 
     def _encode(self, text: str) -> int:
-        if self._encoding is None:
-            # Deferred: tiktoken is a retrieval extra, and importing manicule must not load it.
-            import tiktoken  # noqa: PLC0415
-
-            self._encoding = tiktoken.get_encoding(self.encoding_name)
         tokens: Any = self._encoding.encode(text)
         return len(tokens)
+
+
+def _load(encoding: str) -> Any:  # noqa: ANN401 - tiktoken's own type, not imported here
+    """The vocabulary, from this machine, never from the network.
+
+    Deferred import: ``tiktoken`` is a retrieval extra and importing manicule must not load
+    it. :func:`manicule.vocabularies.load_encoding` rather than ``tiktoken.get_encoding``
+    because the latter downloads whatever the cache lacks, which is how a query path acquired
+    a dependency on a blob store nobody had noticed.
+    """
+    from manicule import vocabularies  # noqa: PLC0415 - see docstring
+
+    return vocabularies.load_encoding(encoding)
 
 
 __all__ = [

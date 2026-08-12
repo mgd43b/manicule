@@ -288,7 +288,74 @@ native install and a container share a data directory they are the same index �
 same time: SQLite's locking is per-file and a concurrent ingest from two processes is not
 something this design has been exercised against.
 
-### 5.1 Redistributing an image
+### 5.1 An install with no network, outside the container
+
+The image carries what it needs because the build put it there. A native install on an
+air-gapped host has to be given the same two things, and neither of them ships in a wheel.
+
+**Grammars** are [`parsing.md`](parsing.md) §8.1.1's offline bundle, built with
+`tools/build_grammar_bundle.py` on a machine that has network access and the same platform.
+
+**BPE vocabularies** are the same story arriving through `tiktoken`, and the failure it caused
+is worth knowing because it does not look like a missing artifact: the host **indexes
+perfectly**, which reads as a working install, and then fails at the first question with a
+connection error naming a blob storage host. Three things fix it, in increasing order of
+effort:
+
+```sh
+# 1. On a host that has a network — the ordinary case, and `manicule init` already did it.
+#    5.3 MB, once. The same command repairs an install that was made before it had a route.
+manicule doctor --fix
+
+# 2. On a host that never will. Build the bundle where there is a network:
+python tools/build_vocabulary_bundle.py --output dist/vocabularies
+#    copy `dist/vocabularies` across, point manicule at it, and seed from it:
+export MANICULE_VOCABULARY_BUNDLE=/opt/manicule/vocabularies
+manicule doctor --fix
+
+# 3. Or build it into a distribution, so it installs like any other dependency
+#    and needs no environment variable at all:
+python tools/build_vocabulary_bundle.py --output build/pkg --package
+```
+
+`init` and `doctor --fix` seed the vocabularies through the same call, alongside the grammars,
+so an install and a repair cannot come to mean different things. A pre-seed that could not
+complete is a **note in the report, not a refusal to finish**: the configuration is written,
+and an air-gapped host with no bundle can still install software it is perfectly able to run
+once the bundle arrives. `doctor` then reports it as **failing** — not degraded, which is what
+a missing grammar is, because a corpus of Markdown works fine without a grammar and nothing
+works without a vocabulary.
+
+**Set `TIKTOKEN_CACHE_DIR` on any host you pre-seed.** With nothing set, `tiktoken` caches
+under the system temporary directory, and a temp sweep that removes 5 MB turns a working
+air-gapped install back into a broken one at the next question. The image sets it to
+`/opt/manicule/tiktoken`; a native install wants something equally durable. A read-only
+deployment can point it straight at a bundle's `vocab/` directory, which is laid out as a
+`tiktoken` cache and needs no copy.
+
+manicule does not redistribute these files and will not: OpenAI publishes them with no SPDX
+licence expression, so manicule cannot state the terms under which it would be handing them
+on. The bundle manifest records the URL every file came from, so whoever carries one can see
+exactly what is in it.
+
+**Model weights** are the third, and they are a different kind of artifact: 2.3 GB of ONNX
+export, not something anyone carries in a manifest. They are pre-seeded rather than bundled —
+`uv run tools/prefetch_embedding_models.py`, or point `embedding.model` (or a backend's
+`weights`) at a local directory — and `HF_HUB_OFFLINE=1` is what stops the hub looking at all.
+Set it on any host that has pre-seeded: a first search on a machine with a slow route to
+huggingface.co otherwise spends half a minute in what looks like a hang. A model that is
+neither cached nor reachable now refuses naming the pre-seed rather than surfacing the hub's
+own exception mid-query.
+
+**Nothing on the query path downloads silently.** A vocabulary that was never seeded is a
+refusal while retrieval is being assembled — naming the encoding, the cache that was read and
+where a bundle was looked for — rather than a download at the first question. A model that is
+not on the machine says which command supplies it. And the model table the generation provider
+library fetches at import is switched off: manicule sets `LITELLM_LOCAL_MODEL_COST_MAP` unless
+you have, so both an air-gapped host and a networked one read the table pinned in the lockfile
+instead of whichever revision a GitHub repository is serving today.
+
+### 5.2 Redistributing an image
 
 manicule is **GPL-3.0-or-later**, and that reaches an image built from it. Publishing an image
 to a registry others can pull is distribution: the corresponding source has to be available on

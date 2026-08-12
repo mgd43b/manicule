@@ -80,10 +80,16 @@ class TokenEstimator:
 
 
 def _tiktoken_counter(encoding_name: str) -> Callable[[str], int]:
-    """A ``tiktoken`` counter, imported here so nothing pays for it until it counts."""
-    import tiktoken  # noqa: PLC0415 - deliberately not a module-level import
+    """A ``tiktoken`` counter, imported here so nothing pays for it until it counts.
 
-    encoding = tiktoken.get_encoding(encoding_name)
+    Through :func:`manicule.vocabularies.load_encoding` rather than ``tiktoken.get_encoding``,
+    which fetches the vocabulary from a blob store when the cache cannot answer — on the path
+    that answers a question, where a download is the least useful thing that can happen. The
+    pre-seed is :func:`manicule.vocabularies.prefetch`.
+    """
+    from manicule import vocabularies  # noqa: PLC0415 - deliberately not a module-level import
+
+    encoding = vocabularies.load_encoding(encoding_name)
     return lambda text: len(encoding.encode(text, disallowed_special=()))
 
 

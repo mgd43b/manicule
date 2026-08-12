@@ -17,6 +17,7 @@ handled: the ``ollama_chat`` prefix (§4.2), the three timeouts (§4.5), the ret
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import time
 from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
@@ -88,8 +89,29 @@ def compose_model(provider: str, model: str) -> str:
     return f"{prefix}/{model.strip()}"
 
 
+LOCAL_COST_MAP_ENV = "LITELLM_LOCAL_MODEL_COST_MAP"
+"""The provider library's switch for using the model table it ships with.
+
+Set by :func:`_litellm` when the operator has not, and the reason is the same one behind
+:mod:`manicule.vocabularies`: **importing the library performs an HTTPS GET to a third-party
+host** — the model pricing and context-window table, from raw.githubusercontent.com, on a
+five-second timeout — and it does it on the path that answers a question. It is not a call to
+the configured model server, and it is not optional at import.
+
+Its failure is silent: the library falls back to the copy in its own wheel. So an air-gapped
+host pays five seconds per process and gets the local table anyway, and a networked host gets
+whichever revision that repository is serving today. Setting this makes both hosts use the
+same table — the one pinned in the lockfile — which is the difference between an answer that
+depends on the machine and one that does not.
+
+Only set when unset, so an operator who wants the live table, or a mirror through
+``LITELLM_MODEL_COST_MAP_URL``, keeps it.
+"""
+
+
 def _litellm() -> Any:  # noqa: ANN401 - the library's own surface, deliberately untyped here
     """Import the provider library. Deferred, so registration never pays for it."""
+    os.environ.setdefault(LOCAL_COST_MAP_ENV, "True")
     import litellm  # noqa: PLC0415 - the whole point is that this is not a module import
 
     return litellm

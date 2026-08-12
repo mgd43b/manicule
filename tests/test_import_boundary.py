@@ -99,6 +99,13 @@ MANICULE_PACKAGES = (
     # import lives inside the factory that builds the generator, so an installation that
     # never asks a question never pays for it — and `manicule doctor` does not load it at all.
     "manicule.generation",
+    # The vocabulary package exists because `tiktoken` fetches a BPE table from a blob store
+    # on first use, and it must not become the reason `tiktoken` is loaded at all. Every one
+    # of its functions imports the library inside itself, so a process that pre-seeds pays for
+    # it and a process that merely knows where the cache is does not — which is what lets the
+    # container build and a status report ask the question without loading a 200 000-entry
+    # vocabulary to hear the answer.
+    "manicule.vocabularies",
     # The evaluation harness computes binomial tails, Wilson intervals and sign tests in pure
     # Python. numpy and scipy would each have done it in one call, and an evaluation harness
     # that cannot be imported without a numerical stack is one that gets skipped — which is

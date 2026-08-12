@@ -647,9 +647,11 @@ class ApplicationService:
 
         Args:
             fix: Perform the repairs this command knows how to perform, and then report the
-                state that resulted. Exactly one repair exists — seeding the declared code
-                grammars, :meth:`_grammar_check` — and it is the only thing here that writes
-                to the machine or may use the network.
+                state that resulted. Two repairs exist, and they are the same repair against
+                two libraries that ship the same gap: seeding the declared code grammars
+                (:meth:`_grammar_check`) and the BPE vocabularies the token counters measure
+                with (:meth:`_vocabulary_check`). They are the only things here that write to
+                the machine or may use the network.
 
                 **Off by default, and passed only by the command line.** The MCP tool and the
                 HTTP route both call this with no arguments, deliberately: a diagnostic an
@@ -669,6 +671,7 @@ class ApplicationService:
         checks.append(await self._permissions_check())
         checks.append(await self._index_check())
         checks.append(await self._grammar_check(fix=fix))
+        checks.append(await self._vocabulary_check(fix=fix))
         checks.extend(await self._backend.component_checks())
         worst: r.CheckState = "ok"
         for check in checks:
@@ -950,6 +953,109 @@ class ApplicationService:
             detail=(
                 f"{settled}{len(languages)} declared grammar(s) in {cache} "
                 f"({grammars.PACK_DISTRIBUTION} {grammars.pack_version()}){carried}"
+            ),
+        )
+
+    async def _vocabulary_check(self, *, fix: bool = False) -> r.Check:
+        """Whether the BPE vocabularies this installation counts tokens with are on it.
+
+        ``tiktoken`` ships none in its wheel: every encoding it knows is a file on a blob
+        store, fetched on first use (``docs/retrieval.md`` §7.2). manicule will not make that
+        fetch while answering a question, so an installation that never pre-seeded is one that
+        indexes a corpus perfectly and then refuses every ``search`` — the failure split across
+        two moments, the second one unexplained. This is what says so at the first moment.
+
+        **Failing rather than degraded, and the difference from :meth:`_grammar_check` is the
+        whole reason to state it.** Missing grammars are degraded because there are
+        installations for which their absence costs nothing: a corpus of Markdown and PDFs
+        works perfectly without one, and a red check on a healthy machine teaches an operator
+        to ignore ``doctor``. No such installation exists here. Every context is measured with
+        this vocabulary whatever the corpus is made of, so a machine without it cannot answer
+        a question at all — this is not a healthy machine being marked red, it is a broken one
+        being marked broken, and the objection the grammar check is answering does not arise.
+
+        The other two failing states are the same two, for the same reasons: a bundle that is
+        present and unusable, and a configured encoding no installed ``tiktoken`` defines —
+        both misconfigurations somebody made, and both invisible until a query.
+
+        Args:
+            fix: Seed what is missing before reporting, from the offline bundle first and the
+                network only for what the bundle did not supply.
+
+        Returns:
+            One check. It never raises: a ``doctor`` that crashed on a broken bundle would be
+            a diagnostic that only works on a healthy machine.
+        """
+        return await asyncio.to_thread(self._inspect_vocabularies, fix=fix)
+
+    def _inspect_vocabularies(self, *, fix: bool) -> r.Check:
+        """The blocking half of :meth:`_vocabulary_check`, off the event loop.
+
+        Blocking, and not trivially: answering "is every vocabulary here" reads each file and
+        checks it against the digest ``tiktoken`` declares, because a cache entry with the
+        right name and the wrong bytes is one ``tiktoken`` deletes and re-fetches — which on a
+        host that cannot fetch is a refusal that an existence check would have called healthy.
+        That is 5 MB of hashing; under ``fix`` it may also copy from a bundle or download.
+
+        The import is lazy for the reason every optional import in this file is: an
+        installation without the retrieval extra still runs ``doctor``, and this must not be
+        the check that discovers the extra is missing by failing to start.
+        """
+        from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra
+        from manicule.vocabularies import bundle as vocabulary_bundle  # noqa: PLC0415
+
+        seeded: tuple[str, ...] = ()
+        try:
+            wanted = vocabularies.required_encodings(self.settings.rag.context.encoding)
+            # `locate` rather than `resolve`, for the reason `_inspect_grammars` gives: it
+            # answers "is there a bundle here at all" from an environment variable and a module
+            # spec, where resolving reads the manifest — and `bundle_status` below reads it
+            # anyway when there is something worth saying.
+            located = vocabulary_bundle.locate()
+            missing = vocabularies.missing_vocabularies(wanted)
+            if missing and fix:
+                seeded = vocabularies.prefetch(wanted)
+                # Asked of the cache again rather than taken from what the pre-seed returned.
+                # `prefetch` checks itself, and a check that trusted the repair it had just
+                # asked for would report success for the one failure this area exists to catch.
+                missing = vocabularies.missing_vocabularies(wanted)
+            offline = vocabularies.bundle_status() if missing or located is not None else ""
+        except ImportError:
+            return r.Check(
+                name="vocabularies",
+                state="unknown",
+                detail=(
+                    "the retrieval extra is not installed, so there is no token counter here "
+                    "to give a vocabulary to. Install `manicule[retrieval]`."
+                ),
+            )
+        except ManiculeError as exc:
+            # ConfigError for a configured encoding no installed tiktoken defines — a model
+            # name in `rag.context.encoding` is the specific mistake docs/retrieval.md §7.2
+            # asks the fitter never to accept — VocabularyBundleError for a bundle that is
+            # installed and wrong, VocabularyFetchError for a pre-seed that could not
+            # complete. Each already says what to do about itself.
+            return r.Check(name="vocabularies", state="failing", detail=str(exc))
+
+        cache = vocabularies.cache_directory()
+        if missing:
+            return r.Check(
+                name="vocabularies",
+                state="failing",
+                detail=(
+                    f"no vocabulary for {list(missing)} in {cache}, so every search refuses "
+                    f"rather than downloading one mid-question. Run `manicule doctor --fix` "
+                    f"to seed them — {offline}"
+                ),
+            )
+        settled = f"seeded {list(seeded)}; " if seeded else ""
+        carried = f"; {offline}" if offline else ""
+        return r.Check(
+            name="vocabularies",
+            state="ok",
+            detail=(
+                f"{settled}{len(wanted)} vocabulary(ies) {list(wanted)} in {cache} "
+                f"(tiktoken {vocabularies.tiktoken_version()}){carried}"
             ),
         )
 
@@ -1364,20 +1470,23 @@ class ApplicationService:
         a default that is wrong for the machine is discovered at the first ingest, and by then
         a corpus has been indexed with it.
 
-        **It also pre-seeds the declared code grammars**, through the same call ``doctor
-        --fix`` makes, so the two cannot come to mean different things. The grammar pack ships
-        none in its wheel and fetches them per language on first use, which would make a file
-        chunk one way on a machine that reached the network and another way on a machine that
-        did not; ``docs/parsing.md`` §8.1 closes that by pre-seeding at install time, and
-        ``init`` is install time. The offline bundle is consulted first, so a host carrying one
-        needs no network here at all.
+        **It also pre-seeds the two artifacts no wheel ships**, through the same calls ``doctor
+        --fix`` makes, so ``init`` and the repair cannot come to mean different things. The
+        grammar pack fetches grammars per language on first use, which would make a file chunk
+        one way on a machine that reached the network and another way on a machine that did
+        not; ``tiktoken`` fetches its BPE vocabularies the same way, and without one no
+        ``search`` can measure a context at all. ``docs/parsing.md`` §8.1 and
+        ``docs/retrieval.md`` §7.2 close both by pre-seeding at install time, and ``init`` is
+        install time. Each consults its offline bundle first, so a host carrying them needs no
+        network here at all.
 
         A pre-seed that fails is **reported, not raised.** The configuration file is written by
         then, so raising would leave a config on disk and a command that says it failed, and the
-        retry would need ``--force``; the note carries the whole failure, ``doctor`` reports it
-        as degraded afterwards, and every source document refused says which command fixes it.
-        An installation with no grammars is a real state — a Markdown corpus never needs one —
-        and it is one this reports rather than one it prevents by refusing to finish.
+        retry would need ``--force``; the notes carry the whole failure, ``doctor`` reports it
+        afterwards, and the refusal each absence produces names the command that fixes it. An
+        installation with no grammars is a real state — a Markdown corpus never needs one — and
+        an installation that cannot reach a blob store is one somebody has to be *told* about
+        rather than one this prevents by refusing to finish writing their configuration.
         """
         path = config_file()
         if await asyncio.to_thread(path.exists) and not force:
@@ -1388,10 +1497,12 @@ class ApplicationService:
         provider = "mlx" if probe["apple_silicon"] else "onnx"
         await asyncio.to_thread(_update_config, path, _initial_configuration(settings, provider))
         pre_seed = await self._grammar_check(fix=True)
+        vocabulary_seed = await self._vocabulary_check(fix=True)
         notes = [
             f"embedding backend {provider!r} chosen for {probe['machine']} on {probe['system']}",
             "bind host written as 127.0.0.1; a wider bind needs auth and an explicit flag",
             f"grammars ({pre_seed.state}): {pre_seed.detail}",
+            f"vocabularies ({vocabulary_seed.state}): {vocabulary_seed.detail}",
         ]
         return r.InitReport(
             path=str(path),

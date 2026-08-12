@@ -488,6 +488,231 @@ async def test_a_code_parser_configuration_that_does_not_validate_is_reported(
     assert "parser.sourcecode" in check.detail
 
 
+@pytest.fixture
+def vocabulary_seeds(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """Record what the vocabulary pre-seed is asked for instead of fetching it.
+
+    The counterpart of :func:`grammar_seeds`, for the same two reasons: a suite run on a
+    machine with an empty ``tiktoken`` cache would otherwise download 5 MB from a unit test,
+    and one run on a machine that already has it would prove nothing about the call happening
+    at all. That the seeding *works* is proved against a real bundle with the network cut in
+    ``tests/vocabularies/test_vocabulary_bundle.py``; what is asserted here is which
+    operations ask for it and what they do with the answer.
+    """
+    from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra, not core
+
+    asked: list[tuple[str, ...]] = []
+
+    def spy(encodings: Sequence[str], **_: object) -> tuple[str, ...]:
+        asked.append(tuple(encodings))
+        return tuple(encodings)
+
+    monkeypatch.setattr(vocabularies, "prefetch", spy)
+    return asked
+
+
+@pytest.fixture
+def empty_vocabulary_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point ``tiktoken`` at a cache directory with nothing in it.
+
+    Through the environment because that is the only hook ``tiktoken`` reads, and it is what a
+    deployment sets — so this is the same mechanism a container uses rather than a test-only
+    door into the code under test.
+    """
+    from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra, not core
+
+    cache = tmp_path / "tiktoken"
+    cache.mkdir()
+    monkeypatch.setenv(vocabularies.CACHE_DIR_ENV, str(cache))
+    return cache
+
+
+@pytest.mark.usefixtures("empty_vocabulary_cache")
+async def test_doctor_reports_a_missing_vocabulary_without_fetching_one(
+    backend: FakeBackend, vocabulary_seeds: list[tuple[str, ...]]
+) -> None:
+    """A report is a report: ``doctor`` on its own must not start a download."""
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vocabularies")
+
+    assert check.state == "failing"
+    assert "manicule doctor --fix" in check.detail
+    assert vocabulary_seeds == []
+
+
+@pytest.mark.usefixtures("empty_vocabulary_cache")
+async def test_a_missing_vocabulary_is_failing_where_a_missing_grammar_is_degraded(
+    backend: FakeBackend, tmp_path: Path, vocabulary_seeds: list[tuple[str, ...]]
+) -> None:
+    """The severity decision, asserted as a decision rather than left to a reader.
+
+    Grammars are degraded because there are installations for which their absence costs
+    nothing — a corpus of Markdown and PDFs works perfectly without one — and a red check on a
+    healthy machine teaches an operator to ignore ``doctor``. No such installation exists for
+    a vocabulary: every context is measured with it whatever the corpus is made of, so a
+    machine without one cannot answer a question at all. Marking both the same way would make
+    one of the two answers a lie, and which one depends on which way they were made the same.
+    """
+    del vocabulary_seeds
+    backend.settings = _empty_grammar_cache(tmp_path / "grammars")
+
+    diagnosis = await ApplicationService(backend).doctor()
+    states = {check.name: check.state for check in diagnosis.checks}
+
+    assert states["grammars"] == "degraded"
+    assert states["vocabularies"] == "failing"
+    assert diagnosis.state == "failing"
+
+
+@pytest.mark.usefixtures("empty_vocabulary_cache")
+async def test_doctor_fix_asks_the_pre_seed_for_every_encoding_this_install_uses(
+    backend: FakeBackend, vocabulary_seeds: list[tuple[str, ...]]
+) -> None:
+    """Every encoding, not the missing subset, and read from this installation's settings.
+
+    Two encodings, and the pair is the point: ``cl100k_base`` is the chunker's stand-in and
+    ``o200k_base`` is what a context is measured with. Seeding only the first is an install
+    that indexes and cannot answer, which is the defect the whole area exists to close.
+    """
+    from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra, not core
+
+    await ApplicationService(backend).doctor(fix=True)
+
+    wanted = vocabularies.required_encodings(backend.settings.rag.context.encoding)
+    assert vocabulary_seeds == [wanted]
+    assert len(wanted) > 1
+
+
+@pytest.mark.usefixtures("empty_vocabulary_cache")
+async def test_a_vocabulary_repair_is_reported_from_the_cache_and_not_from_the_seed(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ok`` means the vocabulary is there, not that something said it put it there.
+
+    ``tiktoken`` writes its cache on a best-effort basis — it swallows every write error when
+    the directory was not named by an environment variable — so "the fetch returned" and "the
+    file is on disk" are genuinely different facts. The double here is that failure with the
+    honesty removed: it reports success and writes nothing.
+    """
+    from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra, not core
+
+    def claim_success(encodings: Sequence[str], **_: object) -> tuple[str, ...]:
+        return tuple(encodings)
+
+    monkeypatch.setattr(vocabularies, "prefetch", claim_success)
+
+    diagnosis = await ApplicationService(backend).doctor(fix=True)
+    check = next(check for check in diagnosis.checks if check.name == "vocabularies")
+
+    assert check.state == "failing", "doctor believed a pre-seed that wrote nothing"
+
+
+@pytest.mark.usefixtures("empty_vocabulary_cache")
+async def test_a_vocabulary_repair_that_could_not_complete_says_what_stopped_it(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The message an air-gapped operator reads, carried through rather than replaced."""
+    from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra, not core
+
+    def refuse(encodings: Sequence[str], **_: object) -> tuple[str, ...]:
+        message = f"no route to the blob store for {list(encodings)}"
+        raise vocabularies.VocabularyFetchError(message)
+
+    monkeypatch.setattr(vocabularies, "prefetch", refuse)
+
+    diagnosis = await ApplicationService(backend).doctor(fix=True)
+    check = next(check for check in diagnosis.checks if check.name == "vocabularies")
+
+    assert check.state == "failing"
+    assert "no route to the blob store" in check.detail
+
+
+async def test_doctor_says_it_does_not_know_when_the_retrieval_extra_is_not_installed(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Core installs without the retrieval extra, and ``doctor`` is not the command that
+    discovers that by failing to run. There is no token counter to give a vocabulary to."""
+    from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra, not core
+
+    def absent(encodings: Sequence[str]) -> tuple[str, ...]:
+        del encodings
+        raise ImportError("No module named 'tiktoken'")
+
+    monkeypatch.setattr(vocabularies, "missing_vocabularies", absent)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vocabularies")
+
+    assert check.state == "unknown"
+    assert "manicule[retrieval]" in check.detail
+
+
+@pytest.mark.usefixtures("empty_vocabulary_cache")
+async def test_an_encoding_no_installed_tiktoken_defines_is_a_configuration_failure(
+    backend: FakeBackend,
+) -> None:
+    """``rag.context.encoding`` holding a model name is the specific mistake to catch.
+
+    ``docs/retrieval.md`` §7.2 asks the fitter to name an encoding and never a model, because
+    a model name makes an estimate look authoritative about a model that is not being used.
+    Reaching this far, it must be a diagnosis rather than a refusal at the first question.
+    """
+    backend.settings = Settings(
+        rag={"context": {"encoding": "gpt-4o"}}  # pyright: ignore[reportArgumentType] - validated on the way in
+    )
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vocabularies")
+
+    assert check.state == "failing"
+    assert "never a model name" in check.detail
+
+
+@pytest.mark.usefixtures("empty_vocabulary_cache")
+async def test_init_pre_seeds_the_vocabularies_and_reports_what_it_did(
+    backend: FakeBackend, config_home: Path, vocabulary_seeds: list[tuple[str, ...]]
+) -> None:
+    """Install time is when a vocabulary arrives, because it must never arrive during a query.
+
+    Through the same call ``doctor --fix`` makes, so an install and a repair cannot come to
+    mean different things — which is exactly what would have happened had ``init`` seeded
+    grammars and left this to be discovered at the first search.
+    """
+    del config_home
+    from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra, not core
+
+    report = await ApplicationService(backend).initialise()
+
+    wanted = vocabularies.required_encodings(backend.settings.rag.context.encoding)
+    assert vocabulary_seeds == [wanted]
+    assert any("vocabularies" in note for note in report.notes)
+
+
+@pytest.mark.usefixtures("empty_vocabulary_cache")
+async def test_a_vocabulary_pre_seed_that_fails_leaves_init_finished_and_says_so(
+    backend: FakeBackend, config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A note, not an exception, exactly as the grammar pre-seed does it.
+
+    The configuration file is on disk by then, so raising would leave a written config beside
+    a command that reported failure and a retry that needs ``--force``. An air-gapped host
+    with no bundle must still be able to finish installing.
+    """
+    from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra, not core
+
+    def refuse(encodings: Sequence[str], **_: object) -> tuple[str, ...]:
+        del encodings
+        message = "no route to the blob store"
+        raise vocabularies.VocabularyFetchError(message)
+
+    monkeypatch.setattr(vocabularies, "prefetch", refuse)
+
+    report = await ApplicationService(backend).initialise()
+
+    assert await asyncio.to_thread(config_home.exists)
+    assert any("no route to the blob store" in note for note in report.notes)
+
+
 async def test_doctor_builds_nothing_expensive(
     service: ApplicationService, backend: FakeBackend
 ) -> None:

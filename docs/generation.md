@@ -1320,11 +1320,13 @@ content type.
 ### 9.2 The estimate, and the one measurement that replaces it
 
 The estimate follows `retrieval.md` §7.2 exactly and this document adds nothing to it:
-`tiktoken.get_encoding("o200k_base")` by encoding name rather than
-`encoding_for_model("gpt-4o")` — naming a model that is not being used makes the estimate look
-authoritative — with a per-model safety factor biased toward overcounting
-(`llm.token_safety_factor`, default 1.15), no sampling, and counts cached by content-derived
-`chunk.id`.
+`o200k_base` by encoding name rather than `encoding_for_model("gpt-4o")` — naming a model that
+is not being used makes the estimate look authoritative — with a per-model safety factor biased
+toward overcounting (`llm.token_safety_factor`, default 1.15), no sampling, and counts cached
+by content-derived `chunk.id`. The vocabulary is resolved through `manicule.vocabularies`
+rather than `tiktoken.get_encoding`, so the estimator cannot download one while answering; the
+pre-seed and the offline bundle behind that are `retrieval.md` §7.2's, since the budget and the
+fitter measure with the same file.
 
 > **Prior art.** A module-level singleton hardcoded to `encodingForModel('gpt-4o')`, with no
 > parameter and no configuration. The defaults it measures for are `qwen2.5:14b`,
