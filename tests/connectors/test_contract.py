@@ -126,15 +126,24 @@ def test_a_factory_handed_the_wrong_configuration_refuses_it() -> None:
 
 
 def test_the_plugin_registers_the_sources_this_build_ships() -> None:
-    """Confluence for v1, and the local filesystem that ``manicule index <path>`` walks.
+    """Confluence live, Confluence from disk, and the local filesystem ``manicule index`` walks.
 
     Asserted as an exact list rather than a membership check: a connector registered and
     never mentioned anywhere is a source nobody knows they can configure.
+
+    ``confluence-snapshot`` is a third entry rather than a mode of ``confluence`` because the two
+    share no configuration — it has no base URL, no credential and no deployment. Folding them
+    together would mean a config model where over half the fields are refused depending on another
+    field's value, and a connector that reaches no network could then be misconfigured into trying.
     """
     registry = ComponentRegistry()
     PLUGIN.register(registry.bind("connectors"))
 
-    assert registry.names(ComponentKind.CONNECTOR) == ["confluence", "filesystem"]
+    assert registry.names(ComponentKind.CONNECTOR) == [
+        "confluence",
+        "confluence-snapshot",
+        "filesystem",
+    ]
 
 
 def test_a_cloud_token_without_an_email_is_refused_before_anything_is_built() -> None:

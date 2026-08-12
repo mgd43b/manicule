@@ -30,8 +30,10 @@ from manicule.core.errors import ConfigError
 __all__ = [
     "CONNECTOR_NAME",
     "FILESYSTEM_CONNECTOR_NAME",
+    "SNAPSHOT_CONNECTOR_NAME",
     "AuthMethod",
     "ConfluenceConfig",
+    "ConfluenceSnapshotConfig",
     "Deployment",
     "FilesystemConfig",
     "resolve_credentials",
@@ -42,6 +44,37 @@ CONNECTOR_NAME = "confluence"
 
 FILESYSTEM_CONNECTOR_NAME = "filesystem"
 """The registered name of the local-directory connector."""
+
+SNAPSHOT_CONNECTOR_NAME = "confluence-snapshot"
+"""The registered name of the offline Confluence-snapshot connector.
+
+A name of its own rather than a mode of ``confluence``, because the two share no
+configuration: this one has no base URL, no credential and no deployment, and folding them
+together would mean a config model where over half the fields are refused depending on
+another field's value. It also keeps the credential refusal honest — a connector that
+reaches no network cannot be misconfigured into trying.
+"""
+
+
+class ConfluenceSnapshotConfig(BaseModel):
+    """Configuration for the offline Confluence-snapshot connector.
+
+    Set under ``plugins.config."connector.confluence-snapshot"``. One setting, because the
+    input is a directory of page snapshots and everything else about a page is in its
+    manifest — a connector option that overrode a manifest would be a second authority for a
+    fact the manifest already states, and the two would disagree the first time either was
+    edited.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    root: str = Field(
+        default="",
+        description="Directory holding page snapshots, at any depth. Resolved to an absolute "
+        "path, because a relative one changes with the working directory — and while a "
+        "snapshot's identity is its page id rather than its path, the root is what bounds "
+        "every read this connector is allowed to make.",
+    )
 
 
 class FilesystemConfig(BaseModel):
