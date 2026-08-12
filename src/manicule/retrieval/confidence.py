@@ -86,10 +86,14 @@ NOISE_SIMILARITY: Final = 0.45
 """Cosine at which this embedder's output stops carrying information about the query.
 
 **Measured, not inherited.** Over manicule's own documentation — 13 documents, 604 chunks,
-BGE-M3 — 21 questions drawn from subjects the corpus does not cover topped out at a top-1
-cosine of 0.467, with a median of 0.395; 16 questions the corpus does answer started at 0.560,
-median 0.636. 0.45 sits inside that gap, near the noise side of it, so a passage at or below it
-contributes nothing and a real match keeps almost all of its score.
+BGE-M3 — 22 questions drawn from subjects the corpus does not cover averaged 0.353 to 0.457
+across the passages that reached a context; 16 questions the corpus does answer averaged 0.531
+to 0.641. 0.45 sits just under the top of the noise range, so an unanswerable question scores
+essentially zero while the weakest real question keeps a clear margin.
+
+Both constants are calibrated against the **mean over the passages in the context**, which is
+the quantity :func:`score_confidence` actually rescales — not against a top-1 cosine, which runs
+roughly 0.08 higher and would put the whole scale out by that much.
 
 This is a property of **the embedder and the corpus**, not a universal constant: BGE-M3's
 similarities are not centred on zero for unrelated text, and a different model or a much more
@@ -98,20 +102,35 @@ measured — ask questions the corpus demonstrably cannot answer and read where 
 land — rather than adjusting it until an example looks right.
 """
 
-STRONG_SIMILARITY: Final = 0.75
-"""Cosine at which a passage is treated as fully on-topic.
+STRONG_SIMILARITY: Final = 0.65
+"""Mean context cosine at which a retrieval is treated as fully on-topic.
 
 The top of the measured range rather than 1.0. Cosine 1.0 against a chunk means the query *is*
-that chunk, which no question is, so scaling to 1.0 would make a perfect retrieval report about
-0.6 and put ``high`` out of reach for reasons that have nothing to do with the evidence. The
-best observed on-corpus top-1 was 0.724.
+that chunk, which no question is; and a *mean* over several passages is pulled below even the
+best passage by the ones beneath it. The best on-corpus mean observed was 0.641, so scaling to
+1.0 — or to the 0.724 best *top-1*, which is a different statistic — would cap a flawless
+retrieval at about half the component and report well-answered questions as weakly supported.
 """
 
 BANDS: Final[tuple[tuple[float, ConfidenceBand], ...]] = (
     (0.75, ConfidenceBand.HIGH),
     (0.45, ConfidenceBand.MEDIUM),
-    (0.20, ConfidenceBand.LOW),
+    (0.10, ConfidenceBand.LOW),
 )
+"""Where the bands are cut on the rescaled scale.
+
+The ``none`` boundary moved from 0.20 to 0.10, and the reason is the measurement rather than
+taste. Once similarity is rescaled against the noise level the two populations separate with a
+wide empty gap between them: over 604 chunks, unanswerable questions scored at most 0.032 and
+real ones at least 0.162, across all three profiles. A boundary at 0.20 sat *inside* the real
+population, so the deepest profile reported ``none`` — "nothing here resembles your question" —
+for a question the corpus answers. That is the original defect wearing the other mask. 0.10 sits
+in the gap, where a boundary belongs: every negative measured falls below it and every positive
+above it.
+
+``high`` and ``medium`` are unchanged, so a pipeline with no reranker still tops out below
+``high``.
+"""
 
 NOTHING_RETRIEVED: Final = "retrieval ran and found no supporting passage"
 BUDGET_CAPPED: Final = (
