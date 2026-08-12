@@ -13,17 +13,17 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 | Area | Items | Ticket |
 |---|---:|---|
 | CLI | 48 | #8 — **built** |
-| MCP tools | 20 | #8 — **built** |
-| HTTP endpoints | 52 | #11 — **built** |
+| MCP tools | 29 | #8 — **built** |
+| HTTP endpoints | 56 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **178** | |
+| **Total** | **191** | |
 
 ## CLI — 48
 
-Ticket: #8 — **built.** Nineteen commands: `ask` `search` `index` `document` `connector`
-`workspace` `auth` `plugin` `config` `backup` `export` `import` `reset-index` `doctor` `init`
-`start` `stop` `upgrade` `completion`. Several of the bare verbs below are subcommands of one
+Ticket: #8 — **built.** Twenty commands: `ask` `search` `index` `document` `collection`
+`connector` `workspace` `auth` `plugin` `config` `backup` `export` `import` `reset-index`
+`doctor` `init` `start` `stop` `upgrade` `completion`. Several of the bare verbs below are subcommands of one
 of those, so the mapping is noted where it is not obvious. The output shape is a contract:
 [`docs/surfaces.md`](docs/surfaces.md).
 
@@ -32,10 +32,10 @@ of those, so the mapping is noted where it is not obvious. The output shape is a
   whole set is reviewable in one place; `connector sync` runs one. A command that wrote a
   source into the config file would be a second way to edit it
 - [x] `auth <name>` → the `auth` group
-- [ ] `create <name>` — collections. #10
+- [x] `create <name>` → `collection create`
 - [x] `create-key` → `auth create-key`
 - [x] `delete <id>` → `document delete`
-- [ ] `delete <name>` — collections. #10
+- [x] `delete <name>` → `collection delete`
 - [ ] ~~`dev`~~ — a development server. There is one way to start manicule and it is `start`
 - [ ] ~~`edit`~~ — opening the config file in `$EDITOR`. `config set` validates the whole tree
   before writing, and an editor that saves an invalid file has already saved it
@@ -95,13 +95,22 @@ of those, so the mapping is noted where it is not obvious. The output shape is a
 - `ask --repl` — the interactive prompt, which is also what `ask` with no question does at a
   terminal.
 
-## MCP tools — 20
+## MCP tools — 29
 
-Ticket: #8 — **built.** Nineteen tools over the same application service the command line
-calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
+Ticket: #8 — **built.** Twenty-eight tools over the same application service the command
+line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
 - [x] `ask`
+- [x] `collection_add`
+- [x] `collection_counts`
+- [x] `collection_create`
+- [x] `collection_delete`
+- [x] `collection_documents`
+- [x] `collection_list`
+- [x] `collection_remove`
+- [x] `collection_rename`
+- [x] `collection_update`
 - [x] `config_get`
 - [x] `config_set`
 - [x] `connector_list`
@@ -124,11 +133,12 @@ server, so a prefix would be the server's name written twice.
   a tool no client can describe, and the description is how an assistant knows when to call it.
 
 **Deliberately not tools.** `reset-index`, `backup`, `restore`, `import`, `upgrade`, `start`,
-`stop` and the `auth` verbs are command-line only. Each destroys data, mints a credential or
-changes what the installation is, and a surface called unattended should not be able to do any
-of that.
+`stop`, `collection orphans` and the `auth` verbs are command-line only. Each destroys data,
+mints a credential or changes what the installation is, and a surface called unattended should
+not be able to do any of that. `collection orphans` moves every document outside every
+collection into the trash, which in a corpus where collections are optional is most of it.
 
-## HTTP endpoints — 52
+## HTTP endpoints — 56
 
 Ticket: #11 — **built.** Eleven route groups over the same application service the CLI and the
 MCP server use: health · documents · chat · conversations · collections · tags · admin ·
@@ -154,6 +164,7 @@ name — an absence with no test is an absence that comes back.
 - [x] `GET    /api/v1/admin/query-logs`
 - [x] `GET    /api/v1/admin/search-quality`
 - [x] `GET    /api/v1/admin/stats`
+- [x] `GET    /api/v1/collections/:id/counts`
 - [x] `GET    /api/v1/collections/:id/documents`
 - [x] `GET    /api/v1/collections`
 - [x] `GET    /api/v1/conversations/:id/messages`
@@ -176,6 +187,9 @@ name — an absence with no test is an absence that comes back.
 - [ ] ~~`GET    /auth/callback/:provider`~~ — OAuth. #13
 - [ ] ~~`GET    /auth/login/:provider`~~ — OAuth. #13
 - [x] `GET    /auth/providers`
+- [x] `PATCH  /api/v1/collections/:id` — the description. Renaming is its own route: it can
+  fail with a 409 and describing cannot, and one route returning either status depending on
+  which field was present is a route a caller cannot reason about
 - [x] `PATCH  /api/v1/conversations/:id`
 - [x] `POST   /api/v1/admin/connectors/:name/sync`
 - [ ] ~~`POST   /api/v1/admin/connectors/:type`~~ — a connector holds credentials and reaches a remote system. Sources are declared in configuration, where the whole set is reviewable in one place; `POST /admin/connectors/:name/sync` runs one that is already declared
@@ -185,7 +199,12 @@ name — an absence with no test is an absence that comes back.
 - [x] `POST   /api/v1/chat/stream`
 - [x] `POST   /api/v1/chat`
 - [x] `POST   /api/v1/collections/:id/documents/:docId`
+- [x] `POST   /api/v1/collections/:id/name` — rename. No document moves and nothing is
+  re-embedded
 - [x] `POST   /api/v1/collections`
+- [ ] ~~`POST   /api/v1/collections/orphans`~~ — deleting every document outside every
+  collection. It destroys data, so it stays on the command line as `collection orphans
+  --confirm`, where a person is present. `tests/api/test_routes.py` asserts the absence
 - [x] `POST   /api/v1/conversations/:id/share`
 - [x] `POST   /api/v1/conversations`
 - [x] `POST   /api/v1/documents/:docId/tags/:tagId`

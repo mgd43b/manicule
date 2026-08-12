@@ -225,3 +225,33 @@ def test_every_route_describes_itself() -> None:
         if isinstance(route, APIRoute) and not (route.summary or route.description)
     )
     assert undescribed == [], f"routes with no summary: {undescribed}"
+
+
+def test_no_route_exposes_the_orphan_cleanup() -> None:
+    """``collection_orphans`` deletes documents, so it is not on this surface at all.
+
+    Asserted over the walked route table, and it belongs in this file rather than beside the
+    other deliberate absences for a reason worth writing down.
+
+    The obvious version asks for ``POST /api/v1/collections/orphans`` and accepts 404 or 405.
+    Both come back and **neither means what it looks like**: ``/collections/orphans`` matches
+    ``/collections/{collection_id}``, so the 405 is "wrong verb on a path that exists", and the
+    ``DELETE`` is a 404 from ``collection_delete`` *running* with ``collection_id='orphans'``.
+    Create a collection actually called ``orphans`` and that request deletes it and returns
+    200, while the assertion goes on passing.
+
+    The second attempt read ``app.routes`` directly and was worse — it found no routes at all,
+    for the reason this module's docstring already gives, and reported success. Hence
+    :func:`_routes`, whose floor fails a walk that collapsed.
+    """
+    offending = sorted(
+        f"{route.name} {route.path}"
+        for route in _routes()
+        if "orphan" in route.path.lower() or "orphan" in route.name.lower()
+    )
+    assert offending == [], (
+        f"the orphan cleanup is reachable over HTTP: {offending}. It moves every document "
+        f"outside every collection into the trash, which in a corpus where collections are "
+        f"optional is most of it. It stays on the command line as `collection orphans "
+        f"--confirm`, with the other operations that destroy data."
+    )

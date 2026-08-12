@@ -41,11 +41,26 @@ if TYPE_CHECKING:
 WORKSPACE = "default"
 
 
+COLLECTION = "runbooks-alpha"
+"""The collection the fixture seeds, and the marker the browser column looks for.
+
+Named here because three columns need the same string and a page that renders a *different*
+collection would still contain the word "collection". Distinctive enough that finding it in
+the HTML means the page rendered this envelope rather than coincidence.
+"""
+
+
 @pytest.fixture
 def backend() -> FakeBackend:
     made = FakeBackend()
     document = make_document(WORKSPACE)
     made.store.add(document, make_chunk(document))
+    # Seeded so the collections page has something to render. Two of the rows below carry no
+    # page precisely because this fixture leaves their surface empty; collections deliberately
+    # does not join them — a group whose page is never asserted against is a page free to stop
+    # showing what the envelope says.
+    made.organisation_.documents[document.id] = document
+    asyncio.run(made.organisation_.create_collection(COLLECTION, description="worked examples"))
     return made
 
 
@@ -91,15 +106,26 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
 # --- the surfaces offer what they say they offer ---------------------------------------------
 
 
-def test_the_server_offers_exactly_nineteen_tools(service: ApplicationService) -> None:
-    """Nineteen, named, and matching the list the ticket specifies."""
+def test_the_server_offers_exactly_twenty_eight_tools(service: ApplicationService) -> None:
+    """Twenty-eight, named, and matching the list the ticket specifies."""
     server = build_server(service)
     offered = sorted(tool.name for tool in asyncio.run(server.list_tools()))
     assert offered == sorted(TOOL_NAMES)
-    assert len(offered) == 19
+    assert len(offered) == 28
 
 
-def test_the_command_line_offers_exactly_nineteen_commands() -> None:
+def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:
+    """``collection_orphans`` is command line only, and this is what keeps it there.
+
+    It moves every document outside every collection into the trash. That is the one
+    collection operation that destroys data, so it stays on the surface where a person is
+    present — the rule ``reset-index``, ``backup`` and ``import`` are already held to. An
+    absence with no test is an absence that comes back.
+    """
+    assert "collection_orphans" not in TOOL_NAMES
+
+
+def test_the_command_line_offers_exactly_twenty_commands() -> None:
     """Counted from the built command tree rather than from the source.
 
     A command registered on a sub-application and never attached would be in the file and not
@@ -113,6 +139,7 @@ def test_the_command_line_offers_exactly_nineteen_commands() -> None:
         "ask",
         "auth",
         "backup",
+        "collection",
         "completion",
         "config",
         "connector",
@@ -130,7 +157,7 @@ def test_the_command_line_offers_exactly_nineteen_commands() -> None:
         "upgrade",
         "workspace",
     ]
-    assert len(names) == 19
+    assert len(names) == 20
 
 
 def test_only_the_command_line_can_ask_doctor_to_repair_anything(
@@ -284,6 +311,20 @@ PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
     ),
     ("plugin_list", {}, ["plugin", "list"], ("GET", "/api/v1/plugins", {}), None),
     ("config_get", {"key": "rag.profile"}, ["config", "get", "rag.profile"], None, None),
+    (
+        "collection_list",
+        {},
+        ["collection", "list"],
+        ("GET", "/api/v1/collections", {}),
+        ("/ui/collections", ("collections", 0, "name")),
+    ),
+    (
+        "collection_counts",
+        {"collection_id": "col-0"},
+        ["collection", "counts", "col-0"],
+        ("GET", "/api/v1/collections/col-0/counts", {}),
+        None,
+    ),
 )
 """One row per operation: the MCP tool, the command, the HTTP request, and the page.
 

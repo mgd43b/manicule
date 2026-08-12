@@ -11,6 +11,7 @@ a renderer, and forgetting the renderer is a loud failure rather than a blank sc
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Final, cast
 
 from rich.console import Console
@@ -582,6 +583,72 @@ def render_connector_signed_in(out: Console, payload: r.ConnectorSignedIn) -> No
     out.print(f"  manicule will use it until {escape(payload.expires_at)}")
 
 
+def render_collection(out: Console, payload: r.CollectionSummary) -> None:
+    out.print(f"[bold]{escape(payload.name)}[/bold] [dim]{escape(payload.id)}[/dim]")
+    if payload.description:
+        out.print(escape(payload.description))
+    if payload.rule is not None:
+        # The rule is named, not evaluated. What it currently selects is what
+        # `collection documents` and `collection counts` answer, and a second count computed
+        # here would be a cheaper-looking number free to disagree with both.
+        out.print(f"[dim]rule: {escape(json.dumps(payload.rule, sort_keys=True))}[/dim]")
+
+
+def render_collections(out: Console, payload: r.CollectionList) -> None:
+    table = Table("name", "id", "rule", "description", box=None, pad_edge=False)
+    for collection in payload.collections:
+        table.add_row(
+            escape(collection.name),
+            escape(collection.id),
+            "yes" if collection.rule is not None else "—",
+            escape(collection.description or "—"),
+        )
+    out.print(table)
+    if not payload.collections:
+        out.print("[dim]no collections[/dim]")
+
+
+def render_collection_deleted(out: Console, payload: r.CollectionDeleted) -> None:
+    out.print(f"deleted collection [bold]{escape(payload.collection_id)}[/bold]")
+    out.print("[dim]the documents it held are untouched[/dim]")
+
+
+def render_collection_membership(out: Console, payload: r.CollectionMembership) -> None:
+    out.print(
+        f"[bold]{payload.changed}[/bold] of {len(payload.document_ids)} "
+        f"changed in {escape(payload.collection_id)}"
+    )
+    out.print("[dim]membership is metadata; nothing was re-embedded[/dim]")
+
+
+def render_collection_counts(out: Console, payload: r.CollectionCounts) -> None:
+    out.print(
+        f"[bold]{escape(payload.name)}[/bold]: "
+        f"{payload.documents} documents, {payload.chunks} chunks"
+    )
+
+
+def render_collection_orphans(out: Console, payload: r.CollectionOrphans) -> None:
+    """Report first, and say plainly which of the two things just happened.
+
+    One payload covers the listing and the cleanup, and the difference between them matters
+    more than anything else on it: one moved documents out of the corpus and the other moved
+    nothing at all.
+    """
+    if not payload.count:
+        out.print("[dim]no documents outside every collection[/dim]")
+        return
+    for document_id in payload.document_ids:
+        out.print(escape(document_id))
+    if payload.deleted:
+        out.print(f"[bold]{payload.count}[/bold] moved to the trash, and restorable from it")
+    else:
+        out.print(
+            f"[bold]{payload.count}[/bold] in no collection. "
+            f"[dim]nothing was deleted; pass --confirm to move them to the trash[/dim]"
+        )
+
+
 RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.AnswerResultPayload: lambda out, p: render_answer(out, _as(r.AnswerResultPayload, p)),
     r.SearchResult: lambda out, p: render_search(out, _as(r.SearchResult, p)),
@@ -614,6 +681,14 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.ApiKeyIssued: lambda out, p: render_api_key_issued(out, _as(r.ApiKeyIssued, p)),
     r.ApiKeyList: lambda out, p: render_api_keys(out, _as(r.ApiKeyList, p)),
     r.ApiKeyRevoked: lambda out, p: render_api_key_revoked(out, _as(r.ApiKeyRevoked, p)),
+    r.CollectionSummary: lambda out, p: render_collection(out, _as(r.CollectionSummary, p)),
+    r.CollectionList: lambda out, p: render_collections(out, _as(r.CollectionList, p)),
+    r.CollectionDeleted: lambda out, p: render_collection_deleted(out, _as(r.CollectionDeleted, p)),
+    r.CollectionMembership: lambda out, p: render_collection_membership(
+        out, _as(r.CollectionMembership, p)
+    ),
+    r.CollectionCounts: lambda out, p: render_collection_counts(out, _as(r.CollectionCounts, p)),
+    r.CollectionOrphans: lambda out, p: render_collection_orphans(out, _as(r.CollectionOrphans, p)),
 }
 """Payload type to renderer.
 
