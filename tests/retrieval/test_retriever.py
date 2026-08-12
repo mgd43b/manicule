@@ -448,3 +448,118 @@ async def test_the_composition_root_honours_the_cache_switch(
         retriever = await build_retriever(container)
 
     assert not retriever.cache_available
+
+
+# --- collection-scoped retrieval --------------------------------------------------------------
+#
+# `Filter.collection_ids` was a field three readers listed and nothing resolved. `prefilter`
+# named it join-requiring and handed it to `list_documents`, which refuses it; the function
+# that turns collections into document ids had no caller outside the tests. So every search
+# naming a collection raised, and `docs/retrieval.md` §3.3 described a resolution step that
+# never ran. These are the tests that would have caught it.
+
+
+def _in_collections(*collection_ids: str) -> Query:
+    """A query restricted to these collections. ``a_query`` fixes the filter, and this varies it."""
+    return Query(
+        text="authentication",
+        limit=3,
+        filter=Filter(workspace_ids=SCOPE, collection_ids=frozenset(collection_ids)),
+    )
+
+
+async def _two_projects(store: SqliteDocStore) -> tuple[list[Chunk], list[Chunk]]:
+    """Two documents whose text overlaps, so only the filter can separate them."""
+    first = make_document(source_id="alpha", uri="file:///alpha/runbook.md")
+    second = make_document(source_id="beta", uri="file:///beta/runbook.md")
+    await store.upsert_document(first)
+    await store.upsert_document(second)
+    left = [make_chunk(first, 0, "authentication tokens rotate weekly")]
+    right = [make_chunk(second, 0, "authentication tokens rotate weekly")]
+    await store.replace_chunks(first.id, left)
+    await store.replace_chunks(second.id, right)
+    return left, right
+
+
+async def test_a_search_scoped_to_a_collection_returns_only_that_collections_documents(
+    store: SqliteDocStore,
+) -> None:
+    """The property the whole feature is for, end to end through the real pipeline.
+
+    Both documents carry the same sentence, so a pipeline that ignored the restriction would
+    still return two plausible passages ranked by relevance — which is exactly what made the
+    gap survive. The assertion is on *which* document came back, never on how many.
+    """
+    left, right = await _two_projects(store)
+    collection = await store.create_collection("alpha")
+    await store.add_to_collection(collection.id, [left[0].document_id])
+
+    result = await _retriever(store, [*left, *right]).retrieve(_in_collections(collection.id))
+
+    found = {candidate.chunk.document_id for candidate in result.context.passages}
+    assert found == {left[0].document_id}, (
+        "a search restricted to one collection returned a document outside it"
+    )
+
+
+async def test_a_search_across_two_collections_unions_them(store: SqliteDocStore) -> None:
+    """Several collections union, the way every set-valued filter field does."""
+    left, right = await _two_projects(store)
+    alpha = await store.create_collection("alpha")
+    beta = await store.create_collection("beta")
+    await store.add_to_collection(alpha.id, [left[0].document_id])
+    await store.add_to_collection(beta.id, [right[0].document_id])
+
+    result = await _retriever(store, [*left, *right]).retrieve(_in_collections(alpha.id, beta.id))
+
+    found = {candidate.chunk.document_id for candidate in result.context.passages}
+    assert found == {left[0].document_id, right[0].document_id}
+
+
+async def test_a_search_scoped_to_an_empty_collection_returns_nothing_at_all(
+    store: SqliteDocStore,
+) -> None:
+    """The inversion this feature exists to avoid, asserted from the surface that would show it.
+
+    An empty field restricts nothing, so resolving an empty collection to `document_ids=set()`
+    would turn the narrowest request anyone can make into a search of the whole workspace —
+    ranked, plausible, and exactly backwards. Zero passages is the only correct answer.
+    """
+    left, right = await _two_projects(store)
+    empty = await store.create_collection("nothing yet")
+
+    result = await _retriever(store, [*left, *right]).retrieve(_in_collections(empty.id))
+
+    assert list(result.context.passages) == [], (
+        "an empty collection returned passages, so the restriction was dropped rather than "
+        "applied and the search silently widened to the workspace"
+    )
+    assert result.confidence is not None, (
+        "confidence is absent, which reads as 'we did not look'. We looked and there is "
+        "nothing, which is the `none` band with a reason."
+    )
+
+
+async def test_a_membership_change_is_not_served_from_the_cache(store: SqliteDocStore) -> None:
+    """The cache key is computed from the *resolved* filter, so membership invalidates it.
+
+    Without that, the second search returns the first one's ranking: the collection now holds
+    another document and the cached entry cannot know. The rehydration path had the same hole
+    from the other end — it re-applies `join_filter`, which carries `collection_ids`, to a
+    store that refuses the field.
+    """
+    left, right = await _two_projects(store)
+    collection = await store.create_collection("alpha")
+    await store.add_to_collection(collection.id, [left[0].document_id])
+    retriever = _retriever(store, [*left, *right], cache=L1QueryCache(entries=8))
+    first = await retriever.retrieve(_in_collections(collection.id))
+    await store.add_to_collection(collection.id, [right[0].document_id])
+    second = await retriever.retrieve(_in_collections(collection.id))
+
+    assert {candidate.chunk.document_id for candidate in first.context.passages} == {
+        left[0].document_id
+    }
+    assert {candidate.chunk.document_id for candidate in second.context.passages} == {
+        left[0].document_id,
+        right[0].document_id,
+    }, "the second search was served a ranking computed before the document was added"
