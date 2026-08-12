@@ -570,3 +570,49 @@ def test_the_diagnostic_shows_duplicate_evidence_being_refused() -> None:
     assert len(diagnostics.passages) == 10
     assert sum(1 for item in diagnostics.passages if item.counted) == 1
     assert diagnostics.evidence_documents == 1
+
+
+NONSENSE_STRONGEST = 0.5194
+"""The highest cosine the unrelated query ``zzzqqq unrelated nonsense xyzzy`` reached.
+
+On a single passage, over this project's own documentation — and both retrieval legs found it.
+It is the reason the noise floor is 0.52 rather than a rounder number below it: at 0.45 or 0.50
+this passage counted as evidence, and because two legs had touched it the agreement term paid
+out as well, carrying a query about nothing into the ``low`` band.
+"""
+
+
+def test_the_strongest_measured_noise_passage_is_not_evidence() -> None:
+    """The floor is where it is because of this number, so this number is what pins it.
+
+    A floor calibrated on context *means* looked safe at 0.45. Per passage the populations sit
+    far closer, and moving to a per-passage statistic without re-measuring the constant is what
+    let a nonsense query reach ``low``.
+    """
+    confidence = score_confidence(
+        [passage(FIRST, 0, dense=NONSENSE_STRONGEST, lexical=8.0)], rerank_stage=None
+    )
+
+    assert confidence.components[SIMILARITY] == 0.0
+    assert confidence.score == 0.0
+    assert confidence.band is ConfidenceBand.NONE
+
+
+WEAKEST_ANSWERABLE = 0.5598
+"""The weakest top-1 cosine any answerable question produced across the measured corpora."""
+
+
+def test_the_weakest_answerable_passage_is_still_evidence() -> None:
+    """The other side of the same boundary, so the floor cannot drift upward unnoticed either.
+
+    The weakest *top* passage any answerable question produced across the measured corpora. A
+    floor above this would start reporting real answers as no answer, which is the failure the
+    previous floor had in the other direction. Together with the test above these two numbers
+    bracket the floor: it must sit between them, and it sits in the middle.
+    """
+    confidence = score_confidence(
+        [passage(FIRST, 0, dense=WEAKEST_ANSWERABLE, lexical=8.0)], rerank_stage=None
+    )
+
+    assert confidence.components[SIMILARITY] > 0.0
+    assert confidence.band is not ConfidenceBand.NONE

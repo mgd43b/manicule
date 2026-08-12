@@ -84,7 +84,7 @@ with no reranker reaches at most 0.70, so ``fast`` still cannot claim a verifica
 skipped.
 """
 
-NOISE_SIMILARITY: Final = 0.52
+NOISE_SIMILARITY: Final = 0.54
 """Cosine at or below which **one passage** carries no information about the query.
 
 **Measured, and re-measured when the statistic changed.** Both constants describe a single
@@ -94,11 +94,18 @@ the *mean* over a context, and that pairing was wrong in a way only a narrow que
 :func:`_similarity`).
 
 Per passage the two populations sit much closer than their context means did, and that is the
-number this constant has to respect. Sweeping a floor over 300 passages from answerable queries
-and 149 from unanswerable ones across two corpora: at 0.48 one noise passage still survived, and
-at **0.52 none did**, while every answerable query kept at least one passage. An unrelated query
-reached 0.5194 on a single passage — so a floor at 0.50, which looked safe against the earlier
-context-mean figures, left exactly that passage counting as evidence.
+number this constant has to respect. The measured boundary, over two corpora:
+
+* The strongest passage any unanswerable query reached was **0.5194** — and both legs had found
+  it, so at a floor of 0.45 or 0.50 it counted as evidence *and* collected the agreement term,
+  carrying a query about nothing into the ``low`` band.
+* The weakest top passage any answerable query produced was **0.5598**.
+
+0.54 is the middle of that gap rather than either edge. Sitting mid-gap is deliberate and is the
+same argument the retrieval floor makes in ``docs/retrieval.md`` §4.5: MLX and ONNX agree to
+cosine 0.9999, worth about 0.01 of movement in a query-passage cosine, so a constant placed
+against one edge could be crossed by a backend change. Platform may change throughput; it must
+never change output.
 
 This is a property of **the embedder and the corpus**, not a universal constant: BGE-M3's
 similarities are not centred on zero for unrelated text, and a different model or a much more

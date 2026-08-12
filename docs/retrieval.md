@@ -973,8 +973,8 @@ Only quantities with a defined scale are admissible.
 
 | Component | Weight | Source |
 |---|---|---|
-| Similarity | 0.55 | Mean of `scores["dense"]` over the context passages **that carry one**, negatives clamped to 0, then rescaled against the corpus noise level (§8.4) |
-| Cross-leg agreement | 0.15 | Fraction of context passages carrying **both** leg scores |
+| Similarity | 0.55 | Strongest `scores["dense"]` **per document**, negatives clamped to 0, each rescaled against the corpus noise level, combined by noisy-OR (§8.4) |
+| Cross-leg agreement | 0.15 | Fraction of the **evidence-bearing** passages carrying both leg scores, scaled by the evidence (§8.4) |
 | Reranker | 0.30 | Mean `sigmoid(logit)` over the context passages — **present only when a reranker ran** |
 
 Two details in the similarity row are load-bearing, and both were defects fixed by measurement:
@@ -1092,41 +1092,114 @@ real question and the best nonsense one differ by 0.07 on a scale whose bands ar
 so they land in the same band, which is exactly what was observed. So similarity is rescaled:
 
 ```
-component = clamp01((mean_cosine − NOISE_SIMILARITY) / (STRONG_SIMILARITY − NOISE_SIMILARITY))
-                     NOISE_SIMILARITY = 0.45      STRONG_SIMILARITY = 0.65
+evidence(p) = clamp01((cosine(p) - NOISE_SIMILARITY) / (STRONG_SIMILARITY - NOISE_SIMILARITY))
+component   = 1 - Π over documents d of (1 - max evidence(p) for p in d)
+
+              NOISE_SIMILARITY = 0.54      STRONG_SIMILARITY = 0.65
 ```
 
 Below the noise level the answer is 0.0, because "further from the query than unrelated text" is
-not a finer grade of relevance. Both constants are calibrated against the **context mean**, not
-a top-1 cosine — top-1 runs about 0.08 higher, and calibrating to it puts the whole scale out by
-that much and caps a flawless retrieval at roughly half the component.
+not a finer grade of relevance.
 
-**These are properties of the embedder and the corpus, not universal constants.** Re-measure them
-the way they were measured — ask questions the corpus demonstrably cannot answer, and read where
-their similarities land — rather than adjusting them until one example looks right.
+**The statistic is per passage, combined afterwards — not a mean over the context — and that
+correction came from a second report.** A short question retrieved the exactly-correct passage at
+rank 1 and reported confidence 0.0, band `none`. Measured against a synthetic glossary defining an
+acronym that collides with an ordinary English word:
+
+| Query | Correct passage | Its cosine | Mean over the context | Reported |
+|---|---|---|---|---|
+| "What is NOW?" | rank 1 | 0.623 | 0.387 | **0.0 `none`** |
+| "What is the Network Operations Workspace?" | rank 1 | 0.702 | 0.408 | **0.0 `none`** |
+| a deliberately lexical phrasing | rank 1 | 0.747 | 0.457 | 0.035 `none` |
+
+**A mean answers "how on-topic is the typical passage shown", and nobody asked that.** The
+pipeline fills the context to `final_top_k` whether or not the corpus holds that many relevant
+passages, so a narrow question is *guaranteed* filler — and averaging made that filler count as
+evidence against the answer in front of it. It also explains the asymmetry in the report: the
+lexical phrasing scored non-zero only because its mean happened to land a hundredth above the
+floor, not because lexical evidence was being counted.
+
+Noisy-OR replaces it because four properties are needed at once, and no single summary statistic
+has them:
+
+- **Filler costs nothing.** A passage at zero evidence multiplies by one.
+- **Independent support compounds.** Two documents that each answer the question are better
+  support than one, which is what the retired breadth term was reaching for and getting backwards
+  — and the difference is that a document only counts once it independently clears the floor, so
+  scattered *noise* still contributes nothing.
+- **Duplicates do not multiply.** The strongest passage *per document* is taken first, so ten
+  chunks of one page are one observation. Otherwise a finely-chunked document manufactures
+  certainty, which is a property of the ingest configuration reported as a property of evidence.
+- **It saturates rather than overflowing**, so no clamp has to hide an out-of-range number.
+
+#### Corroboration is scaled by the evidence
+
+Cross-leg agreement is measured over the **evidence-bearing** passages, for the same reason: a
+query with one strong, doubly-confirmed answer used to score 1/5 for perfect corroboration
+because the denominator counted four passages nobody claimed were relevant.
+
+It is then multiplied by the evidence level, because **you cannot corroborate more than you
+have.** Counting alone handed an unrelated query the full agreement weight: exactly one passage
+cleared the floor, barely, both legs happened to touch it, and 1/1 paid out in full — 0.15 of a
+number whose whole job in that case is to say the corpus holds nothing.
+
+#### Where the floor sits, and why not at either edge
+
+Per passage the two populations sit far closer than their context means did, which is why moving
+to a per-passage statistic required re-measuring the constant rather than carrying it over:
+
+| Measured, per passage | Value |
+|---|---|
+| Strongest passage any unanswerable query reached | **0.5194** |
+| Weakest top passage any answerable query produced | **0.5598** |
+
+`NOISE_SIMILARITY = 0.54` is the middle of that gap rather than either edge, and mid-gap is
+deliberate — the same argument §4.5 makes for the retrieval floor. MLX and ONNX agree to cosine
+0.9999, worth about 0.01 of movement in a query-passage cosine, so a constant placed against
+either edge could be crossed by a backend change. Platform may change throughput; it must never
+change output.
 
 #### What the rescale did
 
 Same index, same queries, before and after:
 
-| Query | Before | After |
-|---|---|---|
-| `zzzqqq unrelated nonsense xyzzy` | 0.330 `low` | **0.002 `none`** |
-| `how are citations verified` | 0.246 `low` | **0.449 `low`** |
+| Query | Originally | After the rescale | After per-passage evidence |
+|---|---|---|---|
+| `zzzqqq unrelated nonsense xyzzy` | 0.330 `low` | 0.002 `none` | **0.000 `none`** |
+| `how are citations verified` | 0.246 `low` | 0.449 `low` | **0.470 `medium`** |
+| "What is NOW?", correct at rank 1 | — | **0.000 `none`** | **0.414 `low`** |
 
-And across the whole query set, on every profile: every one of the 16 answerable questions scores
+Across the whole query set, on **every** profile: every one of the 16 answerable questions scores
 `low` or better, every one of the 22 unanswerable ones scores `none`, and **all 16 answerable
-questions still return passages** — the floor change costs no recall. Worst answerable score
-against best unanswerable score: 0.332 vs 0.032 (`fast`), 0.252 vs 0.019 (`balanced`), 0.162 vs
-0.000 (`precise`).
+questions still return passages** — none of this costs recall. Worst answerable score against
+best unanswerable score: 0.332 vs 0.000 (`fast`), 0.398 vs 0.000 (`balanced`), 0.408 vs 0.000
+(`precise`). The margin is wider than it was under the mean, and no unanswerable query reaches a
+non-zero score at all.
 
-#### Confidence is not comparable across profiles, and this is where you see it
+#### Confidence is not comparable across profiles
 
-`precise` scores the same query lower than `balanced` does, because its context holds ten
-passages rather than five and the mean is dragged down by the weaker tail. That is honest — the
-mean describes what you were actually shown — and it is why `PipelineIdentity` travels with every
-score and why §8.1 says the number is not comparable across configurations. It is a reason to
-compare a profile against itself over time, never against another profile.
+`PipelineIdentity` travels with every score and §8.1 says the number is not comparable across
+configurations, of which a profile is one. Compare a profile against itself over time, never
+against another profile. Combining per document rather than averaging removed the largest source
+of cross-profile drift — a deeper profile no longer scores lower merely for showing more of the
+weak tail — but a reranked pipeline still reaches a ceiling an unreranked one cannot, and that
+difference is real rather than an artefact.
+
+### 8.5 The diagnostic
+
+`explain_confidence` returns every input to a score: the components and what each weighed, every
+suppressed component and why, the normalisation constants, the band thresholds, the weights, and
+per passage its raw cosine, its rescaled evidence, which legs scored it, and whether it was
+counted or displaced by a stronger passage from the same document.
+
+**It carries no passage text.** Diagnostics travel further than results — into logs, bug reports
+and screenshots — and one that carried corpus text would turn every one of those into a
+disclosure. The chunk id is enough for anyone entitled to read the passage and useless to anyone
+who is not.
+
+It runs `score_confidence` rather than reimplementing it, so the explanation cannot drift from the
+number it explains. A diagnostic that computes its own answer is a second implementation, and the
+one that disagrees is always the one nobody reads.
 
 ---
 
