@@ -98,3 +98,35 @@ def test_a_durable_directory_is_not(tmp_path: Path) -> None:
     """``tmp_path`` is pytest's, not the system temporary directory, and must not trip it."""
     assert not vocabularies.is_impermanent(Path.home() / ".cache" / "manicule")
     del tmp_path
+
+
+def test_reporting_on_the_cache_does_not_bring_one_into_existence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``doctor`` writes to the machine only under ``--fix``, and a read path is a read path.
+
+    The first version of ``pointed_at_the_cache`` created the directory unconditionally, so a
+    plain ``doctor`` — a report — left a new directory behind it.
+    """
+    monkeypatch.delenv(store.CACHE_DIR_ENV, raising=False)
+    monkeypatch.delenv(store.LEGACY_CACHE_DIR_ENV, raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    with store.pointed_at_the_cache():
+        pass
+
+    assert not vocabularies.default_cache_directory().exists()
+
+
+def test_the_pre_seed_makes_the_directory_it_is_about_to_write_into(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The write path, where creating it is the whole point."""
+    monkeypatch.delenv(store.CACHE_DIR_ENV, raising=False)
+    monkeypatch.delenv(store.LEGACY_CACHE_DIR_ENV, raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    with store.pointed_at_the_cache(create=True):
+        pass
+
+    assert vocabularies.default_cache_directory().is_dir()

@@ -291,7 +291,7 @@ def is_impermanent(directory: Path) -> bool:
 
 
 @contextlib.contextmanager
-def pointed_at_the_cache() -> Generator[None]:
+def pointed_at_the_cache(*, create: bool = False) -> Generator[None]:
     """Make ``tiktoken`` read the directory :func:`cache_directory` names, for the duration.
 
     **Necessary because ``tiktoken`` is the reader.** It resolves its cache from the
@@ -304,17 +304,31 @@ def pointed_at_the_cache() -> Generator[None]:
     behaviour of a process that merely mentioned it. Set only when neither variable is already
     present, so an operator's own choice is never disturbed and never restored to something
     they did not set.
+
+    **Under :data:`_lock`, because the environment is process-global.** Two threads reporting
+    on the cache at once — which is what a health page does under any concurrency at all —
+    would otherwise have the first one's ``pop`` land while the second is still inside, and
+    ``tiktoken`` would resolve a different directory mid-call. The lock is re-entrant, so the
+    :func:`load_encoding` path that already holds it nests without deadlocking.
+
+    Args:
+        create: Whether to make the directory. ``False`` for the read paths, so that a
+            ``doctor`` that merely *reports* on the cache does not bring one into existence —
+            those checks write to the machine only under ``--fix``, and a diagnostic with a
+            side effect is what this package's docstrings keep objecting to.
     """
     if os.environ.get(CACHE_DIR_ENV) or os.environ.get(LEGACY_CACHE_DIR_ENV):
         yield
         return
     directory = default_cache_directory()
-    directory.mkdir(parents=True, exist_ok=True)
-    os.environ[CACHE_DIR_ENV] = str(directory)
-    try:
-        yield
-    finally:
-        os.environ.pop(CACHE_DIR_ENV, None)
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    with _lock:
+        os.environ[CACHE_DIR_ENV] = str(directory)
+        try:
+            yield
+        finally:
+            os.environ.pop(CACHE_DIR_ENV, None)
 
 
 def cache_path(url: str) -> Path:
@@ -545,7 +559,7 @@ def prefetch(encodings: Sequence[str], *, bundle_dir: Path | None = None) -> tup
     # variable makes caching best-effort: a fetch can succeed, return a working encoding, and
     # leave the cache empty. Pointing the variable turns that into an error the check below
     # can see.
-    with pointed_at_the_cache():
+    with pointed_at_the_cache(create=True):
         return _seed(encodings, bundle_dir)
 
 
