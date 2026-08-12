@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -1021,13 +1022,17 @@ class _Maintenance:
                 await store.delete_document(document.id)
         return documents, chunks, removed
 
-    async def export_corpus(self, target: Path) -> tuple[int, int]:
+    async def export_corpus(
+        self, target: Path, *, allow_insecure_target: bool = False
+    ) -> tuple[int, int]:
         """Write retained bytes and metadata, and nothing derived from them."""
         from manicule.core.retrieval import Filter  # noqa: PLC0415
 
         store = await self._runtime.documents()
         blobs = await self._runtime.blobs()
-        await asyncio.to_thread(_prepare_archive_dir, target)
+        await asyncio.to_thread(
+            _prepare_archive_dir, target, allow_insecure_target=allow_insecure_target
+        )
         selector = Filter(workspace_ids=frozenset({self._runtime.workspace}))
         entries: list[ArchiveEntry] = []
         written = 0
@@ -1044,7 +1049,7 @@ class _Maintenance:
                 if data is None:
                     continue
                 blob_path = target / "blobs" / document.original_ref
-                await asyncio.to_thread(blob_path.write_bytes, data)
+                await asyncio.to_thread(_write_private, blob_path, data)
                 written += len(data)
                 entries.append(
                     ArchiveEntry(
@@ -1063,9 +1068,9 @@ class _Maintenance:
             documents=tuple(entries),
         )
         await asyncio.to_thread(
-            (target / ARCHIVE_MANIFEST).write_text,
-            manifest.model_dump_json(indent=2),
-            "utf-8",
+            _write_private,
+            target / ARCHIVE_MANIFEST,
+            manifest.model_dump_json(indent=2).encode("utf-8"),
         )
         return len(entries), written
 
@@ -1115,10 +1120,38 @@ def _length(value: object) -> int:
     return len(cast("list[object]", value)) if isinstance(value, list) else 0
 
 
-def _prepare_archive_dir(target: Path) -> None:
-    """Create the archive directory and its blob shard. Blocking, so it runs off the loop."""
-    target.mkdir(parents=True, exist_ok=True)
-    (target / "blobs").mkdir(exist_ok=True)
+def _prepare_archive_dir(target: Path, *, allow_insecure_target: bool = False) -> None:
+    """Create the archive directory and its blob shard. Blocking, so it runs off the loop.
+
+    The mode is the same question ``backup`` answers, so it is answered by the same function
+    rather than by a second one that would drift: an archive is every retained source byte
+    this workspace holds, and this one is written *to be carried somewhere*.
+    """
+    from manicule.storage.engine import secure_output_dir  # noqa: PLC0415 - a storage extra
+
+    secure_output_dir(target, operation="export", allow_insecure=allow_insecure_target)
+    (target / "blobs").mkdir(mode=0o700, exist_ok=True)
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Write ``data``, readable by nobody but the owner, at no point wider.
+
+    ``Path.write_bytes`` creates at the process ``umask``, which is commonly ``0644``. Inside
+    an archive directory that is ``0700`` nobody else can reach the file — but an archive
+    exists to be carried, and a file copied out of that directory takes its own mode with it,
+    not the directory's. The same reasoning put the backup snapshot at ``0600``.
+
+    The mode is passed to :func:`os.open` *and* applied to the descriptor, because the first
+    is honoured only when the call creates the file — the trap this whole family of bugs is
+    made of — and a re-export over yesterday's archive would otherwise keep yesterday's mode.
+    Doing it through the descriptor means there is no window in which the path exists at a
+    wider mode, which matters when ``--allow-insecure-target`` made the directory reachable.
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        if os.name == "posix":
+            os.fchmod(handle.fileno(), 0o600)
+        handle.write(data)
 
 
 def _read_blob(path: Path) -> bytes | None:
