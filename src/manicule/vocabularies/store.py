@@ -258,8 +258,18 @@ def _constructor(encoding: str) -> Callable[[], Mapping[str, Any]]:
     return constructors[encoding]
 
 
+_enumerated: Final[dict[str, tuple[Blob, ...]]] = {}
+"""Encodings whose full file list has been learned, in this process.
+
+Only *complete* enumerations are kept — a probe that stopped at a gap has not seen what comes
+after it. The list cannot change while a process runs: it is a property of the installed
+``tiktoken``, not of what happens to be on disk. So this is a memo rather than a cache, and
+what it buys is that the expensive shape of the probe happens at most once per encoding.
+"""
+
+
 def blobs_for(encoding: str) -> tuple[Blob, ...]:
-    """Which vocabulary files ``encoding`` is built from, up to the first one absent here.
+    """Which vocabulary files ``encoding`` is built from, as far as this machine can see.
 
     Asked of ``tiktoken`` rather than derived from a table in manicule: the URLs and digests
     are arguments inside constructor bodies, so the only way to learn them that cannot go
@@ -267,17 +277,18 @@ def blobs_for(encoding: str) -> tuple[Blob, ...]:
     The loader is replaced for the duration with a recorder that hands back the real cached
     file when there is one and stops the constructor at the first file there is not.
 
-    Stopping early is deliberate and is why this is cheap: a constructor allowed to finish
-    builds a 200 000-entry BPE table, which is a second's work to answer a question about file
-    names. The consequence is stated rather than hidden — for an encoding assembled from
-    several files, this reports the ones up to the first gap. That is exactly what a pre-seed
-    needs, because it fills that gap and asks again; and it is safe for everything else,
-    because :func:`load_encoding` cannot fetch whatever was not enumerated.
+    **What that costs, honestly.** When a file is missing the probe stops there, which is
+    cheap and is the case a pre-seed acts on. When every file is present the constructor runs
+    to completion and builds a 200 000-entry BPE table, because the only way to learn whether
+    an encoding needs a *second* file is to let it ask for one. That full pass happens at most
+    once per encoding per process: a complete answer is memoised in :data:`_enumerated`, and
+    the file list is a property of the installed library rather than of the disk, so the memo
+    cannot go stale. Nothing on the query path calls this.
 
     Returns:
-        Every blob recorded before the probe stopped, in the order the constructor asked for
-        them. Empty only if the constructor asked for nothing, which no ``tiktoken`` encoding
-        does.
+        Every blob recorded, in the order the constructor asked for them. An enumeration that
+        stopped at a gap is not memoised, so the next call — after a pre-seed has filled that
+        gap — sees what comes after it.
 
     Raises:
         ConfigError: ``encoding`` is not one this install knows.
@@ -295,11 +306,16 @@ def blobs_for(encoding: str) -> tuple[Blob, ...]:
         raise _Probed
 
     with _lock:
+        memoised = _enumerated.get(encoding)
+        if memoised is not None:
+            return memoised
         original = loader.read_file_cached
         loader.read_file_cached = record
+        complete = False
         try:
             build()
-        except Exception:  # noqa: BLE001, S110 - see below
+            complete = True
+        except Exception:  # noqa: BLE001 - see below
             # Every way a constructor can end is fine here, and none of them is this
             # function's business. :class:`_Probed` is the ordinary one — the answer arrived
             # and the constructor was stopped. The rest are the constructor failing on bytes
@@ -309,10 +325,31 @@ def blobs_for(encoding: str) -> tuple[Blob, ...]:
             # and the file names — which is what was asked for — are already recorded.
             # Whoever goes on to load or bundle the encoding gets the real failure, from
             # ``tiktoken``'s digest check or from :func:`manicule.vocabularies.bundle.build`.
-            pass
+            complete = False
         finally:
             loader.read_file_cached = original
-    return tuple(recorded)
+        blobs = tuple(recorded)
+        if complete and blobs:
+            _enumerated[encoding] = blobs
+        return blobs
+
+
+def _cached(blob: Blob) -> bool:
+    """Whether this machine holds ``blob``, in the bytes ``tiktoken`` expects for it.
+
+    The digest is checked and not merely the file name, because ``tiktoken``'s own loader
+    checks it and *deletes the file and re-fetches* when it disagrees. A pre-seed that counted
+    a wrong-bytes file as present would report success and leave the next query refusing, with
+    the fix — copy the vocabulary again — sitting behind a message about a blob store. So a
+    cache entry that will not be believed is reported as absent, which makes the pre-seed
+    repair it from the bundle or the network like any other gap.
+    """
+    path = cache_path(blob.url)
+    if not path.is_file():
+        return False
+    if blob.sha256 is None:
+        return True
+    return hashlib.sha256(path.read_bytes()).hexdigest() == blob.sha256
 
 
 def missing_vocabularies(encodings: Sequence[str]) -> tuple[str, ...]:
@@ -320,14 +357,14 @@ def missing_vocabularies(encodings: Sequence[str]) -> tuple[str, ...]:
 
     What a pre-seed acts on and what a status report prints. No network access, and the cost
     is asymmetric in the useful direction: answering "this one is missing" stops at the first
-    absent file, while answering "this one is here" means the probe read every file the
-    encoding needs — because the only party that knows how many there are is the constructor
-    that asks for them.
+    absent file, while answering "this one is here" reads every file the encoding needs —
+    once to learn there are no more of them, and again to check the bytes are the ones
+    ``tiktoken`` will accept.
     """
     absent: list[str] = []
     for encoding in sorted(set(encodings)):
         blobs = blobs_for(encoding)
-        if not blobs or any(not cache_path(blob.url).is_file() for blob in blobs):
+        if not blobs or any(not _cached(blob) for blob in blobs):
             absent.append(encoding)
     return tuple(absent)
 

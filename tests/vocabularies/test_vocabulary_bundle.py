@@ -297,6 +297,64 @@ def test_a_read_only_bundle_is_a_cache_directory_in_its_own_right(
         _make_writable(read_only)
 
 
+@pytest.mark.usefixtures("cold_registry")
+def test_a_cache_entry_with_the_right_name_and_the_wrong_bytes_is_re_seeded(
+    bundle: bundles.VocabularyBundle, empty_cache: Path, no_network: list[str]
+) -> None:
+    """A pre-seed that counts a corrupt file as present reports success and fixes nothing.
+
+    ``tiktoken`` checks the digest when it reads, and on a mismatch it *deletes the file and
+    fetches* — which on the host this exists for is a refusal, arriving after an install step
+    said everything was fine. So a cache entry that will not be believed is reported as
+    absent, and the pre-seed repairs it like any other gap.
+
+    One flipped byte, which is what a truncated copy or a bad transfer leaves behind.
+    """
+    blob = vocabularies.blobs_for("o200k_base")[0]
+    good = (bundle.vocabulary_dir / bundle.vocabularies[blob.url].filename).read_bytes()
+    (empty_cache / blob.key).write_bytes(good[:-1] + bytes([good[-1] ^ 0xFF]))
+
+    assert vocabularies.missing_vocabularies(["o200k_base"]) == ("o200k_base",)
+    assert vocabularies.prefetch(["o200k_base"], bundle_dir=bundle.root) == ("o200k_base",)
+
+    assert (empty_cache / blob.key).read_bytes() == good
+    assert vocabularies.missing_vocabularies(["o200k_base"]) == ()
+    assert no_network == []
+
+
+def test_the_file_list_for_an_encoding_is_learned_once_and_not_re_probed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe's expensive shape happens at most once per encoding per process.
+
+    Learning that an encoding needs no *second* file means letting the constructor ask for
+    one, and a constructor allowed to get that far builds a 200 000-entry BPE table. The list
+    is a property of the installed library rather than of the disk, so it is memoised — and
+    the assertion is that the constructor is never run again, because a timing comparison
+    would be a flake and a cache that is merely fast is not the claim.
+
+    **The spy is on the constructor and not on the loader**, which the first draft got wrong
+    and which passed while checking nothing: the probe *replaces* the loader for the duration
+    of its call, so a stand-in installed there is exactly what the probe puts aside. The
+    constructor is the thing the probe reaches for and does not touch.
+    """
+    from tiktoken import registry  # noqa: PLC0415 - a retrieval extra, not core
+
+    require_source_vocabularies(("o200k_base",))
+    first = vocabularies.blobs_for("o200k_base")
+    assert first
+
+    def never() -> dict[str, object]:
+        message = "the file list was already known and this ran the constructor again"
+        raise AssertionError(message)
+
+    constructors = dict(registry.ENCODING_CONSTRUCTORS or {})
+    constructors["o200k_base"] = never
+    monkeypatch.setattr(registry, "ENCODING_CONSTRUCTORS", constructors)
+
+    assert vocabularies.blobs_for("o200k_base") == first
+
+
 def test_a_pre_seed_that_wrote_nothing_is_a_failure_however_it_reported_itself(
     empty_cache: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
