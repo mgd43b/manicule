@@ -41,3 +41,6 @@ lychee-report.json
 
 # Claude Code worktrees
 .claude/worktrees/
+
+# Bug reports and working notes written against a checkout, not part of the project.
+bugs/
