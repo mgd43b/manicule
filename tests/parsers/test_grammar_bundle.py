@@ -272,8 +272,10 @@ def test_a_bundle_installed_as_a_distribution_needs_no_configuration(
     assert report["parsed"] == "module"
     # A distribution, not a directory that happens to import: the version answers from
     # installed metadata, which is what `pip list` reads and what an operator asking "which
-    # grammars does this machine have" gets told.
-    assert report["distribution"] == f"{grammars.pack_version()}+{_local_version()}"
+    # grammars does this machine have" gets told. Asserted against what the builder writes,
+    # which is the comparison that catches a version the installer *normalised* — `linux-x86_64`
+    # loses its underscore to PEP 440, and macOS, whose tag has none, never notices.
+    assert report["distribution"] == _expected_version()
 
 
 def test_the_packaging_metadata_describes_the_bundle_it_was_written_beside(
@@ -292,16 +294,48 @@ def test_the_packaging_metadata_describes_the_bundle_it_was_written_beside(
     assert main(["--output", str(package), "--package", "--languages", *BUNDLE_LANGUAGES]) == 0
     metadata = (package / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert f'version = "{grammars.pack_version()}+{_local_version()}"' in metadata
+    assert f'version = "{_expected_version()}"' in metadata
     assert grammar_bundle.platform_tag() in metadata
     assert f'name = "{grammar_bundle.BUNDLE_MODULE.replace("_", "-")}"' in metadata
     # The licence the build asserted, carried to the machine the wheel lands on.
     assert f'license = "{grammar_bundle.licence_of_installed_pack()}"' in metadata
+    # Neither separator survives PEP 440 normalisation, so a version carrying one describes a
+    # distribution that installs under a different name than the file it came from.
+    assert "_" not in _expected_version()
 
 
-def _local_version() -> str:
-    """The platform tag as PEP 440 spells a local version segment: dots, never hyphens."""
-    return grammar_bundle.platform_tag().replace("-", ".")
+def _expected_version() -> str:
+    """What this machine's bundle must be versioned as, from the builder's own rule."""
+    from tools.build_grammar_bundle import package_version  # noqa: PLC0415 - a build script
+
+    return package_version(grammars.pack_version(), grammar_bundle.platform_tag())
+
+
+@pytest.mark.parametrize(
+    "platform", ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-aarch64", "windows-x86_64"]
+)
+def test_the_distribution_version_survives_being_installed_on_every_platform(
+    platform: str,
+) -> None:
+    """Every platform's version, checked on whichever one is running this.
+
+    PEP 440 folds ``-`` and ``_`` in a local version segment to ``.``, so a version written
+    ``1.14.3+linux.x86_64`` is *installed* as ``1.14.3+linux.x86.64`` — the metadata naming one
+    thing and the installed distribution another. That is a platform-dependent difference in
+    output, which is the one class of defect this subsystem exists to refuse, and it is
+    unobservable on macOS because ``macos-arm64`` has no underscore in it. It reached CI once.
+
+    Parametrised over the tags ``platform_tag`` can produce rather than asserted about this
+    machine, so the Linux answer is checked on a laptop and the macOS answer on a runner. The
+    comparison is against ``packaging``, which is what every installer normalises with.
+    """
+    from packaging.version import Version  # noqa: PLC0415 - a core dependency, used once here
+    from tools.build_grammar_bundle import package_version  # noqa: PLC0415 - a build script
+
+    written = package_version(grammars.pack_version(), platform)
+
+    assert str(Version(written)) == written, "an installer would rename this distribution"
+    assert written.endswith(f"+{platform.replace('-', '.').replace('_', '.')}")
 
 
 def _install(package: Path, target: Path) -> Path:

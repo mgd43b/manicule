@@ -22,7 +22,9 @@ makes it installable**, so the grammars travel through the same channel as every
 dependency and no environment variable is needed at all. That package is built rather than
 published, because a bundle is valid for exactly one platform and one pack release — which is
 also why its version carries both: ``1.14.3+macos.arm64`` says, in ``pip list``, exactly what
-the thing on this machine is good for.
+the thing on this machine is good for. :func:`package_version` writes that string, separators
+already normalised the way PEP 440 will normalise them, so the file and the installed
+distribution report the same version on every platform rather than on the one it was written on.
 
 **The metadata is written here rather than by whoever consumes the output.** It was not, once,
 and the deployment that needed it supplied a ``pyproject.toml`` of its own — which meant the
@@ -47,6 +49,7 @@ anything absent.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -106,20 +109,32 @@ the directory rather than a constant that drifts from it.
 """
 
 
-def package_metadata(bundle: grammar_bundle.GrammarBundle) -> str:
-    """``pyproject.toml`` for the distribution around ``bundle``.
+def package_version(pack_version: str, platform: str) -> str:
+    """The distribution version for a bundle: the pack release, then the platform.
 
-    The version is the pack release with the platform as a PEP 440 local segment —
-    ``1.14.3+macos.arm64`` — because those two facts are exactly what decides whether an
-    installed bundle is usable, and a distribution whose version says ``0.0.0`` makes an
-    operator open the manifest to find out what they have. Local segments are the right home
-    for it: they are never published to an index, which is the correct treatment for a
-    distribution that is built per platform rather than released.
+    ``1.14.3+macos.arm64``. The platform goes in a PEP 440 **local version segment** because
+    those two facts are exactly what decides whether an installed bundle is usable, and a
+    distribution whose version says ``0.0.0`` makes an operator open the manifest to find out
+    what they have. A local segment is the right home for it: it is never published to an
+    index, which is the correct treatment for a distribution built per platform.
+
+    **Separators are normalised here rather than left to the installer**, and that is not
+    tidiness. PEP 440 folds both ``-`` and ``_`` in a local segment to ``.``, so writing
+    ``linux-x86_64`` produces a file that says one version and an installed distribution that
+    reports another — the artifact describing something the machine does not have. It is
+    invisible on macOS, whose tag has no underscore in it, and it is the platform-dependent
+    difference this whole subsystem exists to refuse. One function, so the metadata, the
+    installed distribution and the test all name the same string.
     """
+    return f"{pack_version}+{re.sub(r'[-_]', '.', platform)}"
+
+
+def package_metadata(bundle: grammar_bundle.GrammarBundle) -> str:
+    """``pyproject.toml`` for the distribution around ``bundle``."""
     return PACKAGE_METADATA.format(
         distribution=grammar_bundle.BUNDLE_MODULE.replace("_", "-"),
         module=grammar_bundle.BUNDLE_MODULE,
-        version=f"{bundle.pack_version}+{bundle.platform.replace('-', '.')}",
+        version=package_version(bundle.pack_version, bundle.platform),
         description=(
             f"Offline tree-sitter grammars for manicule: "
             f"{grammars.PACK_DISTRIBUTION} {bundle.pack_version}, {bundle.platform}, "
