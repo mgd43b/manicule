@@ -43,9 +43,11 @@ import sys
 from pathlib import Path
 
 import pytest
+from _pytest.outcomes import Failed, OutcomeException, Skipped
 
 from manicule import vocabularies
 from manicule.chunking.tokens import TIKTOKEN_ENCODING
+from manicule.config.settings import ENV_PREFIX
 from manicule.core.errors import ConfigError
 from manicule.generation.budget import GENERATION_ENCODING
 from manicule.retrieval.tokens import DEFAULT_ENCODING, ContextTokenCounter
@@ -865,6 +867,59 @@ def test_a_broken_bundle_is_quoted_into_the_refusal_rather_than_thrown_from_it(
     assert "o200k_base" in message
     assert "the offline vocabulary bundle is unusable" in message
     assert bundles.MANIFEST_NAME in message
+
+
+# --- the switch that decides whether this suite means anything -------------------------------
+
+
+def test_the_required_switch_survives_the_test_environment() -> None:
+    """The mechanism that stops a green job from meaning nothing, and it has failed twice.
+
+    ``manicule_environment`` deletes every variable in the ``MANICULE_`` namespace before each
+    test, so a switch named that way is scrubbed before it is ever read and the job reports
+    green having skipped everything. That has already happened to the embedding switch and to
+    the grammar one. This name is outside the namespace, and the value is read at *import* as
+    well, so a future fixture that deletes it cannot disarm the switch either.
+    """
+    from tests import vocabulary_support  # noqa: PLC0415 - the module under test here
+
+    assert not vocabulary_support.REQUIRE_BUNDLE_ENV.startswith(ENV_PREFIX)
+    assert (
+        bool(os.environ.get(vocabulary_support.REQUIRE_BUNDLE_ENV, "").strip())
+        == vocabulary_support.BUNDLE_REQUIRED
+    )
+
+
+@pytest.mark.parametrize("armed", [True, False])
+def test_an_absent_vocabulary_fails_when_the_switch_is_armed_and_skips_when_it_is_not(
+    monkeypatch: pytest.MonkeyPatch, empty_cache: Path, *, armed: bool
+) -> None:
+    """Both directions, exercised rather than assumed.
+
+    The switch has exactly one job — turn this suite's skips into failures — and both halves
+    matter for different reasons. Armed and skipping means CI certifies nothing. Unset and
+    failing means a first checkout is red for a reason that has nothing to do with the change
+    under test, which is how a suite gets marked flaky and then ignored.
+    """
+    from tests import vocabulary_support  # noqa: PLC0415 - the module under test here
+
+    del empty_cache
+    monkeypatch.setattr(vocabulary_support, "BUNDLE_REQUIRED", armed)
+    expected = Failed if armed else Skipped
+
+    # `OutcomeException` — the base of both — rather than `expected`, and the reason is the
+    # defect this whole file is about. `pytest.raises(Failed)` does not catch `Skipped`, so a
+    # switch that had stopped arming would let the skip escape and pytest would mark *this
+    # test* skipped: a green run, and a guard that checked nothing. Caught here, the wrong
+    # outcome is an assertion failure like any other. Found by disabling the switch and
+    # watching this test skip rather than fail.
+    with pytest.raises(OutcomeException) as raised:
+        vocabulary_support.require_source_vocabularies(("o200k_base",))
+
+    assert type(raised.value) is expected
+
+    assert "o200k_base" in str(raised.value)
+    assert (vocabulary_support.REQUIRE_BUNDLE_ENV in str(raised.value)) is armed
 
 
 # --- what a pre-seed is asked for -----------------------------------------------------------
