@@ -513,11 +513,11 @@ def connector_login(
         bool, typer.Option("--forget", help="Remove the stored session instead of taking one.")
     ] = False,
 ) -> None:
-    """Capture the browser session a Confluence source behind single sign-on authenticates with.
+    """Capture the browser session a Confluence source behind single sign-on signs in with.
 
-    Sign in to Confluence in your own browser first, then paste the ``Cookie`` header from its
-    developer tools when this asks. manicule never asks for your password, cannot use one, and
-    has nowhere to put one.
+    Sign in to Confluence in your own browser first, then paste the Cookie header from its
+    developer tools when this asks. manicule never asks for your password, cannot use one,
+    and has nowhere to put one.
     """
     cookies = "" if forget else read_secret(SESSION_PROMPT)
     emit(
