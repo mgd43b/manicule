@@ -545,17 +545,23 @@ async def test_a_page_removed_from_a_later_export_stops_being_reported(tmp_path:
 
 async def test_a_symlinked_directory_is_not_followed(tmp_path: Path) -> None:
     """A symlink out of the tree is the escape ``fetch`` refuses; one inside it is an endless
-    walk."""
-    snapshot(tmp_path)
-    outside = tmp_path.parent / "outside-the-root"
-    outside.mkdir(exist_ok=True)
-    snapshot(outside, manifest={**MANIFEST, "page_id": "elsewhere"}, at="ENG/elsewhere")
-    (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+    walk.
 
-    found = [doc.ref.source_id for doc in await discovered(tmp_path)]
+    Both directories live under this test's own ``tmp_path``. An earlier version put the target in
+    ``tmp_path.parent``, which pytest shares across the whole session — so the test wrote outside
+    its own sandbox and could have collided with, or been read by, another test's walk.
+    """
+    root = tmp_path / "corpus"
+    root.mkdir()
+    snapshot(root)
+    outside = tmp_path / "outside-the-root"
+    snapshot(outside, manifest={**MANIFEST, "page_id": "elsewhere"}, at="ENG/elsewhere")
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    found = [doc.ref.source_id for doc in await discovered(root)]
 
     assert found == ["123456"]
-    assert "elsewhere" not in found
+    assert "elsewhere" not in found, "the walk followed a symlink out of the root"
 
 
 # --- change detection -------------------------------------------------------------------------
