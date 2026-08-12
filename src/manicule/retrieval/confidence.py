@@ -247,6 +247,44 @@ def combine_evidence(strengths: Iterable[float]) -> float:
     return 1.0 - absent
 
 
+def evidence_per_passage(
+    passages: Sequence[Candidate], dense_leg: str | None, *, noise: float, strong: float
+) -> list[float | None]:
+    """How much evidence each passage carries, positionally, or ``None`` where none was measured.
+
+    The single definition of that question. Three callers need it — the component, the
+    corroboration term and the diagnostic — and computing it three times is how the diagnostic
+    ends up explaining a number nobody computed. ``None`` is not zero: it means the dense leg
+    never ranked this passage, so there is nothing to rescale.
+    """
+    if dense_leg is None:
+        return [None] * len(passages)
+    return [
+        rescale_similarity(max(candidate.scores[dense_leg], 0.0), noise=noise, strong=strong)
+        if dense_leg in candidate.scores
+        else None
+        for candidate in passages
+    ]
+
+
+def strongest_per_document(
+    passages: Sequence[Candidate], strengths: Sequence[float | None]
+) -> dict[str, float]:
+    """The best evidence each document offered, which is what may be combined.
+
+    Chunks of one document are not independent observations, so only the strongest counts —
+    otherwise a finely-chunked document manufactures certainty by being chunked finely, which is
+    a property of the ingest configuration reported as a property of the evidence.
+    """
+    best: dict[str, float] = {}
+    for candidate, strength in zip(passages, strengths, strict=True):
+        if strength is None:
+            continue
+        document = candidate.chunk.document_id
+        best[document] = max(best.get(document, 0.0), strength)
+    return best
+
+
 def _similarity(
     passages: Sequence[Candidate], dense_leg: str | None, *, noise: float, strong: float
 ) -> tuple[float, str]:
@@ -279,15 +317,9 @@ def _similarity(
         # Suppressed rather than scored zero: a zero would report weak evidence for what is a
         # property of the pipeline.
         return 0.0, "this pipeline declares no retrieval legs to read a similarity from"
-    best: dict[str, float] = {}
-    for candidate in passages:
-        if dense_leg not in candidate.scores:
-            continue
-        document = candidate.chunk.document_id
-        strength = rescale_similarity(
-            max(candidate.scores[dense_leg], 0.0), noise=noise, strong=strong
-        )
-        best[document] = max(best.get(document, 0.0), strength)
+    best = strongest_per_document(
+        passages, evidence_per_passage(passages, dense_leg, noise=noise, strong=strong)
+    )
     if not best:
         return 0.0, (
             f"no passage in the context carries a {dense_leg!r} score, so there is no similarity "
@@ -320,13 +352,11 @@ def _agreement(
     """
     if dense_leg is None:
         return 0.0
+    strengths = evidence_per_passage(passages, dense_leg, noise=noise, strong=strong)
     bearing = [
         candidate
-        for candidate in passages
-        if rescale_similarity(
-            max(candidate.scores.get(dense_leg, 0.0), 0.0), noise=noise, strong=strong
-        )
-        > 0.0
+        for candidate, strength in zip(passages, strengths, strict=True)
+        if strength is not None and strength > 0.0
     ]
     if not bearing:
         return 0.0
@@ -548,26 +578,16 @@ def explain_confidence(
         strong_similarity=strong_similarity,
     )
     dense_leg = legs[0] if legs else None
-    strongest: dict[str, float] = {}
-    for candidate in passages:
-        if dense_leg is not None and dense_leg in candidate.scores:
-            strength = rescale_similarity(
-                max(candidate.scores[dense_leg], 0.0),
-                noise=noise_similarity,
-                strong=strong_similarity,
-            )
-            document = candidate.chunk.document_id
-            strongest[document] = max(strongest.get(document, 0.0), strength)
+    strengths = evidence_per_passage(
+        passages, dense_leg, noise=noise_similarity, strong=strong_similarity
+    )
+    strongest = strongest_per_document(passages, strengths)
 
     detail: list[PassageEvidence] = []
     claimed: set[str] = set()
-    for candidate in passages:
+    for candidate, measured in zip(passages, strengths, strict=True):
         raw = candidate.scores.get(dense_leg) if dense_leg is not None else None
-        strength = (
-            rescale_similarity(max(raw, 0.0), noise=noise_similarity, strong=strong_similarity)
-            if raw is not None
-            else 0.0
-        )
+        strength = measured or 0.0
         document = candidate.chunk.document_id
         # A passage at zero evidence contributed nothing, so it is not "counted" however it
         # compares to its document's best — otherwise every filler passage in a context of noise
@@ -618,8 +638,10 @@ __all__ = [
     "PassageEvidence",
     "band_for",
     "combine_evidence",
+    "evidence_per_passage",
     "explain_confidence",
     "reachable_band",
     "rescale_similarity",
     "score_confidence",
+    "strongest_per_document",
 ]
