@@ -318,11 +318,27 @@
       return pump();
     }
 
+    /* The answer that was on screen, moved into the thread before the next one overwrites the
+     * live block. Without this, asking a second question makes the first answer vanish — the
+     * live block is one element and the turns above it come from the server. The rating widget
+     * is dropped from the copy: cloning does not carry its listener, so a button that looked
+     * live and did nothing is worse than no button. */
+    function keepPreviousAnswer() {
+      if (live.hidden || !answer.textContent) { return; }
+      var finished = live.firstElementChild;
+      if (!finished) { return; }
+      var copy = finished.cloneNode(true);
+      var stale = copy.querySelector("[data-rate]");
+      if (stale) { stale.parentNode.removeChild(stale); }
+      turns.appendChild(copy);
+    }
+
     form.addEventListener("submit", function (event) {
       event.preventDefault();
       var text = question.value.trim();
       if (!text) { return; }
       question.value = "";
+      keepPreviousAnswer();
       addAsked(text);
       live.hidden = false;
       rate.hidden = true;
