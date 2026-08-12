@@ -63,6 +63,17 @@ BACKUP_IS_NOT_A_RESTORE = (
     "pass either --output to take a backup or --restore to put one back, not both"
 )
 
+INSECURE_TARGET_IS_A_BACKUP_OPTION = (
+    "--allow-insecure-target applies to --output, which is where a backup is written. A "
+    "restore reads from the directory you name and writes into the data directory, whose "
+    "permissions manicule sets itself."
+)
+"""Why ``--restore --allow-insecure-target`` is refused rather than ignored.
+
+Accepting a security flag that has no effect on the operation being run is the exact shape of
+the defect this option exists to fix: an option that reads as a decision and reaches nothing.
+"""
+
 UNKNOWN_WORKSPACE = "unknown"
 """What an envelope reports when configuration could not be loaded at all.
 
@@ -577,16 +588,28 @@ def backup(
         Path | None, typer.Option("--restore", help="Restore from here instead.")
     ] = None,
     force: Annotated[bool, typer.Option("--force", help="Overwrite an existing target.")] = False,
+    allow_insecure_target: Annotated[
+        bool,
+        typer.Option(
+            "--allow-insecure-target",
+            help="Write into a group- or world-readable directory. It holds the whole corpus.",
+        ),
+    ] = False,
 ) -> None:
     """Take a consistent copy of the data directory, or put one back."""
     if output is not None and restore is not None:
         raise typer.BadParameter(BACKUP_IS_NOT_A_RESTORE)
     if restore is not None:
+        if allow_insecure_target:
+            raise typer.BadParameter(INSECURE_TARGET_IS_A_BACKUP_OPTION)
         emit("restore", lambda service: service.restore(restore, force=force))
         return
     if output is None:
         raise typer.BadParameter(BACKUP_NEEDS_A_TARGET)
-    emit("backup", lambda service: service.backup(output))
+    emit(
+        "backup",
+        lambda service: service.backup(output, allow_insecure_target=allow_insecure_target),
+    )
 
 
 @app.command("export")

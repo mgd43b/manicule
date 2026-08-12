@@ -12,6 +12,12 @@ mean a document marked ``indexed`` that silently returns nothing.
 are three files captured at three instants, and a checkpoint landing between them produces a
 result that will not open. :meth:`sqlite3.Connection.backup` is in the standard library and is
 correct against a live database.
+
+**A backup is a second copy of the corpus, and it is checked as one.** With retained source
+bytes a snapshot is byte-identical to what the connectors fetched (``docs/storage.md`` §7.1),
+so where it lands is a security decision rather than a filing one. :func:`create_backup`
+refuses a group- or world-readable target — see :func:`_secure_target` for why asking for a
+mode is not the same as having one.
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,11 +35,13 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
 
+from manicule.core.errors import ManiculeError
 from manicule.storage import models
 from manicule.storage.engine import (
     BLOBS_DIRNAME,
     VECTORS_DIRNAME,
     database_path,
+    exposure,
     prepare_data_dir,
 )
 from manicule.storage.migrator import current, head_revision
@@ -46,8 +55,16 @@ BACKUP_FORMAT = "manicule-backup"
 BACKUP_VERSION = 1
 
 
-class BackupError(Exception):
-    """A backup could not be created, or a restore refused to proceed."""
+class BackupError(ManiculeError):
+    """A backup could not be created, or a restore refused to proceed.
+
+    A :class:`~manicule.core.errors.ManiculeError` because every one of these is a refusal
+    manicule decided on, not a defect: an unusable target, a tampered snapshot, a backup from
+    a newer schema. Only errors in that hierarchy reach
+    :func:`~manicule.app.dispatch.run_op`'s envelope — anything else propagates as a
+    traceback, and a security refusal that reaches an operator as a stack trace is a refusal
+    they will read as a crash.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +109,68 @@ def _copy_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, symlinks=False, dirs_exist_ok=True)
 
 
-async def create_backup(engine: AsyncEngine, data_dir: Path, target: Path) -> dict[str, Any]:
+def _secure_target(target: Path, *, allow_insecure: bool) -> None:
+    """Create ``target`` ``0700``, then check that is what it actually is.
+
+    **Asking for a mode is not having one, and this is the function that stopped pretending
+    otherwise.** ``Path.mkdir(mode=0o700, exist_ok=True)`` applies ``mode`` only when it
+    creates the directory: a pre-existing group- or world-readable one is used exactly as
+    found. That is not the rare path, it is the ordinary one — an operator who backs up into
+    the same place twice creates it once — so the mode is requested and then *verified*.
+    Verifying also covers the case creation alone cannot: a default POSIX ACL on the parent
+    can hand back a directory wider than the one that was asked for.
+
+    A snapshot is a verbatim copy of the corpus, retained source bytes included
+    (``docs/storage.md`` §7.1), so an exposed target has published every indexed document to
+    every account on the machine. ``doctor`` fails rather than warns on exactly this exposure
+    of the data directory; the second copy of the same bytes gets the same answer.
+
+    Only the target directory is examined, for the reason
+    :func:`~manicule.storage.engine.exposure` gives: POSIX gates every read on every ancestor,
+    so a directory nobody else may enter is one nobody else may read *through*, whatever the
+    permissions on the path leading to it.
+
+    Args:
+        target: Where the snapshot will be written. Created if absent.
+        allow_insecure: Write into an exposed target anyway. The operator asked for it in so
+            many words; manicule still refuses to be the one that decided.
+
+    Raises:
+        BackupError: The target is group- or world-readable and ``allow_insecure`` was not
+            given, or its mode could not be read at all.
+    """
+    existed = target.exists()
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        exposed = exposure(target)
+    except OSError as error:
+        msg = f"backup target {target} cannot be examined: {error}"
+        raise BackupError(msg) from error
+    if not exposed or allow_insecure:
+        return
+    if not existed:
+        # Created a moment ago and refused a moment later: leave nothing behind, so the next
+        # run meets the directory it would have met anyway.
+        with suppress(OSError):
+            target.rmdir()
+    msg = (
+        f"backup target {target} carries group or other permissions ({exposed:03o}), so the "
+        f"snapshot written into it would be readable by accounts other than the one running "
+        f"manicule. A backup holds the retained source bytes of every indexed document, which "
+        f"makes this an exposure of the corpus rather than a tidiness problem. Run "
+        f"`chmod 0700 {target}`, choose a target only this account can read, or pass "
+        f"--allow-insecure-target to write it there knowingly."
+    )
+    raise BackupError(msg)
+
+
+async def create_backup(
+    engine: AsyncEngine,
+    data_dir: Path,
+    target: Path,
+    *,
+    allow_insecure_target: bool = False,
+) -> dict[str, Any]:
     """Snapshot a data directory into ``target``, and return the manifest.
 
     The order is load-bearing and is argued in the module docstring. Callers must hold
@@ -102,20 +180,31 @@ async def create_backup(engine: AsyncEngine, data_dir: Path, target: Path) -> di
     Args:
         engine: The live engine, used to read counts and the migration revision.
         data_dir: What to back up.
-        target: An empty or absent directory to write the snapshot into.
+        target: An empty or absent directory to write the snapshot into. Group- or
+            world-readable targets are refused; see :func:`_secure_target`.
+        allow_insecure_target: Write into a group- or world-readable target anyway. Off by
+            default, and the default is the point.
 
     Returns:
         The manifest, as written.
 
     Raises:
-        BackupError: The target is unusable, or the database is missing.
+        BackupError: The target is unusable or exposed, or the database is missing.
     """
     revision = await current(engine)
     counts = await _counts(engine)
     index_state = await _index_state(engine)
     # The filesystem work is blocking, and a backup copies the whole corpus. Running it on the
     # event loop would stall every concurrent query for the duration.
-    return await asyncio.to_thread(_write_snapshot, data_dir, target, revision, counts, index_state)
+    return await asyncio.to_thread(
+        _write_snapshot,
+        data_dir,
+        target,
+        revision,
+        counts,
+        index_state,
+        allow_insecure_target=allow_insecure_target,
+    )
 
 
 def _write_snapshot(
@@ -124,6 +213,8 @@ def _write_snapshot(
     revision: str | None,
     counts: dict[str, int],
     index_state: dict[str, str | None],
+    *,
+    allow_insecure_target: bool,
 ) -> dict[str, Any]:
     """The blocking half of :func:`create_backup`, in snapshot order."""
     source_db = database_path(data_dir)
@@ -142,19 +233,25 @@ def _write_snapshot(
         )
         raise BackupError(msg)
 
-    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _secure_target(target, allow_insecure=allow_insecure_target)
 
     # 1. SQLite first. The online backup API produces one consistent file from a live
     #    database; copying the three files would not.
+    snapshot_db = target / source_db.name
     source = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
     try:
-        snapshot = sqlite3.connect(target / source_db.name)
+        snapshot = sqlite3.connect(snapshot_db)
         try:
             source.backup(snapshot)
         finally:
             snapshot.close()
     finally:
         source.close()
+    # sqlite3 creates its file at the invoking shell's umask, which is commonly 0644 — the
+    # whole index, every chunk of extracted text, readable by anyone who can reach it. The
+    # copied trees keep their source modes and the manifest sets its own; this is the one
+    # file in a snapshot that would otherwise be looser than what it came from.
+    snapshot_db.chmod(0o600)
 
     # 2. Derived stores second, so they can only ever be ahead of the snapshot above.
     _copy_tree(data_dir / VECTORS_DIRNAME, target / VECTORS_DIRNAME)

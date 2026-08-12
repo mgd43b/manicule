@@ -1117,10 +1117,20 @@ both are storage's to handle:
 group- or world-readable, and names the offending path. A default that depends on the
 operator's `umask` is not a default.
 
-**`manicule backup` refuses a world-readable target** unless `--allow-insecure-target` is
-passed, and creates its own output `0700`. §9 makes backup a routine, exercised operation,
-which makes an unprotected backup the most likely way a copy of the corpus ends up somewhere
-it should not be. A procedure that is safe only when performed carefully is not safe.
+**`manicule backup` refuses a group- or world-readable target** unless
+`--allow-insecure-target` is passed, and creates its own output `0700` with the snapshot
+database and the manifest `0600`. §9 makes backup a routine, exercised operation, which makes
+an unprotected backup the most likely way a copy of the corpus ends up somewhere it should not
+be. A procedure that is safe only when performed carefully is not safe.
+
+The mode is **asked for and then checked**, and the difference is the whole of
+[#60](https://github.com/mgd43b/manicule/issues/60). `mkdir(mode=0o700, exist_ok=True)` applies
+`mode` only when it creates the directory, so this paragraph previously described a refusal
+that existed nowhere and a mode that a pre-existing target — an operator's `~/backups`, a
+mounted volume, the second run into the same place — never received. `create_backup` now
+`stat`s the target after creating it and refuses on any group or other bit, naming the path and
+the mode as `doctor` does. Checking afterwards also covers what creation alone cannot: a
+default POSIX ACL can hand back a directory wider than the one requested.
 
 **What is genuinely not storage's to decide** stays with the security surface
 ([#13](https://github.com/mgd43b/manicule/issues/13),

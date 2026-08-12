@@ -12,6 +12,7 @@ none of them has any business loading a multi-gigabyte model to answer.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -25,6 +26,7 @@ from manicule.generation.config import GENERATOR_NAME
 from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
 from manicule.plugins.manifest import ComponentKind
 from manicule.plugins.registry import discover
+from manicule.storage.backup import BackupError
 from manicule.storage.config import DOC_STORE_NAME, VECTOR_STORE_NAME
 
 if TYPE_CHECKING:
@@ -131,6 +133,31 @@ async def test_a_backup_is_taken_and_names_what_it_contains(
     report = await ApplicationService(runtime).backup(manicule_environment / "backup")
     assert report.schema_revision is not None
     assert (manicule_environment / "backup").is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_a_backup_into_a_pre_existing_exposed_directory_is_refused_end_to_end(
+    runtime: Runtime, manicule_environment: Path
+) -> None:
+    """The whole stack, not a fake of it: service, runtime, storage, one real ``stat``.
+
+    ``docs/storage.md`` §7.1 promised this refusal and nothing implemented it (#60), which is
+    the kind of gap only a test that goes all the way down can close. The directory exists
+    *before* the call, because that is the case ``mkdir(mode=0o700, exist_ok=True)`` never
+    reaches.
+    """
+    target = manicule_environment / "shared"
+    target.mkdir()
+    target.chmod(0o755)
+    service = ApplicationService(runtime)
+
+    with pytest.raises(BackupError, match="group or other permissions") as refusal:
+        await service.backup(target)
+    assert str(target) in str(refusal.value)
+    assert not any(target.iterdir()), "a refused backup leaves the corpus where it was"
+
+    report = await service.backup(target, allow_insecure_target=True)
+    assert report.files, "the escape hatch is an escape hatch, not a second refusal"
 
 
 async def test_the_vector_store_is_prepared_before_anything_writes_a_vector(

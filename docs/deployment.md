@@ -92,7 +92,9 @@ whatever the files inside it say — and walking the blob store would make a dia
 That distinction is load-bearing rather than theoretical: **`manicule.db` and its `-wal` and
 `-shm` siblings are created `0644`**, because SQLite creates them and manicule does not chmod
 them afterwards. Unreachable inside a `0700` directory, and worth knowing before copying one
-of those files somewhere with a different parent.
+of those files somewhere with a different parent. The one copy manicule makes itself is the
+exception: `backup` writes its snapshot database `0600` (§3), because that copy is made to be
+moved.
 
 **Do not branch a script on `manicule doctor`'s exit status.** It exits **0** whenever it
 managed to produce a diagnosis, whatever the diagnosis says — which is the exit-status
@@ -122,16 +124,38 @@ the derived stores can only ever be *ahead* of the database snapshot, never behi
 manifest records the schema revision, the embedding and chunking fingerprints and an inventory.
 `manicule backup --restore <dir>` puts one back.
 
-The output directory is created `0700` and its manifest `0600`.
+The output directory is created `0700`, and the snapshot database and manifest inside it
+`0600`.
 
 **A backup is a second copy of the corpus, and it is the copy most likely to end up somewhere
 careless** — a shared drive, a `/tmp` scratch, an object store with a permissive bucket policy.
-Everything §1 says about the data directory applies to it unchanged. Two habits are worth
-having:
+Everything §1 says about the data directory applies to it unchanged, so `backup` applies §2's
+rule to where you send it:
 
-- Write backups somewhere only the manicule account can read, and check with `ls -ld` rather
-  than assuming; manicule sets the mode of the directory it creates and has no opinion about
-  the volume you created it on.
+```console
+$ manicule backup --output /srv/share/manicule
+backup failed: BackupError
+backup target /srv/share/manicule carries group or other permissions (055), so the
+snapshot written into it would be readable by accounts other than the one running
+manicule. … Run `chmod 0700 /srv/share/manicule`, choose a target only this account
+can read, or pass --allow-insecure-target to write it there knowingly.
+```
+
+The refusal names the path and the mode, and `chmod 0700` on that path is the whole repair.
+It covers a directory that was already there, which is the one that matters: a target manicule
+creates is `0700` because it made it, and a target you created last month is whatever your
+`umask` said at the time.
+
+`--allow-insecure-target` writes the backup anyway, unchanged and unhidden — for a volume
+whose permissions are somebody else's decision, where the protection is the volume rather than
+the mode. It is a consent, not a repair: nothing about the copy is different, and it is a
+complete copy of every document indexed.
+
+Two habits are still worth having:
+
+- Prefer a target only the manicule account can read, rather than one manicule was told to
+  accept. The refusal checks the directory it writes into; it has no opinion about a volume
+  that is exported over NFS, replicated to an object store, or backed up by something else.
 - Treat an off-machine backup as an export of the corpus, because that is what it is.
 
 `manicule export --output <dir>` is a different thing and is not a backup: it writes retained

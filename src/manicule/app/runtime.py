@@ -965,7 +965,9 @@ class _Maintenance:
 
         return await current(self._runtime.require_engine())
 
-    async def backup(self, target: Path) -> Mapping[str, object]:
+    async def backup(
+        self, target: Path, *, allow_insecure_target: bool = False
+    ) -> Mapping[str, object]:
         from manicule.storage.backup import create_backup  # noqa: PLC0415
 
         settings = self._runtime.settings
@@ -973,6 +975,7 @@ class _Maintenance:
             self._runtime.require_engine(),
             settings.data_dir,
             target,
+            allow_insecure_target=allow_insecure_target,
         )
 
     async def restore(self, source: Path, *, force: bool = False) -> Mapping[str, object]:

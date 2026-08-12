@@ -149,7 +149,17 @@ class Maintenance(Protocol):
 
     async def schema_revision(self) -> str | None: ...
 
-    async def backup(self, target: Path) -> Mapping[str, object]: ...
+    async def backup(
+        self, target: Path, *, allow_insecure_target: bool = False
+    ) -> Mapping[str, object]:
+        """Snapshot the installation into ``target``. Returns the manifest.
+
+        A group- or world-readable ``target`` is refused: a snapshot is a verbatim second
+        copy of the corpus, retained source bytes included, and the flag is on the port
+        rather than buried in storage because refusing is the default and consenting is a
+        decision an operator makes out loud.
+        """
+        ...
 
     async def restore(self, source: Path, *, force: bool = False) -> Mapping[str, object]: ...
 

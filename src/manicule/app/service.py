@@ -1034,10 +1034,21 @@ class ApplicationService:
 
     # --- operations the command line owns -------------------------------------------------
 
-    async def backup(self, target: Path | str) -> r.BackupReport:
-        """Take a consistent copy of the data directory."""
+    async def backup(
+        self, target: Path | str, *, allow_insecure_target: bool = False
+    ) -> r.BackupReport:
+        """Take a consistent copy of the data directory.
+
+        Refuses a group- or world-readable target unless ``allow_insecure_target`` says
+        otherwise, for the reason ``docs/storage.md`` §7.1 gives and ``doctor``'s permissions
+        check already acts on: a snapshot is a verbatim copy of every indexed document, and
+        backup is the routine operation, so an unprotected one is the likeliest way that copy
+        ends up somewhere it should not be.
+        """
         maintenance = await self._backend.maintenance()
-        manifest = await maintenance.backup(_local(target))
+        manifest = await maintenance.backup(
+            _local(target), allow_insecure_target=allow_insecure_target
+        )
         files = _as_list(manifest.get("files"))
         return r.BackupReport(
             path=str(_local(target)),
