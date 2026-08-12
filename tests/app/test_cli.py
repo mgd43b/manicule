@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from typer._click.exceptions import NoSuchOption, UsageError
 from typer.testing import CliRunner
 
 import manicule.cli.main as cli
@@ -700,6 +701,352 @@ def test_the_scan_accounts_for_every_payload_entry() -> None:
         f"print_envelope through a call shape this scan does not know about — in which case "
         f"add the shape to OP_TAKING_CALLS, or the whole surface loses the guarantee."
     )
+
+
+# --- `--json` reaches the same place from either side of the command name ---------------------
+
+
+ENVELOPE_PRODUCING: frozenset[str] = frozenset({"emit", "print_envelope"}) | OP_TAKING_CALLS
+"""Bare-name calls that put a result envelope in front of the caller.
+
+``emit`` and ``print_envelope`` are the two that write one; the four in
+:data:`OP_TAKING_CALLS` are the ones that build one. A command reaching any of them, directly
+or through a helper, is a command that emits data — which is the set ``--json`` has to cover.
+"""
+
+MINIMUM_DATA_EMITTING_COMMANDS = 25
+"""A floor on the derivation below, well under the real count.
+
+Present for one reason: a subset check over an empty set passes, and a derivation that walked
+the wrong tree or matched no call shape would return one. This repository has shipped that
+shape more than once — a scan that read no files, a contract test that enumerated no routes —
+so the number is asserted before anything is asserted *about* the set.
+"""
+
+JSON_LANDMARKS: frozenset[tuple[str, ...]] = frozenset(
+    {
+        ("doctor",),
+        ("search",),
+        ("ask",),
+        ("index",),
+        ("document", "list"),
+        ("config", "set"),
+        ("auth", "create-key"),
+        ("completion",),
+        ("stop",),
+    }
+)
+"""Commands the derivation must have found, named individually.
+
+Not the obvious ones only. ``completion`` and ``stop`` reach an envelope without going through
+``emit`` at all, and ``auth create-key`` and ``config set`` live two levels down on
+sub-applications — so a walk that only descended one level, or only recognised ``emit``, would
+still return the large majority of commands and look perfectly healthy.
+"""
+
+
+def _called_names(node: ast.AST) -> set[str]:
+    """Every bare-name call inside one function, nested definitions included.
+
+    Bare names only — ``emit(...)`` and not ``something.emit(...)`` — matching
+    :func:`_op_literals`. The narrowing is safe in the direction that matters: a call this
+    misses makes its command look non-emitting, and
+    :func:`test_the_derivation_covers_every_command_the_interface_offers` fails loudly rather
+    than quietly shrinking what ``--json`` is asserted over.
+    """
+    return {
+        child.func.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+    }
+
+
+def _call_graph() -> dict[str, set[str]]:
+    """Every function the command line defines, and the bare names each one calls.
+
+    One flat namespace across the package, deliberately. A call is a bare name resolved through
+    an import — ``main.py`` names ``serve_forever``, which ``serving.py`` defines — so
+    qualifying by module would break the cross-module hop this graph exists to follow.
+
+    The cost is that two modules defining the same function name would be merged, and a
+    non-emitting one would inherit its namesake's verdict. That is a false *positive*: it can
+    only make a command look like it emits data, which is the direction that adds an assertion
+    rather than dropping one. There are no such collisions today.
+    """
+    package = Path(cli.__file__).parent
+    graph: dict[str, set[str]] = {}
+    for module in sorted(package.rglob("*.py")):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                graph.setdefault(node.name, set()).update(_called_names(node))
+    return graph
+
+
+def _emitting_functions() -> set[str]:
+    """Functions that reach an envelope, following calls until the set stops growing.
+
+    Transitive rather than one-hop, and derived rather than listed. Four commands hand off to a
+    runner in another module — ``start`` to ``serve_forever``, ``stop`` to ``stop_running``,
+    ``ask --repl`` to ``run_repl``, ``index --watch`` to ``watch_path`` — and a list of those
+    hand-offs is exactly the kind of thing that is edited when a fifth appears rather than
+    heeded.
+    """
+    graph = _call_graph()
+    emitting = {name for name, calls in graph.items() if calls & ENVELOPE_PRODUCING}
+    while True:
+        grown = {
+            name for name, calls in graph.items() if calls & emitting or calls & ENVELOPE_PRODUCING
+        }
+        if grown == emitting:
+            return emitting
+        emitting = grown
+
+
+def _leaf_commands() -> dict[tuple[str, ...], Any]:
+    """Every command that can be typed, by the argv that reaches it.
+
+    Read from the **built** command tree rather than from the source, so a command registered
+    on a sub-application and never attached is absent here exactly as it is absent from the
+    interface.
+    """
+    from typer.core import TyperGroup  # noqa: PLC0415 - only this derivation walks the tree
+    from typer.main import get_command  # noqa: PLC0415 - only this derivation builds the tree
+
+    def walk(group: Any, prefix: tuple[str, ...]) -> dict[tuple[str, ...], Any]:
+        found: dict[tuple[str, ...], Any] = {}
+        for name, command in group.commands.items():
+            if isinstance(command, TyperGroup):
+                found |= walk(command, (*prefix, name))
+            else:
+                found[*prefix, name] = command
+        return found
+
+    return walk(get_command(cli.app), ())
+
+
+def _data_emitting_commands() -> dict[tuple[str, ...], Any]:
+    """The commands ``--json`` has to work on, derived from what each one actually calls."""
+    emitting = _emitting_functions()
+    return {
+        path: command
+        for path, command in _leaf_commands().items()
+        if getattr(command.callback, "__name__", "") in emitting
+    }
+
+
+def _parse(command: Any, name: str, args: list[str]) -> None:
+    """Run the **real** parser over one command's arguments, and throw away the result.
+
+    Parsing rather than invoking, deliberately. ``start`` and ``stop`` are in this set and
+    running them would bind a socket or hunt for a daemon; ``make_context`` stops at the point
+    the defect lived, which is argument parsing and nothing after it.
+
+    ``resilient_parsing`` is deliberately **off**. With it on Click ignores unknown options
+    entirely, so the assertion below would pass for ``--nonsense`` just as readily as for
+    ``--json`` — a guard that cannot fail, which is worse than no guard.
+
+    ``STATE`` is put back afterwards. Parsing ``--json`` *sets* it — that side effect is the
+    mechanism working, and it is how the value escapes an option Click never passes to the
+    command — but a helper that left the flag on would hand the next test a command line
+    already in JSON mode.
+    """
+    was = cli.STATE.json_output
+    try:
+        command.make_context(name, args, parent=None)
+    finally:
+        cli.STATE.json_output = was
+
+
+def test_the_derivation_covers_every_command_the_interface_offers() -> None:
+    """Before anything is asserted *about* the set, that the set is the right size and shape.
+
+    Three separate claims, because they fail for three different reasons. The floor catches a
+    walk that found nothing. The landmarks catch a walk that found plenty and missed the
+    awkward ones. The equality catches the case that would quietly weaken every assertion
+    below: a command the derivation decided does not emit data.
+
+    That last one is the interesting assertion. Every command manicule has emits an envelope on
+    some path, so "the commands that emit data" and "the commands" are the same set today. If
+    somebody adds one that genuinely emits nothing, this fails and asks them to say so on
+    purpose — rather than ``--json`` silently ceasing to be a promise about the whole interface.
+    """
+    emitting = _data_emitting_commands()
+    assert len(emitting) >= MINIMUM_DATA_EMITTING_COMMANDS, (
+        f"the derivation found {len(emitting)} data-emitting command(s), below the floor of "
+        f"{MINIMUM_DATA_EMITTING_COMMANDS}. It is walking the wrong tree, or recognising none "
+        f"of the calls that produce an envelope."
+    )
+    missing = sorted(JSON_LANDMARKS - set(emitting))
+    assert missing == [], (
+        f"the derivation did not find {missing} among the commands that emit data. Whatever it "
+        f"walked, it was not the whole command tree."
+    )
+    silent = sorted(set(_leaf_commands()) - set(emitting))
+    assert silent == [], (
+        f"these commands were not found to emit any envelope: {silent}. Either one of them "
+        f"reaches print_envelope by a route this scan cannot follow — in which case the scan "
+        f"needs the shape, or --json stops being asserted for it — or a command that genuinely "
+        f"emits nothing has been added, which is worth saying out loud."
+    )
+
+
+def test_every_data_emitting_command_takes_json_after_the_command_name() -> None:
+    """The defect: ``manicule doctor --json`` was ``No such option: --json``, exit 2.
+
+    ``--json`` was declared once, on the root callback, so it worked only in front of the
+    command name. That is the position nobody types first, and the restriction had already been
+    written up twice as though it were a decision — once by correcting the example in
+    ``docs/surfaces.md`` that used the natural order, and once by describing the rule in the
+    README.
+
+    Asserted for every command rather than for ``doctor``, because a fix that special-cased the
+    command in the bug report would leave the same trap on the other thirty.
+    """
+    for path, command in sorted(_data_emitting_commands().items()):
+        try:
+            _parse(command, path[-1], ["--json"])
+        except NoSuchOption as unknown:  # pragma: no cover - the assertion is the report
+            pytest.fail(
+                f"`manicule {' '.join(path)} --json` is rejected: {unknown.option_name} is not "
+                f"an option of this command. --json has to work on either side of the command "
+                f"name."
+            )
+        except UsageError:
+            # A required argument this parse did not supply. A different failure entirely, and
+            # not the one under test: `document get --json` still has to be told which document.
+            continue
+
+
+def test_every_data_emitting_command_still_takes_json_before_the_command_name() -> None:
+    """The documented position, which the fix must not have traded away.
+
+    ``manicule --json <command>`` is in the README, in ``docs/deployment.md``'s health-gate
+    recipe and in every envelope-parity assertion. Moving the option rather than sharing it
+    would have broken all three while making the reported bug go away.
+    """
+    for path in sorted(_data_emitting_commands()):
+        # `--help` stops the run at the point this test is about, so `start` and `stop` can be
+        # asserted alongside the rest without one of them binding a socket.
+        result = run(["--json", *path, "--help"])
+        assert result.exit_code == 0, (
+            f"`manicule --json {' '.join(path)}` no longer parses: {result.output}"
+        )
+
+
+def test_an_unknown_option_is_still_rejected_by_every_one_of_those_commands() -> None:
+    """The control. Without it the test above proves nothing.
+
+    Every command now carries an option the parser did not previously know, added by a
+    mechanism that reaches inside the built command tree. If that mechanism had instead made
+    the commands accept *anything* — by widening the parser rather than adding one option —
+    the assertion above would pass on a command line that had stopped checking its arguments,
+    which is a far worse defect than the one being fixed.
+    """
+    for path, command in sorted(_data_emitting_commands().items()):
+        with pytest.raises(NoSuchOption):
+            _parse(command, path[-1], ["--not-an-option"])
+
+
+def test_json_before_and_after_the_command_name_are_the_same_invocation(
+    bound: ApplicationService,
+) -> None:
+    """Not merely both accepted — both producing the same bytes.
+
+    An option that parsed in the new position and reached nothing would satisfy every
+    assertion above while printing the human table to stdout, which is the exact shape of the
+    ``--allow-insecure-target`` defect this repository has already been bitten by.
+    """
+    del bound
+    before = run(["--json", "document", "list"])
+    after = run(["document", "list", "--json"])
+    assert before.exit_code == 0
+    assert after.exit_code == 0
+    assert json.loads(after.stdout) == json.loads(before.stdout)
+    assert json.loads(after.stdout)["op"] == "document_list"
+
+
+ESCAPE = "\x1b"
+"""The first byte of every ANSI sequence Rich emits.
+
+Asserted against the characters that were actually printed. The mistake this replaces is
+asserting that colour was *configured* off — a check that passes while the library it is about
+carries on writing escapes, because the setting was read at import and the test never looked at
+the output.
+"""
+
+
+def test_a_colouring_terminal_puts_no_escape_sequences_in_the_json(
+    monkeypatch: pytest.MonkeyPatch, bound: ApplicationService
+) -> None:
+    """``manicule doctor --json | jq`` has to work from an interactive shell.
+
+    ``FORCE_COLOR`` is the environment a terminal actually presents, and it is the one where
+    this fails: Rich decides to colour, and a single escape sequence anywhere in the stream
+    makes the whole document unparseable — for ``jq``, and for every JSON library there is.
+
+    The output is captured and read. Nothing here asserts that a flag was set, because the
+    flag being set is not the claim; the claim is about what came out.
+    """
+    del bound
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    result = run(["doctor", "--json"])
+    assert result.exit_code == 0
+    assert ESCAPE not in result.stdout, "an ANSI escape sequence reached stdout under --json"
+    assert json.loads(result.stdout)["op"] == "doctor"
+
+
+def test_the_same_terminal_does_colour_the_human_output(
+    monkeypatch: pytest.MonkeyPatch, bound: ApplicationService
+) -> None:
+    """The positive control, and without it the test above proves nothing.
+
+    ``FORCE_COLOR`` has to actually reach Rich for the absence of escapes under ``--json`` to
+    mean anything. If it did not — a typo in the variable, a console built before the
+    environment was set — the assertion above would hold on a stream that was never going to be
+    coloured, and would go on holding after somebody reintroduced a banner.
+    """
+    del bound
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    result = run(["doctor"])
+    assert result.exit_code == 0
+    assert ESCAPE in result.stdout, (
+        "FORCE_COLOR did not reach Rich, so the no-escapes assertion under --json is vacuous"
+    )
+
+
+def test_the_human_diagnosis_is_unchanged_when_json_is_absent(
+    bound: ApplicationService,
+) -> None:
+    """The regression bug6 asks for by name: the table a person reads still prints.
+
+    Asserted with the layout taken back out, because the subject is the characters that were
+    printed rather than how Rich chose to box them on this machine.
+    """
+    del bound
+    result = run(["doctor"])
+    assert result.exit_code == 0
+    bare = _laid_bare(result.stdout)
+    assert "overall:" in bare
+    assert "configuration" in bare
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_naming_json_in_both_positions_at_once_is_not_an_error(
+    bound: ApplicationService,
+) -> None:
+    """``manicule --json doctor --json`` says the same thing twice, which is not a conflict.
+
+    It is what a script that already passed the flag produces when somebody adds it to the
+    other end, and refusing it would be a usage error over an unambiguous request. The
+    per-command option **or**\\ s into the root's value rather than assigning, so the second,
+    defaulted-to-``False`` position cannot cancel the first.
+    """
+    del bound
+    both = run(["--json", "document", "list", "--json"])
+    assert both.exit_code == 0
+    assert json.loads(both.stdout)["ok"] is True
 
 
 # --- what a reader is told when the number alone would mislead -------------------------------

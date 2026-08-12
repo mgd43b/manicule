@@ -7,9 +7,10 @@ and rendering — no command decides anything, and none of them reaches past
 
 Three things hold everywhere:
 
-**``--json`` on everything that emits data.** The same envelope the MCP tools return, printed
-to stdout with nothing else in it. Human output and failures go to stderr, so ``| jq`` on a
-failed run reads an empty stream rather than a prose error.
+**``--json`` on everything that emits data, in either position.** ``manicule --json doctor``
+and ``manicule doctor --json`` are the same invocation. The same envelope the MCP tools return,
+printed to stdout with nothing else in it. Human output and failures go to stderr, so ``| jq``
+on a failed run reads an empty stream rather than a prose error.
 
 **Failures exit non-zero and say what to do.** A shell script can branch on that; a person
 gets the hint.
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
+from typer.core import TyperGroup, TyperOption
 
 from manicule.app import results as r
 from manicule.app.dispatch import error_info, run_op
@@ -101,19 +103,104 @@ class State:
 
 STATE = State()
 
+JSON_HELP = "Emit the result envelope as JSON on stdout, and nothing else."
+"""One sentence for ``--json``, wherever it is declared.
+
+Both declarations are the same option, so two spellings of the help would be two answers to
+``--help`` depending on where the reader asked.
+"""
+
+
+def _accept_json(ctx: object, param: object, value: bool) -> bool:
+    """Record ``--json`` typed *after* the command name.
+
+    Click invokes the group's callback before it parses the subcommand's arguments, so
+    :func:`main_callback` has already written ``STATE.json_output`` by the time this runs. That
+    is why this **or**\\ s rather than assigns: ``manicule --json doctor --json`` names the same
+    intention twice, and an assignment would let the second, defaulted-to-``False`` position
+    quietly cancel the first.
+    """
+    del ctx, param
+    STATE.json_output = STATE.json_output or value
+    return value
+
+
+class CommandsShareTheRootOptions(TyperGroup):
+    """A command group whose leaf commands also accept the options declared on ``manicule``.
+
+    ``--json`` was declared once, on the root callback. That made ``manicule --json doctor``
+    work and ``manicule doctor --json`` an *unknown option* — exit 2, no output, from an
+    interface whose own module docstring said ``--json`` was on everything that emits data. It
+    is the position everybody types first, it was reported as a missing feature, and it had
+    been papered over twice: once by correcting the example in ``docs/surfaces.md`` that
+    happened to use it, and once by writing the restriction up in the README as though somebody
+    had chosen it.
+
+    Attaching the option here rather than to thirty-odd command signatures is what keeps the
+    two positions from drifting: there is one option object per command, built from one
+    declaration, so a command added tomorrow accepts ``--json`` tomorrow without anybody
+    remembering. ``tests/app/test_cli.py`` derives the set of data-emitting commands from the
+    built command tree and asserts both positions for every one of them.
+
+    ``expose_value=False`` is what makes it possible at all. Typer generates each command's
+    callback from its Python signature, so an option Click passed through as a keyword argument
+    would be a ``TypeError`` on a parameter the function never declared. The value reaches
+    :data:`STATE` through the option's callback instead, which is where the root's copy already
+    puts it.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401 - Click's own signature
+        super().__init__(*args, **kwargs)
+        for command in self.commands.values():
+            # Groups are skipped: `manicule document` emits nothing itself, and its own leaves
+            # are handled when that group is constructed — by this same class, because every
+            # sub-application below declares it too.
+            if isinstance(command, TyperGroup):
+                continue
+            if any("--json" in option.opts for option in command.params):
+                continue
+            command.params.append(
+                TyperOption(
+                    param_decls=["--json"],
+                    is_flag=True,
+                    default=False,
+                    expose_value=False,
+                    callback=_accept_json,
+                    help=JSON_HELP,
+                )
+            )
+
+
 app = typer.Typer(
     name="manicule",
     help="Self-hosted document search and answers, with citations that resolve.",
     no_args_is_help=True,
     add_completion=False,
     rich_markup_mode="rich",
+    cls=CommandsShareTheRootOptions,
 )
-document_app = typer.Typer(help="Inspect and manage indexed documents.", no_args_is_help=True)
-connector_app = typer.Typer(help="Configured sources.", no_args_is_help=True)
-workspace_app = typer.Typer(help="Workspaces, and which one is active.", no_args_is_help=True)
-plugin_app = typer.Typer(help="Installed plugins.", no_args_is_help=True)
-config_app = typer.Typer(help="Read and write configuration.", no_args_is_help=True)
-auth_app = typer.Typer(help="API keys for this workspace.", no_args_is_help=True)
+document_app = typer.Typer(
+    help="Inspect and manage indexed documents.",
+    no_args_is_help=True,
+    cls=CommandsShareTheRootOptions,
+)
+connector_app = typer.Typer(
+    help="Configured sources.", no_args_is_help=True, cls=CommandsShareTheRootOptions
+)
+workspace_app = typer.Typer(
+    help="Workspaces, and which one is active.",
+    no_args_is_help=True,
+    cls=CommandsShareTheRootOptions,
+)
+plugin_app = typer.Typer(
+    help="Installed plugins.", no_args_is_help=True, cls=CommandsShareTheRootOptions
+)
+config_app = typer.Typer(
+    help="Read and write configuration.", no_args_is_help=True, cls=CommandsShareTheRootOptions
+)
+auth_app = typer.Typer(
+    help="API keys for this workspace.", no_args_is_help=True, cls=CommandsShareTheRootOptions
+)
 app.add_typer(document_app, name="document")
 app.add_typer(connector_app, name="connector")
 app.add_typer(workspace_app, name="workspace")
@@ -122,10 +209,7 @@ app.add_typer(config_app, name="config")
 app.add_typer(auth_app, name="auth")
 
 
-JsonOption = Annotated[
-    bool,
-    typer.Option("--json", help="Emit the result envelope as JSON on stdout, and nothing else."),
-]
+JsonOption = Annotated[bool, typer.Option("--json", help=JSON_HELP)]
 WorkspaceOption = Annotated[
     str | None,
     typer.Option("--workspace", "-w", help="Run in this workspace instead of the configured one."),
@@ -848,6 +932,7 @@ __all__ = [
     "PAYLOADS",
     "RESET_NEEDS_CONFIRMATION",
     "STATE",
+    "CommandsShareTheRootOptions",
     "State",
     "app",
     "emit",

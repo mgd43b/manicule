@@ -102,10 +102,18 @@ contract in `docs/surfaces.md` §2 working as written, because producing the dia
 operation and it succeeded. To gate on health, read the envelope:
 
 ```bash
-manicule --json doctor | jq -e '[.data.checks[] | select(.state == "failing")] | length == 0'
+manicule doctor --json | jq -e '[.data.checks[] | select(.state == "failing")] | length == 0'
 ```
 
-Note the position of `--json`: it is an option of `manicule`, not of `doctor`.
+`--json` goes on either side of the command name; `manicule --json doctor` is the same
+invocation. Select on `.name`, which is the stable identifier — never on `.detail`, which is
+prose and is free to be reworded. Each check also carries `.facts` for the numbers behind that
+sentence and `.remedy` for the suggested fix, so a gate that reports *what to do* does not have
+to parse English to find it:
+
+```bash
+manicule doctor --json | jq -r '.data.checks[] | select(.state == "failing") | "\(.name): \(.remedy)"'
+```
 
 **The common way to fail this is to point `data_dir` at a directory you made yourself.**
 `mkdir /srv/manicule` under the usual `umask 022` produces `0755`, and manicule will use it as

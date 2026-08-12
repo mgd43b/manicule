@@ -28,8 +28,8 @@ Notion, Drive, S3/GCS, Swagger, a crawler and web search — are designed in
 [`PLAN.md`](PLAN.md) and tracked in [#16](https://github.com/mgd43b/manicule/issues/16). None
 of them is built, and nothing below describes them.
 
-Every command that emits data takes `--json` — before the command name, `manicule --json search
-…`, because it is an option of `manicule` rather than of each command — and most of them are
+Every command that emits data takes `--json`, on either side of the command name — `manicule
+--json search …` and `manicule search … --json` are the same invocation — and most of them are
 also MCP tools, so an assistant reaches the same operations through `manicule start --mcp-only`,
 and `manicule start --transport http` serves them over HTTP with an OpenAPI document at
 `/api/docs`. All three emit the same envelope, and the shape is a contract written down in
