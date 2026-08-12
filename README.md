@@ -76,7 +76,7 @@ manicule config set llm.model qwen2.5:14b   # or any model that Ollama is servin
 `manicule doctor` reports what is wrong and what to do about it, and it is the first thing to
 run when something does not work.
 
-## The three surfaces
+## The four surfaces
 
 **The command line** is nineteen commands; `manicule --help` lists them. Under `--json` the
 result envelope is the whole of stdout, so a failed run piped into `jq` reads an empty stream
@@ -86,6 +86,17 @@ rather than a prose error.
 streaming, conversations and shareable links, collections, tags, admin, plugins, auth, a
 workbench, a websocket channel — plus an embeddable chat widget. `manicule start --transport
 http` serves it, on loopback unless three separate things say otherwise.
+
+**The browser surface** is twelve areas of server-rendered HTML at `/ui`, on the same socket:
+chat with streaming citations, confidence and feedback; documents, their chunks, the trash and
+restore; collections and tags; connectors, plugins, workspaces, health, an admin dashboard and
+your own API keys. Command palette on `Ctrl`/`Cmd`+`K`, keyboard navigation, dark mode.
+
+It adds **no build toolchain**: Jinja2 templates, one hand-written stylesheet and one
+hand-written script, so `uv sync` is still the whole install and the container image stays free
+of Node. It also adds **no operation** — every page reads through a service method that already
+has a route, so there is no upload and no configuration write here either.
+[`docs/web.md`](docs/web.md) has the reasoning, including what that costs.
 
 **The MCP server** is nineteen tools over the same service, and it speaks stdio by default —
 which opens no socket at all. To let Claude Code use your index:
@@ -178,12 +189,13 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/cli` | Nineteen commands over that service, and nothing else |
 | `src/manicule/mcp` | Nineteen MCP tools over that service, and nothing else |
 | `src/manicule/api` | Eleven HTTP route groups over that service, and nothing else |
+| `src/manicule/web` | Twelve areas of HTML over that service. No build step, no new operation |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |
 
-The three surfaces are adapters: they parse arguments, call one method, and render what comes
-back. A rule that lived in one of them would be a rule the others did not have — and two of the
-three are called unattended, so that is not a distinction worth risking. A test runs the same
-operation through all three and compares the results.
+The four surfaces are adapters: they parse arguments, call one method, and render what comes
+back. A rule that lived in one of them would be a rule the others did not have — and two of them
+are called unattended, so that is not a distinction worth risking. A test runs the same operation
+through all of them and compares the results.
 
 **Nothing binds a network socket unless it is asked to.** The MCP server speaks stdio by
 default, which opens no socket at all; every HTTP bind goes through one policy that starts at

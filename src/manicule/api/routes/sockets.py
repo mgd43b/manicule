@@ -47,7 +47,11 @@ INVALID_PAYLOAD = 1007
 """The close code for a message this server cannot read."""
 
 
-@router.websocket("/api/v1/chat/ws")
+# ``name="ask"``, the same as the two HTTP chat routes, because it is the same operation and
+# the envelopes it sends say so. Without it the route's name is the handler's — ``chat_socket``
+# — which is a word that appears in no other surface's vocabulary. Nothing noticed for a while
+# because the check that enumerates route names was walking a shape FastAPI had stopped using.
+@router.websocket("/api/v1/chat/ws", name="ask")
 async def chat_socket(websocket: WebSocket) -> None:
     """Stream answers over one connection, one question per message.
 

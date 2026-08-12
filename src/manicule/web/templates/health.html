@@ -1,0 +1,23 @@
+{#
+  `doctor`, rendered. `unknown` is a check that could not run and is deliberately not `ok` —
+  the distinction is the report's whole value.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+{% if panels.doctor.ok %}
+<p class="figure">{{ m.state(panels.doctor.data.state) }}</p>
+<table>
+  <thead><tr><th>Check</th><th>State</th><th>Detail</th></tr></thead>
+  <tbody>
+    {% for check in panels.doctor.data.checks %}
+    <tr><td>{{ check.name }}</td><td>{{ m.state(check.state) }}</td><td>{{ check.detail }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="muted">
+  <code>doctor</code> builds nothing expensive — no model runtime is loaded and no document is
+  read — which is why it is safe to run on an installation that is not working.
+</p>
+{% else %}{{ m.failed(panels.doctor) }}{% endif %}
+{% endblock %}

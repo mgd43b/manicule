@@ -1,0 +1,50 @@
+{#
+  A shared conversation, as an anonymous reader receives it.
+
+  What reaches this template is already `SharedCitationLabel` — a different *type* from the
+  citation an owner sees, produced in storage by `redact_for_anonymous`. There is no
+  document id, no chunk id, no URI, no anchor and no passage text on it to render, which is the
+  point: the projection is structural rather than a helper that blanks two fields and can be
+  forgotten.
+
+  An unknown token, an expired link, a revoked link, a deleted conversation and sharing being
+  switched off all arrive here identically — as nothing. Distinguishing them for an
+  unauthenticated reader would tell them which of their guesses was closest.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+{% if panels.shared.ok %}
+  {% if panels.shared.data.turns %}
+  <div class="turns">
+    {% for turn in panels.shared.data.turns %}
+    <article class="turn turn-{{ turn.role }}">
+      <p class="role">{{ turn.role }}</p>
+      <div class="body">{{ turn.content }}</div>
+      {% if turn.citations %}
+      <ul class="cites">
+        {% for label in turn.citations %}
+        <li class="cite">
+          <span class="slot">[{{ label.slot }}]</span>
+          <span class="title">{{ label.title }}</span>
+          {{ m.trail(label.heading_path) }}
+          {% if label.location %}<span class="muted">{{ label.location }}</span>{% endif %}
+          <span class="verdict verdict-{{ label.verification }}">{{ label.verification }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  <p class="muted">
+    Citations here are attestations, not links: a title, the section it came from where the
+    kind of block permits one, and whether the claim verified at the time the answer was
+    written. The passages themselves stay inside the workspace.
+  </p>
+  {% else %}
+  <p>This link does not resolve. It may never have existed, it may have expired, or it may have
+    been revoked.</p>
+  {% endif %}
+{% else %}{{ m.failed(panels.shared) }}{% endif %}
+{% endblock %}

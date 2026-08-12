@@ -1,0 +1,83 @@
+{#
+  Asking, and the conversation so far.
+
+  Two rendering paths meet on this page and both are covered:
+
+  * The **stored** turns below are rendered by Jinja, which autoescapes. They are model output
+    over documents somebody else wrote, so that is load-bearing rather than hygienic.
+  * The **live** answer arrives over SSE and is written by `manicule.js` through `textContent`,
+    never as markup — the same rule the embeddable widget is written under, and asserted the
+    same way against what the route actually served.
+
+  The profile select and the feedback buttons post JSON to the API's own routes. There is no
+  ask endpoint of this surface's own: the answer path, its telemetry and its tenancy check are
+  the service's, and a second one would be a second set of guarantees.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+<div class="chat">
+  <aside class="conversations">
+    <h2>Conversations</h2>
+    {% if panels.conversations.ok %}
+      {% if panels.conversations.data.conversations %}
+      <ul class="list">
+        {% for item in panels.conversations.data.conversations %}
+        <li{% if item.id == conversation_id %} class="current"{% endif %}>
+          <a href="/ui/chat/{{ item.id }}">{{ item.title or 'Untitled' }}</a>
+          <span class="muted">{{ item.messages }} turns{% if item.shared %} · shared{% endif %}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}{{ m.empty('No conversations yet. Ask something.') }}{% endif %}
+    {% else %}{{ m.failed(panels.conversations) }}{% endif %}
+  </aside>
+
+  <section class="thread" data-chat data-conversation="{{ conversation_id }}">
+    <div class="turns" data-turns>
+      {% for turn in turns %}
+      <article class="turn turn-{{ turn.role }}">
+        <p class="role">{{ turn.role }}</p>
+        <div class="body">{{ turn.content }}</div>
+        {% if turn.citations %}
+        <ul class="cites">
+          {% for item in turn.citations %}{{ m.citation(item) }}{% endfor %}
+        </ul>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+
+    <div class="live" data-live hidden>
+      <article class="turn turn-assistant">
+        <p class="role">assistant</p>
+        <div class="body" data-answer></div>
+        <ul class="cites" data-citations></ul>
+        <p class="muted" data-verdict></p>
+        <div class="rate" data-rate hidden>
+          <button type="button" class="ghost" data-feedback="positive">Useful</button>
+          <button type="button" class="ghost" data-feedback="negative">Not useful</button>
+          <span class="muted" data-rated></span>
+        </div>
+      </article>
+    </div>
+
+    <form class="ask" data-ask>
+      <label class="offscreen" for="question">Your question</label>
+      <textarea id="question" name="question" rows="3" required
+                placeholder="Ask the corpus. Enter sends, Shift+Enter is a newline."></textarea>
+      <div class="row">
+        <label for="profile">Profile</label>
+        <select id="profile" name="profile" data-profile>
+          <option value="">configured</option>
+          <option value="fast">fast</option>
+          <option value="balanced">balanced</option>
+          <option value="precise">precise</option>
+        </select>
+        <button type="submit">Ask</button>
+        <span class="muted" data-status></span>
+      </div>
+    </form>
+  </section>
+</div>
+{% endblock %}

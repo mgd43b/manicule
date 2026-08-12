@@ -1,0 +1,69 @@
+{#
+  The frame every area is rendered inside.
+
+  Three things live here because each of them has to be true of every page or it is true of
+  none: the skip link and the landmarks that make keyboard navigation work, the command
+  palette's markup, and the single stylesheet and script tags. A page that supplied its own
+  would be the page that forgot one.
+
+  Nothing in this file interpolates anything unescaped. No template in this directory marks
+  anything as pre-escaped or turns autoescaping off, and `tests/web/test_escaping.py` asserts
+  that over the whole directory as well as proving the escaping fires.
+#}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{{ title }} · manicule</title>
+<link rel="stylesheet" href="{{ stylesheet }}">
+</head>
+<body data-area="{{ area }}">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <a class="brand" href="/ui">manicule</a>
+  <form class="find" action="/ui/search" method="get" role="search">
+    <label class="offscreen" for="q">Search passages</label>
+    <input id="q" name="q" type="search" placeholder="Search passages" autocomplete="off">
+  </form>
+  <div class="who">
+    <span class="pill" title="Workspace">{{ workspace }}</span>
+    <span class="pill" title="Role">{{ role }}</span>
+    <button type="button" class="ghost" data-palette-open aria-keyshortcuts="Control+K">Go to…</button>
+    <button type="button" class="ghost" data-theme-toggle aria-label="Switch colour scheme">Theme</button>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="Areas">
+    <ul data-navigation>
+      {% for name, path, label in navigation %}
+      <li><a href="{{ path }}"{% if name == area %} aria-current="page"{% endif %}>{{ label }}</a></li>
+      {% endfor %}
+    </ul>
+  </nav>
+
+  <main id="main" tabindex="-1">
+    <h1>{{ title }}</h1>
+    {% block content %}{% endblock %}
+  </main>
+</div>
+
+<div class="palette" data-palette hidden>
+  <div class="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
+    <label class="offscreen" for="palette-input">Go to an area</label>
+    <input id="palette-input" type="text" autocomplete="off" placeholder="Go to…" data-palette-input>
+    <ul data-palette-list></ul>
+    <p class="muted">Enter opens · Esc closes · <kbd>?</kbd> lists shortcuts</p>
+  </div>
+</div>
+
+<footer class="foot">
+  manicule {{ version }} · workspace <strong>{{ workspace }}</strong> · authentication
+  <strong>{{ auth_mode }}</strong>{% if not authenticated %} (no credential presented){% endif %}
+</footer>
+
+<script src="{{ script }}" defer></script>
+</body>
+</html>

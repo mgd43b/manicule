@@ -1,13 +1,17 @@
-# Surfaces: the CLI, the MCP server, the HTTP API, and the shape of what they return
+# Surfaces: the CLI, the MCP server, the HTTP API, the browser, and the shape of what they return
 
-Three surfaces, one service, one output contract. This document says what that contract is,
+Four surfaces, one service, one output contract. This document says what that contract is,
 because `--json` is something scripts and assistants parse, and a shape nobody wrote down is
 whatever the code happened to do last.
 
 - **The application service** (`manicule.app.service.ApplicationService`) has all the
   behaviour.
-- **The command line** (`manicule.cli`), **the MCP server** (`manicule.mcp`) and **the HTTP
-  API** (`manicule.api`) are adapters over it. None of them decides anything.
+- **The command line** (`manicule.cli`), **the MCP server** (`manicule.mcp`), **the HTTP API**
+  (`manicule.api`) and **the browser surface** (`manicule.web`) are adapters over it. None of
+  them decides anything.
+
+The browser surface renders the same envelope as HTML rather than serialising it, and has its
+own document: [`web.md`](web.md). Everything below applies to it too.
 
 ---
 
@@ -20,8 +24,11 @@ credential masking, refusing to install a plugin, refusing a wide bind: every on
 rule that has to hold on all three surfaces or it does not hold.
 
 So the surfaces are thin by construction and the property is checked rather than intended.
-`tests/app/test_surface_parity.py` runs the same operation through all three and compares the
-results. It fails the moment they stop being the same call.
+`tests/app/test_surface_parity.py` runs the same operation through all of them and compares the
+results. It fails the moment they stop being the same call. The browser column cannot be a byte
+comparison — a page is HTML — so it asserts the same claim in the form HTML can carry: a value
+the tool reported is on the page, and a failure the tool reports is the failure the page shows,
+with the same type, message and hint.
 
 ### What each layer may contain
 
@@ -30,6 +37,7 @@ results. It fails the moment they stop being the same call.
 | `manicule.cli` | Parse arguments, read stdin, render, set the exit status | Query a store, compute a filter, decide a policy |
 | `manicule.mcp` | Declare tools, describe them, pass arguments through | Anything the CLI may not |
 | `manicule.api` | Route, authenticate, decide a status code, frame a stream | Anything the CLI may not |
+| `manicule.web` | Render an envelope as HTML, escape it, choose a template | Anything the CLI may not — and it adds no operation of its own |
 | `manicule.app.service` | Everything else | Import a database, a model runtime or a web framework |
 | `manicule.app.runtime` | Build components, own the lifecycle | Decide anything a surface could ask about |
 
@@ -323,6 +331,10 @@ Every case there has a control beside it: the same route against a correct store
 tenant's own document, because a surface that refused everything would satisfy the negatives
 and be useless.
 
+`tests/web/test_tenancy.py` does it a third time, through the pages and against the same broken
+stores, asserting on the **rendered HTML** — because a page is where a leak would actually be
+read, and a title that never reached a payload could still reach a heading or a link.
+
 ---
 
 ## 8. Two things the surfaces refuse to do
@@ -364,7 +376,10 @@ above.
 | workbench | `GET /api/v1/workbench?document_id=…` |
 | websocket chat | `WS /api/v1/chat/ws` |
 
-Plus the embeddable widget: `GET /widget/widget.js` and a static page at `GET /widget`.
+Plus the embeddable widget: `GET /widget/widget.js` and a static page at `GET /widget`, and the
+browser surface at `/ui` — twelve areas of server-rendered HTML over the same service, mounted on
+the same application. It is not a twelfth route group: it publishes no operation of its own, and
+[`web.md`](web.md) is its document.
 
 `/healthz` and `/readyz` are the only routes that answer without an envelope, because they
 answer a probe rather than a person. They also answer different questions: `/healthz` opens
@@ -475,6 +490,26 @@ unattended caller reaches, so each of them is absent rather than merely guarded:
 
 `tests/api/test_routes.py` asserts each absence by name. An absence with no test is an absence
 that comes back.
+
+The browser surface adds **no operation**, so it inherits all of it — and
+`tests/web/test_boundaries.py` asserts the same absences again under `/ui`, because an absence
+protected by a test that only knows about `/api` is an absence a second package can undo. Two of
+these were asked for by [#12](https://github.com/mgd43b/manicule/issues/12)'s checklist and are
+deliberately not built; [`web.md` §6](web.md#6-what-this-surface-will-not-do) says why.
+
+### 9.6.1 Cross-site writes
+
+An unsafe method a browser says came from another origin is refused unless that origin is in
+`security.transport.allowed_origins`. `manicule.api.origins` decides it, checked in middleware
+before routing.
+
+The threat needs a browser holding *ambient* authority, which is the posture manicule ships as:
+loopback with `security.auth.mode = none`, where there is no credential and the caller is whoever
+can reach the port. CORS hides the **response** to a cross-origin request and does not stop a
+"simple" one being sent, so a form `POST` from a page the operator merely visited would take
+effect. `Sec-Fetch-Site` is the primary signal because page script cannot set it; `Origin`
+compared against `Host` is the fallback. A request with neither header — every non-browser
+client — is unaffected.
 
 ### 9.7 Telemetry, and what a failed write costs
 

@@ -1,0 +1,64 @@
+{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+<form class="filters" method="get" action="/ui/documents">
+  <label for="source">Source</label>
+  <input id="source" name="source" value="{{ source }}" autocomplete="off">
+  <label for="media_type">Media type</label>
+  <input id="media_type" name="media_type" value="{{ media_type }}" autocomplete="off">
+  <button type="submit">Filter</button>
+  <a class="ghost" href="/ui/documents/trash">Trash</a>
+</form>
+
+{% if panels.documents.ok %}
+<p class="muted">
+  {{ panels.documents.data.count }} shown, offset {{ panels.documents.data.offset }}.
+</p>
+{% if panels.documents.data.documents %}
+<table>
+  <thead><tr><th>Title</th><th>Source</th><th>Media type</th><th>Status</th><th>Chunks</th><th></th></tr></thead>
+  <tbody>
+    {% for item in panels.documents.data.documents %}
+    <tr data-document="{{ item.id }}">
+      <td><a href="/ui/documents/{{ item.id }}">{{ item.title or item.source_id }}</a></td>
+      <td>{{ item.source }}</td>
+      <td>{{ item.media_type }}</td>
+      <td>{{ m.state(item.status) }}{% if item.status_detail %} <span class="muted">{{ item.status_detail }}</span>{% endif %}</td>
+      <td>{{ item.chunk_count if item.chunk_count is not none else '—' }}</td>
+      <td class="actions">
+        <button type="button" class="ghost" data-reindex="{{ item.id }}">Reindex</button>
+        <button type="button" class="ghost danger" data-trash="{{ item.id }}">Trash</button>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<nav class="pager" aria-label="Pages">
+  {% if offset > 0 %}
+  <a href="/ui/documents?limit={{ limit }}&amp;offset={{ [offset - limit, 0] | max }}">Previous</a>
+  {% endif %}
+  {% if panels.documents.data.count == limit %}
+  <a href="/ui/documents?limit={{ limit }}&amp;offset={{ offset + limit }}">Next</a>
+  {% endif %}
+</nav>
+{% else %}{{ m.empty('Nothing indexed matches this filter.') }}{% endif %}
+{% else %}{{ m.failed(panels.documents) }}{% endif %}
+
+<section class="panel">
+  <h2>Adding documents</h2>
+  <p>
+    There is no upload on any network surface of manicule, deliberately. Accepting bytes over
+    HTTP and writing them into the corpus is an ingest path with no filesystem permission check
+    and no path an operator chose, and this is the surface an unattended caller reaches.
+  </p>
+  <p>Documents arrive one of two ways:</p>
+  <ul>
+    <li><code>manicule index &lt;path&gt;</code> — a directory the operator named, at a terminal.</li>
+    <li>A connector declared in configuration, run from the Connectors area.</li>
+  </ul>
+  <p class="muted">
+    Deleting is soft and always reversible from the Trash; there is no hard delete here either.
+  </p>
+</section>
+{% endblock %}

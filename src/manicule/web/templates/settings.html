@@ -1,0 +1,80 @@
+{#
+  Read-only, and the reason is on the page rather than only in a docstring.
+
+  `config get` and `config set` have no route on any network surface: reading and writing
+  configuration over the network is how an installation gets repointed at a different data
+  directory by something holding a key. This page does not reach around that — everything on it
+  is a fact the diagnostics already report about the *running* system, not the contents of a
+  file.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+<section class="panel">
+  <h2>Changing any of this</h2>
+  <p>
+    Configuration is not editable from a browser, and there is no endpoint that would make it
+    so. Reading and writing configuration over the network is how an installation gets
+    repointed at a different data directory by something holding a key, so
+    <code>config get</code> and <code>config set</code> stay on the command line and the MCP
+    tool — the two surfaces a person is at.
+  </p>
+  <pre>manicule config show
+manicule config set rag.profile precise</pre>
+  <p class="muted">
+    What follows is the installation's posture as <code>doctor</code> and the index report it:
+    live facts about this process, not a rendering of the file.
+  </p>
+</section>
+
+<section class="panel">
+  <h2>Diagnosis</h2>
+  {% if panels.doctor.ok %}
+  <p class="figure">{{ m.state(panels.doctor.data.state) }}</p>
+  <table>
+    <thead><tr><th>Check</th><th>State</th><th>Detail</th></tr></thead>
+    <tbody>
+      {% for check in panels.doctor.data.checks %}
+      <tr><td>{{ check.name }}</td><td>{{ m.state(check.state) }}</td><td>{{ check.detail }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}{{ m.failed(panels.doctor) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>What the index committed to</h2>
+  {% if panels.index.ok %}
+  <dl class="facts">
+    <dt>Data directory</dt><dd><code>{{ panels.index.data.data_dir }}</code></dd>
+    <dt>Schema revision</dt><dd>{{ panels.index.data.schema_revision or 'none' }}</dd>
+    <dt>Embedding</dt><dd>{{ panels.index.data.embedding or 'not decided' }}</dd>
+    <dt>Embedding fingerprint</dt><dd><code>{{ panels.index.data.embed_fingerprint or 'none — the index will accept whatever the first ingest brings' }}</code></dd>
+    <dt>Chunking</dt><dd>{{ panels.index.data.chunking or 'not decided' }}</dd>
+    <dt>Chunking fingerprint</dt><dd><code>{{ panels.index.data.chunk_fingerprint or 'none' }}</code></dd>
+    <dt>Documents</dt><dd>{{ panels.index.data.documents }}</dd>
+    <dt>Chunks</dt><dd>{{ panels.index.data.chunks }}</dd>
+  </dl>
+  <p class="muted">
+    The fingerprints are shown in their canonical form. A prettied identity is one nobody can
+    compare, and comparing them is the only thing they are for.
+  </p>
+  {% else %}{{ m.failed(panels.index) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>What this surface will not do</h2>
+  <ul>
+    <li><strong>Upload a document.</strong> No filesystem permission check, no path the operator chose.</li>
+    <li><strong>Write configuration.</strong> See above.</li>
+    <li><strong>Create a connector.</strong> It holds credentials and reaches a remote system.</li>
+    <li><strong>Install a plugin.</strong> Fetching and executing code.</li>
+    <li><strong>Hard-delete, reset, back up, restore, import, export or upgrade.</strong> Each
+      destroys or relocates the corpus with no undo from here.</li>
+  </ul>
+  <p class="muted">
+    Each of those is absent from the HTTP API by name, with a test asserting the absence. This
+    surface adds no operation of its own, so it inherits every one of them.
+  </p>
+</section>
+{% endblock %}

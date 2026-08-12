@@ -1,0 +1,61 @@
+{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+<div class="two">
+<section class="panel">
+  <h2>Collections</h2>
+  <p class="muted">
+    A duplicate name is refused rather than merged: a collection is a deliberate object, and
+    handing back an existing one under the same name joins two sets somebody kept apart.
+  </p>
+  <form class="filters" data-create-collection>
+    <label for="collection-name">Name</label>
+    <input id="collection-name" name="name" required autocomplete="off">
+    <button type="submit">Create</button>
+    <span class="muted" data-collection-status></span>
+  </form>
+  {% if panels.collections.ok %}
+    {% if panels.collections.data.collections %}
+    <ul class="list">
+      {% for item in panels.collections.data.collections %}
+      <li>
+        <strong>{{ item.name }}</strong>
+        {% if item.description %}<span class="muted">{{ item.description }}</span>{% endif %}
+        {% if item.rule %}<span class="pill">rule-driven</span>{% endif %}
+        <button type="button" class="ghost danger" data-delete-collection="{{ item.id }}">Delete</button>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}{{ m.empty('No collections yet.') }}{% endif %}
+  {% else %}{{ m.failed(panels.collections) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Tags</h2>
+  <p class="muted">
+    Applying a tag that already exists is the normal case, so creating one is idempotent. Names
+    are normalised to NFKC, so two keyboards produce one tag.
+  </p>
+  <form class="filters" data-create-tag>
+    <label for="tag-name">Name</label>
+    <input id="tag-name" name="name" required autocomplete="off">
+    <button type="submit">Create</button>
+    <span class="muted" data-tag-status></span>
+  </form>
+  {% if panels.tags.ok %}
+    {% if panels.tags.data.tags %}
+    <ul class="list">
+      {% for item in panels.tags.data.tags %}
+      <li>
+        <strong>{{ item.name }}</strong>
+        {% if item.color %}<span class="muted">{{ item.color }}</span>{% endif %}
+        <button type="button" class="ghost danger" data-delete-tag="{{ item.id }}">Delete</button>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}{{ m.empty('No tags yet.') }}{% endif %}
+  {% else %}{{ m.failed(panels.tags) }}{% endif %}
+</section>
+</div>
+{% endblock %}

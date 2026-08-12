@@ -1,0 +1,131 @@
+{#
+  Everything the admin group already computes, rendered once.
+
+  No number here is calculated by this page. Search quality in particular is the evaluation
+  harness's own report, verbatim: `available: false` means nobody has judged any pairs, which
+  is the truth and is not a score of zero, and `is_evidence: false` means the query set behind
+  the numbers is an example one. Both caveats travel with the numbers rather than beside them.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+<section class="cards">
+  {% if panels.index.ok %}
+  <article class="card"><h2>Documents</h2><p class="figure">{{ panels.index.data.documents }}</p></article>
+  <article class="card"><h2>Chunks</h2><p class="figure">{{ panels.index.data.chunks }}</p></article>
+  {% endif %}
+  {% if panels.queries.ok %}
+  <article class="card"><h2>Queries logged</h2><p class="figure">{{ panels.queries.data.total }}</p></article>
+  {% endif %}
+  {% if panels.audit.ok %}
+  <article class="card"><h2>Audit rows</h2><p class="figure">{{ panels.audit.data.total }}</p></article>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>Search quality</h2>
+  {% if panels.quality.ok %}
+    {% if panels.quality.data.available %}
+    <p class="muted">
+      {{ panels.quality.data.judged }} of {{ panels.quality.data.records }} pairs judged ·
+      {{ panels.quality.data.left_label }} against {{ panels.quality.data.right_label }} ·
+      query set {{ panels.quality.data.query_set }}
+    </p>
+    {% if not panels.quality.data.is_evidence %}
+    <p class="warn">{{ panels.quality.data.caveat }}</p>
+    {% endif %}
+    <pre>{{ panels.quality.data.report }}</pre>
+    {% else %}
+    <p>Nobody has judged any pairs. That is not a score of zero — it is the absence of a
+      measurement, and the harness refuses to report for a system it cannot distinguish from
+      guessing.</p>
+    {% if panels.quality.data.caveat %}<p class="muted">{{ panels.quality.data.caveat }}</p>{% endif %}
+    {% endif %}
+  {% else %}{{ m.failed(panels.quality) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Query log</h2>
+  {% if panels.queries.ok %}
+    {% if panels.queries.data.entries %}
+    <table>
+      <thead><tr><th>When</th><th>Query</th><th>Profile</th><th>Chunks</th><th>Confidence</th><th>Elapsed</th></tr></thead>
+      <tbody>
+        {% for row in panels.queries.data.entries %}
+        <tr>
+          <td>{{ row.created_at }}</td>
+          <td>{{ row.query }}</td>
+          <td>{{ row.profile }}</td>
+          <td>{{ row.chunks }}</td>
+          <td>{{ row.confidence if row.confidence is not none else '—' }}</td>
+          <td>{{ row.elapsed_ms if row.elapsed_ms is not none else '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <nav class="pager" aria-label="Query log pages">
+      {% if offset > 0 %}<a href="/ui/admin?limit={{ limit }}&amp;offset={{ [offset - limit, 0] | max }}">Previous</a>{% endif %}
+      {% if panels.queries.data.offset + panels.queries.data.count < panels.queries.data.total %}
+      <a href="/ui/admin?limit={{ limit }}&amp;offset={{ offset + limit }}">Next</a>
+      {% endif %}
+    </nav>
+    {% else %}{{ m.empty('Nothing has been asked yet.') }}{% endif %}
+  {% else %}{{ m.failed(panels.queries) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Audit trail</h2>
+  {% if panels.audit.ok %}
+    {% if not panels.audit.data.enabled %}
+    <p class="warn">
+      Auditing is switched off, so an empty trail here means nothing was recorded rather than
+      that nothing happened. Those are different answers.
+    </p>
+    {% endif %}
+    {% if panels.audit.data.entries %}
+    <table>
+      <thead><tr><th>When</th><th>Event</th><th>Actor</th><th>Address</th><th>Details</th></tr></thead>
+      <tbody>
+        {% for row in panels.audit.data.entries %}
+        <tr>
+          <td>{{ row.created_at }}</td>
+          <td>{{ row.event_type }}</td>
+          <td>{{ row.actor or '—' }}</td>
+          <td>{{ row.ip_address or 'unknown' }}</td>
+          <td>{% for key, value in row.details | items %}<span class="pill">{{ key }}={{ value }}</span> {% endfor %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}{{ m.empty('No audit entries in this page.') }}{% endif %}
+  {% else %}{{ m.failed(panels.audit) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Plugin health</h2>
+  {% if panels.plugins.ok %}
+  <table>
+    <thead><tr><th>Plugin</th><th>Components</th><th>State</th><th>Detail</th></tr></thead>
+    <tbody>
+      {% for item in panels.plugins.data.plugins %}
+      <tr><td>{{ item.name }}</td><td>{{ item.components }}</td><td>{{ m.state(item.state) }}</td><td>{{ item.detail }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}{{ m.failed(panels.plugins) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Connectors</h2>
+  {% if panels.connectors.ok %}
+  <table>
+    <thead><tr><th>Name</th><th>Type</th><th>Last sync</th><th>Status</th></tr></thead>
+    <tbody>
+      {% for item in panels.connectors.data.connectors %}
+      <tr><td>{{ item.name }}</td><td>{{ item.type }}</td><td>{{ item.last_synced_at or 'never' }}</td><td>{{ item.status or '—' }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}{{ m.failed(panels.connectors) }}{% endif %}
+</section>
+{% endblock %}

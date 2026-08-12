@@ -1710,6 +1710,7 @@ retrieval = [
 serve = [
     { name = "fastapi" },
     { name = "fastmcp" },
+    { name = "jinja2" },
     { name = "rich" },
     { name = "typer" },
     { name = "uvicorn" },
@@ -1746,6 +1747,7 @@ requires-dist = [
     { name = "fastmcp", marker = "extra == 'serve'", specifier = ">=2.10" },
     { name = "httpx", marker = "extra == 'connectors'", specifier = ">=0.28" },
     { name = "huggingface-hub", marker = "extra == 'embeddings'", specifier = ">=0.26" },
+    { name = "jinja2", marker = "extra == 'serve'", specifier = ">=3.1" },
     { name = "lancedb", marker = "extra == 'storage'", specifier = ">=0.17" },
     { name = "litellm", marker = "extra == 'generation'", specifier = ">=1.83" },
     { name = "markdown-it-py", marker = "extra == 'parsers'", specifier = ">=3.0" },
