@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from enum import StrEnum
 from importlib.metadata import PackageNotFoundError
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -124,6 +125,28 @@ class NoRetention:
     async def get(self, digest: str) -> bytes | None:
         del digest
         return None
+
+
+class Change(StrEnum):
+    """What differs between a stored document and what a connector just fetched.
+
+    Three axes, kept apart because they change independently and cost different things to repair.
+    A single "changed" boolean would answer whether to re-ingest and destroy the answer to why —
+    and the second is the question somebody watching an unexpected re-ingest of a whole corpus is
+    actually asking.
+    """
+
+    CONTENT = "content"
+    """The source bytes differ. A re-parse, re-chunk and re-embed."""
+
+    METADATA = "metadata"
+    """The source record differs while the bytes may not. A mirrored page whose manifest was
+    corrected: the citation changes, the text does not."""
+
+    LINEAGE = "lineage"
+    """The parser that produced the stored text is not the one installed now
+    (``docs/storage.md`` §6.4). Neither the bytes nor the metadata moved; what we make of them
+    did."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -815,14 +838,42 @@ class IngestPipeline:
         ``raw`` is the fetched document, so that the source record can be compared as well; it is
         optional only for callers that have no fetch in hand, and those cannot have a changed
         record either.
+
+        Expressed in terms of :meth:`changes_since` rather than repeating its comparisons, so that
+        "what changed" and "may this be skipped" cannot come to disagree — and so the classifier is
+        exercised by every ingest rather than being a reporting path nobody runs.
         """
         return (
             existing is not None
             and existing.status in SETTLED
-            and existing.content_hash == digest
-            and self._parse_lineage_is_current(existing)
-            and self._source_record_is_current(existing, raw)
+            and not self.changes_since(existing, digest, raw)
         )
+
+    def changes_since(
+        self, existing: Document, digest: str, raw: RawDocument | None = None
+    ) -> frozenset[Change]:
+        """What differs between the stored document and what was just fetched.
+
+        **Content and metadata are detected independently**, which is a requirement rather than a
+        nicety: they change independently and they cost different things to repair. A body edited
+        with its manifest untouched needs a re-parse; a manifest corrected over an unchanged body
+        needs only the record rewritten, and reports a version the reader can trust. Collapsing
+        them into one boolean answers "should this be re-ingested" and destroys the answer to
+        "why", which is the question an operator staring at a re-ingest of ten thousand pages
+        actually has.
+
+        Returns an empty set when nothing changed, which is the skip condition — so the set is
+        load-bearing rather than diagnostic, and cannot rot into a description of a decision made
+        somewhere else.
+        """
+        found: set[Change] = set()
+        if existing.content_hash != digest:
+            found.add(Change.CONTENT)
+        if not self._source_record_is_current(existing, raw):
+            found.add(Change.METADATA)
+        if not self._parse_lineage_is_current(existing):
+            found.add(Change.LINEAGE)
+        return frozenset(found)
 
     @staticmethod
     def _source_record_is_current(existing: Document, raw: RawDocument | None) -> bool:
@@ -1202,6 +1253,7 @@ def _member_title(member: ExpandedMember) -> str:
 
 __all__ = [
     "BlobSink",
+    "Change",
     "DocumentOutcome",
     "IngestPipeline",
     "NoRetention",

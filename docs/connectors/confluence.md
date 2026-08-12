@@ -506,3 +506,122 @@ statement; the caller's half — persist it only once what the run produced is s
 The five-minute overlap in §2 is what makes the remaining race survivable rather than
 theoretical: a run interrupted between yielding a document and committing it re-enumerates that
 document next time, and change detection skips it if it did land.
+
+---
+
+## 12. Offline snapshots — the same wiki, from a directory
+
+Everything above needs a base URL, a credential and a reachable instance. Often none of those is
+available: an air-gapped install, a wiki nobody has API access to, an export taken once and
+archived. `manicule/connectors/confluence_snapshot.py` ingests that export, with **no network and
+no credentials**, and it is registered separately as `confluence-snapshot`.
+
+A name of its own rather than a mode of `confluence`, because the two share no configuration —
+this one has no base URL, no deployment and no auth. Folding them together would produce a config
+model where over half the fields are refused depending on another field's value, and a connector
+that reaches no network could then be misconfigured into trying.
+
+### 12.1 The input
+
+One directory is one page:
+
+```
+<root>/anything/at/any/depth/
+    confluence.json     # the manifest
+    body.xhtml          # the raw page representation
+```
+
+A directory holding `confluence.json` **is** a page snapshot, and the walk does not descend into
+one — so attachments or resources stored beside a body cannot be mistaken for pages of their own.
+
+The manifest carries `page_id` (required), and optionally `title`, `space_key`, `canonical_url`,
+`version`, `created_at`, `modified_at`, `ancestors`, `ancestor_ids`, `content_status`, `labels`,
+`attachments`, `retrieved_at`, `body_file` and `body_checksum`. Only `page_id` is required, and it
+is required for a reason no default can supply: it is the document's identity.
+
+### 12.2 It is a wire format, not an extension of the core record
+
+The manifest is **what somebody else's export tool writes**, so its field names are Confluence's
+and its spellings are a compatibility surface. It is mapped onto
+[`storage.md`](../storage.md) §4.2.1's `SourceMetadata` rather than being it:
+
+| Manifest field | Where it lands | Generic? |
+|---|---|---|
+| `page_id` | `SourceMetadata.source_id`, and the document's `source_id` | yes |
+| `title` | `SourceMetadata.title` | yes |
+| `canonical_url` | `SourceMetadata.canonical_uri` | yes |
+| `version` | `SourceMetadata.version` | yes |
+| `created_at` / `modified_at` | the same, on the record | yes |
+| `space_key` + `ancestors` | `SourceMetadata.section_path`, coarsest first | yes |
+| `space_key` | also `metadata["space_key"]` | **no** |
+| `ancestor_ids` | `metadata["ancestor_ids"]` | **no** |
+| `content_status` | `metadata["content_status"]` | **no** |
+| `labels` | `metadata["labels"]` | **no** |
+| `attachments` | `metadata["attachments"]` | **no** |
+
+**The rule, and this connector is the first real test of it: the record carries what every source
+has; anything one product means and others do not stays in the connector's own keys.** A space key
+is tempting to add to the record — it is listed beside the canonical URL as a citation requirement
+— and it would be wrong, because a filesystem mirror and a documentation export have nothing to
+put there. What the record contributes instead is `section_path`, so the breadcrumb works with no
+Confluence knowledge anywhere in core. **No field was added to `SourceMetadata` for this
+connector.**
+
+### 12.3 Identity is the page id, never the path
+
+The difference from the filesystem connector, where identity *is* the resolved path. A mirroring
+tool that renames a directory, or organises by space this year and by page tree next year, has not
+created new pages — but a connector keyed on the path would report every document deleted and every
+document new, dangling every citation into the previous corpus. So `DocRef.source_id` is the page
+id and the directory travels in `DocRef.metadata`, which is what that field is for.
+
+`parsers/expansion.py`'s `member_source_id` settled the same question for archive members:
+identity comes from a stable key, never from a position.
+
+### 12.4 Three disciplines carried over from the sidecar unchanged
+
+They are the same threats, because a manifest is a file in the corpus and anyone who can get a
+directory indexed can write one.
+
+- **The manifest never authorises a read.** The body is found by *looking* — it is the file beside
+  the manifest. A declared `body_file` is compared against what was found, never followed, so
+  `../../../../etc/passwd` is a name matching nothing in the directory and at no point a path
+  anything opens. Exactly one candidate is the body; several with no declaration is a refusal
+  rather than a guess.
+- **The change token covers the pair.** A manifest corrected to declare a new version changes what
+  every citation says while leaving the body byte-identical, so both files' size and modification
+  time go into the token. [`ingest.md`](../ingest.md) §4 names the failure this avoids.
+- **An unusable manifest never costs the page.** The reason is recorded on the record instead, and
+  the body is still indexed with local identity.
+
+### 12.5 Nothing is dropped in silence, including a snapshot that cannot be used
+
+Every directory holding a manifest becomes a document — even one whose manifest is unreadable, or
+whose body is missing or ambiguous. Skipping them is the quiet failure: an export of ten thousand
+pages would ingest nine thousand and report a clean run.
+
+Where no `page_id` can be read there is no identity to key on, so one is derived from the directory
+behind an explicit `unidentified:` prefix. That identity is deliberately **unstable across a
+manifest repair**: fixing the manifest makes the page appear under its real id and makes the
+placeholder stop appearing in `reconcile`, which the ordinary deletion pass (§3) then soft-deletes.
+A stable-looking placeholder would instead leave two live documents for one page.
+
+### 12.6 What this connector cannot yet do, and says so
+
+Storage-format XHTML is routed as `text/html` and read by the generic HTML parser — which is
+exactly what the live connector does for Server and Data Center today, so this is no worse than
+shipped behaviour. It is, however, **lossy in a way nothing reported**:
+
+> An HTML parser has no CDATA in that context. Every `<ac:plain-text-body>` — the body of every
+> `code`, `noformat` and `graphviz` macro — reparses as a bogus comment, and its content is
+> **absent from the document**, not merely stripped of its semantics.
+
+So every fetched page is scanned for the macros it contains, and the finding is recorded under
+`metadata["uninterpreted_macros"]`, with a distinct entry when a CDATA body means content was lost
+rather than flattened. A partial parse that reports itself is a usable interim; a partial parse
+that reports success is a corpus that is quietly wrong.
+
+A storage-format parser that understands `ac:*` and `ri:*` — including Graphviz DOT preserved
+inert, task lists, and unsupported macros as explicit placeholders — is the next piece of work, and
+it is what removes this warning. `parsing.md` §2.4's anchor table gains its row then, with the
+media type that gives it meaning.
