@@ -651,6 +651,15 @@ class ApplicationService:
         )
 
     async def _storage_check(self) -> r.Check:
+        """Whether the database is at a schema revision, and what it means when it is not.
+
+        The remedy used to be "run ``manicule init``", and that was a repair nobody had
+        written: ``init`` chooses an embedding backend and writes a configuration file, and it
+        does not open the database at all. Migrations run when the document store is first
+        built — which is what asking this question just did, one line above. So an answer of
+        "no revision" is not a step somebody skipped; it is migrations that ran and did not
+        stick, and the fixes for that are about the directory rather than about a command.
+        """
         try:
             maintenance = await self._backend.maintenance()
             revision = await maintenance.schema_revision()
@@ -660,7 +669,12 @@ class ApplicationService:
             return r.Check(
                 name="storage",
                 state="degraded",
-                detail="the database carries no schema revision; run `manicule init`",
+                detail=(
+                    f"the database in {self.settings.data_dir} carries no schema revision. "
+                    f"Opening it applies them, and opening it is what this check just did, so "
+                    f"they did not take: check the directory is writable by the account "
+                    f"running manicule and that the database file is not from a later version."
+                ),
             )
         return r.Check(name="storage", state="ok", detail=f"schema at {revision}")
 
@@ -762,7 +776,10 @@ class ApplicationService:
         answer about the per-user cache while the installation reads an image-local one — and
         would report an image full of grammars as empty. That is the same shape as the macOS
         cache-redirect bug this area has already been burned by, so the configuration is
-        applied here explicitly, with the values the parser itself would use.
+        applied here explicitly, with the values the parser itself would use. It is the same
+        call the parser's own factory makes with the same values read from the same settings,
+        so a ``doctor`` run alongside an ingest repoints nothing: the cost of the overlap is
+        that the pack's per-language parser cache is rebuilt, not that it is rebuilt differently.
 
         Args:
             fix: Seed what is missing before reporting, from the offline bundle first and the
@@ -807,12 +824,26 @@ class ApplicationService:
                 cache_dir=config.grammar_cache_dir,
                 manifest_url=config.grammar_manifest_url,
             )
-            bundle = grammar_bundle.resolve()
+            # `locate` rather than `resolve`: it answers "is there a bundle here at all" from
+            # an environment variable and a module spec, where resolving reads the manifest and
+            # stats every library in it. That matters because the browser surface renders this
+            # check on a page, and `bundle_status` below reads the bundle anyway — so resolving
+            # here would read it twice per request to say one thing.
+            located = grammar_bundle.locate()
             missing = grammars.missing_grammars(languages)
             if missing and fix:
                 seeded = grammars.prefetch(languages)
+                # Asked of the cache again rather than taken from what the seed returned. The
+                # pack's own prefetch reports success for a language in its process-global
+                # registry whatever the configured cache holds, which is how an image ships
+                # with no grammars in it and is told it succeeded.
                 missing = grammars.missing_grammars(languages)
-            offline = grammars.bundle_status() if missing or bundle is not None else ""
+            # Quoted when it is actionable — something is absent, or a bundle is installed and
+            # is therefore a fact about this machine worth stating. On a healthy install with no
+            # bundle it is three lines of advice about a thing nobody needs, and this check is
+            # read on a page. A bundle that is present and unusable raises out of here, which is
+            # the one case where "no bundle" would be a lie.
+            offline = grammars.bundle_status() if missing or located is not None else ""
         except ImportError:
             return r.Check(
                 name="grammars",
@@ -1275,11 +1306,11 @@ class ApplicationService:
         settings = self.settings
         provider = "mlx" if probe["apple_silicon"] else "onnx"
         await asyncio.to_thread(_update_config, path, _initial_configuration(settings, provider))
-        grammars = await self._grammar_check(fix=True)
+        pre_seed = await self._grammar_check(fix=True)
         notes = [
             f"embedding backend {provider!r} chosen for {probe['machine']} on {probe['system']}",
             "bind host written as 127.0.0.1; a wider bind needs auth and an explicit flag",
-            f"grammars ({grammars.state}): {grammars.detail}",
+            f"grammars ({pre_seed.state}): {pre_seed.detail}",
         ]
         return r.InitReport(
             path=str(path),

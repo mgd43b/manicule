@@ -3,8 +3,9 @@
 :mod:`manicule.parsers.grammars` closes the ordinary case — a declared language set, a
 pre-seed step, and a refusal instead of a fallback. It does not close the air-gapped one.
 ``prefetch`` still fetches, and a host with no route to the grammar release has nothing to
-fetch *from*, so ``manicule init`` fails there and the code parser refuses every document
-afterwards. Pointing the manifest at an internal mirror assumes somebody has a mirror.
+fetch *from*: ``manicule init`` reports a pre-seed it could not complete, ``manicule doctor``
+reports the grammars as absent, and the code parser refuses every source document afterwards.
+Pointing the manifest at an internal mirror assumes somebody has a mirror.
 
 A bundle is the answer that assumes nothing: **a directory of grammar libraries plus a
 manifest describing exactly which release they came from**, produced once by

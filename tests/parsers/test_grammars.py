@@ -356,18 +356,32 @@ def _claimed_commands(text: str) -> list[list[str]]:
     return [claim.split()[1:] for claim in re.findall(r"``(manicule [^`]+)``", text)]
 
 
-def test_every_command_this_module_names_exists_with_the_flags_it_names() -> None:
+def test_every_command_the_parsing_package_names_exists_with_the_flags_it_names() -> None:
     """A docstring that names a command is a claim, and this is the check on it.
+
+    Over the whole package rather than this one module, because the defect was never specific
+    to ``grammars.py``: ``grammar_bundle.py`` described what ``manicule init`` does on an
+    air-gapped host and ``config.py`` describes what ``manicule doctor`` loads, and a claim is
+    as cheap to get wrong in one file as in another.
 
     ``PRESEED_COMMAND`` is included with the docstrings because it is the same kind of claim
     carried in a different vehicle: it is the ``status_detail`` of every document refused for
     want of a grammar, so it is read by more people than any docstring here.
     """
-    source = Path(grammars.__file__).read_text(encoding="utf-8")
-    claims = [*_claimed_commands(source), grammars.PRESEED_COMMAND.split()[1:]]
+    package = Path(grammars.__file__).parent
+    sources = sorted(package.glob("*.py"))
+    claims = [
+        *(
+            claim
+            for source in sources
+            for claim in _claimed_commands(source.read_text(encoding="utf-8"))
+        ),
+        grammars.PRESEED_COMMAND.split()[1:],
+    ]
     named = {" ".join(claim) for claim in claims}
 
-    assert {"doctor --fix", "init"} <= named, f"the module stopped naming its callers: {named}"
+    assert len(sources) > 1, f"{package} produced no modules to read"
+    assert {"doctor --fix", "init"} <= named, f"the package stopped naming its callers: {named}"
     for claim in claims:
         flags = [part for part in claim if part.startswith("-")]
         offered = _options_of([part for part in claim if not part.startswith("-")])
