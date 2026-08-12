@@ -45,9 +45,10 @@ uv sync --all-extras
 uv run manicule --version
 ```
 
-`--all-extras` is the whole system: the parser stack, the storage stack, the embedding backend
-this machine can run, retrieval and generation, the connectors, and the optional cross-encoder
-reranker that comes with torch.
+`--all-extras` is the whole system — the nine extras `pyproject.toml` declares: the parser stack
+and the ingest pipeline, storage, the embedding backend this machine can run, retrieval,
+generation, the connectors, the serving stack, and the optional cross-encoder reranker that
+comes with torch.
 
 Everything below writes `manicule`; from a checkout that is `uv run manicule`, or
 `.venv/bin/manicule` if you would rather not type `uv run` each time.
@@ -102,9 +103,12 @@ vocabularies, from an offline bundle when one is installed and from upstream oth
 only part of that command that writes to the machine or uses the network, which is why it is a
 flag — and it does **not** fetch the model weights, which is why the line above exists.
 
-Nothing here downloads anything while answering a question. That is the whole shape of it: the
-artefacts are seeded by a step you can watch fail, so a query either answers or refuses, and
-never silently waits on a blob store.
+**A query never fetches a vocabulary or a grammar.** Those are seeded by a step you can watch
+fail, and a query that finds one missing refuses rather than reaching for the network: `search`
+exits non-zero with `VocabularyUnavailableError` and names the cache it looked in. The model
+weights are the one artefact fetched on demand rather than refused — which is why `init` and
+`doctor` both announce them while they are still to come, and why the prefetch line above
+exists.
 
 ### What it costs to wait
 
@@ -115,7 +119,7 @@ never silently waits on a blob store.
 | the same `index` with the model already present | 38 s |
 | the same `index` inside the container, on ONNX | 5 m 04 s |
 
-One machine — an Apple M4 Max — against this repository's `docs/`: 13 documents, about 675 kB.
+One machine — an Apple M4 Max — against this repository's `docs/`: 13 documents, about 677 kB.
 They are here to set expectations about orders of magnitude. They are not benchmarks, and a
 busier machine moves them: the 38-second run above took 54 seconds with a container build
 alongside it.
