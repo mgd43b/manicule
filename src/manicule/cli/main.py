@@ -642,9 +642,20 @@ def reset_index(
 
 
 @app.command()
-def doctor() -> None:
-    """Check configuration, plugins, storage, the index and the network bind."""
-    emit("doctor", lambda service: service.doctor())
+def doctor(
+    fix: Annotated[
+        bool,
+        typer.Option(
+            "--fix",
+            help="Repair what can be repaired, then report. Today that is one thing: seeding "
+            "the declared code grammars, from an offline bundle if one is installed and from "
+            "the grammar release otherwise. It is the only part of this command that writes "
+            "to the machine or uses the network, which is why it is a flag.",
+        ),
+    ] = False,
+) -> None:
+    """Check configuration, plugins, storage, the index, grammars and the network bind."""
+    emit("doctor", lambda service: service.doctor(fix=fix))
 
 
 @app.command()

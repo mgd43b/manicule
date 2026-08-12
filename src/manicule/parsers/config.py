@@ -15,6 +15,12 @@ regresses, and it is worth stating why the cheap thing is not merely nicer: plug
 runs before configuration is read, so the cost is paid by every process that starts, including
 ``manicule doctor`` on a machine that is not going to parse anything at all.
 
+One deliberate exception, stated so the claim above stays exactly true: ``doctor``'s
+``grammars`` check *does* load the grammar pack, because "are the declared grammars on this
+machine" cannot be answered without asking the thing that keeps them. That is one native
+extension and a directory listing, it happens inside the check rather than during registration,
+and it is the only parsing library any diagnostic touches.
+
 Two consequences worth knowing before adding to this file.
 
 - **No module-level lookup of an installed package.** The parsing extras are optional, so an

@@ -74,7 +74,9 @@ manicule config set llm.model qwen2.5:14b   # or any model that Ollama is servin
 ```
 
 `manicule doctor` reports what is wrong and what to do about it, and it is the first thing to
-run when something does not work.
+run when something does not work. `manicule doctor --fix` repairs what it can — today that is
+seeding the tree-sitter grammars, which `manicule init` already does and which is the one thing
+here that may use the network.
 
 ## The four surfaces
 
