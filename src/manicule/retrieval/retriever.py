@@ -1,13 +1,13 @@
 """The whole of retrieval, assembled: route, expand, cache, pipeline, context, confidence.
 
-    Query -> router -> glossary -> L1 cache -> declared stages -> context assembly -> confidence
+    Query -> router -> membership -> glossary -> L1 cache -> stages -> assembly -> confidence
 
-Four of those six are not stages, and each is outside the pipeline for a reason rather than by
+Five of those seven are not stages, and each is outside the pipeline for a reason rather than by
 omission. The router runs before everything and consults nothing. Context assembly emits a
 different type, which is exactly what lets the stage list be reordered freely while this step
 cannot be. Confidence produces neither candidates nor context — it is a report on the run.
 
-**Glossary expansion is the fourth, and it is here for the strongest of the four reasons.**
+**Glossary expansion is one of them, and it is here for the strongest of the reasons.**
 :class:`~manicule.core.protocols.RetrievalStage` is locked, and widening it would invalidate
 every recorded evaluation result. Expansion does not need it widened: what it produces is a
 *second query*, so the declared pipeline runs over it unchanged, exactly as it ran over the
@@ -38,6 +38,7 @@ from manicule.retrieval import trace as tracing
 from manicule.retrieval.cache import L1QueryCache, cache_key, rehydrate
 from manicule.retrieval.confidence import score_confidence
 from manicule.retrieval.expansion import (
+    GLOSSARY_SCORE_KEY,
     ExpansionPolicy,
     mark_authoritative,
     merge_rankings,
@@ -287,28 +288,37 @@ class Retriever:
         then to the chunk-level restrictions the vocabulary lookup deliberately ignored. The
         entry is a document-level fact and cannot be used to return a chunk the query excluded.
 
+        **One passage per chunk, however many terms it defines.** A glossary page states dozens
+        of definitions in one chunk, so a query naming two of them resolves both matches to the
+        same passage — and promoting it twice would report ``promoted=2`` for one passage that
+        moved, count one fetch as two, and hand the merge a duplicate it only has to collapse
+        again. The strongest detection confidence among the terms that landed on it is the one
+        recorded, because that is the mark, not a ranking score.
+
         Returns:
             The promoted candidates, and how many of them neither search had found.
         """
         if not expansion.matches:
             return [], 0
         by_chunk = {candidate.chunk.id: candidate for ranking in rankings for candidate in ranking}
-        promoted: list[Candidate] = []
-        fetched = 0
-        missing = [
-            match
-            for match in expansion.matches
-            if match.entry.chunk_id not in by_chunk and match.entry.chunk_id
-        ]
+        missing = [match for match in expansion.matches if match.entry.chunk_id not in by_chunk]
         cold = await self._fetch_definitions(query, missing)
+
+        promoted: dict[str, Candidate] = {}
+        fetched = 0
         for match in expansion.matches:
-            candidate = by_chunk.get(match.entry.chunk_id) or cold.get(match.entry.chunk_id)
+            chunk_id = match.entry.chunk_id
+            candidate = by_chunk.get(chunk_id) or cold.get(chunk_id)
             if candidate is None:
                 continue
-            if candidate.chunk.id in cold:
+            seen = promoted.get(chunk_id)
+            if seen is None and chunk_id in cold:
                 fetched += 1
-            promoted.append(mark_authoritative(candidate, match.entry.confidence))
-        return promoted, fetched
+            confidence = max(
+                match.entry.confidence, seen.scores.get(GLOSSARY_SCORE_KEY, 0.0) if seen else 0.0
+            )
+            promoted[chunk_id] = mark_authoritative(candidate, confidence)
+        return list(promoted.values()), fetched
 
     async def _fetch_definitions(
         self, query: Query, matches: Sequence[GlossaryMatch]

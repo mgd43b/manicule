@@ -180,6 +180,29 @@ async def test_a_promoted_passage_is_marked_as_authoritative_without_being_resco
     assert promoted.score != promoted.scores[GLOSSARY_SCORE_KEY]
 
 
+async def test_two_terms_defined_in_one_chunk_promote_one_passage(
+    store: SqliteDocStore, indexed: list[Chunk], definition: str
+) -> None:
+    """A glossary page states dozens of definitions in one chunk.
+
+    So a query naming two of them resolves both matches to the same passage. Promoting it twice
+    would report two promotions for one passage that moved, count one fetch as two, and hand
+    the merge a duplicate it only has to collapse again. Found by re-reading the diff rather
+    than by a failing test, which is why it now has one.
+    """
+    retriever = await _with_glossary(store, indexed)
+
+    result = await retriever.retrieve(_ask("What are NOW and QUARTZ?"))
+
+    assert result.expansion is not None
+    assert len(result.expansion.matches) == 2, "both terms resolved"
+    assert {match.entry.chunk_id for match in result.expansion.matches} == {definition}
+    assert result.trace.glossary is not None
+    assert result.trace.glossary.promoted == 1, "one passage moved, so one promotion"
+    assert result.trace.glossary.promoted_from_store <= 1
+    assert [passage.chunk.id for passage in result.context.passages].count(definition) == 1
+
+
 # --- the queries that must not change ----------------------------------------------------------
 
 

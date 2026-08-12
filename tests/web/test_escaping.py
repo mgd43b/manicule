@@ -88,6 +88,15 @@ PLANTED: tuple[tuple[str, tuple[str, ...]], ...] = (
     # appears, so this pair is the whole of their coverage.
     ("canonical", ("/ui/documents/{document}",)),
     ("section", ("/ui/documents/{document}",)),
+    # A glossary expansion is text a *document* stated, so it is attacker-controlled on exactly
+    # the terms a title is — anybody who can get a document indexed can write a line that reads
+    # as a definition. It reaches the search page above the results rather than inside a hit,
+    # which is a path none of the fields above take.
+    ("glossary", ("/ui/search?q=retry",)),
+    # The second query form, which is a *different* field on the same page and is rendered by a
+    # different line of the template. Separate from `glossary` because a single string planted
+    # in both would let either line satisfy the assertion for the other.
+    ("expanded", ("/ui/search?q=retry",)),
 )
 
 SENTINELS = (
@@ -97,6 +106,8 @@ SENTINELS = (
     "window.__quote",
     "window.__canonical",
     "window.__section",
+    "window.__glossary",
+    "window.__expanded",
 )
 """What each hostile string would set if it ever executed.
 

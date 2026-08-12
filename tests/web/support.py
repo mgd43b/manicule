@@ -17,7 +17,14 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from manicule.core.anchors import HeadingAnchor
-from manicule.core.content import BlockKind
+from manicule.core.content import BlockKind, Chunk
+from manicule.core.glossary import (
+    DefinitionForm,
+    GlossaryEntry,
+    GlossaryMatch,
+    MatchReason,
+    QueryExpansion,
+)
 from manicule.core.provenance import LocalSnapshot, Provenance, SourceMetadata
 from manicule.core.retrieval import Candidate
 from manicule.generation.answers import Citation, Verification
@@ -49,6 +56,8 @@ MARKUP: dict[str, str] = {
     "quote": "<svg onload=window.__quote=1>the client retries twice",
     "canonical": "<script>window.__canonical=1</script>Retry policy",
     "section": "<iframe srcdoc='<script>window.__section=1</script>'>Runbooks",
+    "glossary": "<script>window.__glossary=1</script>Network Operations Workspace",
+    "expanded": "<img src=x onerror=window.__expanded=1>retry policy",
 }
 """One hostile string per place model output or corpus content reaches HTML.
 
@@ -107,6 +116,37 @@ def _hostile_citation(document: Document) -> Citation:
     )
 
 
+def _hostile_expansion(document: Document, chunk: Chunk) -> QueryExpansion:
+    """A fired alias whose expansion is markup, cited to the hostile document."""
+    return QueryExpansion(
+        original="retry",
+        # Deliberately *not* built from the expansion above. In production the second query form
+        # contains the expansion verbatim, so one hostile string would reach the page through
+        # two fields — and the "it appears escaped somewhere" half of the assertion would then
+        # be satisfied by whichever one still rendered. That is exactly how a test passes for a
+        # template that stopped rendering the field it names, so the two carry distinct
+        # payloads here and are asserted separately.
+        expanded=MARKUP["expanded"],
+        matches=(
+            GlossaryMatch(
+                surface="retry",
+                key="RETRY",
+                reason=MatchReason.EXACT_CASE,
+                entry=GlossaryEntry(
+                    acronym="RETRY",
+                    display="RETRY",
+                    expansion=MARKUP["glossary"],
+                    document_id=document.id,
+                    chunk_id=chunk.id,
+                    location=MARKUP["heading"],
+                    form=DefinitionForm.EM_DASH,
+                    confidence=0.95,
+                ),
+            ),
+        ),
+    )
+
+
 def backend_with_hostile_text() -> tuple[FakeBackend, Document]:
     """A backend whose document, conversation, share link, search hits and trash are hostile.
 
@@ -143,6 +183,11 @@ def backend_with_hostile_text() -> tuple[FakeBackend, Document]:
     # What `/ui/search` ranks. The same chunk the store holds, so the hit's title, heading path
     # and text are the hostile document's own rather than a second fixture that could drift.
     backend.retriever_.candidates = [Candidate(chunk=chunk, score=0.5)]
+    # A glossary expansion carrying the hostile document's own words. An expansion is text a
+    # *document* stated, so it is attacker-controlled on exactly the terms a title is — and it
+    # reaches the search page through a path no other field takes, above the results rather
+    # than inside a hit.
+    backend.retriever_.expansion = _hostile_expansion(hostile, chunk)
     # What `/ui/documents/trash` lists.
     backend.organisation_.trash[hostile.id] = hostile
 
