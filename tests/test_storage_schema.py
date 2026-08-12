@@ -294,6 +294,39 @@ async def test_an_output_directory_is_created_private(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_parents_invented_along_the_way_are_private_too(tmp_path: Path) -> None:
+    """``mkdir(parents=True)`` creates the ones above at the umask, which is not a decision.
+
+    `upgrade` names a destination two levels down that nobody has made before, so this is the
+    ordinary path rather than a corner: the leaf would be ``0700`` inside a ``0755`` directory
+    manicule had just invented for itself.
+    """
+    target = tmp_path / "invented" / "monday"
+
+    secure_output_dir(target, operation="export")
+
+    assert target.stat().st_mode & 0o777 == 0o700
+    assert target.parent.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_a_parent_that_was_already_there_is_left_exactly_as_found(tmp_path: Path) -> None:
+    """Only the target is judged. An existing ancestor is the operator's, not manicule's.
+
+    Tightening one would be a mode change to a directory nobody asked about, which is how a
+    tool ends up chmod-ing something that mattered to somebody else.
+    """
+    parent = tmp_path / "theirs"
+    parent.mkdir()
+    parent.chmod(0o755)
+
+    secure_output_dir(parent / "ours", operation="backup")
+
+    assert parent.stat().st_mode & 0o777 == 0o755
+    assert (parent / "ours").stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
 async def test_a_pre_existing_exposed_output_directory_is_refused(tmp_path: Path) -> None:
     """The case ``mkdir(mode=…, exist_ok=True)`` never reaches, and the reason #60 existed.
 

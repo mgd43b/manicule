@@ -1159,14 +1159,11 @@ class ApplicationService:
         target = version or "latest"
         backup_path: str | None = None
         if not skip_backup:
+            # Named here and created by whoever writes into it. The service touches no
+            # filesystem of its own: `backup` makes the directory and the one above it,
+            # both 0700, and a call that never reaches storage — a fake backend, a dry run —
+            # must not leave a directory behind to prove it was thinking about one.
             destination = pre_upgrade_destination(self.settings.data_dir, moment=int(time.time()))
-            # The snapshot directory is created and verified 0700 by `backup` itself. This
-            # creates the one above it, which is not the guarantee and is not treated as one:
-            # it keeps a fresh installation from leaving a listable `…-backups` behind at
-            # whatever the umask said.
-            await asyncio.to_thread(
-                lambda: destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            )
             backup_path = (await self.backup(destination)).path
         specifier = f"manicule=={version}" if version else "manicule"
         return r.UpgradeReport(

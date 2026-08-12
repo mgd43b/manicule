@@ -175,7 +175,9 @@ def secure_output_dir(target: Path, *, operation: str, allow_insecure: bool = Fa
     read *through*, whatever the permissions on the path leading to it.
 
     Args:
-        target: Where the copy will be written. Created, with its parents, if absent.
+        target: Where the copy will be written. Created if absent, and so is any parent that
+            has to be invented to reach it — those get ``0700`` as well, rather than the
+            umask's answer.
         operation: What is being written, as the operator typed it — ``"backup"``,
             ``"export"``. It opens the message, so the refusal names the command that stopped.
         allow_insecure: Write into an exposed target anyway. The operator asked for it in so
@@ -186,6 +188,18 @@ def secure_output_dir(target: Path, *, operation: str, allow_insecure: bool = Fa
             not given, or its mode could not be read at all.
     """
     existed = target.exists()
+    for ancestor in reversed(target.parents):
+        # ``mkdir(parents=True)`` creates the ones above at the umask, so a target named
+        # `/srv/exports/monday` would leave `/srv/exports` at 0755 while insisting its leaf be
+        # 0700. Root-first, one at a time, so each one manicule invents gets manicule's mode.
+        #
+        # An ancestor already there raises ``FileExistsError`` and is left exactly as found,
+        # modes included. That is the intended behaviour rather than a tolerated one: an
+        # existing directory is the operator's, and tightening it would be a mode change to a
+        # path nobody asked about. Guarding with ``if not ancestor.exists()`` first would read
+        # as the thing enforcing that, and would enforce nothing.
+        with suppress(FileExistsError):
+            ancestor.mkdir(mode=0o700)
     target.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         exposed = exposure(target)
