@@ -1407,6 +1407,8 @@ async def test_a_diagnosis_never_prints_the_value_of_an_environment_variable(
     assert private_value not in dumped, "an environment variable's value reached the diagnosis"
     assert OFFLINE_ENV in check.detail, "the switch that caused this has to be named"
     assert check.facts["offline_env_set"] is True
+
+
 # --- collections ------------------------------------------------------------------------------
 
 

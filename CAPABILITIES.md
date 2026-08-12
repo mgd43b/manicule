@@ -14,10 +14,10 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 |---|---:|---|
 | CLI | 48 | #8 — **built** |
 | MCP tools | 29 | #8 — **built** |
-| HTTP endpoints | 55 | #11 — **built** |
+| HTTP endpoints | 56 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **190** | |
+| **Total** | **191** | |
 
 ## CLI — 48
 
@@ -138,7 +138,7 @@ mints a credential or changes what the installation is, and a surface called una
 not be able to do any of that. `collection orphans` moves every document outside every
 collection into the trash, which in a corpus where collections are optional is most of it.
 
-## HTTP endpoints — 55
+## HTTP endpoints — 56
 
 Ticket: #11 — **built.** Eleven route groups over the same application service the CLI and the
 MCP server use: health · documents · chat · conversations · collections · tags · admin ·

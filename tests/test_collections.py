@@ -518,3 +518,37 @@ async def test_no_membership_operation_can_reach_a_write_that_would_re_embed(
     await store.describe_collection(collection.id, "worked examples")
     await store.set_collection_rule(collection.id, CollectionRule(sources=frozenset({"fs"})))
     await store.delete_collection(collection.id)
+
+
+async def test_the_too_large_refusal_tells_the_caller_what_to_do(
+    store: SqliteDocStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal that only refuses leaves the caller where it found them.
+
+    This one arrives without warning, on the day a collection crosses a line nobody was
+    watching, and it says search is unavailable for a collection the person deliberately
+    built. Every other refusal in this project names the remedy, and this one used to point at
+    "the over-fetch-and-post-filter plan" — an internal regime that is not implemented for
+    collection filters and that no caller can ask for. Naming an unreachable remedy is worse
+    than naming none: it reads as though there were a way and the reader simply missed it.
+    """
+    from manicule.storage import organisation  # noqa: PLC0415 - only this test patches the cap
+
+    corpus = await _corpus(store)
+    collection = await store.create_collection("large")
+    await store.add_to_collection(collection.id, [document.id for document in corpus.values()])
+    monkeypatch.setattr(organisation, "MAX_RESOLVED_DOCUMENTS", 1)
+
+    scope = Filter(
+        workspace_ids=frozenset({DEFAULT_WORKSPACE}),
+        collection_ids=frozenset({collection.id}),
+    )
+    with pytest.raises(ValueError, match="more than 1 documents") as caught:
+        await resolve_filter(scope, collections=store, tags=store)
+
+    said = str(caught.value)
+    assert "split the collection" in said, "the refusal does not say what the caller can do"
+    assert "over-fetch" not in said, (
+        "the refusal points at an internal regime that is not implemented for collection "
+        "filters, so it names a remedy the caller cannot reach"
+    )
