@@ -1097,11 +1097,6 @@ class ApplicationService:
         """
         return await asyncio.to_thread(self._inspect_models, provider=provider)
 
-    async def _weights_are_pending(self, provider: str) -> bool:
-        """Whether a first ingest will download the weights. ``False`` when it cannot be told."""
-        plan = await asyncio.to_thread(self._weights_plan, provider)
-        return plan is not None and not plan.present
-
     def _weights_plan(self, provider: str | None) -> WeightsPlan | None:
         """The artefact the configured backend will load, or ``None`` with no embedding extra."""
         from manicule.embedding.artifacts import planned_weights  # noqa: PLC0415 - an extra
@@ -1115,49 +1110,7 @@ class ApplicationService:
 
     def _inspect_models(self, *, provider: str | None) -> r.Check:
         """The blocking half of :meth:`_model_check`: one cache probe, off the event loop."""
-        offline_env = _hub_offline_env()
-        plan = self._weights_plan(provider)
-        if plan is None:
-            return r.Check(
-                name="models",
-                state="unknown",
-                detail=(
-                    "the embeddings extra is not installed, so there is no backend here to "
-                    "have weights. Install `manicule[embeddings]`."
-                ),
-            )
-        if plan.present:
-            return r.Check(
-                name="models",
-                state="ok",
-                detail=f"{plan.repo} is on this machine; no download is pending",
-            )
-        # Named per backend rather than as one line for both. `--full --mlx` fetches the
-        # parity model, the ONNX export and the MLX conversion — about 3.6 GB to seed a
-        # backend that loads a third of it — so the advice a Mac reader follows has to be the
-        # narrow flag or it costs them more than saying nothing would have.
-        seed = f"uv run tools/prefetch_embedding_models.py --backend {plan.provider}"
-        offline = os.environ.get(offline_env) if offline_env else None
-        if offline:
-            return r.Check(
-                name="models",
-                state="failing",
-                detail=(
-                    f"{plan.repo} is not on this machine and {offline_env}={offline} forbids "
-                    f"fetching it, so the first search refuses rather than waits. Seed it with "
-                    f"`{seed}` from a host that can reach the hub, or point embedding.model at "
-                    f"a local directory holding the weights."
-                ),
-            )
-        return r.Check(
-            name="models",
-            state="ok",
-            detail=(
-                f"{plan.repo} is not on this machine yet, so the first `manicule index` "
-                f"downloads {plan.size} before it indexes anything. Nothing is wrong; it is a "
-                f"wait, once. Run `{seed}` to take it now instead."
-            ),
-        )
+        return _weights_check(self._weights_plan(provider))
 
     def _source_code_config(self) -> SourceCodeConfig:
         """The code parser's configuration, validated the way the parser's own factory does.
@@ -1603,13 +1556,14 @@ class ApplicationService:
         # and an install step that downloads one before anybody has decided to index anything
         # makes a worse first five minutes than the download itself does. What was missing was
         # the sentence saying it is still to come, and this is that sentence.
-        weights = await self._model_check(provider=provider)
+        weights = await asyncio.to_thread(self._weights_plan, provider)
+        weights_check = _weights_check(weights)
         notes = [
             f"embedding backend {provider!r} chosen for {probe['machine']} on {probe['system']}",
             "bind host written as 127.0.0.1; a wider bind needs auth and an explicit flag",
             f"grammars ({pre_seed.state}): {pre_seed.detail}",
             f"vocabularies ({vocabulary_seed.state}): {vocabulary_seed.detail}",
-            f"weights ({weights.state}): {weights.detail}",
+            f"weights ({weights_check.state}): {weights_check.detail}",
         ]
         return r.InitReport(
             path=str(path),
@@ -1623,10 +1577,11 @@ class ApplicationService:
             # A field rather than something a renderer sniffs out of the note above it. The
             # note is one dim line among five and the pending download is the single fact that
             # changes what the next command feels like, so the surfaces are told it plainly
-            # and each decides how loudly to say it. Asked of the plan a second time rather
-            # than parsed back out of the note: a boolean recovered from prose is a boolean
-            # that changes when somebody rewords a sentence.
-            weights_pending=await self._weights_are_pending(provider),
+            # and each decides how loudly to say it. Read off the same plan the note above was
+            # built from — one cache probe, two readers — rather than parsed back out of the
+            # note: a boolean recovered from prose is a boolean that changes when somebody
+            # rewords a sentence.
+            weights_pending=weights is not None and not weights.present,
         )
 
     async def upgrade(
@@ -2766,6 +2721,58 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         by_status=dict(report.by_status),
         error=report.error,
         elapsed_ms=_millis(started),
+    )
+
+
+def _weights_check(plan: WeightsPlan | None) -> r.Check:
+    """Turn a weights plan into the check ``doctor`` prints. Pure: no probe, no network.
+
+    Separate from the probe so that ``init`` can ask the cache **once** and use the answer
+    twice — for the note it prints and for the flag it puts on the report. Two probes would
+    not merely be wasteful; they would be two answers to one question, free to disagree the
+    moment somebody's first ingest finished between them.
+    """
+    if plan is None:
+        return r.Check(
+            name="models",
+            state="unknown",
+            detail=(
+                "the embeddings extra is not installed, so there is no backend here to have "
+                "weights. Install `manicule[embeddings]`."
+            ),
+        )
+    if plan.present:
+        return r.Check(
+            name="models",
+            state="ok",
+            detail=f"{plan.repo} is on this machine; no download is pending",
+        )
+    # Named per backend rather than as one line for both. `--full --mlx` fetches the parity
+    # model, the ONNX export and the MLX conversion — about 3.6 GB to seed a backend that
+    # loads a third of it — so the advice a Mac reader follows has to be the narrow flag, or
+    # it costs them more than saying nothing would have.
+    seed = f"uv run tools/prefetch_embedding_models.py --backend {plan.provider}"
+    offline_env = _hub_offline_env()
+    offline = os.environ.get(offline_env) if offline_env else None
+    if offline:
+        return r.Check(
+            name="models",
+            state="failing",
+            detail=(
+                f"{plan.repo} is not on this machine and {offline_env}={offline} forbids "
+                f"fetching it, so the first search refuses rather than waits. Seed it with "
+                f"`{seed}` from a host that can reach the hub, or point embedding.model at a "
+                f"local directory holding the weights."
+            ),
+        )
+    return r.Check(
+        name="models",
+        state="ok",
+        detail=(
+            f"{plan.repo} is not on this machine yet, so the first `manicule index` downloads "
+            f"{plan.size} before it indexes anything. Nothing is wrong; it is a wait, once. "
+            f"Run `{seed}` to take it now instead."
+        ),
     )
 
 

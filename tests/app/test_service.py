@@ -12,6 +12,7 @@ import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import huggingface_hub
 import pytest
 
 from manicule.app.results import CheckState
@@ -1100,15 +1101,23 @@ async def test_doctor_never_downloads_a_model_to_report_on_one(
 ) -> None:
     """A diagnostic that fetched a gigabyte to report on a gigabyte would be absurd.
 
-    ``snapshot`` is the only route to the network in the embedding stack, so a ``doctor`` that
-    never reaches it is a ``doctor`` that never downloads.
+    Asserted at ``snapshot_download`` itself, with ``local_files_only`` as the thing being
+    checked — not at manicule's ``snapshot`` wrapper, which ``is_cached`` does not call. A test
+    that patched the wrapper would pass whatever the probe did, which is a check whose name is
+    wider than its assertion.
     """
+    calls: list[bool] = []
 
-    def refuse(*_args: object, **_kwargs: object) -> None:
-        message = "doctor reached the network to answer whether it would need to"
-        raise AssertionError(message)
+    def probe(*_args: object, local_files_only: bool = False, **_kwargs: object) -> str:
+        calls.append(local_files_only)
+        if not local_files_only:
+            message = "doctor reached the network to answer whether it would need to"
+            raise AssertionError(message)
+        return "/nowhere"
 
-    monkeypatch.setattr(hub, "snapshot", refuse)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", probe)
     diagnosis = await ApplicationService(backend).doctor()
 
     assert any(check.name == "models" for check in diagnosis.checks)
+    assert calls, "the models check answered without consulting the cache at all"
+    assert all(calls), "the cache probe was allowed to reach the hub"
