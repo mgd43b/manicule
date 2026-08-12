@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +95,7 @@ __all__ = [
     "DECLARED_LANGUAGES",
     "DEFAULT_SCOPE_SEPARATOR",
     "DEFINITION_WRAPPERS",
+    "FETCH_RETRY_DELAYS",
     "MANIFEST_URL_ENV",
     "MEDIA_TYPES",
     "NODE_TYPE_DEFINITIONS",
@@ -134,6 +136,28 @@ shell profile.
 
 PACK_DISTRIBUTION: Final = "tree-sitter-language-pack"
 """The installed distribution the grammars come from."""
+
+FETCH_RETRY_DELAYS: Final[tuple[float, ...]] = (1.0, 4.0)
+"""Seconds to wait between download attempts. Its length is how many retries follow the first.
+
+The grammars come from a third-party GitHub release, and the failure that host actually
+produces is not a refusal — it is ``Peer disconnected`` part-way through a transfer, which the
+next attempt completes. Without a retry that single dropped connection fails whatever asked for
+it; in this repository that was every pull request at once, because the image build pre-seeds.
+
+**This tolerates a flaky transfer and not an absent host, and the difference is kept visible.**
+The delays are bounded and few, the last failure is raised with everything the first one would
+have said, and no attempt anywhere returns a partial set of grammars — :func:`prefetch` asks the
+cache afterwards regardless of what the pack reported. A retry that quietly shipped what it
+managed to get would be strictly worse than the outage it was added for.
+
+Backoff rather than a fixed interval because the two transient failures differ: a dropped
+connection clears at once, a rate limit does not, and two attempts a second apart would spend
+both inside the same rate-limit window.
+
+Read at call time rather than captured, so a caller that must not sleep — the test suite, which
+would otherwise spend five seconds per deliberately-unreachable manifest — can say so.
+"""
 
 PRESEED_COMMAND: Final = "manicule doctor --fix"
 """The command that seeds a missing grammar, named once because it is quoted everywhere.
@@ -608,8 +632,6 @@ def prefetch(languages: Sequence[str], *, bundle_dir: Path | None = None) -> tup
             not have it, a checksum mismatch — **or it reported success and the grammar is
             still not in the cache**, which is checked rather than assumed. See below.
     """
-    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
-
     from manicule.parsers import grammar_bundle  # noqa: PLC0415 - lazy, see module docstring
 
     wanted = validate_languages(languages)
@@ -625,13 +647,7 @@ def prefetch(languages: Sequence[str], *, bundle_dir: Path | None = None) -> tup
     if not absent:
         return seeded
 
-    try:
-        pack.prefetch(list(absent))
-    except (pack.Error, OSError, RuntimeError) as exc:
-        # RuntimeError is in this tuple because the native layer maps some download failures
-        # to the pack's own exception hierarchy and others to a bare RuntimeError; catching
-        # only the former would let an unreachable mirror surface as an unhandled crash.
-        raise GrammarFetchError(_fetch_failure(absent, str(exc), bundle_dir)) from exc
+    _fetch(absent, bundle_dir)
 
     # The pack's own prefetch returns without error for a language it has already loaded into
     # its process-global registry, **even when the configured cache does not contain it** —
@@ -647,6 +663,45 @@ def prefetch(languages: Sequence[str], *, bundle_dir: Path | None = None) -> tup
         )
         raise GrammarFetchError(_fetch_failure(still_missing, detail, bundle_dir))
     return tuple(sorted({*seeded, *absent}))
+
+
+def _fetch(languages: Sequence[str], bundle_dir: Path | None) -> None:
+    """Download ``languages`` into the configured cache, retrying a dropped transfer.
+
+    The retry is deliberately the dumbest one that fixes the observed failure: the same request
+    again, after a bounded wait, up to :data:`FETCH_RETRY_DELAYS` times. It does not recompute
+    what is still outstanding between attempts — the pack skips what it already has, so the
+    saving would be small, and asking the cache mid-retry would put a second reading of "what
+    is missing" next to the authoritative one :func:`prefetch` performs afterwards. One place
+    decides whether a seed worked.
+
+    **Success here is not success.** Every path out of this function that does not raise returns
+    to that check, which is what makes a retry safe to add: there is no attempt count at which
+    this reports a set of grammars it did not actually land.
+
+    Raises:
+        GrammarFetchError: Every attempt failed. The message is built from the *last* failure,
+            because that is the one describing the state the host is in now, and it names the
+            attempt count so that a genuine outage is not read as a single unlucky request.
+    """
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
+    delays = FETCH_RETRY_DELAYS
+    attempts = len(delays) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            pack.prefetch(list(languages))
+        except (pack.Error, OSError, RuntimeError) as exc:
+            # RuntimeError is in this tuple because the native layer maps some download failures
+            # to the pack's own exception hierarchy and others to a bare RuntimeError; catching
+            # only the former would let an unreachable mirror surface as an unhandled crash.
+            if attempt == attempts:
+                plural = "" if attempts == 1 else "s"
+                detail = f"{exc} (after {attempts} attempt{plural})"
+                raise GrammarFetchError(_fetch_failure(languages, detail, bundle_dir)) from exc
+            time.sleep(delays[attempt - 1])
+        else:
+            return
 
 
 def _fetch_failure(languages: Sequence[str], detail: str, bundle_dir: Path | None = None) -> str:

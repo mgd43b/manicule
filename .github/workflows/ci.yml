@@ -288,6 +288,97 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      # The grammar pack is staged on the runner and handed to the build, rather than
+      # downloaded inside the image. #22 made the *image* need no network; the build still did,
+      # on every run, from a third-party GitHub release — so a dropped transfer there blocked
+      # every merge in the repository at once, which is what happened. Staging moves that
+      # dependency to once per pack release.
+      #
+      # `--extra parsers` is the only extra involved: this needs `manicule.parsers.grammars`
+      # importable and nothing else. The environment lands in `.venv`, which `.dockerignore`
+      # excludes, so none of it reaches the build context.
+      #
+      # Keyed on the pack release *and* the declared language set, because those are the two
+      # facts that decide whether a staged directory is usable. The release alone would leave a
+      # newly declared language missing from a cache that still hits — and the staging step
+      # below refuses to download on a hit, so that would surface as a hard failure rather than
+      # a slow build. Platform is in the key because a bundle is valid for one of those.
+      - name: what the staged grammars would be valid for
+        id: grammars
+        run: >-
+          uv run --extra parsers python -c
+          "import hashlib;
+          from manicule.parsers import grammars;
+          declared = ','.join(grammars.DECLARED_LANGUAGES);
+          print(f'pack={grammars.pack_version()}');
+          print(f'languages={hashlib.sha256(declared.encode()).hexdigest()[:12]}')"
+          >> "$GITHUB_OUTPUT"
+      - name: restore the grammar pack
+        id: staged
+        uses: actions/cache/restore@v6
+        with:
+          # The pack's own cache, which is the path the other three jobs here cache and the one
+          # an operator would have. Deliberately not the staged directory: with `cache_dir`
+          # overridden the pack writes its manifest and the downloaded release tarball *beside*
+          # the libraries — 24 MB of them — and caching the staging area would put that in the
+          # build context, copied to the daemon on every build. Cached here, reused, and never
+          # copied.
+          path: ~/.cache/tree-sitter-language-pack
+          key: >-
+            container-grammars-${{ runner.os }}-${{ runner.arch }}-${{
+            steps.grammars.outputs.pack }}-${{ steps.grammars.outputs.languages }}
+      # No `restore-keys`. A near-miss here is a directory built for another pack release or
+      # another language set, and both are things this must not build an image from — the
+      # Dockerfile looks for a directory named after the release it installs, so an older one
+      # would be ignored anyway. A prefix match would only make the cache report hits it cannot
+      # honour.
+      - name: stage the grammar pack the image is built from
+        env:
+          # On a restored cache nothing should be downloaded, and this is what makes that a
+          # demonstrated fact rather than an assumption: the manifest is pointed at the discard
+          # port, so a run that reaches for the release fails here instead of quietly fetching
+          # it again and reporting the same green tick. It is the same address the suite uses to
+          # keep a test honest. Empty on a miss, where fetching is the entire point — read
+          # through `or None` below, because an empty string is a URL and `None` is the default.
+          TREE_SITTER_LANGUAGE_PACK_MANIFEST_URL: >-
+            ${{ steps.staged.outputs.cache-hit == 'true'
+            && 'http://127.0.0.1:9/manicule-ci-must-not-download.json' || '' }}
+        # The same pre-seed the other two jobs run — the operator's own command, against the
+        # pack's default cache — and then a copy of the libraries into a directory named for the
+        # release, which is what the Dockerfile looks for. Nothing configures the pack here: the
+        # manifest URL above is the only override, and the pack reads that from the environment
+        # itself, so a `configure_pack` call would have to pass it back through by hand.
+        #
+        # The assertion between the two is the point of the step rather than the seed. A staged
+        # directory short of a language fails the image build much later, in a builder whose
+        # message is about bundles; it fails here instead, naming the language and the pre-seed.
+        run: >-
+          uv run --extra parsers python -c
+          "import shutil;
+          from pathlib import Path;
+          from manicule.parsers import grammars;
+          print('seeded:', grammars.prefetch(grammars.DECLARED_LANGUAGES));
+          missing = grammars.missing_grammars(grammars.DECLARED_LANGUAGES);
+          assert not missing, f'grammars still missing after the pre-seed: {missing}';
+          staged = Path('.ci/grammars') / grammars.pack_version();
+          shutil.copytree(grammars.cache_directory(), staged, dirs_exist_ok=True);
+          print('staged', len(list(staged.iterdir())), 'libraries in', staged)"
+      # Saved only after the step above asserted the set is complete, and only when nothing was
+      # restored. `actions/cache` in its combined form saves at the end of the job, which would
+      # store whatever the directory held — including a half-finished download from a run that
+      # failed. Splitting restore from save is what makes a cached directory one that a build
+      # has been shown to be able to use.
+      - name: keep the grammar pack for the next run
+        if: steps.staged.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: >-
+            container-grammars-${{ runner.os }}-${{ runner.arch }}-${{
+            steps.grammars.outputs.pack }}-${{ steps.grammars.outputs.languages }}
       - name: docker build (the offline smoke test runs inside it)
         run: docker build --progress=plain --tag manicule:ci .
       - name: the shipped image does not run as root

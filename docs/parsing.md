@@ -1429,8 +1429,9 @@ guardrail. So it is closed in three moves:
    happens to be cached. manicule supports the languages it declares and no others.
 2. **Pre-seed, never lazy-load.** `manicule init` and `manicule doctor --fix` prefetch the
    declared set (`download_all()` / `prefetch()`, with the cache directory and language set
-   fixed via `configure(PackConfig(...))`). Container images prefetch at build time. The
-   manifest URL is overridable, so an air-gapped deployment can point at an internal mirror.
+   fixed via `configure(PackConfig(...))`). Container images prefetch at build time, or build
+   from a pack staged into the build context by whoever already has one — §8.1.2. The manifest
+   URL is overridable, so an air-gapped deployment can point at an internal mirror.
 
    Both commands reach it through one method — `ApplicationService._grammar_check(fix=True)` —
    and `doctor` without `--fix` runs the same check as a **report**: a `grammars` check that
@@ -1561,6 +1562,42 @@ its manifest carries a group and a size per language, and the SBOM beside it des
 native extension's Rust build dependencies — so what is checked is the distribution that
 publishes them under a stated permissive-only policy. A release that changes that expression
 fails a bundle build instead of shipping.
+
+### 8.1.2 The release is fetched once, not once per build
+
+The bundle closes the air-gapped case. It did nothing for the case that actually stopped work:
+the machine *building* the image had to reach the pack's GitHub release every single time, so an
+upstream blip — a transfer dropping part-way, three times in an hour — failed every open pull
+request at once. An image that needs no network was being produced by a build that needed one
+more reliably than the network provides.
+
+Two changes, in the order they matter.
+
+**A retry around the download.** `prefetch` attempts the fetch three times, waiting one second
+and then four (`FETCH_RETRY_DELAYS`). Backoff rather than a fixed interval because the two
+transient failures differ: a dropped connection clears at once and a rate limit does not. The
+last failure is raised with everything the first would have said, and the count is added to it,
+so an outage does not read as one unlucky request. This tolerates a flaky transfer and not an
+absent host — and it cannot half-succeed, because `prefetch` asks the cache afterwards whatever
+the pack reported.
+
+**The pack is staged rather than fetched inside the image.** `.ci/grammars/<pack release>` in
+the build context, if it holds libraries this platform can load, is where the image's bundle is
+built from; the Dockerfile downloads the release only when it does not. CI fills it from a cache
+keyed on the pack release, the platform and the declared language set, restoring before the
+build and never during it. The release is therefore fetched once per version rather than once
+per merge, and on a restored cache the pre-seed runs with the manifest pointed at a dead address
+— so a run that reaches for the network fails loudly instead of quietly re-downloading and
+reporting the same green tick.
+
+The staged directory is named for the release it holds and the build looks for the release it
+installs, which is what makes a stale cache a miss rather than a mislabelled bundle. Nothing
+about the image changes: the smoke test still runs `init`, an index and a search under
+`--network=none`, and both paths build the same bundle or fail naming the language they could
+not. A third fallback — proceeding from a previously built bundle when upstream is gone — was
+considered and rejected. The cache already *is* the previously built artefact, and a fallback
+that produced an image with fewer grammars than declared would be worse than the outage: the
+image would build, pass every check, ship, and parse those languages as plain text.
 
 ### 8.2 Deriving `LineAnchor.symbol`
 

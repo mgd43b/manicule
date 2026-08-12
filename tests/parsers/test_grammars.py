@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from collections.abc import Callable, Iterator, Sequence
 from importlib.metadata import metadata
 from pathlib import Path
@@ -251,6 +252,150 @@ def test_a_prefetch_that_wrote_nothing_is_a_failure_however_it_reported_itself(
     assert "still not in the cache" in str(raised.value)
     assert str(empty) in str(raised.value)
     assert not grammars.is_available("python")
+
+
+# --- the retry around the download ----------------------------------------------------------
+#
+# The grammars come from a third-party GitHub release, and the failure it actually produces is a
+# transfer that drops part-way rather than a host that refuses. Until #80 a single one of those
+# failed whatever had asked for it, which in this repository meant every open pull request at
+# once, because the image build pre-seeds. These three are the whole contract: a dropped transfer
+# is retried, a host that is genuinely gone still fails and says so, and the happy path does not
+# pay for either.
+
+
+def _installed_pack() -> Any:
+    """The pack module ``_fetch`` reaches for, so a test can stand in for its download."""
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - a parsing extra, not core
+
+    return pack
+
+
+DROPPED_TRANSFER = (
+    "Download error: Failed to download parsers-linux-x86_64.tar.zst: io: Peer disconnected"
+)
+"""The observed failure, quoted from the build log in #80 rather than invented.
+
+It arrives as a bare ``RuntimeError`` from the native layer, which is why that type is in the
+caught tuple at all — an earlier reading of this suite assumed the pack's own exception
+hierarchy and would have let this one through as an unhandled crash.
+"""
+
+
+def test_a_dropped_transfer_is_retried_with_backoff_and_the_seed_succeeds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The failure that blocked the repository, and the behaviour that unblocks it.
+
+    The stand-in fails twice the way the real host does and then *actually writes the library*,
+    copied out of this machine's cache — so what is asserted at the end is the real
+    post-condition, a grammar the pack can find, rather than a mock reporting that it was
+    called. A retry that returned success without landing a file would pass a weaker version of
+    this test and ship an image with no grammars in it.
+
+    The waits are recorded rather than taken. That the second is longer than the first is the
+    part worth checking: a fixed interval would spend every attempt inside the same rate-limit
+    window, which is one of the two transient failures this is for.
+    """
+    if not grammars.is_available("python"):
+        pytest.skip("no python grammar cached to copy, so a successful attempt cannot be staged")
+    library = next(iter(grammars.cache_directory().glob("*python*")))
+
+    cache = tmp_path / "grammars"
+    cache.mkdir()
+    grammars.configure_pack(["python"], cache_dir=cache, manifest_url=UNREACHABLE_MANIFEST)
+    slept: list[float] = []
+    monkeypatch.setattr(grammars.time, "sleep", slept.append)
+    monkeypatch.setattr(grammars, "FETCH_RETRY_DELAYS", (0.25, 0.5))
+    attempts: list[list[str]] = []
+
+    def flaky(languages: list[str]) -> None:
+        attempts.append(list(languages))
+        if len(attempts) < 3:
+            raise RuntimeError(DROPPED_TRANSFER)
+        shutil.copy2(library, cache / library.name)
+
+    monkeypatch.setattr(_installed_pack(), "prefetch", flaky)
+
+    assert grammars.prefetch(["python"]) == ("python",)
+    assert attempts == [["python"], ["python"], ["python"]]
+    assert slept == [0.25, 0.5]
+    assert grammars.is_available("python")
+
+
+def test_a_host_that_never_answers_still_fails_and_keeps_the_whole_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Retrying must not become a way of tolerating an outage, or of half-seeding one.
+
+    Two things are asserted together on purpose. **Nothing lands**: the cache is empty
+    afterwards, so there is no attempt count at which this produces a partial set of grammars
+    for a later build step to package and ship — an image carrying three of twenty-four
+    languages would build, pass, and silently parse the rest as plain text.
+
+    **The message still says everything it did**, because it is read almost exclusively by
+    someone whose host has no route to the release: the bundle, the mirror variable and the
+    section that explains building one. The attempt count is the only addition, and it is there
+    so that a genuine outage is not read as a single unlucky request.
+    """
+    cache = tmp_path / "grammars"
+    cache.mkdir()
+    grammars.configure_pack(["python"], cache_dir=cache, manifest_url=UNREACHABLE_MANIFEST)
+    slept: list[float] = []
+    monkeypatch.setattr(grammars.time, "sleep", slept.append)
+    monkeypatch.setattr(grammars, "FETCH_RETRY_DELAYS", (0.0, 0.0))
+    attempts: list[list[str]] = []
+
+    def never_answers(languages: list[str]) -> None:
+        attempts.append(list(languages))
+        raise RuntimeError(DROPPED_TRANSFER)
+
+    monkeypatch.setattr(_installed_pack(), "prefetch", never_answers)
+
+    with pytest.raises(grammars.GrammarFetchError) as raised:
+        grammars.prefetch(["python"])
+
+    message = str(raised.value)
+    assert len(attempts) == 3
+    # Two waits for three attempts: it gives up rather than sleeping once more first.
+    assert len(slept) == 2
+    assert "after 3 attempts" in message
+    assert "Peer disconnected" in message
+    assert grammars.MANIFEST_URL_ENV in message
+    assert "docs/parsing.md §8.1" in message
+    assert list(cache.iterdir()) == []
+    assert not grammars.is_available("python")
+
+
+def test_a_download_that_works_first_time_neither_retries_nor_waits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The steady state, and the off-by-one that would make every pre-seed five seconds slower.
+
+    ``prefetch`` is called on every ``manicule init`` and every ``doctor --fix``, so a loop that
+    slept before deciding whether it needed to would put a fixed cost on the path that is
+    supposed to be free.
+    """
+    if not grammars.is_available("python"):
+        pytest.skip("no python grammar cached to copy, so a successful attempt cannot be staged")
+    library = next(iter(grammars.cache_directory().glob("*python*")))
+
+    cache = tmp_path / "grammars"
+    cache.mkdir()
+    grammars.configure_pack(["python"], cache_dir=cache, manifest_url=UNREACHABLE_MANIFEST)
+    slept: list[float] = []
+    monkeypatch.setattr(grammars.time, "sleep", slept.append)
+    attempts: list[list[str]] = []
+
+    def works(languages: list[str]) -> None:
+        attempts.append(list(languages))
+        shutil.copy2(library, cache / library.name)
+
+    monkeypatch.setattr(_installed_pack(), "prefetch", works)
+
+    assert grammars.prefetch(["python"]) == ("python",)
+    assert len(attempts) == 1
+    assert slept == []
 
 
 def test_prefetch_does_nothing_when_every_declared_grammar_is_already_cached() -> None:
