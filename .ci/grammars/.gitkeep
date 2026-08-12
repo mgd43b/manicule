@@ -1,0 +1,9 @@
+# Kept so that the Dockerfile's `COPY .ci/grammars` resolves on a clean clone, where nothing
+# has staged anything here. An absent directory is a build that fails at the copy; an empty one
+# is a build that downloads the grammar release itself, which is what a developer running
+# `docker build .` wants and gets.
+#
+# CI fills this from a cache before building — see the container job in
+# .github/workflows/ci.yml — so that the release is fetched once per pack version rather than
+# once per pull request. Contents are ignored by git: they are compiled libraries for one
+# platform and one release, which is the definition of something that should not be committed.

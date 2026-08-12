@@ -25,6 +25,13 @@ manicule.db-shm
 # uv.lock is deliberately committed: CI installs with --frozen, so a build here is the
 # build that runs there.
 
+# The tree-sitter pack, staged for the image build by CI and named for the pack release it
+# holds. Compiled shared libraries for one platform and one release — the definition of
+# something rebuilt rather than committed. The directory itself stays, so that the Dockerfile's
+# `COPY .ci/grammars` resolves on a clean clone.
+.ci/grammars/*
+!.ci/grammars/.gitkeep
+
 # macOS
 .DS_Store
 
