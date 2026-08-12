@@ -12,7 +12,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from typer._click.exceptions import NoSuchOption, UsageError
@@ -32,7 +32,7 @@ from manicule.storage.backup import BackupError
 from tests.app.fakes import FakeBackend, FakeMaintenance, make_chunk, make_document
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from manicule.app.results import Envelope
 
@@ -983,9 +983,8 @@ def _root_option_names() -> set[str]:
     from typer.main import get_command  # noqa: PLC0415 - only this derivation builds the tree
 
     root = get_command(cli.app)
-    return {
-        next(name for name in sorted(option.opts, key=len, reverse=True)) for option in root.params
-    }
+    # The longest spelling, so `--workspace`/`-w` is keyed by the name the tables use.
+    return {max(option.opts, key=len) for option in root.params}
 
 
 def test_every_root_option_is_either_shared_with_the_commands_or_deliberately_not() -> None:
@@ -1451,3 +1450,33 @@ def test_the_refusal_names_both_workspaces_so_the_typo_is_visible() -> None:
     assert "tenant-a" in message
     assert "tenant-b" in message
     assert "--workspace" in message
+
+
+def test_recording_a_workspace_keeps_any_other_override_already_set() -> None:
+    """The bag of overrides is splatted into ``Runtime.open``, so it can hold more than one key.
+
+    Nothing else puts a key in it today, which is exactly why this is worth pinning: the next
+    value-carrying shared option will be written by analogy with ``_accept_workspace``, and a
+    line that *replaces* the bag rather than adding to it would drop the workspace on the way
+    past — silently, and only for the invocations that used both.
+
+    Driven through the option's own callback, taken from the shared table rather than imported
+    by name — so it is the function the command line actually reaches, not one that merely
+    still exists. There is no argv that produces a second override today, and inventing a
+    command-line spelling to reach it would be testing something this change did not add.
+    """
+    recorder = cli.SHARED_OPTIONS["--workspace"]().callback
+    assert recorder is not None, "--workspace records nothing, so it reaches nothing"
+    record = cast("Callable[[object, object, str | None], object]", recorder)
+
+    was = dict(cli.STATE.overrides)
+    try:
+        cli.STATE.workspace = None
+        cli.STATE.overrides = {"already": "set"}
+
+        record(None, None, "other")
+
+        assert cli.STATE.overrides == {"already": "set", "workspace": "other"}
+    finally:
+        cli.STATE.workspace = None
+        cli.STATE.overrides = was

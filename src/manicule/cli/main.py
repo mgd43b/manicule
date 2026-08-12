@@ -178,7 +178,10 @@ def _accept_workspace(ctx: object, param: object, value: str | None) -> str | No
     if STATE.workspace is not None and STATE.workspace != value:
         raise typer.BadParameter(WORKSPACE_NAMED_TWICE.format(before=STATE.workspace, after=value))
     STATE.workspace = value
-    STATE.overrides = {"workspace": value}
+    # Merged rather than replaced. `overrides` is splatted into `Runtime.open`, so it is a bag
+    # that can hold more than one key — and the next value-carrying shared option, written by
+    # analogy with this line, would silently drop the workspace on its way past.
+    STATE.overrides = {**STATE.overrides, "workspace": value}
     return value
 
 
