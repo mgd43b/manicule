@@ -1074,8 +1074,8 @@ Same index, same queries, before and after:
 
 | Query | Before | After |
 |---|---|---|
-| `zzzqqq unrelated nonsense xyzzy` | 0.330 `low` | **0.001 `none`** |
-| `how are citations verified` | 0.246 `low` | **0.300 `low`** |
+| `zzzqqq unrelated nonsense xyzzy` | 0.330 `low` | **0.002 `none`** |
+| `how are citations verified` | 0.246 `low` | **0.449 `low`** |
 
 And across the whole query set, on every profile: every one of the 16 answerable questions scores
 `low` or better, every one of the 22 unanswerable ones scores `none`, and **all 16 answerable
