@@ -264,6 +264,15 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     if payload.error:
         out.print(f"[red]the run did not finish: {escape(payload.error)}[/red]")
         out.print("[dim]the watermark was not advanced, so running it again resumes[/dim]")
+        return
+    # The longest command in the first run ends here, often after minutes, and ended on a
+    # table with nothing to do about it — the same gap `init` had. Only when something was
+    # actually indexed: after a run that added nothing, "now search it" is advice about
+    # somebody else's corpus.
+    if payload.ingested:
+        out.print(
+            "\n[dim]next: [/dim]manicule search <query>[dim], or[/dim] manicule ask <question>"
+        )
 
 
 # --- state ------------------------------------------------------------------------------------

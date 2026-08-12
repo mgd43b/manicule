@@ -817,3 +817,34 @@ def test_an_install_with_its_weights_already_here_is_not_warned_about_a_download
     out = " ".join(capsys.readouterr().out.split())
     assert "not on this machine yet" not in out
     assert "next:" in out
+
+
+def _ingest_output(capsys: pytest.CaptureFixture[str], *, ingested: int, error: str = "") -> str:
+    render.render_ingest(
+        render.console(),
+        r.IngestReport(connector="local", discovered=13, ingested=ingested, error=error),
+    )
+    return " ".join(capsys.readouterr().out.split())
+
+
+def test_the_longest_command_in_a_first_run_says_what_comes_after_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A first ingest can take minutes and used to end on a table with nothing to do about it."""
+    assert "next: manicule search <query>" in _ingest_output(capsys, ingested=13)
+
+
+def test_a_run_that_indexed_nothing_does_not_suggest_searching_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """After a no-op re-run, "now search it" is advice about somebody else's corpus."""
+    assert "next:" not in _ingest_output(capsys, ingested=0)
+
+
+def test_a_run_that_failed_says_how_to_resume_rather_than_what_to_do_next(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The next command after a broken ingest is the same ingest, and the error already says so."""
+    out = _ingest_output(capsys, ingested=4, error="the connector stopped")
+    assert "running it again resumes" in out
+    assert "next:" not in out
