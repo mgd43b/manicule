@@ -7,11 +7,14 @@ import pytest
 from manicule.core.retrieval import Candidate, ConfidenceBand, PipelineIdentity
 from manicule.retrieval.confidence import (
     AGREEMENT,
+    BANDS,
     NOISE_SIMILARITY,
     NOTHING_RESEMBLES,
     RERANK,
     SIMILARITY,
+    STRONG_SIMILARITY,
     WEIGHTS,
+    explain_confidence,
     rescale_similarity,
     score_confidence,
 )
@@ -20,6 +23,13 @@ from tests.storage_helpers import make_chunk, make_document
 FIRST = make_document(source_id="one")
 SECOND = make_document(source_id="two")
 THIRD = make_document(source_id="three")
+
+NONSENSE_COSINES = (0.4588, 0.4576, 0.4472, 0.4456, 0.4439)
+"""What the query ``zzzqqq unrelated nonsense xyzzy`` actually returned, over seven documents.
+
+Kept as measured rather than rounded to a story: the whole point is that these sit just *above*
+a raw reading of the noise level and just *below* the rescale's, which is why the defect was
+invisible until the two populations were measured against each other."""
 
 
 def passage(document: object, position: int, **scores: float) -> Candidate:
@@ -148,32 +158,52 @@ def test_negative_similarities_clamp_to_zero() -> None:
     assert confidence.components[SIMILARITY] == 0.0
 
 
-def test_scattering_across_documents_does_not_raise_confidence() -> None:
-    """The term that used to run backwards, asserted in the direction it actually runs.
+def test_scattered_noise_does_not_raise_confidence() -> None:
+    """The distinction the retired support-breadth term could not make.
 
-    Counting distinct documents was meant to read as corroboration and read as diffusion
-    instead: noise scatters across a corpus and a good answer concentrates in one place, so the
-    term paid the worse result. Spread is now not evidence in either direction — only how well
-    the passages match, and whether the two legs agreed, are.
+    Breadth counted distinct documents and so read *diffusion* as corroboration: noise scatters
+    across a corpus and a good answer concentrates in one place, and the term paid the worse
+    result. Spread across documents now raises confidence **only when each document independently
+    clears the noise floor** — which is what corroboration means and what a count never captured.
+    Passages below the floor contribute nothing however many documents they are spread over.
+
+    These are the cosines an unrelated query actually returned, over seven documents.
     """
     concentrated = score_confidence(
-        [
-            passage(FIRST, 0, dense=0.7, lexical=1.0),
-            passage(FIRST, 1, dense=0.7, lexical=1.0),
-            passage(FIRST, 2, dense=0.7, lexical=1.0),
-        ],
+        [passage(FIRST, index, dense=cosine) for index, cosine in enumerate(NONSENSE_COSINES)],
+        legs=("dense",),
         rerank_stage=None,
     )
     scattered = score_confidence(
         [
-            passage(FIRST, 0, dense=0.7, lexical=1.0),
-            passage(SECOND, 1, dense=0.7, lexical=1.0),
-            passage(THIRD, 2, dense=0.7, lexical=1.0),
+            passage(document, index, dense=cosine)
+            for index, (document, cosine) in enumerate(
+                zip((FIRST, SECOND, THIRD, FIRST, SECOND), NONSENSE_COSINES, strict=True)
+            )
         ],
+        legs=("dense",),
         rerank_stage=None,
     )
 
-    assert scattered.score == pytest.approx(concentrated.score)
+    assert scattered.band is ConfidenceBand.NONE
+    assert concentrated.band is ConfidenceBand.NONE
+    assert scattered.score < BANDS[-1][0]
+
+
+def test_spreading_real_evidence_across_documents_does_raise_confidence() -> None:
+    """The other half of the same rule, so neither direction can drift unnoticed.
+
+    Two documents that each independently answer the question *are* better support than one, and
+    saying so is the job the breadth term was reaching for and getting backwards.
+    """
+    one = score_confidence([passage(FIRST, 0, dense=0.55)], legs=("dense",), rerank_stage=None)
+    two = score_confidence(
+        [passage(FIRST, 0, dense=0.55), passage(SECOND, 1, dense=0.55)],
+        legs=("dense",),
+        rerank_stage=None,
+    )
+
+    assert two.score > one.score
 
 
 def test_noise_scores_below_a_weaker_but_real_match() -> None:
@@ -282,3 +312,261 @@ def test_a_pipeline_that_declares_no_legs_suppresses_similarity_rather_than_zero
     assert SIMILARITY in confidence.suppressed
     assert SIMILARITY not in confidence.components
     assert confidence.ceiling < 1.0
+
+
+# --- the glossary corpus: one definition, one distractor, filler, one unsupported question ----
+#
+# Every cosine below was measured with the shipped embedder against a synthetic public glossary
+# defining `NOW - Network Operations Workspace`, not invented to make the arithmetic work. The
+# corpus is one definition, one semantically related distractor about scheduling ("...admitted
+# to the queue now...") and eight irrelevant operational passages.
+
+GLOSSARY_HIT = 0.6228
+"""Cosine of the defining passage for the question "What is NOW?". Rank 1 of ten."""
+GLOSSARY_FILLER = (0.4108, 0.3218, 0.3065, 0.2722)
+"""The four passages behind it, which `final_top_k` puts in the context regardless."""
+UNSUPPORTED = (0.3928, 0.3780, 0.3734, 0.3099, 0.3087)
+"""The whole context for a question the corpus cannot answer."""
+
+
+def _context(*cosines: float, documents: object = None) -> list[Candidate]:
+    """One passage per cosine, each its own document unless told otherwise."""
+    docs = documents or (FIRST, SECOND, THIRD, FIRST, SECOND)
+    return [
+        passage(docs[index % len(docs)], index, dense=cosine)
+        for index, cosine in enumerate(cosines)
+    ]
+
+
+def test_a_correct_rank_one_passage_is_not_reported_as_no_evidence() -> None:
+    """The reported defect. A perfect retrieval scored 0.0 and the band ``none``.
+
+    "What is NOW?" put the defining passage at rank 1 with cosine 0.623 — and the mean over the
+    context, dragged down by four filler passages the pipeline is obliged to return, fell to
+    0.387. That is *below* the noise floor, so the strongest possible dense evidence reported
+    exactly no evidence.
+    """
+    confidence = score_confidence(
+        _context(GLOSSARY_HIT, *GLOSSARY_FILLER), legs=("dense",), rerank_stage=None
+    )
+
+    assert confidence.score > 0.0
+    assert confidence.band is not ConfidenceBand.NONE
+    assert confidence.reason != NOTHING_RESEMBLES
+
+
+def test_filler_behind_a_correct_hit_does_not_lower_confidence() -> None:
+    """The mechanism, isolated: filler is not evidence against the answer in front of it.
+
+    An average said otherwise, and the context is *guaranteed* to contain filler — the pipeline
+    fills to ``final_top_k`` whether or not the corpus holds that many relevant passages, so a
+    narrow question was penalised precisely for being narrow.
+    """
+    alone = score_confidence(_context(GLOSSARY_HIT), legs=("dense",), rerank_stage=None)
+    padded = score_confidence(
+        _context(GLOSSARY_HIT, *GLOSSARY_FILLER), legs=("dense",), rerank_stage=None
+    )
+
+    assert padded.score == pytest.approx(alone.score)
+
+
+def test_an_unsupported_question_still_reports_no_answer() -> None:
+    """The property won earlier and defended here: nothing may make noise look like evidence."""
+    confidence = score_confidence(_context(*UNSUPPORTED), legs=("dense",), rerank_stage=None)
+
+    assert confidence.score == 0.0
+    assert confidence.band is ConfidenceBand.NONE
+    assert confidence.reason == NOTHING_RESEMBLES
+
+
+def test_independent_documents_supporting_the_same_answer_raise_confidence() -> None:
+    """Monotone in added independent evidence, which is what "combined" has to mean."""
+    one = score_confidence([passage(FIRST, 0, dense=0.60)], legs=("dense",), rerank_stage=None)
+    two = score_confidence(
+        [passage(FIRST, 0, dense=0.60), passage(SECOND, 1, dense=0.60)],
+        legs=("dense",),
+        rerank_stage=None,
+    )
+    three = score_confidence(
+        [
+            passage(FIRST, 0, dense=0.60),
+            passage(SECOND, 1, dense=0.60),
+            passage(THIRD, 2, dense=0.60),
+        ],
+        legs=("dense",),
+        rerank_stage=None,
+    )
+
+    assert one.score < two.score < three.score
+
+
+def test_duplicate_evidence_from_one_document_does_not_multiply_confidence() -> None:
+    """Ten chunks of one page are one observation, not ten.
+
+    Without this, a single well-matched document manufactures certainty by being chunked
+    finely — a property of the ingest configuration reported as a property of the evidence.
+    """
+    single = score_confidence([passage(FIRST, 0, dense=0.60)], legs=("dense",), rerank_stage=None)
+    chunked = score_confidence(
+        [passage(FIRST, index, dense=0.60) for index in range(10)],
+        legs=("dense",),
+        rerank_stage=None,
+    )
+
+    assert chunked.score == pytest.approx(single.score)
+
+
+def test_one_strong_passage_alone_is_not_treated_as_proof() -> None:
+    """Rank 1 is evidence, not certainty.
+
+    A perfectly-matched passage takes the *dense* component in full, which is honest — that is
+    what the component measures. What stops top-1 becoming proof is that dense evidence is 0.55
+    of the number: the lexical leg has to have found it too, and a reranker has to have agreed,
+    before anything can reach ``high``. So a lone strong passage in a full two-leg pipeline
+    lands at ``medium`` and cannot climb further on its own.
+    """
+    confidence = score_confidence([passage(FIRST, 0, dense=STRONG_SIMILARITY)], rerank_stage=None)
+
+    assert confidence.components[SIMILARITY] == pytest.approx(WEIGHTS[SIMILARITY])
+    assert confidence.band is not ConfidenceBand.HIGH
+    assert confidence.score < BANDS[0][0]
+
+
+def test_corroboration_is_measured_over_the_passages_that_carry_evidence() -> None:
+    """Filler must not dilute agreement either, for the same reason it must not dilute evidence.
+
+    A query with one strong, doubly-confirmed answer used to score 1/5 for perfect
+    corroboration, because the denominator counted four passages nobody claimed were relevant.
+
+    Corroboration is then **scaled by the evidence**, because you cannot corroborate more than
+    you have: the component is the corroborated fraction times the evidence level, so a fully
+    corroborated strong answer approaches the full weight and a fully corroborated *weak* one
+    does not.
+    """
+    corroborated = score_confidence(
+        [
+            passage(FIRST, 0, dense=GLOSSARY_HIT, lexical=9.0),
+            *(
+                passage(SECOND, index + 1, dense=cosine)
+                for index, cosine in enumerate(GLOSSARY_FILLER)
+            ),
+        ],
+        rerank_stage=None,
+    )
+    uncorroborated = score_confidence(
+        [
+            passage(FIRST, 0, dense=GLOSSARY_HIT),
+            *(
+                passage(SECOND, index + 1, dense=cosine)
+                for index, cosine in enumerate(GLOSSARY_FILLER)
+            ),
+        ],
+        rerank_stage=None,
+    )
+
+    evidence = corroborated.components[SIMILARITY] / WEIGHTS[SIMILARITY]
+    assert corroborated.components[AGREEMENT] == pytest.approx(WEIGHTS[AGREEMENT] * evidence)
+    assert uncorroborated.components[AGREEMENT] == 0.0
+    assert corroborated.score > uncorroborated.score
+
+
+def test_corroborating_weak_evidence_pays_less_than_corroborating_strong_evidence() -> None:
+    """You cannot corroborate more than you have.
+
+    Counting alone handed a nonsense query the full agreement weight: exactly one passage cleared
+    the floor, barely, both legs happened to touch it, and 1/1 paid out in full — 0.15 of a number
+    whose whole job in that case is to say the corpus holds nothing.
+    """
+    weak = score_confidence(
+        [passage(FIRST, 0, dense=NOISE_SIMILARITY + 0.01, lexical=9.0)], rerank_stage=None
+    )
+    strong = score_confidence(
+        [passage(FIRST, 0, dense=STRONG_SIMILARITY, lexical=9.0)], rerank_stage=None
+    )
+
+    assert weak.components[AGREEMENT] < strong.components[AGREEMENT]
+    assert weak.band is ConfidenceBand.NONE
+
+
+def test_the_thresholds_remain_configurable() -> None:
+    """A corpus whose noise sits elsewhere must be able to say so without editing this module."""
+    passages = [passage(FIRST, 0, dense=0.50)]
+
+    default = score_confidence(passages, legs=("dense",), rerank_stage=None)
+    shifted = score_confidence(
+        passages,
+        legs=("dense",),
+        rerank_stage=None,
+        noise_similarity=0.20,
+        strong_similarity=0.40,
+    )
+
+    assert default.score < shifted.score
+
+
+# --- the diagnostic ---------------------------------------------------------------------------
+
+
+def test_the_diagnostic_reports_every_input_to_the_score() -> None:
+    """ "The right passage was rank 1 and confidence said none" must be answerable in one call."""
+    diagnostics = explain_confidence(
+        _context(GLOSSARY_HIT, *GLOSSARY_FILLER), legs=("dense",), rerank_stage=None
+    )
+
+    assert diagnostics.noise_similarity == NOISE_SIMILARITY
+    assert diagnostics.strong_similarity == STRONG_SIMILARITY
+    assert diagnostics.weights == dict(WEIGHTS)
+    assert diagnostics.bands == tuple((value, band.value) for value, band in BANDS)
+    assert diagnostics.components
+    assert len(diagnostics.passages) == 1 + len(GLOSSARY_FILLER)
+    assert diagnostics.evidence_documents == 1
+    # The passage that carried the answer is the one counted, and the filler is visibly not.
+    counted = [item for item in diagnostics.passages if item.counted]
+    assert len(counted) == 1
+    assert counted[0].raw_similarity == pytest.approx(GLOSSARY_HIT)
+    assert counted[0].evidence > 0.0
+
+
+def test_the_diagnostic_agrees_with_the_score_it_explains() -> None:
+    """It runs the scorer rather than reimplementing it; a second implementation would drift."""
+    passages = _context(GLOSSARY_HIT, *GLOSSARY_FILLER)
+
+    scored = score_confidence(passages, legs=("dense",), rerank_stage=None)
+    explained = explain_confidence(passages, legs=("dense",), rerank_stage=None)
+
+    assert explained.score == scored.score
+    assert explained.band is scored.band
+    assert explained.ceiling == scored.ceiling
+    assert explained.components == scored.components
+
+
+def test_the_diagnostic_never_carries_passage_text() -> None:
+    """Diagnostics travel into logs, bug reports and screenshots; corpus text must not.
+
+    Asserted over the serialised form rather than the attributes, because the risk is what gets
+    written out — a field added later that happens to hold text would pass an attribute check
+    and still leak.
+    """
+    body = "CORPUS-TEXT-THAT-MUST-NOT-APPEAR-IN-A-DIAGNOSTIC"
+    chunk = make_chunk(FIRST, 0, body)  # pyright: ignore[reportArgumentType]
+    candidate = Candidate(chunk=chunk, score=1.0, scores={"dense": GLOSSARY_HIT})
+
+    serialised = explain_confidence(
+        [candidate], legs=("dense",), rerank_stage=None
+    ).model_dump_json()
+
+    assert body not in serialised
+    assert chunk.id in serialised, "the chunk id is how an entitled reader finds the passage"
+
+
+def test_the_diagnostic_shows_duplicate_evidence_being_refused() -> None:
+    """Ten chunks of one document appear, and exactly one of them is counted."""
+    diagnostics = explain_confidence(
+        [passage(FIRST, index, dense=0.60) for index in range(10)],
+        legs=("dense",),
+        rerank_stage=None,
+    )
+
+    assert len(diagnostics.passages) == 10
+    assert sum(1 for item in diagnostics.passages if item.counted) == 1
+    assert diagnostics.evidence_documents == 1

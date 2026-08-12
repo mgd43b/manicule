@@ -53,10 +53,12 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Final
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from manicule.core.retrieval import Confidence, ConfidenceBand, PipelineIdentity
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from manicule.core.retrieval import Candidate
 
@@ -82,18 +84,27 @@ with no reranker reaches at most 0.70, so ``fast`` still cannot claim a verifica
 skipped.
 """
 
-NOISE_SIMILARITY: Final = 0.45
-"""Cosine at which this embedder's output stops carrying information about the query.
+NOISE_SIMILARITY: Final = 0.52
+"""Cosine at or below which **one passage** carries no information about the query.
 
-**Measured, not inherited.** Over manicule's own documentation — 13 documents, 604 chunks,
-BGE-M3 — 22 questions drawn from subjects the corpus does not cover averaged 0.353 to 0.457
-across the passages that reached a context; 16 questions the corpus does answer averaged 0.531
-to 0.641. 0.45 sits just under the top of the noise range, so an unanswerable question scores
-essentially zero while the weakest real question keeps a clear margin.
+**Measured, and re-measured when the statistic changed.** Both constants describe a single
+passage, because :func:`rescale_similarity` is applied per passage and the results combined
+afterwards — which is the only thing a cosine ever described. They were first calibrated against
+the *mean* over a context, and that pairing was wrong in a way only a narrow query exposed (see
+:func:`_similarity`).
 
-Both constants are calibrated against the **mean over the passages in the context**, which is
-the quantity :func:`score_confidence` actually rescales — not against a top-1 cosine, which runs
-roughly 0.08 higher and would put the whole scale out by that much.
+Per passage the two populations sit much closer than their context means did, and that is the
+number this constant has to respect. Sweeping a floor over 300 passages from answerable queries
+and 149 from unanswerable ones across two corpora: at 0.48 one noise passage still survived, and
+at **0.52 none did**, while every answerable query kept at least one passage. An unrelated query
+reached 0.5194 on a single passage — so a floor at 0.50, which looked safe against the earlier
+context-mean figures, left exactly that passage counting as evidence.
+
+This is a property of **the embedder and the corpus**, not a universal constant: BGE-M3's
+similarities are not centred on zero for unrelated text, and a different model or a much more
+topically concentrated corpus puts the noise level somewhere else. Re-measure it the way it was
+measured — ask questions the corpus demonstrably cannot answer and read where their similarities
+land — rather than adjusting it until an example looks right.
 
 This is a property of **the embedder and the corpus**, not a universal constant: BGE-M3's
 similarities are not centred on zero for unrelated text, and a different model or a much more
@@ -103,13 +114,14 @@ land — rather than adjusting it until an example looks right.
 """
 
 STRONG_SIMILARITY: Final = 0.65
-"""Mean context cosine at which a retrieval is treated as fully on-topic.
+"""Cosine at which one passage is treated as fully answering the query.
 
-The top of the measured range rather than 1.0. Cosine 1.0 against a chunk means the query *is*
-that chunk, which no question is; and a *mean* over several passages is pulled below even the
-best passage by the ones beneath it. The best on-corpus mean observed was 0.641, so scaling to
-1.0 — or to the 0.724 best *top-1*, which is a different statistic — would cap a flawless
-retrieval at about half the component and report well-answered questions as weakly supported.
+The top of the measured range rather than 1.0: cosine 1.0 against a chunk means the query *is*
+that chunk, which no question is, so scaling to 1.0 would cap a flawless retrieval at roughly
+two thirds of the component for a reason that has nothing to do with the evidence. Measured
+top-1 cosines ran to 0.724 over this project's own documentation and 0.747 against a synthetic
+glossary, so a passage at or above 0.65 has answered the question as well as this embedder ever
+signals.
 """
 
 BANDS: Final[tuple[tuple[float, ConfidenceBand], ...]] = (
@@ -204,39 +216,121 @@ def rescale_similarity(cosine: float, *, noise: float, strong: float) -> float:
     return min(1.0, max(0.0, (cosine - noise) / (strong - noise)))
 
 
+def combine_evidence(strengths: Iterable[float]) -> float:
+    """Combine independent pieces of evidence for one answer, in ``[0, 1]``.
+
+    ``1 - Π(1 - e_i)`` — the probability that *at least one* of them is real, if each were
+    independent. It is chosen for four properties the alternatives do not have together:
+
+    * **Passages carrying nothing cost nothing.** A term at 0 multiplies by 1. This is the whole
+      correction: the pipeline always fills the context to ``final_top_k`` whether or not the
+      corpus holds that many relevant passages, so a narrow question with one right answer is
+      *guaranteed* filler — and an average made that filler count against the answer.
+    * **More independent support raises it, and never lowers it.** Monotone non-decreasing in
+      every term.
+    * **It saturates rather than overflowing.** Ten good passages approach 1.0 without a clamp
+      having to hide an out-of-range number.
+    * **One strong passage is not proof.** A single piece of evidence at 0.86 yields 0.86, so
+      rank 1 alone lands short of certainty and a second independent source is what closes the
+      gap. Confidence is a statement about evidence, and one source is one source.
+    """
+    absent = 1.0
+    for strength in strengths:
+        absent *= 1.0 - min(1.0, max(0.0, strength))
+    return 1.0 - absent
+
+
 def _similarity(
     passages: Sequence[Candidate], dense_leg: str | None, *, noise: float, strong: float
 ) -> tuple[float, str]:
-    """The rescaled similarity component, or why there is none.
+    """The dense evidence component, or why there is none.
 
     Returns the value and an empty string, or ``0.0`` and the reason it is unavailable. Absent
     and zero are different answers here and the caller must not be able to confuse them, which
     is why the reason rather than the number carries the signal.
 
-    **Only the passages the dense leg actually scored are averaged.** ``.get(leg, 0.0)`` was the
-    defect this replaces: a passage the lexical leg found and the dense leg never ranked has *no*
-    measured similarity, and reading the absent key as 0.0 asserts the dense leg looked at it and
-    judged it orthogonal to the query. It never looked. On the query that exposed this, BM25's top
-    hit was averaged in as a zero and cost the best answer in the corpus a twentieth of a point —
-    the not-measured-versus-measured-zero conflation this module forbids one component along,
-    committed in a default argument.
+    **The strongest passage per document, combined by :func:`combine_evidence`.** This replaced a
+    mean, which was wrong in a way that only a narrow query exposes. Measured on a synthetic
+    glossary: the question "What is NOW?" put the defining passage at rank 1 with cosine 0.623,
+    and the four filler passages behind it pulled the mean to 0.387 — *below the noise floor*, so
+    a perfect retrieval reported 0.0 and the band ``none``. The full-expansion phrasing scored a
+    near-ideal 0.702 at rank 1 and also reported 0.0. An average answers "how on-topic is the
+    typical passage shown", and nobody asked that; the question is how well supported the answer
+    is, and filler behind a correct hit is not evidence against it.
+
+    **Best per document, not per passage**, so that a document split into ten chunks is one piece
+    of evidence rather than ten. Chunks of one page are not independent observations, and letting
+    them compound is how a single well-matched document manufactures certainty.
+
+    **Only the passages the dense leg actually scored count.** ``.get(leg, 0.0)`` was an earlier
+    defect here: a passage the lexical leg found and the dense leg never ranked has *no* measured
+    similarity, and reading the absent key as 0.0 asserts the dense leg looked at it and judged it
+    orthogonal to the query. It never looked.
     """
     if dense_leg is None:
-        # A pipeline with no fusion names no legs, so nothing here has a similarity to average.
+        # A pipeline with no fusion names no legs, so nothing here has a similarity to read.
         # Suppressed rather than scored zero: a zero would report weak evidence for what is a
         # property of the pipeline.
         return 0.0, "this pipeline declares no retrieval legs to read a similarity from"
-    scored = [
-        candidate.scores[dense_leg] for candidate in passages if dense_leg in candidate.scores
-    ]
-    if not scored:
+    best: dict[str, float] = {}
+    for candidate in passages:
+        if dense_leg not in candidate.scores:
+            continue
+        document = candidate.chunk.document_id
+        strength = rescale_similarity(
+            max(candidate.scores[dense_leg], 0.0), noise=noise, strong=strong
+        )
+        best[document] = max(best.get(document, 0.0), strength)
+    if not best:
         return 0.0, (
             f"no passage in the context carries a {dense_leg!r} score, so there is no similarity "
-            f"this run could average — absent, not zero"
+            f"this run could read — absent, not zero"
         )
-    return rescale_similarity(
-        _mean([max(value, 0.0) for value in scored]), noise=noise, strong=strong
-    ), ""
+    return combine_evidence(best.values()), ""
+
+
+def _agreement(
+    passages: Sequence[Candidate],
+    legs: Sequence[str],
+    dense_leg: str | None,
+    *,
+    evidence: float,
+    noise: float,
+    strong: float,
+) -> float:
+    """How much of the evidence both legs found, over the passages that carry evidence.
+
+    **The denominator is the evidence-bearing passages, not every passage in the context**, and
+    that is the same correction :func:`_similarity` needed for the same reason. Filler is
+    guaranteed — the context is filled to ``final_top_k`` regardless of how much the corpus
+    actually holds — and dividing by it meant a query with one strong, doubly-confirmed answer
+    scored 1/5 for perfect corroboration. Asking whether the lexical leg also found the *filler*
+    is not a question anybody wants answered.
+
+    With no evidence-bearing passage there is nothing to corroborate, so this is 0.0 and the
+    similarity component is already 0.0 for the same reason — a run with no evidence should not
+    collect an agreement bonus for two legs concurring about noise.
+    """
+    if dense_leg is None:
+        return 0.0
+    bearing = [
+        candidate
+        for candidate in passages
+        if rescale_similarity(
+            max(candidate.scores.get(dense_leg, 0.0), 0.0), noise=noise, strong=strong
+        )
+        > 0.0
+    ]
+    if not bearing:
+        return 0.0
+    agreeing = sum(1 for candidate in bearing if all(leg in candidate.scores for leg in legs))
+    # Scaled by the evidence, not merely counted over it. **You cannot corroborate more than you
+    # have.** Counting alone gave a nonsense query the full agreement weight: exactly one passage
+    # cleared the floor, barely, both legs happened to touch it, and 1/1 paid out in full — 0.15
+    # of a number that is supposed to say the corpus holds nothing. Multiplying by the evidence
+    # level makes weak corroboration of weak evidence weak, which is the only reading that is
+    # ever true.
+    return (agreeing / len(bearing)) * evidence
 
 
 def _rerank(passages: Sequence[Candidate], stage: str | None) -> tuple[float, str]:
@@ -299,8 +393,9 @@ def score_confidence(
     components: dict[str, float] = {}
     suppressed: dict[str, str] = {}
 
+    dense_leg = legs[0] if legs else None
     measured, unavailable = _similarity(
-        passages, legs[0] if legs else None, noise=noise_similarity, strong=strong_similarity
+        passages, dense_leg, noise=noise_similarity, strong=strong_similarity
     )
     if unavailable:
         suppressed[SIMILARITY] = unavailable
@@ -318,8 +413,14 @@ def score_confidence(
             "two scores and a zero here would describe the pipeline rather than the evidence"
         )
     else:
-        agreeing = sum(1 for candidate in passages if all(leg in candidate.scores for leg in legs))
-        components[AGREEMENT] = agreeing / len(passages)
+        components[AGREEMENT] = _agreement(
+            passages,
+            legs,
+            dense_leg,
+            evidence=components.get(SIMILARITY, 0.0),
+            noise=noise_similarity,
+            strong=strong_similarity,
+        )
 
     verified, unverifiable = _rerank(passages, rerank_stage)
     if unverifiable:
@@ -360,6 +461,140 @@ def score_confidence(
     )
 
 
+class PassageEvidence(BaseModel):
+    """What one passage contributed, without saying what it said.
+
+    **No passage text, ever.** Diagnostics travel further than results — into logs, bug reports
+    and screenshots — and a diagnostic that carries corpus text turns every one of those into a
+    disclosure. The chunk id is enough to find the passage for anyone entitled to read it, and
+    useless to anyone who is not.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    chunk_id: str
+    document_id: str
+    raw_similarity: float | None = Field(
+        default=None, description="The dense leg's cosine, or None if it never ranked this passage."
+    )
+    evidence: float = Field(
+        ge=0.0, le=1.0, description="That cosine rescaled against the noise level. 0.0 is noise."
+    )
+    legs: tuple[str, ...] = Field(default=(), description="Which legs scored it, sorted.")
+    counted: bool = Field(
+        description="Whether it reached the combination at all. False for a passage whose "
+        "document contributed a stronger one, which is how duplicate evidence is refused."
+    )
+
+
+class ConfidenceDiagnostics(BaseModel):
+    """Every input to a confidence score, so the number can be argued with.
+
+    Built on request rather than always, because it costs a second pass and most callers want
+    the number. What it is *for* is the class of report this module keeps producing: "the right
+    passage was rank 1 and confidence said none". Answering that took a measurement harness and
+    a day; with this it is one call, and the answer is in the components rather than inferred
+    from them.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    score: float
+    band: ConfidenceBand
+    ceiling: float
+    reason: str = ""
+    components: dict[str, float] = Field(default_factory=dict)
+    suppressed: dict[str, str] = Field(default_factory=dict)
+    noise_similarity: float
+    strong_similarity: float
+    bands: tuple[tuple[float, str], ...] = Field(
+        default=(), description="The thresholds this run was cut on, best band first."
+    )
+    weights: dict[str, float] = Field(default_factory=dict)
+    passages: tuple[PassageEvidence, ...] = ()
+    evidence_documents: int = Field(
+        default=0, ge=0, description="Documents that cleared the noise floor and were combined."
+    )
+
+
+def explain_confidence(
+    passages: Sequence[Candidate],
+    *,
+    legs: Sequence[str] = ("dense", "lexical"),
+    rerank_stage: str | None = None,
+    exhausted_budget: bool = False,
+    noise_similarity: float = NOISE_SIMILARITY,
+    strong_similarity: float = STRONG_SIMILARITY,
+) -> ConfidenceDiagnostics:
+    """Score a retrieval and show the working.
+
+    Runs the same :func:`score_confidence` the pipeline runs rather than reimplementing it, so
+    the explanation cannot drift from the number it explains — a diagnostic that computes its own
+    answer is a second implementation, and the one that disagrees is always the one nobody reads.
+    """
+    confidence = score_confidence(
+        passages,
+        legs=legs,
+        rerank_stage=rerank_stage,
+        exhausted_budget=exhausted_budget,
+        noise_similarity=noise_similarity,
+        strong_similarity=strong_similarity,
+    )
+    dense_leg = legs[0] if legs else None
+    strongest: dict[str, float] = {}
+    for candidate in passages:
+        if dense_leg is not None and dense_leg in candidate.scores:
+            strength = rescale_similarity(
+                max(candidate.scores[dense_leg], 0.0),
+                noise=noise_similarity,
+                strong=strong_similarity,
+            )
+            document = candidate.chunk.document_id
+            strongest[document] = max(strongest.get(document, 0.0), strength)
+
+    detail: list[PassageEvidence] = []
+    claimed: set[str] = set()
+    for candidate in passages:
+        raw = candidate.scores.get(dense_leg) if dense_leg is not None else None
+        strength = (
+            rescale_similarity(max(raw, 0.0), noise=noise_similarity, strong=strong_similarity)
+            if raw is not None
+            else 0.0
+        )
+        document = candidate.chunk.document_id
+        # A passage at zero evidence contributed nothing, so it is not "counted" however it
+        # compares to its document's best — otherwise every filler passage in a context of noise
+        # reports as having been used, which is the opposite of what this field exists to show.
+        counted = strength > 0.0 and document not in claimed and strongest.get(document) == strength
+        if counted:
+            claimed.add(document)
+        detail.append(
+            PassageEvidence(
+                chunk_id=candidate.chunk.id,
+                document_id=document,
+                raw_similarity=raw,
+                evidence=strength,
+                legs=tuple(sorted(candidate.scores)),
+                counted=counted,
+            )
+        )
+
+    return ConfidenceDiagnostics(
+        score=confidence.score,
+        band=confidence.band,
+        ceiling=confidence.ceiling,
+        reason=confidence.reason,
+        components=dict(confidence.components),
+        suppressed=dict(confidence.suppressed),
+        noise_similarity=noise_similarity,
+        strong_similarity=strong_similarity,
+        bands=tuple((threshold, band.value) for threshold, band in BANDS),
+        weights=dict(WEIGHTS),
+        passages=tuple(detail),
+        evidence_documents=sum(1 for value in strongest.values() if value > 0.0),
+    )
+
+
 __all__ = [
     "AGREEMENT",
     "BANDS",
@@ -372,7 +607,11 @@ __all__ = [
     "STRONG_SIMILARITY",
     "UNREACHABLE_BAND",
     "WEIGHTS",
+    "ConfidenceDiagnostics",
+    "PassageEvidence",
     "band_for",
+    "combine_evidence",
+    "explain_confidence",
     "reachable_band",
     "rescale_similarity",
     "score_confidence",
