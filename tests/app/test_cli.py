@@ -7,6 +7,7 @@ second place a rule lives — which is the thing this design exists to prevent.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
@@ -457,9 +458,9 @@ RENDERER_LANDMARKS: tuple[type[r.Payload], ...] = (
 )
 """Renderers that must exist, named individually.
 
-A count is satisfied by any twenty-eight entries. These four are the results of the operations
-somebody actually runs — ask, search, doctor, index — so a table that has lost its way fails
-here rather than passing on its size.
+A count is satisfied by any table of the right size. These four are the results of the
+operations somebody actually runs — ask, search, doctor, index — so a table that has lost its
+way fails here rather than passing on how many entries it happens to have.
 """
 
 
@@ -533,4 +534,61 @@ def test_every_renderer_is_reachable_from_some_operation() -> None:
         f"these renderers cannot be reached by any operation: {unreachable}. Either the "
         f"operation that produced them was removed and its view was not, or a payload type "
         f"is missing from PAYLOADS."
+    )
+
+
+EMITTED_OP_LANDMARKS: frozenset[str] = frozenset({"ask", "search", "document_list", "doctor"})
+"""Operation names the scan below must have found in the source.
+
+The scan reads string literals out of an AST, which is the kind of derivation that returns an
+empty set when it is pointed at the wrong thing — and an empty set satisfies a subset check.
+These four are emitted by commands nobody is going to delete.
+"""
+
+
+def _emitted_ops() -> set[str]:
+    """Every operation name passed to ``emit`` as a literal, read from the source.
+
+    The op is a string argument inside a lambda, so it exists nowhere a type checker or an
+    import can reach it — but it is what ``print_envelope`` looks ``PAYLOADS`` up by, so a
+    command that emits an operation the table does not name is a ``KeyError`` the first time
+    it succeeds. Reading the source is the only way to see them.
+
+    Deliberately only literals. A computed op name would not be found here, and a scan that
+    guessed at one would report a name nothing emits.
+    """
+    source = Path(cli.__file__)
+    assert source.is_file(), f"{source} is not a file; the scan below would read nothing"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    return {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "emit"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+
+
+def test_every_operation_the_command_line_emits_has_a_payload_type() -> None:
+    """The other half of the same ``KeyError``, and the half a new command actually hits.
+
+    ``print_envelope`` does ``PAYLOADS[envelope.op]`` before it renders anything. Adding a
+    command means writing an op name in one file and an entry in another, and nothing but this
+    connects them — which is exactly the step somebody adding a command forgets, because the
+    failure path renders perfectly well and the success path is the one that raises.
+    """
+    emitted = _emitted_ops()
+    missing_landmarks = sorted(EMITTED_OP_LANDMARKS - emitted)
+    assert missing_landmarks == [], (
+        f"the scan did not find {missing_landmarks} among the operations this module emits. "
+        f"Whatever it parsed, it was not the command line."
+    )
+    unknown = sorted(emitted - set(cli.PAYLOADS))
+    assert unknown == [], (
+        f"these operations are emitted but named in no PAYLOADS entry: {unknown}. Each is a "
+        f"KeyError the first time the operation succeeds. Add it to PAYLOADS in "
+        f"manicule.cli.main."
     )
