@@ -329,11 +329,15 @@ UNSUPPORTED = (0.3928, 0.3780, 0.3734, 0.3099, 0.3087)
 """The whole context for a question the corpus cannot answer."""
 
 
-def _context(*cosines: float, documents: object = None) -> list[Candidate]:
-    """One passage per cosine, each its own document unless told otherwise."""
-    docs = documents or (FIRST, SECOND, THIRD, FIRST, SECOND)
+def _context(*cosines: float) -> list[Candidate]:
+    """One passage per cosine, spread over distinct documents.
+
+    Spread rather than concentrated because that is the shape the reported defect had: a correct
+    passage at rank 1 and unrelated filler from elsewhere in the corpus behind it.
+    """
+    documents = (FIRST, SECOND, THIRD, FIRST, SECOND)
     return [
-        passage(docs[index % len(docs)], index, dense=cosine)
+        passage(documents[index % len(documents)], index, dense=cosine)
         for index, cosine in enumerate(cosines)
     ]
 
@@ -548,7 +552,7 @@ def test_the_diagnostic_never_carries_passage_text() -> None:
     and still leak.
     """
     body = "CORPUS-TEXT-THAT-MUST-NOT-APPEAR-IN-A-DIAGNOSTIC"
-    chunk = make_chunk(FIRST, 0, body)  # pyright: ignore[reportArgumentType]
+    chunk = make_chunk(FIRST, 0, body)
     candidate = Candidate(chunk=chunk, score=1.0, scores={"dense": GLOSSARY_HIT})
 
     serialised = explain_confidence(
