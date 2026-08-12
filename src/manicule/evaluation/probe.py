@@ -74,11 +74,26 @@ DEFAULT_K = 5
 """Results examined per probe item. The question is "did it find the document at all", so a
 small window rather than one: a system that ranks the right document third is retrieving."""
 
-MIN_TITLE_WORDS = 2
-"""How many words a title needs before it can be a probe query.
+MIN_TITLE_CHARACTERS = 3
+"""How much title a document needs before it can be a probe query.
 
-One-word titles collide across documents and make the known answer ambiguous, which would
-show up as a working system failing the probe.
+This used to be ``MIN_TITLE_WORDS = 2``, and that rule made the probe **unavailable on exactly
+the corpus shape it is most needed for.** Documents ingested from a filesystem are titled with
+their filenames — ``retrieval.md``, ``storage.md`` — one word each, so every one was rejected and
+the probe was left with no items at all. It then raised :class:`ProbeUnusableError`, and the
+chance-level guard that every other number in this package depends on simply did not run. A guard
+that is silently absent on the common case is worse than a lenient one.
+
+The word count was a *proxy* for the property that actually matters — a title distinctive enough
+that the known answer is unambiguous — and that property is now checked directly, two ways: the
+extension is stripped so ``notes.md`` and ``notes.txt`` collide as they should, and any title
+resolving to more than one document is dropped. What is left is a length floor, excluding only
+titles too short to be a question at all.
+
+Admitting shorter titles admits weaker probe items, and that is the safe direction: a weak item
+can only *lower* a hit rate, and the binomial test is precisely the instrument for deciding
+whether the rate still beats chance. Refusing to generate the item settles by heuristic what the
+measurement exists to settle.
 """
 
 TITLE_PAGE = 200
@@ -342,6 +357,24 @@ def _is_hit(item: ProbeItem, results: Sequence[ResultItem]) -> bool:
     return False
 
 
+def _without_extension(title: str) -> str:
+    """``retrieval.md`` -> ``retrieval``, and ``version 2.1 notes`` unchanged.
+
+    Only a trailing dot-suffix that looks like a file extension is removed: short, alphanumeric,
+    and with something in front of it. A title is not a path, so ``pathlib`` is the wrong tool —
+    it would take ``version 2.1 notes`` down to ``version 2``, inventing a collision between two
+    documents that never shared a name.
+    """
+    stem, dot, suffix = title.rpartition(".")
+    if dot and stem and suffix.isalnum() and len(suffix) <= _EXTENSION_MAX:
+        return stem.strip()
+    return title
+
+
+_EXTENSION_MAX = 5
+"""Longest trailing suffix treated as a file extension. Covers ``json``, ``jsonl``, ``xhtml``."""
+
+
 async def probe_from_titles(
     docstore: DocStore,
     *,
@@ -354,14 +387,20 @@ async def probe_from_titles(
     a deliberately low bar — a title is the most retrievable text a document has — and a low
     bar is what a liveness check needs. Anything that fails it is not retrieving.
 
+    A **file extension is not part of the question**, so it is stripped: the query becomes
+    ``retrieval`` rather than ``retrieval.md``. That is the question a person would ask, and it
+    keeps the probe a test of retrieval rather than of whether the index happens to store a
+    filename as a literal string. Stripping also makes the uniqueness check stricter, since
+    ``notes.md`` and ``notes.txt`` now collide and are both dropped, which is correct — they were
+    always two documents with one name.
+
     Two exclusions, both because they would make a working system look broken rather than
     because they are inconvenient:
 
-    - **Titles shorter than :data:`MIN_TITLE_WORDS` words.** One word collides across
-      documents, so the "correct" answer is ambiguous and a correct result scores as a miss.
-    - **Titles that are not unique in the corpus.** Same reason, arrived at from the other
-      direction, and the version that actually bites: two documents named ``README`` make each
-      other's probe unanswerable.
+    - **Titles shorter than :data:`MIN_TITLE_CHARACTERS` characters** once the extension is off.
+      Too short to be a question, so a miss would say nothing about retrieval.
+    - **Titles that are not unique in the corpus.** The one that actually bites: two documents
+      named ``README`` make each other's probe unanswerable.
 
     Ordered by document id so the same corpus yields the same probe on every run. A probe that
     resampled would make two runs of the same configuration disagree for a reason that has
@@ -375,8 +414,8 @@ async def probe_from_titles(
         if not page:
             break
         for document in page:
-            title = (document.title or "").strip()
-            if len(title.split()) >= MIN_TITLE_WORDS:
+            title = _without_extension((document.title or "").strip())
+            if len(title) >= MIN_TITLE_CHARACTERS:
                 titles.setdefault(title, []).append(document.id)
         if len(page) < TITLE_PAGE:
             break
@@ -392,7 +431,7 @@ async def probe_from_titles(
 __all__ = [
     "DEFAULT_ALPHA",
     "DEFAULT_K",
-    "MIN_TITLE_WORDS",
+    "MIN_TITLE_CHARACTERS",
     "TITLE_PAGE",
     "DiscriminationProbe",
     "ProbeItem",

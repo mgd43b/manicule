@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import pytest
+
 from manicule.core.retrieval import Candidate, ConfidenceBand, PipelineIdentity
 from manicule.retrieval.confidence import (
     AGREEMENT,
+    NOISE_SIMILARITY,
+    NOTHING_RESEMBLES,
     RERANK,
     SIMILARITY,
     WEIGHTS,
+    rescale_similarity,
     score_confidence,
 )
 from tests.storage_helpers import make_chunk, make_document
@@ -41,8 +46,8 @@ def test_a_pipeline_with_no_reranker_cannot_reach_high() -> None:
 
     confidence = score_confidence(passages, rerank_stage=None)
 
-    assert confidence.ceiling == 0.70
-    assert confidence.score <= 0.70
+    assert confidence.ceiling == pytest.approx(0.70)
+    assert confidence.score <= confidence.ceiling
     assert confidence.band is not ConfidenceBand.HIGH
     assert RERANK in confidence.suppressed
 
@@ -67,17 +72,19 @@ def test_turning_the_reranker_off_never_raises_the_reported_confidence() -> None
     assert without.score < with_reranker.score
 
 
-def test_a_degraded_leg_suppresses_agreement_rather_than_scoring_it_zero() -> None:
-    """Confidence never blames the corpus for a fault in the pipeline.
+def test_a_leg_that_matched_nothing_is_scored_not_excused() -> None:
+    """The inversion this whole module was rewritten for.
 
-    If the lexical leg returned nothing, no passage can carry both scores — so an agreement
-    term computed as zero would report lower confidence *because the lexical index threw*,
-    which is a statement about the system dressed up as a statement about the evidence.
+    Suppression is for a leg that *failed*. A leg that ran and matched nothing has reported a
+    fact about the query, and waiving its component rewards precisely the queries that deserve
+    it least — nonsense matches no keywords, so under the old rule it paid no agreement penalty
+    at all, while a real question that matched some paid one in full.
     """
-    passages = [passage(FIRST, 0, dense=0.9), passage(SECOND, 1, dense=0.9)]
-
-    degraded = score_confidence(passages, degraded_legs=["lexical"], rerank_stage=None)
-    healthy = score_confidence(
+    matched_nothing = score_confidence(
+        [passage(FIRST, 0, dense=0.9), passage(SECOND, 1, dense=0.9)],
+        rerank_stage=None,
+    )
+    agreed = score_confidence(
         [
             passage(FIRST, 0, dense=0.9, lexical=1.0),
             passage(SECOND, 1, dense=0.9, lexical=1.0),
@@ -85,21 +92,51 @@ def test_a_degraded_leg_suppresses_agreement_rather_than_scoring_it_zero() -> No
         rerank_stage=None,
     )
 
-    assert AGREEMENT in degraded.suppressed
-    assert AGREEMENT not in degraded.components
-    assert degraded.ceiling < healthy.ceiling
-    assert degraded.score <= healthy.score
+    assert AGREEMENT not in matched_nothing.suppressed
+    assert matched_nothing.components[AGREEMENT] == 0.0
+    # Same ceiling: nothing about the *pipeline* differed between these two runs, so they are
+    # measured on the same scale — which is what makes the comparison below meaningful at all.
+    assert matched_nothing.ceiling == pytest.approx(agreed.ceiling)
+    assert matched_nothing.score < agreed.score
 
 
-def test_a_degraded_dense_leg_suppresses_similarity_by_the_same_rule() -> None:
-    """The rule generalises, and it has to: the reasoning is about the *cause*, not the term.
+def test_agreement_is_suppressed_only_when_the_pipeline_declares_one_leg() -> None:
+    """Suppression tracks the shape of the pipeline, never what one query happened to match."""
+    confidence = score_confidence(
+        [passage(FIRST, 0, dense=0.9)], legs=("dense",), rerank_stage=None
+    )
 
-    A similarity term computed as zero because the dense leg contributed nothing reports weak
-    evidence for a pipeline fault, which is exactly what the agreement rule forbids.
+    assert AGREEMENT in confidence.suppressed
+    assert AGREEMENT not in confidence.components
+
+
+def test_a_passage_the_dense_leg_never_scored_is_absent_not_zero() -> None:
+    """Not-measured and measured-zero are different claims, and averaging conflates them.
+
+    A passage the lexical leg found and the dense leg never ranked carries no similarity. Under
+    ``.get(leg, 0.0)`` it was averaged in as a zero, which asserts the dense leg looked and found
+    it orthogonal to the query. It never looked.
     """
-    passages = [passage(FIRST, 0, lexical=3.0), passage(SECOND, 1, lexical=2.0)]
+    both_scored = score_confidence(
+        [passage(FIRST, 0, dense=0.75), passage(SECOND, 1, dense=0.75)], rerank_stage=None
+    )
+    one_unscored = score_confidence(
+        [
+            passage(FIRST, 0, dense=0.75),
+            passage(SECOND, 1, dense=0.75),
+            passage(THIRD, 2, lexical=7.0),
+        ],
+        rerank_stage=None,
+    )
 
-    confidence = score_confidence(passages, degraded_legs=["dense"], rerank_stage=None)
+    assert one_unscored.components[SIMILARITY] == pytest.approx(both_scored.components[SIMILARITY])
+
+
+def test_no_passage_carrying_a_dense_score_suppresses_similarity() -> None:
+    """When nothing was measured there is nothing to average, and zero would be a claim."""
+    confidence = score_confidence(
+        [passage(FIRST, 0, lexical=3.0), passage(SECOND, 1, lexical=2.0)], rerank_stage=None
+    )
 
     assert SIMILARITY in confidence.suppressed
     assert confidence.components.get(SIMILARITY) is None
@@ -111,18 +148,81 @@ def test_negative_similarities_clamp_to_zero() -> None:
     assert confidence.components[SIMILARITY] == 0.0
 
 
-def test_support_breadth_rewards_independent_documents() -> None:
-    """One document saying so and three saying so are different claims."""
-    one = score_confidence([passage(FIRST, 0, dense=1.0, lexical=1.0)], rerank_stage=None)
-    three = score_confidence(
+def test_scattering_across_documents_does_not_raise_confidence() -> None:
+    """The term that used to run backwards, asserted in the direction it actually runs.
+
+    Counting distinct documents was meant to read as corroboration and read as diffusion
+    instead: noise scatters across a corpus and a good answer concentrates in one place, so the
+    term paid the worse result. Spread is now not evidence in either direction — only how well
+    the passages match, and whether the two legs agreed, are.
+    """
+    concentrated = score_confidence(
         [
-            passage(FIRST, 0, dense=1.0, lexical=1.0),
-            passage(SECOND, 1, dense=1.0, lexical=1.0),
-            passage(THIRD, 2, dense=1.0, lexical=1.0),
+            passage(FIRST, 0, dense=0.7, lexical=1.0),
+            passage(FIRST, 1, dense=0.7, lexical=1.0),
+            passage(FIRST, 2, dense=0.7, lexical=1.0),
         ],
         rerank_stage=None,
     )
-    assert three.score > one.score
+    scattered = score_confidence(
+        [
+            passage(FIRST, 0, dense=0.7, lexical=1.0),
+            passage(SECOND, 1, dense=0.7, lexical=1.0),
+            passage(THIRD, 2, dense=0.7, lexical=1.0),
+        ],
+        rerank_stage=None,
+    )
+
+    assert scattered.score == pytest.approx(concentrated.score)
+
+
+def test_noise_scores_below_a_weaker_but_real_match() -> None:
+    """The reported defect, reduced to its arithmetic.
+
+    Measured cosines: an unrelated query's passages sat around 0.45 and spread over four
+    documents; a real question's sat around 0.60 in a single document. The old scoring put the
+    first above the second. Nothing may do that again.
+    """
+    noise = score_confidence(
+        [
+            passage(FIRST, 0, dense=0.459),
+            passage(SECOND, 1, dense=0.458),
+            passage(THIRD, 2, dense=0.447),
+        ],
+        rerank_stage=None,
+    )
+    signal = score_confidence(
+        [
+            passage(FIRST, 0, dense=0.633),
+            passage(FIRST, 1, dense=0.619),
+            passage(FIRST, 2, dense=0.602),
+        ],
+        rerank_stage=None,
+    )
+
+    assert noise.score < signal.score
+    assert noise.band is ConfidenceBand.NONE
+    assert noise.reason == NOTHING_RESEMBLES
+
+
+def test_confidence_is_monotonic_in_similarity() -> None:
+    """A better-matched query is never reported as less confident than a worse one."""
+    scores = [
+        score_confidence(
+            [passage(FIRST, 0, dense=cosine, lexical=1.0)], rerank_stage=None
+        ).score
+        for cosine in (0.30, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80)
+    ]
+
+    assert scores == sorted(scores)
+
+
+def test_a_cosine_at_or_below_the_corpus_noise_level_contributes_nothing() -> None:
+    """Further from the query than unrelated text is not a finer grade of relevance."""
+    assert rescale_similarity(NOISE_SIMILARITY, noise=NOISE_SIMILARITY, strong=0.75) == 0.0
+    assert rescale_similarity(0.20, noise=NOISE_SIMILARITY, strong=0.75) == 0.0
+    assert rescale_similarity(0.75, noise=NOISE_SIMILARITY, strong=0.75) == 1.0
+    assert rescale_similarity(0.95, noise=NOISE_SIMILARITY, strong=0.75) == 1.0
 
 
 def test_nothing_retrieved_is_the_none_band_with_a_reason() -> None:

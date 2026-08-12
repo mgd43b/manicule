@@ -281,7 +281,7 @@ async def test_a_reranked_run_can_reach_high_confidence_and_an_unreranked_one_ca
 
     assert plain.confidence is not None
     assert reranked.confidence is not None
-    assert plain.confidence.ceiling == 0.70
+    assert plain.confidence.ceiling == pytest.approx(0.70)
     assert reranked.confidence.ceiling > plain.confidence.ceiling
     assert plain.confidence.band is not ConfidenceBand.HIGH
 

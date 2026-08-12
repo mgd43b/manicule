@@ -21,6 +21,25 @@ substring keyword coverage does no stemming and no IDF weighting, so a query for
 failure the lexical index's stemming tokenizer exists to avoid. Cross-leg agreement replaces
 it, which is the same idea asked of the leg that already solved it.
 
+**Cosine is rescaled against the corpus's noise level, because raw cosine is not centred on
+zero.** A query with no relationship to anything indexed still returns its nearest neighbours,
+and those neighbours are not far away in absolute terms: measured over a 604-chunk corpus,
+unrelated questions topped out at 0.467 while real ones started at 0.560
+(``docs/retrieval.md`` §8.4). Read raw, those two are a tenth of a point apart on a scale whose
+bands are cut at 0.20 and 0.45, so noise and signal land in the same band. Subtracting the
+measured noise level and dividing by the distance to a strong match is what makes "nothing in
+this corpus resembles your question" expressible at all — the same move the evaluation harness
+makes when it reports a hit rate against a chance rate rather than bare.
+
+**There is no support-breadth term, and removing it was a measured correction rather than a
+simplification.** Counting distinct documents was meant to separate "one document said so" from
+"several independent places said so". It cannot do that, because noise scatters across a corpus
+and a good answer concentrates in it — so the term ran *backwards*. On the pair that exposed
+this, a nonsense query reached four documents and took the full 0.15 while a correctly-focused
+answer reached one and took 0.05: a tenth of a point handed to the worse result, which was most
+of the reason the worse result outranked it. Telling corroboration from diffusion requires
+knowing whether the documents *agree*, which is an entailment check and not a count.
+
 **No fallback term.** When a component did not run, its weight is not redistributed and the
 remaining weights are not renormalised: the reachable ceiling drops instead. Substituting the
 retrieval average into the reranker's slot — the obvious-looking fix — makes retrieval count
@@ -43,23 +62,49 @@ if TYPE_CHECKING:
 
 SIMILARITY: Final = "similarity"
 AGREEMENT: Final = "agreement"
-BREADTH: Final = "breadth"
 RERANK: Final = "rerank"
 
 WEIGHTS: Final[Mapping[str, float]] = {
-    SIMILARITY: 0.40,
+    SIMILARITY: 0.55,
     AGREEMENT: 0.15,
-    BREADTH: 0.15,
     RERANK: 0.30,
 }
-"""What each admissible component is worth. They sum to 1.0 and are never renormalised."""
+"""What each admissible component is worth. They sum to 1.0 and are never renormalised.
 
-BREADTH_TARGET: Final = 3
-"""Distinct documents at which support breadth is considered full.
+Similarity carries the weight support breadth used to hold, rather than that weight being
+dropped or spread. Breadth was removed at design time because it measured the wrong direction
+(see the module docstring); its 0.15 goes to the one component that survived contact with a
+measurement. Retiring a component and *renormalising after a component is suppressed at run
+time* are different acts — the second is forbidden below and remains so.
 
-Three, not because three is special, but because the term is meant to distinguish "one
-document said so" from "several independent places said so", and beyond a handful the
-distinction stops carrying information.
+Keeping the total at 1.0 preserves the property the profiles were built around: a pipeline
+with no reranker reaches at most 0.70, so ``fast`` still cannot claim a verification step it
+skipped.
+"""
+
+NOISE_SIMILARITY: Final = 0.45
+"""Cosine at which this embedder's output stops carrying information about the query.
+
+**Measured, not inherited.** Over manicule's own documentation — 13 documents, 604 chunks,
+BGE-M3 — 21 questions drawn from subjects the corpus does not cover topped out at a top-1
+cosine of 0.467, with a median of 0.395; 16 questions the corpus does answer started at 0.560,
+median 0.636. 0.45 sits inside that gap, near the noise side of it, so a passage at or below it
+contributes nothing and a real match keeps almost all of its score.
+
+This is a property of **the embedder and the corpus**, not a universal constant: BGE-M3's
+similarities are not centred on zero for unrelated text, and a different model or a much more
+topically concentrated corpus puts the noise level somewhere else. Re-measure it the way it was
+measured — ask questions the corpus demonstrably cannot answer and read where their similarities
+land — rather than adjusting it until an example looks right.
+"""
+
+STRONG_SIMILARITY: Final = 0.75
+"""Cosine at which a passage is treated as fully on-topic.
+
+The top of the measured range rather than 1.0. Cosine 1.0 against a chunk means the query *is*
+that chunk, which no question is, so scaling to 1.0 would make a perfect retrieval report about
+0.6 and put ``high`` out of reach for reasons that have nothing to do with the evidence. The
+best observed on-corpus top-1 was 0.724.
 """
 
 BANDS: Final[tuple[tuple[float, ConfidenceBand], ...]] = (
@@ -73,14 +118,39 @@ BUDGET_CAPPED: Final = (
     "a leg stopped at its own budget rather than at the end of the corpus, so this retrieval "
     "is a floor rather than a result"
 )
+NOTHING_RESEMBLES: Final = (
+    "every passage retrieved sits at or below the level this corpus returns for a question it "
+    "has no answer to, so these are its nearest passages rather than relevant ones"
+)
+UNREACHABLE_BAND: Final = (
+    "this pipeline's suppressed components put a higher band out of reach regardless of the "
+    "evidence, so the band reports the ceiling rather than the corpus"
+)
 
 
 def band_for(score: float) -> ConfidenceBand:
-    """Which band a score falls in."""
+    """Which band a score falls in.
+
+    Deliberately **not** normalised by the run's ceiling. Dividing a score through by what the
+    arithmetic permitted would let a pipeline with no reranker reach ``high``, which is exactly
+    the claim ``fast`` must not be able to make: the profile that skips the verification step
+    must not be able to report that it verified. The ceiling is used instead by
+    :func:`reachable_band`, to say when a band was *unreachable* rather than unearned.
+    """
     for threshold, band in BANDS:
         if score >= threshold:
             return band
     return ConfidenceBand.NONE
+
+
+def reachable_band(ceiling: float) -> ConfidenceBand:
+    """The best band this run's arithmetic allowed, whatever the corpus held.
+
+    Read beside the band actually reported. "The evidence was mediocre" and "this pipeline
+    cannot report better than mediocre" are different statements that produce the same number,
+    and a reader deciding whether to trust an answer needs to know which one they have.
+    """
+    return band_for(ceiling)
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -100,14 +170,30 @@ def _sigmoid(value: float) -> float:
     return exponentiated / (1.0 + exponentiated)
 
 
+def rescale_similarity(cosine: float, *, noise: float, strong: float) -> float:
+    """Where ``cosine`` sits between "this corpus's noise" and "a strong match", in ``[0, 1]``.
+
+    The one transformation that lets an absolute cosine mean something to a reader. Raw cosine
+    understates how good a good match is and wildly overstates how good a bad one is, because
+    the scale does not start at zero: this embedder returns 0.4-odd for text with no relation to
+    the query at all. Below ``noise`` the answer is 0.0 — not a small number, because "further
+    from the query than unrelated text" is not a finer grade of relevance.
+    """
+    if strong <= noise:  # pragma: no cover - refused where the values are configured
+        msg = f"strong similarity {strong!r} must exceed noise similarity {noise!r}"
+        raise ValueError(msg)
+    return min(1.0, max(0.0, (cosine - noise) / (strong - noise)))
+
+
 def score_confidence(
     passages: Sequence[Candidate],
     *,
     identity: PipelineIdentity | None = None,
     legs: Sequence[str] = ("dense", "lexical"),
-    degraded_legs: Sequence[str] = (),
     rerank_stage: str | None = None,
     exhausted_budget: bool = False,
+    noise_similarity: float = NOISE_SIMILARITY,
+    strong_similarity: float = STRONG_SIMILARITY,
 ) -> Confidence:
     """Score the retrieval that produced ``passages``.
 
@@ -116,12 +202,12 @@ def score_confidence(
             shown, not about everything that was considered.
         identity: What produced the ranking. Travels with the score, because two scores from
             different pipelines are not two measurements of one thing.
-        legs: The retrieval legs whose agreement is being measured.
-        degraded_legs: Legs that contributed nothing. Their components are **suppressed**, not
-            scored zero — reporting lower confidence because the lexical index threw is a
-            statement about the system dressed up as a statement about the evidence.
+        legs: The retrieval legs **this pipeline declares**. Whether a leg found anything for
+            this particular query is evidence and is scored; it is not a reason to suppress.
         rerank_stage: The stage name a reranker scored under, or ``None`` if none ran.
         exhausted_budget: Whether a leg stopped at its own caps. Caps the band at ``medium``.
+        noise_similarity: Cosine at or below which a passage carries no information.
+        strong_similarity: Cosine at which a passage is fully on-topic.
 
     Returns:
         A :class:`~manicule.core.retrieval.Confidence` carrying the band, every component that
@@ -138,38 +224,54 @@ def score_confidence(
             pipeline=pipeline,
         )
 
-    healthy = [leg for leg in legs if leg not in degraded_legs]
     components: dict[str, float] = {}
     suppressed: dict[str, str] = {}
 
     dense_leg = legs[0] if legs else None
+    # Only the passages the dense leg actually scored. `.get(leg, 0.0)` was the bug this
+    # replaces: a passage the lexical leg found and the dense leg never ranked has *no*
+    # measured similarity, and reading the absent key as 0.0 asserts the dense leg looked at it
+    # and found it orthogonal to the query. It did not look. On the query that exposed this,
+    # BM25's top hit was averaged in as a zero and cost the best answer in the corpus a twentieth
+    # of a point — the not-measured-versus-measured-zero conflation this module forbids one
+    # component along, committed here in a default argument.
+    scored = (
+        [candidate.scores[dense_leg] for candidate in passages if dense_leg in candidate.scores]
+        if dense_leg is not None
+        else []
+    )
     if dense_leg is None:
         # A pipeline with no fusion names no legs, so nothing here has a similarity to average.
-        # Suppressed rather than scored zero, for the same reason a degraded leg is: a zero
-        # would report weak evidence for what is a property of the pipeline.
+        # Suppressed rather than scored zero: a zero would report weak evidence for what is a
+        # property of the pipeline.
         suppressed[SIMILARITY] = (
             "this pipeline declares no retrieval legs to read a similarity from"
         )
-    elif dense_leg in degraded_legs:
+    elif not scored:
         suppressed[SIMILARITY] = (
-            f"the {dense_leg!r} leg contributed nothing, so no passage carries a similarity "
-            f"this run could average"
+            f"no passage in the context carries a {dense_leg!r} score, so there is no similarity "
+            f"this run could average — absent, not zero"
         )
     else:
-        similarities = [max(candidate.scores.get(dense_leg, 0.0), 0.0) for candidate in passages]
-        components[SIMILARITY] = _mean(similarities)
+        components[SIMILARITY] = rescale_similarity(
+            _mean([max(value, 0.0) for value in scored]),
+            noise=noise_similarity,
+            strong=strong_similarity,
+        )
 
-    if len(healthy) < len(legs) or len(legs) < 2:  # noqa: PLR2004 - agreement needs two legs
+    # Suppressed on the shape of the *pipeline*, never on what this query happened to match. A
+    # lexical leg that ran and matched nothing has reported a fact about the query, and waiving
+    # the agreement term for it rewards exactly the queries that deserve it least: a nonsense
+    # query matches no keywords, so it would pay no agreement penalty while a real question that
+    # matched some would pay one in full.
+    if len(legs) < 2:  # noqa: PLR2004 - agreement needs two legs to compare
         suppressed[AGREEMENT] = (
-            "fewer than two legs contributed, so no passage could carry both scores and a "
-            "zero here would blame the corpus for a fault in the pipeline"
+            "this pipeline declares fewer than two retrieval legs, so no passage could carry "
+            "two scores and a zero here would describe the pipeline rather than the evidence"
         )
     else:
         agreeing = sum(1 for candidate in passages if all(leg in candidate.scores for leg in legs))
         components[AGREEMENT] = agreeing / len(passages)
-
-    documents = {candidate.chunk.document_id for candidate in passages}
-    components[BREADTH] = min(len(documents) / BREADTH_TARGET, 1.0)
 
     if rerank_stage is None:
         suppressed[RERANK] = (
@@ -194,11 +296,23 @@ def score_confidence(
     ceiling = sum(WEIGHTS[name] for name in components)
     band = band_for(score)
     reason = ""
+    # Ordered least to most specific, so the most informative reason is the one that survives
+    # into a single `reason` field. A run that both stopped at its budget and retrieved nothing
+    # resembling the query should say the second: "we did not finish looking" matters far less
+    # than "what we found is what this corpus returns for a question it cannot answer", and the
+    # budget shortfall is still on the trace either way.
+    if band is not ConfidenceBand.NONE and reachable_band(ceiling) is band:
+        reason = UNREACHABLE_BAND
     if exhausted_budget and band is ConfidenceBand.HIGH:
         band = ConfidenceBand.MEDIUM
         reason = BUDGET_CAPPED
     elif exhausted_budget:
         reason = BUDGET_CAPPED
+    # The `none` band now *means* this, whenever similarity was actually measured: the rescale
+    # puts a passage at the corpus's noise level at zero, so a run that lands here retrieved
+    # nothing that stands above what an unanswerable question returns.
+    if band is ConfidenceBand.NONE and SIMILARITY in components:
+        reason = NOTHING_RESEMBLES
 
     return Confidence(
         score=score,
@@ -214,13 +328,17 @@ def score_confidence(
 __all__ = [
     "AGREEMENT",
     "BANDS",
-    "BREADTH",
-    "BREADTH_TARGET",
     "BUDGET_CAPPED",
+    "NOISE_SIMILARITY",
+    "NOTHING_RESEMBLES",
     "NOTHING_RETRIEVED",
     "RERANK",
     "SIMILARITY",
+    "STRONG_SIMILARITY",
+    "UNREACHABLE_BAND",
     "WEIGHTS",
     "band_for",
+    "reachable_band",
+    "rescale_similarity",
     "score_confidence",
 ]
