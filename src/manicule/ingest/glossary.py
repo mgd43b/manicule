@@ -230,6 +230,40 @@ class _Candidate:
         self.extra = extra
 
 
+_LEADING_ARTICLES: Final[frozenset[str]] = frozenset({"a", "an", "the", "our", "its", "this"})
+"""Words that begin the sentence rather than the term.
+
+``The Network Operations Workspace (NOW)`` defines three words, not four, and a detector that
+kept the article would store an expansion no document ever writes and no query ever matches.
+"""
+
+
+def _phrase_before(captured: str, acronym: str) -> str:
+    """Which words of ``captured`` are the term, rather than the sentence around it.
+
+    A parenthetical has no left-hand delimiter — the regular expression has to guess where the
+    phrase starts, and it guesses greedily, so ``The Network Operations Workspace (NOW)`` yields
+    a four-word expansion for a three-letter acronym.
+
+    Resolved by asking the acronym: the **shortest** suffix whose initials spell it is the
+    phrase the writer meant. Shortest rather than longest, and that is the whole of the fix —
+    ``initials_match`` skips function words, so ``The Network Operations Workspace`` spells
+    ``NOW`` just as well as ``Network Operations Workspace`` does, and taking the first match
+    from the left keeps the article every time.
+
+    When nothing spells it, the leading article is dropped and the rest is kept, because an
+    article is never part of a term and everything else might be.
+    """
+    words = captured.split()
+    for length in range(1, len(words) + 1):
+        candidate = " ".join(words[len(words) - length :])
+        if initials_match(acronym, candidate):
+            return candidate
+    while words and words[0].casefold() in _LEADING_ARTICLES:
+        words = words[1:]
+    return " ".join(words)
+
+
 def _from_line(line: str, previous: str) -> list[_Candidate]:
     """Every definition one line offers, in the order the forms are tried.
 
@@ -267,7 +301,7 @@ def _from_line(line: str, previous: str) -> list[_Candidate]:
             found.append(
                 _Candidate(
                     terms[0],
-                    parenthetical["expansion"],
+                    _phrase_before(parenthetical["expansion"], terms[0]),
                     DefinitionForm.PARENTHETICAL,
                     tuple(terms[1:]),
                 )
@@ -276,8 +310,16 @@ def _from_line(line: str, previous: str) -> list[_Candidate]:
     return found
 
 
-def _heading_definitions(lines: Sequence[str]) -> list[_Candidate]:
-    """Headings that name a term, with the expansion in the first line beneath them."""
+def _heading_definitions(lines: Sequence[str], breadcrumb: Sequence[str]) -> list[_Candidate]:
+    """Headings that name a term, with the expansion in the text beneath them.
+
+    **Two routes, because a heading reaches a chunk two ways.** Plain text and Markdown that a
+    parser left alone keep the ``### NOW`` line, so the first route reads it out of the text.
+    But the structural chunker lifts headings into
+    :attr:`~manicule.core.content.Chunk.heading_path` and the ``#`` never appears in
+    :attr:`~manicule.core.content.Chunk.text` at all — so on the corpus this feature is actually
+    for, a detector with only the first route finds nothing and looks like it works.
+    """
     found: list[_Candidate] = []
     for index, line in enumerate(lines):
         heading = _HEADING_RE.match(line)
@@ -288,6 +330,11 @@ def _heading_definitions(lines: Sequence[str]) -> list[_Candidate]:
             found.append(
                 _Candidate(heading["term"].strip(), body, DefinitionForm.HEADING),
             )
+
+    innermost = breadcrumb[-1].strip() if breadcrumb else ""
+    body = next((line for line in lines if line.strip()), "")
+    if innermost and body and not _HEADING_RE.match(body):
+        found.append(_Candidate(innermost, body, DefinitionForm.HEADING))
     return found
 
 
@@ -305,7 +352,7 @@ def detect_in_chunk(chunk: Chunk, *, glossary_context: bool = False) -> list[Glo
     context = glossary_context or _mentions_glossary(chunk.heading_path, lines[:1])
     location = " > ".join(chunk.heading_path)
 
-    candidates = _heading_definitions(lines)
+    candidates = _heading_definitions(lines, chunk.heading_path)
     previous = ""
     for line in lines:
         candidates.extend(_from_line(line, previous))

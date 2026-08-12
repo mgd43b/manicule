@@ -64,7 +64,32 @@ They are not thereby ignored. The expanded query carries the whole filter into t
 unchanged, and the retriever checks a promoted definition passage against them before it may
 be returned — so a chunk-level restriction still decides what comes back, which is what it is
 for.
+
+The two fields are **projected out before the guard runs**, exactly as
+:func:`~manicule.retrieval.prefilter.join_filter` projects them out before a query over
+``documents``. That is the difference between "honoured" and "ignored", and it is the whole
+reason this is written as a narrower filter rather than as a larger set of excuses: nothing
+here is handed a restriction it then declines to apply.
 """
+
+
+def vocabulary_filter(source: Filter) -> Filter:
+    """The document-level half of ``source``: what a vocabulary lookup can apply.
+
+    The same move :func:`~manicule.retrieval.prefilter.join_filter` makes, for the same reason
+    and with the same consequence — the guard below then sees a filter every field of which
+    this query really does honour.
+    """
+    return Filter(
+        workspace_ids=source.workspace_ids,
+        document_ids=source.document_ids,
+        sources=source.sources,
+        media_types=source.media_types,
+        collection_ids=source.collection_ids,
+        tag_ids=source.tag_ids,
+        updated_after=source.updated_after,
+        updated_before=source.updated_before,
+    )
 
 
 @runtime_checkable
@@ -126,6 +151,7 @@ class GlossaryMixin(WorkspaceScoped):
                 await self._clear_entries(session, document_id)
                 return
             await self._clear_entries(session, document_id)
+            aliases: list[tuple[str, str]] = []
             for entry in entries:
                 entry_id = glossary_entry_id(entry.chunk_id, entry.acronym, entry.expansion)
                 session.add(
@@ -141,8 +167,16 @@ class GlossaryMixin(WorkspaceScoped):
                         confidence=entry.confidence,
                     )
                 )
-                for alias in dict.fromkeys(entry.aliases):
-                    session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
+                aliases += [(entry_id, alias) for alias in dict.fromkeys(entry.aliases)]
+            # Flushed before the aliases, explicitly. The unit of work orders inserts by table
+            # dependency only where a mapper *relationship* declares one, and there is none here
+            # — deliberately, because an alias is a lookup key rather than an object anybody
+            # navigates to. Without this the alias row reaches SQLite first and the foreign key
+            # rejects it, which is how the parenthetical form's second short form was found to
+            # be unwritable at all.
+            await session.flush()
+            for entry_id, alias in aliases:
+                session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
 
     async def _clear_entries(self, session: AsyncSession, document_id: str) -> None:
         await session.execute(
@@ -183,12 +217,13 @@ class GlossaryMixin(WorkspaceScoped):
             CrossWorkspaceCollisionError: The filter names another workspace.
             ValueError: The filter restricts on a field this lookup cannot honour.
         """
-        self._require_honourable(filter, VOCABULARY_FILTER_FIELDS, "look glossary terms up")
+        scoped = vocabulary_filter(filter)
+        self._require_honourable(scoped, VOCABULARY_FILTER_FIELDS, "look glossary terms up")
         wanted = [key for key in dict.fromkeys(keys) if key]
         if not wanted:
             return []
 
-        resolved = await resolve_filter(filter, collections=self, tags=self)  # pyright: ignore[reportArgumentType]
+        resolved = await resolve_filter(scoped, collections=self, tags=self)  # pyright: ignore[reportArgumentType]
         if resolved is None:
             # The filter named a collection or tag holding nothing. No document is in scope, so
             # no vocabulary is either — collapsing this to "no restriction" would let an empty
@@ -300,4 +335,9 @@ class GlossaryMixin(WorkspaceScoped):
         ]
 
 
-__all__ = ["VOCABULARY_FILTER_FIELDS", "GlossaryMixin", "ListsDocuments"]
+__all__ = [
+    "VOCABULARY_FILTER_FIELDS",
+    "GlossaryMixin",
+    "ListsDocuments",
+    "vocabulary_filter",
+]

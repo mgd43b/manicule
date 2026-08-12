@@ -268,6 +268,73 @@ class SearchHit(Anchored):
     token_count: int = 0
 
 
+class GlossaryExpansion(Payload):
+    """A glossary term the query named, expanded, with where the definition came from.
+
+    **The provenance fields have no defaults**, and that is the requirement rather than a
+    style choice. ``bugs/bug2.md`` §3 forbids presenting an expansion without citation
+    provenance, so the payload is built so there is no shape of it that omits the source: a
+    surface cannot forget to include the document, because pydantic will not construct one
+    without it.
+
+    Not an :class:`Anchored`. An anchor describes a *quotation*, and this is not one — nothing
+    here is a passage of text, so an anchor on it would be a location for a span that is never
+    shown. :attr:`chunk_id` is the citation, and it resolves through exactly the machinery every
+    other citation resolves through.
+    """
+
+    document_id: str
+    chunk_id: str
+    uri: str
+    title: str
+
+    acronym: str
+    """The normalised key that fired — ``NOW``."""
+
+    display: str
+    """The term as the source document writes it. Shown in preference to the normalised key,
+    so a reader sees the document's own words rather than ours."""
+
+    expansion: str
+    matched: str = Field(
+        default="", description="The token as the query wrote it, which may differ in case."
+    )
+    reason: str = Field(
+        default="",
+        description="Which rule admitted the occurrence: an exact-case match, a definitional "
+        "question, or a term that is not an ordinary English word. Surfaced because these are "
+        "the rules that stop the feature rewriting every use of a common word, and a rule "
+        "nobody can see fire is a rule nobody can check.",
+    )
+    form: str = Field(default="", description="The written form the definition was read in.")
+    detection_confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="How strongly the source text reads as a definition. Never a claim about "
+        "whether the definition is correct.",
+    )
+    location: str = Field(default="", description="Where in the document, in its own terms.")
+
+
+class GlossaryConflict(Payload):
+    """One term with more than one definition in scope, and every candidate.
+
+    Reported instead of an expansion, never alongside one. A surface that showed a conflict and
+    an expansion for the same term would be presenting a choice it had already made.
+    """
+
+    acronym: str
+    matched: str = ""
+    candidates: tuple[GlossaryExpansion, ...] = Field(
+        default=(),
+        min_length=2,
+        description="Every definition in scope, each with its own provenance. At least two, "
+        "because one is not a conflict — and the whole value of this field is that a reader "
+        "can go and look at both documents.",
+    )
+
+
 class SearchResult(Payload):
     """What ``search`` produced."""
 
@@ -278,6 +345,13 @@ class SearchResult(Payload):
     confidence: float | None = None
     confidence_band: str | None = None
     confidence_reason: str = ""
+    expansions: tuple[GlossaryExpansion, ...] = ()
+    conflicts: tuple[GlossaryConflict, ...] = ()
+    expanded_query: str = Field(
+        default="",
+        description="The second query form glossary lookup produced, or empty when none did. "
+        "The original is :attr:`query` and is never replaced.",
+    )
     route: str = ""
     cached: bool = False
     truncated: bool = False
@@ -316,6 +390,14 @@ class AnswerResultPayload(Payload):
     confidence: float | None = None
     confidence_band: str | None = None
     confidence_reason: str = ""
+    expansions: tuple[GlossaryExpansion, ...] = Field(
+        default=(),
+        description="Glossary terms the question named, each with the document and passage its "
+        "definition was read out of. An answer that was retrieved through an expansion has to "
+        "be able to say so: the reader is entitled to know that the search ran on words they "
+        "did not type, and which document put them there.",
+    )
+    conflicts: tuple[GlossaryConflict, ...] = ()
     corpus_consulted: bool = True
     ungrounded: bool = False
     context_truncated: bool = False
@@ -1248,6 +1330,8 @@ __all__ = [
     "ErrorInfo",
     "ExportReport",
     "FeedbackRecorded",
+    "GlossaryConflict",
+    "GlossaryExpansion",
     "Identity",
     "ImportReport",
     "IndexStatus",

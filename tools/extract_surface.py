@@ -65,9 +65,7 @@ def db_columns(root: Path) -> list[str]:
     out = []
     for f in sorted((root / "packages/core/src/storage/migrations").glob("*.sql")):
         src = read(f)
-        for m in re.finditer(
-            r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)\s*\((.*?)\n\s*\);", src, re.S
-        ):
+        for m in re.finditer(r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)\s*\((.*?)\n\s*\);", src, re.S):
             table, body = m.group(1), m.group(2)
             for line in body.splitlines():
                 line = line.strip().rstrip(",")
@@ -128,7 +126,6 @@ def core_exports(root: Path) -> list[str]:
     return out
 
 
-
 # Subsystems whose behaviour is deliberately not ported.
 SKIP = ("web/src/lib/i18n",)  # internationalisation is out of scope
 
@@ -144,8 +141,12 @@ def behaviours(root: Path) -> list[str]:
     invisible: every behaviour gets a row that must be ticked or struck.
     """
     out = []
-    roots = [root / "packages/core/src", root / "packages/server/src",
-             root / "packages/cli/src", root / "packages/client/src"]
+    roots = [
+        root / "packages/core/src",
+        root / "packages/server/src",
+        root / "packages/cli/src",
+        root / "packages/client/src",
+    ]
     for base in roots:
         pkg = base.parent.name
         for f in sorted(base.rglob("*.ts")):
@@ -155,7 +156,9 @@ def behaviours(root: Path) -> list[str]:
             src = read(f)
             syms = re.findall(
                 r"^export\s+(?:async\s+)?(?:function|class|const|interface|type|enum)\s+(\w+)",
-                src, re.M)
+                src,
+                re.M,
+            )
             for sym in syms:
                 out.append(f"`{pkg}/{rel}` → `{sym}`")
     for f in sorted(root.glob("plugins/*/src/index.ts")):
@@ -163,6 +166,7 @@ def behaviours(root: Path) -> list[str]:
         for sym in re.findall(r"^export\s+(?:default\s+)?class\s+(\w+)", src, re.M):
             out.append(f"`{f.parent.parent.name}` → `{sym}`")
     return out
+
 
 # What a user can do. This is the parity target.
 CAPABILITIES = [

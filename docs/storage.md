@@ -159,7 +159,8 @@ class UtcDateTime(TypeDecorator[datetime]):
     impl, cache_ok = DateTime, True
 
     def process_bind_param(self, value, dialect):
-        if value is None: return None
+        if value is None:
+            return None
         if value.tzinfo is None:
             raise ValueError("naive datetime rejected; pass an aware UTC value")
         return value.astimezone(UTC).replace(tzinfo=None)
@@ -249,39 +250,39 @@ for data the vector store has no reason to hold.
 class Document(Base):
     __tablename__ = "documents"
 
-    id:            Mapped[str]  = mapped_column(Text, primary_key=True)
-    workspace_id:  Mapped[str]  = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"))
-    connector_id:  Mapped[str]  = mapped_column(ForeignKey("connectors.id", ondelete="RESTRICT"))
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"))
+    connector_id: Mapped[str] = mapped_column(ForeignKey("connectors.id", ondelete="RESTRICT"))
 
-    source:        Mapped[str]  = mapped_column(Text)          # "confluence", "filesystem"
-    source_id:     Mapped[str]  = mapped_column(Text)          # connector-stable identity
-    uri:           Mapped[str]  = mapped_column(Text)          # citable location; mutable
-    title:         Mapped[str]  = mapped_column(Text)
-    media_type:    Mapped[str | None]
-    size_bytes:    Mapped[int | None]
+    source: Mapped[str] = mapped_column(Text)  # "confluence", "filesystem"
+    source_id: Mapped[str] = mapped_column(Text)  # connector-stable identity
+    uri: Mapped[str] = mapped_column(Text)  # citable location; mutable
+    title: Mapped[str] = mapped_column(Text)
+    media_type: Mapped[str | None]
+    size_bytes: Mapped[int | None]
 
-    content_hash:  Mapped[str | None]                          # sha256 of fetched bytes
-    version_token: Mapped[str | None]                          # opaque, connector-defined
-    original_ref:  Mapped[str | None] = mapped_column(ForeignKey("blobs.hash", ondelete="RESTRICT"))
+    content_hash: Mapped[str | None]  # sha256 of fetched bytes
+    version_token: Mapped[str | None]  # opaque, connector-defined
+    original_ref: Mapped[str | None] = mapped_column(ForeignKey("blobs.hash", ondelete="RESTRICT"))
     original_omitted_reason: Mapped[str | None]
 
-    container_id:  Mapped[str | None] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    container_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
     container_depth: Mapped[int] = mapped_column(default=0)
 
-    status:        Mapped[DocumentStatus]
+    status: Mapped[DocumentStatus]
     error_message: Mapped[str | None]
-    parser:        Mapped[str | None]
+    parser: Mapped[str | None]
     parse_duration_ms: Mapped[int | None]
 
-    parse_fp:      Mapped[str | None]                          # canonical, §6.4
-    chunk_fp:      Mapped[str | None]                          # short hash, §6.4
-    embed_fp:      Mapped[str | None]
+    parse_fp: Mapped[str | None]  # canonical, §6.4
+    chunk_fp: Mapped[str | None]  # short hash, §6.4
+    embed_fp: Mapped[str | None]
 
-    metadata_:     Mapped[dict] = mapped_column("metadata", JSON, default=dict)
-    created_at:    Mapped[datetime]
-    updated_at:    Mapped[datetime]
-    indexed_at:    Mapped[datetime | None]
-    deleted_at:    Mapped[datetime | None]
+    metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+    indexed_at: Mapped[datetime | None]
+    deleted_at: Mapped[datetime | None]
 ```
 
 **Identity is `(workspace_id, source, source_id)`, and the workspace is part of the id
@@ -322,8 +323,14 @@ nothing and cannot fail that way. `uri` remains, because a citation needs somewh
 > and still free.
 
 ```python
-Index("uq_documents_identity", "workspace_id", "connector_id", "source_id",
-      unique=True, sqlite_where=text("deleted_at IS NULL"))
+Index(
+    "uq_documents_identity",
+    "workspace_id",
+    "connector_id",
+    "source_id",
+    unique=True,
+    sqlite_where=text("deleted_at IS NULL"),
+)
 ```
 
 A **partial** unique index, because a soft-deleted document must not block re-ingesting the
@@ -444,23 +451,23 @@ corpus that looks freshly revised because somebody re-ran an import. `indexed_at
 class Chunk(Base):
     __tablename__ = "chunks"
 
-    seq:          Mapped[int] = mapped_column(Integer, primary_key=True)   # rowid alias
-    id:           Mapped[str] = mapped_column(Text, unique=True)
-    document_id:  Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True)  # rowid alias
+    id: Mapped[str] = mapped_column(Text, unique=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
 
-    text:         Mapped[str]                     # cited and shown
-    embed_text:   Mapped[str]                     # exactly what the embedder saw
-    heading_text: Mapped[str]                     # " > "-joined breadcrumb, indexed by FTS
+    text: Mapped[str]  # cited and shown
+    embed_text: Mapped[str]  # exactly what the embedder saw
+    heading_text: Mapped[str]  # " > "-joined breadcrumb, indexed by FTS
     heading_path: Mapped[list[str]] = mapped_column(JSON)
 
-    kind:         Mapped[BlockKind]               # prose|heading|table|code|list|panel|media
-    lang:         Mapped[str | None]
-    position:     Mapped[int]
-    token_count:  Mapped[int]
+    kind: Mapped[BlockKind]  # prose|heading|table|code|list|panel|media
+    lang: Mapped[str | None]
+    position: Mapped[int]
+    token_count: Mapped[int]
 
-    anchor:       Mapped[dict] = mapped_column(JSON)   # tagged union, contracts.md §1
-    metadata_:    Mapped[dict] = mapped_column("metadata", JSON, default=dict)
-    created_at:   Mapped[datetime]
+    anchor: Mapped[dict] = mapped_column(JSON)  # tagged union, contracts.md §1
+    metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime]
 ```
 
 **`embed_text` is stored, not recomputed.** It is derivable from `heading_text` and `text`
@@ -501,7 +508,7 @@ second half of that predicate.
 ### 4.5 `blobs`
 
 ```python
-hash: Mapped[str] = mapped_column(Text, primary_key=True)   # sha256 hex of original bytes
+hash: Mapped[str] = mapped_column(Text, primary_key=True)  # sha256 hex of original bytes
 algo / media_type / size_bytes / stored_bytes / compression / created_at
 ```
 
@@ -514,11 +521,11 @@ questions and `doctor` reports both.
 A singleton. One row, enforced.
 
 ```python
-id:                Mapped[int] = mapped_column(primary_key=True)  # CHECK (id = 1)
-vector_table:      Mapped[str]                # e.g. "chunks__7f3a91c2"
-embed_fingerprint: Mapped[str] = mapped_column(Text)   # canonical bytes, verbatim
+id: Mapped[int] = mapped_column(primary_key=True)  # CHECK (id = 1)
+vector_table: Mapped[str]  # e.g. "chunks__7f3a91c2"
+embed_fingerprint: Mapped[str] = mapped_column(Text)  # canonical bytes, verbatim
 chunk_fingerprint: Mapped[str] = mapped_column(Text)
-fts_tokenizer:     Mapped[str]                # "porter unicode61 remove_diacritics 2"
+fts_tokenizer: Mapped[str]  # "porter unicode61 remove_diacritics 2"
 created_at / updated_at
 ```
 
@@ -539,10 +546,12 @@ nothing.
 
 ```python
 def canonical(fp: Mapping[str, object]) -> bytes:
-    return json.dumps(fp, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=True, allow_nan=False).encode("ascii")
+    return json.dumps(
+        fp, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+    ).encode("ascii")
 
-fp8 = hashlib.sha256(canonical(fp)).hexdigest()[:8]   # the §6.5 table-name suffix
+
+fp8 = hashlib.sha256(canonical(fp)).hexdigest()[:8]  # the §6.5 table-name suffix
 ```
 
 `sort_keys` makes it order-independent; `separators` pins whitespace rather than describing it;
@@ -607,8 +616,9 @@ Four things `env.py` must do:
 
 ```python
 async def run_migrations_online() -> None:
-    engine = async_engine_from_config(config.get_section(config.config_ini_section),
-                                      poolclass=pool.NullPool)
+    engine = async_engine_from_config(
+        config.get_section(config.config_ini_section), poolclass=pool.NullPool
+    )
     async with engine.connect() as conn:
         await conn.run_sync(do_run_migrations)
 ```
@@ -623,11 +633,11 @@ project discovers, months in, that it cannot migrate:
 
 ```python
 NAMING = {
-  "ix": "ix_%(table_name)s_%(column_0_N_name)s",
-  "uq": "uq_%(table_name)s_%(column_0_N_name)s",
-  "ck": "ck_%(table_name)s_%(constraint_name)s",
-  "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
-  "pk": "pk_%(table_name)s",
+    "ix": "ix_%(table_name)s_%(column_0_N_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_N_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
 }
 ```
 

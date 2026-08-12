@@ -34,6 +34,7 @@ from manicule.core.anchors import HeadingAnchor
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus
 from manicule.core.embedding import IndexFingerprints
 from manicule.core.errors import NameInUseError, UnknownEntityError
+from manicule.core.glossary import QueryExpansion
 from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.core.organisation import Collection as DocumentCollection
 from manicule.core.organisation import CollectionRule, Restoration, Tag, TrashEntry
@@ -681,6 +682,11 @@ class FakeRetriever:
 
     candidates: list[Candidate] = field(default_factory=list[Candidate])
     seen: list[Query] = field(default_factory=list[Query])
+    expansion: QueryExpansion | None = None
+    """What the glossary said, when a test is about that.
+
+    ``None`` by default, which is what a directly-routed query carries — so every test that
+    does not care about the glossary exercises the branch where there is nothing to report."""
 
     async def retrieve(self, query: Query) -> RetrievalResult:
         self.seen.append(query)
@@ -690,6 +696,7 @@ class FakeRetriever:
             confidence=Confidence(
                 score=0.5, band=ConfidenceBand.MEDIUM, reason="a fake, so this is a constant"
             ),
+            expansion=self.expansion,
         )
 
 

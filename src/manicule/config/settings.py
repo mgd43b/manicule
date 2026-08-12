@@ -846,7 +846,7 @@ class ContextSettings(Section):
 
 
 class GlossarySettings(Section):
-    """Glossary-aware entity and acronym retrieval (``docs/retrieval.md`` §12).
+    """Glossary-aware entity and acronym retrieval (``docs/retrieval.md`` §14).
 
     Two settings decide whether a query is expanded and one decides whether an already-indexed
     definition is trusted enough to expand it. There is deliberately **no** setting that

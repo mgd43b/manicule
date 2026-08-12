@@ -172,7 +172,7 @@ before:store   after:store
 class Middleware(Protocol):
     stage: PipelineStage
     order: int
-    mutates_embedded_text: bool          # §3.3
+    mutates_embedded_text: bool  # §3.3
 
     async def run(self, value: T) -> T: ...
 ```
@@ -271,8 +271,8 @@ So the capability boundary is expressed in the type rather than in prose. `Chunk
 
 ```python
 class Chunk(BaseModel):
-    text:       str = Field(frozen=True)   # citable; immutable after parse
-    embed_text: str                        # mutable, and a fingerprint input
+    text: str = Field(frozen=True)  # citable; immutable after parse
+    embed_text: str  # mutable, and a fingerprint input
 ```
 
 That stops in-place mutation. It does not stop a middleware constructing replacement `Chunk`

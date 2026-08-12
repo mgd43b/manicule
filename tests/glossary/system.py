@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
     from manicule.core.content import Chunk, Document
     from manicule.core.protocols import Embedder
+    from manicule.retrieval.ports import GlossarySource
     from manicule.storage.docstore import SqliteDocStore
 
 WORKSPACE = "default"
@@ -82,9 +83,7 @@ async def index(
     return document, chunks
 
 
-async def build_corpus(
-    store: SqliteDocStore, *, workspace_id: str = WORKSPACE
-) -> list[Chunk]:
+async def build_corpus(store: SqliteDocStore, *, workspace_id: str = WORKSPACE) -> list[Chunk]:
     """The whole fixture: one glossary page, forty-five ordinary uses, fifteen usages."""
     chunks: list[Chunk] = []
     _, glossary = await index(
@@ -112,7 +111,7 @@ async def retriever_over(
     chunks: Sequence[Chunk],
     *,
     policy: ExpansionPolicy | None = None,
-    glossary: bool = True,
+    glossary: GlossarySource | bool = True,
     cache: L1QueryCache | None = None,
 ) -> Retriever:
     """The shipped retriever, dense + lexical + RRF, over ``chunks``.
@@ -120,6 +119,11 @@ async def retriever_over(
     ``glossary=False`` builds the **baseline**: the identical pipeline with no glossary source
     wired at all. That is what makes the before-and-after comparison a comparison of one thing
     — a baseline built by also changing the stage list, the profile or the store would not be.
+
+    ``glossary=<a source>`` substitutes one, which is how the leaky one is exercised. It is
+    matched with ``is True`` rather than by truthiness, and that is a fix rather than fussiness:
+    the first version tested ``if glossary``, so passing a source silently selected the real
+    store instead and a tenancy test passed while checking the wrong object entirely.
     """
     vectors = CosineVectorStore()
     await vectors.ensure_ready(embedder.fingerprint)
@@ -138,9 +142,17 @@ async def retriever_over(
         legs=fusion.legs,
         rrf_k=fusion.k,
         embed_fingerprint=embedder.fingerprint.canonical(),
-        glossary=store if glossary else None,
+        glossary=_source(store, glossary),
         expansion=policy or ExpansionPolicy(),
     )
+
+
+def _source(store: SqliteDocStore, glossary: GlossarySource | bool) -> GlossarySource | None:
+    if glossary is True:
+        return store
+    if glossary is False:
+        return None
+    return glossary
 
 
 def query_filter(*, workspace_id: str = WORKSPACE, **fields: object) -> Filter:

@@ -84,6 +84,7 @@ def render_answer(
     streamed — so printing it a second time would show a reader the same paragraph twice and
     leave them wondering which one to trust.
     """
+    _render_glossary(out, payload.expansions, payload.conflicts)
     if payload.text and not text_already_shown:
         out.print(Panel(Text(payload.text), title="answer", border_style="cyan"))
     if payload.error:
@@ -120,8 +121,52 @@ def render_answer(
     _render_confidence_reason(out, payload.confidence_band, payload.confidence_reason)
 
 
+def _render_glossary(
+    out: Console,
+    expansions: Sequence[r.GlossaryExpansion],
+    conflicts: Sequence[r.GlossaryConflict],
+    expanded_query: str = "",
+) -> None:
+    """Say which words the search actually ran on, and where they came from.
+
+    Printed **before** the results rather than in the summary line, because it changes how the
+    results should be read: a reader looking at passages retrieved partly through words they
+    did not type needs to know that before they read them, not after.
+
+    Every line names its source. That is not presentation — ``bugs/bug2.md`` §3 forbids showing
+    an expansion without its provenance, and this is the surface where the rule is easiest to
+    break by writing one fewer field.
+    """
+    for expansion in expansions:
+        out.print(
+            f"[cyan]{escape(expansion.display)}[/cyan] expands to "
+            f"[bold]{escape(expansion.expansion)}[/bold]"
+            f"[dim] — defined in {escape(expansion.title or expansion.uri)}"
+            f"{', ' + escape(expansion.location) if expansion.location else ''}"
+            f" ({escape(expansion.reason)})[/dim]"
+        )
+    if expanded_query:
+        out.print(f"[dim]also searched: {escape(expanded_query)}[/dim]")
+    for conflict in conflicts:
+        # Never resolved, here or anywhere. Both definitions are printed with their sources so
+        # the reader picks; choosing one and showing it as *the* expansion is the failure this
+        # whole feature is most able to cause.
+        out.print(
+            f"[yellow]{escape(conflict.acronym)} has "
+            f"{len(conflict.candidates)} conflicting definitions in scope, so it was not "
+            f"expanded:[/yellow]"
+        )
+        for candidate in conflict.candidates:
+            out.print(
+                f"  [dim]·[/dim] {escape(candidate.expansion)}"
+                f"[dim] — {escape(candidate.title or candidate.uri)}"
+                f"{', ' + escape(candidate.location) if candidate.location else ''}[/dim]"
+            )
+
+
 def render_search(out: Console, payload: r.SearchResult) -> None:
     """Ranked passages, most relevant first."""
+    _render_glossary(out, payload.expansions, payload.conflicts, payload.expanded_query)
     if not payload.hits:
         # "nothing matched" is the same sentence whether the corpus is empty or the query
         # simply missed, and those need opposite things from the reader. The payload carries

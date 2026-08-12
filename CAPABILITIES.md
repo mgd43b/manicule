@@ -322,6 +322,10 @@ is a feature list entry, not a feature.
   and so an anchor can be verified against the document it was made from.
 - `rag.chunker`, `rag.pipeline`, `rag.reranker` — a retrieval pipeline is a declared list of
   stages, so two pipelines can be compared by configuration rather than by editing code.
+- `rag.glossary.*` — glossary-aware acronym retrieval: whether ingest reads definitions out of
+  documents, whether a query naming one is expanded, how confident an entry has to be before a
+  query acts on it, and which extra words to treat as ordinary English. There is deliberately no
+  setting that resolves a conflict between two definitions; conflicts are always reported.
 - `plugins.config` — per-component settings, validated against each component's own model.
 - `embedding.cache_entries` — keyed by model identity, so a model change can never serve
   vectors made by the previous one.

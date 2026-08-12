@@ -74,7 +74,7 @@ def bundle_root() -> Path:
     return Path(__file__).parent / "bundle"
 '''
 
-PACKAGE_METADATA = '''\
+PACKAGE_METADATA = """\
 # Written by tools/build_grammar_bundle.py. Edit the builder, not this file: it is rewritten
 # every time a bundle is built, and a hand-edit here would describe a bundle nobody has.
 [build-system]
@@ -101,7 +101,7 @@ packages = ["src/{module}"]
 # wheel carries a manifest describing libraries that are not in it, which surfaces on the
 # air-gapped host as a bundle that is present and empty.
 artifacts = ["*.so", "*.dylib", "*.dll"]
-'''
+"""
 """The packaging metadata that makes ``--package`` output an installable distribution.
 
 Formatted from the bundle that was just written, so what ``pip show`` reports is what is in

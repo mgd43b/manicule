@@ -437,11 +437,11 @@ them is answerable about a single anchor at answer time.
 
 ```python
 await litellm.acompletion(
-    model=...,           # "<provider>/<model>"
-    messages=[...],      # §6
+    model=...,  # "<provider>/<model>"
+    messages=[...],  # §6
     stream=True,
-    stream_options={"include_usage": True},   # §4.10
-    base_url=...,        # None for hosted providers with a default
+    stream_options={"include_usage": True},  # §4.10
+    base_url=...,  # None for hosted providers with a default
     api_key=...,
     temperature=...,
     max_tokens=...,
@@ -1015,6 +1015,7 @@ That much is easy to disown. What is not is that merged manicule config has the 
 
 ```python
 LOCAL_PROVIDERS = frozenset({"ollama", "mlx", "onnx", "local"})
+
 
 def is_local(provider: str) -> bool:
     return provider.strip().lower() in LOCAL_PROVIDERS
