@@ -51,7 +51,10 @@ class ProfileConfig(BaseModel):
         "every candidate in every profile and returns an empty result set that looks exactly "
         "like an empty corpus; and BM25 is corpus-relative and unbounded, so a constant has "
         "nothing absolute to mean. Cosine over L2-normalised vectors is the one number in the "
-        "pipeline with a meaning that survives leaving the run it was computed in.",
+        "pipeline with a meaning that survives leaving the run it was computed in. It is a "
+        "junk filter and deliberately not the relevance decision: that is confidence's job, "
+        "because a threshold is a cliff and two embedding backends agreeing to cosine 0.9999 "
+        "can still land either side of one.",
     )
     final_top_k: int = Field(ge=1, description="Candidates that survive into context.")
     context_tokens: int = Field(ge=256, description="Token budget for retrieved passages.")
@@ -95,7 +98,7 @@ class ProfileConfig(BaseModel):
 PROFILES: Mapping[RetrievalProfile, ProfileConfig] = {
     RetrievalProfile.FAST: ProfileConfig(
         candidates=10,
-        min_score=0.5,
+        min_score=0.35,
         final_top_k=3,
         context_tokens=4096,
         history_tokens=512,
@@ -103,7 +106,7 @@ PROFILES: Mapping[RetrievalProfile, ProfileConfig] = {
     ),
     RetrievalProfile.BALANCED: ProfileConfig(
         candidates=20,
-        min_score=0.3,
+        min_score=0.35,
         final_top_k=5,
         context_tokens=5632,
         history_tokens=1024,
@@ -111,7 +114,7 @@ PROFILES: Mapping[RetrievalProfile, ProfileConfig] = {
     ),
     RetrievalProfile.PRECISE: ProfileConfig(
         candidates=50,
-        min_score=0.15,
+        min_score=0.35,
         final_top_k=10,
         context_tokens=12288,
         history_tokens=2048,
@@ -137,12 +140,25 @@ The consequence worth remembering:
 * ``fast`` and ``balanced`` both fit an **8k** window, prompt and reserve included.
 * ``precise`` needs **16k**, and fits the default generator's 32768 with room to spare.
 
-The similarity floors are the one set of numbers here that remain inherited rather than
-measured. They are placeholders in the right place: the embedder's cosine similarities are not
-centred on zero for unrelated text, so 0.5 on ``fast`` may be discarding relevant passages and
-0.15 on ``precise`` may be doing nothing at all. Calibrating them is a measurement — sweep the
-floor against recall on a fixed query set — and until it runs, saying so is more useful than
-implying they were tuned.
+**The similarity floors have now been measured, and all three inherited values were wrong.**
+The sweep — 16 questions this corpus answers against 22 it cannot (16 off-topic and 6 of
+gibberish), over 604 chunks with BGE-M3 — found unrelated text at a top-1 cosine of 0.33 to 0.47
+and real questions at 0.56 to 0.72. Against that distribution the old numbers did the following:
+
+* ``fast``'s 0.5 sat *inside* the relevant range and discarded 7 of 160 passages a real query
+  wanted — the floor was eating answers.
+* ``balanced``'s 0.3 and ``precise``'s 0.15 sat *below* the noise, so every passage of every
+  unrelated query survived them. They could not fire, and never had.
+
+All three are now **0.35**, and they no longer differ by profile because the quantity does not:
+junk is junk at any cost setting, and what a profile actually trades is ``candidates``,
+``final_top_k`` and ``rerank``. 0.35 is chosen to sit *below* the point that separates the two
+distributions rather than on it. That is deliberate. A floor placed at the separation would be a
+cliff exactly where the decision is hardest, and MLX and ONNX agree only to cosine 0.9999 — worth
+about 0.01 of movement in a query-passage cosine — so a passage within that distance of the
+threshold could be returned on one backend and dropped on the other. Platform may change
+throughput; it must never change output. The relevance judgement therefore lives in confidence,
+which is continuous, and this floor only removes what is not worth fusing.
 """
 
 
