@@ -129,11 +129,15 @@ installation reports success at being broken.
 
 `--json` is not on the command line's exit status alone:
 
-- **stdout carries the envelope and nothing else.** No banner, no progress, no prose.
+- **stdout carries the envelope and nothing else.** No banner, no progress, no prose, and no
+  ANSI escape sequence even when the terminal has asked for colour.
 - **Everything human goes to stderr.** `manicule --json search x | jq` on a failed run reads
-  an empty stream rather than an error message `jq` cannot parse. `--json` is an option of
-  `manicule`, not of each command, so it goes **before** the command name; after it, Typer
-  rejects it as an unknown option with exit status 2.
+  an empty stream rather than an error message `jq` cannot parse.
+- **`--json` goes on either side of the command name.** `manicule --json doctor` and
+  `manicule doctor --json` are the same invocation, and naming it in both positions at once is
+  not an error. It was once accepted only *before* the command name, and after it Typer
+  rejected it as an unknown option with exit status 2 — which is worth stating because the
+  restriction was written up twice as though somebody had chosen it.
 - **Exit status is 0 on success, 1 on a failed operation, 2 on a usage error** that Typer
   rejected before the service was reached.
 
@@ -262,11 +266,53 @@ it again resumes.
 
 ### `doctor` → `Diagnosis`
 
-`state` and `checks[]`, each `{name, state, detail}`. States are `ok`, `degraded`, `failing`
-and `unknown` — the last is a check that could not run, which is deliberately not `ok`.
+`state`, `schema_version`, `manicule_version`, `checked_at` and `checks[]`, each
+`{name, state, detail, facts, remedy}`. States are `ok`, `degraded`, `failing` and `unknown` —
+the last is a check that could not run, which is deliberately not `ok`.
+
+`state` is the **worst** state among the checks. `checked_at` is ISO 8601 in UTC: a health
+record with no time on it cannot be told from a stale one somebody pasted. `schema_version` is
+the shape of this payload and moves only when the shape does, which is what a consumer pinning
+behaviour actually wants — `manicule_version` and the envelope's `version` both move with every
+release whether or not anything changed.
 
 Checks: `configuration`, `transport`, `plugins`, `storage`, `permissions`, `index`, `grammars`,
-`vocabularies`, and `component:<kind>:<name>` for anything already constructed.
+`vocabularies`, `models`, and `component:<kind>:<name>` for anything already constructed.
+
+**`name` is the stable identifier.** It is what a monitor selects on, so it is chosen once and
+does not move with the wording. `detail` is the sentence a person reads and is free to be
+reworded; `facts` is the same finding as data, so that nobody has to recover a number by
+parsing English; `remedy` is the suggested fix as a command, empty on a healthy check and on
+one whose fix is not a command.
+
+**These four states are the only status vocabulary manicule has**, and `--json` reports exactly
+the words the terminal prints. A contract spelling its statuses differently from the human
+output is a trap: somebody reads the screen, writes `error`, and matches nothing forever. A
+consumer that needs the conventional triple maps `ok`→`ok`, `degraded`→`warning`,
+`failing`→`error`, and `unknown`→`warning` — `unknown` has no equivalent in that triple, which
+is the reason the triple is not what is emitted: "could not be measured" and "measured, fine"
+are different facts and collapsing them loses the one worth acting on.
+
+**Nothing here carries a secret, a credential, a token or an environment variable's value.**
+Paths through `$HOME` are reported as `~/…`: the home directory's name is the account name and
+was never the part anybody needed, while everything below it is kept so the reader can still
+`cd` to what it names and paste the `chmod` back. A path outside the home directory —
+`/srv/manicule` — is reported whole, because it names no account. Where a check is caused by an
+environment variable, it names the **variable** and that it is set, never its contents.
+
+### `doctor`'s exit status
+
+`manicule doctor` exits **0 whenever it produced a diagnosis, whatever the diagnosis says**,
+and this is deliberate rather than an omission. The exit status tracks the envelope's `ok`
+across every operation uniformly — 0 for a result, 1 for an operation that failed, 2 for a
+usage error Typer rejected. Producing a diagnosis of a broken machine *is* the operation
+succeeding. Making this one command exit non-zero on a `failing` check would leave `"ok": true`
+and a non-zero status disagreeing, so a script reading the envelope and a script reading `$?`
+would reach opposite conclusions about the same run.
+
+So a health gate reads the payload rather than the status, and `docs/deployment.md` §2 carries
+the recipe. `doctor` still exits **1** when it could not produce a diagnosis at all — a
+configuration that will not load — and **2** on a usage error.
 
 **`doctor` builds nothing expensive.** No model runtime is loaded and no document is read, so
 it is safe on an installation that is not working — which is the only time anybody runs it.
