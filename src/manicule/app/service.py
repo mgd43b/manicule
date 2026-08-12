@@ -418,6 +418,10 @@ class ApplicationService:
         )
         from manicule.connectors.sessions import capture, default_store  # noqa: PLC0415
 
+        # Settings directly rather than ``Runtime.connector(name)``, which every other
+        # connector operation uses. That builds the connector, and building it resolves the
+        # credential — which is the thing this operation exists to capture, and which by
+        # definition is not there yet the first time somebody runs this.
         configured = self.settings.connectors.get(name)
         if configured is None:
             known = ", ".join(sorted(self.settings.connectors)) or "none configured"
