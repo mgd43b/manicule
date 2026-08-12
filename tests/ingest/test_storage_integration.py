@@ -8,6 +8,7 @@ exercises: lineage, tombstones, the recovery sweep, run counters, ``index_state`
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -49,6 +50,78 @@ def _pipeline(
         chunk_fingerprint=chunker.fingerprint,
         blobs=blobs,
     )
+
+
+async def test_a_mirrored_page_with_a_manifest_cites_the_page_through_the_real_stores(
+    store: SqliteDocStore,
+    data_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """The whole claim, end to end, over a real directory and a migrated database.
+
+    Every other source-metadata test substitutes something: the interface tests build records
+    directly, the sidecar tests stop at the connector, and the pipeline tests use an in-memory
+    store. This one walks a real tree with a real manifest in it using the real
+    :class:`~manicule.connectors.filesystem.FilesystemConnector`, and writes through the real
+    SQLite store — so it is the test that catches the record being lost in the JSON column's
+    round trip, or the connector and the readers disagreeing about the reserved key.
+
+    It is also the assertion behind the sentence added to ``README.md``: a page stored as
+    ``123456.html`` beside a ``123456.html.source.json`` cites as the retry policy, at its
+    canonical address, with the local snapshot still on the record.
+
+    The breadcrumb is deliberately not asserted here — this file's chunker is a fake that does
+    not build one. ``tests/test_chunking.py`` covers that against the real chunker.
+    """
+    from manicule.connectors.filesystem import FilesystemConnector  # noqa: PLC0415
+    from manicule.connectors.sidecar import manifest_path_for  # noqa: PLC0415
+
+    # A corpus directory of its own: `data_dir` is also under `tmp_path`, so walking the latter
+    # would index this test's own SQLite database and vector files as documents.
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    page = corpus / "123456.html"
+    page.write_text("Retry policy\nThe client retries twice.\n", encoding="utf-8")
+    manifest_path_for(page).write_text(
+        json.dumps(
+            {
+                "title": "Retry policy",
+                "canonical_uri": "https://docs.example.test/pages/123456/retry-policy",
+                "source_id": "123456",
+                "version": "7",
+                "modified_at": "2026-03-04T05:06:07+00:00",
+                "retrieved_at": "2026-06-01T00:00:00+00:00",
+                "section_path": ["Engineering", "Runbooks"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    report = await _pipeline(store, vectors).run(FilesystemConnector(corpus, name="local"))
+
+    assert report.indexed == 1, "the manifest must not be indexed as a document of its own"
+    stored = (await store.list_documents())[0]
+
+    # The citation, which is the point of the whole change.
+    assert stored.title == "Retry policy"
+    assert stored.uri == "https://docs.example.test/pages/123456/retry-policy"
+
+    # The local snapshot, which must survive being superseded.
+    assert stored.source_id == str(page)
+    record = stored.provenance
+    assert record is not None, "the record must survive the JSON column round trip"
+    assert record.snapshot is not None
+    assert record.snapshot.path == "123456.html"
+    assert record.source is not None
+    assert record.source.version == "7"
+    assert record.source.section_path == ("Engineering", "Runbooks")
+
+    # Three distinct timestamps, none standing in for another.
+    assert record.source.modified_at != record.snapshot.retrieved_at
+    assert stored.indexed_at is not None
+    assert stored.indexed_at not in {record.source.modified_at, record.snapshot.retrieved_at}
 
 
 @pytest.mark.contract

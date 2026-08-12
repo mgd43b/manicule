@@ -287,6 +287,39 @@ Each hit carries the passage, its document, its anchor, its effective `score` **
 — the score every pipeline stage gave it. The per-stage history is kept because "reranking
 helped" is only checkable while the pre-rerank score survives.
 
+### `provenance` → `SourceReference`
+
+On every search hit, every answer citation and every document summary — and `null` on all three
+unless the document carries authoritative source metadata ([`storage.md`](storage.md) §4.2.1): a
+locally mirrored page with a sidecar manifest, or any connector supplying the same record.
+
+`title`, `canonical_uri`, `source_id`, `version`, `modified_at` and `section_path` describe the
+**publication**. `snapshot_path`, `snapshot_checksum` and `retrieved_at` describe **this
+installation's copy**. `indexed_at` is neither: it is when manicule indexed that copy. A reader
+being pointed at the document needs the first group; an audit of what was actually read needs the
+second; reproducing a result months later needs both — so the citation carries both rather than
+choosing. `unavailable_reason` is present when a record was attempted and refused, because a
+silently ignored manifest presents as a citation naming a filename, which is indistinguishable from
+having written no manifest at all.
+
+Three things about it are contract rather than implementation detail:
+
+- **`null`, not an empty object**, for a document with no record. "There is no canonical address"
+  and "the canonical address is the empty string" are different claims, and a consumer branching on
+  presence should have one thing to look at.
+- **The field is `provenance`, not `source`.** `source` is already on `DocumentSummary` and means
+  the name of the connector that owns the document. Two senses of one word on one model is a field
+  somebody reads wrong once and then builds on.
+- **`title` and `uri` on the citation itself are already canonical** wherever a record exists,
+  because the pipeline writes them into the columns every surface reads. This block is the
+  structured form, for a consumer that needs the version it cited or the snapshot it was read from
+  rather than a line to display.
+
+`conversation_messages` replays stored citations and reports `provenance: null` on them. A stored
+citation records **what was shown**, its title and URI frozen as they were at answer time; this
+block reports **what is true now**. Attaching a live one to a historical record would let a
+replayed conversation claim it had cited a version that did not exist yet.
+
 ### `index_path` / `connector_sync` / `import` → `IngestReport`
 
 `connector`, `discovered`, `ingested`, `skipped`, `failed`, `expanded`, `by_status`, `error`,
