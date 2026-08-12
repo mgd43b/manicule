@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -24,6 +25,7 @@ from manicule.cli import render
 from manicule.cli.shell import SHELLS, completion_script
 from manicule.core.errors import ConfigError
 from manicule.core.version import CORE_VERSION
+from manicule.storage.backup import BackupError
 from tests.app.fakes import FakeBackend, FakeMaintenance, make_chunk, make_document
 
 if TYPE_CHECKING:
@@ -165,6 +167,68 @@ def test_backup_needs_somewhere_to_write(bound: ApplicationService) -> None:
     del bound
     assert "--output" in cli.BACKUP_NEEDS_A_TARGET
     result = run(["backup"])
+    assert result.exit_code != 0
+
+
+def test_a_backup_consents_to_nothing_unless_the_flag_is_typed(
+    bound: ApplicationService,
+) -> None:
+    """Refusing an exposed target is the default, and defaults are what get exercised."""
+    result = run(["--json", "backup", "--output", "/tmp/somewhere"])  # noqa: S108 - the fake never writes
+    assert result.exit_code == 0
+    maintenance = asyncio.run(bound.backend.maintenance())
+    assert isinstance(maintenance, FakeMaintenance)
+    assert maintenance.backups == [(Path("/tmp/somewhere"), False)]  # noqa: S108
+
+
+def test_allow_insecure_target_reaches_the_layer_that_acts_on_it(
+    bound: ApplicationService,
+) -> None:
+    """Four layers between the flag and the ``stat`` that decides.
+
+    Asserted at the backend rather than at the exit status, because a flag that parses,
+    renders and exits zero while never arriving looks exactly like one that works — which is
+    the defect (#60) this option was added to close.
+    """
+    result = run(
+        ["--json", "backup", "--output", "/tmp/somewhere", "--allow-insecure-target"]  # noqa: S108
+    )
+    assert result.exit_code == 0
+    maintenance = asyncio.run(bound.backend.maintenance())
+    assert isinstance(maintenance, FakeMaintenance)
+    assert maintenance.backups == [(Path("/tmp/somewhere"), True)]  # noqa: S108
+
+
+def test_a_refused_backup_reaches_the_operator_as_a_result_not_a_traceback(
+    bound: ApplicationService,
+) -> None:
+    """``BackupError`` is a ``ManiculeError``, and this is what that buys.
+
+    Only that hierarchy becomes an envelope; anything else propagates as a defect. A security
+    refusal delivered as a stack trace is read as a crash, and the path it names — the whole
+    point of naming it — arrives buried in one.
+    """
+    maintenance = asyncio.run(bound.backend.maintenance())
+    assert isinstance(maintenance, FakeMaintenance)
+    maintenance.backup_error = BackupError(
+        "backup target /srv/share carries group or other permissions (055)"
+    )
+
+    result = run(["--json", "backup", "--output", "/srv/share"])
+
+    assert result.exit_code == 1
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "BackupError"
+    assert "/srv/share" in error["message"]
+
+
+def test_allow_insecure_target_is_refused_on_a_restore_rather_than_ignored(
+    bound: ApplicationService,
+) -> None:
+    """A security flag accepted where it does nothing is the shape of the original bug."""
+    del bound
+    assert "--allow-insecure-target" in cli.INSECURE_TARGET_IS_A_BACKUP_OPTION
+    result = run(["backup", "--restore", "/tmp/b", "--allow-insecure-target"])  # noqa: S108 - never opened
     assert result.exit_code != 0
 
 

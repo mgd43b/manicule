@@ -708,11 +708,25 @@ class FakeMaintenance:
     Counted so a test can assert that a command which *refused* wrote nothing. An exit status
     says the command stopped; it does not say it stopped before doing the thing.
     """
+    backups: list[tuple[Path, bool]] = field(default_factory=list[tuple[Path, bool]])
+    """Every backup asked for, with the target and whether an insecure one was consented to.
+
+    Recorded because ``--allow-insecure-target`` crosses four layers to reach storage, and a
+    flag that parses but never arrives is indistinguishable from one that works right up until
+    somebody needs it.
+    """
+    backup_error: Exception | None = None
+    """Raised instead of writing, for tests about how a refusal reaches the caller."""
 
     async def schema_revision(self) -> str | None:
         return self.revision
 
-    async def backup(self, target: Path) -> Mapping[str, object]:
+    async def backup(
+        self, target: Path, *, allow_insecure_target: bool = False
+    ) -> Mapping[str, object]:
+        self.backups.append((target, allow_insecure_target))
+        if self.backup_error is not None:
+            raise self.backup_error
         return {
             "created_at": "2026-01-01T00:00:00Z",
             "files": [],

@@ -7,6 +7,8 @@ destroys a data directory and asks whether the same query gives the same answer 
 from __future__ import annotations
 
 import json
+import os
+import stat
 from typing import TYPE_CHECKING
 
 import pytest
@@ -21,7 +23,7 @@ from manicule.storage.backup import (
 )
 from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.storage.docstore import SqliteDocStore
-from manicule.storage.engine import create_engine, database_path
+from manicule.storage.engine import DATABASE_FILENAME, create_engine, database_path
 from manicule.storage.migrator import current, head_revision, upgrade
 from tests.storage_helpers import make_chunk, make_document
 
@@ -194,6 +196,142 @@ async def test_backing_up_into_a_non_empty_directory_is_refused(
 
     with pytest.raises(BackupError, match="not empty"):
         await create_backup(engine, data_dir, backup_dir)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_backing_up_into_a_pre_existing_world_readable_directory_is_refused(
+    engine: AsyncEngine, data_dir: Path, tmp_path: Path
+) -> None:
+    """The directory already exists, which is the case ``mkdir(mode=...)`` never reaches.
+
+    A test that creates a fresh target proves nothing here: ``mode`` is applied on creation
+    and the umask can only clear bits, so a directory manicule made is ``0700`` whatever the
+    code says. The exposure arrives with a directory that was already there — an operator's
+    ``~/backups``, a mounted volume, a second run into the same place.
+    """
+    await _populate(engine, data_dir)
+    target = tmp_path / "shared"
+    target.mkdir()
+    target.chmod(0o755)
+
+    with pytest.raises(BackupError, match="group or other permissions") as refusal:
+        await create_backup(engine, data_dir, target)
+
+    assert str(target) in str(refusal.value), "an unnamed path sends an operator hunting"
+    assert "055" in str(refusal.value), "the mode objected to is half the diagnosis"
+    assert not (target / DATABASE_FILENAME).exists(), "a refused backup writes nothing"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_a_group_readable_target_is_refused_too(
+    engine: AsyncEngine, data_dir: Path, tmp_path: Path
+) -> None:
+    """Group is not a safer kind of other. Both mean accounts that are not this one."""
+    await _populate(engine, data_dir)
+    target = tmp_path / "team"
+    target.mkdir()
+    target.chmod(0o750)
+
+    with pytest.raises(BackupError, match="group or other permissions"):
+        await create_backup(engine, data_dir, target)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_an_exposed_target_is_written_when_it_is_asked_for_in_so_many_words(
+    engine: AsyncEngine, data_dir: Path, tmp_path: Path
+) -> None:
+    """The escape hatch exists, is off by default, and does not quietly chmod the operator.
+
+    Someone backing up onto a shared volume has a reason. What they do not get is the
+    decision made for them, in either direction.
+    """
+    await _populate(engine, data_dir)
+    target = tmp_path / "shared"
+    target.mkdir()
+    target.chmod(0o755)
+
+    manifest = await create_backup(engine, data_dir, target, allow_insecure_target=True)
+
+    assert manifest["files"], "the snapshot is written, not merely permitted"
+    verify_backup(target)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755, (
+        "the target is left as the operator set it; silently tightening it is a different "
+        "surprise, not an absent one"
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_a_refused_target_that_manicule_created_is_not_left_behind(
+    engine: AsyncEngine, data_dir: Path, tmp_path: Path
+) -> None:
+    """Refusing after creating leaves the operator the directory they started with."""
+    await _populate(engine, data_dir)
+    target = tmp_path / "fresh"
+
+    await create_backup(engine, data_dir, target)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700, "a target manicule creates is 0700"
+
+
+async def test_a_target_that_came_back_wider_than_it_was_asked_for_is_refused(
+    engine: AsyncEngine, data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mkdir(mode=0o700)`` is a request, and a default POSIX ACL can answer it with more.
+
+    Simulated rather than staged: a default ACL needs ``setfacl`` and a filesystem mounted to
+    honour it, neither of which a suite can assume. What is exercised for real is the
+    consequence — the mode is *checked after* creation rather than asserted before it, so even
+    a directory manicule created itself can be refused, and is then removed again.
+    """
+    await _populate(engine, data_dir)
+    target = tmp_path / "widened"
+
+    def widened(_: Path) -> int:
+        return 0o055
+
+    monkeypatch.setattr("manicule.storage.backup.exposure", widened)
+
+    with pytest.raises(BackupError, match="group or other permissions"):
+        await create_backup(engine, data_dir, target)
+
+    assert not target.exists(), "created here and refused here: leave nothing behind"
+
+
+async def test_a_target_whose_mode_cannot_be_read_is_a_different_diagnosis(
+    engine: AsyncEngine, data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A target that cannot be examined is not a target that is exposed, and ``doctor`` agrees.
+
+    Reporting the second for the first sends an operator to ``chmod`` a path whose real
+    problem is that it is not there, or not theirs.
+    """
+    await _populate(engine, data_dir)
+
+    def unreadable(_: Path) -> int:
+        raise PermissionError("no")
+
+    monkeypatch.setattr("manicule.storage.backup.exposure", unreadable)
+
+    with pytest.raises(BackupError, match="cannot be examined"):
+        await create_backup(engine, data_dir, tmp_path / "opaque")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
+async def test_the_snapshot_database_is_not_left_at_the_umask(
+    engine: AsyncEngine, data_dir: Path, tmp_path: Path
+) -> None:
+    """``sqlite3.connect`` creates at the umask, which is commonly ``0644``.
+
+    The directory being ``0700`` is what gates it, but a backup copied onward file by file —
+    to a share, into an archive — carries the mode of the file, not of the directory it used
+    to sit in.
+    """
+    await _populate(engine, data_dir)
+    backup_dir = tmp_path / "backup"
+    await create_backup(engine, data_dir, backup_dir)
+
+    assert stat.S_IMODE((backup_dir / DATABASE_FILENAME).stat().st_mode) == 0o600
+    assert stat.S_IMODE((backup_dir / MANIFEST_NAME).stat().st_mode) == 0o600
 
 
 async def test_backing_up_into_the_directory_being_backed_up_is_refused(
