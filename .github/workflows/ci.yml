@@ -452,8 +452,15 @@ jobs:
                --connect-timeout 20 --max-time 180 --speed-limit 1024 --speed-time 30 \
                --output "${work}/lychee.tar.gz" "${url}"
           tar -xzf "${work}/lychee.tar.gz" -C "${work}"
-          binary="$(find "${work}" -type f -name lychee | head -n 1)"
-          test -n "${binary}"
+          # `-print -quit` rather than piping into `head -n 1`. Under `pipefail` that pipeline
+          # fails whenever `head` closes the pipe while `find` is still writing — a race this
+          # archive is small enough to usually win, which is the worst kind: it would pass
+          # every time it was tried and fail on some later Tuesday.
+          binary="$(find "${work}" -type f -name lychee -print -quit)"
+          if [ -z "${binary}" ]; then
+            echo "no lychee binary in the ${LYCHEE_VERSION} archive. Did its layout change?" >&2
+            exit 1
+          fi
           mkdir -p "${HOME}/.cache/lychee"
           install -m 0755 "${binary}" "${HOME}/.cache/lychee/lychee"
       # Saved only after an install that produced a usable binary, and only when nothing was
@@ -482,7 +489,12 @@ jobs:
           export PATH="${HOME}/.cache/lychee:${PATH}"
           version="$(lychee --version | head -n 1 | cut -d ' ' -f 2)"
           echo "lychee ${version}"
-          test "v${version}" = "${LYCHEE_VERSION}"
+          if [ "v${version}" != "${LYCHEE_VERSION}" ]; then
+            echo "this job pins ${LYCHEE_VERSION} and the checker on PATH reports v${version}." >&2
+            echo "A restored cache is holding a different binary; the key is not distinguishing" >&2
+            echo "them. Do not trust a link result produced by a checker nobody chose." >&2
+            exit 1
+          fi
           lychee --offline --include-fragments --no-progress --verbose \
                  --format json --output lychee-report.json \
                  '**/*.md'
