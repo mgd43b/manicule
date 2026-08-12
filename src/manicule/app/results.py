@@ -28,6 +28,9 @@ The envelope carries four things before any payload:
 
 from __future__ import annotations
 
+import os
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -103,7 +106,53 @@ Declared here, above every payload that uses it, rather than beside :class:`Chec
 resolves an annotation against the module namespace as the model class is built, so a payload
 defined earlier in the file than its own type alias fails at import — loudly, but at import,
 which is a poor place to discover an ordering rule.
+
+These four names are the **only** status vocabulary manicule has. ``doctor --json`` reports
+exactly the words the terminal prints, because a machine-readable contract whose statuses are
+spelled differently from the human output is a trap for whoever automates against it: they read
+the screen, write ``error``, and match nothing forever. ``docs/surfaces.md`` §5 records the
+translation to the conventional ``ok``/``warning``/``error`` triple for consumers that need one.
 """
+
+DOCTOR_SCHEMA_VERSION = 1
+"""The shape of :class:`Diagnosis`, versioned separately from manicule itself.
+
+Distinct from ``Envelope.version`` on purpose. That one moves with every release whether or not
+any shape changed; this one moves only when the diagnosis payload gains, loses or repurposes a
+field. A consumer pinning behaviour wants the second, and giving it only the first forces it to
+diff release notes.
+"""
+
+
+def redacted_path(path: str | Path) -> str:
+    """A filesystem path with the account's home directory replaced by ``~``.
+
+    ``doctor``'s output is the thing an operator pastes into an issue, a support thread or a
+    chat window, and the paths in it run through ``$HOME`` — cache directories, the data
+    directory, the configuration file. The home directory's *name* is the account name, which
+    is a credential's worth of a hint on a shared or corporate machine and is never the part
+    anybody needed.
+
+    ``~`` rather than a fixed token, because the requirement is redaction that stays
+    *diagnosable*: an operator reading their own output can still ``cd`` to what it names, and
+    ``chmod 0700 ~/…`` is a command they can paste back. A path outside the home directory is
+    returned unchanged — ``/srv/manicule`` names no account and hiding it would cost the reader
+    the only location in the message.
+    """
+    text = str(path)
+    try:
+        home = str(Path.home())
+    except (OSError, RuntimeError):  # pragma: no cover - a platform with no home to resolve
+        return text
+    # A home of "/" would turn every absolute path into a tilde, which is redaction that has
+    # eaten the message rather than the account name.
+    if not home or home == os.sep:
+        return text
+    if text == home:
+        return "~"
+    if text.startswith(home + os.sep):
+        return "~" + text[len(home) :]
+    return text
 
 
 # --- retrieval and answers -----------------------------------------------------------------
@@ -689,17 +738,53 @@ class Stats(Payload):
 
 
 class Check(Payload):
-    """One diagnostic."""
+    """One diagnostic.
 
-    name: str
+    ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``plugins``,
+    ``storage``, ``permissions``, ``index``, ``grammars``, ``vocabularies``, ``models``, and
+    ``component:<kind>:<name>`` for anything already constructed. It is what a monitor selects
+    on, so it is chosen once and does not move with the wording.
+
+    ``detail`` and ``facts`` are the same finding twice, for two readers. ``detail`` is the
+    sentence a person reads; ``facts`` is what a script would otherwise have to recover by
+    parsing that sentence, which is how a wording change becomes somebody's outage.
+    """
+
+    name: str = Field(description="The stable identifier. Selected on; never reworded.")
     state: CheckState
-    detail: str = ""
+    detail: str = Field(default="", description="The human-readable summary.")
+    facts: dict[str, JsonValue] = Field(
+        default_factory=dict[str, JsonValue],
+        description="Structured form of what the check measured. Empty where the state and "
+        "the summary are the whole finding.",
+    )
+    remedy: str = Field(
+        default="",
+        description="What to do about it, when there is something specific to do. Empty on a "
+        "healthy check and on one whose fix is not a command.",
+    )
 
 
 class Diagnosis(Payload):
-    """Everything ``doctor`` looked at."""
+    """Everything ``doctor`` looked at.
 
-    state: CheckState
+    ``state`` is the **worst** state among the checks, not a summary of them: a rollup that
+    reported the best one would be a diagnosis nobody could act on.
+    """
+
+    state: CheckState = Field(description="The worst state among ``checks``.")
+    schema_version: int = Field(
+        default=DOCTOR_SCHEMA_VERSION,
+        description="The shape of this payload. Moves only when the shape does.",
+    )
+    manicule_version: str = Field(
+        default=CORE_VERSION, description="The manicule that produced the diagnosis."
+    )
+    checked_at: str = Field(
+        default_factory=lambda: datetime.now(UTC).isoformat(),
+        description="When the diagnosis was taken, ISO 8601 in UTC. A health record with no "
+        "time on it cannot be told from a stale one somebody pasted.",
+    )
     checks: tuple[Check, ...] = ()
 
 
@@ -996,6 +1081,7 @@ class ApiKeyRevoked(Payload):
 
 __all__ = [
     "CONTRACT_VERSION",
+    "DOCTOR_SCHEMA_VERSION",
     "Anchored",
     "AnswerCitation",
     "AnswerResultPayload",
@@ -1076,5 +1162,6 @@ __all__ = [
     "WorkspaceSummary",
     "WorkspaceSwitched",
     "failed",
+    "redacted_path",
     "succeeded",
 ]

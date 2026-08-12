@@ -705,18 +705,39 @@ class ApplicationService:
     def _configuration_check(self) -> r.Check:
         problems = self.settings.policy_problems()
         if not problems:
-            return r.Check(name="configuration", state="ok", detail="no policy conflicts")
-        return r.Check(name="configuration", state="failing", detail="; ".join(problems))
+            return r.Check(
+                name="configuration",
+                state="ok",
+                detail="no policy conflicts",
+                facts={"problems": []},
+            )
+        return r.Check(
+            name="configuration",
+            state="failing",
+            detail="; ".join(problems),
+            facts={"problems": list(problems)},
+            remedy="manicule config show",
+        )
 
     def _transport_check(self) -> r.Check:
         transport = self.settings.security.transport
+        mode = self.settings.security.auth.mode
+        # The bind host and the authentication mode, and neither is a secret: a host is an
+        # address this machine already answers on, and the mode is which *kind* of credential
+        # is demanded rather than any credential itself.
+        facts: dict[str, JsonValue] = {
+            "bind_host": transport.bind_host,
+            "loopback": transport.is_loopback,
+            "auth_mode": mode.value,
+        }
         if transport.is_loopback:
             return r.Check(
                 name="transport",
                 state="ok",
                 detail=f"bound to {transport.bind_host}, reachable only from this machine",
+                facts=facts,
             )
-        if self.settings.security.auth.mode is AuthMode.NONE:
+        if mode is AuthMode.NONE:
             return r.Check(
                 name="transport",
                 state="failing",
@@ -724,14 +745,17 @@ class ApplicationService:
                     f"security.transport.bind_host is {transport.bind_host!r} with no "
                     f"authentication. Bind 127.0.0.1, or set security.auth.mode."
                 ),
+                facts=facts,
+                remedy="manicule config set security.transport.bind_host 127.0.0.1",
             )
         return r.Check(
             name="transport",
             state="degraded",
             detail=(
                 f"bound to {transport.bind_host}, which is reachable from the network. "
-                f"Authentication is on ({self.settings.security.auth.mode.value})."
+                f"Authentication is on ({mode.value})."
             ),
+            facts=facts,
         )
 
     def _plugin_check(self) -> r.Check:
@@ -746,6 +770,11 @@ class ApplicationService:
                 f"{len(discovery.manifests)} plugin(s), "
                 f"{len(discovery.registry)} component(s){disabled}"
             ),
+            facts={
+                "plugins": len(discovery.manifests),
+                "components": len(discovery.registry),
+                "disabled": len(discovery.disabled),
+            },
         )
 
     async def _storage_check(self) -> r.Check:
@@ -762,19 +791,31 @@ class ApplicationService:
             maintenance = await self._backend.maintenance()
             revision = await maintenance.schema_revision()
         except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
-            return r.Check(name="storage", state="failing", detail=f"{type(exc).__name__}: {exc}")
+            return r.Check(
+                name="storage",
+                state="failing",
+                detail=f"{type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        where = r.redacted_path(self.settings.data_dir)
         if revision is None:
             return r.Check(
                 name="storage",
                 state="degraded",
                 detail=(
-                    f"the database in {self.settings.data_dir} carries no schema revision. "
+                    f"the database in {where} carries no schema revision. "
                     f"Opening it applies them, and opening it is what this check just did, so "
                     f"they did not take: check the directory is writable by the account "
                     f"running manicule and that the database file is not from a later version."
                 ),
+                facts={"data_dir": where, "revision": None},
             )
-        return r.Check(name="storage", state="ok", detail=f"schema at {revision}")
+        return r.Check(
+            name="storage",
+            state="ok",
+            detail=f"schema at {revision}",
+            facts={"data_dir": where, "revision": revision},
+        )
 
     async def _permissions_check(self) -> r.Check:
         """Whether anybody but the owner can read the data directory.
@@ -792,11 +833,15 @@ class ApplicationService:
         from manicule.storage.engine import exposure  # noqa: PLC0415 - a storage extra
 
         data_dir = self.settings.data_dir
+        # Redacted, not withheld. The mode and the location are the whole diagnosis, and
+        # `chmod 0700 ~/…` is still a command the operator who owns that home can paste.
+        where = r.redacted_path(data_dir)
         if os.name != "posix":
             return r.Check(
                 name="permissions",
                 state="unknown",
-                detail=f"{data_dir} is on a platform with no POSIX file modes to check",
+                detail=f"{where} is on a platform with no POSIX file modes to check",
+                facts={"path": where, "posix": False},
             )
         try:
             exposed = await asyncio.to_thread(exposure, data_dir)
@@ -806,24 +851,31 @@ class ApplicationService:
             return r.Check(
                 name="permissions",
                 state="unknown",
-                detail=f"{data_dir} could not be examined: {exc}",
+                detail=f"{where} could not be examined: {exc}",
+                facts={"path": where, "error_type": type(exc).__name__},
             )
         if not exposed:
             return r.Check(
                 name="permissions",
                 state="ok",
-                detail=f"{data_dir} is readable only by the account running manicule",
+                detail=f"{where} is readable only by the account running manicule",
+                facts={"path": where, "exposed": False},
             )
         return r.Check(
             name="permissions",
             state="failing",
             detail=(
-                f"{data_dir} carries group or other permissions ({exposed:03o}), so it is "
+                f"{where} carries group or other permissions ({exposed:03o}), so it is "
                 f"reachable by accounts other than the one running manicule. It holds the "
                 f"retained source bytes of every indexed document, which makes this an "
                 f"exposure of the corpus rather than a tidiness problem. Run "
-                f"`chmod 0700 {data_dir}`."
+                f"`chmod 0700 {where}`."
             ),
+            # `exposed_bits` rather than `mode`: :func:`exposure` returns the group and other
+            # bits alone, not the directory's mode. A field named `mode` carrying `055` would
+            # be read as the whole mode by everyone who did not go and check.
+            facts={"path": where, "exposed": True, "exposed_bits": f"{exposed:03o}"},
+            remedy=f"chmod 0700 {where}",
         )
 
     async def _index_check(self) -> r.Check:
@@ -832,7 +884,12 @@ class ApplicationService:
             fingerprints = await store.index_fingerprints()
             documents = await store.count_documents()
         except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
-            return r.Check(name="index", state="failing", detail=f"{type(exc).__name__}: {exc}")
+            return r.Check(
+                name="index",
+                state="failing",
+                detail=f"{type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
         if fingerprints.is_empty:
             return r.Check(
                 name="index",
@@ -842,11 +899,14 @@ class ApplicationService:
                     if documents == 0
                     else f"{documents} document(s) but no recorded fingerprints"
                 ),
+                facts={"documents": documents, "vector_table": None},
+                remedy="" if documents == 0 else "manicule index <path> --reindex",
             )
         return r.Check(
             name="index",
             state="ok",
             detail=f"{documents} document(s) in {fingerprints.vector_table or 'no vector table'}",
+            facts={"documents": documents, "vector_table": fingerprints.vector_table or None},
         )
 
     async def _grammar_check(self, *, fix: bool = False) -> r.Check:
@@ -975,9 +1035,15 @@ class ApplicationService:
                 state="degraded",
                 detail=(
                     f"run `manicule doctor --fix` to seed {len(missing)} missing grammar(s) "
-                    f"into {cache}: {named}. Until then a document in one of those languages "
-                    f"is refused rather than line-split{carried}"
+                    f"into {r.redacted_path(cache)}: {named}. Until then a document in one of "
+                    f"those languages is refused rather than line-split{carried}"
                 ),
+                facts={
+                    "cache": r.redacted_path(cache),
+                    "missing": list(missing),
+                    "declared": len(languages),
+                },
+                remedy="manicule doctor --fix",
             )
         settled = f"seeded {list(seeded)}; " if seeded else ""
         carried = f"; {offline}" if offline else ""
@@ -985,9 +1051,15 @@ class ApplicationService:
             name="grammars",
             state="ok",
             detail=(
-                f"{settled}{len(languages)} declared grammar(s) in {cache} "
+                f"{settled}{len(languages)} declared grammar(s) in {r.redacted_path(cache)} "
                 f"({grammars.PACK_DISTRIBUTION} {grammars.pack_version()}){carried}"
             ),
+            facts={
+                "cache": r.redacted_path(cache),
+                "missing": [],
+                "declared": len(languages),
+                "seeded": list(seeded),
+            },
         )
 
     async def _vocabulary_check(self, *, fix: bool = False) -> r.Check:
@@ -1072,20 +1144,23 @@ class ApplicationService:
             return r.Check(name="vocabularies", state="failing", detail=str(exc))
 
         cache = vocabularies.cache_directory()
+        where = r.redacted_path(cache)
         if missing:
             return r.Check(
                 name="vocabularies",
                 state="failing",
                 detail=(
-                    f"no vocabulary for {list(missing)} in {cache}, so every search refuses "
+                    f"no vocabulary for {list(missing)} in {where}, so every search refuses "
                     f"rather than downloading one mid-question. Run `manicule doctor --fix` "
                     f"to seed them — {offline}"
                 ),
+                facts={"cache": where, "missing": list(missing), "wanted": list(wanted)},
+                remedy="manicule doctor --fix",
             )
         settled = f"seeded {list(seeded)}; " if seeded else ""
         carried = f"; {offline}" if offline else ""
         here = (
-            f"{settled}{len(wanted)} vocabulary(ies) {list(wanted)} in {cache} "
+            f"{settled}{len(wanted)} vocabulary(ies) {list(wanted)} in {where} "
             f"(tiktoken {vocabularies.tiktoken_version()})"
         )
         # Present, and in a directory the operating system reclaims. `ok` there would be a
@@ -1102,10 +1177,26 @@ class ApplicationService:
                     f"on a schedule. Everything works until it is swept, and then every "
                     f"search refuses. Point {vocabularies.CACHE_DIR_ENV} at a durable "
                     f"directory — with it unset manicule uses "
-                    f"{vocabularies.default_cache_directory()}{carried}"
+                    f"{r.redacted_path(vocabularies.default_cache_directory())}{carried}"
+                ),
+                facts={"cache": where, "missing": [], "wanted": list(wanted), "durable": False},
+                remedy=(
+                    f"{vocabularies.CACHE_DIR_ENV}="
+                    f"{r.redacted_path(vocabularies.default_cache_directory())}"
                 ),
             )
-        return r.Check(name="vocabularies", state="ok", detail=f"{here}{carried}")
+        return r.Check(
+            name="vocabularies",
+            state="ok",
+            detail=f"{here}{carried}",
+            facts={
+                "cache": where,
+                "missing": [],
+                "wanted": list(wanted),
+                "durable": True,
+                "seeded": list(seeded),
+            },
+        )
 
     async def _model_check(self, *, provider: str | None = None) -> r.Check:
         """Whether the embedding weights are on this machine, and what it costs if not.
@@ -2783,12 +2874,14 @@ def _weights_check(plan: WeightsPlan | None) -> r.Check:
                 "the embeddings extra is not installed, so there is no backend here to have "
                 "weights. Install `manicule[embeddings]`."
             ),
+            remedy="pip install 'manicule[embeddings]'",
         )
     if plan.present:
         return r.Check(
             name="models",
             state="ok",
             detail=f"{plan.repo} is on this machine; no download is pending",
+            facts={"repo": plan.repo, "provider": plan.provider, "present": True},
         )
     # Named per backend rather than as one line for both. `--full --mlx` fetches the parity
     # model, the ONNX export and the MLX conversion — about 3.6 GB to seed a backend that
@@ -2798,15 +2891,27 @@ def _weights_check(plan: WeightsPlan | None) -> r.Check:
     offline_env = _hub_offline_env()
     offline = os.environ.get(offline_env) if offline_env else None
     if offline:
+        # The variable's **name and that it is set**, never its value. What matters here is
+        # that fetching is forbidden, which the name alone says; the value is an environment
+        # variable's contents, and a diagnostic that prints those is one nobody can paste into
+        # an issue. It is also the specific thing this command is not allowed to do.
         return r.Check(
             name="models",
             state="failing",
             detail=(
-                f"{plan.repo} is not on this machine and {offline_env}={offline} forbids "
+                f"{plan.repo} is not on this machine and {offline_env} is set, which forbids "
                 f"fetching it, so the first search refuses rather than waits. Seed it with "
                 f"`{seed}` from a host that can reach the hub, or point embedding.model at a "
                 f"local directory holding the weights."
             ),
+            facts={
+                "repo": plan.repo,
+                "provider": plan.provider,
+                "present": False,
+                "offline_env": offline_env,
+                "offline_env_set": True,
+            },
+            remedy=seed,
         )
     return r.Check(
         name="models",
@@ -2816,6 +2921,13 @@ def _weights_check(plan: WeightsPlan | None) -> r.Check:
             f"{plan.size} before it indexes anything. Nothing is wrong; it is a wait, once. "
             f"Run `{seed}` to take it now instead."
         ),
+        facts={
+            "repo": plan.repo,
+            "provider": plan.provider,
+            "present": False,
+            "size": plan.size,
+        },
+        remedy=seed,
     )
 
 

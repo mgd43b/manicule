@@ -298,21 +298,28 @@ connectors and installs no plugins, so their pages correctly render "there are n
 is no value from the envelope to assert on. ``tests/web/test_pages.py`` covers that they answer.
 """
 
-ELAPSED = "elapsed_ms"
-"""The one field that legitimately differs between two runs of the same operation.
+VOLATILE: frozenset[str] = frozenset({"elapsed_ms", "checked_at"})
+"""The fields that legitimately differ between two runs of the same operation.
 
-Excluded by name rather than by tolerance. A comparison that ignored whatever happened to
-differ would ignore a real divergence too.
+Excluded **by name** rather than by tolerance, and the distinction is the whole value of this
+harness. A comparison that ignored whatever happened to differ would ignore a real divergence
+too — it would pass on a surface that had quietly stopped reporting a field, which is the
+defect this test exists to catch.
+
+Both entries are clocks. ``elapsed_ms`` is how long the operation took; ``checked_at`` is when
+``doctor`` took the diagnosis. Neither can be equal across three separate runs of the same
+operation, and neither is a thing the surfaces could disagree about *in kind*: whatever they
+report, they report the same field with the same meaning, which is what parity is about.
 """
 
 
 def _comparable(envelope: Envelopes) -> Envelopes:
-    """One envelope, with the timing removed, so two runs of one operation can be equal."""
+    """One envelope, with the clocks removed, so two runs of one operation can be equal."""
     payload = envelope.get("data")
     if not isinstance(payload, dict):
         return envelope
     typed = cast("dict[str, Any]", payload)
-    return {**envelope, "data": {key: value for key, value in typed.items() if key != ELAPSED}}
+    return {**envelope, "data": {key: value for key, value in typed.items() if key not in VOLATILE}}
 
 
 @pytest.mark.parametrize(("tool", "arguments", "argv", "request_", "page"), PAIRS)

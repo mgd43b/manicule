@@ -1190,3 +1190,220 @@ async def test_doctor_is_quiet_about_a_vocabulary_cache_that_will_survive(
 
     assert check.state == "ok"
     assert "reclaimed" not in check.detail
+
+
+# --- the diagnosis as a machine reads it -------------------------------------------------------
+
+
+async def test_a_diagnosis_carries_the_four_things_a_reader_needs_before_the_checks(
+    service: ApplicationService,
+) -> None:
+    """Version, schema version and a timestamp, beside the overall state.
+
+    A diagnosis is pasted into issues, stored by monitors and compared against yesterday's.
+    Without a time on it there is no telling a live reading from a stale one somebody kept, and
+    without the two versions there is no telling a check that changed meaning from a machine
+    that changed state.
+    """
+    from datetime import datetime  # noqa: PLC0415 - only this assertion parses the stamp
+
+    from manicule.app.results import DOCTOR_SCHEMA_VERSION  # noqa: PLC0415
+    from manicule.core.version import CORE_VERSION  # noqa: PLC0415
+
+    diagnosis = await service.doctor()
+
+    assert diagnosis.schema_version == DOCTOR_SCHEMA_VERSION
+    assert diagnosis.manicule_version == CORE_VERSION
+    assert diagnosis.state in {"ok", "degraded", "failing", "unknown"}
+    # Parsed rather than pattern-matched: a string that looks like a timestamp and does not
+    # parse is worse than no timestamp, because it is trusted.
+    stamp = datetime.fromisoformat(diagnosis.checked_at)
+    assert stamp.tzinfo is not None, "a timestamp with no zone cannot be compared to anything"
+
+
+async def test_every_check_carries_an_identifier_that_is_selected_on_rather_than_read(
+    service: ApplicationService,
+) -> None:
+    """The names are the contract. A monitor matches on them; the prose is free to change.
+
+    Asserted as a property of every check rather than against a list of the ones that exist
+    today, so a check added tomorrow is held to the same rule without anybody editing this.
+    """
+    diagnosis = await service.doctor()
+
+    assert diagnosis.checks, "a diagnosis with no checks proves nothing about their identifiers"
+    for check in diagnosis.checks:
+        assert check.name, "a check with no identifier cannot be selected on"
+        assert check.name == check.name.strip()
+        assert " " not in check.name, f"{check.name!r} has a space in it, so it is prose"
+        assert check.name.islower(), f"{check.name!r} is not stable against a change of case"
+
+
+async def test_the_json_a_diagnosis_dumps_to_is_the_shape_it_declares(
+    service: ApplicationService,
+) -> None:
+    """Dumped and re-read, because the contract is the wire format rather than the class."""
+    diagnosis = await service.doctor()
+
+    dumped = json.loads(json.dumps(diagnosis.model_dump(mode="json")))
+
+    assert set(dumped) == {"state", "schema_version", "manicule_version", "checked_at", "checks"}
+    assert set(dumped["checks"][0]) == {"name", "state", "detail", "facts", "remedy"}
+
+
+async def test_a_failing_required_check_is_reported_without_the_command_failing(
+    backend: FakeBackend,
+) -> None:
+    """The exit-status decision, asserted where it is made rather than only written down.
+
+    ``doctor`` succeeded: it was asked for a diagnosis and it produced one. The envelope's
+    ``ok`` and the command's exit status track *that*, uniformly across every operation, and a
+    script gates on the payload — ``docs/deployment.md`` §2 carries the recipe. Reporting a
+    broken machine as a failed operation would make ``ok: true`` and exit 0 disagree for this
+    one command.
+    """
+    backend.settings = Settings(
+        security={"transport": {"bind_host": "0.0.0.0"}}  # pyright: ignore[reportArgumentType]  # noqa: S104 - the subject of the check
+    )
+    diagnosis = await ApplicationService(backend).doctor()
+
+    assert diagnosis.state == "failing"
+    failing = [check for check in diagnosis.checks if check.state == "failing"]
+    assert failing, "the fixture was supposed to produce a failing check"
+    assert all(check.remedy for check in failing if check.name == "transport")
+
+
+async def test_a_warning_only_installation_is_degraded_rather_than_failing(
+    backend: FakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The middle state has to exist and be reachable, or operators read every run as binary.
+
+    The claim is about the *severity of the finding*, not about the rollup. This fixture's
+    plugin discovery has not run, which is honestly ``unknown``, and ``unknown`` outranks
+    ``degraded`` — so asserting the overall state here would be asserting something about the
+    fixture rather than about the warning.
+    """
+    data_dir = tmp_path / "private"
+    data_dir.mkdir()
+    data_dir.chmod(0o700)
+    backend.settings = Settings(data_dir=data_dir)
+    monkeypatch.setenv(vocabularies.CACHE_DIR_ENV, str(tempfile.gettempdir()))
+
+    def nothing_missing(_encodings: Sequence[str]) -> tuple[str, ...]:
+        return ()
+
+    monkeypatch.setattr(vocabularies, "missing_vocabularies", nothing_missing)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vocabularies")
+
+    assert check.state == "degraded"
+    assert check.remedy, "a warning nobody can act on is a warning that teaches nothing"
+    failing = [check.name for check in diagnosis.checks if check.state == "failing"]
+    assert failing == [], f"this installation was supposed to warn, not fail: {failing}"
+
+
+async def test_a_check_that_can_be_repaired_says_so_in_a_field_rather_than_only_in_prose(
+    backend: FakeBackend, tmp_path: Path
+) -> None:
+    """The remediation bug6 asks for, as something a script can act on.
+
+    The advice was always in ``detail``, which means a consumer wanting it had to parse an
+    English sentence that is free to be reworded. ``remedy`` is the same advice in a field.
+    """
+    data_dir = tmp_path / "exposed"
+    data_dir.mkdir()
+    data_dir.chmod(0o755)
+    backend.settings = Settings(data_dir=data_dir)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "permissions")
+
+    assert check.state == "failing"
+    assert check.remedy.startswith("chmod 0700 ")
+    assert check.facts["exposed"] is True
+    # The group and other bits alone, which is what `exposure` measures. `0755` exposes `055`.
+    assert check.facts["exposed_bits"] == "055"
+
+
+async def test_a_healthy_check_offers_no_remedy(backend: FakeBackend, tmp_path: Path) -> None:
+    """A remedy on a healthy check is advice to fix what is not broken."""
+    data_dir = tmp_path / "private"
+    data_dir.mkdir()
+    data_dir.chmod(0o700)
+    backend.settings = Settings(data_dir=data_dir)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "permissions")
+
+    assert check.state == "ok"
+    assert check.remedy == ""
+
+
+async def test_a_diagnosis_names_the_home_directory_rather_than_the_account(
+    backend: FakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The redaction bug6 asks for, and the reason it is ``~`` rather than a black box.
+
+    ``doctor``'s output is the thing an operator pastes into an issue. The paths in it run
+    through ``$HOME``, whose name is the account name. What is kept is everything below it, so
+    the reader can still ``cd`` to what it names and paste the ``chmod`` back.
+    """
+    home = tmp_path / "home" / "someone"
+    data_dir = home / "manicule"
+    data_dir.mkdir(parents=True)
+    data_dir.chmod(0o755)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    backend.settings = Settings(data_dir=data_dir)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "permissions")
+
+    assert str(home) not in check.detail, "the account's home directory reached the output"
+    assert str(home) not in json.dumps(check.model_dump(mode="json"))
+    assert "~/manicule" in check.detail, "redaction ate the part that made it diagnosable"
+    assert check.facts["path"] == "~/manicule"
+    assert check.remedy == "chmod 0700 ~/manicule"
+
+
+async def test_a_path_outside_the_home_directory_is_reported_whole(
+    backend: FakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/srv/manicule`` names no account, and hiding it would cost the reader the location."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "elsewhere")
+    data_dir = tmp_path / "srv"
+    data_dir.mkdir()
+    data_dir.chmod(0o755)
+    backend.settings = Settings(data_dir=data_dir)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "permissions")
+
+    assert str(data_dir) in check.detail
+    assert check.facts["path"] == str(data_dir)
+
+
+async def test_a_diagnosis_never_prints_the_value_of_an_environment_variable(
+    backend: FakeBackend,
+    weights_on_disk: Callable[[bool], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naming the switch is the diagnosis; its contents are somebody's environment.
+
+    ``models`` reported ``HF_HUB_OFFLINE=<value>`` verbatim. The value carried the whole
+    diagnosis nowhere — that the variable is *set* is the fact that matters — and printing an
+    environment variable's contents into an output made for pasting is the one thing bug6 names
+    outright.
+    """
+    private_value = "1-and-something-nobody-meant-to-share"
+    weights_on_disk(False)
+    monkeypatch.setenv(OFFLINE_ENV, private_value)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "failing", "the fixture was supposed to produce the offline refusal"
+    dumped = json.dumps(check.model_dump(mode="json"))
+    assert private_value not in dumped, "an environment variable's value reached the diagnosis"
+    assert OFFLINE_ENV in check.detail, "the switch that caused this has to be named"
+    assert check.facts["offline_env_set"] is True
