@@ -81,9 +81,14 @@ class CollectionBody(Body):
 
 
 class CollectionUpdateBody(Body):
-    """A change to what a collection is *for*, never to what is in it."""
+    """A change to what a collection is *for*, never to what is in it.
 
-    description: str | None = Field(default=None, max_length=2000)
+    Required rather than defaulted, the way :class:`ConversationPatch` treats a title. The
+    write is a set, not a merge, so a defaulted field would make ``PATCH`` with an empty body
+    erase the description instead of leaving it alone. An empty string clears it, deliberately.
+    """
+
+    description: str = Field(max_length=2000)
 
 
 class CollectionNameBody(Body):

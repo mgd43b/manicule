@@ -2089,15 +2089,26 @@ class ApplicationService:
         return _collection(await store.rename_collection(collection_id, name))
 
     async def collection_update(
-        self, collection_id: str, *, description: str | None = None
+        self, collection_id: str, *, description: str
     ) -> r.CollectionSummary:
-        """Change a collection's description, leaving its membership alone.
+        """Set a collection's description, leaving its membership alone.
+
+        **``description`` has no default, and that is the whole point.** It used to default to
+        ``None``, which meant every surface could reach this verb without mentioning the field
+        — and ``describe_collection`` writes whatever it is given, so ``collection update <id>``
+        with no arguments silently erased the description it was named for changing. A verb
+        that destroys by omission is one the caller cannot be careful about. Required here, so
+        a surface that forgets to pass it fails to call rather than quietly clearing.
+
+        An empty string clears it, and clearing is therefore something asked for rather than
+        something that happens. It is stored as ``None`` so that "no description" has one
+        spelling on the wire instead of two that render differently.
 
         Raises:
             UnknownEntityError: No such collection in this workspace.
         """
         store = await self._backend.organisation()
-        return _collection(await store.describe_collection(collection_id, description))
+        return _collection(await store.describe_collection(collection_id, description or None))
 
     async def collection_counts(self, collection_id: str) -> r.CollectionCounts:
         """How many documents and chunks a collection holds, counted now.

@@ -138,14 +138,16 @@ def _register_collections(
         )
 
     @mcp.tool
-    async def collection_update(
-        collection_id: str, description: str | None = None
-    ) -> dict[str, Any]:
-        """Change a collection's description, leaving its membership alone.
+    async def collection_update(collection_id: str, description: str) -> dict[str, Any]:
+        """Set a collection's description, leaving its membership alone.
+
+        The write is a set, not a merge. ``description`` is required for that reason: as an
+        optional argument, calling this tool without one erased the description rather than
+        leaving it alone, which is a destructive default nobody would ask for.
 
         Args:
             collection_id: The collection to describe.
-            description: What it is for. Pass nothing to clear it.
+            description: What it is for. An empty string clears it.
         """
         return await dispatch(
             "collection_update",

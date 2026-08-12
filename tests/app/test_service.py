@@ -1494,3 +1494,37 @@ async def test_a_search_names_the_collections_it_was_scoped_to(
     assert scoped.collections == ("alpha",)
     assert wide.collections == ()
     del backend
+
+
+async def test_updating_a_description_cannot_erase_one_by_omission(
+    service: ApplicationService,
+) -> None:
+    """A set, not a merge — so the field is required and omission is a call that fails.
+
+    This is a defect this branch shipped and this test is what found it, so it is worth being
+    exact about. ``describe_collection`` writes whatever it is handed, and ``description``
+    defaulted to ``None``; every surface could therefore reach the verb without mentioning the
+    field, and ``collection update <id>`` with no arguments silently erased the description it
+    is named for changing. Nothing raised and nothing rendered differently — the value was
+    simply gone.
+
+    Required, so a surface that forgets is a ``TypeError`` at the call rather than a caller
+    who has to have been careful. Clearing is still possible and now has to be asked for.
+    """
+    import inspect  # noqa: PLC0415 - only this assertion reads a signature
+
+    made = await service.collection_create("alpha", description="worked examples")
+    parameter = inspect.signature(service.collection_update).parameters["description"]
+    assert parameter.default is inspect.Parameter.empty, (
+        "description has a default again, so `collection update <id>` with no arguments "
+        "erases the description instead of failing to call"
+    )
+
+    kept = await service.collection_update(made.id, description="still worked examples")
+    assert kept.description == "still worked examples"
+
+    cleared = await service.collection_update(made.id, description="")
+    assert cleared.description is None, (
+        "an empty string neither cleared the description nor was rejected; 'no description' "
+        "now has two spellings on the wire"
+    )

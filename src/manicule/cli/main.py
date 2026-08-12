@@ -645,9 +645,16 @@ def collection_rename(
 @collection_app.command("update")
 def collection_update(
     collection_id: Annotated[str, typer.Argument(help="The collection id.")],
-    description: Annotated[str | None, typer.Option(help="What this collection is for.")] = None,
+    description: Annotated[
+        str, typer.Argument(help="What this collection is for. Pass '' to clear it.")
+    ],
 ) -> None:
-    """Change a collection's description, leaving its membership alone."""
+    """Set a collection's description, leaving its membership alone.
+
+    An argument rather than an option, because the write is a set and not a merge: as an
+    optional flag, `collection update <id>` with nothing else erased the description it exists
+    to change.
+    """
     emit(
         "collection_update",
         lambda service: service.collection_update(collection_id, description=description),
