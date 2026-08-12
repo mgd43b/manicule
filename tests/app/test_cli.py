@@ -25,11 +25,12 @@ from manicule.cli import render
 from manicule.cli.shell import SHELLS, completion_script
 from manicule.core.errors import ConfigError
 from manicule.core.version import CORE_VERSION
+from manicule.mcp.server import TOOL_NAMES
 from manicule.storage.backup import BackupError
 from tests.app.fakes import FakeBackend, FakeMaintenance, make_chunk, make_document
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from manicule.app.results import Envelope
 
@@ -417,4 +418,119 @@ def test_a_fingerprint_is_never_truncated(
     monkeypatch.setenv("COLUMNS", width)
     assert FINGERPRINT in _laid_bare(_status_output(capsys)), (
         f"at {width} columns the fingerprint was truncated rather than wrapped"
+    )
+
+
+# --- the two registries the command line dispatches through -----------------------------------
+
+
+CLI_ONLY_OPS: frozenset[str] = frozenset(
+    {
+        "auth_create_key",
+        "auth_list_keys",
+        "auth_revoke_key",
+        "backup",
+        "completion",
+        "export",
+        "import",
+        "index_changes",
+        "init",
+        "reset_index",
+        "restore",
+        "start",
+        "stop",
+        "upgrade",
+    }
+)
+"""Operations the command line carries that the MCP surface deliberately does not.
+
+Named here so the emptiness check below covers both halves of ``PAYLOADS``. ``TOOL_NAMES``
+alone would leave the command-line-only operations unproven, and those are exactly the ones a
+new command is most likely to join — the ones with no tool to keep them honest.
+"""
+
+RENDERER_LANDMARKS: tuple[type[r.Payload], ...] = (
+    r.AnswerResultPayload,
+    r.SearchResult,
+    r.Diagnosis,
+    r.IngestReport,
+)
+"""Renderers that must exist, named individually.
+
+A count is satisfied by any twenty-eight entries. These four are the results of the operations
+somebody actually runs — ask, search, doctor, index — so a table that has lost its way fails
+here rather than passing on its size.
+"""
+
+
+def _registries() -> tuple[Mapping[str, type[r.Payload]], Mapping[type[r.Payload], object]]:
+    """The two tables the command line dispatches through, having proved they are populated.
+
+    An invariant over two empty collections holds vacuously, and this repository has shipped
+    that shape before. So the emptiness check lives here, where both directions of the
+    invariant go through it, rather than beside them where one could skip it.
+
+    The floor is *derived* rather than written down: every MCP tool's operation is also a
+    command-line operation, so :data:`~manicule.mcp.server.TOOL_NAMES` is a lower bound that
+    nobody has to maintain — and one that fails loudly if the tables are read from the wrong
+    module.
+    """
+    payloads = cli.PAYLOADS
+    renderers = render.RENDERERS
+
+    missing_tools = sorted(set(TOOL_NAMES) - set(payloads))
+    assert missing_tools == [], (
+        f"PAYLOADS is missing {missing_tools}, which are MCP tool operations. Every tool's "
+        f"operation is one the command line can run too, so this is either a table read from "
+        f"the wrong place or a surface that has genuinely diverged."
+    )
+    missing_cli = sorted(CLI_ONLY_OPS - set(payloads))
+    assert missing_cli == [], (
+        f"PAYLOADS is missing the command-line-only operation(s) {missing_cli}. If one was "
+        f"deliberately removed, delete it from CLI_ONLY_OPS in the same change."
+    )
+    absent = [kind.__name__ for kind in RENDERER_LANDMARKS if kind not in renderers]
+    assert absent == [], (
+        f"RENDERERS has no entry for {absent}. Whatever table this is, it is not the one the "
+        f"command line renders through."
+    )
+    return payloads, renderers
+
+
+def test_every_operation_the_command_line_can_emit_has_a_renderer() -> None:
+    """A payload with no renderer is a ``KeyError`` on the operation's **success** path.
+
+    ``print_envelope`` parses the envelope into the type ``PAYLOADS`` names, then hands it to
+    ``render``, which looks it up in ``RENDERERS``. A missing entry raises — and it raises on
+    the path least likely to be exercised by hand, because whoever adds a command checks the
+    error case first and sees the failure envelope render perfectly well.
+
+    This is the check that would have caught it with nobody in the loop.
+    """
+    payloads, renderers = _registries()
+    unrenderable = sorted(
+        f"{op} -> {kind.__name__}" for op, kind in payloads.items() if kind not in renderers
+    )
+    assert unrenderable == [], (
+        f"these operations produce a payload no renderer handles: {unrenderable}. Each one is "
+        f"a KeyError the moment the operation succeeds. Add the payload type to RENDERERS in "
+        f"manicule.cli.render."
+    )
+
+
+def test_every_renderer_is_reachable_from_some_operation() -> None:
+    """The other direction, and it catches the mistake that reads as coverage.
+
+    A renderer for a payload no operation produces is dead code that looks exactly like a
+    handled case — so the table appears complete while the operation somebody actually wanted
+    renders through nothing. It is also what is left behind when an operation is removed and
+    its view is not.
+    """
+    payloads, renderers = _registries()
+    produced = set(payloads.values())
+    unreachable = sorted(kind.__name__ for kind in renderers if kind not in produced)
+    assert unreachable == [], (
+        f"these renderers cannot be reached by any operation: {unreachable}. Either the "
+        f"operation that produced them was removed and its view was not, or a payload type "
+        f"is missing from PAYLOADS."
     )
