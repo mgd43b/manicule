@@ -50,6 +50,7 @@ from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.ingest.pipeline import RunReport
 from manicule.ingest.reindex import ReindexReport
 from manicule.retrieval.retriever import RetrievalResult
+from manicule.storage.organisation import normalise_name
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Mapping, Sequence
@@ -253,12 +254,13 @@ class FakeOrganisation:
         description: str | None = None,
         rule: CollectionRule | None = None,
     ) -> DocumentCollection:
-        if any(item.name == name for item in self.collections.values()):
-            msg = f"a collection named {name!r} already exists"
+        label = normalise_name(name)
+        if any(item.name == label for item in self.collections.values()):
+            msg = f"a collection named {label!r} already exists"
             raise NameInUseError(msg)
         made = DocumentCollection(
             id=f"col-{len(self.collections)}",
-            name=name,
+            name=label,
             description=description,
             rule=rule,
             created_at=datetime.now(UTC),
@@ -272,6 +274,57 @@ class FakeOrganisation:
 
     async def get_collection(self, collection_id: str) -> DocumentCollection | None:
         return self.collections.get(collection_id)
+
+    async def find_collection(self, name: str) -> DocumentCollection | None:
+        label = normalise_name(name)
+        for item in self.collections.values():
+            if item.name == label:
+                return item
+        return None
+
+    async def rename_collection(self, collection_id: str, name: str) -> DocumentCollection:
+        label = normalise_name(name)
+        existing = self._require_collection(collection_id)
+        rival = await self.find_collection(label)
+        if rival is not None and rival.id != collection_id:
+            msg = f"a collection named {label!r} already exists"
+            raise NameInUseError(msg)
+        renamed = existing.model_copy(update={"name": label})
+        self.collections[collection_id] = renamed
+        return renamed
+
+    async def describe_collection(
+        self, collection_id: str, description: str | None
+    ) -> DocumentCollection:
+        existing = self._require_collection(collection_id)
+        described = existing.model_copy(update={"description": description})
+        self.collections[collection_id] = described
+        return described
+
+    async def collections_for(self, document_id: str) -> Sequence[DocumentCollection]:
+        """Manual membership only.
+
+        The rule-driven half is deliberately not modelled here. Evaluating a rule against an
+        in-memory dict would be a *second* implementation of ``rule_clause``, and two spellings
+        of one rule is the drift that function exists as a single expression to prevent — a
+        fake that disagreed with SQL would make these tests agree with the wrong thing. The
+        rule half is held against the real store by ``assert_collection_store_contract``.
+        """
+        return sorted(
+            (
+                self.collections[identifier]
+                for identifier, held in self.members.items()
+                if document_id in held and identifier in self.collections
+            ),
+            key=lambda item: item.name,
+        )
+
+    def _require_collection(self, collection_id: str) -> DocumentCollection:
+        existing = self.collections.get(collection_id)
+        if existing is None:
+            msg = f"no collection {collection_id!r}"
+            raise UnknownEntityError(msg)
+        return existing
 
     async def delete_collection(self, collection_id: str) -> None:
         if collection_id not in self.collections:

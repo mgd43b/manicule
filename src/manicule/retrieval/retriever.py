@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from manicule.core.protocols import CollectionStore, TagStore
 from manicule.core.retrieval import (
     Candidate,
     Confidence,
@@ -142,6 +143,20 @@ class Retriever:
         if routing.bypasses_retrieval:
             return await self._direct(query, routing, started)
 
+        # Membership becomes document ids here, before anything else looks at the filter.
+        # Neither leg has a join to `collection_documents`, and both refuse the field rather
+        # than drop it, so a query naming a collection fails in the store unless it is resolved
+        # first. Here rather than in a leg because there are three readers of the filter and
+        # only one of them is a leg: the lexical statement, the dense prefilter, and the cache
+        # -- `_from_cache` rehydrates through `join_filter`, which carries `collection_ids`
+        # too. Resolving once, above all three, is also what makes the cache key correct:
+        # the key is computed from the resolved filter, so changing a collection's membership
+        # changes the key and cannot serve a ranking computed over the old set.
+        resolved = await self._resolve_membership(query)
+        if resolved is None:
+            return self._matches_nothing(query, routing, started)
+        query = resolved
+
         identity = self.identity(query)
         key = self._key(query, identity)
         if key is not None:
@@ -185,6 +200,76 @@ class Retriever:
                 stages=run.spans,
                 assembly=assembly,
                 incomparable=tuple(dict.fromkeys(incomparable)),
+            ),
+            routing=routing,
+        )
+
+    async def _resolve_membership(self, query: Query) -> Query | None:
+        """Turn ``collection_ids`` and ``tag_ids`` into ``document_ids``, or refuse.
+
+        ``None`` means *no document can match*, and it is not the same as an empty result.
+        A filter's set-valued fields default to empty and an empty field restricts nothing, so
+        resolving an empty collection into ``document_ids=frozenset()`` would hand the legs a
+        filter that searches the whole workspace — the narrowest request anyone can make,
+        answered with the widest possible result, ranked and plausible. The caller returns no
+        candidates instead.
+
+        The import is deferred rather than module-level on purpose. ``manicule.retrieval``
+        imports nothing from ``manicule.storage`` — the property ``prefilter``'s docstring
+        already protects when it restates a constant rather than importing it — and this is
+        the one place that needs a function living over there. Deferring keeps the package's
+        module graph as it was, and the cost is paid only by a query that names a collection.
+
+        Raises:
+            ValueError: The store cannot resolve membership. Refused rather than dropped: a
+                silently ignored restriction returns rows the filter was written to exclude,
+                and the search still looks like it worked.
+        """
+        scope = query.filter
+        if not (scope.collection_ids or scope.tag_ids):
+            return query
+
+        from manicule.storage.organisation import resolve_filter  # noqa: PLC0415 - only here
+
+        store = self._docstore
+        if not isinstance(store, CollectionStore) or not isinstance(store, TagStore):
+            named = " and ".join(sorted(scope.restricting_fields & {"collection_ids", "tag_ids"}))
+            msg = (
+                f"this query restricts on {named}, and the document store behind it resolves "
+                f"neither collections nor tags. Refused rather than dropped: applying the rest "
+                f"of the filter would return documents the caller asked to exclude, and the "
+                f"result would look like an ordinary search."
+            )
+            # `ValueError`, not the `TypeError` the isinstance test suggests. This is the same
+            # refusal `_require_honourable` makes when a store is handed a field it has no
+            # column for, and it reaches a caller as one kind of thing: a filter that cannot
+            # be honoured here. Splitting it by which layer noticed would make the surfaces
+            # report two different errors for one cause.
+            raise ValueError(msg)  # noqa: TRY004
+
+        resolved = await resolve_filter(scope, collections=store, tags=store)
+        if resolved is None:
+            return None
+        return query.model_copy(update={"filter": resolved})
+
+    def _matches_nothing(self, query: Query, routing: Routing, started: float) -> RetrievalResult:
+        """The answer when membership resolved to no document at all.
+
+        Confidence is *scored* rather than left ``None``. The two are different claims — the
+        dataclass says so — and this is the ``none`` band with a reason: we looked, and the
+        collection this query names holds nothing that could match.
+        """
+        context = Context(query=query)
+        identity = self.identity(query)
+        return RetrievalResult(
+            context=context,
+            candidates=[],
+            confidence=self._confidence(context, identity, exhausted_budget=False),
+            trace=RetrievalTrace(
+                route=routing.route,
+                pipeline=identity,
+                cached=False,
+                total_ms=(time.perf_counter() - started) * 1000.0,
             ),
             routing=routing,
         )

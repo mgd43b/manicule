@@ -80,6 +80,18 @@ class CollectionBody(Body):
     description: str | None = Field(default=None, max_length=2000)
 
 
+class CollectionUpdateBody(Body):
+    """A change to what a collection is *for*, never to what is in it."""
+
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class CollectionNameBody(Body):
+    """A new name for an existing collection."""
+
+    name: str = Field(min_length=1, max_length=200)
+
+
 class TagBody(Body):
     """A new tag, or the existing one of that name."""
 

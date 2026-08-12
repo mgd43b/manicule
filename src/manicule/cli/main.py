@@ -201,7 +201,11 @@ config_app = typer.Typer(
 auth_app = typer.Typer(
     help="API keys for this workspace.", no_args_is_help=True, cls=CommandsShareTheRootOptions
 )
+collection_app = typer.Typer(
+    help="Named sets of documents.", no_args_is_help=True, cls=CommandsShareTheRootOptions
+)
 app.add_typer(document_app, name="document")
+app.add_typer(collection_app, name="collection")
 app.add_typer(connector_app, name="connector")
 app.add_typer(workspace_app, name="workspace")
 app.add_typer(plugin_app, name="plugin")
@@ -342,6 +346,16 @@ PAYLOADS: dict[str, type[Payload]] = {
     "auth_create_key": r.ApiKeyIssued,
     "auth_list_keys": r.ApiKeyList,
     "auth_revoke_key": r.ApiKeyRevoked,
+    "collection_create": r.CollectionSummary,
+    "collection_list": r.CollectionList,
+    "collection_rename": r.CollectionSummary,
+    "collection_update": r.CollectionSummary,
+    "collection_delete": r.CollectionDeleted,
+    "collection_add": r.CollectionMembership,
+    "collection_remove": r.CollectionMembership,
+    "collection_documents": r.DocumentList,
+    "collection_counts": r.CollectionCounts,
+    "collection_orphans": r.CollectionOrphans,
 }
 """Which payload each operation produces.
 
@@ -417,6 +431,10 @@ def ask(
     profile: Annotated[str | None, typer.Option(help="fast, balanced or precise.")] = None,
     limit: Annotated[int | None, typer.Option(help="Passages to retrieve.")] = None,
     source: Annotated[list[str] | None, typer.Option(help="Restrict to these sources.")] = None,
+    collection: Annotated[
+        list[str] | None,
+        typer.Option(help="Restrict to these collections, by name. Repeat to union them."),
+    ] = None,
     conversation: Annotated[str | None, typer.Option(help="Continue this conversation.")] = None,
     repl: Annotated[bool, typer.Option("--repl", help="Ask repeatedly, interactively.")] = False,
 ) -> None:
@@ -460,6 +478,7 @@ def ask(
             profile=profile,
             limit=limit,
             sources=tuple(source or ()),
+            collections=tuple(collection or ()),
             conversation_id=conversation,
             on_event=on_event if stream else None,
         ),
@@ -474,11 +493,16 @@ def search(
     query: Annotated[
         str | None, typer.Argument(help="What to search for. Reads stdin if absent.")
     ] = None,
+    *,
     top: Annotated[int, typer.Option("--top", "-n", help="How many passages to return.")] = 10,
     profile: Annotated[str | None, typer.Option(help="fast, balanced or precise.")] = None,
     source: Annotated[list[str] | None, typer.Option(help="Restrict to these sources.")] = None,
     media_type: Annotated[
         list[str] | None, typer.Option("--type", help="Restrict to these media types.")
+    ] = None,
+    collection: Annotated[
+        list[str] | None,
+        typer.Option(help="Restrict to these collections, by name. Repeat to union them."),
     ] = None,
 ) -> None:
     """Rank passages for a query, without asking a model anything."""
@@ -490,6 +514,7 @@ def search(
             profile=profile,
             sources=tuple(source or ()),
             media_types=tuple(media_type or ()),
+            collections=tuple(collection or ()),
         ),
     )
 
@@ -582,6 +607,123 @@ def document_reindex(
 ) -> None:
     """Re-parse one document from the bytes ingest retained. Touches no network."""
     emit("document_reindex", lambda service: service.document_reindex(document_id))
+
+
+# --- collection -------------------------------------------------------------------------------
+
+
+@collection_app.command("create")
+def collection_create(
+    name: Annotated[str, typer.Argument(help="The collection's name.")],
+    description: Annotated[str | None, typer.Option(help="What this collection is for.")] = None,
+) -> None:
+    """Create a collection. A name already in use is refused rather than merged."""
+    emit(
+        "collection_create",
+        lambda service: service.collection_create(name, description=description),
+    )
+
+
+@collection_app.command("list")
+def collection_list() -> None:
+    """List every collection in this workspace."""
+    emit("collection_list", lambda service: service.collection_list())
+
+
+@collection_app.command("rename")
+def collection_rename(
+    collection_id: Annotated[str, typer.Argument(help="The collection id.")],
+    name: Annotated[str, typer.Argument(help="The new name.")],
+) -> None:
+    """Rename a collection. Nothing is re-indexed and no membership moves."""
+    emit(
+        "collection_rename",
+        lambda service: service.collection_rename(collection_id, name),
+    )
+
+
+@collection_app.command("update")
+def collection_update(
+    collection_id: Annotated[str, typer.Argument(help="The collection id.")],
+    description: Annotated[str | None, typer.Option(help="What this collection is for.")] = None,
+) -> None:
+    """Change a collection's description, leaving its membership alone."""
+    emit(
+        "collection_update",
+        lambda service: service.collection_update(collection_id, description=description),
+    )
+
+
+@collection_app.command("delete")
+def collection_delete(
+    collection_id: Annotated[str, typer.Argument(help="The collection id.")],
+) -> None:
+    """Delete a collection. The documents in it are untouched."""
+    emit("collection_delete", lambda service: service.collection_delete(collection_id))
+
+
+@collection_app.command("add")
+def collection_add(
+    collection_id: Annotated[str, typer.Argument(help="The collection id.")],
+    document_id: Annotated[list[str], typer.Argument(help="Documents to add.")],
+) -> None:
+    """Add documents to a collection. Nothing is re-embedded."""
+    emit(
+        "collection_add",
+        lambda service: service.collection_add(collection_id, tuple(document_id)),
+    )
+
+
+@collection_app.command("remove")
+def collection_remove(
+    collection_id: Annotated[str, typer.Argument(help="The collection id.")],
+    document_id: Annotated[list[str], typer.Argument(help="Documents to remove.")],
+) -> None:
+    """Remove documents from a collection. The documents themselves survive."""
+    emit(
+        "collection_remove",
+        lambda service: service.collection_remove(collection_id, tuple(document_id)),
+    )
+
+
+@collection_app.command("documents")
+def collection_documents(
+    collection_id: Annotated[str, typer.Argument(help="The collection id.")],
+    limit: Annotated[int, typer.Option(help="Page size.")] = 50,
+    offset: Annotated[int, typer.Option(help="How many to skip.")] = 0,
+) -> None:
+    """List a collection's documents, manual members and rule-selected alike."""
+    emit(
+        "collection_documents",
+        lambda service: service.collection_documents(collection_id, limit=limit, offset=offset),
+    )
+
+
+@collection_app.command("counts")
+def collection_counts(
+    collection_id: Annotated[str, typer.Argument(help="The collection id.")],
+) -> None:
+    """Count a collection's documents and chunks, now rather than from a stored total."""
+    emit("collection_counts", lambda service: service.collection_counts(collection_id))
+
+
+@collection_app.command("orphans")
+def collection_orphans(
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Move the orphans to the trash instead of listing them."),
+    ] = False,
+) -> None:
+    """List live documents in no collection, and optionally move them to the trash.
+
+    Reporting is the default. In a corpus where collections are optional "in no collection"
+    describes most of it, so deletion has to be asked for by name -- and even then it is the
+    same soft delete `document delete` performs, so everything it removes can be restored.
+
+    Command line only. It destroys data, and this project keeps that class of operation off
+    the surfaces an unattended caller reaches.
+    """
+    emit("collection_orphans", lambda service: service.collection_orphans(delete=confirm))
 
 
 # --- connector --------------------------------------------------------------------------------
