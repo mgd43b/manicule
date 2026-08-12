@@ -79,6 +79,24 @@ updates:
       - dependency-name: "manicule-plugin-example"
       - dependency-name: "manicule-plugin-hostile"
 
+      # One version, not a range, and it is upstream's arithmetic rather than a preference of
+      # ours. `tokenizers` published no final 0.23.0 — only 0.23.0rc0 — and went straight to
+      # 0.23.1, while every released `transformers`, up to and including 5.15.0, pins
+      # `tokenizers>=0.22.0,<=0.23.0`. `sentence-transformers` under the `rerank` extra
+      # depends on `transformers`, so `manicule[embeddings]` at 0.23.1 and `manicule[rerank]`
+      # cannot both be satisfied by any combination of versions. Without this entry Dependabot
+      # re-derives that every Monday and reports it as a resolution failure, which reads like
+      # a problem with this repository and is not one: `uv lock --upgrade-package tokenizers`
+      # already returns the newest satisfiable version and leaves the lockfile unchanged.
+      #
+      # Naming the single version rather than capping the dependency keeps this self-clearing.
+      # The next `tokenizers` release is offered normally, and by then `transformers` will
+      # have widened its bound or the failure will be a real one worth seeing. Drop this entry
+      # once `transformers` allows 0.23.1 — the whole point is that it does not outlive the
+      # upstream cap it describes.
+      - dependency-name: "tokenizers"
+        versions: ["0.23.1"]
+
     # Group order is meaningful: a dependency joins the first group it matches. The
     # `index-affecting-*` groups are therefore first, and `runtime` — the only group with a
     # wildcard — repeats their patterns under `exclude-patterns` as well. That duplication is
