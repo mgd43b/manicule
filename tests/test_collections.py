@@ -478,3 +478,43 @@ async def test_a_collection_and_a_source_keep_only_what_is_in_both(
         "the two fields stopped combining"
     )
     assert not resolved.collection_ids
+
+
+async def test_no_membership_operation_can_reach_a_write_that_would_re_embed(
+    store: SqliteDocStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spec's central promise, guarded by *reachability* rather than by state.
+
+    The test above compares chunk ids before and after, which catches a re-embed that changed
+    something. It would not catch one that re-derived identical chunks — the corpus would look
+    untouched while every membership change quietly did the work of an ingest, and on a real
+    model that is the difference between instant and minutes.
+
+    So this asserts the stronger thing: from the six operations that change what a collection
+    *is*, the two methods that rewrite a document or its chunks are not reachable at all. It
+    holds today because membership is join rows and a rule is a column. It is here so that a
+    later change which wires a re-index into `rename_collection` — a plausible, well-meant
+    change — fails loudly instead of being discovered as a performance complaint.
+    """
+    corpus = await _corpus(store)
+    collection = await store.create_collection("alpha")
+    await store.add_to_collection(collection.id, [corpus[SHARED].id])
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        msg = (
+            "a collection operation reached a document or chunk write. Membership is "
+            "metadata: one document in two collections is one identity with one set of "
+            "embeddings, and grouping it must never re-parse, re-chunk or re-embed it"
+        )
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(type(store), "replace_chunks", forbidden)
+    monkeypatch.setattr(type(store), "upsert_document", forbidden)
+
+    await store.add_to_collection(collection.id, [corpus[ALPHA_ONLY].id])
+    await store.remove_from_collection(collection.id, [corpus[ALPHA_ONLY].id])
+    await store.rename_collection(collection.id, "alpha handbook")
+    await store.describe_collection(collection.id, "worked examples")
+    await store.set_collection_rule(collection.id, CollectionRule(sources=frozenset({"fs"})))
+    await store.delete_collection(collection.id)

@@ -211,17 +211,6 @@ ABSENT: tuple[tuple[str, str, str], ...] = (
     ("POST", "/api/v1/admin/upgrade", "an upgrade fetches and executes code"),
     ("POST", "/api/v1/admin/connectors", "declaring a connector points the index somewhere new"),
     ("GET", "/api/v1/admin/benchmark", "a benchmark on request is a denial of service"),
-    (
-        "POST",
-        "/api/v1/collections/orphans",
-        "deleting every document outside every collection is most of a corpus where "
-        "collections are optional, and `collection orphans --confirm` is the only way to it",
-    ),
-    (
-        "DELETE",
-        "/api/v1/collections/orphans",
-        "the same operation spelled as a delete",
-    ),
 )
 """Operations that exist elsewhere in manicule and are deliberately not routes here.
 

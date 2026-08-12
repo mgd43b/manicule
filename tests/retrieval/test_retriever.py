@@ -563,3 +563,35 @@ async def test_a_membership_change_is_not_served_from_the_cache(store: SqliteDoc
         left[0].document_id,
         right[0].document_id,
     }, "the second search was served a ranking computed before the document was added"
+
+
+async def test_a_cache_hit_still_honours_the_collection_filter(store: SqliteDocStore) -> None:
+    """The second half of the same defect, and the half nobody looks at twice.
+
+    `_from_cache` rehydrates through `join_filter(query.filter)`, which carries
+    `collection_ids` — to a store that refuses the field. So a fix applied only to the live
+    path leaves a cached path that either raises on the second identical query or, worse,
+    serves rows the filter was written to exclude. A restriction honoured the first time and
+    dropped the second is worse than one that never worked: the first query is the one anybody
+    checks.
+
+    `trace.cached` is asserted on both queries, because a test that merely compared the two
+    result sets would pass without the cache ever being consulted — which is exactly how this
+    path went untested in the first place.
+    """
+    left, right = await _two_projects(store)
+    collection = await store.create_collection("alpha")
+    await store.add_to_collection(collection.id, [left[0].document_id])
+    retriever = _retriever(store, [*left, *right], cache=L1QueryCache(entries=8))
+
+    first = await retriever.retrieve(_in_collections(collection.id))
+    second = await retriever.retrieve(_in_collections(collection.id))
+
+    assert first.trace.cached is False, "the first query was already a hit; the cache is dirty"
+    assert second.trace.cached is True, (
+        "the second identical query was not served from the cache, so this test is not "
+        "exercising the rehydration path it exists for"
+    )
+    assert {candidate.chunk.document_id for candidate in second.context.passages} == {
+        left[0].document_id
+    }, "a cache hit returned a document outside the collection the query named"
