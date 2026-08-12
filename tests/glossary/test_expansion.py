@@ -279,12 +279,17 @@ async def test_the_same_definition_stated_twice_is_not_a_conflict() -> None:
     assert result.conflicts == ()
 
 
-async def test_a_conflict_is_reported_even_when_the_occurrence_would_not_have_fired() -> None:
-    """The one case where a conflict would otherwise be invisible.
+async def test_a_conflict_is_not_reported_on_a_query_that_would_never_have_expanded() -> None:
+    """Corrected after watching the command line render the other way round.
 
-    An ordinary lower-case use does not expand — but the disagreement in the corpus is a fact
-    about the corpus, and hiding it behind the case rule would mean only the queries that
-    already worked ever surfaced it.
+    The first version reported a conflict whenever one existed, on the argument that a
+    disagreement is a fact about the corpus. Rendered, that put a glossary banner above the
+    results for *should I restart the daemon now* — a question that was never about the term.
+    A banner that appears on questions it does not concern is one readers learn to skip, which
+    costs exactly the case it exists for.
+
+    So the firing rules decide first. A term used as an ordinary word does not expand whether
+    or not the corpus disagrees about it, and there is nothing to warn anybody about.
     """
     result, _ = await expand(
         "restart the daemon now",
@@ -293,6 +298,34 @@ async def test_a_conflict_is_reported_even_when_the_occurrence_would_not_have_fi
     )
 
     assert not result.fired
+    assert result.conflicts == ()
+
+
+async def test_a_conflict_is_reported_when_the_query_did_ask_about_the_term() -> None:
+    """The case the report exists for, kept working by the change above."""
+    result, _ = await expand(
+        "what is now?",
+        entry(document="doc-a", chunk="chunk-a"),
+        entry(expansion=OTHER, document="doc-b", chunk="chunk-b"),
+    )
+
+    assert not result.fired
+    assert [conflict.key for conflict in result.conflicts] == ["NOW"]
+
+
+async def test_a_conflict_is_reported_when_only_one_documents_spelling_matches() -> None:
+    """Any of the disagreeing entries may admit the occurrence.
+
+    They share a normalised key and can write the display form differently, so testing only
+    the first would make a conflict's visibility depend on which document happened to be
+    indexed first.
+    """
+    result, _ = await expand(
+        "What is N.O.W. used for?",
+        entry(display="N.O.W.", document="doc-a", chunk="chunk-a"),
+        entry(expansion=OTHER, document="doc-b", chunk="chunk-b"),
+    )
+
     assert [conflict.key for conflict in result.conflicts] == ["NOW"]
 
 

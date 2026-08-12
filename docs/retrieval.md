@@ -1637,6 +1637,13 @@ an answer that is fluent, cited, and about the wrong thing — the one failure m
 feature has that plain search does not. Narrowing the scope is not a tie-break either: a
 collection holding both definitions holds a disagreement.
 
+The **firing rules run first**, and the order was corrected after watching the command line render
+the other way round. A term used as an ordinary English word does not expand whether or not the
+corpus disagrees about it, so reporting a conflict there put a glossary banner above the results
+for *should I restart the daemon now* — a question that was never about the term. A banner that
+appears on questions it does not concern is one readers learn to skip, which costs exactly the case
+it exists for.
+
 ### 14.6 What it does to confidence: nothing, by construction
 
 A promoted definition carries **no leg score**. `evidence_per_passage` (§8.2) skips a passage the

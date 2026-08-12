@@ -237,11 +237,31 @@ async def resolve_expansion(
         if not found:
             continue
         distinct = _distinct_expansions(found)
+        candidates = [entry for group in distinct.values() for entry in group]
+
+        # The firing rules run **before** the conflict check, and the order is a correction
+        # made after watching the command line render the other way round. A term used as an
+        # ordinary English word does not expand whether or not the corpus disagrees about it,
+        # so reporting a conflict there puts a glossary banner on a question that was never
+        # about the term — and a banner that appears on questions it does not concern is one
+        # readers learn to skip, which costs exactly the case it exists for.
+        #
+        # Any of the disagreeing entries may admit the occurrence: they share the key, and
+        # `exact_case` reads the *display* form, which two documents may write differently.
+        reason = next(
+            (
+                admitted
+                for admitted in (
+                    _why_it_fires(query.text, surface, entry, policy) for entry in candidates
+                )
+                if admitted is not None
+            ),
+            None,
+        )
+        if reason is None:
+            continue
+
         if len(distinct) > 1:
-            # Reported whether or not the occurrence would have fired. A conflict is a fact
-            # about the corpus, and hiding it behind a case rule would mean the one query most
-            # likely to surface a contradiction — the one that named the term properly — is the
-            # only one that ever does.
             conflicts.append(
                 ExpansionConflict(
                     key=key,
@@ -250,12 +270,9 @@ async def resolve_expansion(
                 )
             )
             continue
-        entry = max(next(iter(distinct.values())), key=lambda item: item.confidence)
         if len(matches) >= policy.max_terms:
             continue
-        reason = _why_it_fires(query.text, surface, entry, policy)
-        if reason is None:
-            continue
+        entry = max(next(iter(distinct.values())), key=lambda item: item.confidence)
         matches.append(GlossaryMatch(surface=surface, key=key, reason=reason, entry=entry))
 
     if not matches:
