@@ -121,7 +121,15 @@ def render_answer(
 def render_search(out: Console, payload: r.SearchResult) -> None:
     """Ranked passages, most relevant first."""
     if not payload.hits:
+        # "nothing matched" is the same sentence whether the corpus is empty or the query
+        # simply missed, and those need opposite things from the reader. The payload carries
+        # no corpus size, so this says which question to ask rather than guessing the answer.
         out.print("[yellow]nothing matched[/yellow]")
+        out.print(
+            "[dim]if this is a new installation nothing may be indexed yet — "
+            "[/dim]manicule index[dim] reports what is there, and "
+            "[/dim]manicule index <path>[dim] adds to it[/dim]"
+        )
     for position, hit in enumerate(payload.hits, start=1):
         heading = " / ".join(hit.heading_path)
         title = hit.title or hit.uri
@@ -234,7 +242,7 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
 
 
 def render_index_status(out: Console, payload: r.IndexStatus) -> None:
-    table = Table(box=None, show_header=False, pad_edge=False)
+    table = _folding_table()
     table.add_row("documents", str(payload.documents))
     table.add_row("chunks", str(payload.chunks))
     for status, count in sorted(payload.by_status.items()):
@@ -251,6 +259,10 @@ def render_index_status(out: Console, payload: r.IndexStatus) -> None:
         out.print(f"[dim]embed fingerprint: {escape(payload.embed_fingerprint)}[/dim]")
     if payload.chunk_fingerprint:
         out.print(f"[dim]chunk fingerprint: {escape(payload.chunk_fingerprint)}[/dim]")
+    # An index reporting zeros is the state a first run is in, and a screen of zeros with no
+    # next action is where that run stops.
+    if not payload.documents:
+        out.print("\n[dim]nothing is indexed yet. [/dim]manicule index <path>[dim] fills it[/dim]")
 
 
 def render_stats(out: Console, payload: r.Stats) -> None:
@@ -397,7 +409,7 @@ def render_reset(out: Console, payload: r.ResetReport) -> None:
 
 def render_init(out: Console, payload: r.InitReport) -> None:
     out.print(f"configuration written to [bold]{escape(payload.path)}[/bold]")
-    table = Table(box=None, show_header=False, pad_edge=False)
+    table = _folding_table()
     table.add_row("data directory", escape(payload.data_dir))
     table.add_row(
         "embedding", f"{escape(payload.embedding_provider)} · {escape(payload.embedding_model)}"
@@ -406,22 +418,44 @@ def render_init(out: Console, payload: r.InitReport) -> None:
     out.print(table)
     for note in payload.notes:
         out.print(f"[dim]{escape(note)}[/dim]")
+    # The one thing a person needs after `init`, and the only command that has to come next.
+    # Without it the first run ends on a report with nothing to do about it.
+    out.print("\n[dim]next: [/dim]manicule index <path>[dim], then[/dim] manicule search <query>")
 
 
-def render_address(out: Console, payload: r.ServerAddress) -> None:
+def render_address(
+    out: Console, payload: r.ServerAddress, *, serves_api: bool = False, web: bool = False
+) -> None:
+    """Where the server is listening, and which surface is on it.
+
+    ``serves_api`` and ``web`` are told rather than inferred. :class:`~manicule.app.results.
+    ServerAddress` carries a *transport* and not a protocol, so the payload alone cannot tell
+    the HTTP API from MCP-over-HTTP — and announcing every socket as "MCP server" was wrong for
+    the one people actually open in a browser: ``manicule start --transport http`` printed
+    ``MCP server on http://127.0.0.1:8765, 11 tool(s)`` while serving the REST API and the
+    browser surface, and named neither. The caller that decided knows; only the default, where
+    nobody said, stays vague.
+    """
     if payload.transport == "stdio":
         out.print(f"MCP server on stdio, {payload.tools} tool(s). [dim]No socket is open.[/dim]")
         return
-    where = f"{payload.host}:{payload.port}"
+    where = f"http://{payload.host}:{payload.port}"
+    what = "HTTP API" if serves_api else "MCP server"
+    reach = "[dim](this machine only)[/dim]" if payload.loopback else ""
     if payload.loopback:
-        out.print(
-            f"MCP server on http://{where}, {payload.tools} tool(s) [dim](this machine only)[/dim]"
-        )
+        out.print(f"{what} on {where} {reach}")
+    else:
+        out.print(f"[red]{what} on {where} — reachable from the network[/red]")
+    if not serves_api:
+        out.print(f"[dim]{payload.tools} tool(s)[/dim]")
         return
-    out.print(
-        f"[red]MCP server on http://{where} — reachable from the network[/red], "
-        f"{payload.tools} tool(s)"
-    )
+    # The three things a person wants next, and none of them were printed before. A server
+    # whose browser surface is not named is one nobody finds without reading the source.
+    if web:
+        out.print(f"[dim]browser surface[/dim]  {where}/ui")
+    else:
+        out.print("[dim]browser surface off (--no-web)[/dim]")
+    out.print(f"[dim]API documentation[/dim] {where}/api/docs")
 
 
 def render_upgrade(out: Console, payload: r.UpgradeReport) -> None:
@@ -519,6 +553,24 @@ def _as[T: Payload](kind: type[T], payload: Payload) -> T:
         msg = f"expected {kind.__name__}, got {type(payload).__name__}"
         raise TypeError(msg)
     return payload
+
+
+def _folding_table() -> Table:
+    """A two-column table whose value column wraps rather than elides.
+
+    Rich truncates a cell that does not fit and marks it with ``…``, which is the right default
+    for prose and the wrong one for a path. ``manicule init`` and ``manicule index`` both report
+    the data directory, and on an ordinary terminal both printed it as
+    ``/private/tmp/…/scratchpad/c4fdec3b…`` — a location the reader cannot cd to, copy, or check
+    the permissions of, presented as though it were the whole value.
+
+    :func:`render_document` already folds for exactly this reason. This is the same decision in
+    the two other places that print a filesystem path.
+    """
+    table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_column()
+    table.add_column(overflow="fold")
+    return table
 
 
 def _status(status: str) -> str:

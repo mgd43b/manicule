@@ -55,7 +55,13 @@
     <label class="offscreen" for="palette-input">Go to an area</label>
     <input id="palette-input" type="text" autocomplete="off" placeholder="Go to…" data-palette-input>
     <ul data-palette-list></ul>
-    <p class="muted">Enter opens · Esc closes · <kbd>?</kbd> lists shortcuts</p>
+    {# The shortcuts this page actually has. It previously said "? lists shortcuts", and `?`
+       opens this same palette — there is no shortcuts list anywhere, so the one line of help
+       on the surface described a feature that does not exist. These four are real. #}
+    <p class="muted">
+      <kbd>↑</kbd><kbd>↓</kbd> choose · <kbd>Enter</kbd> open · <kbd>Esc</kbd> close ·
+      <kbd>/</kbd> search · <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>K</kbd> reopens this
+    </p>
   </div>
 </div>
 

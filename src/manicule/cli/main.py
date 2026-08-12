@@ -724,10 +724,10 @@ def start(
     is configured **and** ``--allow-public-bind`` is passed **and** authentication is on. Any
     one missing is a refusal naming which.
 
-    ``--no-web`` is accepted and currently describes what already happens: the web UI is not
-    part of this build, so nothing but the API and MCP is served.
+    ``--no-web`` leaves the browser surface unmounted, so every ``/ui`` path answers 404 and
+    the process serves only the JSON API. It applies to ``--transport http`` without
+    ``--mcp-only``, which is the only mode that has a browser surface to suppress.
     """
-    del no_web  # the web UI is #12; the API and MCP are what there is to serve
     from manicule.cli.serving import serve_forever  # noqa: PLC0415 - only this command serves
 
     raise typer.Exit(
@@ -739,6 +739,7 @@ def start(
             overrides=STATE.overrides,
             json_output=STATE.json_output,
             mcp_only=mcp_only,
+            web=not no_web,
         )
     )
 

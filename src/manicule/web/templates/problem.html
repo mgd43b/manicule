@@ -8,11 +8,20 @@
 #}{% extends layout %}
 {% block content %}
 <div class="panel bad">
-  <p class="op">{{ problem.op }}</p>
+  {# The bare operation name read as a label for the page — a reader who asked for a document
+     that is not there was shown the word "workbench" and nothing that made sense of it. It is
+     still worth printing, because it is what the other three surfaces call the same failure,
+     so it is framed as the operation rather than left standing as a heading. #}
+  <p class="op">while running <code>{{ problem.op }}</code></p>
   {% if problem.error %}
   <p class="type">{{ problem.error.type }}</p>
   <p class="message">{{ problem.error.message }}</p>
   {% if problem.error.hint %}<p class="hint">{{ problem.error.hint }}</p>{% endif %}
   {% endif %}
 </div>
+{# A refusal is where a reader is most likely to be stuck, and the frame's navigation is a list
+   of eleven areas rather than the way back to the one they came from. #}
+<p class="muted">
+  {%- for name, path, label in navigation %}{% if name == area %}<a href="{{ path }}">Back to {{ label }}</a>{% endif %}{% endfor -%}
+</p>
 {% endblock %}
