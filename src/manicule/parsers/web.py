@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Final
 
 from selectolax.lexbor import LexborHTMLParser, LexborNode
 
@@ -33,7 +34,7 @@ from manicule.core.content import BlockKind, Metadata, ParsedBlock, RawDocument
 from manicule.parsers.base import HeadingStack, ParserProfile, decode
 from manicule.parsers.config import WEB_MEDIA_TYPES, WebConfig
 
-__all__ = ["WEB_MEDIA_TYPES", "WebConfig", "WebParser"]
+__all__ = ["WEB_MEDIA_TYPES", "WebConfig", "WebParser", "recover_cdata"]
 
 _HEADING_LEVELS: Mapping[str, int] = {f"h{level}": level for level in range(1, 7)}
 
@@ -139,7 +140,7 @@ class WebParser:
         return reading.preamble or None
 
     def _read(self, raw: RawDocument) -> _Reading:
-        tree = LexborHTMLParser(decode(raw))
+        tree = LexborHTMLParser(recover_cdata(decode(raw)))
         for tag in sorted(self._config.drop_tags):
             for node in tree.css(tag):
                 node.decompose()
@@ -147,6 +148,74 @@ class WebParser:
         body = tree.body
         found = list(_walk(body)) if body is not None else []
         return _assemble(found, title)
+
+
+_CDATA_OPEN: Final = "<![CDATA["
+_CDATA_CLOSE: Final = "]]>"
+
+
+def recover_cdata(document: str) -> str:
+    """Rewrite every ``<![CDATA[…]]>`` section as the text it holds, escaped.
+
+    Public because two callers need it and one of them is a test that asserts the *rendered*
+    document contains no element the recovery could have created — a property only checkable on the
+    string this returns. A storage-format parser will be the second real caller.
+
+    **This recovers content an HTML parser deletes.** ``<![CDATA[…]]>`` is not a construct HTML has
+    outside foreign content, so a conforming parser reparses it as a *bogus comment* — lexbor
+    produces ``<!--[CDATA[…]]-->`` — and everything inside is gone from the document. Not degraded:
+    absent, with nothing raised and nothing reported.
+
+    It shipped as a live defect rather than a hypothetical. Confluence wraps the body of every
+    ``code``, ``noformat`` and ``graphviz`` macro in CDATA, and storage-format bodies are routed as
+    ``text/html`` (``docs/connectors/confluence.md`` §4), so every code block on every Server or
+    Data Center page has been missing from the index while a fragment of it was indexed as prose.
+    The Graphviz case is worse than a clean loss: ``->`` inside the body terminates the bogus
+    comment early, so the opening is swallowed and the tail escapes as the page's own words.
+
+    **Not a Confluence special case, and deliberately so.** A CDATA section in any HTML document is
+    content its author intended, and losing it is wrong for every input — which matters here
+    because there is no way to tell storage format from HTML at this point: storage format *is*
+    ``text/html``. A fix that needed to know would have needed a media type, and a media type is
+    only honest once a parser gives it meaning.
+
+    The escaping is what keeps this a recovery rather than an injection. CDATA exists precisely so
+    a body can contain ``<`` and ``&`` without being markup, so the recovered text is escaped
+    before it re-enters the document — otherwise ``<![CDATA[<script>…]]>`` would be *promoted* from
+    inert text to a live element, turning a content-loss bug into an execution one.
+
+    Unterminated sections are left exactly as they are. A document whose CDATA never closes is
+    malformed, and guessing where the author meant it to end would invent content; the existing
+    behaviour — the parser's own error recovery — is the honest answer.
+    """
+    if _CDATA_OPEN not in document:
+        return document
+    out: list[str] = []
+    rest = document
+    while True:
+        before, opened, after = rest.partition(_CDATA_OPEN)
+        if not opened:
+            out.append(before)
+            return "".join(out)
+        inner, closed, remainder = after.partition(_CDATA_CLOSE)
+        if not closed:
+            # Unterminated: emit the rest untouched rather than guessing where it ended.
+            out.append(before)
+            out.append(opened)
+            out.append(after)
+            return "".join(out)
+        out.append(before)
+        out.append(_escape(inner))
+        rest = remainder
+
+
+def _escape(text: str) -> str:
+    """The three characters that would otherwise make recovered text into markup.
+
+    ``&`` first, or the escapes introduced by the other two would themselves be escaped. Quotes are
+    left alone: this text becomes a text node, never an attribute value.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _title(raw: RawDocument, tree: LexborHTMLParser) -> str:
