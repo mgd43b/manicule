@@ -511,6 +511,19 @@ def render_api_key_revoked(out: Console, payload: r.ApiKeyRevoked) -> None:
     out.print(f"revoked [bold]{escape(payload.name)}[/bold] ({payload.id})")
 
 
+def render_connector_signed_in(out: Console, payload: r.ConnectorSignedIn) -> None:
+    """What was captured, where it went, and when it stops working. Never the session itself."""
+    if payload.forgotten:
+        out.print(f"forgot the stored session for [bold]{escape(payload.name)}[/bold]")
+        return
+    out.print(
+        f"signed in to [bold]{escape(payload.base_url)}[/bold] as "
+        f"[bold]{escape(payload.account)}[/bold]"
+    )
+    out.print(f"  stored in {escape(payload.stored_in)}")
+    out.print(f"  manicule will use it until {escape(payload.expires_at)}")
+
+
 RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.AnswerResultPayload: lambda out, p: render_answer(out, _as(r.AnswerResultPayload, p)),
     r.SearchResult: lambda out, p: render_search(out, _as(r.SearchResult, p)),
@@ -523,6 +536,9 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.Stats: lambda out, p: render_stats(out, _as(r.Stats, p)),
     r.Diagnosis: lambda out, p: render_diagnosis(out, _as(r.Diagnosis, p)),
     r.ConnectorList: lambda out, p: render_connectors(out, _as(r.ConnectorList, p)),
+    r.ConnectorSignedIn: lambda out, p: render_connector_signed_in(
+        out, _as(r.ConnectorSignedIn, p)
+    ),
     r.ConfigValue: lambda out, p: render_config_value(out, _as(r.ConfigValue, p)),
     r.ConfigChange: lambda out, p: render_config_change(out, _as(r.ConfigChange, p)),
     r.WorkspaceList: lambda out, p: render_workspaces(out, _as(r.WorkspaceList, p)),

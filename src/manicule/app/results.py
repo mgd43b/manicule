@@ -725,6 +725,28 @@ class ConnectorList(Payload):
     connectors: tuple[ConnectorSummary, ...] = ()
 
 
+class ConnectorSignedIn(Payload):
+    """A browser session captured for a source, proved against it, and stored.
+
+    Carries no part of the credential and never will. The session itself is the sync account's
+    whole identity at that company, so what is reported is what the instance said about it —
+    who it belongs to and when it was taken — and where it now lives.
+    """
+
+    name: str = Field(description="The configured source the session was captured for.")
+    base_url: str
+    account: str = Field(description="Who the instance said the session belongs to.")
+    captured_at: str
+    expires_at: str = Field(
+        description="When manicule will stop using it without a fresh sign-in. Its own ceiling "
+        "(``session_max_age_hours``) rather than the instance's, which no cookie states."
+    )
+    stored_in: str = Field(description="Where the session was put.")
+    forgotten: bool = Field(
+        default=False, description="Whether this removed a stored session instead of taking one."
+    )
+
+
 # --- configuration -------------------------------------------------------------------------
 
 
