@@ -14,9 +14,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from manicule.core.content import DocumentStatus
+from manicule.core.content import DocumentStatus, RawDocument
 from manicule.core.provenance import PROVENANCE_KEY, LocalSnapshot, Provenance, SourceMetadata
+from manicule.ingest.pipeline import Change
 from manicule.ingest.reindex import re_parse
+from tests.fakes import MEDIA_TYPE
 from tests.ingest import fakes
 from tests.ingest.test_pipeline import build
 
@@ -328,6 +330,52 @@ async def test_a_re_parse_from_retained_bytes_keeps_the_record_and_the_citation(
     assert after.provenance.source.version == "7"
     assert after.title == "Retry policy", "nor demote the citation back to a local name"
     assert after.uri == CANONICAL
+
+
+async def test_content_and_metadata_changes_are_detected_independently() -> None:
+    """Two axes, asked separately, because they cost different things to repair.
+
+    A body edited with its manifest untouched needs a re-parse; a manifest corrected over an
+    unchanged body needs only the record rewritten. Collapsed into one boolean, "should this be
+    re-ingested" is answerable and "why" is not — and *why* is the question somebody watching an
+    unexpected re-ingest of a whole corpus actually has.
+
+    The classifier is the one the skip decision is expressed in terms of, so it cannot rot into a
+    description of a decision made elsewhere: an empty set **is** the skip condition.
+    """
+    connector = a_connector(metadata=a_record(version="7"))
+    pipeline, store, _ = build()
+    await pipeline.run(connector)
+    stored = next(iter(store.documents.values()))
+    digest = stored.content_hash
+
+    # Nothing moved.
+    assert pipeline.changes_since(stored, digest, _raw(a_record(version="7"))) == frozenset()
+
+    # The manifest declares a new version; the bytes are identical.
+    assert pipeline.changes_since(stored, digest, _raw(a_record(version="8"))) == {Change.METADATA}
+
+    # The bytes moved; the record did not.
+    assert pipeline.changes_since(stored, "another-digest", _raw(a_record(version="7"))) == {
+        Change.CONTENT
+    }
+
+    # Both, and reported as both rather than as one.
+    assert pipeline.changes_since(stored, "another-digest", _raw(a_record(version="8"))) == {
+        Change.CONTENT,
+        Change.METADATA,
+    }
+
+
+def _raw(metadata: Metadata) -> RawDocument:
+    """A fetched document carrying ``metadata``, for asking the classifier a question."""
+    return RawDocument(
+        source_id=MIRRORED,
+        uri=f"memory://{MIRRORED}",
+        media_type=MEDIA_TYPE,
+        content="The client retries twice.\n",
+        metadata=metadata,
+    )
 
 
 async def test_a_hostile_stored_record_cannot_take_over_the_citation() -> None:

@@ -24,6 +24,7 @@ from manicule.ingest.embedding import batch_size, embed_chunks
 from manicule.ingest.middleware import MiddlewareRunner, declarations, text_digest
 from manicule.ingest.pipeline import (
     BlobSink,
+    Change,
     DocumentOutcome,
     IngestPipeline,
     NoRetention,
@@ -45,6 +46,7 @@ from manicule.ingest.workers import (
 __all__ = [
     "AttemptResult",
     "BlobSink",
+    "Change",
     "DocumentOutcome",
     "InProcessRunner",
     "IngestPipeline",
