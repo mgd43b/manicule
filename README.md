@@ -3,16 +3,16 @@
 Self-hosted document search and answers. Index documents from wherever they live — disk,
 git, Notion, Confluence, Drive, S3, the web — ask questions in natural language, and get
 answers with citations that resolve to a real location in a real document. Usable from the
-command line, over HTTP, and by AI assistants over MCP.
+command line, from a browser, over HTTP, and by AI assistants over MCP.
 
-> **Early, and runnable.** All three surfaces work today: point it at a directory, search it,
-> ask it questions, hand the same operations to an assistant over MCP, or serve them over HTTP.
-> There is no release on PyPI yet, so it is installed from a checkout — [below](#install). The
-> web UI is not built; see [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is
+> **Early, and runnable.** All four surfaces work today: point it at a directory, search it,
+> ask it questions, read it in a browser, hand the same operations to an assistant over MCP, or
+> serve them over HTTP. There is no release on PyPI yet, so it is installed from a checkout —
+> [below](#install). See [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is
 > being built in.
 
 ```bash
-manicule init                     # choose a backend this machine can run, write a config
+manicule init                     # pick a backend, write a config, seed what no wheel ships
 manicule index ~/Documents        # walk it, parse it, chunk it, embed it
 manicule search "retry policy"    # ranked passages, no model involved
 manicule ask "how do retries work?"
@@ -52,31 +52,53 @@ code, not to the tolerance.
 
 ## First run
 
-The shortest path from a clone to an answer about your own documents. `manicule init` writes a
-config file; the first `index` downloads the embedding model and then does not again. For the
-default `BAAI/bge-m3` that is about 1.1 GB on Apple silicon — the MLX conversion, in fp16 —
-and about 2.3 GB elsewhere, where the ONNX export is what runs.
+The shortest path from a clone to an answer about your own documents.
 
 ```bash
-manicule init
+manicule init                             # config, grammars, vocabularies — seconds
 manicule index docs                       # this repository's own design documents
 manicule search "how are citations verified"
-manicule ask "what does an anchor carry when the location is unknown?"
 ```
 
-`search` needs nothing but the embedder. **`ask` additionally needs a generator**, and the
-default configuration expects [Ollama](https://ollama.com) on `localhost:11434` serving
-`qwen2.5:14b`:
+**`manicule init` first, and it does more than write a file.** It picks the embedding backend
+this machine can run, then pre-seeds the two things no Python wheel ships: the tree-sitter
+grammars the code parser needs, and the BPE vocabularies every search measures a context with.
+Both are small — the whole step took **6 seconds** on a cold machine here — and both are the
+kind of thing manicule refuses to download in the middle of a question. Skip `init` and the
+first `search` will tell you so rather than fetching.
+
+**The model weights are the one thing `init` does not fetch, and the first `index` does.** They
+are the big artefact: about **1.1 GB** for `BAAI/bge-m3` on Apple silicon (the MLX conversion,
+fp16) and about **2.3 GB** elsewhere (the ONNX export). `init` tells you it is still to come
+and `manicule doctor` says so too, because the download itself is quiet — a Hugging Face
+progress bar, and a stretch with no manicule output at all. Indexing this repository's `docs/`
+cold measured **1 minute 21 seconds** and **2 minutes 4 seconds** on two runs here, the
+difference being the download; the same index with the weights already present took
+**33 seconds**.
+
+To take that wait deliberately, before you have a corpus to be impatient about:
+
+```bash
+uv run tools/prefetch_embedding_models.py --backend mlx    # or --backend onnx
+```
+
+**`ask` additionally needs a generator**, where `search` needs only the embedder. The default
+configuration expects [Ollama](https://ollama.com) on `localhost:11434` serving `qwen2.5:14b`:
 
 ```bash
 ollama pull qwen2.5:14b
-manicule config set llm.model qwen2.5:14b   # or any model that Ollama is serving
+manicule ask "what does an anchor carry when the location is unknown?"
 ```
 
 `manicule doctor` reports what is wrong and what to do about it, and it is the first thing to
-run when something does not work. `manicule doctor --fix` repairs what it can — today that is
-seeding the tree-sitter grammars, which `manicule init` already does and which is the one thing
-here that may use the network.
+run when something does not work. `manicule doctor --fix` repairs what it can: the grammars and
+the vocabularies, from an offline bundle when one is installed and from upstream otherwise. It
+is the only part of that command that writes to the machine or uses the network, which is why
+it is a flag — and it does **not** fetch the model weights, which is why the line above exists.
+
+Nothing here downloads anything while answering a question. That is the whole shape of it: the
+artefacts are seeded by a step you can watch fail, so a query either answers or refuses, and
+never silently waits on a blob store.
 
 ## The four surfaces
 
@@ -87,12 +109,24 @@ rather than a prose error.
 **The HTTP API** is eleven route groups over the same service — documents, chat with SSE
 streaming, conversations and shareable links, collections, tags, admin, plugins, auth, a
 workbench, a websocket channel — plus an embeddable chat widget. `manicule start --transport
-http` serves it, on loopback unless three separate things say otherwise.
+http` serves it on `127.0.0.1:8765`, and only there unless three separate things say otherwise.
+It prints where it is listening, including the two paths below:
 
-**The browser surface** is twelve areas of server-rendered HTML at `/ui`, on the same socket:
-chat with streaming citations, confidence and feedback; documents, their chunks, the trash and
-restore; collections and tags; connectors, plugins, workspaces, health, an admin dashboard and
-your own API keys. Command palette on `Ctrl`/`Cmd`+`K`, keyboard navigation, dark mode.
+```
+HTTP API on http://127.0.0.1:8765 (this machine only)
+browser surface  http://127.0.0.1:8765/ui
+API documentation http://127.0.0.1:8765/api/docs
+```
+
+`/api/docs` is Swagger over the OpenAPI document at `/api/openapi.json`. Every response is the
+same envelope the CLI prints under `--json`.
+
+**The browser surface** is server-rendered HTML at `/ui`, on the same socket, with eleven
+areas in its navigation: a dashboard, chat with streaming citations, confidence and feedback;
+documents, their chunks, the trash and restore; collections and tags; connectors, plugins,
+workspaces, health, an admin dashboard and your own API keys. Command palette on
+`Ctrl`/`Cmd`+`K`, keyboard navigation, dark mode. `manicule start --no-web` prints `browser
+surface off (--no-web)`, keeps the API, and answers 404 for every `/ui` path.
 
 It adds **no build toolchain**: Jinja2 templates, one hand-written stylesheet and one
 hand-written script, so `uv sync` is still the whole install and the container image stays free
@@ -245,7 +279,7 @@ uv run ruff check . && uv run pyright
 **GPL-3.0-or-later.** See [`LICENSE`](LICENSE).
 
 The embedding runtime decided this. `mlx-embeddings` is GPL-3.0, and running embeddings
-in-process on Apple Silicon is what keeps `uv tool install manicule` a single command with no
+in-process on Apple Silicon is what keeps installing manicule a single command with no model
 server to operate alongside it. Changing the licence was chosen over changing the dependency.
 
 **This reaches plugins.** They load in-process, in the same address space, through

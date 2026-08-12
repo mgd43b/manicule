@@ -11,7 +11,7 @@ a renderer, and forgetting the renderer is a loud failure rather than a blank sc
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 
 from rich.console import Console
 from rich.markup import escape
@@ -146,6 +146,34 @@ def render_search(out: Console, payload: r.SearchResult) -> None:
         summary.append("served from the query cache")
     summary.append(f"{payload.elapsed_ms} ms")
     out.print(f"[dim]{' · '.join(summary)}[/dim]")
+    _render_confidence_reason(out, payload.confidence_band, payload.confidence_reason)
+
+
+UNCONVINCED_BANDS: Final[frozenset[str]] = frozenset({"none", "low"})
+"""Bands whose reason is worth the line it takes.
+
+The reason for a *high* confidence is "the passages scored well", which the scores beside
+each hit already said. The reason for `none` is that every passage retrieved is one the
+corpus would have returned for any question at all — and without that sentence the reader is
+looking at three plausible-looking excerpts and one number they have no scale for.
+"""
+
+
+def _render_confidence_reason(out: Console, band: str | None, reason: str | None) -> None:
+    """Say *why* the score is what it is, when the score alone is misleading.
+
+    ``SearchResult`` has carried this since retrieval learned to admit ignorance, and the
+    browser surface renders it (``web/templates/search.html``) while the command line did
+    not — so the same query showed a sentence in one place and a bare ``0.00 (none)`` above
+    three plausible-looking excerpts in the other. The band gates it because a reason nobody
+    needed, printed every time, is how a reader learns to skip the last line.
+
+    ``ask`` still shows a band with no reason: ``AnswerResultPayload`` has no
+    ``confidence_reason`` to render, and inventing one here would mean a renderer deciding
+    something the service did not say.
+    """
+    if reason and band in UNCONVINCED_BANDS:
+        out.print(f"[yellow]{escape(reason)}[/yellow]")
 
 
 # --- documents --------------------------------------------------------------------------------
@@ -236,6 +264,15 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     if payload.error:
         out.print(f"[red]the run did not finish: {escape(payload.error)}[/red]")
         out.print("[dim]the watermark was not advanced, so running it again resumes[/dim]")
+        return
+    # The longest command in the first run ends here, often after minutes, and ended on a
+    # table with nothing to do about it — the same gap `init` had. Only when something was
+    # actually indexed: after a run that added nothing, "now search it" is advice about
+    # somebody else's corpus.
+    if payload.ingested:
+        out.print(
+            "\n[dim]next: [/dim]manicule search <query>[dim], or[/dim] manicule ask <question>"
+        )
 
 
 # --- state ------------------------------------------------------------------------------------
@@ -418,6 +455,15 @@ def render_init(out: Console, payload: r.InitReport) -> None:
     out.print(table)
     for note in payload.notes:
         out.print(f"[dim]{escape(note)}[/dim]")
+    # Not dim, and above `next:` rather than among the notes. `init` seeds the grammars and
+    # the vocabularies and leaves the weights, so the command it is about to recommend is the
+    # one that spends several minutes downloading a model — and a reader who was not told that
+    # reads the pause as a hang and kills it. One line, before the instruction it qualifies.
+    if payload.weights_pending:
+        out.print(
+            "\n[yellow]the embedding model is not on this machine yet[/yellow][dim]: the first "
+            "[/dim]index[dim] downloads it before indexing anything. Expect minutes, once.[/dim]"
+        )
     # The one thing a person needs after `init`, and the only command that has to come next.
     # Without it the first run ends on a report with nothing to do about it.
     out.print("\n[dim]next: [/dim]manicule index <path>[dim], then[/dim] manicule search <query>")

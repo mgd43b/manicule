@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from manicule.app.ports import Backend, Conversing
     from manicule.core.content import Chunk, Document
     from manicule.core.organisation import Collection, Tag
+    from manicule.embedding.artifacts import WeightsPlan
     from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
     from manicule.generation.ports import ConversationRecord
     from manicule.ingest.pipeline import RunReport
@@ -672,6 +673,11 @@ class ApplicationService:
         checks.append(await self._index_check())
         checks.append(await self._grammar_check(fix=fix))
         checks.append(await self._vocabulary_check(fix=fix))
+        # No `fix`. The other two repairs move megabytes and finish while somebody is looking
+        # at the command; this one would move over a gigabyte, and `doctor --fix` is what a
+        # person runs to un-break a machine, not what they run to spend ten minutes. It
+        # reports, and names the command that fetches.
+        checks.append(await self._model_check())
         checks.extend(await self._backend.component_checks())
         worst: r.CheckState = "ok"
         for check in checks:
@@ -1058,6 +1064,53 @@ class ApplicationService:
                 f"(tiktoken {vocabularies.tiktoken_version()}){carried}"
             ),
         )
+
+    async def _model_check(self, *, provider: str | None = None) -> r.Check:
+        """Whether the embedding weights are on this machine, and what it costs if not.
+
+        **The one artifact nothing pre-seeds, and this is the check that says so.** Grammars
+        and vocabularies are seeded by ``init`` because they are megabytes; the weights are
+        1.1 GB on MLX and 2.3 GB as an ONNX export, and refusing to work until somebody has
+        downloaded one would turn "install manicule and point it at a directory" into an
+        errand. So the download happens on the path that needs it — inside the first ``index``
+        — and the whole cost of that decision lands in one place: a first ingest that pauses
+        for minutes with a third-party progress bar and no explanation. This is the sentence
+        that makes the pause expected instead of a hang.
+
+        **``ok`` when they are absent, which is the point rather than a lapse.** A machine
+        that has not downloaded a model yet is not a broken machine, and a red check on a
+        healthy install is how an operator learns to stop reading ``doctor``. There is exactly
+        one state here that is genuinely broken and it is the one that is failing: weights
+        absent on an install that has told the hub it may not look, which cannot answer a
+        question and will not say so until somebody asks one.
+
+        **It never touches the network** — see :func:`manicule.embedding.runtimes.hub.is_cached`.
+        A diagnostic that fetched a gigabyte to report on a gigabyte would be absurd.
+
+        Args:
+            provider: The embedder to report on, for the caller that has just chosen one and
+                not yet reloaded configuration — ``init``. Defaults to the configured one.
+
+        Returns:
+            One check. It never raises: like every other check here, a broken installation has
+            to be diagnosable by the command that diagnoses it.
+        """
+        return await asyncio.to_thread(self._inspect_models, provider=provider)
+
+    def _weights_plan(self, provider: str | None) -> WeightsPlan | None:
+        """The artefact the configured backend will load, or ``None`` with no embedding extra."""
+        from manicule.embedding.artifacts import planned_weights  # noqa: PLC0415 - an extra
+
+        settings = self.settings
+        chosen = provider or settings.embedding.provider
+        try:
+            return planned_weights(chosen, settings.embedding.model)
+        except ImportError:
+            return None
+
+    def _inspect_models(self, *, provider: str | None) -> r.Check:
+        """The blocking half of :meth:`_model_check`: one cache probe, off the event loop."""
+        return _weights_check(self._weights_plan(provider))
 
     def _source_code_config(self) -> SourceCodeConfig:
         """The code parser's configuration, validated the way the parser's own factory does.
@@ -1498,11 +1551,19 @@ class ApplicationService:
         await asyncio.to_thread(_update_config, path, _initial_configuration(settings, provider))
         pre_seed = await self._grammar_check(fix=True)
         vocabulary_seed = await self._vocabulary_check(fix=True)
+        # Reported, never fetched — and that is a decision rather than an omission. The
+        # weights are the one artifact `init` does not seed: they are a gigabyte and upward,
+        # and an install step that downloads one before anybody has decided to index anything
+        # makes a worse first five minutes than the download itself does. What was missing was
+        # the sentence saying it is still to come, and this is that sentence.
+        weights = await asyncio.to_thread(self._weights_plan, provider)
+        weights_check = _weights_check(weights)
         notes = [
             f"embedding backend {provider!r} chosen for {probe['machine']} on {probe['system']}",
             "bind host written as 127.0.0.1; a wider bind needs auth and an explicit flag",
             f"grammars ({pre_seed.state}): {pre_seed.detail}",
             f"vocabularies ({vocabulary_seed.state}): {vocabulary_seed.detail}",
+            f"weights ({weights_check.state}): {weights_check.detail}",
         ]
         return r.InitReport(
             path=str(path),
@@ -1513,6 +1574,14 @@ class ApplicationService:
             llm_model=settings.llm.model,
             hardware=probe,
             notes=tuple(notes),
+            # A field rather than something a renderer sniffs out of the note above it. The
+            # note is one dim line among five and the pending download is the single fact that
+            # changes what the next command feels like, so the surfaces are told it plainly
+            # and each decides how loudly to say it. Read off the same plan the note above was
+            # built from — one cache probe, two readers — rather than parsed back out of the
+            # note: a boolean recovered from prose is a boolean that changes when somebody
+            # rewords a sentence.
+            weights_pending=weights is not None and not weights.present,
         )
 
     async def upgrade(
@@ -2653,6 +2722,73 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         error=report.error,
         elapsed_ms=_millis(started),
     )
+
+
+def _weights_check(plan: WeightsPlan | None) -> r.Check:
+    """Turn a weights plan into the check ``doctor`` prints. Pure: no probe, no network.
+
+    Separate from the probe so that ``init`` can ask the cache **once** and use the answer
+    twice — for the note it prints and for the flag it puts on the report. Two probes would
+    not merely be wasteful; they would be two answers to one question, free to disagree the
+    moment somebody's first ingest finished between them.
+    """
+    if plan is None:
+        return r.Check(
+            name="models",
+            state="unknown",
+            detail=(
+                "the embeddings extra is not installed, so there is no backend here to have "
+                "weights. Install `manicule[embeddings]`."
+            ),
+        )
+    if plan.present:
+        return r.Check(
+            name="models",
+            state="ok",
+            detail=f"{plan.repo} is on this machine; no download is pending",
+        )
+    # Named per backend rather than as one line for both. `--full --mlx` fetches the parity
+    # model, the ONNX export and the MLX conversion — about 3.6 GB to seed a backend that
+    # loads a third of it — so the advice a Mac reader follows has to be the narrow flag, or
+    # it costs them more than saying nothing would have.
+    seed = f"uv run tools/prefetch_embedding_models.py --backend {plan.provider}"
+    offline_env = _hub_offline_env()
+    offline = os.environ.get(offline_env) if offline_env else None
+    if offline:
+        return r.Check(
+            name="models",
+            state="failing",
+            detail=(
+                f"{plan.repo} is not on this machine and {offline_env}={offline} forbids "
+                f"fetching it, so the first search refuses rather than waits. Seed it with "
+                f"`{seed}` from a host that can reach the hub, or point embedding.model at a "
+                f"local directory holding the weights."
+            ),
+        )
+    return r.Check(
+        name="models",
+        state="ok",
+        detail=(
+            f"{plan.repo} is not on this machine yet, so the first `manicule index` downloads "
+            f"{plan.size} before it indexes anything. Nothing is wrong; it is a wait, once. "
+            f"Run `{seed}` to take it now instead."
+        ),
+    )
+
+
+def _hub_offline_env() -> str:
+    """The hub's own offline switch, named without importing an extra that may be absent.
+
+    Read from :mod:`manicule.embedding.runtimes.hub` rather than repeated as a literal, so the
+    name ``doctor`` prints and the name the fetch actually consults cannot drift. An install
+    with no embeddings extra gets an empty string, which reads as "there is no such switch
+    here" — correct, because there is also no backend to switch off.
+    """
+    try:
+        from manicule.embedding.runtimes.hub import OFFLINE_ENV  # noqa: PLC0415 - an extra
+    except ImportError:
+        return ""
+    return OFFLINE_ENV
 
 
 def _millis(started: float) -> int:

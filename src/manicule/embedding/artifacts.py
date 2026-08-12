@@ -24,6 +24,8 @@ whatever runs fastest — and stop at anything that moves the vectors.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
 
@@ -97,6 +99,83 @@ def mlx_repo(model_id: str, *, override: str = "") -> str:
 def onnx_repo(model_id: str, *, override: str = "") -> str:
     """Which repository the ONNX export comes from. Pure, for the same reason."""
     return override or model_id
+
+
+APPROXIMATE_WEIGHT_BYTES: Final[Mapping[tuple[str, str], int]] = {
+    ("mlx", "mlx-community/bge-m3-mlx-fp16"): 1_150_000_000,
+    ("onnx", "BAAI/bge-m3"): 2_290_000_000,
+}
+"""Roughly what a first fetch moves, per ``(provider, repo)``, for the models manicule ships
+a default for.
+
+**Keyed by both, because the same repository id means two different downloads.** The ONNX
+export lives in the model's own repository beside weights nothing here loads, and
+:data:`_ONNX_PATTERNS` takes a slice of it; MLX loads a separate conversion. A table keyed by
+repository alone would report the ONNX size for an MLX install of any model whose own
+repository happens to carry safetensors.
+
+**Approximate, recorded, and never guessed for anything absent.** These are the sizes the
+Hugging Face tree API reports for the files the two pattern sets match, rounded down to the
+figure a person would repeat. A model not in this table reports no size rather than an
+estimate: "about 1.1 GB" that turns out to be 4 is worse than "size not known here", because
+the first is what somebody plans an afternoon around.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class WeightsPlan:
+    """Which artefact a backend will load, and whether this machine already has it.
+
+    Answered without the network, so that a wait measured in gigabytes can be announced by
+    ``init`` and ``doctor`` before the first ingest meets it as an unexplained pause.
+    """
+
+    provider: str
+    repo: str
+    patterns: tuple[str, ...]
+    present: bool
+    approximate_bytes: int | None = None
+
+    @property
+    def size(self) -> str:
+        """The download, as a person would say it, or a stated absence of one."""
+        if self.approximate_bytes is None:
+            return "an unrecorded amount"
+        return f"about {self.approximate_bytes / 1_000_000_000:.1f} GB"
+
+
+def planned_weights(provider: str, model_id: str, *, override: str = "") -> WeightsPlan:
+    """What ``provider`` will load for ``model_id``, and whether it is already here.
+
+    Args:
+        provider: The configured embedder implementation, ``"mlx"`` or ``"onnx"``.
+        model_id: The canonical model.
+        override: An explicit artefact from configuration, which wins over the table.
+
+    Returns:
+        The plan. A provider this module knows no artefact route for — a third-party embedder
+        registered by a plugin — reports the model id with no patterns and ``present=True``,
+        because "manicule does not know how this one loads its weights" must not be rendered
+        as "this machine is missing something".
+    """
+    routes: Mapping[str, tuple[str, tuple[str, ...]]] = {
+        "mlx": (mlx_repo(model_id, override=override), _MLX_WEIGHT_PATTERNS),
+        "onnx": (onnx_repo(model_id, override=override), _ONNX_PATTERNS),
+    }
+    chosen = routes.get(provider.strip().lower())
+    if chosen is None:
+        return WeightsPlan(provider=provider, repo=model_id, patterns=(), present=True)
+    repo, patterns = chosen
+
+    from manicule.embedding.runtimes.hub import is_cached  # noqa: PLC0415 - an embeddings extra
+
+    return WeightsPlan(
+        provider=provider,
+        repo=repo,
+        patterns=patterns,
+        present=is_cached(repo, patterns),
+        approximate_bytes=APPROXIMATE_WEIGHT_BYTES.get((provider.strip().lower(), repo)),
+    )
 
 
 def mlx_weights(model_id: str, *, override: str = "") -> WeightsRef:
@@ -231,11 +310,14 @@ def _materialise(repo: str, patterns: tuple[str, ...]) -> Path:
 
 
 __all__ = [
+    "APPROXIMATE_WEIGHT_BYTES",
     "MLX_WEIGHTS",
     "ONNX_SUBDIR",
+    "WeightsPlan",
     "WeightsRef",
     "mlx_repo",
     "mlx_weights",
     "onnx_repo",
     "onnx_weights",
+    "planned_weights",
 ]

@@ -74,6 +74,43 @@ def snapshot(repo: str, patterns: Sequence[str], revision: str | None = None) ->
         raise ModelUnavailableError(_unavailable(repo, patterns, exc)) from exc
 
 
+def is_cached(repo: str, patterns: Sequence[str], revision: str | None = None) -> bool:
+    """Whether :func:`snapshot` would answer from disk alone. **Never touches the network.**
+
+    The question ``doctor`` and ``init`` ask so that a gigabyte-scale download can be
+    announced before it starts rather than met as a silent pause inside a first ingest. It has
+    to be answerable offline, because the command asking it is a diagnostic: one that reached
+    the hub to find out whether it would need to reach the hub would be the download it exists
+    to warn about.
+
+    Args:
+        repo: A repository id, or a local directory — which is present by definition.
+        patterns: The same globs :func:`snapshot` would pass. A repository whose ONNX export
+            is cached and whose safetensors are not is present for one backend and absent for
+            the other, so the answer is per pattern set rather than per repository.
+        revision: A commit, branch or tag.
+
+    Returns:
+        Whether every matching file is already in the local cache.
+    """
+    local = Path(repo).expanduser()
+    if local.is_dir():
+        return True
+
+    from huggingface_hub import snapshot_download  # noqa: PLC0415 - kept out of import time
+
+    try:
+        snapshot_download(
+            repo, revision=revision, allow_patterns=list(patterns), local_files_only=True
+        )
+    except Exception:  # noqa: BLE001 - the reason `snapshot` gives, in a place that must not raise
+        # Anything at all means "not usable from disk", which is the whole question. A
+        # narrower except would let the one unlisted error escape a *diagnostic* as a
+        # traceback, which is worse than the answer being conservative.
+        return False
+    return True
+
+
 def _unavailable(repo: str, patterns: Sequence[str], exc: Exception) -> str:
     """What a query says when the model it needs was never put on this machine."""
     return (
@@ -87,4 +124,4 @@ def _unavailable(repo: str, patterns: Sequence[str], exc: Exception) -> str:
     )
 
 
-__all__ = ["OFFLINE_ENV", "ModelUnavailableError", "snapshot"]
+__all__ = ["OFFLINE_ENV", "ModelUnavailableError", "is_cached", "snapshot"]
