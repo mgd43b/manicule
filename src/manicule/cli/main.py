@@ -110,6 +110,38 @@ Both declarations are the same option, so two spellings of the help would be two
 ``--help`` depending on where the reader asked.
 """
 
+WORKSPACE_HELP = "Run in this workspace instead of the configured one."
+"""One sentence for ``--workspace``, for the same reason :data:`JSON_HELP` is one sentence."""
+
+WORKSPACE_NAMED_TWICE = (
+    "--workspace was given twice with different values, {before!r} before the command and "
+    "{after!r} after it. Name one workspace: manicule cannot run an operation in both, and "
+    "choosing between them silently would run it in a tenant you also named and did not get."
+)
+"""Why two *different* workspaces in one invocation is refused rather than resolved.
+
+A constant rather than a literal at the raise site, so a test can assert the refusal names both
+values without reading them back out of a rendered terminal box, which wraps, colours and
+elides differently on every machine.
+
+**This is the one place the shared options behave differently, and the difference is the
+point.** ``--json`` is a flag: naming it twice says the same thing twice, and the two positions
+cannot disagree. ``--workspace`` carries a value, across a *tenancy boundary*. Last-wins would
+be defensible if the positions meant "general" then "specific" — but by construction this is
+the same option in two places, so there is no specificity to appeal to, and picking one would
+run the operation in a workspace the operator also named while the envelope reported the winner
+as though it were the whole request. A wrong-tenant run that looks exactly like a correct one
+is the worst failure available in a system where scope is an auditability property and
+cross-workspace access is a 5xx.
+
+The same shape as :data:`BACKUP_IS_NOT_A_RESTORE`, and refused for the same reason: two
+contradictory instructions in one invocation is a typo, not a plan.
+
+Identical values are accepted. They are unambiguous, and refusing them would break the case
+that makes ``--json`` twice acceptable — a script that already passes the option, and somebody
+adding it at the other end.
+"""
+
 
 def _accept_json(ctx: object, param: object, value: bool) -> bool:
     """Record ``--json`` typed *after* the command name.
@@ -123,6 +155,62 @@ def _accept_json(ctx: object, param: object, value: bool) -> bool:
     del ctx, param
     STATE.json_output = STATE.json_output or value
     return value
+
+
+def _accept_workspace(ctx: object, param: object, value: str | None) -> str | None:
+    """Record ``--workspace`` typed *after* the command name, or refuse a contradiction.
+
+    Same ordering as :func:`_accept_json` — the root callback has already run — but a different
+    rule, for the reason :data:`WORKSPACE_NAMED_TWICE` gives: a flag cannot disagree with
+    itself and a value can.
+
+    ``None`` means the option was not given here, which is distinguishable from every real
+    workspace name, so absent and given never have to be told apart by guesswork.
+
+    Raises:
+        typer.BadParameter: Both positions named a workspace and they differ. A usage error, so
+            it exits 2 alongside everything else Typer rejects before the service is reached,
+            rather than inventing a fourth exit status for this one refusal.
+    """
+    del ctx, param
+    if value is None:
+        return value
+    if STATE.workspace is not None and STATE.workspace != value:
+        raise typer.BadParameter(WORKSPACE_NAMED_TWICE.format(before=STATE.workspace, after=value))
+    STATE.workspace = value
+    STATE.overrides = {"workspace": value}
+    return value
+
+
+SHARED_OPTIONS: dict[str, Callable[[], TyperOption]] = {
+    "--json": lambda: TyperOption(
+        param_decls=["--json"],
+        is_flag=True,
+        default=False,
+        expose_value=False,
+        callback=_accept_json,
+        help=JSON_HELP,
+    ),
+    "--workspace": lambda: TyperOption(
+        param_decls=["--workspace", "-w"],
+        default=None,
+        expose_value=False,
+        callback=_accept_workspace,
+        help=WORKSPACE_HELP,
+    ),
+}
+"""The root callback's options that every command accepts too, keyed by their long name.
+
+A fresh option per command rather than one shared object: a Click parameter belongs to the
+command holding it, and handing one instance to thirty-one commands is the kind of sharing that
+works right up until something keeps state on it.
+
+Public, because it is half of an accounting against the root callback's real signature. Every
+option ``manicule`` declares is either named here or carries a written reason for not being,
+and ``tests/app/test_cli.py`` walks the built tree to check — so a fourth root option added
+tomorrow fails until somebody classifies it, rather than quietly becoming the next thing that
+cannot be typed where people type it.
+"""
 
 
 class CommandsShareTheRootOptions(TyperGroup):
@@ -157,18 +245,17 @@ class CommandsShareTheRootOptions(TyperGroup):
             # sub-application below declares it too.
             if isinstance(command, TyperGroup):
                 continue
-            if any("--json" in option.opts for option in command.params):
-                continue
-            command.params.append(
-                TyperOption(
-                    param_decls=["--json"],
-                    is_flag=True,
-                    default=False,
-                    expose_value=False,
-                    callback=_accept_json,
-                    help=JSON_HELP,
-                )
-            )
+            for build in SHARED_OPTIONS.values():
+                option = build()
+                # Any overlap at all, not just the long name. A command declaring `-w` for
+                # something of its own would otherwise end up with two parameters answering to
+                # one string, which Click resolves by silently preferring one of them. Skipping
+                # leaves that command without the shared option, which the accounting in
+                # `tests/app/test_cli.py` fails on rather than tolerates.
+                taken = {name for existing in command.params for name in existing.opts}
+                if taken & set(option.opts):
+                    continue
+                command.params.append(option)
 
 
 app = typer.Typer(
@@ -210,10 +297,7 @@ app.add_typer(auth_app, name="auth")
 
 
 JsonOption = Annotated[bool, typer.Option("--json", help=JSON_HELP)]
-WorkspaceOption = Annotated[
-    str | None,
-    typer.Option("--workspace", "-w", help="Run in this workspace instead of the configured one."),
-]
+WorkspaceOption = Annotated[str | None, typer.Option("--workspace", "-w", help=WORKSPACE_HELP)]
 
 
 def _show_version(value: bool) -> None:
@@ -931,7 +1015,9 @@ __all__ = [
     "BACKUP_NEEDS_A_TARGET",
     "PAYLOADS",
     "RESET_NEEDS_CONFIRMATION",
+    "SHARED_OPTIONS",
     "STATE",
+    "WORKSPACE_NAMED_TWICE",
     "CommandsShareTheRootOptions",
     "State",
     "app",
