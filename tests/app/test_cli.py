@@ -537,39 +537,85 @@ def test_every_renderer_is_reachable_from_some_operation() -> None:
     )
 
 
-EMITTED_OP_LANDMARKS: frozenset[str] = frozenset({"ask", "search", "document_list", "doctor"})
+EMITTED_OP_LANDMARKS: frozenset[str] = frozenset(
+    {"ask", "search", "document_list", "doctor", "start", "stop", "completion", "index_changes"}
+)
 """Operation names the scan below must have found in the source.
 
 The scan reads string literals out of an AST, which is the kind of derivation that returns an
 empty set when it is pointed at the wrong thing — and an empty set satisfies a subset check.
-These four are emitted by commands nobody is going to delete.
+
+The last four are the reason this list is not just the obvious commands. They reach
+``print_envelope`` through call shapes ``emit`` is not one of, in files ``main.py`` is not one
+of, and a scan that lost them would still find twenty-nine ops and look healthy.
+"""
+
+OP_TAKING_CALLS: frozenset[str] = frozenset({"emit", "run_op", "succeeded", "failed"})
+"""Functions whose **first positional argument** is an operation name.
+
+``Envelope(op=...)`` is the fifth shape and is a keyword rather than a positional, which is
+why it is handled separately below. It is also the one a scan written from a quick reading of
+``main.py`` misses, because ``completion`` is the only operation that uses it.
 """
 
 
-def _emitted_ops() -> set[str]:
-    """Every operation name passed to ``emit`` as a literal, read from the source.
+def _op_literals(tree: ast.AST) -> set[str]:
+    """Operation names appearing as literals in one module's AST.
 
-    The op is a string argument inside a lambda, so it exists nowhere a type checker or an
-    import can reach it — but it is what ``print_envelope`` looks ``PAYLOADS`` up by, so a
-    command that emits an operation the table does not name is a ``KeyError`` the first time
-    it succeeds. Reading the source is the only way to see them.
-
-    Deliberately only literals. A computed op name would not be found here, and a scan that
-    guessed at one would report a name nothing emits.
+    Deliberately only literals. A computed op name would not be found, and a scan that guessed
+    at one would report a name nothing emits.
     """
-    source = Path(cli.__file__)
-    assert source.is_file(), f"{source} is not a file; the scan below would read nothing"
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    return {
-        node.args[0].value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "emit"
-        and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
-    }
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        called = node.func.id if isinstance(node.func, ast.Name) else None
+        if called in OP_TAKING_CALLS and node.args:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                found.add(first.value)
+        if called == "Envelope":
+            for keyword in node.keywords:
+                value = keyword.value
+                if (
+                    keyword.arg == "op"
+                    and isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                ):
+                    found.add(value.value)
+    return found
+
+
+def _emitted_ops() -> set[str]:
+    """Every operation name the command line names, read from every module of the surface.
+
+    The op is a string argument — frequently inside a lambda — so it exists nowhere a type
+    checker or an import can reach it. But it is what ``print_envelope`` looks ``PAYLOADS`` up
+    by, so an operation the table does not name is a ``KeyError`` the first time it succeeds.
+    Reading the source is the only way to see them.
+
+    **The whole package, not just ``main.py``.** Four operations reach ``print_envelope`` from
+    ``watch.py`` and ``serving.py``, on three call shapes that are not ``emit`` — which is
+    exactly the blind spot a narrower scan leaves while its name promises otherwise.
+    """
+    package = Path(cli.__file__).parent
+    assert package.is_dir(), f"{package} is not a directory; the scan would read nothing"
+    modules = sorted(package.rglob("*.py"))
+    assert len(modules) >= MINIMUM_CLI_MODULES, (
+        f"the scan found {len(modules)} module(s) under {package}, below the floor of "
+        f"{MINIMUM_CLI_MODULES}. It is reading the wrong package."
+    )
+    found: set[str] = set()
+    for module in modules:
+        found |= _op_literals(ast.parse(module.read_text(encoding="utf-8")))
+    return found
+
+
+MINIMUM_CLI_MODULES = 5
+"""A floor on how many modules the surface has, far below the real count.
+
+Present to catch a scan reading the wrong directory, not to track the package's size.
+"""
 
 
 def test_every_operation_the_command_line_emits_has_a_payload_type() -> None:
@@ -583,12 +629,39 @@ def test_every_operation_the_command_line_emits_has_a_payload_type() -> None:
     emitted = _emitted_ops()
     missing_landmarks = sorted(EMITTED_OP_LANDMARKS - emitted)
     assert missing_landmarks == [], (
-        f"the scan did not find {missing_landmarks} among the operations this module emits. "
+        f"the scan did not find {missing_landmarks} among the operations this surface names. "
         f"Whatever it parsed, it was not the command line."
     )
     unknown = sorted(emitted - set(cli.PAYLOADS))
     assert unknown == [], (
-        f"these operations are emitted but named in no PAYLOADS entry: {unknown}. Each is a "
+        f"these operations are named but appear in no PAYLOADS entry: {unknown}. Each is a "
         f"KeyError the first time the operation succeeds. Add it to PAYLOADS in "
         f"manicule.cli.main."
+    )
+
+
+def test_the_scan_accounts_for_every_payload_entry() -> None:
+    """The other half of the same accounting, and what keeps the blind spot from reopening.
+
+    The check above proves everything the scan *found* is in the table. This proves the scan
+    found everything the table names — so an operation reaching ``print_envelope`` through a
+    sixth call shape, or from a module nobody thought to look in, shows up here as a
+    ``PAYLOADS`` entry the scan cannot account for.
+
+    That is the failure this test exists for. The previous version scanned one function in one
+    file, covered twenty-nine of thirty-three operations, and was named as though it covered
+    them all; nothing said otherwise because the four it missed were all legitimate. A
+    derived total says otherwise.
+
+    Set equality is deliberately asserted as two separate checks rather than one. "Something
+    is emitted that the table does not name" and "the table names something the scan cannot
+    find" are different defects with different fixes, and one message for both would describe
+    neither.
+    """
+    unaccounted = sorted(set(cli.PAYLOADS) - _emitted_ops())
+    assert unaccounted == [], (
+        f"PAYLOADS names {unaccounted}, which the scan could not find anywhere in the command "
+        f"line's source. Either the operation is dead and its entry should go, or it reaches "
+        f"print_envelope through a call shape this scan does not know about — in which case "
+        f"add the shape to OP_TAKING_CALLS, or the whole surface loses the guarantee."
     )
