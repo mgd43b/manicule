@@ -54,6 +54,12 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.12", "3.13"]
+    # tiktoken keeps its vocabularies under the system temporary directory when nothing says
+    # otherwise, which on a runner is neither durable nor cacheable. Naming a directory is
+    # also what `docs/deployment.md` tells an operator to do, so the job exercises the shape
+    # a real install has rather than a shape only CI has.
+    env:
+      TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -88,9 +94,28 @@ jobs:
       # green. Deliberately outside the `MANICULE_` namespace: the test environment fixture
       # deletes every variable with that prefix before each test, which has already silently
       # disarmed one switch in this repository.
+      # tiktoken ships no vocabularies in its wheel either, and the failure that caused is
+      # worse than the grammar one: an install indexes perfectly and then cannot answer a
+      # question. Same shape of step for the same reason — the pre-seed is what an operator
+      # runs, so running it here checks the operator's path and fills the cache the offline
+      # suite builds a bundle out of.
+      - name: cache tiktoken vocabularies
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/tiktoken
+          key: vocabularies-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: pre-seed tiktoken vocabularies
+        run: >-
+          uv run --python ${{ matrix.python }} python -c
+          "from manicule import vocabularies;
+          wanted = vocabularies.required_encodings();
+          print('seeded:', vocabularies.prefetch(wanted));
+          missing = vocabularies.missing_vocabularies(wanted);
+          assert not missing, f'vocabularies still missing after pre-seed: {missing}'"
       - name: pytest
         env:
           REQUIRE_GRAMMAR_BUNDLE: "1"
+          REQUIRE_VOCABULARY_BUNDLE: "1"
         run: uv run --python ${{ matrix.python }} pytest --cov --cov-report=term-missing
 
   # A model edited without a migration and a downgrade that has never run both look exactly
@@ -193,6 +218,33 @@ jobs:
         env:
           REQUIRE_GRAMMAR_BUNDLE: "1"
         run: uv run pytest tests/parsers/test_grammar_bundle.py tests/parsers/test_grammars.py -q -rs
+
+      # The vocabulary suite runs here for the same reason, and the platform difference is
+      # concrete rather than theoretical: with nothing configured, tiktoken caches under the
+      # system temporary directory, which is `/tmp` on Linux and a per-session directory on
+      # macOS. The suite's air-gapped child leaves `TIKTOKEN_CACHE_DIR` unset precisely so
+      # that rule is exercised, and a rule only exercised on one platform is a rule checked
+      # nowhere.
+      - name: cache tiktoken vocabularies
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/tiktoken
+          key: vocabularies-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: pre-seed tiktoken vocabularies
+        env:
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
+        run: >-
+          uv run python -c
+          "from manicule import vocabularies;
+          wanted = vocabularies.required_encodings();
+          print('seeded:', vocabularies.prefetch(wanted));
+          missing = vocabularies.missing_vocabularies(wanted);
+          assert not missing, f'vocabularies still missing after pre-seed: {missing}'"
+      - name: pytest (vocabulary bundle required)
+        env:
+          REQUIRE_VOCABULARY_BUNDLE: "1"
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
+        run: uv run pytest tests/vocabularies -q -rs
 
       # The Confluence browser-session store is the macOS Keychain, reached through
       # `/usr/bin/security`, and its tests skip themselves anywhere that command is absent. On

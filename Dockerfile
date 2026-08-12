@@ -106,19 +106,24 @@ print(snapshot_download('BAAI/bge-m3', allow_patterns=['onnx/*', '*.json', *CARD
 
 # --- tiktoken vocabularies ---
 #
-# Two BPE vocabularies, neither shipped in the `tiktoken` wheel: `cl100k_base`, the chunker's
-# stand-in counter, and `o200k_base`, the default `rag.encoding` the context fitter measures
-# the prompt with. Both are fetched on first use from a Microsoft-hosted blob — which meant a
+# BPE vocabularies, none of them shipped in the `tiktoken` wheel: `cl100k_base`, the chunker's
+# stand-in counter, and `o200k_base`, which both the context fitter and the generation budget
+# measure prompts with. They are fetched from a Microsoft-hosted blob — which once meant a
 # container that indexed happily offline and then failed on the first *search*, because that
-# is the first thing to build a context. The names come from the code that asks for them.
+# is the first thing to build a context.
+#
+# This is the same call an operator makes on any air-gapped host, and the encodings come from
+# `required_encodings()` — one definition, read here, by CI and by the bundle builder, so an
+# image cannot end up with the chunker's vocabulary and not the fitter's. The pre-seed asserts
+# the cache afterwards rather than trusting the fetch, so a build that wrote nothing fails
+# here instead of shipping an image that cannot answer.
 ENV TIKTOKEN_CACHE_DIR=/opt/manicule/tiktoken
 RUN mkdir -p "${TIKTOKEN_CACHE_DIR}" && python -c "\
-import tiktoken; \
-from manicule.chunking.tokens import TIKTOKEN_ENCODING; \
-from manicule.config.settings import ContextSettings; \
-names = {TIKTOKEN_ENCODING, ContextSettings().encoding}; \
-[tiktoken.get_encoding(name) for name in names]; \
-print('tiktoken encodings cached:', sorted(names))"
+from manicule import vocabularies; \
+wanted = vocabularies.required_encodings(); \
+print('tiktoken vocabularies seeded:', vocabularies.prefetch(wanted)); \
+missing = vocabularies.missing_vocabularies(wanted); \
+assert not missing, f'vocabularies still missing after pre-seed: {missing}'"
 
 # --- the image ------------------------------------------------------------------------------
 

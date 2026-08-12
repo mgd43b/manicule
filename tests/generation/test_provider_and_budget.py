@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, override
 
@@ -35,6 +36,7 @@ from manicule.generation.budget import (
     usable_prompt_tokens,
 )
 from manicule.generation.provider import (
+    LOCAL_COST_MAP_ENV,
     LitellmGenerator,
     compose_model,
     error_table,
@@ -200,6 +202,41 @@ def test_every_provider_exception_maps_to_its_own_error_and_not_to_the_base_one(
     }
     for raised, expected in cases.items():
         assert type(map_error(raised, "m")) is expected
+
+
+def test_importing_the_provider_library_does_not_fetch_a_model_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other lazy fetch on the query path, and the only one that fails silently.
+
+    Importing ``litellm`` performs an HTTPS GET to raw.githubusercontent.com for its pricing
+    and context-window table, on the path that answers a question, and falls back to the copy
+    in its own wheel when that fails. So an air-gapped host paid five seconds a process for
+    the local table it was going to use anyway, and a networked host used whichever revision
+    that repository happened to be serving. Both now read the table pinned in the lockfile.
+
+    Driven through ``error_table``, which is one of the four public functions that import the
+    library, rather than through the importer directly: what has to hold is that *reaching*
+    the library sets this, and a test that called the importer would keep passing if a caller
+    grew its own ``import litellm``.
+    """
+    monkeypatch.delenv(LOCAL_COST_MAP_ENV, raising=False)
+
+    error_table()
+
+    assert os.environ[LOCAL_COST_MAP_ENV] == "True"
+
+
+def test_an_operator_who_wants_the_live_model_table_keeps_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default is not a policy. Somebody running hosted models against new releases has a
+    reason to want the current table, and setting the variable is how they say so."""
+    monkeypatch.setenv(LOCAL_COST_MAP_ENV, "False")
+
+    error_table()
+
+    assert os.environ[LOCAL_COST_MAP_ENV] == "False"
 
 
 def test_the_mapping_table_is_ordered_most_specific_first() -> None:

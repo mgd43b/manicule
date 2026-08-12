@@ -334,3 +334,35 @@ def test_the_synthetic_tokenizer_wraps_input_the_way_xlm_roberta_does(tmp_path: 
 
     assert tokenizer.special_token_count() == 2
     assert tokenizer.content_ids("alpha beta") == [4, 5]
+
+
+def test_a_model_this_machine_does_not_have_refuses_with_the_pre_seed_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other silent download on the query path, and the one that costs 2.3 GB.
+
+    An embedder is built and set up while a query is being answered, so a machine that has
+    never held these weights fetches them *inside a search* — and on a host with no route to
+    the hub, what surfaced was the hub's own exception: a repository id, a cache path, and
+    nothing an operator could act on. It is not a bundle problem the way a 5 MB vocabulary is;
+    nobody carries an ONNX export in a manifest, and manicule already ships a pre-seed. What
+    was missing was the sentence naming it at the moment it is needed.
+
+    Offline and synthetic: the hub is told not to look, and the repository does not exist, so
+    this asserts the message rather than the network.
+    """
+    from manicule.embedding.runtimes.hub import (  # noqa: PLC0415 - an embeddings extra
+        OFFLINE_ENV,
+        ModelUnavailableError,
+        snapshot,
+    )
+
+    monkeypatch.setenv(OFFLINE_ENV, "1")
+
+    with pytest.raises(ModelUnavailableError) as raised:
+        snapshot("manicule-tests/no-such-model", ["*.json"])
+
+    message = str(raised.value)
+    assert "manicule-tests/no-such-model" in message
+    assert "tools/prefetch_embedding_models.py" in message
+    assert OFFLINE_ENV in message

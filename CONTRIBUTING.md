@@ -28,13 +28,20 @@ uv run pyright
 uv run pytest
 ```
 
-Two suites need a machine resource that is not in the repository, and both **skip** without it
-rather than failing — right on a laptop, wrong in CI, so CI pre-seeds and then requires them:
+Three suites need a machine resource that is not in the repository, and all three **skip**
+without it rather than failing — right on a laptop, wrong in CI, so CI pre-seeds and then
+requires them:
 
 ```bash
-uv run manicule doctor --fix                      # seeds the declared tree-sitter grammars
+uv run manicule doctor --fix                      # grammars, and the BPE vocabularies
 uv run tools/prefetch_embedding_models.py --mlx   # add --full for BAAI/bge-m3, ~4.6 GB
 ```
+
+`doctor --fix` seeds two things because two libraries ship neither: the tree-sitter grammars,
+and the 5.3 MB of BPE vocabulary `tiktoken` fetches from a blob store on first use. manicule
+never downloads a vocabulary while answering a question, so without the pre-seed the retrieval
+suites refuse rather than fetching — which is the same refusal an operator gets, and the
+reason it is an install step rather than a surprise at the first query.
 
 `REQUIRE_EMBEDDING_MODELS` names the models that must be present rather than merely welcome —
 a comma-separated list, or `all`. CI sets it to exactly what it pre-seeded. If you are touching
@@ -60,6 +67,17 @@ uv run manicule doctor --fix                                             # need 
 A bundle is valid for one platform and one `tree-sitter-language-pack` release, and manicule
 refuses one built for anything else rather than loading it. See
 [`docs/parsing.md`](docs/parsing.md#811-the-offline-bundle).
+
+`REQUIRE_VOCABULARY_BUNDLE` is the third switch, for the BPE vocabularies. Its suite builds a
+real bundle out of the pre-seeded `tiktoken` cache and proves an air-gapped install can
+*answer* — with the cache redirected and the network cut, separately and together. The
+vocabulary bundle is platform-independent, so one build serves every host:
+
+```bash
+uv run tools/build_vocabulary_bundle.py --output dist/vocabularies   # or --package
+MANICULE_VOCABULARY_BUNDLE=/path/to/vocabularies uv run python -c \
+  "from manicule import vocabularies; print(vocabularies.prefetch(vocabularies.required_encodings()))"
+```
 
 It is not a `MANICULE_` variable, and that is deliberate — the test environment clears that
 whole namespace before each test, so a switch living inside it is deleted before it is read.

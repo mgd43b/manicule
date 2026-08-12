@@ -809,6 +809,30 @@ Qwen or Mistral vocabularies, none of which are tiktoken's. So:
 - Counts are cached by `chunk.id`. Chunk ids are content-derived, so the cache is exact and can
   never go stale.
 
+**And the vocabulary comes off the machine, never off the query.** `tiktoken` ships no
+vocabularies in its wheel; `get_encoding` downloads `o200k_base` from a Microsoft-hosted blob
+store on first use, which put an HTTPS call on the path that assembles a context. An air-gapped
+host therefore indexed a corpus perfectly and then failed at the first *question*, with an
+error naming a blob storage host — the failure split across two moments, the second one
+unexplained (#61).
+
+So the fitter resolves its encoding through `manicule.vocabularies`, which is the vocabulary
+counterpart of what [`parsing.md`](parsing.md) §8.1.1 does for grammars and follows it move for
+move: a pre-seed an operator runs and can watch fail, an offline bundle consulted before the
+network so a host with no route to anything can still pre-seed, and a query path that **cannot
+fetch at all** — `load_encoding` shuts `tiktoken`'s single door to the network for the duration
+of the call, so a vocabulary that was never seeded is a refusal naming the encoding, the cache
+that was read and where a bundle was looked for. The counter resolves at construction, which
+is while `build_retriever` is assembling retrieval, so the refusal arrives at startup rather
+than inside a query.
+
+The recorded identity is unchanged and that is the point: `provisional:x1.5:tiktoken/…@0.13.0`
+names a release, and the release was only ever a *claim* about the bytes while those bytes
+arrived from a URL nobody checked. Every byte the pre-seed writes is now verified against the
+digest the installed `tiktoken` declares for it, so the claim is checked. Adding a digest to
+the identifier would rewrite every chunk fingerprint in every index to record what the version
+already implies.
+
 ### 7.3 Whole passages only — a truncated citation is a broken citation
 
 **Assembly includes a candidate entirely or not at all.** It never trims a passage to fit.

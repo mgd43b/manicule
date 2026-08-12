@@ -113,6 +113,14 @@ chunker only when no embedder is bound — parsing without embedding, as in a dr
 or a fixture test — and then a **1.5× safety factor** applies and the resulting chunks are
 marked `provisional` and refused by ingest. Provisional chunks never reach the index.
 
+**Its vocabulary is pre-seeded, never fetched**, exactly as the grammars in §8.1.1 are and for
+exactly the same reason: `tiktoken` ships no vocabularies in its wheel and downloads them on
+first use, so a host with no route to a blob store could index nothing here and answer nothing
+later. `manicule.vocabularies` is that module's counterpart — a pre-seed, an offline bundle
+consulted first, and a load path that refuses rather than downloading — and
+[`retrieval.md`](retrieval.md) §7.2 states it, since the *query* path is where the absence was
+first felt.
+
 **The refusal is a refusal, and the mark says everything.** Both halves of that sentence had
 been prose for a while and code for neither, which `contracts.md` §5 calls worse than an
 absent guarantee. Two things now hold, and they are one mechanism rather than two:

@@ -208,10 +208,17 @@ def tiktoken_tokenizer_id() -> str:
 
 
 def _tiktoken_counter() -> Callable[[str], int]:
-    """A ``tiktoken`` counter, imported here so the fast path never pays for it."""
-    import tiktoken  # noqa: PLC0415 - deliberately not a module-level import
+    """A ``tiktoken`` counter, imported here so the fast path never pays for it.
 
-    encoding = tiktoken.get_encoding(TIKTOKEN_ENCODING)
+    Through :func:`manicule.vocabularies.load_encoding` rather than ``tiktoken.get_encoding``,
+    which fetches the vocabulary from a blob store when the cache cannot answer. A chunker
+    that downloaded a vocabulary the first time it was constructed would make an install step
+    into an intermittent ingest failure; the pre-seed is
+    :func:`manicule.vocabularies.prefetch`.
+    """
+    from manicule import vocabularies  # noqa: PLC0415 - deliberately not a module-level import
+
+    encoding = vocabularies.load_encoding(TIKTOKEN_ENCODING)
     return lambda text: len(encoding.encode(text, disallowed_special=()))
 
 
