@@ -33,6 +33,35 @@
   {% if found.cached %} · cached{% endif %}{% if found.truncated %} · truncated{% endif %}
 </p>
 {% if found.confidence_reason %}<p class="muted">{{ found.confidence_reason }}</p>{% endif %}
+{# Which words the search actually ran on, and where they came from. Above the results rather
+   than below them, because it changes how the results should be read: passages retrieved partly
+   through words the reader did not type have to be flagged before they are read.
+
+   Every line names its source document, and that is a requirement rather than presentation —
+   `bugs/bug2.md` §3 forbids showing an expansion without its provenance, and a template is the
+   easiest place in the system to break that by writing one fewer field. #}
+{% for expansion in found.expansions %}
+<p class="muted">
+  <strong>{{ expansion.display }}</strong> expands to <strong>{{ expansion.expansion }}</strong> —
+  defined in <a href="/ui/documents/{{ expansion.document_id }}">{{ expansion.title or expansion.uri }}</a>{% if expansion.location %}, {{ expansion.location }}{% endif %}
+  ({{ expansion.reason }})
+</p>
+{% endfor %}
+{% if found.expanded_query %}<p class="muted">also searched: {{ found.expanded_query }}</p>{% endif %}
+{# Never resolved, here or anywhere. Both definitions are shown with their sources so the reader
+   picks; choosing one and presenting it as *the* expansion is the failure this feature is most
+   able to cause. #}
+{% for conflict in found.conflicts %}
+<p class="muted">
+  {{ conflict.acronym }} has {{ conflict.candidates | length }} conflicting definitions in scope,
+  so it was not expanded:
+</p>
+<ul class="muted">
+  {% for candidate in conflict.candidates %}
+  <li>{{ candidate.expansion }} — <a href="/ui/documents/{{ candidate.document_id }}">{{ candidate.title or candidate.uri }}</a>{% if candidate.location %}, {{ candidate.location }}{% endif %}</li>
+  {% endfor %}
+</ul>
+{% endfor %}
 {% if found.hits %}
 <ol class="hits">
   {% for hit in found.hits %}

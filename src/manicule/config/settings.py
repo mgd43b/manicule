@@ -845,6 +845,54 @@ class ContextSettings(Section):
     )
 
 
+class GlossarySettings(Section):
+    """Glossary-aware entity and acronym retrieval (``docs/retrieval.md`` §14).
+
+    Two settings decide whether a query is expanded and one decides whether an already-indexed
+    definition is trusted enough to expand it. There is deliberately **no** setting that
+    resolves a conflict: two definitions of one term in scope are reported as a conflict
+    whatever this section says, because a configurable tie-break is a silent choice with an
+    audit trail rather than an absence of one.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Whether a query naming a glossary term is expanded and its definition "
+        "promoted. Off means no lookup runs at all, rather than a lookup whose answer is "
+        "discarded: a disabled feature that still queries a store can still be slow and can "
+        "still fail.",
+    )
+    detect_on_ingest: bool = Field(
+        default=True,
+        description="Whether ingest reads definitions out of documents. Separate from "
+        "``enabled`` because the two fail differently: turning this off stops new entries "
+        "being written and leaves existing ones queryable, which is what an operator wants "
+        "while investigating a detector that is producing rubbish.",
+    )
+    min_entry_confidence: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Detection confidence an entry needs before a query will act on it. "
+        "Applied at query time as well as at ingest, so raising it takes effect against a "
+        "corpus already indexed — the only remedy available to someone who cannot re-ingest.",
+    )
+    max_terms: int = Field(
+        default=3,
+        ge=1,
+        description="Distinct terms one query may expand. A query naming four of them is "
+        "asking something a definition lookup cannot answer, and expanding all four produces "
+        "a second query that is a list of noun phrases.",
+    )
+    homographs: tuple[str, ...] = Field(
+        default=(),
+        description="Extra terms to treat as ordinary English words, so they expand only on an "
+        "exact-case match or a definitional question. Extends the shipped list rather than "
+        "replacing it: the words that collide with a corpus's terms are a property of that "
+        "corpus, and nobody should have to restate the common ones to add one of their own.",
+    )
+
+
 class RagSettings(Section):
     """Retrieval and chunking."""
 
@@ -869,6 +917,7 @@ class RagSettings(Section):
     cache: QueryCacheSettings = Field(default_factory=QueryCacheSettings)
     router: RouterSettings = Field(default_factory=RouterSettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
+    glossary: GlossarySettings = Field(default_factory=GlossarySettings)
     assert_scope: bool = Field(
         default=False,
         description="Run the pipeline's scope assertion on every query, as a runtime check "
@@ -1255,6 +1304,7 @@ __all__ = [
     "DataPolicySettings",
     "EmbeddingSettings",
     "EventSettings",
+    "GlossarySettings",
     "IngestSettings",
     "LlmSettings",
     "Mode",

@@ -51,6 +51,8 @@ from manicule.core.errors import (
 from manicule.core.ids import content_hash, document_id
 from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.ingest.embedding import embed_chunks
+from manicule.ingest.glossary import detect_entries
+from manicule.ingest.ports import GlossaryWriter
 from manicule.ingest.refusals import require_measured
 from manicule.ingest.workers import AttemptResult
 from manicule.parsers.chain import (
@@ -221,6 +223,8 @@ class IngestPipeline:
         target_batch_tokens: int = 16_384,
         max_embed_batch: int = 64,
         parse_fingerprints: Callable[[str], ParseFingerprint | None] = parse_fingerprint,
+        glossary: GlossaryWriter | None = None,
+        detect_glossary: bool = True,
     ) -> None:
         # Second of the two places this is refused, and not a redundant one.
         # `check_before_run` is the once-per-run boundary and is what an operator meets; this
@@ -242,6 +246,12 @@ class IngestPipeline:
         self._target_batch_tokens = target_batch_tokens
         self._max_embed_batch = max_embed_batch
         self._parse_fingerprints = parse_fingerprints
+        # Two conditions, and the second is not configuration. Detection is switchable, *and*
+        # the store has to be able to hold the result — a pipeline that detected definitions
+        # and had nowhere to put them would spend the work on every document and produce
+        # nothing, which reads from the outside as a detector that finds nothing.
+        self._glossary = glossary if glossary is not None else _writer_of(store)
+        self._detect_glossary = detect_glossary and self._glossary is not None
         self._fetching = asyncio.Semaphore(max(1, fetch_concurrency))
         self._embedding = asyncio.Lock()
 
@@ -682,6 +692,11 @@ class IngestPipeline:
         )
         stored = await self._store.upsert_document(_with_status(document, settled))
         await self._store.replace_chunks(stored.id, [])
+        # A document with no chunks states no definitions. Said explicitly rather than left to
+        # the chunk cascade, because the cascade is a property of one store's schema and this
+        # is a property of the pipeline: a store that kept its chunks in a separate service
+        # would leave a whole glossary behind for a page that no longer has any text in it.
+        await self._store_definitions(stored, [])
         # The determination "there is no text in this" is itself the output of a parser
         # version. Without lineage here, a document that yielded nothing would be re-parsed on
         # every sync forever — and, worse, the day a library learns to read it, nothing would
@@ -718,6 +733,13 @@ class IngestPipeline:
         """
         try:
             await self._store.replace_chunks(document.id, chunks)
+            # Between the chunks and the vectors, because the entries have a foreign key to the
+            # chunks and none to anything written later. The crash window this opens is
+            # harmless in the one direction that matters: the document is not yet ``indexed``,
+            # and a glossary lookup only ever reads entries of indexed documents — so entries
+            # written by a run that died before its vectors are invisible until the repair
+            # finishes the job.
+            await self._store_definitions(document, chunks)
             await self._vectors.upsert(chunks, vectors)
         except Exception as exc:  # noqa: BLE001 - a store failure is this document's
             return await self._demote(
@@ -746,6 +768,20 @@ class IngestPipeline:
             document_id=indexed.id,
             chunks=len(chunks),
         )
+
+    async def _store_definitions(self, document: Document, chunks: Sequence[Chunk]) -> None:
+        """Read this document's glossary definitions and make them its stored ones.
+
+        **Unconditionally a replace, including with an empty list.** A document that used to
+        define three terms and now defines none has to end up with none — writing only when
+        something was found would leave the old three answering queries, cited to a page that
+        no longer says them. That is the failure this whole feature could most easily
+        introduce: a definition that is wrong, confident, and looks exactly like a right one.
+        """
+        if not self._detect_glossary or self._glossary is None:
+            return
+        entries = detect_entries(chunks, title=document.title, media_type=document.media_type)
+        await self._glossary.replace_glossary_entries(document.id, entries)
 
     # --- change detection ------------------------------------------------------------------
 
@@ -1125,6 +1161,17 @@ class IngestPipeline:
             document_id=document.id,
             detail=detail,
         )
+
+
+def _writer_of(store: object) -> GlossaryWriter | None:
+    """The store itself, when it can hold glossary entries.
+
+    Structural rather than configured, and taken from the store the pipeline was already given
+    rather than accepted as a second handle. Two handles onto one database is how a definition
+    ends up committed against a workspace the document is not in — the store carries the
+    workspace, so taking the writer from it makes the two agree by construction.
+    """
+    return store if isinstance(store, GlossaryWriter) else None
 
 
 def _with_status(document: Document, result: ChainResult) -> Document:

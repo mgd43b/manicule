@@ -202,15 +202,15 @@ class Filter(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    workspace_ids:  frozenset[str]                        # required, non-empty
-    document_ids:   frozenset[str] = frozenset()
-    sources:        frozenset[str] = frozenset()
+    workspace_ids: frozenset[str]  # required, non-empty
+    document_ids: frozenset[str] = frozenset()
+    sources: frozenset[str] = frozenset()
     collection_ids: frozenset[str] = frozenset()
-    tag_ids:        frozenset[str] = frozenset()
-    media_types:    frozenset[str] = frozenset()
-    kinds:          frozenset[BlockKind] = frozenset()
-    langs:          frozenset[str] = frozenset()
-    updated_after:  datetime | None = None
+    tag_ids: frozenset[str] = frozenset()
+    media_types: frozenset[str] = frozenset()
+    kinds: frozenset[BlockKind] = frozenset()
+    langs: frozenset[str] = frozenset()
+    updated_after: datetime | None = None
     updated_before: datetime | None = None
 ```
 
@@ -1529,6 +1529,139 @@ Two structural notes. Every one of these is a stage or a leg, so measuring it is
 change and a run — which is the property §2.4 exists to protect. And the fusion stage taking its
 leg names from configuration (§5.2) is what makes the last row a two-line config edit rather than
 a rewrite of the fusion code.
+
+## 14. Glossary-aware entity and acronym retrieval
+
+The problem `bugs/bug2.md` states: a glossary defines an acronym that is also an ordinary English
+word, and a question naming it retrieves passages that *use* the term rather than the one that
+defines it.
+
+### 14.1 What the failure actually is, measured
+
+It is not a threshold that needs adjusting, and it is not visible on a small fixture. Measured
+with BGE-M3 over a synthetic corpus (`tests/glossary/corpus.py`), the same question against three
+progressively more realistic versions of it:
+
+| Fixture | Rank of the definition |
+|---|---|
+| The glossary line as its own short passage, thirty ordinary uses of "now" around it | **1 of 33** — no failure at all |
+| The glossary as one chunk holding 25 entries | **1 of 31**, cosine **0.4655** — ranked fine, but below the §8.4 noise floor, so confidence says `none` |
+| The above, plus fifteen passages that *use* the acronym in running text | **15 of 61** — absent from a ten-passage context |
+
+Two ingredients are needed and a fixture missing either proves nothing. **The definition is
+diluted inside a chunk**: chunking is 512/64, so a glossary page arrives as one chunk and any one
+definition is a fortieth of its vector. **The term is used far more often than it is defined**,
+which is what every corpus looks like once a term exists — and those usage passages are short, on
+topic, and contain the acronym.
+
+The consequence for the design is the important part. The expanded *embedding* does not rescue
+this: searching for `Network Operations Workspace` alone ranks the glossary 8 of 61, which would
+not reach a ten-passage context either. What rescues it is that **an exact alias hit is a lookup,
+not a search** — ingest recorded which chunk defines the term, so the definition is fetched by id
+and promoted with its provenance rather than made to win a similarity contest.
+
+### 14.2 Where it lives, and why it is not a stage
+
+`RetrievalStage` is locked (§2.3). Expansion does not need it widened, because what it produces
+is a **second query**: the declared pipeline runs over it unchanged. So the retriever's list of
+things that are not stages grows from three to four —
+
+    Query → router → glossary → L1 cache → declared stages → context assembly → confidence
+
+— for the same reason as the other three. A stage that took one query and searched two would be a
+stage whose output could not be replayed from its input, which is exactly what §2.3 protects.
+
+The second pass costs a full second run of the pipeline, and it is paid only when an alias fires.
+`RetrievalTrace.glossary` records whether it did, so the cost is on the record rather than
+inferred from a latency that doubled.
+
+### 14.3 Detection, at ingest
+
+`manicule.ingest.glossary` reads definitions out of chunks — chunks rather than blocks, because a
+definition has to be citable and a chunk is what a citation resolves to. Six written forms: em
+dash, colon, parenthetical, Markdown definition list, two-column table row, and a heading followed
+by its definition (read both from the text and from the breadcrumb, because the structural chunker
+lifts headings out of the text entirely).
+
+The hard part is refusing prose. `Note: the scheduler restarts nightly` has exactly the shape of a
+real definition, and two independent gates apply:
+
+1. **Shape.** The term must be *written* like an abbreviation — predominantly upper case. This is
+   what rejects `Note:` without consulting anything else, and no amount of glossary-looking
+   context can buy it off.
+2. **Confidence.** Everything else is evidence: the written form, whether the expansion's initials
+   spell the term, and whether the document says it is a glossary. The threshold is 0.6, set from
+   the combinations rather than from a sweep — a dash form whose initials match clears it alone
+   (0.80), a dash form on a glossary page clears it alone (0.60), and a colon form with neither
+   does not (0.40).
+
+### 14.4 Scope is a correctness property
+
+Entries are stored in `glossary_entries` and `glossary_aliases`, scoped through `document_id` and
+nothing else: a document id is derived from the workspace, so a copy of the workspace on the entry
+row could only ever be a second answer to a question the foreign key already settles.
+
+Collection membership is **not** copied onto the entry, because a collection's contents change
+without any glossary being re-ingested. A lookup resolves it through `resolve_filter` — the same
+function collection-scoped search resolves through, so there is one notion of what a collection
+contains rather than a second one that drifts.
+
+`kinds` and `langs` are projected out before the lookup, exactly as `join_filter` projects them out
+before a query over `documents` (§3.3). They restrict which *chunks* a search may return, and this
+lookup returns vocabulary; a query for table passages is not asking to be kept ignorant of what an
+acronym in its own text means. They are applied where they belong — to the promoted passage, which
+is a chunk — so a chunk-level restriction still decides what comes back.
+
+### 14.5 Over-expansion, which is what stops this making retrieval worse
+
+An occurrence expands only when one of three rules admits it, and the rule that fired is recorded:
+
+| Rule | Fires when |
+|---|---|
+| `exact_case` | The query wrote the term the way the glossary writes it — `NOW`, not `now` |
+| `definitional_frame` | The query asks *about* the token rather than using it: "what is now", "define now", "what does now stand for". A question is not a use |
+| `unambiguous` | The term is not an ordinary English word, so no other evidence is needed |
+
+The third consults a short list of common English words (`manicule.retrieval.homographs`),
+extensible per deployment through `rag.glossary.homographs`. It is deliberately short and short in
+one direction: over-expansion is only expensive for words a corpus contains dozens of innocent uses
+of, and a longer list would start refusing legitimate terms.
+
+Nothing here is applied to a document. manicule does not rewrite what it indexed, so the worst an
+over-broad rule can do is run one extra search whose provenance is on screen.
+
+**Conflicts are never resolved.** Two definitions of one term in scope expand nothing and are
+reported as a conflict with both sources. Highest detection confidence, most recent and
+first-alphabetically are all defensible and all silent, and a silently chosen definition produces
+an answer that is fluent, cited, and about the wrong thing — the one failure mode a glossary
+feature has that plain search does not. Narrowing the scope is not a tie-break either: a
+collection holding both definitions holds a disagreement.
+
+The **firing rules run first**, and the order was corrected after watching the command line render
+the other way round. A term used as an ordinary English word does not expand whether or not the
+corpus disagrees about it, so reporting a conflict there put a glossary banner above the results
+for *should I restart the daemon now* — a question that was never about the term. A banner that
+appears on questions it does not concern is one readers learn to skip, which costs exactly the case
+it exists for.
+
+### 14.6 What it does to confidence: nothing, by construction
+
+A promoted definition carries **no leg score**. `evidence_per_passage` (§8.2) skips a passage the
+dense leg never ranked, so promotion contributes nothing in either direction — it cannot
+manufacture evidence, and it cannot be mistaken for a cosine nobody measured. Where a passage was
+found by both the original and the expanded search, the better of the two opinions is kept per leg,
+which is the only combination that cannot let the feature quietly *lower* a reported confidence.
+
+Measured on the fixture above, `What is NOW?` reports **0.1121 `low`** before and after. That is
+non-zero, which is `bugs/bug2.md`'s second acceptance criterion, and it is low because a chunk that
+is mostly about twenty-four other terms genuinely is weak evidence. Making the number larger would
+mean letting a detection confidence stand in for a cosine, which §8 refuses everywhere else.
+
+### 14.7 The cache key
+
+`cache_key` carries the expanded query form. The generation counter catches a definition being
+added, because that is a row; it catches neither expansion being switched off nor a second
+definition turning a term into a conflict, and both change the ranking without changing the corpus.
 
 ---
 

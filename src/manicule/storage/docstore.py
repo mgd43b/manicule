@@ -28,6 +28,7 @@ from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import SourceId, Watermark
 from manicule.storage import models
 from manicule.storage.fts import SEARCH_SQL, escape_match_query
+from manicule.storage.glossary import GlossaryMixin
 from manicule.storage.history import TrashMixin, VersionsMixin
 from manicule.storage.organisation import CollectionsMixin, TagsMixin
 from manicule.storage.relations import RelationsMixin
@@ -87,6 +88,7 @@ class SqliteDocStore(
     VersionsMixin,
     TrashMixin,
     RelationsMixin,
+    GlossaryMixin,
     WorkspaceScoped,
 ):
     """Every relational protocol manicule has, over SQLite.
@@ -98,8 +100,9 @@ class SqliteDocStore(
     :class:`~manicule.core.protocols.CollectionStore`,
     :class:`~manicule.core.protocols.TagStore`,
     :class:`~manicule.core.protocols.VersionStore`,
-    :class:`~manicule.core.protocols.TrashStore` and
-    :class:`~manicule.core.protocols.ChunkRelationStore`.
+    :class:`~manicule.core.protocols.TrashStore`,
+    :class:`~manicule.core.protocols.ChunkRelationStore` and
+    :class:`~manicule.retrieval.ports.GlossarySource`.
     """
 
     # --- documents ------------------------------------------------------------------------

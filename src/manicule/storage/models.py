@@ -456,6 +456,73 @@ class CollectionDocument(Base):
     __table_args__ = (WITHOUT_ROWID,)
 
 
+class GlossaryEntry(Base):
+    """One acronym definition a document states, with where it says it.
+
+    **Scoped through ``document_id`` and nothing else.** There is no ``workspace_id`` column
+    here, and its absence is the design rather than an omission: a document id is derived from
+    the workspace (:func:`~manicule.core.ids.document_id`), so a copy of the workspace on this
+    row could only ever be a second answer to a question the foreign key already settles — and
+    a second answer can disagree. Collection membership is likewise read through the join table
+    at query time rather than copied here, because a collection's contents change without any
+    glossary being re-ingested.
+
+    ``chunk_id`` is a real foreign key with the same cascade the chunk table gets, so a
+    re-parse that replaces a document's chunks takes its stale definitions with it. Without
+    that, an edited glossary would keep answering with the line it used to have, citing a chunk
+    that no longer exists.
+    """
+
+    __tablename__ = "glossary_entries"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    chunk_id: Mapped[str] = mapped_column(
+        ForeignKey("chunks.id", ondelete="CASCADE"), nullable=False
+    )
+
+    acronym: Mapped[str] = mapped_column(Text, nullable=False)
+    """The normalised lookup key, upper case and stripped. Written by
+    :func:`~manicule.core.glossary.normalise_acronym` and read back with keys produced by the
+    same function; a store that normalised differently would miss silently."""
+
+    display: Mapped[str] = mapped_column(Text, nullable=False)
+    expansion: Mapped[str] = mapped_column(Text, nullable=False)
+    location: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    form: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        Index("ix_glossary_entries_acronym", "acronym"),
+        Index("ix_glossary_entries_document_id", "document_id"),
+        Index("ix_glossary_entries_chunk_id", "chunk_id"),
+        CheckConstraint("confidence >= 0.0 AND confidence <= 1.0", name="confidence_is_a_fraction"),
+    )
+
+
+class GlossaryAlias(Base):
+    """Another key that resolves to an entry.
+
+    A table rather than a JSON column on :class:`GlossaryEntry`, because this is the column a
+    lookup filters on and SQLite cannot index inside JSON. A glossary with two hundred terms is
+    queried on every search that names one of them; an unindexed ``LIKE`` over a JSON array
+    would make the cheapest part of the feature the most expensive.
+    """
+
+    __tablename__ = "glossary_aliases"
+
+    entry_id: Mapped[str] = mapped_column(
+        ForeignKey("glossary_entries.id", ondelete="CASCADE"), primary_key=True
+    )
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+
+    __table_args__ = (Index("ix_glossary_aliases_key", "key"), WITHOUT_ROWID)
+
+
 class Tag(Base):
     """A label applicable to documents."""
 
@@ -787,6 +854,8 @@ __all__ = [
     "Document",
     "DocumentTag",
     "DocumentVersion",
+    "GlossaryAlias",
+    "GlossaryEntry",
     "IndexState",
     "Message",
     "Plugin",

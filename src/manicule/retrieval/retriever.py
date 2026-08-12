@@ -1,11 +1,22 @@
-"""The whole of retrieval, assembled: route, cache, pipeline, context, confidence.
+"""The whole of retrieval, assembled: route, expand, cache, pipeline, context, confidence.
 
-    Query -> router -> L1 cache -> declared stages -> context assembly -> confidence
+    Query -> router -> membership -> glossary -> L1 cache -> stages -> assembly -> confidence
 
-Three of those five are not stages, and each is outside the pipeline for a reason rather than
-by omission. The router runs before everything and consults nothing. Context assembly emits a
+Five of those seven are not stages, and each is outside the pipeline for a reason rather than by
+omission. The router runs before everything and consults nothing. Context assembly emits a
 different type, which is exactly what lets the stage list be reordered freely while this step
 cannot be. Confidence produces neither candidates nor context — it is a report on the run.
+
+**Glossary expansion is one of them, and it is here for the strongest of the reasons.**
+:class:`~manicule.core.protocols.RetrievalStage` is locked, and widening it would invalidate
+every recorded evaluation result. Expansion does not need it widened: what it produces is a
+*second query*, so the declared pipeline runs over it unchanged, exactly as it ran over the
+first. A stage that took one query and searched two would be a stage whose output could not be
+replayed from its input.
+
+The second run costs a second pass of the whole pipeline, and it is paid only when an alias
+actually fires — which requires the query to name a glossary term as a whole token and to
+satisfy the over-expansion rules in :mod:`manicule.retrieval.expansion`.
 """
 
 from __future__ import annotations
@@ -14,6 +25,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from manicule.core.glossary import QueryExpansion, normalise_acronym
 from manicule.core.protocols import CollectionStore, TagStore
 from manicule.core.retrieval import (
     Candidate,
@@ -25,19 +37,29 @@ from manicule.core.retrieval import (
 from manicule.retrieval import trace as tracing
 from manicule.retrieval.cache import L1QueryCache, cache_key, rehydrate
 from manicule.retrieval.confidence import score_confidence
+from manicule.retrieval.expansion import (
+    GLOSSARY_SCORE_KEY,
+    ExpansionPolicy,
+    mark_authoritative,
+    merge_rankings,
+    resolve_expansion,
+)
+from manicule.retrieval.hydration import visible_documents
 from manicule.retrieval.prefilter import join_filter
 from manicule.retrieval.router import QueryRouter, Routing, UtilityKind
 from manicule.retrieval.runner import PipelineRunner
-from manicule.retrieval.trace import RetrievalTrace, Route
+from manicule.retrieval.trace import GlossaryReport, RetrievalTrace, Route
 from manicule.retrieval.utility import UtilityAnswer, handlers_for
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from manicule.container.container import Container
+    from manicule.core.glossary import GlossaryMatch
     from manicule.core.protocols import DocStore
     from manicule.core.retrieval import Query
     from manicule.retrieval.assembly import ContextAssembler
+    from manicule.retrieval.ports import GlossarySource
     from manicule.retrieval.profile import Profiles
     from manicule.retrieval.utility import UtilityHandler
 
@@ -73,6 +95,20 @@ class RetrievalResult:
     trace: RetrievalTrace = field(default_factory=RetrievalTrace)
     routing: Routing = field(default_factory=Routing)
     utility: UtilityAnswer | None = None
+    expansion: QueryExpansion | None = None
+    """What the glossary said about this query: which alias fired, to what, from where, and
+    what conflicted.
+
+    ``None`` on exactly the runs where :attr:`confidence` is ``None`` — a query the router
+    answered without consulting the corpus — and for the same reason: no lookup happened, which
+    is a different claim from "a lookup happened and matched nothing". On every retrieval run it
+    is present even when nothing fired, because *nothing named*, *expanded* and *conflicting*
+    are three states of one object and collapsing two of them into a ``None`` would make a
+    conflict indistinguishable from an ordinary query.
+
+    Every match carries the entry it resolved through, and every entry carries the chunk it was
+    read out of. That is what makes "never present an expansion without citation provenance" a
+    property of the type rather than a rule each surface has to remember."""
 
     @property
     def cites_the_corpus(self) -> bool:
@@ -98,6 +134,8 @@ class Retriever:
         embed_fingerprint: str | None = None,
         reranker_model_id: str | None = None,
         utility_handlers: Mapping[UtilityKind, UtilityHandler] | None = None,
+        glossary: GlossarySource | None = None,
+        expansion: ExpansionPolicy | None = None,
     ) -> None:
         self._runner = runner
         self._docstore = docstore
@@ -115,6 +153,8 @@ class Retriever:
         self._embed_fingerprint = embed_fingerprint
         self._reranker_model_id = reranker_model_id
         self._utility = dict(utility_handlers or handlers_for(docstore))
+        self._glossary = glossary
+        self._expansion = expansion or ExpansionPolicy()
 
     @property
     def cache_available(self) -> bool:
@@ -137,7 +177,7 @@ class Retriever:
         )
 
     async def retrieve(self, query: Query) -> RetrievalResult:
-        """Route, retrieve, assemble and score one query."""
+        """Route, expand, retrieve, assemble and score one query."""
         started = time.perf_counter()
         routing = self._router.route(query.text) if self._router else Routing()
         if routing.bypasses_retrieval:
@@ -146,21 +186,29 @@ class Retriever:
         # Membership becomes document ids here, before anything else looks at the filter.
         # Neither leg has a join to `collection_documents`, and both refuse the field rather
         # than drop it, so a query naming a collection fails in the store unless it is resolved
-        # first. Here rather than in a leg because there are three readers of the filter and
-        # only one of them is a leg: the lexical statement, the dense prefilter, and the cache
-        # -- `_from_cache` rehydrates through `join_filter`, which carries `collection_ids`
-        # too. Resolving once, above all three, is also what makes the cache key correct:
-        # the key is computed from the resolved filter, so changing a collection's membership
-        # changes the key and cannot serve a ranking computed over the old set.
+        # first. Here rather than in a leg because there are four readers of the filter and
+        # only one of them is a leg: the lexical statement, the dense prefilter, the glossary
+        # lookup, and the cache -- `_from_cache` rehydrates through `join_filter`, which
+        # carries `collection_ids` too. Resolving once, above all four, is also what makes the
+        # cache key correct: the key is computed from the resolved filter, so changing a
+        # collection's membership changes the key and cannot serve a ranking computed over the
+        # old set.
         resolved = await self._resolve_membership(query)
         if resolved is None:
             return self._matches_nothing(query, routing, started)
         query = resolved
 
+        # After membership resolution and before the cache key. After, so the glossary lookup
+        # sees the same resolved document ids the legs will -- one notion of what a collection
+        # contains rather than a second one resolved separately. Before, because the expansion
+        # changes what is retrieved, and a key that could not tell an expanded run from an
+        # unexpanded one would serve one as the other.
+        expansion = await resolve_expansion(query, self._glossary, self._expansion)
+
         identity = self.identity(query)
-        key = self._key(query, identity)
+        key = self._key(query, identity, expansion)
         if key is not None:
-            hit = await self._from_cache(key, query, identity, started)
+            hit = await self._from_cache(key, query, identity, started, expansion)
             if hit is not None:
                 return hit
 
@@ -169,7 +217,23 @@ class Retriever:
         # same run. The runner reuses an ambient frame when it finds one.
         with tracing.installed() as frame:
             run = await self._runner.run(query)
-            context = self._assembler.assemble(query, run.candidates)
+            candidates = run.candidates
+            second: list[Candidate] = []
+            if expansion.fired:
+                second = (await self._runner.run(_reworded(query, expansion.expanded))).candidates
+            promoted, from_store = await self._definitions(query, expansion, candidates, second)
+            if expansion.fired or promoted:
+                # The merged list is no longer than a single run's would have been. Expansion
+                # buys better passages, never more of them: a context that grew whenever a
+                # glossary term was named would make every downstream budget a function of the
+                # corpus's vocabulary.
+                candidates = merge_rankings(
+                    run.candidates,
+                    second,
+                    promoted=promoted,
+                    limit=max(len(run.candidates), query.limit),
+                )
+            context = self._assembler.assemble(query, candidates)
             assembly = frame.assembly
             incomparable = list(frame.incomparable)
 
@@ -181,7 +245,7 @@ class Retriever:
             self._cache.put(
                 key,
                 L1QueryCache.record(
-                    run.candidates,
+                    candidates,
                     identity,
                     incomparable=incomparable,
                     exhausted_budget=exhausted,
@@ -190,7 +254,7 @@ class Retriever:
 
         return RetrievalResult(
             context=context,
-            candidates=run.candidates,
+            candidates=candidates,
             confidence=self._confidence(context, identity, exhausted_budget=exhausted),
             trace=RetrievalTrace(
                 route=routing.route,
@@ -199,9 +263,116 @@ class Retriever:
                 total_ms=(time.perf_counter() - started) * 1000.0,
                 stages=run.spans,
                 assembly=assembly,
+                glossary=self._report(expansion, promoted, from_store, second_pass=bool(second)),
                 incomparable=tuple(dict.fromkeys(incomparable)),
             ),
             routing=routing,
+            expansion=expansion,
+        )
+
+    async def _definitions(
+        self,
+        query: Query,
+        expansion: QueryExpansion,
+        *rankings: Sequence[Candidate],
+    ) -> tuple[list[Candidate], int]:
+        """The passages that define the terms that fired, in match order.
+
+        Taken from whichever ranking already holds them and fetched by id when neither does —
+        which is the case that makes this a *lookup* rather than a boost. On a corpus where an
+        acronym is used far more often than it is defined, similarity ranks the usages above
+        the definition and the definition is simply not in the candidate set; a feature that
+        only reordered what search returned would do nothing at all there.
+
+        A fetched passage is subjected to the same visibility join the dense leg applies, and
+        then to the chunk-level restrictions the vocabulary lookup deliberately ignored. The
+        entry is a document-level fact and cannot be used to return a chunk the query excluded.
+
+        **One passage per chunk, however many terms it defines.** A glossary page states dozens
+        of definitions in one chunk, so a query naming two of them resolves both matches to the
+        same passage — and promoting it twice would report ``promoted=2`` for one passage that
+        moved, count one fetch as two, and hand the merge a duplicate it only has to collapse
+        again. The strongest detection confidence among the terms that landed on it is the one
+        recorded, because that is the mark, not a ranking score.
+
+        Returns:
+            The promoted candidates, and how many of them neither search had found.
+        """
+        if not expansion.matches:
+            return [], 0
+        by_chunk = {candidate.chunk.id: candidate for ranking in rankings for candidate in ranking}
+        missing = [match for match in expansion.matches if match.entry.chunk_id not in by_chunk]
+        cold = await self._fetch_definitions(query, missing)
+
+        promoted: dict[str, Candidate] = {}
+        fetched = 0
+        for match in expansion.matches:
+            chunk_id = match.entry.chunk_id
+            candidate = by_chunk.get(chunk_id) or cold.get(chunk_id)
+            if candidate is None:
+                continue
+            seen = promoted.get(chunk_id)
+            if seen is None and chunk_id in cold:
+                fetched += 1
+            confidence = max(
+                match.entry.confidence, seen.scores.get(GLOSSARY_SCORE_KEY, 0.0) if seen else 0.0
+            )
+            promoted[chunk_id] = mark_authoritative(candidate, confidence)
+        return list(promoted.values()), fetched
+
+    async def _fetch_definitions(
+        self, query: Query, matches: Sequence[GlossaryMatch]
+    ) -> dict[str, Candidate]:
+        """Defining chunks neither search returned, fetched by id and then scoped.
+
+        Every restriction a retrieved candidate would have passed is applied here, in the same
+        order and through the same helper: the document-level join first — workspace, soft
+        delete, status and any post-filter — and then ``kinds`` and ``langs``, which the
+        vocabulary lookup does not apply because it returns vocabulary rather than chunks.
+
+        A candidate produced here carries **no leg score**, and that is deliberate rather than
+        an omission. Confidence reads the dense leg's key and skips a passage that has none, so
+        a promoted definition contributes nothing to the reported confidence in either
+        direction — it cannot manufacture evidence, and it cannot be mistaken for a cosine
+        nobody measured.
+        """
+        if not matches:
+            return {}
+        chunk_ids = list(dict.fromkeys(match.entry.chunk_id for match in matches))
+        chunks = await self._docstore.get_chunks(chunk_ids)
+        if not chunks:
+            return {}
+        visible = await visible_documents(
+            self._docstore, join_filter(query.filter), [chunk.document_id for chunk in chunks]
+        )
+        allowed = query.filter
+        return {
+            chunk.id: Candidate(chunk=chunk, score=0.0)
+            for chunk in chunks
+            if chunk.document_id in visible
+            and (not allowed.kinds or chunk.kind in allowed.kinds)
+            and (not allowed.langs or chunk.lang in allowed.langs)
+        }
+
+    def _report(
+        self,
+        expansion: QueryExpansion,
+        promoted: Sequence[Candidate],
+        from_store: int,
+        *,
+        second_pass: bool,
+    ) -> GlossaryReport | None:
+        if self._glossary is None:
+            return None
+        return GlossaryReport(
+            consulted=self._expansion.enabled,
+            expanded_query=expansion.expanded,
+            terms=tuple(match.key for match in expansion.matches),
+            reasons=tuple(match.reason.value for match in expansion.matches),
+            conflicts=tuple(conflict.key for conflict in expansion.conflicts),
+            promoted=len(promoted),
+            promoted_from_store=from_store,
+            second_pass=second_pass,
         )
 
     async def _resolve_membership(self, query: Query) -> Query | None:
@@ -298,16 +469,25 @@ class Retriever:
             utility=answer,
         )
 
-    def _key(self, query: Query, identity: PipelineIdentity) -> str | None:
+    def _key(
+        self, query: Query, identity: PipelineIdentity, expansion: QueryExpansion
+    ) -> str | None:
         if not self._cache.enabled:
             return None
         store = self._docstore
         if not isinstance(store, SupportsGeneration):
             return None
-        return cache_key(query, generation=store.generation, identity=identity)
+        return cache_key(
+            query, generation=store.generation, identity=identity, expanded=expansion.expanded
+        )
 
     async def _from_cache(
-        self, key: str, query: Query, identity: PipelineIdentity, started: float
+        self,
+        key: str,
+        query: Query,
+        identity: PipelineIdentity,
+        started: float,
+        expansion: QueryExpansion,
     ) -> RetrievalResult | None:
         entry = self._cache.get(key)
         if entry is None:
@@ -333,9 +513,14 @@ class Retriever:
                 cached=True,
                 total_ms=(time.perf_counter() - started) * 1000.0,
                 assembly=assembly,
+                # The expansion is recomputed on every query rather than cached, so a hit
+                # reports the same alias, the same provenance and the same conflicts a miss
+                # would have. What it does not report is ``second_pass``: no pipeline ran.
+                glossary=self._report(expansion, (), 0, second_pass=False),
                 incomparable=(CACHED_RUN, *entry.incomparable),
             ),
             routing=Routing(),
+            expansion=expansion,
         )
 
     def _confidence(
@@ -360,6 +545,16 @@ class Retriever:
             rerank_stage=self._rerank_stage,
             exhausted_budget=exhausted_budget,
         )
+
+
+def _reworded(query: Query, text: str) -> Query:
+    """The same request, asked the way the glossary says it means.
+
+    Everything but the text is copied, and the filter above all: the second search is subject to
+    exactly the restrictions the first was. A rewritten query that widened its own scope would
+    be a scope escape reachable by writing an acronym.
+    """
+    return query.model_copy(update={"text": text})
 
 
 def _exhausted_budget(spans: Sequence[tracing.StageSpan]) -> bool:
@@ -388,6 +583,7 @@ async def build_retriever(container: Container) -> Retriever:
     from manicule.core.protocols import Reranker  # noqa: PLC0415
     from manicule.retrieval.assembly import ContextAssembler  # noqa: PLC0415
     from manicule.retrieval.fusion import RRFStage  # noqa: PLC0415
+    from manicule.retrieval.ports import GlossarySource  # noqa: PLC0415
     from manicule.retrieval.profile import Profiles  # noqa: PLC0415
     from manicule.retrieval.tokens import ContextTokenCounter  # noqa: PLC0415
 
@@ -401,6 +597,10 @@ async def build_retriever(container: Container) -> Retriever:
     fusion = next((stage for stage in stages if isinstance(stage, RRFStage)), None)
     reranker = next((stage for stage in stages if isinstance(stage, Reranker)), None)
     handlers = handlers_for(docstore)
+    # Structural, like every other optional capability retrieval reads off a store. A store
+    # that cannot answer glossary lookups is not a defective store; expansion is simply
+    # unavailable against it, and the trace says so by carrying no report at all.
+    glossary = docstore if isinstance(docstore, GlossarySource) else None
 
     return Retriever(
         runner=PipelineRunner(stages, docstore=docstore, assert_scope=rag.assert_scope),
@@ -424,6 +624,15 @@ async def build_retriever(container: Container) -> Retriever:
         embed_fingerprint=embedder.fingerprint.canonical(),
         reranker_model_id=reranker.model_id if reranker else None,
         utility_handlers=handlers,
+        glossary=glossary,
+        expansion=ExpansionPolicy(
+            enabled=rag.glossary.enabled,
+            min_entry_confidence=rag.glossary.min_entry_confidence,
+            max_terms=rag.glossary.max_terms,
+            homographs=frozenset(
+                key for key in (normalise_acronym(word) for word in rag.glossary.homographs) if key
+            ),
+        ),
     )
 
 

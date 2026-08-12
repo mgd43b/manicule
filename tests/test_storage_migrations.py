@@ -175,6 +175,87 @@ async def test_parse_lineage_arrives_empty_and_leaves_the_rest_alone(data_dir: P
         await engine.dispose()
 
 
+_SEEDED_GLOSSARY = (
+    "INSERT INTO glossary_entries (id, document_id, chunk_id, acronym, display, expansion, "
+    "location, form, confidence, created_at) "
+    "VALUES ('g1', 'd1', 'c1', 'NOW', 'NOW', 'Network Operations Workspace', 'Glossary', "
+    "'em_dash', 0.95, '2026-01-01T00:00:00+00:00')",
+    "INSERT INTO glossary_aliases (entry_id, \"key\") VALUES ('g1', 'NETOPS')",
+)
+"""One entry and one alias, hung off the seeded document and its first chunk.
+
+Both foreign keys are exercised, which is the point: the entry points at ``chunks`` and the
+alias points at the entry, so this is the shape whose ``DROP`` has somewhere to cascade to.
+"""
+
+
+@pytest.mark.contract
+async def test_the_glossary_tables_arrive_empty_and_their_removal_cascades_nowhere(
+    data_dir: Path,
+) -> None:
+    """The glossary revision, over a database that already has documents in it.
+
+    Three claims, and the third is the one an empty database cannot make.
+
+    **The tables arrive empty.** Definitions come from parsing text, so an existing corpus gains
+    a glossary on its next ingest. Deriving entries inside a migration would freeze one copy of
+    the detector's rules into a revision that can never be changed.
+
+    **Adding them disturbs nothing.** Every seeded row and every column of the seeded document
+    is still exactly as it was.
+
+    **Removing them cascades nowhere.** ``glossary_entries`` has foreign keys to ``documents``
+    and to ``chunks``, and the cascades point *inwards* — but a downgrade drops the table while
+    it is populated, and this project's worst near-miss was a migration whose ``DROP`` emptied
+    four tables and reported success. So the glossary is populated before the downgrade runs,
+    and the counts are read on the other side of it.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision=_first_revision())
+        await _seed(engine)
+        counts = await _row_counts(engine)
+        columns = await _document_values(engine)
+
+        await upgrade(engine)
+        assert await _glossary_counts(engine) == {"glossary_entries": 0, "glossary_aliases": 0}, (
+            "an existing corpus must not be claimed to have a glossary nobody extracted"
+        )
+        assert await _row_counts(engine) == counts
+        assert await _document_values(engine) == columns
+
+        async with engine.begin() as connection:
+            for statement in _SEEDED_GLOSSARY:
+                await connection.execute(text(statement))
+        assert await _glossary_counts(engine) == {"glossary_entries": 1, "glossary_aliases": 1}, (
+            "the seed must actually seed, or the downgrade below proves nothing"
+        )
+
+        await downgrade(engine, _first_revision())
+        assert await _row_counts(engine) == counts, (
+            "dropping a populated glossary must not take the documents or chunks with it"
+        )
+        assert await _document_values(engine) == columns
+
+        await upgrade(engine)
+        assert await _glossary_counts(engine) == {"glossary_entries": 0, "glossary_aliases": 0}
+        assert await _row_counts(engine) == counts
+    finally:
+        await engine.dispose()
+
+
+async def _glossary_counts(engine: AsyncEngine) -> dict[str, int]:
+    async with engine.connect() as connection:
+        return {
+            # S608: both names are literals in this function, and a table name cannot be a
+            # bind parameter.
+            table: (
+                await connection.execute(text(f"SELECT count(*) FROM {table}"))  # noqa: S608
+            ).scalar_one()
+            for table in ("glossary_entries", "glossary_aliases")
+        }
+
+
 def _first_revision() -> str:
     script = ScriptDirectory.from_config(alembic_config())
     return next(r.revision for r in script.walk_revisions() if r.down_revision is None)

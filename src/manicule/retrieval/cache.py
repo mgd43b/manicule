@@ -75,10 +75,11 @@ def cache_key(
     *,
     generation: int,
     identity: PipelineIdentity,
+    expanded: str = "",
 ) -> str:
     """A stable digest of everything that could change this query's ranking.
 
-    Four of the inputs are worth saying out loud:
+    Five of the inputs are worth saying out loud:
 
     * **``Query.limit``**, which looks like a presentation concern and is not. Retrieval depth
       is the larger of the limit and the profile's head, so a larger limit is a *deeper run*,
@@ -89,6 +90,12 @@ def cache_key(
     * **The pipeline identity**, because comparing two pipelines is the evaluation harness's
       entire method and a cache that cannot tell them apart would serve one's ranking as the
       other's.
+    * **The expanded query form**, when glossary lookup produced one. Two runs of one pipeline
+      over one text return different rankings when a glossary term was defined between them, or
+      when expansion was switched off, or when a second definition arrived and turned the term
+      into a conflict — and every one of those changes this string. The generation counter
+      catches the first because the definition is a row; it catches neither of the others,
+      because they are configuration and scope rather than content.
     * **Not the conversation history.** Retrieval runs on the query text; nothing in this
       pipeline reads history. Including it would guarantee a miss on every turn of a
       conversation — the one place a user actually repeats themselves. If a history-conditioned
@@ -105,6 +112,7 @@ def cache_key(
         "rrf_k": identity.rrf_k,
         "embed_fingerprint": identity.embed_fingerprint,
         "text": query.text.strip(),
+        "expanded": expanded.strip(),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

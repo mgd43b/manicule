@@ -24,7 +24,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from manicule.core.embedding import IndexFingerprints
+    from manicule.core.glossary import GlossaryEntry
+    from manicule.core.retrieval import Filter
 
 
 @runtime_checkable
@@ -61,7 +65,43 @@ class SupportsIndexState(Protocol):
     async def count_chunks(self, document_id: str | None = None) -> int: ...
 
 
+@runtime_checkable
+class GlossarySource(Protocol):
+    """A store that can look glossary terms up **within a filter's scope**.
+
+    The filter is a parameter rather than an afterthought, and that is the whole security
+    argument for this port. An entry names the document it was read out of, and a document id
+    already carries the workspace (:func:`~manicule.core.ids.document_id` takes it as the first
+    component of its digest) — but *collection* scope is a membership relation the entry cannot
+    carry without holding a second copy that can go stale. So the store resolves both, in the
+    same statement it selects the entries with, and there is no path that returns an entry and
+    then filters it.
+
+    A store that does not implement this is not defective: expansion is simply unavailable
+    against it, and the retriever says so rather than silently searching one form.
+    """
+
+    async def entries_for(
+        self,
+        keys: Sequence[str],
+        filter: Filter,  # noqa: A002 - mirrors the vocabulary every other scoped read uses
+    ) -> Sequence[GlossaryEntry]:
+        """Every entry in scope whose acronym or alias is one of ``keys``.
+
+        Args:
+            keys: Normalised lookup keys, as :func:`~manicule.core.glossary.normalise_acronym`
+                produces them. A store must not normalise again: two normalisations that
+                disagree produce a lookup that silently misses, which reads exactly like a
+                corpus with no glossary in it.
+            filter: The query's whole restriction. A store that cannot honour a field of it
+                must refuse rather than drop it — an entry admitted by an ignored
+                ``collection_ids`` is one collection's glossary leaking into another's search.
+        """
+        ...
+
+
 __all__ = [
+    "GlossarySource",
     "SupportsDocumentCount",
     "SupportsIndexState",
     "SupportsLiveChunkCount",

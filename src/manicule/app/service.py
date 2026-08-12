@@ -48,6 +48,7 @@ from manicule.config.settings import (
 )
 from manicule.core.content import DocumentStatus
 from manicule.core.errors import ConfigError, ManiculeError, UnknownEntityError
+from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id
 from manicule.core.retrieval import Filter, Query, RetrievalProfile
 from manicule.core.version import CORE_VERSION
@@ -98,6 +99,14 @@ A constant rather than something derived from the directory, because a document'
 would re-index the same file as a new document every time it was indexed from somewhere else.
 """
 
+_CONFLICTING = 2
+"""How many readable definitions make a disagreement.
+
+Named rather than written as a literal because the number *is* the definition of the word: one
+definition is a definition, and a "conflict" reported with a single candidate is a warning a
+reader cannot act on.
+"""
+
 
 @dataclass(slots=True)
 class AskAside:
@@ -123,6 +132,17 @@ class AskAside:
 
     message_id: str | None = None
     """Where the answer was persisted, when there was a conversation to persist it to."""
+
+    expansions: tuple[r.GlossaryExpansion, ...] = ()
+    """Glossary terms the question named, each with the passage its definition came from.
+
+    Here rather than on the envelope for the same reason the band is: the envelope is what the
+    generator produced, and this is a fact about the retrieval that produced its context. An
+    answer reached through words the reader did not type has to be able to say so, and to name
+    the document that put them there."""
+
+    conflicts: tuple[r.GlossaryConflict, ...] = ()
+    """Terms with more than one definition in scope, so none was expanded."""
 
     payload: r.AnswerResultPayload | None = None
     """The settled result, built by :meth:`ApplicationService.ask_stream` when the run ends.
@@ -260,6 +280,7 @@ class ApplicationService:
         if confidence is not None:
             record.confidence_band = confidence.band.value
             record.confidence_reason = confidence.reason
+        record.expansions, record.conflicts = await self._glossary_payloads(retrieved.expansion)
         envelope: AnswerEnvelope | None = None
         try:
             async with answering(answerer, request, result) as events:
@@ -327,6 +348,7 @@ class ApplicationService:
             for candidate in candidates
         )
         confidence = retrieved.confidence
+        expansions, conflicts = await self._glossary_payloads(retrieved.expansion)
         return r.SearchResult(
             query=query_text,
             profile=query.profile.value,
@@ -335,12 +357,83 @@ class ApplicationService:
             confidence=confidence.score if confidence else None,
             confidence_band=confidence.band.value if confidence else None,
             confidence_reason=confidence.reason if confidence else "",
+            expansions=expansions,
+            conflicts=conflicts,
+            expanded_query=retrieved.expansion.expanded if retrieved.expansion else "",
             route=retrieved.trace.route.value,
             cached=retrieved.trace.cached,
             truncated=retrieved.context.truncated,
             elapsed_ms=_millis(started),
             collections=tuple(collections),
         )
+
+    async def _glossary_payloads(
+        self, expansion: QueryExpansion | None
+    ) -> tuple[tuple[r.GlossaryExpansion, ...], tuple[r.GlossaryConflict, ...]]:
+        """Turn what the glossary said into payloads, with every source resolved.
+
+        **Every entry's document is looked up through the scoped store**, and an entry whose
+        document this workspace cannot see is dropped rather than reported with a blank source.
+        The entries came from a workspace-scoped lookup already, so this can only ever fire on
+        a store that leaked — which is exactly why it is here and not assumed away. It is the
+        same second check ``_require_scoped_chunks`` performs on the passages, applied to the
+        one other thing a search now puts on screen.
+
+        Dropping rather than raising, because a definition that has become unreadable between
+        the lookup and the render is a race rather than an attack, and failing the whole search
+        over it would turn a soft delete into an outage. A leak, by contrast, cannot get past
+        this: there is no branch that emits an expansion without a resolved document.
+        """
+        if expansion is None or not (expansion.matches or expansion.conflicts):
+            return (), ()
+        entries = [match.entry for match in expansion.matches]
+        entries += [entry for conflict in expansion.conflicts for entry in conflict.entries]
+        documents = await self._scoped_documents({entry.document_id for entry in entries})
+
+        def payload(entry: GlossaryEntry, matched: str, reason: str) -> r.GlossaryExpansion | None:
+            document = documents.get(entry.document_id)
+            if document is None:
+                return None
+            return r.GlossaryExpansion(
+                document_id=entry.document_id,
+                chunk_id=entry.chunk_id,
+                uri=document.uri,
+                title=document.title,
+                acronym=entry.acronym,
+                display=entry.display,
+                expansion=entry.expansion,
+                matched=matched,
+                reason=reason,
+                form=entry.form.value,
+                detection_confidence=entry.confidence,
+                location=entry.location,
+            )
+
+        expanded = tuple(
+            built
+            for built in (
+                payload(match.entry, match.surface, match.reason.value)
+                for match in expansion.matches
+            )
+            if built is not None
+        )
+        conflicts: list[r.GlossaryConflict] = []
+        for conflict in expansion.conflicts:
+            candidates = tuple(
+                built
+                for built in (payload(entry, conflict.surface, "") for entry in conflict.entries)
+                if built is not None
+            )
+            # A conflict whose candidates no longer resolve to two readable documents is not a
+            # conflict this workspace has. Reporting it with one candidate would be reporting a
+            # disagreement nobody can look at.
+            if len(candidates) >= _CONFLICTING:
+                conflicts.append(
+                    r.GlossaryConflict(
+                        acronym=conflict.key, matched=conflict.surface, candidates=candidates
+                    )
+                )
+        return expanded, tuple(conflicts)
 
     # --- ingest ---------------------------------------------------------------------------
 
@@ -2752,22 +2845,7 @@ class ApplicationService:
         wanted = list(dict.fromkeys(chunk.document_id for chunk in chunks))
         if not wanted:
             return {}
-        store = await self._backend.documents()
-        # One query rather than one per document. `document_ids` is a field the store honours,
-        # so this is the same scoped, trash-excluding lookup — and a ranked page routinely
-        # spans several documents, which made the per-document form N round trips on the hot
-        # path of every search and every answer.
-        asked = frozenset(wanted)
-        page = await store.list_documents(
-            Filter(workspace_ids=frozenset({self.workspace}), document_ids=asked),
-            limit=len(wanted),
-        )
-        # Restricted to what was asked for. A store that returns more than the filter allowed
-        # is a defect its own conformance suite owns; here the question is only whether every
-        # requested document came back, and whether each one belongs to this tenant.
-        found: dict[str, Document] = {
-            document.id: document for document in page if document.id in asked
-        }
+        found = await self._scoped_documents(wanted)
         missing = [document_id_ for document_id_ in wanted if document_id_ not in found]
         if missing:
             msg = (
@@ -2778,6 +2856,32 @@ class ApplicationService:
             raise CrossWorkspaceError(msg)
         require_owned(self.workspace, found.values())
         return found
+
+    async def _scoped_documents(self, document_ids: Iterable[str]) -> dict[str, Document]:
+        """The documents of ``document_ids`` this workspace can see, keyed by id.
+
+        One query rather than one per document. ``document_ids`` is a field the store honours,
+        so this is the scoped, trash-excluding lookup — and a ranked page routinely spans
+        several documents, which made the per-document form N round trips on the hot path of
+        every search and every answer.
+
+        Returns what was found and says nothing about what was not. Two callers want different
+        things from that: a passage whose document is missing is a leak and must raise, while a
+        glossary entry whose document is missing is a race and must be dropped. Deciding here
+        would force one of them to un-decide it.
+        """
+        asked = frozenset(document_ids)
+        if not asked:
+            return {}
+        store = await self._backend.documents()
+        page = await store.list_documents(
+            Filter(workspace_ids=frozenset({self.workspace}), document_ids=asked),
+            limit=len(asked),
+        )
+        # Restricted to what was asked for. A store that returns more than the filter allowed
+        # is a defect its own conformance suite owns; here the question is only which of the
+        # requested documents came back.
+        return {document.id: document for document in page if document.id in asked}
 
     def _answer_payload(
         self,
@@ -2810,6 +2914,8 @@ class ApplicationService:
             ),
             dropped=len(envelope.dropped),
             confidence=envelope.confidence,
+            expansions=aside.expansions,
+            conflicts=aside.conflicts,
             confidence_band=aside.confidence_band,
             confidence_reason=aside.confidence_reason,
             corpus_consulted=envelope.corpus_consulted,
