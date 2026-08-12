@@ -32,6 +32,10 @@ manicule.db-shm
 .ci/grammars/*
 !.ci/grammars/.gitkeep
 
+# The link checker's machine-readable report, written by the docs job and by anyone running
+# lychee the way that job does. `tools/check_link_report.py` is what reads it.
+lychee-report.json
+
 # macOS
 .DS_Store
 

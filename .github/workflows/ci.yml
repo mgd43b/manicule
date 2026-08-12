@@ -407,18 +407,108 @@ jobs:
   docs:
     name: docs links
     runs-on: ubuntu-latest
+    env:
+      # Pinned here rather than left to `lychee-action`'s default, for two reasons. It is the
+      # cache key below, and a floating version cannot be one. And a checker that changes under
+      # this repository without a diff is a checker whose results change without a reason.
+      LYCHEE_VERSION: v0.24.2
     steps:
       - uses: actions/checkout@v7
-      - name: lychee
-        uses: lycheeverse/lychee-action@v2
+      # `lycheeverse/lychee-action@v2` is not used, and the reason is one line of it:
+      # `curl -sfLO "${DOWNLOAD_URL}"`, with no retry and no cache, run on every job. That is
+      # the same fragility #85 removed from the image build, and it failed this job three times
+      # in an hour — `exit 22` (HTTP >= 400) and `exit 56` (failure receiving data), two symptoms
+      # of one cause. The action always downloads, so there is no way to put a cache in front of
+      # it while still using it; the install below is its install with the two flaws removed.
+      - name: restore the link checker
+        id: lychee
+        uses: actions/cache/restore@v6
         with:
-          args: >-
-            --offline
-            --include-fragments
-            --no-progress
-            --verbose
-            '**/*.md'
-          fail: true
-        # External links are excluded by --offline: the documents are full of GitHub issue
-        # URLs, and a rate-limited fetch must never fail a build. What is checked is what
-        # this repository controls — relative paths, and anchors resolving to real headings.
+          path: ~/.cache/lychee
+          key: lychee-${{ runner.os }}-${{ runner.arch }}-${{ env.LYCHEE_VERSION }}
+      - name: install the link checker
+        if: steps.lychee.outputs.cache-hit != 'true'
+        # `--retry-all-errors` is the load-bearing flag and not a belt-and-braces one. Measured:
+        # plain `--retry` retries an HTTP 503 and does **not** retry a transfer that drops
+        # mid-body — it gives up and leaves a truncated file — so a retry written against the
+        # first symptom would not have survived the second, and both have been seen here.
+        #
+        # `--speed-limit/--speed-time` are what make a stall cheap. Also measured: with only
+        # `--max-time` in force, a dropped transfer was not noticed for the full five minutes,
+        # which across five retries is twenty-five minutes of a job doing nothing. Aborting a
+        # transfer that has managed under 1 KB/s for 30s turns that into 33 seconds and a retry.
+        #
+        # Downloaded and extracted in a temporary directory, and only an extracted binary is
+        # installed into the cached one. A truncated archive therefore cannot become the cache —
+        # the next run would restore it, skip the download, and fail on a corrupt checker.
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "${work}"' EXIT
+          url="https://github.com/lycheeverse/lychee/releases/download/lychee-${LYCHEE_VERSION}/lychee-$(uname -m)-unknown-linux-gnu.tar.gz"
+          echo "downloading ${url}"
+          curl --fail --location --silent --show-error \
+               --retry 5 --retry-all-errors \
+               --connect-timeout 20 --max-time 180 --speed-limit 1024 --speed-time 30 \
+               --output "${work}/lychee.tar.gz" "${url}"
+          tar -xzf "${work}/lychee.tar.gz" -C "${work}"
+          # `-print -quit` rather than piping into `head -n 1`. Under `pipefail` that pipeline
+          # fails whenever `head` closes the pipe while `find` is still writing — a race this
+          # archive is small enough to usually win, which is the worst kind: it would pass
+          # every time it was tried and fail on some later Tuesday.
+          binary="$(find "${work}" -type f -name lychee -print -quit)"
+          if [ -z "${binary}" ]; then
+            echo "no lychee binary in the ${LYCHEE_VERSION} archive. Did its layout change?" >&2
+            exit 1
+          fi
+          mkdir -p "${HOME}/.cache/lychee"
+          install -m 0755 "${binary}" "${HOME}/.cache/lychee/lychee"
+      # Saved only after an install that produced a usable binary, and only when nothing was
+      # restored — the same split as the grammar pack, for the same reason.
+      - name: keep the link checker for the next run
+        if: steps.lychee.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/lychee
+          key: lychee-${{ runner.os }}-${{ runner.arch }}-${{ env.LYCHEE_VERSION }}
+      # External links are excluded by --offline: the documents are full of GitHub issue
+      # URLs, and a rate-limited fetch must never fail a build. What is checked is what
+      # this repository controls — relative paths, and anchors resolving to real headings.
+      #
+      # The version is asserted before the run rather than trusted, and it covers the restored
+      # binary as much as the freshly installed one: a cache is a file from another day, and one
+      # that will not execute or reports something else is a checker this job must not use.
+      #
+      # `--format json --output` alongside `--verbose`, so the log keeps every line a human
+      # reads *and* the run leaves an artefact the next step can hold to account. Neither is a
+      # substitute for the other: the console cannot be asserted on, and the report is not
+      # something anybody scrolls.
+      - name: lychee
+        run: |
+          set -euo pipefail
+          export PATH="${HOME}/.cache/lychee:${PATH}"
+          version="$(lychee --version | head -n 1 | cut -d ' ' -f 2)"
+          echo "lychee ${version}"
+          if [ "v${version}" != "${LYCHEE_VERSION}" ]; then
+            echo "this job pins ${LYCHEE_VERSION} and the checker on PATH reports v${version}." >&2
+            echo "A restored cache is holding a different binary; the key is not distinguishing" >&2
+            echo "them. Do not trust a link result produced by a checker nobody chose." >&2
+            exit 1
+          fi
+          lychee --offline --include-fragments --no-progress --verbose \
+                 --format json --output lychee-report.json \
+                 '**/*.md'
+      # **The step that makes this job's green tick mean something.** lychee exits 0 when it
+      # checked nothing at all — verified, not assumed: pointed at a glob matching no files it
+      # prints one warning among thousands of lines and returns success. A job that only
+      # propagates the exit code therefore reports the same result for "every link resolves" and
+      # "there were no links", and the second is what a renamed directory leaves behind.
+      #
+      # `!cancelled()` rather than nothing, so this is the last word in every case that is not a
+      # cancellation: a lychee that exited non-zero still gets its broken links named here rather
+      # than left in the log, and a lychee that never ran leaves no report, which is a failure.
+      # That is the property worth more than the cache — a link check that could not run cannot
+      # report success, because success is asserted from an artefact only a real run produces.
+      - name: the link check actually checked links
+        if: ${{ !cancelled() }}
+        run: python3 tools/check_link_report.py lychee-report.json
