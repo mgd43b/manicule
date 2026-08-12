@@ -585,3 +585,56 @@ async def test_ordinary_html_passes_through_the_recovery_unchanged() -> None:
     assert rendered.startswith(plain), "markup before a section was escaped"
     assert rendered.endswith(plain), "markup after a section was escaped"
     assert "a &lt; b" in rendered, "the recovered body was not escaped"
+
+
+async def test_a_cdata_section_that_is_not_a_macro_body_is_recovered_too() -> None:
+    """A page *about* CDATA gets the same treatment, and that is deliberate rather than incidental.
+
+    The recovery knows nothing about Confluence — it is a rule about HTML — so a document showing
+    CDATA syntax as an example has that example recovered as text. That is the correct outcome for
+    the same reason it is correct for a macro body: the author put content there and an HTML parser
+    would have deleted it.
+
+    Pinned so the next person changing this knows the behaviour was chosen. The alternative — only
+    recovering sections inside `ac:` elements — would make the rule Confluence-specific and would
+    silently keep losing content from every other document.
+    """
+    document = (
+        "<h2>Writing XML</h2>"
+        "<p>Wrap literal markup in a section:</p>"
+        '<pre><![CDATA[<config enabled="true"/>]]></pre>'
+    )
+    blocks = await read_blocks(WebParser(WebConfig()), raw_of(document, MEDIA_TYPE))
+    text = "\n".join(block.text for block in blocks)
+
+    assert '<config enabled="true"/>' in text, "an ordinary document's CDATA example was deleted"
+    assert "]]>" not in text
+    assert any(block.kind is BlockKind.CODE for block in blocks), (
+        "the example is inside <pre>, so it should still be a code block"
+    )
+
+
+async def test_script_and_style_are_decomposed_before_the_recovery_matters() -> None:
+    """The legacy ``//<![CDATA[`` idiom never reaches a reader, and that is someone else's default.
+
+    ``WebConfig.drop_tags`` decomposes ``script`` and ``style``, so the wrapper old documents put
+    around inline JavaScript is gone before anything cites it. **Asserted rather than assumed**: it
+    is a dependency on another module's default, and if that default ever changed, this recovery
+    would start surfacing script bodies as document text.
+    """
+    document = (
+        "<h2>Retry policy</h2>"
+        "<script>//<![CDATA[\nwindow.__owned=1\n//]]></script>"
+        "<style>/*<![CDATA[*/ .x{} /*]]>*/</style>"
+        "<p>The client retries twice.</p>"
+    )
+    blocks = await read_blocks(WebParser(WebConfig()), raw_of(document, MEDIA_TYPE))
+    text = "\n".join(block.text for block in blocks)
+
+    assert {"script", "style"} <= WebConfig().drop_tags, (
+        "drop_tags no longer decomposes script/style, so the CDATA recovery would surface "
+        "inline JavaScript as document text"
+    )
+    assert "window.__owned=1" not in text
+    assert ".x{}" not in text
+    assert "The client retries twice." in text

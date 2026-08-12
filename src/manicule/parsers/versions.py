@@ -72,7 +72,12 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     "adf": ParserVersions(rules="1"),
     "archive": ParserVersions(rules="1"),
     "docx": ParserVersions(rules="1", distributions=("python-docx", "lxml")),
-    "email": ParserVersions(rules="1", distributions=("selectolax",)),
+    # 1 -> 2: an HTML-only mail body's line numbers address the text
+    # `mail._html_to_text` builds from the web parser's blocks, and the web parser now
+    # recovers CDATA sections instead of deleting them — so a recovered body becomes a block
+    # and every line after it moves. Bumped even though this parser's own rules are
+    # unchanged, because what it extracts changed and `parse_fp` is what re-parses it.
+    "email": ParserVersions(rules="2", distributions=("selectolax",)),
     # 1 -> 2: CDATA sections are recovered as text rather than deleted by the HTML parser's
     # bogus-comment reparse. Every document containing one produces different text now, and
     # the bump is what re-parses them from retained bytes instead of leaving a corpus that is
