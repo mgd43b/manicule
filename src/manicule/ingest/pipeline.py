@@ -50,7 +50,7 @@ from manicule.core.errors import (
     MiddlewareViolationError,
 )
 from manicule.core.ids import content_hash, document_id
-from manicule.core.provenance import PROVENANCE_KEY, Provenance
+from manicule.core.provenance import Provenance
 from manicule.ingest.embedding import embed_chunks
 from manicule.ingest.glossary import detect_entries
 from manicule.ingest.ports import GlossaryWriter
@@ -999,27 +999,34 @@ class IngestPipeline:
         """
         keep_status = self._keeps_status(existing, result.status)
         # **The connector's own metadata reaches the document, and it is not decoration.** The
-        # chunker builds its breadcrumb from `document.metadata["ancestors"]`, so a pipeline
-        # that dropped what the connector attached to the fetched bytes would leave every
-        # breadcrumb empty — and an empty breadcrumb is not a visible failure, it is a section
-        # called "Configuration" that nobody can retrieve. Lowest precedence, so what the parse
-        # stage concluded still wins over what the source guessed.
+        # chunker builds its breadcrumb from `document.metadata["ancestors"]`, so a pipeline that
+        # dropped what the connector attached to the fetched bytes would leave every breadcrumb
+        # empty — and an empty breadcrumb is not a visible failure, it is a section called
+        # "Configuration" that nobody can retrieve.
+        #
+        # **What a connector just fetched beats what was stored last time, and the parse stage
+        # beats both.** The order used to put `existing.metadata` over `raw.metadata`, which
+        # protected accumulated per-document state at the cost of freezing everything a connector
+        # re-derives on every fetch. Two instances made the cost concrete: a source record whose
+        # version had moved, and a page's labels and content status. In each case the stored copy
+        # won, so the fact never updated and nothing looked wrong.
+        #
+        # The failure shape is what decided it. This is not a document that looks stale — it is a
+        # document that looks **freshly synced** while carrying superseded facts, because the
+        # fields that do refresh (its version token, its content hash) sit beside the ones that do
+        # not. A page archived and deprecated at the source reads as `current` for ever, and an
+        # operator filtering on that gets a retired runbook back under a version number asserting
+        # the sync is up to date.
+        #
+        # Accumulated state still survives, and for a reason that needs no special case: a key
+        # absent from `raw.metadata` overrides nothing. `annotate` writes
+        # `last_after_store_error` and `last_ingest_error`, which no connector supplies, so they
+        # are untouched by the reorder.
         metadata: Metadata = {
-            **dict(raw.metadata),
             **(existing.metadata if existing else {}),
+            **dict(raw.metadata),
             **result.metadata,
         }
-        # **The source record is this run's conclusion, so it is assigned rather than merged.**
-        # The layers above put `existing.metadata` over `raw.metadata`, which is right for
-        # accumulated per-document state and wrong for anything a connector re-derives on every
-        # fetch: under the merge alone a record read now loses to the one already stored, so a
-        # manifest edited to declare a higher source version would be found, validated, and then
-        # discarded in favour of the version it supersedes. The document would cite the old one
-        # for ever and nothing would look wrong. A connector that supplies no record leaves
-        # whatever is stored alone, so this cannot erase one either.
-        fresh = Provenance.from_metadata(raw.metadata)
-        if fresh is not None:
-            metadata[PROVENANCE_KEY] = fresh.as_metadata_value()
         if keep_status:
             # The document keeps everything a reader can see, and the failure still goes on the
             # record. It simply does not cost anybody a document that was working.

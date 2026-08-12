@@ -378,6 +378,89 @@ def _raw(metadata: Metadata) -> RawDocument:
     )
 
 
+async def test_a_connectors_mutable_facts_refresh_rather_than_freezing() -> None:
+    """Labels and a content status move at the source; the stored copy must not win.
+
+    **The second instance of one bug, and the reason the general rule changed rather than gaining
+    another exception.** The merge order used to put ``existing.metadata`` over ``raw.metadata``, so
+    anything a connector re-derives on every fetch froze at whatever was stored first. bug4 fixed
+    that narrowly, for the source record alone, by assigning it after the merge — and the narrow fix
+    is what made the remaining breakage *invisible*, because the record's version refreshed while
+    everything beside it did not.
+
+    That asymmetry is the failure, not the staleness. A page archived and deprecated at the source
+    reads as ``current`` for ever **while its version number says the sync is up to date**, so an
+    operator filtering ``content_status == "archived"`` to exclude retired runbooks gets one back,
+    ranked and plausible, carrying evidence of its own freshness.
+    """
+    connector = a_connector(metadata=a_record(version="7"))
+    connector.metadata[MIRRORED] = {
+        **a_record(version="7"),
+        "labels": ["runbook"],
+        "content_status": "current",
+    }
+    store, first = await ingest_once(connector)
+    assert first.metadata["labels"] == ["runbook"]
+    assert first.metadata["content_status"] == "current"
+
+    # The page is re-labelled and archived and its version bumps. Its bytes do not move, which is
+    # the ordinary shape of a metadata edit.
+    connector.metadata[MIRRORED] = {
+        **a_record(version="8"),
+        "labels": ["runbook", "deprecated"],
+        "content_status": "archived",
+    }
+    connector.tokens[MIRRORED] = "v8"
+    _, second = await ingest_once(connector, store)
+
+    assert second.provenance is not None
+    assert second.provenance.source is not None
+    assert second.provenance.source.version == "8", "the record refreshed, as it already did"
+    assert second.metadata["labels"] == ["runbook", "deprecated"], (
+        "labels froze at the stored copy while the version refreshed beside them — a document that "
+        "looks freshly synced and is not"
+    )
+    assert second.metadata["content_status"] == "archived", (
+        "an archived page still reads as current, so a filter meant to exclude it returns it"
+    )
+
+
+async def test_accumulated_state_no_connector_supplies_survives_a_re_ingest() -> None:
+    """The property the old order was protecting, preserved without a special case.
+
+    A key absent from ``raw.metadata`` overrides nothing, so per-document state written by
+    ``IngestStore.annotate`` — ``last_ingest_error``, ``last_after_store_error``, which no connector
+    supplies — is untouched by the reorder. This is the assertion that would have sunk the change if
+    it failed, so it is here rather than in the reasoning.
+    """
+    connector = a_connector(metadata=a_record())
+    store, first = await ingest_once(connector)
+    await store.annotate(first.id, {"last_ingest_error": {"stage": "parse", "detail": "earlier"}})
+
+    connector.documents[MIRRORED] = "The client retries three times.\n"
+    _, second = await ingest_once(connector, store)
+
+    assert second.metadata["last_ingest_error"] == {"stage": "parse", "detail": "earlier"}, (
+        "accumulated state a connector never supplies was erased by the reorder"
+    )
+
+
+async def test_the_parse_stage_still_beats_the_connector() -> None:
+    """``result.metadata`` is highest precedence, and the reorder must not have disturbed that.
+
+    What the parse stage concluded about the bytes outranks what the source guessed about them: a
+    connector's declared ``media_type`` or title is a hint, and the chain that actually read the
+    document is the authority. The reorder moved the *lower* two layers past each other and left
+    this one on top.
+    """
+    connector = a_connector(metadata={**a_record(), "parser_used": "a-connector-lie"})
+    _, document = await ingest_once(connector)
+
+    assert document.metadata["parser_used"] == "lines", (
+        "a connector overrode what the parse stage concluded; result.metadata is no longer highest"
+    )
+
+
 async def test_a_hostile_stored_record_cannot_take_over_the_citation() -> None:
     """A connector that supplies an unvalidatable record changes nothing about the citation.
 

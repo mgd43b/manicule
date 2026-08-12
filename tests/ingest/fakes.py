@@ -154,9 +154,24 @@ class MemoryIngestStore:
             )
 
     async def annotate(self, document_id: str, updates: Metadata) -> None:
-        merged = dict(self.metadata.get(document_id, {}))
+        """Merge keys into a document's metadata, as :class:`SqliteDocStore` does.
+
+        **This used to write to a side dictionary that nothing ever read**, so an annotation
+        vanished the moment it was made and any test asserting on one through this fake was
+        asserting nothing. The real store merges into ``documents.metadata`` and
+        ``rows.to_document`` reads it straight back, so a double that kept annotations somewhere
+        else diverged from the thing it stands in for on the one operation it exists to model.
+        Found while asserting that a metadata-precedence change did not erase accumulated state —
+        the assertion failed against the fake and passed against the real store.
+        """
+        merged: Metadata = dict(self.metadata.get(document_id, {}))
         merged.update(updates)
         self.metadata[document_id] = merged
+        stored = self.documents.get(document_id)
+        if stored is not None:
+            combined: Metadata = dict(stored.metadata)
+            combined.update(updates)
+            self.documents[document_id] = stored.model_copy(update={"metadata": combined})
 
     async def set_lineage(
         self,
