@@ -52,6 +52,158 @@ def _pipeline(
     )
 
 
+def _confluence_snapshot(
+    root: Path, *, page_id: str = "123456", version: int = 7, body: str | None = None
+) -> Path:
+    """One Confluence page snapshot: a manifest and a storage-format body beside it.
+
+    Synthetic throughout — the page, the space, the host and the ids are invented here.
+    """
+    from manicule.connectors.confluence_snapshot import MANIFEST_NAME  # noqa: PLC0415
+
+    directory = root / "ENG" / page_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "body.xhtml").write_text(
+        body if body is not None else "<h2>Retry policy</h2>\n<p>The client retries twice.</p>\n",
+        encoding="utf-8",
+    )
+    (directory / MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "page_id": page_id,
+                "title": "Retry policy",
+                "space_key": "ENG",
+                "canonical_url": (
+                    f"https://docs.example.test/wiki/spaces/ENG/pages/{page_id}/Retry-policy"
+                ),
+                "version": version,
+                "modified_at": "2026-03-04T05:06:07+00:00",
+                "ancestors": ["Runbooks"],
+                "retrieved_at": "2026-06-01T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return directory
+
+
+async def test_a_confluence_snapshot_cites_the_page_through_the_real_stores(
+    store: SqliteDocStore, data_dir: Path, tmp_path: Path
+) -> None:
+    """A mirrored Confluence page, end to end, over a real directory and a migrated database.
+
+    The connector's own suite stops at the bytes it hands over. This takes those bytes through the
+    real pipeline into the real SQLite store, so it is what catches the record being lost in the
+    JSON column's round trip, or the pipeline and the connector disagreeing about which field is
+    the citation.
+    """
+    from manicule.connectors.confluence_snapshot import (  # noqa: PLC0415
+        ConfluenceSnapshotConnector,
+    )
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    _confluence_snapshot(corpus)
+
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    report = await _pipeline(store, vectors).run(ConfluenceSnapshotConnector(corpus))
+
+    assert report.indexed == 1, "the manifest must not be indexed as a document of its own"
+    stored = (await store.list_documents())[0]
+
+    assert stored.source_id == "123456", "identity is the page id, not the directory"
+    assert stored.title == "Retry policy"
+    assert stored.uri == "https://docs.example.test/wiki/spaces/ENG/pages/123456/Retry-policy"
+
+    record = stored.provenance
+    assert record is not None, "the record must survive the JSON column round trip"
+    assert record.source is not None
+    assert record.source.version == "7"
+    assert record.source.section_path == ("ENG", "Runbooks")
+    assert record.snapshot is not None
+    assert record.snapshot.path == "ENG/123456/body.xhtml"
+    await vectors.teardown()
+
+
+async def test_re_exporting_a_page_at_a_higher_version_replaces_it(
+    store: SqliteDocStore, data_dir: Path, tmp_path: Path
+) -> None:
+    """One document, updated — not a second one. Over the real store, which is where it counts.
+
+    Three claims in one run, because they are one claim from three sides: the page id keys the
+    document so a re-export updates rather than duplicates; the record refreshes so the citation
+    reports the version it was just told about; and the chunks are replaced rather than accumulated,
+    which is what stops a stale half of the page staying retrievable.
+    """
+    from manicule.connectors.confluence_snapshot import (  # noqa: PLC0415
+        ConfluenceSnapshotConnector,
+    )
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    _confluence_snapshot(corpus, version=7)
+
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(store, vectors)
+    await pipeline.run(ConfluenceSnapshotConnector(corpus))
+    first = (await store.list_documents())[0]
+
+    _confluence_snapshot(
+        corpus, version=8, body="<h2>Retry policy</h2>\n<p>The client retries three times.</p>\n"
+    )
+    await pipeline.run(ConfluenceSnapshotConnector(corpus))
+
+    documents = await store.list_documents()
+    assert len(documents) == 1, "a re-export of one page is one document, not two"
+    assert documents[0].id == first.id, "and the same document, so its citations still resolve"
+    record = documents[0].provenance
+    assert record is not None
+    assert record.source is not None
+    assert record.source.version == "8"
+    chunks = await store.document_chunks(documents[0].id)
+    texts = "\n".join(chunk.text for chunk in await store.get_chunks([c.id for c in chunks]))
+    assert "three times" in texts
+    assert "retries twice" not in texts, "the superseded text must not stay retrievable"
+    await vectors.teardown()
+
+
+async def test_re_ingesting_an_unchanged_snapshot_changes_nothing(
+    store: SqliteDocStore, data_dir: Path, tmp_path: Path
+) -> None:
+    """Idempotence, and duplicate prevention, over the store that would actually duplicate.
+
+    An export re-run nightly with nothing changed must cost nothing and must not grow the corpus.
+    The chunk ids are compared rather than only counted: equal counts with different ids means every
+    vector was rewritten, which is the expensive version of the same bug.
+    """
+    from manicule.connectors.confluence_snapshot import (  # noqa: PLC0415
+        ConfluenceSnapshotConnector,
+    )
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    _confluence_snapshot(corpus)
+
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(store, vectors)
+    await pipeline.run(ConfluenceSnapshotConnector(corpus))
+    document = (await store.list_documents())[0]
+    before = [chunk.id for chunk in await store.document_chunks(document.id)]
+
+    report = await pipeline.run(ConfluenceSnapshotConnector(corpus))
+
+    assert len(await store.list_documents()) == 1
+    after = [chunk.id for chunk in await store.document_chunks(document.id)]
+    assert after == before, "an unchanged page must keep its chunk ids, and therefore its vectors"
+    assert report.skipped_version or report.skipped_hash, (
+        "an unchanged page should be skipped rather than re-parsed; neither counter moved"
+    )
+    await vectors.teardown()
+
+
 async def test_a_mirrored_page_with_a_manifest_cites_the_page_through_the_real_stores(
     store: SqliteDocStore,
     data_dir: Path,
