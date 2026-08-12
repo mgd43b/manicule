@@ -138,8 +138,43 @@ installation reports success at being broken.
   not an error. It was once accepted only *before* the command name, and after it Typer
   rejected it as an unknown option with exit status 2 — which is worth stating because the
   restriction was written up twice as though somebody had chosen it.
+- **So does `--workspace`/`-w`**, and it is the same option in both places rather than a
+  general one and a specific one. That distinction decides what happens when the two positions
+  disagree — see below.
 - **Exit status is 0 on success, 1 on a failed operation, 2 on a usage error** that Typer
   rejected before the service was reached.
+
+### Options `manicule` and its commands share
+
+Two options are declared on `manicule` itself and accepted by every command as well:
+`--json` and `--workspace`/`-w`. `--version` is deliberately **not** among them: it replaces
+the invocation rather than modifying it — eager, prints one line, exits — so
+`manicule doctor --version` would be asking for the version *of doctor*, which does not exist.
+
+That list is not maintained by hand. `tests/app/test_cli.py` reads the root callback's real
+parameters out of the built command tree and requires each one to be either shared with the
+commands or carrying a written reason for not being, so an option added later fails until
+somebody classifies it rather than quietly becoming the next thing that cannot be typed where
+people type it.
+
+**Naming a shared option in both positions at once is not an error — except when the two
+disagree.** `--json` is a flag, so saying it twice says the same thing twice and the positions
+cannot contradict each other. `--workspace` carries a value, and that value is a tenancy
+boundary:
+
+```
+$ manicule --workspace a doctor --workspace a     # fine: one workspace, said twice
+$ manicule --workspace a doctor --workspace b     # refused, exit 2, naming both
+```
+
+The refusal is deliberate and last-wins was rejected. Last-wins is defensible when two
+positions mean "general" then "specific", but by construction this is the *same* option in two
+places, so there is no specificity to appeal to. Choosing silently would run the operation in a
+workspace the operator also named, and the envelope would report the winner as though it were
+the whole request — a wrong-tenant run that reads exactly like a correct one, in a system where
+scope is an auditability property (§7) and cross-workspace access is a 5xx. Two contradictory
+instructions in one invocation is a typo, not a plan, and it is refused for the same reason
+`manicule backup --output X --restore Y` is.
 
 `start` is the one exception, and it is not a hedge: under the default stdio transport
 **stdout is the MCP protocol channel**, so an envelope written there would be a corrupt

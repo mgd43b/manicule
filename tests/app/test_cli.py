@@ -12,7 +12,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from typer._click.exceptions import NoSuchOption, UsageError
@@ -32,7 +32,7 @@ from manicule.storage.backup import BackupError
 from tests.app.fakes import FakeBackend, FakeMaintenance, make_chunk, make_document
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from manicule.app.results import Envelope
 
@@ -891,26 +891,50 @@ def test_the_derivation_covers_every_command_the_interface_offers() -> None:
     )
 
 
-def test_every_data_emitting_command_takes_json_after_the_command_name() -> None:
+SAMPLE_VALUES: dict[str, list[str]] = {"--json": [], "--workspace": ["scratch"]}
+"""Argv for each shared option, since one is a flag and the other takes a value.
+
+Keyed by the same names :data:`~manicule.cli.main.SHARED_OPTIONS` uses, and checked against it
+by :func:`test_every_shared_option_has_a_way_to_be_typed` — so an option added to that table
+without a sample here fails rather than being quietly skipped by every test below.
+"""
+
+
+def test_every_shared_option_has_a_way_to_be_typed() -> None:
+    """The parametrisation below is only as complete as this mapping.
+
+    A shared option with no entry would be silently absent from every assertion in this
+    section, which is the failure mode where coverage is reported for an option nothing typed.
+    """
+    assert set(SAMPLE_VALUES) == set(cli.SHARED_OPTIONS), (
+        "SAMPLE_VALUES and SHARED_OPTIONS have diverged, so some shared option is either "
+        "untested or tested and not declared."
+    )
+
+
+@pytest.mark.parametrize("option", sorted(cli.SHARED_OPTIONS))
+def test_every_data_emitting_command_takes_a_shared_option_after_the_command_name(
+    option: str,
+) -> None:
     """The defect: ``manicule doctor --json`` was ``No such option: --json``, exit 2.
 
-    ``--json`` was declared once, on the root callback, so it worked only in front of the
-    command name. That is the position nobody types first, and the restriction had already been
-    written up twice as though it were a decision — once by correcting the example in
-    ``docs/surfaces.md`` that used the natural order, and once by describing the rule in the
-    README.
+    Both shared options were declared once, on the root callback, so each worked only in front
+    of the command name. That is the position nobody types first, and for ``--json`` the
+    restriction had been written up twice as though it were a decision — once by correcting the
+    example in ``docs/surfaces.md`` that used the natural order, and once by describing the rule
+    in the README.
 
-    Asserted for every command rather than for ``doctor``, because a fix that special-cased the
-    command in the bug report would leave the same trap on the other thirty.
+    Asserted for every command and every shared option rather than for the one in the bug
+    report, because a fix that special-cased either leaves the same trap everywhere else.
     """
     for path, command in sorted(_data_emitting_commands().items()):
         try:
-            _parse(command, path[-1], ["--json"])
+            _parse(command, path[-1], [option, *SAMPLE_VALUES[option]])
         except NoSuchOption as unknown:  # pragma: no cover - the assertion is the report
             pytest.fail(
-                f"`manicule {' '.join(path)} --json` is rejected: {unknown.option_name} is not "
-                f"an option of this command. --json has to work on either side of the command "
-                f"name."
+                f"`manicule {' '.join(path)} {option}` is rejected: {unknown.option_name} is "
+                f"not an option of this command. {option} has to work on either side of the "
+                f"command name."
             )
         except UsageError:
             # A required argument this parse did not supply. A different failure entirely, and
@@ -918,20 +942,100 @@ def test_every_data_emitting_command_takes_json_after_the_command_name() -> None
             continue
 
 
-def test_every_data_emitting_command_still_takes_json_before_the_command_name() -> None:
+@pytest.mark.parametrize("option", sorted(cli.SHARED_OPTIONS))
+def test_every_data_emitting_command_still_takes_a_shared_option_before_the_command_name(
+    option: str,
+) -> None:
     """The documented position, which the fix must not have traded away.
 
     ``manicule --json <command>`` is in the README, in ``docs/deployment.md``'s health-gate
-    recipe and in every envelope-parity assertion. Moving the option rather than sharing it
+    recipe and in every envelope-parity assertion. Moving an option rather than sharing it
     would have broken all three while making the reported bug go away.
     """
     for path in sorted(_data_emitting_commands()):
         # `--help` stops the run at the point this test is about, so `start` and `stop` can be
         # asserted alongside the rest without one of them binding a socket.
-        result = run(["--json", *path, "--help"])
+        result = run([option, *SAMPLE_VALUES[option], *path, "--help"])
         assert result.exit_code == 0, (
-            f"`manicule --json {' '.join(path)}` no longer parses: {result.output}"
+            f"`manicule {option} {' '.join(path)}` no longer parses: {result.output}"
         )
+
+
+ROOT_ONLY_OPTIONS: dict[str, str] = {
+    "--version": (
+        "replaces the invocation rather than modifying it: eager, prints one line and exits "
+        "before any command runs. `manicule doctor --version` would be asking for the version "
+        "*of doctor*, which is not a thing that exists, and thirty-one ways to ask one "
+        "question is not a fix."
+    ),
+}
+"""Root options deliberately **not** shared with the commands, and why for each.
+
+A reason per entry rather than a bare list, because "this one is different" is a claim that
+needs stating: the next reader has to be able to tell a decision from an oversight, and that is
+exactly what could not be told about ``--json`` — its restriction was written up in the README
+as though somebody had chosen it, and nobody had.
+"""
+
+
+def _root_option_names() -> set[str]:
+    """The long name of every option ``manicule`` itself declares, from the built tree."""
+    from typer.main import get_command  # noqa: PLC0415 - only this derivation builds the tree
+
+    root = get_command(cli.app)
+    # The longest spelling, so `--workspace`/`-w` is keyed by the name the tables use.
+    return {max(option.opts, key=len) for option in root.params}
+
+
+def test_every_root_option_is_either_shared_with_the_commands_or_deliberately_not() -> None:
+    """The accounting that stops this defect recurring under a different option's name.
+
+    ``--json`` and ``--workspace`` were the same bug twice: an option declared on the root
+    callback alone, so it could not be typed where people type it. Fixing the second without
+    this test would leave the door open for a third, and the third would be found the same way
+    the first two were — by somebody hitting it.
+
+    So the root callback's **real** parameters are read from the built tree and every one must
+    be accounted for: either it is shared with the commands, or it carries a written reason for
+    not being. An option added tomorrow belongs to neither set and fails here, which forces
+    whoever adds it to decide rather than to default into the trap.
+
+    Asserted as set equality in both directions. "A root option nobody classified" and "a
+    classification for an option that no longer exists" are different mistakes — the second is
+    what is left behind when an option is removed — and one message for both would describe
+    neither.
+    """
+    declared = _root_option_names()
+    classified = set(cli.SHARED_OPTIONS) | set(ROOT_ONLY_OPTIONS)
+
+    unclassified = sorted(declared - classified)
+    assert unclassified == [], (
+        f"manicule declares {unclassified}, which is neither shared with the commands nor "
+        f"listed as deliberately root-only. Decide which it is: if it modifies the operation, "
+        f"add it to SHARED_OPTIONS in manicule.cli.main; if it replaces the invocation, add it "
+        f"to ROOT_ONLY_OPTIONS here with the reason."
+    )
+    stale = sorted(classified - declared)
+    assert stale == [], (
+        f"{stale} is classified here but the root callback no longer declares it. Either the "
+        f"option was removed and its entry was not, or it has been renamed."
+    )
+    assert all(ROOT_ONLY_OPTIONS.values()), "a root-only option with no reason is an oversight"
+
+
+def test_the_root_option_derivation_reads_the_real_command_line() -> None:
+    """The floor under the accounting above, which is vacuous over an empty set.
+
+    ``--version`` is the landmark: it is the one root option that is *not* shared, so a
+    derivation returning only the shared ones would satisfy the equality above while proving
+    nothing about the case the exclusion list exists for.
+    """
+    declared = _root_option_names()
+    assert "--version" in declared, "the derivation is not reading manicule's own options"
+    assert set(cli.SHARED_OPTIONS) <= declared, (
+        "a shared option is not declared on the root callback at all, so the two positions "
+        "cannot be the same option"
+    )
 
 
 def test_an_unknown_option_is_still_rejected_by_every_one_of_those_commands() -> None:
@@ -1237,3 +1341,142 @@ def test_starting_still_announces_where_it_is_listening(
 
     assert "HTTP API on http://127.0.0.1:8765" in out
     assert "API documentation" in out
+
+
+# --- --workspace, which carries a value and so can contradict itself -------------------------
+
+
+def _run_recording_workspace(argv: list[str]) -> tuple[Any, str | None]:
+    """Run one invocation and report which workspace the runtime would have been opened for.
+
+    Read at the **override** rather than at the exit status. An option that parses, renders and
+    exits zero while never arriving looks exactly like one that works — the ``#60``
+    ``--allow-insecure-target`` defect — and for a *tenancy* option that failure mode would run
+    the operation against the wrong tenant while reporting success, which is the one outcome
+    worth the most to catch.
+
+    ``STATE`` is put back afterwards. The root callback resets it at the start of every real
+    invocation, so this matters only for whatever runs next in the same process.
+    """
+    was_workspace, was_overrides = cli.STATE.workspace, dict(cli.STATE.overrides)
+    cli.STATE.workspace = None
+    cli.STATE.overrides = {}
+    try:
+        result = run(argv)
+        return result, cli.STATE.overrides.get("workspace")
+    finally:
+        cli.STATE.workspace = was_workspace
+        cli.STATE.overrides = was_overrides
+
+
+def _asked_workspace(argv: list[str]) -> str | None:
+    """The workspace one successful invocation would have run in."""
+    result, workspace = _run_recording_workspace(argv)
+    assert result.exit_code == 0, f"{argv} did not run: {result.output}"
+    return workspace
+
+
+def test_a_workspace_named_after_the_command_reaches_the_runtime(
+    bound: ApplicationService,
+) -> None:
+    """The defect: ``manicule doctor --workspace other`` was exit 2, an unknown option.
+
+    The same shape as ``--json``'s, one option along, and the reason it is worth fixing rather
+    than documenting: the position people type is the position that failed.
+    """
+    del bound
+    assert _asked_workspace(["doctor", "--workspace", "other"]) == "other"
+
+
+def test_the_short_form_reaches_the_runtime_too(bound: ApplicationService) -> None:
+    """``-w`` is half the option's interface, and an operator who learned it expects it here."""
+    del bound
+    assert _asked_workspace(["doctor", "-w", "other"]) == "other"
+
+
+def test_a_workspace_named_before_the_command_still_reaches_the_runtime(
+    bound: ApplicationService,
+) -> None:
+    """The documented position. Sharing the option must not have moved it."""
+    del bound
+    assert _asked_workspace(["--workspace", "other", "doctor"]) == "other"
+
+
+def test_naming_the_same_workspace_in_both_positions_is_accepted(
+    bound: ApplicationService,
+) -> None:
+    """Saying the same thing twice is not a contradiction.
+
+    This is the case that makes ``--json`` twice acceptable, and it arrives the same way: a
+    script that already passes the option, and somebody adding it at the other end. Refusing it
+    would be a usage error over an unambiguous request.
+    """
+    del bound
+    assert _asked_workspace(["--workspace", "same", "doctor", "--workspace", "same"]) == "same"
+
+
+@pytest.mark.parametrize("second", ["--workspace", "-w"])
+def test_naming_two_different_workspaces_is_refused_rather_than_resolved(
+    bound: ApplicationService, second: str
+) -> None:
+    """The decision this option needed and ``--json`` did not.
+
+    A flag cannot disagree with itself; a value can. Last-wins would be defensible if the two
+    positions meant "general" then "specific", but by construction this is the same option in
+    two places, so there is nothing to appeal to — and picking one silently would run the
+    operation in a workspace the operator also named, with the envelope reporting the winner as
+    though it were the request. A wrong-tenant run that looks exactly like a correct one is the
+    worst outcome available here.
+
+    Asserted through both spellings, because ``-w`` reaching a different code path than
+    ``--workspace`` is precisely how a refusal ends up half-implemented.
+    """
+    del bound
+    result, recorded = _run_recording_workspace(
+        ["--workspace", "tenant-a", "doctor", second, "tenant-b"]
+    )
+
+    assert result.exit_code == 2, "a contradiction has to be a usage error, not a run"
+    assert recorded != "tenant-b", "the second workspace was recorded despite the refusal"
+
+
+def test_the_refusal_names_both_workspaces_so_the_typo_is_visible() -> None:
+    """ "You gave it twice" without the values sends somebody to re-read their own shell history.
+
+    Asserted against the message constant rather than the rendered box, which wraps, colours
+    and elides differently on every machine.
+    """
+    message = cli.WORKSPACE_NAMED_TWICE.format(before="tenant-a", after="tenant-b")
+    assert "tenant-a" in message
+    assert "tenant-b" in message
+    assert "--workspace" in message
+
+
+def test_recording_a_workspace_keeps_any_other_override_already_set() -> None:
+    """The bag of overrides is splatted into ``Runtime.open``, so it can hold more than one key.
+
+    Nothing else puts a key in it today, which is exactly why this is worth pinning: the next
+    value-carrying shared option will be written by analogy with ``_accept_workspace``, and a
+    line that *replaces* the bag rather than adding to it would drop the workspace on the way
+    past — silently, and only for the invocations that used both.
+
+    Driven through the option's own callback, taken from the shared table rather than imported
+    by name — so it is the function the command line actually reaches, not one that merely
+    still exists. There is no argv that produces a second override today, and inventing a
+    command-line spelling to reach it would be testing something this change did not add.
+    """
+    recorder = cli.SHARED_OPTIONS["--workspace"]().callback
+    assert recorder is not None, "--workspace records nothing, so it reaches nothing"
+    record = cast("Callable[[object, object, str | None], object]", recorder)
+
+    was = dict(cli.STATE.overrides)
+    try:
+        cli.STATE.workspace = None
+        cli.STATE.overrides = {"already": "set"}
+
+        record(None, None, "other")
+
+        assert cli.STATE.overrides == {"already": "set", "workspace": "other"}
+    finally:
+        cli.STATE.workspace = None
+        cli.STATE.overrides = was
