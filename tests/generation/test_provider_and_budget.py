@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator, Sequence
-from typing import Any, override
+from collections.abc import AsyncIterator, Callable, Sequence
+from typing import Any, cast, override
 
 import litellm
 import pytest
@@ -219,24 +219,67 @@ def test_importing_the_provider_library_does_not_fetch_a_model_table(
     library, rather than through the importer directly: what has to hold is that *reaching*
     the library sets this, and a test that called the importer would keep passing if a caller
     grew its own ``import litellm``.
+
+    **The variable is asserted and then spent**, because a variable is a claim and this is
+    about a network call. The library's own resolver is invoked afterwards with its fetch
+    replaced by a recorder: it must return a populated table having reached for nothing. By
+    the time this module is imported the real import has already happened, so the resolver is
+    the only place left in-process where the mechanism can actually be watched.
     """
     monkeypatch.delenv(LOCAL_COST_MAP_ENV, raising=False)
 
     error_table()
 
     assert os.environ[LOCAL_COST_MAP_ENV] == "True"
+    fetched, table = _resolve_model_cost_map(monkeypatch)
+    assert fetched == []
+    assert table
 
 
 def test_an_operator_who_wants_the_live_model_table_keeps_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A default is not a policy. Somebody running hosted models against new releases has a
-    reason to want the current table, and setting the variable is how they say so."""
+    reason to want the current table, and setting the variable is how they say so.
+
+    Asserted through the resolver for the same reason as above: what matters is that the fetch
+    is back, not that a string was left alone.
+    """
     monkeypatch.setenv(LOCAL_COST_MAP_ENV, "False")
 
     error_table()
 
     assert os.environ[LOCAL_COST_MAP_ENV] == "False"
+    fetched, _ = _resolve_model_cost_map(monkeypatch)
+    assert fetched == [_COST_MAP_URL]
+
+
+_COST_MAP_URL = "https://manicule-tests.invalid/model_prices.json"
+
+
+def _resolve_model_cost_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], dict[str, Any]]:
+    """Run the library's own cost-map resolver, recording any remote fetch it attempts.
+
+    The recorder raises rather than returning a table, so a fetch that does happen is visible
+    as an attempt *and* leaves the resolver on its documented fallback — this must never turn
+    into a test that reaches raw.githubusercontent.com for real.
+    """
+    from litellm.litellm_core_utils import get_model_cost_map as resolver  # noqa: PLC0415
+
+    attempted: list[str] = []
+
+    def watch(url: str) -> dict[str, Any]:
+        attempted.append(url)
+        msg = "this test does not fetch a model table"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(resolver.GetModelCostMap, "fetch_remote_model_cost_map", watch)
+    # The library ships no type information for this function, so its `dict` is an Unknown
+    # that would spread into the caller. Declared here, where it is one line.
+    resolve = cast("Callable[[str], dict[str, Any]]", resolver.get_model_cost_map)  # pyright: ignore[reportUnknownMemberType]
+    return attempted, resolve(_COST_MAP_URL)
 
 
 def test_the_mapping_table_is_ordered_most_specific_first() -> None:

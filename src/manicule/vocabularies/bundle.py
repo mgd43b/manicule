@@ -239,6 +239,11 @@ class VocabularyBundle:
                 partial = Path(handle.name)
             try:
                 partial.write_bytes(self._verified_bytes(url))
+                # The bundle's own mode, not the temporary file's. `NamedTemporaryFile` creates
+                # `0600`, which would make a cache seeded by one account unreadable to every
+                # other — and a shared read-only cache is a deployment this bundle is meant to
+                # support. What the operator gave the bundle is what the cache gets.
+                shutil.copymode(self.path_for(url), partial)
                 partial.replace(destination)
             finally:
                 partial.unlink(missing_ok=True)

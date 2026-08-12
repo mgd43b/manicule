@@ -429,11 +429,19 @@ def prefetch(encodings: Sequence[str], *, bundle_dir: Path | None = None) -> tup
 
 
 def _fetch(encoding: str, bundle_dir: Path | None) -> None:
-    """Let ``tiktoken`` download ``encoding``, and report a failure in terms of the fix."""
+    """Let ``tiktoken`` download ``encoding``, and report a failure in terms of the fix.
+
+    Under :data:`_lock` even though nothing here replaces the loader, because something else
+    might be: a :func:`load_encoding` on another thread shuts the door for the duration of its
+    call, and a download that happened to be in flight would find it shut and report a missing
+    vocabulary it was in the middle of fetching. The lock is what keeps the one function
+    allowed to use the network and the one function that forbids it from overlapping.
+    """
     import tiktoken  # noqa: PLC0415 - a retrieval extra, deliberately deferred
 
     try:
-        tiktoken.get_encoding(encoding)
+        with _lock:
+            tiktoken.get_encoding(encoding)
     except Exception as exc:
         # Deliberately broad. The ways this fails span three libraries and no common base:
         # `requests` raises its own hierarchy for a refused connection, a proxy and a TLS
