@@ -17,7 +17,9 @@ matters, and that is what :func:`snapshot` adds.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+import os
+from collections.abc import Generator, Sequence
 from pathlib import Path
 
 from manicule.core.errors import ManiculeError
@@ -65,13 +67,70 @@ def snapshot(repo: str, patterns: Sequence[str], revision: str | None = None) ->
     from huggingface_hub import snapshot_download  # noqa: PLC0415 - kept out of import time
 
     try:
-        return Path(snapshot_download(repo, revision=revision, allow_patterns=list(patterns)))
+        with _progress_worth_showing(repo, patterns, revision):
+            return Path(snapshot_download(repo, revision=revision, allow_patterns=list(patterns)))
     except Exception as exc:
         # Deliberately broad, for the reason the vocabulary pre-seed gives: the ways this
         # fails span the hub's own hierarchy, `requests`, and the filesystem, with no common
         # base. Enumerating them means the one that was left out escapes as a library
         # traceback in the middle of a query, which is the thing being fixed.
         raise ModelUnavailableError(_unavailable(repo, patterns, exc)) from exc
+
+
+PROGRESS_ENV = "HF_HUB_DISABLE_PROGRESS_BARS"
+"""The hub's own switch for its progress bars.
+
+Read, never written. **The variable is consulted at import time**, into a module constant, so
+setting it after ``huggingface_hub`` has been imported changes nothing at all — which is the
+first thing this function was written to do, and it silently did not work. It is read here so
+that an installation which set it deliberately — a CI job capturing logs, a container — is
+left alone rather than having its choice toggled underneath it.
+"""
+
+
+@contextlib.contextmanager
+def _progress_worth_showing(
+    repo: str, patterns: Sequence[str], revision: str | None
+) -> Generator[None]:
+    """Let the hub draw its progress bars only when there is progress to draw.
+
+    ``snapshot_download`` prints ``Fetching N files`` whether or not it fetches anything, so
+    every command that builds an embedder opened with two progress bars — on a warm machine,
+    two bars that complete instantly and report a download that did not happen. Before every
+    ``search``, for ever.
+
+    **Silencing them outright would have been wrong**, and the reason is the case they were
+    covering: a first ``index`` really does move over a gigabyte, and a bar is how somebody
+    knows the process is alive rather than wedged. So the question is not "bars or no bars" but
+    "is anything being downloaded", which :func:`is_cached` answers from disk. Cached, and the
+    bars say nothing worth two lines; not cached, and they are the only thing on screen for a
+    minute or more.
+
+    Done through ``disable_progress_bars``/``enable_progress_bars`` rather than the
+    environment: :data:`PROGRESS_ENV` is read once at import, so assigning it here would be a
+    line that looks like it works and does nothing. An operator who set it is left alone.
+    """
+    # From `utils.tqdm` rather than the `utils` package: the re-export is not in the
+    # package's `__all__`, so importing it from there is a private import a type checker is
+    # right to object to.
+    from huggingface_hub.utils.tqdm import (  # noqa: PLC0415 - kept out of import time
+        are_progress_bars_disabled,
+        disable_progress_bars,
+        enable_progress_bars,
+    )
+
+    if (
+        PROGRESS_ENV in os.environ
+        or are_progress_bars_disabled()
+        or not is_cached(repo, patterns, revision)
+    ):
+        yield
+        return
+    disable_progress_bars()
+    try:
+        yield
+    finally:
+        enable_progress_bars()
 
 
 def is_cached(repo: str, patterns: Sequence[str], revision: str | None = None) -> bool:
@@ -124,4 +183,4 @@ def _unavailable(repo: str, patterns: Sequence[str], exc: Exception) -> str:
     )
 
 
-__all__ = ["OFFLINE_ENV", "ModelUnavailableError", "is_cached", "snapshot"]
+__all__ = ["OFFLINE_ENV", "PROGRESS_ENV", "ModelUnavailableError", "is_cached", "snapshot"]

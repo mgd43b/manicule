@@ -28,6 +28,7 @@ __all__ = [
     "model_cache",
     "settings",
     "store",
+    "vocabulary_cache",
 ]
 
 
@@ -78,6 +79,29 @@ def grammar_cache() -> None:
     from manicule.parsers import grammars  # noqa: PLC0415 - a parsing extra, not core
 
     grammars.configure_pack(grammars.DECLARED_LANGUAGES)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def vocabulary_cache() -> None:
+    """Pin the tiktoken vocabulary cache to this machine's real one, for the whole session.
+
+    The third instance of the hazard ``model_cache`` and ``grammar_cache`` above describe, and
+    it only became one when the vocabulary cache stopped living in the system temporary
+    directory. While it did, ``manicule_environment``'s redirected ``XDG_CACHE_HOME`` could
+    not hide it — the cache was somewhere no test fixture had any reason to move. Now that the
+    default is durable, and therefore *under* the directory every test redirects, a per-test
+    cache is empty by construction and the whole offline-bundle suite skips on a machine where
+    the vocabularies are sitting right there.
+
+    Session-scoped and autouse, so it runs while the environment is still the real one and the
+    path captured is the real cache. Written into ``TIKTOKEN_CACHE_DIR`` rather than restored
+    per test, because that variable is what both ``tiktoken`` and
+    ``manicule.vocabularies.cache_directory`` consult first, so one assignment makes every
+    later resolution agree.
+    """
+    from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra, not core
+
+    os.environ[vocabularies.CACHE_DIR_ENV] = str(vocabularies.cache_directory())
 
 
 @pytest.fixture(scope="session")

@@ -58,11 +58,12 @@ fingerprint in every index to record something the version already implies.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import tempfile
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -83,8 +84,11 @@ __all__ = [
     "cache_directory",
     "cache_key",
     "cache_path",
+    "default_cache_directory",
+    "is_impermanent",
     "load_encoding",
     "missing_vocabularies",
+    "pointed_at_the_cache",
     "prefetch",
     "required_encodings",
     "tiktoken_version",
@@ -97,11 +101,13 @@ Read here rather than set, for the same reason :mod:`manicule.parsers.grammars` 
 pack's manifest variable: it is upstream's hook, and an installation that has already pointed
 it somewhere — a container image, a shared read-only mount — meant it.
 
-An install that sets neither this nor :data:`LEGACY_CACHE_DIR_ENV` gets a directory under the
-system temporary directory, which is where ``tiktoken`` puts it and is **not** a durable
-place. ``docs/deployment.md`` says to set this on any host that pre-seeds, because a temp
-sweep that removes 5 MB of vocabulary turns a working air-gapped install back into a broken
-one at the next question.
+An install that sets neither this nor :data:`LEGACY_CACHE_DIR_ENV` gets
+:func:`default_cache_directory`, which is under manicule's own cache directory. It used to get
+``tiktoken``'s default — the system temporary directory — and that is **not** a durable place:
+a temp sweep removing 5 MB of vocabulary turns a working install into one that refuses every
+question, weeks later, with nothing having changed. Setting this is still how a deployment
+moves the cache somewhere of its own choosing, such as a read-only mount shared between
+containers.
 """
 
 LEGACY_CACHE_DIR_ENV: Final = "DATA_GYM_CACHE_DIR"
@@ -113,7 +119,12 @@ seeds a directory nothing reads, reports success, and leaves the fetch exactly w
 """
 
 CACHE_DIR_NAME: Final = "data-gym-cache"
-"""``tiktoken``'s subdirectory under the system temporary directory, when nothing is set."""
+"""The cache subdirectory's name.
+
+``tiktoken``'s own, kept rather than renamed: an operator who already has a populated
+``data-gym-cache`` can point :data:`CACHE_DIR_ENV` at its parent and be understood, and the
+name is what upstream's own documentation calls it. Only the *parent* moved — see
+:func:`default_cache_directory`."""
 
 
 class VocabularyUnavailableError(ManiculeError):
@@ -216,19 +227,108 @@ def cache_key(url: str) -> str:
     return hashlib.sha1(url.encode(), usedforsecurity=False).hexdigest()
 
 
+def default_cache_directory() -> Path:
+    """Where manicule keeps vocabularies when nobody has said otherwise. **Durable.**
+
+    ``tiktoken``'s own default is :data:`CACHE_DIR_NAME` under the system temporary directory,
+    and this module's opening paragraphs already name the consequence: "a fetch that is merely
+    discouraged still happens on the first machine whose cache was cleared by a temp sweep".
+    With the door to the network shut — which is move 3, and the point of the module — a temp
+    sweep does not cause a fetch. It causes a **refusal**, weeks after a successful install, on
+    a machine nobody has touched. macOS reclaims ``$TMPDIR`` on a schedule; the pre-seed that
+    ``manicule init`` runs, and reports ``ok``, lands there by default.
+
+    So the default moves into manicule's own cache directory, which is where regenerable
+    artifacts live and which nothing reclaims on a timer. Both environment variables still win,
+    unchanged: an install that has pointed ``tiktoken`` somewhere meant it, and this is a
+    default rather than an override.
+
+    Resolved through :func:`~manicule.config.settings.default_cache_dir` rather than a
+    configured ``cache_dir``, and the difference is worth stating: this is called from the
+    query path, which has no configuration in hand, and a cache whose location depended on
+    which caller asked would be a cache the pre-seed and the query disagreed about. An install
+    that has moved ``cache_dir`` and wants its vocabularies to follow sets
+    :data:`CACHE_DIR_ENV`, which is upstream's hook and is what ``docs/deployment.md`` already
+    documents as the way to move this.
+    """
+    from manicule.config.settings import default_cache_dir  # noqa: PLC0415 - avoids a cycle
+
+    return default_cache_dir() / CACHE_DIR_NAME
+
+
 def cache_directory() -> Path:
     """Where ``tiktoken`` reads and writes vocabularies for this process.
 
-    Upstream's resolution order, and the reason it is reproduced rather than read: there is no
-    ``tiktoken.cache_dir()``. Getting it wrong is silent — a pre-seed writes 5 MB into a
-    directory nothing consults and reports success — which is why it is a test's job to keep
-    this honest rather than a comment's.
+    Upstream's resolution order for the two variables, and the reason it is reproduced rather
+    than read: there is no ``tiktoken.cache_dir()``. Getting it wrong is silent — a pre-seed
+    writes 5 MB into a directory nothing consults and reports success — which is why it is a
+    test's job to keep this honest rather than a comment's.
+
+    The fallback is :func:`default_cache_directory` rather than upstream's temp directory, and
+    :func:`pointed_at_the_cache` is what makes ``tiktoken`` agree with the answer given here.
     """
     for variable in (CACHE_DIR_ENV, LEGACY_CACHE_DIR_ENV):
         configured = os.environ.get(variable)
         if configured:
             return Path(configured)
-    return Path(tempfile.gettempdir()) / CACHE_DIR_NAME
+    return default_cache_directory()
+
+
+def is_impermanent(directory: Path) -> bool:
+    """Whether ``directory`` sits under the system temporary directory.
+
+    Asked so that ``doctor`` can say so. Reaching this is a deliberate act now — somebody
+    pointed :data:`CACHE_DIR_ENV` at a temp path — but a check reporting ``ok`` about a
+    location the operating system reclaims would be a check whose name outruns what it
+    verifies, which is the failure this whole module exists to close.
+    """
+    temporary = Path(tempfile.gettempdir()).resolve()
+    try:
+        resolved = directory.resolve()
+    except OSError:  # pragma: no cover - a path that will not resolve is not a temp path
+        return False
+    return resolved == temporary or temporary in resolved.parents
+
+
+@contextlib.contextmanager
+def pointed_at_the_cache(*, create: bool = False) -> Generator[None]:
+    """Make ``tiktoken`` read the directory :func:`cache_directory` names, for the duration.
+
+    **Necessary because ``tiktoken`` is the reader.** It resolves its cache from the
+    environment inside ``read_file_cached``, so a manicule that merely *returned* a durable
+    path would seed one directory and leave the library looking in another — the silent
+    failure :func:`cache_directory` warns about, reintroduced by the fix for it.
+
+    Scoped to the call rather than set once at import, for the reason every side effect in this
+    package is scoped: a module that rewrites the environment when it is imported changes the
+    behaviour of a process that merely mentioned it. Set only when neither variable is already
+    present, so an operator's own choice is never disturbed and never restored to something
+    they did not set.
+
+    **Under :data:`_lock`, because the environment is process-global.** Two threads reporting
+    on the cache at once — which is what a health page does under any concurrency at all —
+    would otherwise have the first one's ``pop`` land while the second is still inside, and
+    ``tiktoken`` would resolve a different directory mid-call. The lock is re-entrant, so the
+    :func:`load_encoding` path that already holds it nests without deadlocking.
+
+    Args:
+        create: Whether to make the directory. ``False`` for the read paths, so that a
+            ``doctor`` that merely *reports* on the cache does not bring one into existence —
+            those checks write to the machine only under ``--fix``, and a diagnostic with a
+            side effect is what this package's docstrings keep objecting to.
+    """
+    if os.environ.get(CACHE_DIR_ENV) or os.environ.get(LEGACY_CACHE_DIR_ENV):
+        yield
+        return
+    directory = default_cache_directory()
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    with _lock:
+        os.environ[CACHE_DIR_ENV] = str(directory)
+        try:
+            yield
+        finally:
+            os.environ.pop(CACHE_DIR_ENV, None)
 
 
 def cache_path(url: str) -> Path:
@@ -384,10 +484,11 @@ def missing_vocabularies(encodings: Sequence[str]) -> tuple[str, ...]:
     ``tiktoken`` will accept.
     """
     absent: list[str] = []
-    for encoding in sorted(set(encodings)):
-        blobs = blobs_for(encoding)
-        if not blobs or any(not _cached(blob) for blob in blobs):
-            absent.append(encoding)
+    with pointed_at_the_cache():
+        for encoding in sorted(set(encodings)):
+            blobs = blobs_for(encoding)
+            if not blobs or any(not _cached(blob) for blob in blobs):
+                absent.append(encoding)
     return tuple(absent)
 
 
@@ -417,7 +518,7 @@ def load_encoding(encoding: str) -> Encoding:
     def refuse(blobpath: str) -> bytes:
         raise VocabularyUnavailableError(_unavailable(encoding, blobpath))
 
-    with _lock:
+    with _lock, pointed_at_the_cache():
         original = loader.read_file
         loader.read_file = refuse
         try:
@@ -452,6 +553,18 @@ def prefetch(encodings: Sequence[str], *, bundle_dir: Path | None = None) -> tup
             store, a digest that did not match — **or it was obtained and is still not in the
             cache**, which is checked rather than assumed. See below.
     """
+    # The whole body, so that `tiktoken`'s own writes land where this module says the cache
+    # is — and so that they *land*. `read_file_cached` swallows every `OSError` from its write
+    # when the cache directory was not named by an environment variable, which means an unset
+    # variable makes caching best-effort: a fetch can succeed, return a working encoding, and
+    # leave the cache empty. Pointing the variable turns that into an error the check below
+    # can see.
+    with pointed_at_the_cache(create=True):
+        return _seed(encodings, bundle_dir)
+
+
+def _seed(encodings: Sequence[str], bundle_dir: Path | None) -> tuple[str, ...]:
+    """The body of :func:`prefetch`, with the cache directory already pointed at."""
     from manicule.vocabularies import bundle as bundles  # noqa: PLC0415 - lazy, see docstring
 
     wanted = sorted(set(encodings))

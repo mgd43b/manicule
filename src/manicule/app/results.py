@@ -177,6 +177,7 @@ class AnswerResultPayload(Payload):
     dropped: int = Field(default=0, ge=0)
     confidence: float | None = None
     confidence_band: str | None = None
+    confidence_reason: str = ""
     corpus_consulted: bool = True
     ungrounded: bool = False
     context_truncated: bool = False
