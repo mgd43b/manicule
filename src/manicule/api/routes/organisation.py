@@ -18,7 +18,12 @@ from fastapi import APIRouter, Query, Response
 
 from manicule.api.context import Service
 from manicule.api.envelopes import respond
-from manicule.api.models import CollectionBody, TagBody
+from manicule.api.models import (
+    CollectionBody,
+    CollectionNameBody,
+    CollectionUpdateBody,
+    TagBody,
+)
 from manicule.api.security import MemberPrincipal, ViewerPrincipal
 
 router = APIRouter(prefix="/api/v1", tags=["collections", "tags"])
@@ -67,6 +72,63 @@ async def collection_documents(
         "collection_documents",
         service,
         lambda: service.collection_documents(collection_id, limit=limit, offset=offset),
+    )
+
+
+@router.get(
+    "/collections/{collection_id}/counts",
+    name="collection_counts",
+    summary="A collection's document and chunk counts.",
+)
+async def collection_counts(
+    service: Service, caller: ViewerPrincipal, collection_id: str
+) -> Response:
+    """Counted on the call, not remembered.
+
+    A rule-driven collection has no materialised membership to keep a total for, so a stored
+    number would be the answer to the day it was written.
+    """
+    del caller
+    return await respond(
+        "collection_counts", service, lambda: service.collection_counts(collection_id)
+    )
+
+
+@router.patch(
+    "/collections/{collection_id}",
+    name="collection_update",
+    summary="Change a collection's description.",
+)
+async def update_collection(
+    service: Service, caller: MemberPrincipal, collection_id: str, body: CollectionUpdateBody
+) -> Response:
+    """Membership is untouched, and nothing is re-indexed."""
+    del caller
+    return await respond(
+        "collection_update",
+        service,
+        lambda: service.collection_update(collection_id, description=body.description),
+    )
+
+
+@router.post(
+    "/collections/{collection_id}/name",
+    name="collection_rename",
+    summary="Rename a collection.",
+)
+async def rename_collection(
+    service: Service, caller: MemberPrincipal, collection_id: str, body: CollectionNameBody
+) -> Response:
+    """A name is a label on a row: no document moves and nothing is re-embedded.
+
+    Its own route rather than a field on the ``PATCH`` above, because renaming can fail in a
+    way describing cannot — the name may already be in use — and one route returning either
+    a 409 or a 200 depending on which field was present is a route a caller cannot reason
+    about from its status code.
+    """
+    del caller
+    return await respond(
+        "collection_rename", service, lambda: service.collection_rename(collection_id, body.name)
     )
 
 

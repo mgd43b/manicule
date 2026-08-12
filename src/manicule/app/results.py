@@ -203,6 +203,15 @@ class SearchResult(Payload):
     truncated: bool = False
     elapsed_ms: int = Field(default=0, ge=0)
 
+    collections: tuple[str, ...] = ()
+    """The collections this search was restricted to, named as the caller named them.
+
+    Empty means the search was not restricted to any, which is a different claim from a
+    restriction that matched nothing — that one comes back as zero hits with the scope still
+    reported here. Without it a scoped search and a workspace-wide search that happened to
+    return the same passages are indistinguishable in a log.
+    """
+
 
 class AnswerCitation(Anchored):
     """A citation the answer carries, after verification."""
@@ -465,6 +474,33 @@ class CollectionDeleted(Payload):
 
     collection_id: str
     deleted: bool
+
+
+class CollectionCounts(Payload):
+    """How much is in a collection, counted now rather than remembered.
+
+    Both numbers are live. A rule-driven collection has no stored membership to count, so a
+    remembered total would be a number that was true on the day it was written and goes on
+    being reported afterwards.
+    """
+
+    collection_id: str
+    name: str
+    documents: int = Field(ge=0)
+    chunks: int = Field(ge=0)
+
+
+class CollectionOrphans(Payload):
+    """Live documents belonging to no collection, and what was done about them.
+
+    ``deleted`` is false for the report, which is what a run produces unless deletion was
+    asked for by name. Deletion is into the trash, so ``document_ids`` names documents that
+    can still be restored rather than documents that are gone.
+    """
+
+    count: int = Field(ge=0)
+    deleted: bool = False
+    document_ids: tuple[str, ...] = ()
 
 
 class TagSummary(Payload):
