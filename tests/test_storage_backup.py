@@ -261,16 +261,21 @@ async def test_an_exposed_target_is_written_when_it_is_asked_for_in_so_many_word
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX modes are what is being checked")
-async def test_a_refused_target_that_manicule_created_is_not_left_behind(
+async def test_a_target_manicule_creates_for_itself_is_not_readable_by_anyone_else(
     engine: AsyncEngine, data_dir: Path, tmp_path: Path
 ) -> None:
-    """Refusing after creating leaves the operator the directory they started with."""
+    """The other half of the check: the ordinary path still produces ``0700``.
+
+    Adding a refusal that also refused the case it was meant to allow would be a worse bug
+    than the one it fixed, and a suite full of tests about refusals would not have noticed.
+    """
     await _populate(engine, data_dir)
     target = tmp_path / "fresh"
 
     await create_backup(engine, data_dir, target)
 
-    assert stat.S_IMODE(target.stat().st_mode) == 0o700, "a target manicule creates is 0700"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    verify_backup(target)
 
 
 async def test_a_target_that_came_back_wider_than_it_was_asked_for_is_refused(

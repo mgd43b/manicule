@@ -92,7 +92,9 @@ whatever the files inside it say — and walking the blob store would make a dia
 That distinction is load-bearing rather than theoretical: **`manicule.db` and its `-wal` and
 `-shm` siblings are created `0644`**, because SQLite creates them and manicule does not chmod
 them afterwards. Unreachable inside a `0700` directory, and worth knowing before copying one
-of those files somewhere with a different parent.
+of those files somewhere with a different parent. The one copy manicule makes itself is the
+exception: `backup` writes its snapshot database `0600` (§3), because that copy is made to be
+moved.
 
 **Do not branch a script on `manicule doctor`'s exit status.** It exits **0** whenever it
 managed to produce a diagnosis, whatever the diagnosis says — which is the exit-status
