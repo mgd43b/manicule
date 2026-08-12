@@ -194,6 +194,24 @@ jobs:
           REQUIRE_GRAMMAR_BUNDLE: "1"
         run: uv run pytest tests/parsers/test_grammar_bundle.py tests/parsers/test_grammars.py -q -rs
 
+      # The Confluence browser-session store is the macOS Keychain, reached through
+      # `/usr/bin/security`, and its tests skip themselves anywhere that command is absent. On
+      # the ubuntu matrix that is every one of them, so without this step the tests that hold
+      # the most dangerous credential manicule stores would run on a developer's machine and
+      # nowhere else. They are here for the same reason the grammar suites are: this is the
+      # platform where the behaviour exists, and a suite that passes by skipping is a suite
+      # that is not being run.
+      #
+      # `REQUIRE_KEYCHAIN` turns this suite's Keychain skips into failures, exactly as
+      # `REQUIRE_GRAMMAR_BUNDLE` does above and for the same reason: without it a runner with no
+      # `/usr/bin/security` would skip the cases and leave the job green, which is
+      # indistinguishable from having run them. The whole file is named rather than a
+      # keyword-selected subset — the Keychain cases are the reason, and the rest costs seconds.
+      - name: pytest (the Keychain is only here)
+        env:
+          REQUIRE_KEYCHAIN: "1"
+        run: uv run pytest tests/connectors/test_browser_sso.py -q -rs
+
   # The image build, which is also the image's test.
   #
   # The Dockerfile's last stage runs `doctor`, an ingest and a search with `--network=none`,

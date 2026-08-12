@@ -13,12 +13,20 @@ the client itself would test the mock.
 retrying in lockstep; a self-hosted index syncing one Confluence is not a fleet, and a
 deterministic delay is one a test can assert on. Where a delay would be long enough to matter,
 the connector stops instead (``max_retry_after_seconds``).
+
+**The credential is consulted per request and redirects are followed by hand.** Both are the
+same decision, and it is the decision browser-session authentication forces. A credential that
+expires has to be asked for again before every request, because a sync outlives sessions; and a
+redirect has to be a redirect at the moment it is judged, because the alternative — letting the
+HTTP client follow it — converts "302 to the identity provider" into "200 carrying a sign-in
+page", which is a successful response no downstream stage can tell from a document.
+:mod:`manicule.connectors.credentials` holds the first half and
+:mod:`manicule.connectors.intercept` the second.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -26,7 +34,8 @@ from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
-from manicule.connectors.config import ConfluenceConfig, Deployment
+from manicule.connectors.config import ConfluenceConfig
+from manicule.connectors.credentials import Credential, token_credential
 from manicule.connectors.errors import (
     AttachmentTooLargeError,
     ConnectorError,
@@ -34,17 +43,30 @@ from manicule.connectors.errors import (
     NotFoundError,
     RateLimitedError,
     RemoteError,
+    SessionExpiredError,
     UntrustedLinkError,
+)
+from manicule.connectors.intercept import (
+    SEARCHED_BYTES,
+    Answer,
+    offsite,
+    signed_out,
+    signin_path,
 )
 from manicule.connectors.pagination import next_page, origin_of
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     import httpx
 
-__all__ = ["BACKOFF_BASE_SECONDS", "ConfluenceClient", "Downloaded"]
+__all__ = ["BACKOFF_BASE_SECONDS", "MAX_REDIRECTS", "ConfluenceClient", "Downloaded"]
 
 BACKOFF_BASE_SECONDS = 0.5
 """First delay after a retryable failure. Doubles per attempt, capped by configuration."""
+
+MAX_REDIRECTS = 5
+"""How many redirects one request may take before the client calls it a loop."""
+
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 type Params = Sequence[tuple[str, str]]
 type Json = Mapping[str, object]
@@ -66,6 +88,9 @@ class ConfluenceClient:
     Args:
         config: Already credential-resolved — see
             :func:`~manicule.connectors.config.resolve_credentials`.
+        credential: What each request authenticates with. ``None`` builds the one this
+            configuration's token implies, which is every mode except a browser session — that
+            one is not derivable from configuration and the factory passes it in.
         transport: Injected in tests. ``None`` uses the network.
         sleep: How to wait between attempts. Injected so a test asserting the backoff does not
             have to serve it in real time.
@@ -76,11 +101,13 @@ class ConfluenceClient:
         self,
         config: ConfluenceConfig,
         *,
+        credential: Credential | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
+        self._credential = credential if credential is not None else token_credential(config)
         self._transport = transport
         self._sleep = sleep if sleep is not None else asyncio.sleep
         self._clock = clock
@@ -106,9 +133,9 @@ class ConfluenceClient:
 
         self._client = httpx.AsyncClient(
             transport=self._transport,
-            headers=self._headers(),
+            headers={"Accept": "application/json"},
             timeout=self._config.request_timeout_seconds,
-            follow_redirects=True,
+            follow_redirects=False,
         )
 
     async def teardown(self) -> None:
@@ -117,26 +144,20 @@ class ConfluenceClient:
             await client.aclose()
 
     def _headers(self) -> dict[str, str]:
-        """The credential, and nothing that varies per request.
+        """The credential for the request about to be made.
 
-        Cloud is Basic over ``email:token``; Server and Data Center are Bearer over a personal
-        access token. The two deployments differ here and in the body format, and nowhere else
-        that matters.
+        Built per request rather than once at :meth:`setup`, which is the difference a browser
+        session forces. A token is the same string every time and could have been baked into
+        the client; a session expires on the instance's schedule and is renewed out of band, so
+        the only correct time to ask what the credential is — and whether there still is one —
+        is immediately before using it.
+
+        Raises:
+            SessionExpiredError: The credential has a lifetime and has outlived it. Raised
+                here, before the request, because a request made with a dead session comes back
+                as a sign-in page rather than as an error.
         """
-        headers = {"Accept": "application/json"}
-        config = self._config
-        if config.deployment is Deployment.CLOUD:
-            token = config.api_token.get_secret_value() if config.api_token else ""
-            pair = f"{config.email}:{token}".encode()
-            headers["Authorization"] = f"Basic {base64.b64encode(pair).decode('ascii')}"
-        else:
-            token = (
-                config.personal_access_token.get_secret_value()
-                if config.personal_access_token
-                else ""
-            )
-            headers["Authorization"] = f"Bearer {token}"
-        return headers
+        return dict(self._credential.authorize().headers)
 
     # --- requests ------------------------------------------------------------------------
 
@@ -181,7 +202,9 @@ class ConfluenceClient:
             msg = (
                 f"{url} answered with {response.headers.get('content-type', 'no content type')} "
                 f"rather than JSON. A sign-in page from a proxy in front of Confluence is the "
-                f"usual cause; check that {self._config.base_url} is reachable without one."
+                f"usual cause — one manicule did not recognise as a sign-in page, since it "
+                f"would have been refused already if it had. Check that "
+                f"{self._config.base_url} is reachable without one. {self._credential.renewal()}"
             )
             raise ConnectorError(msg) from exc
         if not isinstance(payload, dict):
@@ -245,16 +268,33 @@ class ConfluenceClient:
             current_params = following.params
 
     async def download(self, url: str, *, max_bytes: int) -> Downloaded:
-        """Stream a file, refusing one larger than ``max_bytes``.
+        """Stream a file, refusing one larger than ``max_bytes`` and one that is a sign-in page.
 
         The limit is enforced against the bytes that actually arrive, never against a declared
         ``Content-Length``: the declared length is the source's claim about the response, and
         the point of a ceiling is to survive a claim that turns out to be wrong.
 
+        **The sign-in check matters more here than anywhere else.** A JSON endpoint answered
+        with HTML fails to decode, so a sign-in page reaching one is caught by the decoder even
+        without a check. An attachment download has no such backstop: whatever arrives is bytes
+        with a media type, and a sign-in page arrives as perfectly good ``text/html`` that the
+        parser chain would parse, chunk, embed and serve. So the same check runs on the headers
+        and again on the first bytes.
+
         Raises:
             AttachmentTooLargeError: More than ``max_bytes`` arrived. Named as its own failure
                 so the document records why it has no content rather than recording a size.
+            SessionExpiredError: A sign-in answered instead of the file.
         """
+        for _ in range(MAX_REDIRECTS + 1):
+            following = await self._streamed(url, max_bytes=max_bytes)
+            if isinstance(following, Downloaded):
+                return following
+            url = following
+        raise self._looping(url)
+
+    async def _streamed(self, url: str, *, max_bytes: int) -> Downloaded | str:
+        """One download attempt: the file, or the URL a redirect points at."""
         client = self._require_client()
         url = self._checked(url)
         import httpx  # noqa: PLC0415 - see setup()
@@ -262,16 +302,33 @@ class ConfluenceClient:
         for attempt in range(self._config.max_retries + 1):
             self.requests += 1
             try:
-                async with client.stream("GET", url) as response:
+                async with client.stream("GET", url, headers=self._headers()) as response:
                     wait = self._retry_delay(response.status_code, response.headers, attempt)
                     if wait is not None:
                         await response.aread()
                         await self._sleep(wait)
                         continue
+                    redirect = self._redirect(url, response.status_code, response.headers)
+                    if redirect is not None:
+                        await response.aread()
+                        return redirect
                     self._raise_for_status(response.status_code, url, response.headers)
+                    self._verify(Answer(url, response.status_code, dict(response.headers)))
                     chunks: list[bytes] = []
                     total = 0
                     async for chunk in response.aiter_bytes():
+                        if total < SEARCHED_BYTES:
+                            # Checked against the accumulated opening rather than against one
+                            # chunk, because a chunk boundary is wherever the network put it
+                            # and a marker split across two would be a marker nobody saw.
+                            self._verify(
+                                Answer(
+                                    url,
+                                    response.status_code,
+                                    dict(response.headers),
+                                    b"".join([*chunks, chunk]),
+                                )
+                            )
                         total += len(chunk)
                         if total > max_bytes:
                             msg = (
@@ -288,6 +345,22 @@ class ConfluenceClient:
         raise self._exhausted(url)
 
     async def _get(self, url: str, params: Params) -> httpx.Response:
+        for _ in range(MAX_REDIRECTS + 1):
+            response = await self._attempt(url, params)
+            redirect = self._redirect(url, response.status_code, response.headers)
+            if redirect is None:
+                self._verify(
+                    Answer(url, response.status_code, dict(response.headers), response.content)
+                )
+                return response
+            # The Location is a complete URL, so the query that was sent does not travel with
+            # it; carrying the old parameters over would append them to whatever the redirect
+            # already carries.
+            url, params = redirect, ()
+        raise self._looping(url)
+
+    async def _attempt(self, url: str, params: Params) -> httpx.Response:
+        """One URL's worth of requesting, including the retries. Redirects are the caller's."""
         client = self._require_client()
         url = self._checked(url)
         import httpx  # noqa: PLC0415 - see setup()
@@ -295,7 +368,7 @@ class ConfluenceClient:
         for attempt in range(self._config.max_retries + 1):
             self.requests += 1
             try:
-                response = await client.get(url, params=list(params))
+                response = await client.get(url, params=list(params), headers=self._headers())
             except httpx.TransportError as exc:
                 await self._retry_transport(exc, url, attempt)
                 continue
@@ -303,9 +376,60 @@ class ConfluenceClient:
             if wait is not None:
                 await self._sleep(wait)
                 continue
+            if response.status_code in _REDIRECT_STATUSES:
+                return response
             self._raise_for_status(response.status_code, url, response.headers)
             return response
         raise self._exhausted(url)
+
+    # --- redirects and sign-in pages -----------------------------------------------------
+
+    def _redirect(self, url: str, status: int, headers: Mapping[str, str]) -> str | None:
+        """Where this response says to go next, or ``None`` if it is an answer.
+
+        Redirects are followed by this client rather than by ``httpx``, and that is the whole
+        reason an expired session cannot be ingested as a page. Following automatically turns
+        "302 to the identity provider" into "200 with a sign-in page", which is the one shape
+        of failure no downstream stage can detect: it is a successful response of a plausible
+        content type carrying real text. Following by hand means the redirect is still a
+        redirect when the decision is made, and the decision is made against the configured
+        origin — so nothing is ever requested from the provider and no sign-in page is fetched.
+
+        Raises:
+            UntrustedLinkError: The redirect leaves the configured origin, taking this
+                account's credential with it.
+            SessionExpiredError: It points at this instance's own sign-in.
+        """
+        if status not in _REDIRECT_STATUSES:
+            return None
+        location = headers.get("location", "").strip()
+        if not location:
+            msg = f"{url} answered {status} with no Location header, so there is nowhere to go"
+            raise RemoteError(msg, status_code=status)
+        import httpx  # noqa: PLC0415 - see setup()
+
+        target = str(httpx.URL(url).join(location))
+        elsewhere = offsite(target, origin=origin_of(self._config.base_url))
+        if elsewhere is not None:
+            raise UntrustedLinkError(f"{elsewhere}. {self._credential.renewal()}")
+        signin = signin_path(target)
+        if signin is not None:
+            raise SessionExpiredError(f"{signin}. {self._credential.renewal()}")
+        return target
+
+    def _verify(self, answer: Answer) -> None:
+        """Refuse a response that is a sign-in rather than an answer.
+
+        Runs on every response this client returns, for every credential, because the thing in
+        front of Confluence does not know or care which one was sent: a reverse proxy answers a
+        personal access token with a sign-in page exactly as it answers a dead browser session.
+
+        Raises:
+            SessionExpiredError: It is a sign-in page.
+        """
+        reason = signed_out(answer, expected_account=self._credential.account())
+        if reason is not None:
+            raise SessionExpiredError(f"{reason}. {self._credential.renewal()}")
 
     def _require_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -392,20 +516,16 @@ class ConfluenceClient:
         """Why a rejected request was rejected, in terms of the thing that has to change.
 
         401 and 403 are different problems with the same shape, and conflating them sends
-        somebody to rotate a working token. The deployment is named because the two use
-        different credentials entirely.
+        somebody to rotate a working token. What the credential *is* comes from the credential
+        rather than from a branch here, because "rotate the token" and "sign in again in your
+        browser" are different acts and only one of them is available at a time.
         """
         config = self._config
-        kind = (
-            f"an API token for {config.email or '(no email configured)'}"
-            if config.deployment is Deployment.CLOUD
-            else "a personal access token"
-        )
         if status == HTTPStatus.UNAUTHORIZED:
             return (
                 f"Confluence rejected the credential for {url}. This is configured as "
-                f"{config.deployment.value}, which authenticates with {kind}. Check the token "
-                f"has not been revoked, and that ${config.token_env} holds the right one."
+                f"{config.deployment.value} authenticating with "
+                f"{self._credential.describe()}. {self._credential.renewal()}"
             )
         challenge = headers.get("x-authentication-denied-reason", "")
         detail = f" The source said: {challenge}." if challenge else ""
@@ -418,6 +538,14 @@ class ConfluenceClient:
     def _exhausted(self, url: str) -> ConnectorError:
         """Reached only if the retry loop falls out without returning or raising."""
         return ConnectorError(f"gave up on {url} after {self._config.max_retries + 1} attempts")
+
+    def _looping(self, url: str) -> ConnectorError:
+        """More than :data:`MAX_REDIRECTS` hops, which is a redirect loop rather than a route."""
+        return ConnectorError(
+            f"{url} redirected more than {MAX_REDIRECTS} times without answering. A loop like "
+            f"this is what an instance does when a sign-in it insists on cannot be completed by "
+            f"a client that only holds cookies. {self._credential.renewal()}"
+        )
 
 
 def _backoff(attempt: int) -> float:

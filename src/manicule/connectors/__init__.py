@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from manicule.connectors.config import (
     CONNECTOR_NAME,
+    AuthMethod,
     ConfluenceConfig,
     Deployment,
     resolve_credentials,
@@ -31,12 +32,14 @@ from manicule.connectors.errors import (
     NotFoundError,
     RateLimitedError,
     RemoteError,
+    SessionExpiredError,
     UntrustedLinkError,
 )
 
 __all__ = [
     "CONNECTOR_NAME",
     "AttachmentTooLargeError",
+    "AuthMethod",
     "BodyUnavailableError",
     "ConfluenceConfig",
     "ConnectorError",
@@ -45,6 +48,7 @@ __all__ = [
     "NotFoundError",
     "RateLimitedError",
     "RemoteError",
+    "SessionExpiredError",
     "UntrustedLinkError",
     "resolve_credentials",
 ]
