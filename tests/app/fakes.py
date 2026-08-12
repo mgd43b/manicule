@@ -699,6 +699,16 @@ class FakeAnswerer:
 
     text: str = "The client retries twice."
     calls: list[object] = field(default_factory=list[object])
+    envelope: AnswerEnvelope | None = None
+    """The final envelope, for a test the default cannot express.
+
+    The default carries **no citations**, which is right for the tests about confidence, streaming
+    and tenancy and wrong for anything asserting what a citation *reports* — and the difference was
+    invisible until a guard was disabled and nothing went red, because no test on any surface had
+    ever constructed an ``AnswerCitation`` through this path. A test needing a real citation sets
+    one here rather than reaching past the service, so the payload is assembled by the code that
+    assembles it in production.
+    """
 
     def answer(
         self, request: AnswerRequest, result: AnswerResult | None = None
@@ -716,11 +726,11 @@ class FakeAnswerer:
         return self._events()
 
     async def _events(self) -> AsyncIterator[AnswerEvent]:
-        yield AnswerEvent(kind=EventKind.DELTA, text=self.text)
-        yield AnswerEvent(
-            kind=EventKind.FINAL,
-            envelope=AnswerEnvelope(text=self.text, corpus_consulted=True, confidence=0.5),
+        final = self.envelope or AnswerEnvelope(
+            text=self.text, corpus_consulted=True, confidence=0.5
         )
+        yield AnswerEvent(kind=EventKind.DELTA, text=final.text)
+        yield AnswerEvent(kind=EventKind.FINAL, envelope=final)
 
 
 @dataclass

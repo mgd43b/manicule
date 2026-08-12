@@ -116,6 +116,86 @@ async def test_an_answer_reports_the_confidence_band_as_well_as_the_score(
     assert answered.text
 
 
+async def test_an_answer_citation_carries_the_documents_source_metadata(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """A citation on an answer reports the record, not only a search hit does.
+
+    **This test exists because its absence was found by disabling a guard.** The answer path
+    hydrates its documents in ``_require_scoped_context`` and threads them into
+    ``_answer_payload``; blanking that dictionary left the whole suite green — because the fake
+    answerer emitted an envelope with **no citations at all**, so ``AnswerCitation.provenance``
+    had never been constructed by any test on any surface, while the pull request describing it
+    claimed it was populated. An untested field on a contract is one the next refactor removes for
+    free, and `ask` is the output a reader is most likely to act on.
+
+    The envelope therefore carries a real citation here, pointing at the seeded document's own
+    chunk, so the payload is assembled the way a real answer assembles it.
+    """
+    from manicule.core.anchors import HeadingAnchor  # noqa: PLC0415 - only this test builds one
+    from manicule.core.provenance import LocalSnapshot, Provenance, SourceMetadata  # noqa: PLC0415
+    from manicule.generation.answers import (  # noqa: PLC0415 - keeps generation out of the rest
+        AnswerEnvelope,
+        Citation,
+        Verification,
+    )
+
+    canonical = "https://docs.example.test/pages/123456/retry-policy"
+    document = make_document(
+        backend.workspace,
+        source_id="123456.html",
+        title="Retry policy",
+        provenance=Provenance(
+            source=SourceMetadata(
+                title="Retry policy",
+                canonical_uri=canonical,
+                source_id="123456",
+                version="7",
+                section_path=("Engineering", "Runbooks"),
+            ),
+            snapshot=LocalSnapshot(path="mirror/123456.html"),
+        ),
+    )
+    chunk = make_chunk(document)
+    backend.store.add(document)
+    backend.store.chunks[document.id] = [chunk]
+    backend.retriever_.candidates = [Candidate(chunk=chunk, score=0.9)]
+    backend.answerer_.envelope = AnswerEnvelope(
+        text="The client retries twice.",
+        corpus_consulted=True,
+        confidence=0.5,
+        citations=(
+            Citation(
+                slot=1,
+                document_id=document.id,
+                chunk_id=chunk.id,
+                uri=document.uri,
+                title=document.title,
+                heading_path=chunk.heading_path,
+                anchor=HeadingAnchor(path=chunk.heading_path),
+                quote=chunk.text,
+                verification=Verification.RESOLVED,
+            ),
+        ),
+    )
+
+    answered = await service.ask("what is the retry policy")
+
+    assert len(answered.citations) == 1, "the fixture must produce a citation to assert about"
+    cited = answered.citations[0]
+    assert cited.provenance is not None, (
+        "an answer citation reports no source metadata, so a mirrored page is cited by its local "
+        "filename in the one output a reader is most likely to act on"
+    )
+    assert cited.provenance.canonical_uri == canonical
+    assert cited.provenance.source_id == "123456"
+    assert cited.provenance.version == "7"
+    assert cited.provenance.section_path == ("Engineering", "Runbooks")
+    assert cited.provenance.snapshot_path == "mirror/123456.html", (
+        "and the local snapshot is retained beside it, for audit"
+    )
+
+
 async def test_an_answer_carries_the_reason_for_its_confidence_as_a_search_does(
     service: ApplicationService, backend: FakeBackend
 ) -> None:
