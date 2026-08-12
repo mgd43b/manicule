@@ -19,15 +19,21 @@ from __future__ import annotations
 
 import ast
 import inspect
+import io
 import textwrap
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
+from rich.console import Console
 
 from manicule.api.app import build_app
+from manicule.api.serve import TRANSPORT as API_TRANSPORT
+from manicule.app.results import ServerAddress
 from manicule.app.service import ApplicationService
 from manicule.cli import main as cli_main
+from manicule.cli import render
 from tests.api.support import LOCAL_PEER, backend_with_a_document
 
 NOT_FOUND = 404
@@ -120,12 +126,16 @@ def _swallowed_options(function: object) -> list[str]:
     return deleted
 
 
-ALLOWED_TO_BE_DISCARDED: frozenset[str] = frozenset({"version"})
+ALLOWED_TO_BE_DISCARDED: frozenset[tuple[str, str]] = frozenset({("main_callback", "version")})
 """The one parameter a command may delete, and why.
 
-``--version`` is handled by an eager Typer callback that exits before the command body runs, so
-the parameter genuinely has nothing to do. Every other deleted parameter is an option a person
-can pass, that appears on ``--help``, and that changes nothing.
+``--version`` is handled by an eager Typer callback that exits before the root callback's body
+runs, so the parameter genuinely has nothing to do. Every other deleted parameter is an option
+a person can pass, that appears on ``--help``, and that changes nothing.
+
+Keyed by **command and parameter** rather than by name alone. ``upgrade`` also takes a
+``version``, and it is a real option that is passed through — an exemption keyed only on the
+name would quietly excuse discarding that one too.
 """
 
 
@@ -158,7 +168,7 @@ def test_no_command_accepts_an_option_and_throws_it_away() -> None:
         discarded = [
             parameter
             for parameter in _swallowed_options(callback)
-            if parameter not in ALLOWED_TO_BE_DISCARDED
+            if (name, parameter) not in ALLOWED_TO_BE_DISCARDED
         ]
         if discarded:
             swallowed[name] = discarded
@@ -179,6 +189,33 @@ def test_the_swallowed_option_check_can_see_a_swallowed_option() -> None:
         del flag
 
     assert _swallowed_options(pretend) == ["flag"]
+
+
+def test_the_renderer_names_the_surface_the_transport_says_it_is() -> None:
+    """``stop`` names the surface too, because it reads the same field.
+
+    The pid file has always recorded ``http-api`` for the REST API and ``http`` for
+    MCP-over-HTTP, and the renderer ignored the difference — so ``manicule stop`` announced
+    "MCP server" about the API server it had just stopped. This is the regression test for
+    reading it rather than being told.
+    """
+    console = Console(file=io.StringIO(), width=100, no_color=True, highlight=False)
+    render.render_address(
+        console,
+        ServerAddress(transport=API_TRANSPORT, host="127.0.0.1", port=8765, loopback=True),
+    )
+    written = cast("io.StringIO", console.file).getvalue()
+    assert "HTTP API" in written, written
+    assert "MCP server" not in written, "the API server was announced as an MCP server"
+
+
+def test_the_mirrored_transport_constant_agrees_with_the_api() -> None:
+    """``render`` names the API's transport without importing FastAPI to learn it.
+
+    A copied constant is a constant that can drift, so the copy is asserted equal to the
+    original here rather than trusted.
+    """
+    assert render.API_TRANSPORT == API_TRANSPORT
 
 
 def test_the_help_text_for_no_web_is_not_the_old_claim() -> None:

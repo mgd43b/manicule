@@ -108,15 +108,14 @@ async def _serve(
         # Announced before the socket exists, and to stderr when the transport is stdio —
         # where stdout is the protocol channel and a banner on it is a corrupt message.
         #
-        # `serves_api` and `web` are passed because the payload cannot carry them: a
-        # `ServerAddress` names a transport, and "http" is both the REST API and MCP-over-HTTP.
-        # Without them every socket announced itself as an MCP server.
+        # `web` is the one thing the renderer cannot read off the payload: which surface is
+        # serving is in the transport, but `--no-web` is recorded nowhere. Passed only here,
+        # where it was decided; `stop` reads a pid file and rightly claims nothing about it.
         _report(
             succeeded("start", service.workspace, address),
             json_output,
             stderr=True,
-            serves_api=api,
-            web=api and web,
+            web=web if api else None,
         )
         pid = write_pidfile(
             runtime.settings.data_dir,
@@ -216,17 +215,14 @@ def _report(
     json_output: bool,
     *,
     stderr: bool = False,
-    serves_api: bool = False,
-    web: bool = False,
+    web: bool | None = None,
 ) -> None:
     out = render.console(stderr=stderr or not envelope.ok)
     if json_output:
         out.print_json(data=envelope.as_json())
         return
     if envelope.ok and envelope.data is not None:
-        render.render_address(
-            out, ServerAddress.model_validate(envelope.data), serves_api=serves_api, web=web
-        )
+        render.render_address(out, ServerAddress.model_validate(envelope.data), web=web)
         return
     if envelope.error is not None:
         render.render_error(out, envelope.op, envelope.error)

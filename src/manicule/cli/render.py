@@ -423,37 +423,48 @@ def render_init(out: Console, payload: r.InitReport) -> None:
     out.print("\n[dim]next: [/dim]manicule index <path>[dim], then[/dim] manicule search <query>")
 
 
-def render_address(
-    out: Console, payload: r.ServerAddress, *, serves_api: bool = False, web: bool = False
-) -> None:
+API_TRANSPORT = "http-api"
+"""What the HTTP API records as its transport, mirroring :data:`manicule.api.serve.TRANSPORT`.
+
+Named here rather than imported, because importing it would pull FastAPI into every ``manicule
+--help``. :func:`render_address` is the one reader, and ``tests/app/test_serving.py`` asserts
+the two strings agree so the mirror cannot drift.
+"""
+
+
+def render_address(out: Console, payload: r.ServerAddress, *, web: bool | None = None) -> None:
     """Where the server is listening, and which surface is on it.
 
-    ``serves_api`` and ``web`` are told rather than inferred. :class:`~manicule.app.results.
-    ServerAddress` carries a *transport* and not a protocol, so the payload alone cannot tell
-    the HTTP API from MCP-over-HTTP — and announcing every socket as "MCP server" was wrong for
-    the one people actually open in a browser: ``manicule start --transport http`` printed
-    ``MCP server on http://127.0.0.1:8765, 11 tool(s)`` while serving the REST API and the
-    browser surface, and named neither. The caller that decided knows; only the default, where
-    nobody said, stays vague.
+    **Which surface is read off the transport, not passed in.** The MCP server records
+    ``http`` and the HTTP API records ``http-api`` — a distinction the pid file has always
+    carried and this renderer ignored, announcing every socket as "MCP server" including the
+    one people open in a browser. ``manicule start --transport http`` printed ``MCP server on
+    http://127.0.0.1:8765, 11 tool(s)`` while serving the REST API and the browser surface, and
+    named neither URL; ``manicule stop`` said the same thing about the server it had just
+    stopped.
+
+    ``web`` is the one fact the payload cannot carry, because ``--no-web`` is not recorded
+    anywhere. ``None`` means nobody said — which is the honest answer for ``stop``, reading a
+    pid file written by a process whose flags it never saw — and prints no claim either way.
     """
     if payload.transport == "stdio":
         out.print(f"MCP server on stdio, {payload.tools} tool(s). [dim]No socket is open.[/dim]")
         return
     where = f"http://{payload.host}:{payload.port}"
+    serves_api = payload.transport == API_TRANSPORT
     what = "HTTP API" if serves_api else "MCP server"
-    reach = "[dim](this machine only)[/dim]" if payload.loopback else ""
     if payload.loopback:
-        out.print(f"{what} on {where} {reach}")
+        out.print(f"{what} on {where} [dim](this machine only)[/dim]")
     else:
         out.print(f"[red]{what} on {where} — reachable from the network[/red]")
     if not serves_api:
         out.print(f"[dim]{payload.tools} tool(s)[/dim]")
         return
-    # The three things a person wants next, and none of them were printed before. A server
-    # whose browser surface is not named is one nobody finds without reading the source.
-    if web:
+    # The signposts a person wants next, and none of them were printed before. A server whose
+    # browser surface is not named is one nobody finds without reading the source.
+    if web is True:
         out.print(f"[dim]browser surface[/dim]  {where}/ui")
-    else:
+    elif web is False:
         out.print("[dim]browser surface off (--no-web)[/dim]")
     out.print(f"[dim]API documentation[/dim] {where}/api/docs")
 
