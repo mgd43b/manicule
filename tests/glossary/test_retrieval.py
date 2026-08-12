@@ -283,6 +283,47 @@ async def _second_chunks(store: SqliteDocStore) -> list[Chunk]:
     return list(await store.document_chunks(document_id(system.WORKSPACE, "fixture", "second")))
 
 
+async def test_a_collection_scoped_query_consults_only_that_collections_glossary(
+    store: SqliteDocStore, indexed: list[Chunk]
+) -> None:
+    """The spec's regression case for conflicting expansions across collections, end to end.
+
+    Store-level isolation is asserted in ``test_storage.py``; this is the same claim through
+    the whole retriever, which became testable when collection-scoped search landed. It also
+    pins the *order* the retriever resolves things in: membership becomes document ids first,
+    and the glossary lookup then sees the same ids the legs will. Resolving the glossary
+    separately would be a second notion of what a collection contains, free to drift.
+    """
+    left, left_chunks = await system.index(
+        store, "left", "Left glossary", [f"NOW — {corpus.EXPANSION}"]
+    )
+    right, _ = await system.index(store, "right", "Right glossary", [f"NOW — {OTHER}"])
+    inner = await store.create_collection("inner")
+    outer = await store.create_collection("outer")
+    await store.add_to_collection(inner.id, [left.id])
+    await store.add_to_collection(outer.id, [right.id])
+    everything = [*indexed, *left_chunks, *await store.document_chunks(right.id)]
+    retriever = await _with_glossary(store, everything)
+
+    scoped_in = await retriever.retrieve(
+        _ask(corpus.QUERY_ACRONYM, collection_ids=frozenset({inner.id}))
+    )
+    scoped_out = await retriever.retrieve(
+        _ask(corpus.QUERY_ACRONYM, collection_ids=frozenset({outer.id}))
+    )
+    unscoped = await retriever.retrieve(_ask(corpus.QUERY_ACRONYM))
+
+    assert scoped_in.expansion is not None
+    assert scoped_in.expansion.matches[0].entry.expansion == corpus.EXPANSION
+    assert scoped_in.expansion.conflicts == ()
+    assert scoped_out.expansion is not None
+    assert scoped_out.expansion.matches[0].entry.expansion == OTHER
+    assert scoped_out.expansion.conflicts == ()
+    assert unscoped.expansion is not None
+    assert not unscoped.expansion.fired, "the workspace holds both, so neither is chosen"
+    assert set(unscoped.expansion.conflicts[0].expansions) >= {corpus.EXPANSION, OTHER}
+
+
 # --- the lookup path, which is what makes this more than a boost ------------------------------
 
 
