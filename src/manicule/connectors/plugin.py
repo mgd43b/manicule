@@ -18,7 +18,9 @@ from typing import TYPE_CHECKING
 from manicule.connectors.config import (
     CONNECTOR_NAME,
     FILESYSTEM_CONNECTOR_NAME,
+    SNAPSHOT_CONNECTOR_NAME,
     ConfluenceConfig,
+    ConfluenceSnapshotConfig,
     FilesystemConfig,
     resolve_credentials,
 )
@@ -29,7 +31,13 @@ from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginMani
 if TYPE_CHECKING:
     from manicule.core.protocols import Connector
 
-__all__ = ["PLUGIN", "ConnectorsPlugin", "build_confluence", "build_filesystem"]
+__all__ = [
+    "PLUGIN",
+    "ConnectorsPlugin",
+    "build_confluence",
+    "build_confluence_snapshot",
+    "build_filesystem",
+]
 
 
 def build_confluence(context: BuildContext) -> Connector:
@@ -105,6 +113,38 @@ def build_filesystem(context: BuildContext) -> Connector:
     )
 
 
+def build_confluence_snapshot(context: BuildContext) -> Connector:
+    """Construct the offline Confluence-snapshot connector from validated configuration.
+
+    Raises:
+        ConfigError: The context carries configuration of some other type, or names no root. A
+            connector with no root discovers nothing and reports a clean run, which is the shape of
+            a sync that looks like it worked — and this one has no credential whose absence would
+            have failed first.
+    """
+    from pathlib import Path  # noqa: PLC0415 - kept beside its only use
+
+    from manicule.connectors.confluence_snapshot import (  # noqa: PLC0415
+        ConfluenceSnapshotConnector,
+    )
+
+    settings = context.config
+    if not isinstance(settings, ConfluenceSnapshotConfig):
+        msg = (
+            f"connector {SNAPSHOT_CONNECTOR_NAME!r} was built with "
+            f"{type(settings).__name__} where it declares ConfluenceSnapshotConfig."
+        )
+        raise ConfigError(msg)
+    if not settings.root:
+        msg = (
+            f"connector {SNAPSHOT_CONNECTOR_NAME!r} has no root. Set "
+            f'plugins.config."connector.confluence-snapshot".root to the directory holding the '
+            f"page snapshots."
+        )
+        raise ConfigError(msg)
+    return ConfluenceSnapshotConnector(Path(settings.root), name=SNAPSHOT_CONNECTOR_NAME)
+
+
 class ConnectorsPlugin:
     """The plugin object the ``connectors`` entry point resolves to."""
 
@@ -127,6 +167,12 @@ class ConnectorsPlugin:
             build_filesystem,
             config_model=FilesystemConfig,
             summary="A local directory tree, walked in a stable order, reconciled by path.",
+        )
+        registry.add(
+            keys.CONNECTOR.named(SNAPSHOT_CONNECTOR_NAME),
+            build_confluence_snapshot,
+            config_model=ConfluenceSnapshotConfig,
+            summary="Mirrored Confluence pages from disk, keyed on page id, with no network.",
         )
 
 
