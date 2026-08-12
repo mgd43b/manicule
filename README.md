@@ -70,10 +70,11 @@ first `search` will tell you so rather than fetching.
 **The model weights are the one thing `init` does not fetch, and the first `index` does.** They
 are the big artefact: about **1.1 GB** for `BAAI/bge-m3` on Apple silicon (the MLX conversion,
 fp16) and about **2.3 GB** elsewhere (the ONNX export). `init` tells you it is still to come
-and `manicule doctor` says so too, because the download itself is quiet — it is a Hugging Face
-progress bar and a minute or so with no manicule output at all. On this machine, indexing
-`docs/` cold took **2 minutes 4 seconds**, of which 1 minute 11 was the fetch. The same index
-with the weights already present took **33 seconds**.
+and `manicule doctor` says so too, because the download itself is quiet — a Hugging Face
+progress bar, and a stretch with no manicule output at all. Indexing this repository's `docs/`
+cold measured **1 minute 21 seconds** and **2 minutes 4 seconds** on two runs here, the
+difference being the download; the same index with the weights already present took
+**33 seconds**.
 
 To take that wait deliberately, before you have a corpus to be impatient about:
 
