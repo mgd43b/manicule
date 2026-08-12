@@ -21,6 +21,12 @@ different embeddings, one corpus. Platform may change *throughput*; it must neve
    air-gapped deployment can point at an internal mirror. Before any of that it seeds from an
    **offline bundle** if one is installed (:mod:`manicule.parsers.grammar_bundle`), which is
    what makes a pre-seed succeed on a host with no route to anything at all.
+
+   Those two command names are a claim, and this module used to make it while neither command
+   called anything here — the pre-seed had no caller at all and ``--fix`` did not exist.
+   ``tests/parsers/test_grammars.py`` now runs every command named anywhere in this file and
+   fails if it is absent, if the flag it is quoted with is absent, or if running it does not
+   reach :func:`prefetch`. A docstring that names its caller is checkable, so it is checked.
 3. **A missing grammar is a refusal, not a fallback.** :func:`load_parser` raises
    :class:`GrammarUnavailableError`; there is no line-splitting fallback, because a silent
    fallback is precisely how two machines end up with two chunkings of one file. A grammar
@@ -91,6 +97,8 @@ __all__ = [
     "MANIFEST_URL_ENV",
     "MEDIA_TYPES",
     "NODE_TYPE_DEFINITIONS",
+    "PACK_DISTRIBUTION",
+    "PRESEED_COMMAND",
     "SCOPE_SEPARATORS",
     "DefinitionRule",
     "GrammarFetchError",
@@ -126,6 +134,15 @@ shell profile.
 
 PACK_DISTRIBUTION: Final = "tree-sitter-language-pack"
 """The installed distribution the grammars come from."""
+
+PRESEED_COMMAND: Final = "manicule doctor --fix"
+"""The command that seeds a missing grammar, named once because it is quoted everywhere.
+
+It is the ``status_detail`` of every document refused for want of a grammar, so it is the one
+string an operator is most likely to read about this subsystem — and for a while it named a
+flag that did not exist. Naming it here means the refusal, the diagnostic and the test that
+runs the command all say the same thing, and a rename cannot leave two of the three behind.
+"""
 
 
 def pack_version() -> str:
@@ -301,7 +318,7 @@ class GrammarUnavailableError(ManiculeError):
         self, language: str, reason: str | None = None, message: str | None = None
     ) -> None:
         self.language = language
-        self.reason = reason or f"grammar unavailable: {language} — run manicule doctor --fix"
+        self.reason = reason or f"grammar unavailable: {language} — run {PRESEED_COMMAND}"
         """The document's ``status_detail``. Names the language and the command that fixes
         it, because "unsupported" on its own tells an operator nothing to do."""
         super().__init__(
@@ -332,7 +349,7 @@ class GrammarUnusableError(GrammarUnavailableError):
     """
 
     def __init__(self, language: str, detail: str) -> None:
-        reason = f"grammar unusable: {language} — run manicule doctor --fix"
+        reason = f"grammar unusable: {language} — run {PRESEED_COMMAND}"
         super().__init__(
             language,
             reason=reason,
@@ -518,7 +535,9 @@ def is_available(language: str) -> bool:
 def missing_grammars(languages: Sequence[str]) -> tuple[str, ...]:
     """Which of ``languages`` have no grammar in the cache. Sorted, and no network access.
 
-    What ``manicule doctor`` reports and what :func:`prefetch` acts on.
+    What ``manicule doctor`` reports — as its ``grammars`` check, which reads this against the
+    *configured* cache directory rather than the per-user default, because those differ on
+    exactly the deployments that care — and what :func:`prefetch` acts on.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
 
@@ -529,7 +548,8 @@ def missing_grammars(languages: Sequence[str]) -> tuple[str, ...]:
 def bundle_status(bundle_dir: Path | None = None) -> str:
     """One line describing what this install has to seed from offline.
 
-    What ``manicule doctor`` prints, and what every pre-seed failure quotes. An operator whose
+    What ``manicule doctor`` prints — in its ``grammars`` check, whenever a bundle is installed
+    or a grammar is absent — and what every pre-seed failure quotes. An operator whose
     air-gapped host will not parse code needs to know whether a bundle was found, which pack
     release it was built for, and which languages it carries — because "no grammars and no
     network" has three different fixes depending on that answer.
@@ -557,6 +577,12 @@ def prefetch(languages: Sequence[str], *, bundle_dir: Path | None = None) -> tup
     The entry point behind ``manicule init`` and ``manicule doctor --fix``, and the reason
     nothing downloads during ingest: pre-seeding is a step an operator runs and can see fail,
     where a lazy fetch is a step that succeeds on one machine and not on another.
+
+    Both commands reach it through one method — ``ApplicationService._grammar_check(fix=True)``
+    — so ``init`` and the repair cannot come to mean different things, and both report what
+    they seeded rather than doing it silently. ``init`` treats a failure here as a note rather
+    than an error: the configuration file is written by then, and a machine that will only ever
+    index Markdown is entitled to finish installing without a grammar in sight.
 
     **The offline bundle is consulted first, and the network only for what it did not supply.**
     That order is what makes an air-gapped install work rather than merely fail politely: a

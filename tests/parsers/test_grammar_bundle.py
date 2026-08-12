@@ -36,16 +36,22 @@ import shutil
 import stat
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from typing import Final
 
 import pytest
 
+from manicule.app.results import Check, Diagnosis
+from manicule.app.service import ApplicationService
+from manicule.config.settings import Settings
 from manicule.core.errors import ConfigError
 from manicule.parsers import grammar_bundle, grammars
 from tests.grammar_support import (
     BUNDLE_LANGUAGES,
+    BUNDLE_REQUIRED,
     NAME_TRAP_LANGUAGE,
+    REQUIRE_BUNDLE_ENV,
     UNREACHABLE_MANIFEST,
     build_bundle,
     require_source_grammars,
@@ -54,6 +60,18 @@ from tests.grammar_support import (
 
 CODE = b"class Store:\n    def refresh(self):\n        return 1\n"
 """A file every bundled Python grammar must produce the same tree for."""
+
+REAL_ENVIRONMENT: Final[Mapping[str, str]] = dict(os.environ)
+"""This machine's environment, captured at import — before any fixture has redirected it.
+
+For the one subprocess here that is *not* a manicule process: the installer. ``uv`` keeps its
+package cache under ``XDG_CACHE_HOME``, and ``manicule_environment`` moves that variable into a
+temporary directory for every test — correctly, for everything manicule writes, and fatally for
+a tool that would then find an empty cache and try to reach an index. It is the same shape as
+the grammar-cache redirect in ``tests/conftest.py``, arriving through a third tool, and the
+same answer: a cache is a machine resource, so the installer is given the real environment and
+resolves it by its own rules rather than by ones copied in here.
+"""
 
 
 @pytest.fixture(autouse=True)
@@ -213,11 +231,25 @@ def test_a_bundle_installed_as_a_distribution_needs_no_configuration(
 ) -> None:
     """The bundle arrives through the install channel rather than as a directory to copy.
 
-    The builder's ``--package`` mode writes an importable distribution around the bundle, and
-    the child here is given nothing but that distribution on its path — no environment
-    variable, no configured directory. An air-gapped host that can install manicule at all can
-    therefore install its grammars, which is the only shape that does not depend on somebody
-    remembering to copy a directory to the right place.
+    **The output is installed rather than inspected**, and that is the whole design of this
+    test. ``--package`` once wrote a module and no ``pyproject.toml``, so its output was not
+    installable at all — and a test that listed the files it produced would have passed against
+    exactly that, which is how the gap survived to be found by a deployment. So this runs the
+    installer, and what the air-gapped child is then given is the *installed* distribution: a
+    built wheel, unpacked, with its metadata. Nothing here reads the directory the builder
+    wrote.
+
+    That distinction has already caught a live trap, and the ``.gitignore`` written below is it.
+    Hatchling honours one beside the project it builds, this payload is *entirely* compiled
+    shared libraries, and ``*.so`` is about the most commonly ignored pattern there is — so a
+    bundle built inside any checkout that ignores compiled objects loses every library it
+    carries. Without ``artifacts`` in the generated metadata the wheel still builds, still
+    installs, and arrives holding a manifest describing files that are not in it. The install
+    alone would not show that; seeding and parsing out of what was installed does.
+
+    The child is given nothing but that distribution on its path — no environment variable, no
+    configured directory — so an air-gapped host that can install manicule at all can install
+    its grammars, with nobody remembering to copy a directory to the right place.
     """
     from tools.build_grammar_bundle import main  # noqa: PLC0415 - a build script, not runtime
 
@@ -225,17 +257,148 @@ def test_a_bundle_installed_as_a_distribution_needs_no_configuration(
     package = tmp_path / "dist"
     exit_code = main(["--output", str(package), "--package", "--languages", *BUNDLE_LANGUAGES])
     assert exit_code == 0
+    (package / ".gitignore").write_text("*.so\n*.dylib\n*.dll\n", encoding="utf-8")
 
+    installed = _install(package, tmp_path / "installed")
     result = _air_gapped_child(
         tmp_path / "elsewhere",
         _SEED_AND_PARSE,
-        extra={"PYTHONPATH": str(package / "src")},
+        extra={"PYTHONPATH": str(installed)},
     )
 
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)
     assert report["seeded"] == list(BUNDLE_LANGUAGES)
     assert report["parsed"] == "module"
+    # A distribution, not a directory that happens to import: the version answers from
+    # installed metadata, which is what `pip list` reads and what an operator asking "which
+    # grammars does this machine have" gets told.
+    assert report["distribution"] == f"{grammars.pack_version()}+{_local_version()}"
+
+
+def test_the_packaging_metadata_describes_the_bundle_it_was_written_beside(
+    tmp_path: Path,
+) -> None:
+    """A bundle is valid for one pack release and one platform, so its version says both.
+
+    ``0.0.0`` would install just as well and would leave the two facts that decide whether the
+    thing is usable inside a JSON file nobody reads. The description carries them in words for
+    the same reason: ``pip show`` is where somebody looks when a host refuses to parse code.
+    """
+    from tools.build_grammar_bundle import main  # noqa: PLC0415 - a build script, not runtime
+
+    require_source_grammars()
+    package = tmp_path / "dist"
+    assert main(["--output", str(package), "--package", "--languages", *BUNDLE_LANGUAGES]) == 0
+    metadata = (package / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert f'version = "{grammars.pack_version()}+{_local_version()}"' in metadata
+    assert grammar_bundle.platform_tag() in metadata
+    assert f'name = "{grammar_bundle.BUNDLE_MODULE.replace("_", "-")}"' in metadata
+    # The licence the build asserted, carried to the machine the wheel lands on.
+    assert f'license = "{grammar_bundle.licence_of_installed_pack()}"' in metadata
+
+
+def _local_version() -> str:
+    """The platform tag as PEP 440 spells a local version segment: dots, never hyphens."""
+    return grammar_bundle.platform_tag().replace("-", ".")
+
+
+def _install(package: Path, target: Path) -> Path:
+    """Install ``package`` into ``target`` with uv, and return the directory to import from.
+
+    ``--offline`` deliberately. The build backend is resolved from uv's cache, which every
+    environment that ran ``uv sync`` in this repository has — the workspace itself builds with
+    hatchling — so this proves the distribution installs without an index being reachable. A
+    packaging test that went red when PyPI did would be a packaging test nobody trusts.
+
+    ``--target`` rather than a fresh virtual environment, because the child still needs
+    ``manicule`` and the grammar pack, and those are in the interpreter running this suite. What
+    is under test is the distribution, and a built-then-unpacked wheel on the path is exactly
+    that.
+    """
+    uv = shutil.which("uv")
+    if uv is None:
+        detail = "uv is not on PATH, so the packaged bundle cannot be installed to prove it is"
+        if BUNDLE_REQUIRED:
+            pytest.fail(f"{detail}, and {REQUIRE_BUNDLE_ENV} is set")
+        pytest.skip(detail)
+    completed = subprocess.run(  # noqa: S603 - a resolved absolute path and fixed arguments
+        [
+            uv,
+            "pip",
+            "install",
+            "--offline",
+            "--no-deps",
+            "--python",
+            sys.executable,
+            "--target",
+            str(target),
+            str(package),
+        ],
+        env=dict(REAL_ENVIRONMENT),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert completed.returncode == 0, (
+        f"the packaged bundle did not install: {completed.stderr}\n"
+        f"A build-backend resolution failure here means uv's cache has no hatchling; run "
+        f"`uv sync --all-groups` first."
+    )
+    return target
+
+
+async def test_doctor_fix_seeds_the_air_gapped_install_and_then_reports_it_healthy(
+    bundle: grammar_bundle.GrammarBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator's whole path on an air-gapped host, through the command they are told to run.
+
+    Every refused source document carries ``run manicule doctor --fix`` in its
+    ``status_detail``, and for a while that named a flag that did not exist and a repair nothing
+    implemented. This is that string, executed: the installation is configured with a cache
+    directory that has never been written to and a manifest pointing at the discard port, so
+    the grammars that end up in it can only have come out of the bundle — and the report before
+    and after is what an operator would have seen.
+
+    Through the service rather than through :func:`~manicule.parsers.grammars.prefetch`, because
+    what was missing was never the seeding. It was a caller.
+    """
+    from tests.app.fakes import FakeBackend  # noqa: PLC0415 - the app suite's service double
+
+    monkeypatch.setenv(grammar_bundle.BUNDLE_DIR_ENV, str(bundle.root))
+    cache = tmp_path / "cache"
+    backend = FakeBackend()
+    backend.settings = Settings(
+        plugins={  # pyright: ignore[reportArgumentType] - validated on the way in
+            "config": {
+                "parser.sourcecode": {
+                    "languages": list(BUNDLE_LANGUAGES),
+                    "grammar_cache_dir": str(cache),
+                    "grammar_manifest_url": UNREACHABLE_MANIFEST,
+                }
+            }
+        }
+    )
+    service = ApplicationService(backend)
+
+    before = _grammar_check(await service.doctor())
+    after = _grammar_check(await service.doctor(fix=True))
+
+    assert before.state == "degraded"
+    assert str(cache) in before.detail
+    assert after.state == "ok"
+    assert f"seeded {list(BUNDLE_LANGUAGES)}" in after.detail
+    assert grammars.missing_grammars(BUNDLE_LANGUAGES) == ()
+    assert grammars.load_parser("python").parse(CODE).root_node.type == "module"
+
+
+def _grammar_check(diagnosis: Diagnosis) -> Check:
+    """The one check this suite is about, or a failure naming what ``doctor`` did report."""
+    found = next((check for check in diagnosis.checks if check.name == "grammars"), None)
+    assert found is not None, f"doctor reported {[check.name for check in diagnosis.checks]}"
+    return found
 
 
 def test_a_read_only_bundle_is_a_cache_directory_in_its_own_right(
@@ -890,10 +1053,15 @@ def test_the_permissive_list_is_accepted_term_by_term() -> None:
 
 _SEED_AND_PARSE = """
 import json
+from importlib.metadata import PackageNotFoundError, version
 from manicule.parsers import grammars
 
 languages = ["python", "rust"]
 report = {"cache_dir": str(grammars.cache_directory())}
+try:
+    report["distribution"] = version("manicule-grammars")
+except PackageNotFoundError:
+    report["distribution"] = None
 report["missing_before"] = list(grammars.missing_grammars(languages))
 report["seeded"] = list(grammars.prefetch(languages))
 report["missing_after"] = list(grammars.missing_grammars(languages))

@@ -32,7 +32,7 @@ Two suites need a machine resource that is not in the repository, and both **ski
 rather than failing — right on a laptop, wrong in CI, so CI pre-seeds and then requires them:
 
 ```bash
-uv run python -c "from manicule.parsers import grammars; grammars.prefetch(grammars.DECLARED_LANGUAGES)"
+uv run manicule doctor --fix                      # seeds the declared tree-sitter grammars
 uv run tools/prefetch_embedding_models.py --mlx   # add --full for BAAI/bge-m3, ~4.6 GB
 ```
 
@@ -50,9 +50,11 @@ To produce a bundle for a host with no network access, run this on a machine tha
 copy the directory over:
 
 ```bash
-uv run tools/build_grammar_bundle.py --output dist/grammars   # or --package to make it installable
-MANICULE_GRAMMAR_BUNDLE=/path/to/grammars uv run python -c \
-  "from manicule.parsers import grammars; print(grammars.prefetch(grammars.DECLARED_LANGUAGES))"
+uv run tools/build_grammar_bundle.py --output dist/grammars              # a directory to copy
+uv run tools/build_grammar_bundle.py --output dist/pkg --package         # an installable one
+MANICULE_GRAMMAR_BUNDLE=/path/to/grammars uv run manicule doctor --fix   # seeds from the copy
+uv pip install /path/to/pkg                                              # or install it, and
+uv run manicule doctor --fix                                             # need no variable
 ```
 
 A bundle is valid for one platform and one `tree-sitter-language-pack` release, and manicule

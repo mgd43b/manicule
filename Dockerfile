@@ -72,26 +72,15 @@ ENV PATH=/opt/manicule/venv/bin:$PATH
 # pre-seeds the declared set, copies each library, and records the pack release, the platform
 # and a SHA-256 per library — so what lands in the image is described rather than assumed.
 #
-# `--package` writes an importable `manicule_grammars` module. It does not write packaging
-# metadata, so the minimal pyproject.toml below is this file's to supply; the point of taking
-# that route rather than the `MANICULE_GRAMMAR_BUNDLE` environment variable is that an
-# installed distribution is what `grammar_bundle.locate()` finds with nothing configured, and
-# nothing configured is one fewer thing for a deployment to get wrong.
+# `--package` writes an installable `manicule-grammars` distribution — the module, the bundle
+# as package data, and the packaging metadata. This file supplied that metadata itself until
+# #62; it no longer does, and it should not: the version and description name the pack release
+# and the platform the bundle is valid for, which are facts the builder knows and a Dockerfile
+# would have to be told. The point of taking this route rather than the
+# `MANICULE_GRAMMAR_BUNDLE` environment variable is that an installed distribution is what
+# `grammar_bundle.locate()` finds with nothing configured, and nothing configured is one fewer
+# thing for a deployment to get wrong.
 RUN python tools/build_grammar_bundle.py --output /build/grammars --package --prefetch
-COPY <<'EOF' /build/grammars/pyproject.toml
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[project]
-name = "manicule-grammars"
-version = "0.0.0"
-description = "Offline tree-sitter grammars for one platform and one pack release."
-requires-python = ">=3.12"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/manicule_grammars"]
-EOF
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/manicule/venv/bin/python /build/grammars
 
@@ -206,12 +195,22 @@ if bad:
 "
 }
 
-python -c "
-from manicule.parsers import grammars
-print(grammars.bundle_status())
-print('seeded:', grammars.prefetch(grammars.DECLARED_LANGUAGES))
-missing = grammars.missing_grammars(grammars.DECLARED_LANGUAGES)
-assert not missing, f'grammars still missing after seeding from the bundle: {missing}'
+# Seeding the grammars out of the installed bundle, through the command an operator would run
+# rather than through a call into manicule's internals. This step used to reach for `prefetch`
+# directly because nothing shipped called it; `doctor --fix` is now that caller, so the image
+# is built the way an air-gapped host is repaired. With `--network=none` in force, the grammars
+# that land in the cache can only have come out of the installed distribution.
+#
+# The state is read out of the envelope, and `ok` specifically: a missing grammar is *degraded*
+# — an installation with no code in its corpus is fine as it is — so `assert_healthy` below
+# would not catch an image that shipped without them, and this image is meant to have them.
+manicule --json doctor --fix | python -c "
+import json, sys
+checks = {check['name']: check for check in json.load(sys.stdin)['data']['checks']}
+grammars = checks['grammars']
+print('grammars:', grammars['detail'])
+if grammars['state'] != 'ok':
+    raise SystemExit(f'the image did not seed its grammars from the bundle: {grammars}')
 "
 # Against the real `/data` first, before anything is redirected: this is the check that the
 # directory the image ships — the one a named volume inherits its ownership and mode from —
