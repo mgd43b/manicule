@@ -141,9 +141,9 @@ The consequence worth remembering:
 * ``precise`` needs **16k**, and fits the default generator's 32768 with room to spare.
 
 **The similarity floors have now been measured, and all three inherited values were wrong.**
-The sweep — 16 questions this corpus answers against 21 it demonstrably cannot, over 604 chunks
-with BGE-M3 — found unrelated text sitting at a top-1 cosine of 0.33 to 0.47 and real questions
-at 0.56 to 0.72. Against that distribution the old numbers did the following:
+The sweep — 16 questions this corpus answers against 22 it cannot (16 off-topic and 6 of
+gibberish), over 604 chunks with BGE-M3 — found unrelated text at a top-1 cosine of 0.33 to 0.47
+and real questions at 0.56 to 0.72. Against that distribution the old numbers did the following:
 
 * ``fast``'s 0.5 sat *inside* the relevant range and discarded 7 of 160 passages a real query
   wanted — the floor was eating answers.

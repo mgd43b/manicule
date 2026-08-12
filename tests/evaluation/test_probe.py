@@ -417,3 +417,30 @@ async def test_a_version_number_in_a_title_is_not_mistaken_for_an_extension(
     items = await probe_from_titles(store, workspace_ids=SCOPE, limit=100)
 
     assert {item.text for item in items} == {"release 2.1 notes", "release 2.2 notes"}
+
+
+async def test_a_trailing_version_number_is_not_stripped_as_an_extension(
+    store: SqliteDocStore,
+) -> None:
+    """``version 2.1`` and ``version 2.2`` must stay two titles, not collapse into one.
+
+    A suffix has to contain a letter to count as an extension. Without that rule both strip to
+    ``version 2``, the uniqueness check sees a collision, and two perfectly good probe items
+    disappear — the same silent-loss failure the word count used to cause, one case narrower.
+    """
+    from tests.storage_helpers import make_document  # noqa: PLC0415 - only these tests need it
+
+    for minor in ("1", "2"):
+        await store.upsert_document(
+            make_document(
+                source="fixture",
+                source_id=f"version-2-{minor}",
+                title=f"version 2.{minor}",
+                uri=f"file:///version-2-{minor}.md",
+                body=b"version",
+            )
+        )
+
+    items = await probe_from_titles(store, workspace_ids=SCOPE, limit=100)
+
+    assert {item.text for item in items} == {"version 2.1", "version 2.2"}

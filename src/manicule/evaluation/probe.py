@@ -357,22 +357,30 @@ def _is_hit(item: ProbeItem, results: Sequence[ResultItem]) -> bool:
     return False
 
 
-def _without_extension(title: str) -> str:
-    """``retrieval.md`` -> ``retrieval``, and ``version 2.1 notes`` unchanged.
-
-    Only a trailing dot-suffix that looks like a file extension is removed: short, alphanumeric,
-    and with something in front of it. A title is not a path, so ``pathlib`` is the wrong tool —
-    it would take ``version 2.1 notes`` down to ``version 2``, inventing a collision between two
-    documents that never shared a name.
-    """
-    stem, dot, suffix = title.rpartition(".")
-    if dot and stem and suffix.isalnum() and len(suffix) <= _EXTENSION_MAX:
-        return stem.strip()
-    return title
-
-
 _EXTENSION_MAX = 5
 """Longest trailing suffix treated as a file extension. Covers ``json``, ``jsonl``, ``xhtml``."""
+
+
+def _without_extension(title: str) -> str:
+    """``retrieval.md`` -> ``retrieval``, leaving ``version 2.1`` and ``release 2.1 notes`` alone.
+
+    Only a trailing dot-suffix that looks like a file extension is removed: short, alphanumeric,
+    **containing at least one letter**, and with something in front of it. A title is not a path,
+    so ``pathlib`` is the wrong tool — it would take ``release 2.1 notes`` down to ``release 2``,
+    inventing a collision between two documents that never shared a name. The letter requirement
+    separates ``mp3`` and ``h5``, which are extensions, from ``1`` and ``22``, which are version
+    components; without it ``version 2.1`` silently becomes ``version 2``.
+    """
+    stem, dot, suffix = title.rpartition(".")
+    if (
+        dot
+        and stem
+        and suffix.isalnum()
+        and any(character.isalpha() for character in suffix)
+        and len(suffix) <= _EXTENSION_MAX
+    ):
+        return stem.strip()
+    return title
 
 
 async def probe_from_titles(

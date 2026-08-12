@@ -24,12 +24,12 @@ it, which is the same idea asked of the leg that already solved it.
 **Cosine is rescaled against the corpus's noise level, because raw cosine is not centred on
 zero.** A query with no relationship to anything indexed still returns its nearest neighbours,
 and those neighbours are not far away in absolute terms: measured over a 604-chunk corpus,
-unrelated questions topped out at 0.467 while real ones started at 0.560
-(``docs/retrieval.md`` §8.4). Read raw, those two are a tenth of a point apart on a scale whose
-bands are cut at 0.20 and 0.45, so noise and signal land in the same band. Subtracting the
-measured noise level and dividing by the distance to a strong match is what makes "nothing in
-this corpus resembles your question" expressible at all — the same move the evaluation harness
-makes when it reports a hit rate against a chance rate rather than bare.
+unrelated questions averaged at most 0.457 across their context passages while real ones
+averaged at least 0.531 (``docs/retrieval.md`` §8.4). Read raw, the two populations sit a
+fifteenth of a point apart and land in the same band, which is exactly what was reported.
+Subtracting the measured noise level and dividing by the distance to a strong match is what
+makes "nothing in this corpus resembles your question" expressible at all — the same move the
+evaluation harness makes when it reports a hit rate against a chance rate rather than bare.
 
 **There is no support-breadth term, and removing it was a measured correction rather than a
 simplification.** Counting distinct documents was meant to separate "one document said so" from
