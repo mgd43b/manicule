@@ -229,6 +229,7 @@ _PAYLOADS: dict[str, type[Payload]] = {
     "document_reindex": r.DocumentReindexed,
     "doctor": r.Diagnosis,
     "connector_list": r.ConnectorList,
+    "connector_login": r.ConnectorSignedIn,
     "connector_sync": r.IngestReport,
     "config_get": r.ConfigValue,
     "config_set": r.ConfigChange,
@@ -257,6 +258,36 @@ The envelope carries JSON, so rendering has to know what to parse it back into. 
 than a field on the envelope, because the wire format is what an external consumer reads and
 a Python class name means nothing to one.
 """
+
+
+SESSION_PROMPT = (
+    "Paste the Cookie header from a browser already signed in to Confluence "
+    "(it will not be echoed): "
+)
+
+
+def read_secret(prompt: str) -> str:
+    """A secret from the terminal without echoing it, or from a pipe when there is no terminal.
+
+    Public so that the no-echo path can be asserted directly. It is the one piece of this
+    command that is not a service call, and a test that drove it through the terminal instead
+    would be asserting on what a pseudo-terminal echoes.
+
+    Never an argument. A credential on the command line is a credential in the shell's history
+    and in every process listing on the machine, and this one is a live session against a
+    corporate system.
+
+    Raises:
+        ConfigError: Nothing was given.
+    """
+    import getpass  # noqa: PLC0415 - only this function needs it
+
+    given = getpass.getpass(prompt) if sys.stdin.isatty() else sys.stdin.readline()
+    text = given.strip()
+    if not text:
+        msg = "nothing was pasted, so there is no session to store"
+        raise ConfigError(msg)
+    return text
 
 
 def _from_stdin(given: str | None) -> str:
@@ -473,6 +504,26 @@ def connector_sync(
 ) -> None:
     """Run one configured connector."""
     emit("connector_sync", lambda service: service.connector_sync(name, limit=limit))
+
+
+@connector_app.command("login")
+def connector_login(
+    name: Annotated[str, typer.Argument(help="The configured source's name.")],
+    forget: Annotated[
+        bool, typer.Option("--forget", help="Remove the stored session instead of taking one.")
+    ] = False,
+) -> None:
+    """Capture the browser session a Confluence source behind single sign-on authenticates with.
+
+    Sign in to Confluence in your own browser first, then paste the ``Cookie`` header from its
+    developer tools when this asks. manicule never asks for your password, cannot use one, and
+    has nowhere to put one.
+    """
+    cookies = "" if forget else read_secret(SESSION_PROMPT)
+    emit(
+        "connector_login",
+        lambda service: service.connector_login(name, cookies=cookies, forget=forget),
+    )
 
 
 # --- workspace --------------------------------------------------------------------------------

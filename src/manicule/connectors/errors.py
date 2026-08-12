@@ -24,6 +24,7 @@ __all__ = [
     "NotFoundError",
     "RateLimitedError",
     "RemoteError",
+    "SessionExpiredError",
     "UntrustedLinkError",
 ]
 
@@ -98,3 +99,26 @@ class UntrustedLinkError(ConnectorError):
 
 class AttachmentTooLargeError(ConnectorError):
     """An attachment exceeded the configured size ceiling and was not downloaded whole."""
+
+
+class SessionExpiredError(ConnectorError):
+    """The browser session this connector authenticates with is no longer usable.
+
+    Its own class because it is the one credential failure a person answers by going back to a
+    browser rather than by editing configuration, and because it does not arrive as a 401. An
+    instance behind an identity provider answers an expired session with a redirect to that
+    provider, so "signed out" reaches the client as a 302, or as a **200 whose body is a
+    sign-in page** — a response that is successful by every measure a client usually applies.
+    Indexing that page as content is the worst outcome available here: it is plausible text,
+    it arrives for every request, and nothing downstream can tell it from a document.
+
+    Raised in three places, all of which mean the same thing to the run: before the first
+    request, when the stored session is older than this connector will trust; before any
+    request, when the session ages out mid-sync; and on any response that shows the request
+    was answered by a sign-in rather than by Confluence.
+
+    The run stops rather than pausing. Renewal is an out-of-band act — a person signs in to a
+    browser — and there is no interval a sync can usefully wait; the cursor it is holding
+    would expire first (:class:`CursorExpiredError`). Stopping leaves the watermark
+    unadvanced, so a re-run after a fresh sign-in resumes rather than starting over.
+    """

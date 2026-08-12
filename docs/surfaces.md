@@ -185,6 +185,7 @@ commands group several operations, and some operations have no tool at all.
 | `doctor` | ✓ | `doctor` | diagnostics |
 | `connector_list` | ✓ | `connector list` | configured sources |
 | `connector_sync` | ✓ | `connector sync` | run counters |
+| `connector_login` | — | `connector login` | who a captured browser session belongs to |
 | `config_get` | ✓ | `config get` / `config show` | configuration, redacted |
 | `config_set` | ✓ | `config set` | the key, before and after |
 | `workspace_list` | ✓ | `workspace list` | workspaces, active marked |
@@ -204,11 +205,15 @@ commands group several operations, and some operations have no tool at all.
 
 ### Operations with no MCP tool, and why
 
-`reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop` and the `auth` verbs
-are command-line only. Each of them either destroys data, mints a credential, or changes what
-the installation *is* — and a tool an assistant can call unattended should not be able to do
-any of that. The nineteen tools read the corpus, write documents into it, and adjust
-configuration. That is the whole surface.
+`reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login` and
+the `auth` verbs are command-line only. Each of them either destroys data, mints a credential,
+or changes what the installation *is* — and a tool an assistant can call unattended should not
+be able to do any of that. The nineteen tools read the corpus, write documents into it, and
+adjust configuration. That is the whole surface.
+
+`connector_login` is in that list for the credential reason and for one more: it reads a secret
+from a terminal without echoing it. A surface that cannot do that would have to accept the
+secret as a parameter, and a session cookie in a tool call is a session cookie in a transcript.
 
 ---
 

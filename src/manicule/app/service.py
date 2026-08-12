@@ -29,6 +29,7 @@ import platform
 import time
 import tomllib
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -385,6 +386,73 @@ class ApplicationService:
         ingestion = await self._backend.ingestion()
         report = await ingestion.sync(name, limit=limit)
         return _ingest_payload(report, started)
+
+    async def connector_login(
+        self, name: str, *, cookies: str = "", forget: bool = False
+    ) -> r.ConnectorSignedIn:
+        """Capture the browser session a Confluence source authenticates with, or forget it.
+
+        The session is proved against the instance before it is stored, because a cookie copied
+        short, copied from the wrong tab or copied from a session that had already timed out is
+        indistinguishable from a working one until something uses it — and otherwise the first
+        thing to use it would be the first page of the next sync.
+
+        manicule never sees the password. The caller supplies cookies from a browser that is
+        already signed in; there is no parameter here that could carry a password and no code
+        path that would accept one.
+
+        Args:
+            name: The configured source. Its type must be the Confluence connector, which is
+                the only one that authenticates this way.
+            cookies: The ``Cookie`` header from a signed-in browser.
+            forget: Remove the stored session instead of capturing one.
+
+        Raises:
+            UnknownEntityError: Configuration has no connector by that name.
+            ConfigError: That connector is not a Confluence source, or the paste carried no
+                cookies, or the instance would not confirm who the session belongs to.
+        """
+        from manicule.connectors.config import (  # noqa: PLC0415 - no HTTP stack at import
+            CONNECTOR_NAME,
+            ConfluenceConfig,
+        )
+        from manicule.connectors.sessions import capture, default_store  # noqa: PLC0415
+
+        configured = self.settings.connectors.get(name)
+        if configured is None:
+            known = ", ".join(sorted(self.settings.connectors)) or "none configured"
+            msg = f"no connector named {name!r}. Configured: {known}"
+            raise UnknownEntityError(msg)
+        if configured.type != CONNECTOR_NAME:
+            msg = (
+                f"{name!r} is a {configured.type!r} source, and a browser session is how the "
+                f"{CONNECTOR_NAME!r} connector authenticates against an instance behind an "
+                f"identity provider. Nothing else has a session to capture."
+            )
+            raise ConfigError(msg)
+        config = ConfluenceConfig.model_validate(configured.options)
+        store = default_store()
+        if forget:
+            store.forget(config.base_url)
+            return r.ConnectorSignedIn(
+                name=name,
+                base_url=config.base_url,
+                account="",
+                captured_at="",
+                expires_at="",
+                stored_in=store.describe(),
+                forgotten=True,
+            )
+        session = await capture(config, cookies, store=store)
+        expires = session.captured_at + timedelta(hours=config.session_max_age_hours)
+        return r.ConnectorSignedIn(
+            name=name,
+            base_url=config.base_url,
+            account=session.account,
+            captured_at=session.captured_at.isoformat(),
+            expires_at=expires.isoformat(),
+            stored_in=store.describe(),
+        )
 
     async def connector_list(self) -> r.ConnectorList:
         """Every configured source, with what the last run recorded."""

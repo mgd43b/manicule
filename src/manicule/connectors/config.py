@@ -30,6 +30,7 @@ from manicule.core.errors import ConfigError
 __all__ = [
     "CONNECTOR_NAME",
     "FILESYSTEM_CONNECTOR_NAME",
+    "AuthMethod",
     "ConfluenceConfig",
     "Deployment",
     "FilesystemConfig",
@@ -82,10 +83,41 @@ class Deployment(StrEnum):
     """
 
     CLOUD = "cloud"
-    """Atlassian-hosted. Email plus API token, Basic, and bodies in Atlassian Document Format."""
+    """Atlassian-hosted. Bodies in Atlassian Document Format."""
 
     SERVER = "server"
-    """Server or Data Center. Personal access token, Bearer, and bodies in storage format."""
+    """Server or Data Center. Bodies in storage format."""
+
+
+class AuthMethod(StrEnum):
+    """What a request proves this account with — a separate question from which Confluence it is.
+
+    These were one question until browser sessions arrived, because each deployment had exactly
+    one credential. They are not one question: a self-hosted instance behind an identity
+    provider is Server or Data Center for every purpose that decides how a *body* is read, and
+    frequently has personal access tokens disabled by policy, so the credential it can offer is
+    the browser session its users already hold.
+
+    Splitting the axis is what keeps :class:`Deployment` meaning one thing. A third deployment
+    value would have made ``server`` and ``server-behind-sso`` two spellings of the same body
+    format, and every branch that reads a body would then have had to know about both.
+    """
+
+    API_TOKEN = "api_token"  # noqa: S105 - the name of a credential kind, not a credential
+    """Cloud. ``email:token`` over Basic; the token alone authenticates as nobody."""
+
+    PERSONAL_ACCESS_TOKEN = "personal_access_token"  # noqa: S105 - a kind, not a credential
+    """Server or Data Center. A scoped token, sent as a Bearer credential."""
+
+    BROWSER_SESSION = "browser_session"
+    """Server or Data Center. The cookies of a session a person signed in to in their browser.
+
+    Unlike the other two this is not a static string manicule can hold indefinitely: it expires
+    on the instance's schedule, it is renewed out of band, and it carries the whole of that
+    person's identity rather than a narrow grant. Everything about how it is captured, stored,
+    consulted and retired follows from those three facts —
+    :mod:`manicule.connectors.credentials` and :mod:`manicule.connectors.sessions`.
+    """
 
 
 class ConfluenceConfig(BaseModel):
@@ -105,6 +137,43 @@ class ConfluenceConfig(BaseModel):
     )
 
     deployment: Deployment = Deployment.CLOUD
+
+    auth: AuthMethod | None = Field(
+        default=None,
+        description="How to authenticate. Unset means the deployment's usual credential — an "
+        "API token for Cloud, a personal access token for Server and Data Center — so an "
+        "existing configuration keeps working without naming it. Set it to "
+        "``browser_session`` for an instance whose identity provider makes personal access "
+        "tokens unobtainable.",
+    )
+    """Read through :attr:`auth_method`, which resolves the ``None`` default. It is kept
+    nullable rather than defaulted per deployment because the default is a function of another
+    field, and a stored ``api_token`` that silently meant something else after ``deployment``
+    changed would be a configuration that lies about itself."""
+
+    session_max_age_hours: float = Field(
+        default=12.0,
+        gt=0.0,
+        description="How long after capture manicule will keep using a browser session before "
+        "refusing it and asking for a fresh sign-in.",
+    )
+    """A session cookie carries no expiry manicule can read: the instance decides when it dies
+    and says so only by answering a request with a sign-in page. This is manicule's own ceiling
+    rather than the instance's, and it exists so that a dead session is a **startup** refusal
+    naming what to do, rather than something discovered at the first page of a sync. Set it near
+    the identity provider's own session lifetime; too high costs nothing but a later, noisier
+    failure, and too low costs an unnecessary sign-in."""
+
+    session_env: str = Field(
+        default="CONFLUENCE_SESSION_COOKIE",
+        min_length=1,
+        description="Environment variable consulted for a browser session on a machine with no "
+        "macOS Keychain. The variable holds the cookies exactly as they would be pasted.",
+    )
+    """The credential is never read from configuration. ``extra='forbid'`` on this model means
+    a ``session_cookie`` key in ``config.toml`` is a startup error rather than a working
+    setting, and that is deliberate: a session cookie is the sync account's whole identity, and
+    a configuration file is a file that ends up in version control eventually."""
 
     email: str = Field(
         default="",
@@ -228,7 +297,37 @@ class ConfluenceConfig(BaseModel):
             if not space.strip():
                 msg = "spaces contains an empty key; remove it rather than syncing everything"
                 raise ValueError(msg)
+        if self.auth is AuthMethod.BROWSER_SESSION and self.deployment is not Deployment.SERVER:
+            msg = (
+                "auth = 'browser_session' is a Server/Data Center arrangement and this is "
+                "configured as Cloud. Cloud sessions are held by Atlassian's own domains and "
+                "are not a credential a REST client can carry; Cloud authenticates with an API "
+                "token created at https://id.atlassian.com/manage-profile/security/api-tokens. "
+                "Refused rather than attempted, because an attempt would authenticate as "
+                "nobody and index whatever an anonymous reader can see."
+            )
+            raise ValueError(msg)
+        if self.auth is AuthMethod.API_TOKEN and self.deployment is not Deployment.CLOUD:
+            msg = (
+                "auth = 'api_token' is Cloud's credential and this is configured as "
+                "Server/Data Center, which has no API tokens. Use 'personal_access_token', or "
+                "'browser_session' if this instance's identity provider has disabled them."
+            )
+            raise ValueError(msg)
         return self
+
+    @property
+    def auth_method(self) -> AuthMethod:
+        """How this configuration authenticates, with the deployment's default filled in.
+
+        Every reader goes through this rather than through :attr:`auth`, so that "unset" is
+        resolved in exactly one place instead of once per call site with one of them wrong.
+        """
+        if self.auth is not None:
+            return self.auth
+        if self.deployment is Deployment.CLOUD:
+            return AuthMethod.API_TOKEN
+        return AuthMethod.PERSONAL_ACCESS_TOKEN
 
     @property
     def origin(self) -> str:
@@ -250,12 +349,21 @@ def resolve_credentials(
 
     An explicitly configured token is never overwritten by an environment variable.
 
+    **A browser session is not resolved here and never lands on this model.** It is a secret
+    with a lifetime, it lives in the operating system's keychain rather than in configuration,
+    and reading it costs a subprocess — none of which belongs in a module that plugin discovery
+    imports in every process that starts. :func:`manicule.connectors.credentials.credential_for`
+    does that half, and the factory calls both before constructing anything.
+
     Raises:
         ConfigError: The credential for this deployment is absent, or Cloud was configured
             without the email its Basic credential needs.
     """
     env = os.environ if environ is None else environ
     resolved = config
+
+    if config.auth_method is AuthMethod.BROWSER_SESSION:
+        return resolved
 
     if config.deployment is Deployment.CLOUD:
         token = config.api_token or _secret(env.get(config.token_env))
