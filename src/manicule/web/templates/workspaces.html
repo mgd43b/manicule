@@ -1,0 +1,31 @@
+{#
+  One person with several corpora, not several people. Workspaces are a scoping mechanism,
+  and the scope is enforced twice — as a predicate in the store and as identity arithmetic at
+  the surface — so this page can only ever describe the one this process serves.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+{% if panels.workspaces.ok %}
+<p class="muted">Active: <strong>{{ panels.workspaces.data.active }}</strong></p>
+<table>
+  <thead><tr><th>Workspace</th><th>Name</th><th>Mode</th><th>Documents</th></tr></thead>
+  <tbody>
+    {% for item in panels.workspaces.data.workspaces %}
+    <tr{% if item.active %} class="current"{% endif %}>
+      <td><code>{{ item.id }}</code></td>
+      <td>{{ item.name }}</td>
+      <td>{{ item.mode }}</td>
+      <td>{{ item.documents if item.documents is not none else '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="muted">
+  Counts are the active workspace's only. This process is scoped to one tenant and cannot read
+  another's rows, including to count them. Switching is
+  <code>manicule workspace switch &lt;name&gt;</code> at a terminal: it has no route on any
+  network surface, so there is no button here that pretends otherwise.
+</p>
+{% else %}{{ m.failed(panels.workspaces) }}{% endif %}
+{% endblock %}

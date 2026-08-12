@@ -1,0 +1,45 @@
+{#
+  One document as it was chunked. This is the view that tells a chunking problem apart from a
+  retrieval one, so it shows the units the index is built from rather than the file.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+{% if panels.workbench.ok %}
+{% set doc = panels.workbench.data.document %}
+<section class="panel">
+  <h2>{{ doc.title or doc.source_id }}</h2>
+  <dl class="facts">
+    <dt>Identifier</dt><dd><code>{{ doc.id }}</code></dd>
+    <dt>Source</dt><dd>{{ doc.source }} · {{ doc.source_id }}</dd>
+    <dt>URI</dt><dd>{{ doc.uri }}</dd>
+    <dt>Media type</dt><dd>{{ doc.media_type }}</dd>
+    <dt>Status</dt><dd>{{ m.state(doc.status) }}{% if doc.status_detail %} {{ doc.status_detail }}{% endif %}</dd>
+    <dt>Content hash</dt><dd><code>{{ doc.content_hash }}</code></dd>
+    <dt>Blocks</dt><dd>{{ panels.workbench.data.count }} · {{ panels.workbench.data.tokens }} tokens</dd>
+  </dl>
+  <div class="actions">
+    <button type="button" class="ghost" data-reindex="{{ doc.id }}">Reindex</button>
+    <button type="button" class="ghost danger" data-trash="{{ doc.id }}">Move to trash</button>
+    <span class="muted" data-document-status></span>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Blocks</h2>
+  {% if panels.workbench.data.blocks %}
+  <ol class="blocks">
+    {% for block in panels.workbench.data.blocks %}
+    <li>
+      <p class="meta">
+        #{{ block.position }} · {{ block.kind }} · {{ block.token_count }} tokens
+        {{ m.trail(block.heading_path) }}
+      </p>
+      <pre>{{ block.text }}</pre>
+    </li>
+    {% endfor %}
+  </ol>
+  {% else %}{{ m.empty('This document produced no blocks.') }}{% endif %}
+</section>
+{% else %}{{ m.failed(panels.workbench) }}{% endif %}
+{% endblock %}

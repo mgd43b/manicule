@@ -9,6 +9,13 @@ line is a rule an assistant can walk around; a rule implemented in a route is on
 does not have. The only durable defence is a test that fails the moment they stop being the
 same call — so when a third surface arrived, this file grew a third column rather than a
 parallel file with its own idea of what parity means.
+
+**The browser surface is the fourth column**, and it is a different kind of claim. A page is
+HTML, so it cannot be compared byte for byte with an envelope; what *is* asserted is that the
+page's content came from that envelope — a value the tool reported is found in the page, and a
+failure the tool reports is the failure the page shows, with the same type and the same message.
+That is the property that would break if a page ever computed something of its own, which is the
+only thing this file has ever been for.
 """
 
 from __future__ import annotations
@@ -153,6 +160,14 @@ type Envelopes = dict[str, Any]
 type HttpCall = tuple[str, str, dict[str, Any]] | None
 """A method, a path and request keyword arguments — or ``None`` for an operation with no route."""
 
+type WebPage = tuple[str, tuple[str | int, ...]] | None
+"""A page of the browser surface and a key path into the payload it must render.
+
+``None`` where this operation has no page, or where the fixture produces nothing for a page to
+show — an empty connector list renders "no connectors are configured", which is the right page
+and carries no value from the envelope to assert on.
+"""
+
 
 def _http(service: ApplicationService, method: str, path: str, **kwargs: Any) -> Envelopes:
     """Run one request against the **real** application and parse its envelope.
@@ -169,27 +184,58 @@ def _http(service: ApplicationService, method: str, path: str, **kwargs: Any) ->
         return body
 
 
-PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall], ...] = (
+PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
     (
         "search",
         {"query": "retry"},
         ["search", "retry"],
         ("GET", "/api/v1/search", {"params": {"q": "retry"}}),
+        ("/ui/search?q=retry", ("confidence_reason",)),
     ),
-    ("document_list", {}, ["document", "list"], ("GET", "/api/v1/documents", {})),
-    ("stats", {}, ["index", "--stats"], ("GET", "/api/v1/stats", {})),
-    ("index_status", {}, ["index"], ("GET", "/api/v1/admin/stats", {})),
-    ("doctor", {}, ["doctor"], ("GET", "/api/v1/health", {})),
-    ("connector_list", {}, ["connector", "list"], ("GET", "/api/v1/admin/connectors", {})),
-    ("workspace_list", {}, ["workspace", "list"], ("GET", "/api/v1/workspaces", {})),
-    ("plugin_list", {}, ["plugin", "list"], ("GET", "/api/v1/plugins", {})),
-    ("config_get", {"key": "rag.profile"}, ["config", "get", "rag.profile"], None),
+    (
+        "document_list",
+        {},
+        ["document", "list"],
+        ("GET", "/api/v1/documents", {}),
+        ("/ui/documents", ("documents", 0, "id")),
+    ),
+    ("stats", {}, ["index", "--stats"], ("GET", "/api/v1/stats", {}), ("/ui", ("by_media_type",))),
+    (
+        "index_status",
+        {},
+        ["index"],
+        ("GET", "/api/v1/admin/stats", {}),
+        ("/ui/settings", ("data_dir",)),
+    ),
+    (
+        "doctor",
+        {},
+        ["doctor"],
+        ("GET", "/api/v1/health", {}),
+        ("/ui/health", ("checks", 1, "detail")),
+    ),
+    ("connector_list", {}, ["connector", "list"], ("GET", "/api/v1/admin/connectors", {}), None),
+    (
+        "workspace_list",
+        {},
+        ["workspace", "list"],
+        ("GET", "/api/v1/workspaces", {}),
+        ("/ui/workspaces", ("workspaces", 0, "mode")),
+    ),
+    ("plugin_list", {}, ["plugin", "list"], ("GET", "/api/v1/plugins", {}), None),
+    ("config_get", {"key": "rag.profile"}, ["config", "get", "rag.profile"], None, None),
 )
-"""One row per operation: the MCP tool, the command, and the HTTP request that runs it.
+"""One row per operation: the MCP tool, the command, the HTTP request, and the page.
 
-``config_get`` has no HTTP column, and that is a decision rather than an omission: reading and
-writing configuration over the network is how an installation gets repointed at a different
-data directory by something holding a key. It stays on the command line and the MCP tool.
+``config_get`` has neither an HTTP column nor a page, and that is a decision rather than an
+omission: reading and writing configuration over the network is how an installation gets
+repointed at a different data directory by something holding a key. It stays on the command line
+and the MCP tool, and the browser surface's settings area shows the installation's *posture*
+from ``doctor`` and ``index_status`` instead — which is why those two rows have pages.
+
+``connector_list`` and ``plugin_list`` have pages and no page column: this fixture configures no
+connectors and installs no plugins, so their pages correctly render "there are none" and there
+is no value from the envelope to assert on. ``tests/web/test_pages.py`` covers that they answer.
 """
 
 ELAPSED = "elapsed_ms"
@@ -209,7 +255,7 @@ def _comparable(envelope: Envelopes) -> Envelopes:
     return {**envelope, "data": {key: value for key, value in typed.items() if key != ELAPSED}}
 
 
-@pytest.mark.parametrize(("tool", "arguments", "argv", "request_"), PAIRS)
+@pytest.mark.parametrize(("tool", "arguments", "argv", "request_", "page"), PAIRS)
 def test_a_tool_and_its_command_produce_the_same_envelope(
     monkeypatch: pytest.MonkeyPatch,
     service: ApplicationService,
@@ -218,6 +264,7 @@ def test_a_tool_and_its_command_produce_the_same_envelope(
     arguments: dict[str, Any],
     argv: list[str],
     request_: HttpCall,
+    page: WebPage,
 ) -> None:
     """The same operation, every way round, compared as serialised JSON.
 
@@ -225,22 +272,24 @@ def test_a_tool_and_its_command_produce_the_same_envelope(
     pretty-prints and sorts keys and the others do not, and neither of those is part of the
     contract. Everything else is.
     """
-    del request_
+    del request_, page
     from_tool = _tool(service, tool, arguments)
     from_cli = _cli(monkeypatch, service, argv)
     assert _comparable(from_tool) == _comparable(from_cli)
 
 
-@pytest.mark.parametrize(("tool", "arguments", "argv", "request_"), PAIRS)
+@pytest.mark.parametrize(("tool", "arguments", "argv", "request_", "page"), PAIRS)
 def test_the_http_surface_produces_the_same_envelope_as_the_tool(
     service: ApplicationService,
+    *,
     tool: str,
     arguments: dict[str, Any],
     argv: list[str],
     request_: HttpCall,
+    page: WebPage,
 ) -> None:
     """The third column. A route that decided anything of its own fails here."""
-    del argv
+    del argv, page
     if request_ is None:
         pytest.skip("this operation is deliberately not on the HTTP surface")
     method, path, kwargs = request_
@@ -249,7 +298,7 @@ def test_the_http_surface_produces_the_same_envelope_as_the_tool(
     assert _comparable(from_tool) == _comparable(from_http)
 
 
-@pytest.mark.parametrize(("tool", "arguments", "argv", "request_"), PAIRS)
+@pytest.mark.parametrize(("tool", "arguments", "argv", "request_", "page"), PAIRS)
 def test_every_surface_carries_the_workspace_and_the_contract_version(
     monkeypatch: pytest.MonkeyPatch,
     service: ApplicationService,
@@ -258,8 +307,10 @@ def test_every_surface_carries_the_workspace_and_the_contract_version(
     arguments: dict[str, Any],
     argv: list[str],
     request_: HttpCall,
+    page: WebPage,
 ) -> None:
     """Four keys are on every envelope, whichever surface produced it."""
+    del page
     produced = [_tool(service, tool, arguments), _cli(monkeypatch, service, argv)]
     if request_ is not None:
         method, path, kwargs = request_
@@ -268,6 +319,98 @@ def test_every_surface_carries_the_workspace_and_the_contract_version(
         assert set(envelope) == {"version", "op", "ok", "workspace", "data", "error"}
         assert envelope["workspace"] == WORKSPACE
         assert envelope["op"] == tool
+
+
+def _web(service: ApplicationService, path: str) -> str:
+    """Render one page of the browser surface, through the **real** application.
+
+    The production ``build_app`` again, so the page goes through the same routing, the same
+    principal resolution and the same middleware a browser would meet.
+    """
+    from fastapi.testclient import TestClient  # noqa: PLC0415 - only this column needs it
+
+    from manicule.api.app import build_app  # noqa: PLC0415 - keeps FastAPI out of the CLI path
+
+    with TestClient(build_app(service), client=("127.0.0.1", 41234)) as client:
+        response = client.get(path)
+        assert response.status_code == 200, response.text
+        return response.text
+
+
+def _leaf(payload: Any, keys: tuple[str | int, ...]) -> str:
+    """One value out of a payload, as the page would render it.
+
+    A counter table is rendered as its **keys** — ``by_media_type`` shows ``text/markdown``, not
+    the number beside it — so a path ending at a mapping yields its first key. Anything else is
+    stringified.
+    """
+    value: Any = payload
+    for key in keys:
+        value = value[key]
+    if isinstance(value, dict):
+        return str(next(iter(cast("dict[str, Any]", value))))
+    return str(value)
+
+
+@pytest.mark.parametrize(("tool", "arguments", "argv", "request_", "page"), PAIRS)
+def test_the_browser_surface_renders_the_tools_envelope(
+    service: ApplicationService,
+    *,
+    tool: str,
+    arguments: dict[str, Any],
+    argv: list[str],
+    request_: HttpCall,
+    page: WebPage,
+) -> None:
+    """The fourth column: a value the tool reported is on the page.
+
+    Not a byte comparison — a page is HTML — but the same claim in the form HTML can carry. The
+    marker is read out of the tool's envelope at run time rather than written down, so a page
+    that started computing its own version of a field fails here rather than passing against a
+    literal somebody updated to match.
+    """
+    del argv, request_
+    if page is None:
+        pytest.skip("this operation has no page, or this fixture gives its page nothing to show")
+    path, keys = page
+    marker = _leaf(_tool(service, tool, arguments)["data"], keys)
+    assert len(marker) >= 4, (
+        f"the marker for {tool} is {marker!r}, which is short enough to appear in a page by "
+        f"coincidence. Choose a field whose value is distinctive."
+    )
+    trail = ".".join(str(key) for key in keys)
+    assert marker in _web(service, path), f"{path} does not render {tool}'s {trail}"
+
+
+def test_a_page_reports_a_failure_exactly_as_the_tool_does(service: ApplicationService) -> None:
+    """The same operation, the same failure, on a surface that renders HTML.
+
+    A page that caught the error and wrote its own sentence would be a second description of
+    what went wrong — and the hint is usually the thing that fixes it, so losing it costs
+    something real.
+    """
+    from markupsafe import escape  # noqa: PLC0415 - only this column renders HTML
+
+    envelope = _tool(service, "document_get", {"document_id": "nope"})
+    body = _web_status(service, "/ui/documents/nope")
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] in body
+    # Escaped, because the page escapes everything — including an error message, which quotes
+    # the identifier the caller sent and is therefore attacker-controlled text like any other.
+    assert str(escape(envelope["error"]["message"])) in body
+    assert str(escape(envelope["error"]["hint"])) in body
+
+
+def _web_status(service: ApplicationService, path: str) -> str:
+    """A page that is expected to fail, with the status the error's type implies."""
+    from fastapi.testclient import TestClient  # noqa: PLC0415 - only this column needs it
+
+    from manicule.api.app import build_app  # noqa: PLC0415 - keeps FastAPI out of the CLI path
+
+    with TestClient(build_app(service), client=("127.0.0.1", 41234)) as client:
+        response = client.get(path)
+        assert response.status_code == 404, response.status_code
+        return response.text
 
 
 def test_a_failure_is_a_result_on_every_surface(

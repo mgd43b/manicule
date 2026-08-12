@@ -1,0 +1,94 @@
+{#
+  One person managing their own keys.
+
+  There is no user administration here and there is not meant to be: manicule is single-user
+  until it is feature complete, and roles, invitations and identity providers belong to team
+  mode. What a single operator needs is the two things below — which keys exist, and what this
+  installation currently demands of a caller.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+<section class="panel">
+  <h2>This request</h2>
+  <dl class="facts">
+    <dt>Authentication mode</dt><dd>{{ auth_mode }}</dd>
+    <dt>Authenticated</dt><dd>{{ 'yes' if authenticated else 'no' }}</dd>
+    <dt>Role</dt><dd>{{ role }}</dd>
+    <dt>Key</dt><dd>{{ key_name or '—' }} {% if key_id %}<code>{{ key_id }}</code>{% endif %}</dd>
+    <dt>Workspace</dt><dd>{{ workspace }}</dd>
+  </dl>
+  {% if auth_mode == 'none' %}
+  <p class="muted">
+    With <code>security.auth.mode = none</code> there is no credential to check and the caller
+    is whoever is sitting at this machine — the same authority the command line has. That is
+    only tolerable because a non-loopback bind with authentication off is refused twice: once
+    before a socket exists, and once before an application does.
+  </p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>Keys</h2>
+  <p class="muted">
+    Records, never secrets. Only a digest is stored, so a lost key is reissued rather than
+    recovered — the one copy of a secret is in the response that minted it.
+  </p>
+  <form class="filters" data-create-key>
+    <label for="key-name">Name</label>
+    <input id="key-name" name="name" required autocomplete="off">
+    <label for="key-role">Role</label>
+    <select id="key-role" name="role">
+      <option value="viewer">viewer</option>
+      <option value="member" selected>member</option>
+      <option value="admin">admin</option>
+    </select>
+    <label for="key-days">Expires in (days)</label>
+    <input id="key-days" name="expires_days" type="number" min="1" max="3650" inputmode="numeric">
+    <button type="submit">Mint</button>
+  </form>
+  <p class="secret" data-secret hidden></p>
+  <p class="muted" data-key-status></p>
+
+  {% if panels.api_keys.ok %}
+    {% if panels.api_keys.data.keys %}
+    <table>
+      <thead><tr><th>Name</th><th>Prefix</th><th>Role</th><th>Created</th><th>Expires</th><th>State</th><th></th></tr></thead>
+      <tbody>
+        {% for key in panels.api_keys.data.keys %}
+        <tr>
+          <td>{{ key.name }}</td>
+          <td><code>{{ key.prefix }}</code></td>
+          <td>{{ key.role }}</td>
+          <td>{{ key.created_at }}</td>
+          <td>{{ key.expires_at or 'never' }}</td>
+          <td>{{ 'revoked' if key.revoked else 'live' }}</td>
+          <td class="actions">
+            {% if not key.revoked %}
+            <button type="button" class="ghost danger" data-revoke="{{ key.id }}">Revoke</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}{{ m.empty('No keys have been minted.') }}{% endif %}
+  {% else %}{{ m.failed(panels.api_keys) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Identity providers</h2>
+  {% if panels.providers.ok %}
+  <p>Mode <strong>{{ panels.providers.data.mode }}</strong>, {{ panels.providers.data.count }} configured.</p>
+  {% if panels.providers.data.providers %}
+  <ul class="list">{% for name in panels.providers.data.providers %}<li>{{ name }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if panels.providers.data.detail %}<p class="muted">{{ panels.providers.data.detail }}</p>{% endif %}
+  {% else %}{{ m.failed(panels.providers) }}{% endif %}
+  <p class="muted">
+    There is no interactive login in this build. An endpoint that existed and refused every
+    attempt would read as a bug rather than as a decision, so it is absent and said out loud
+    instead.
+  </p>
+</section>
+{% endblock %}

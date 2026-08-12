@@ -1,0 +1,18 @@
+{#
+  The page a failed *primary* operation becomes.
+
+  A document detail with no document is not a page with an empty section, so the whole response
+  becomes this — at the status the error's type implies, which is the same derivation the JSON
+  surface uses. The three fields are the envelope's own: nothing is softened into "something
+  went wrong", because the hint is usually the thing that fixes it.
+#}{% extends layout %}
+{% block content %}
+<div class="panel bad">
+  <p class="op">{{ problem.op }}</p>
+  {% if problem.error %}
+  <p class="type">{{ problem.error.type }}</p>
+  <p class="message">{{ problem.error.message }}</p>
+  {% if problem.error.hint %}<p class="hint">{{ problem.error.hint }}</p>{% endif %}
+  {% endif %}
+</div>
+{% endblock %}

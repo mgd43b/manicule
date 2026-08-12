@@ -1,0 +1,47 @@
+{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+<section class="cards">
+  {% if panels.stats.ok %}
+  <article class="card"><h2>Documents</h2><p class="figure">{{ panels.stats.data.documents }}</p></article>
+  <article class="card"><h2>Chunks</h2><p class="figure">{{ panels.stats.data.chunks }}</p></article>
+  {% endif %}
+  {% if panels.doctor.ok %}
+  <article class="card"><h2>Diagnosis</h2><p class="figure">{{ m.state(panels.doctor.data.state) }}</p></article>
+  {% endif %}
+  {% if panels.workspaces.ok %}
+  <article class="card"><h2>Workspaces</h2><p class="figure">{{ panels.workspaces.data.count }}</p></article>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>Counts</h2>
+  {% if panels.stats.ok %}
+  <div class="triple">
+    <div><h3>By source</h3>{{ m.counts(panels.stats.data.by_source) }}</div>
+    <div><h3>By media type</h3>{{ m.counts(panels.stats.data.by_media_type) }}</div>
+    <div><h3>By status</h3>{{ m.counts(panels.stats.data.by_status) }}</div>
+  </div>
+  {% else %}{{ m.failed(panels.stats) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Checks</h2>
+  {% if panels.doctor.ok %}
+  <table>
+    <thead><tr><th>Check</th><th>State</th><th>Detail</th></tr></thead>
+    <tbody>
+      {% for check in panels.doctor.data.checks %}
+      <tr><td>{{ check.name }}</td><td>{{ m.state(check.state) }}</td><td>{{ check.detail }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}{{ m.failed(panels.doctor) }}{% endif %}
+</section>
+
+<p class="muted">
+  Documents arrive through <code>manicule index &lt;path&gt;</code> or a configured connector.
+  There is no upload here, and that is deliberate — see Settings.
+</p>
+{% endblock %}

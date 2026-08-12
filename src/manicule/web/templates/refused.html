@@ -1,0 +1,31 @@
+{#
+  A refusal, as a page rather than as a JSON envelope.
+
+  Standalone: somebody who may not read this page may not be shown a navigation listing what
+  exists here either. The message is the one `manicule.api.security.require` produced, so a
+  person and a program are told the same thing about what this installation wants.
+#}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{{ title }} · manicule</title>
+<link rel="stylesheet" href="{{ stylesheet }}">
+</head>
+<body class="bare">
+<main id="main">
+  <h1>{{ status }} · {{ title }}</h1>
+  <div class="panel bad">
+    <p class="message">{{ message }}</p>
+    <p class="hint">
+      A browser cannot attach a header to a page load, and this build has no session cookie —
+      a key is presented on every request instead. On an installation with authentication
+      switched on, use the HTTP API or the command line; the browser surface is for the
+      loopback, single-operator installation manicule ships as.
+    </p>
+    <p class="muted">{{ path }}</p>
+  </div>
+</main>
+</body>
+</html>

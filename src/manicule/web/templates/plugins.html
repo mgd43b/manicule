@@ -1,0 +1,68 @@
+{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+<p class="muted">
+  manicule never installs a plugin. One is imported into this process and runs with everything
+  it has — the database, the credentials, the network — so fetching and executing a package is
+  not something a browser can reach. Enabling one that is already installed takes effect at the
+  next start, because a plugin registers components into a container that is already built.
+</p>
+
+<section class="panel">
+  <h2>Installed</h2>
+  {% if panels.plugins.ok %}
+    {% if panels.plugins.data.plugins %}
+    <table>
+      <thead><tr><th>Plugin</th><th>Version</th><th>Core</th><th>Enabled</th><th>Components</th><th></th></tr></thead>
+      <tbody>
+        {% for item in panels.plugins.data.plugins %}
+        <tr>
+          <td>{{ item.name }}{% if item.summary %}<span class="muted"> {{ item.summary }}</span>{% endif %}</td>
+          <td>{{ item.version }}</td>
+          <td>{{ item.core_version }}</td>
+          <td>{{ 'yes' if item.enabled else 'no' }}</td>
+          <td>{{ item.components | length }}</td>
+          <td class="actions">
+            {% if item.enabled %}
+            <button type="button" class="ghost" data-plugin-disable="{{ item.name }}">Disable</button>
+            {% else %}
+            <button type="button" class="ghost" data-plugin-enable="{{ item.name }}">Enable</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted" data-plugin-status></p>
+    {% else %}{{ m.empty('No plugins are installed.') }}{% endif %}
+  {% else %}{{ m.failed(panels.plugins) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Health</h2>
+  {% if panels.health.ok %}
+  <p class="muted">
+    A component nothing has asked for yet is <code>unknown</code>, not <code>ok</code>: a plugin
+    that has never been built has not been proved healthy.
+  </p>
+  <table>
+    <thead><tr><th>Plugin</th><th>Version</th><th>Components</th><th>State</th><th>Detail</th></tr></thead>
+    <tbody>
+      {% for item in panels.health.data.plugins %}
+      <tr>
+        <td>{{ item.name }}</td>
+        <td>{{ item.version }}</td>
+        <td>{{ item.components }}</td>
+        <td>{{ m.state(item.state) }}</td>
+        <td>{{ item.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if panels.health.data.disabled %}
+  <p class="muted">Disabled: {{ panels.health.data.disabled | join(', ') }}</p>
+  {% endif %}
+  {% else %}{{ m.failed(panels.health) }}{% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,32 @@
+{#
+  Soft delete is the only delete this surface offers, which is what makes the destructive
+  version's absence a recoverable inconvenience rather than a missing feature. `free_restore`
+  is on the payload because restoring inside the grace period costs nothing and restoring after
+  the sweep has purged the content brings the document back empty — two different follow-ups.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+<p><a class="ghost" href="/ui/documents">Back to documents</a></p>
+
+{% if panels.trash.ok %}
+{% if panels.trash.data.documents %}
+<table>
+  <thead><tr><th>Title</th><th>Deleted</th><th>Restorable until</th><th>Content</th><th></th></tr></thead>
+  <tbody>
+    {% for entry in panels.trash.data.documents %}
+    <tr>
+      <td>{{ entry.document.title or entry.document.source_id }}</td>
+      <td>{{ entry.deleted_at }}</td>
+      <td>{{ entry.restorable_until or '—' }}</td>
+      <td>{% if entry.purged %}purged — restoring needs a re-parse{% else %}retained{% endif %}</td>
+      <td class="actions">
+        <button type="button" class="ghost" data-restore="{{ entry.document.id }}">Restore</button>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}{{ m.empty('The trash is empty.') }}{% endif %}
+{% else %}{{ m.failed(panels.trash) }}{% endif %}
+{% endblock %}

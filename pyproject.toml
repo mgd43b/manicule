@@ -118,7 +118,7 @@ connectors = [     # #9
   # the same code path a live instance would take rather than against a mocked-out client.
   "httpx>=0.28",
 ]
-serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API.
+serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #12 — the browser UI.
   # Typer derives the command line from type hints, so the signature of a service call and
   # the shape of the command that reaches it cannot drift. MIT.
   "typer>=0.15",
@@ -138,6 +138,13 @@ serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API.
   # The websocket protocol implementation uvicorn dispatches to. Without it a `ws://` client
   # is refused at the handshake by a server that otherwise looks healthy. BSD-3-Clause.
   "websockets>=13.0",
+  # The browser surface's templates. Pure Python, no extension, no build step — which is the
+  # whole reason the UI is server-rendered HTML rather than a compiled single-page application:
+  # `uv sync` stays the entire install and the container image stays free of a Node toolchain.
+  # What is bought is `autoescape`, and on a surface that renders model output over documents
+  # somebody else wrote, escaping is the security property rather than a convenience.
+  # BSD-3-Clause.
+  "jinja2>=3.1",
 ]
 
 # The built-in parsers and the chunker register the same way a third-party plugin does, through

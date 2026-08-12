@@ -16,6 +16,13 @@ and the usual workaround puts the key in the URL — where it lands in the acces
 browser history and any ``Referer`` the page sends. manicule reads it from the subprotocol
 header instead, which is the one field a browser *can* set, and echoes the chosen subprotocol
 back so the handshake completes.
+
+**And the origin is checked here rather than in middleware**, for the same reason: an HTTP
+middleware never sees a websocket scope. That gap matters more here than anywhere else on the
+surface, because a browser applies **no** cross-origin policy to a ``WebSocket`` — no preflight,
+no CORS, and the page reads every frame that comes back. On the posture manicule ships as,
+loopback with ``security.auth.mode`` at ``none``, an unchecked handshake is any page the
+operator visits asking the corpus questions and reading the answers.
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ from pydantic import ValidationError
 
 from manicule.api.context import policy_of, service_of
 from manicule.api.models import AskBody
+from manicule.api.origins import HANDSHAKE_REFUSAL, ORIGIN, handshake_permitted
 from manicule.api.proxy import FORWARDED_FOR
 from manicule.api.security import Principal, require, websocket_token
 from manicule.api.streaming import answer_frames
@@ -47,7 +55,11 @@ INVALID_PAYLOAD = 1007
 """The close code for a message this server cannot read."""
 
 
-@router.websocket("/api/v1/chat/ws")
+# ``name="ask"``, the same as the two HTTP chat routes, because it is the same operation and
+# the envelopes it sends say so. Without it the route's name is the handler's — ``chat_socket``
+# — which is a word that appears in no other surface's vocabulary. Nothing noticed for a while
+# because the check that enumerates route names was walking a shape FastAPI had stopped using.
+@router.websocket("/api/v1/chat/ws", name="ask")
 async def chat_socket(websocket: WebSocket) -> None:
     """Stream answers over one connection, one question per message.
 
@@ -61,6 +73,21 @@ async def chat_socket(websocket: WebSocket) -> None:
     """
     service = service_of(websocket)  # pyright: ignore[reportArgumentType] - reads `app.state` only
     policy = policy_of(websocket)  # pyright: ignore[reportArgumentType] - reads `app.state` only
+
+    origin = websocket.headers.get(ORIGIN)
+    if not handshake_permitted(
+        origin=origin,
+        host=websocket.headers.get("host"),
+        allowed_origins=service.settings.security.transport.allowed_origins,
+    ):
+        # Before `accept`, and before the credential is even looked at: a connection that is
+        # refused after accepting has already told the page it exists, and the first question
+        # may already be queued.
+        await websocket.close(
+            code=POLICY_VIOLATION, reason=HANDSHAKE_REFUSAL.format(origin=origin or "")[:120]
+        )
+        return
+
     token, subprotocol = websocket_token(websocket)
     client = websocket.client
     principal = Principal(

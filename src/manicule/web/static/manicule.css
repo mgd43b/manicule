@@ -1,0 +1,245 @@
+/* manicule browser surface.
+ *
+ * Hand-written, and that is the point rather than an economy: nothing here is generated, so
+ * `uv sync` remains the whole install and the container image stays free of a Node toolchain.
+ * Two colour schemes, both stated as custom properties, so the theme toggle changes one
+ * attribute rather than restyling anything.
+ */
+
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfa;
+  --panel: #ffffff;
+  --ink: #1b1b1a;
+  --muted: #6a6a66;
+  --line: #e0e0dc;
+  --accent: #2f5d50;
+  --accent-ink: #ffffff;
+  --bad: #8c2f2f;
+  --warn: #8a6100;
+  --ok: #2f6b45;
+  --radius: 8px;
+  --gap: 1rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181a;
+    --panel: #1e2124;
+    --ink: #e8e8e4;
+    --muted: #9a9a94;
+    --line: #303438;
+    --accent: #6fae99;
+    --accent-ink: #10231d;
+    --bad: #e08585;
+    --warn: #d8ac52;
+    --ok: #7fc39c;
+  }
+}
+
+/* The toggle wins in both directions: a reader who chose light on a dark system gets light. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #fbfbfa; --panel: #ffffff; --ink: #1b1b1a; --muted: #6a6a66; --line: #e0e0dc;
+  --accent: #2f5d50; --accent-ink: #ffffff; --bad: #8c2f2f; --warn: #8a6100; --ok: #2f6b45;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #16181a; --panel: #1e2124; --ink: #e8e8e4; --muted: #9a9a94; --line: #303438;
+  --accent: #6fae99; --accent-ink: #10231d; --bad: #e08585; --warn: #d8ac52; --ok: #7fc39c;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+body.bare { max-width: 46rem; margin: 0 auto; padding: 2rem 1rem; }
+
+a { color: var(--accent); }
+code, pre, kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--line);
+      border-radius: var(--radius); padding: .6rem .7rem; overflow-x: auto; }
+
+.offscreen {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+
+.skip {
+  position: absolute; left: -999px; top: 0; background: var(--accent); color: var(--accent-ink);
+  padding: .5rem .8rem; z-index: 20;
+}
+.skip:focus { left: .5rem; top: .5rem; }
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* --- frame ---------------------------------------------------------------------------- */
+
+.top {
+  display: flex; align-items: center; gap: var(--gap);
+  padding: .6rem 1rem; border-bottom: 1px solid var(--line); background: var(--panel);
+  position: sticky; top: 0; z-index: 10; flex-wrap: wrap;
+}
+.brand { font-weight: 700; text-decoration: none; letter-spacing: .02em; }
+.find { flex: 1 1 12rem; }
+.find input { width: 100%; }
+.who { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
+
+.shell { display: flex; align-items: flex-start; gap: var(--gap); padding: var(--gap); }
+.side { flex: 0 0 12rem; position: sticky; top: 4rem; }
+.side ul { list-style: none; margin: 0; padding: 0; }
+.side a {
+  display: block; padding: .35rem .6rem; border-radius: var(--radius);
+  text-decoration: none; color: var(--ink);
+}
+.side a:hover { background: var(--panel); }
+.side a[aria-current="page"] { background: var(--accent); color: var(--accent-ink); }
+
+main { flex: 1 1 auto; min-width: 0; }
+h1 { font-size: 1.4rem; margin: 0 0 var(--gap); }
+h2 { font-size: 1.05rem; margin: 0 0 .5rem; }
+h3 { font-size: .9rem; margin: 0 0 .3rem; color: var(--muted); }
+
+.foot { padding: 1rem; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--line); }
+
+/* --- blocks --------------------------------------------------------------------------- */
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: .9rem 1rem; margin-bottom: var(--gap);
+}
+.panel.bad { border-color: var(--bad); }
+.panel.bad .type { font-family: ui-monospace, monospace; color: var(--bad); margin: 0 0 .3rem; }
+.panel.bad .op { color: var(--muted); margin: 0 0 .2rem; font-size: .85rem; }
+.hint { color: var(--muted); }
+.warn { color: var(--warn); }
+.muted { color: var(--muted); font-size: .9rem; }
+.empty { font-style: italic; }
+
+.cards { display: flex; flex-wrap: wrap; gap: var(--gap); margin-bottom: var(--gap); }
+.card {
+  flex: 1 1 8rem; background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: .8rem 1rem;
+}
+.card h2 { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }
+.figure { font-size: 1.6rem; margin: 0; }
+
+.two { display: flex; gap: var(--gap); flex-wrap: wrap; }
+.two > * { flex: 1 1 20rem; }
+.triple { display: flex; gap: var(--gap); flex-wrap: wrap; }
+.triple > * { flex: 1 1 12rem; }
+
+table { width: 100%; border-collapse: collapse; display: block; overflow-x: auto; }
+th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+tr.current td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+
+.list { list-style: none; margin: 0; padding: 0; }
+.list li { padding: .35rem 0; border-bottom: 1px solid var(--line); display: flex; gap: .5rem;
+           align-items: baseline; flex-wrap: wrap; }
+.list li.current { font-weight: 600; }
+
+.counts { list-style: none; margin: 0; padding: 0; }
+.counts li { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line);
+             padding: .2rem 0; }
+
+.facts { display: grid; grid-template-columns: minmax(8rem, 14rem) 1fr; gap: .25rem .8rem; margin: 0; }
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
+
+.pill {
+  display: inline-block; padding: .1rem .45rem; border: 1px solid var(--line);
+  border-radius: 999px; font-size: .78rem; color: var(--muted);
+}
+.state { font-weight: 600; }
+.state-ok, .state-indexed { color: var(--ok); }
+.state-degraded, .state-unknown { color: var(--warn); }
+.state-failing, .state-failed { color: var(--bad); }
+
+.pager { display: flex; gap: var(--gap); margin-top: .6rem; }
+
+/* --- forms and buttons ---------------------------------------------------------------- */
+
+input, select, textarea, button {
+  font: inherit; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--radius); padding: .35rem .5rem;
+}
+textarea { width: 100%; resize: vertical; }
+button { cursor: pointer; background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+button.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+button.danger { color: var(--bad); }
+button:disabled { opacity: .6; cursor: progress; }
+
+.filters { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-bottom: var(--gap); }
+.actions { display: flex; gap: .4rem; flex-wrap: wrap; }
+.row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-top: .5rem; }
+
+.secret {
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  border: 1px solid var(--warn); border-radius: var(--radius); padding: .6rem;
+  font-family: ui-monospace, monospace; overflow-wrap: anywhere;
+}
+
+/* --- chat ----------------------------------------------------------------------------- */
+
+.chat { display: flex; gap: var(--gap); align-items: flex-start; flex-wrap: wrap; }
+.conversations { flex: 0 0 15rem; background: var(--panel); border: 1px solid var(--line);
+                 border-radius: var(--radius); padding: .8rem; }
+.thread { flex: 1 1 22rem; min-width: 0; }
+.turns { display: flex; flex-direction: column; gap: .8rem; }
+.turn { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+        padding: .7rem .9rem; }
+.turn .role { margin: 0 0 .3rem; font-size: .72rem; text-transform: uppercase;
+              letter-spacing: .06em; color: var(--muted); }
+.turn .body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.turn-user { border-left: 3px solid var(--accent); }
+.cites { list-style: none; margin: .6rem 0 0; padding: 0; font-size: .88rem; }
+.cite { border-top: 1px dashed var(--line); padding: .35rem 0; }
+.cite .slot { color: var(--muted); margin-right: .3rem; }
+.cite .title { font-weight: 600; }
+.trail { color: var(--muted); margin-left: .3rem; }
+.verdict { margin-left: .4rem; font-size: .78rem; }
+.verdict-verified { color: var(--ok); }
+.verdict-unverified, .verdict-partial { color: var(--warn); }
+.verdict-failed { color: var(--bad); }
+blockquote { margin: .3rem 0 0; padding-left: .6rem; border-left: 2px solid var(--line);
+             color: var(--muted); }
+.ask { margin-top: var(--gap); }
+.rate { margin-top: .5rem; display: flex; gap: .4rem; align-items: center; }
+
+.hits { padding-left: 1.2rem; }
+.hits li { margin-bottom: .9rem; }
+.hits .meta, .blocks .meta { margin: 0 0 .3rem; }
+.score { color: var(--muted); margin-left: .4rem; }
+.blocks li { margin-bottom: .8rem; }
+
+/* --- command palette ------------------------------------------------------------------- */
+
+.palette {
+  position: fixed; inset: 0; background: rgb(0 0 0 / 45%);
+  display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; z-index: 30;
+}
+.palette[hidden] { display: none; }
+.palette-box {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  width: min(30rem, 92vw); padding: .8rem;
+}
+.palette-box input { width: 100%; }
+.palette-box ul { list-style: none; margin: .5rem 0; padding: 0; max-height: 50vh; overflow-y: auto; }
+.palette-box li a {
+  display: block; padding: .35rem .5rem; border-radius: var(--radius);
+  text-decoration: none; color: var(--ink);
+}
+.palette-box li[aria-selected="true"] a { background: var(--accent); color: var(--accent-ink); }
+
+@media (max-width: 44rem) {
+  .shell { flex-direction: column; }
+  .side { position: static; flex: 1 1 auto; width: 100%; }
+  .side ul { display: flex; flex-wrap: wrap; gap: .2rem; }
+}

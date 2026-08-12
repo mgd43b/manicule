@@ -1,0 +1,55 @@
+{#
+  Fragments several areas share. Presentation only — no macro here decides anything, and none
+  takes a value that is not already on a payload.
+#}
+
+{% macro failed(panel) %}
+{# A panel whose operation failed, rendered where it sits so the rest of the page still says
+   what it knows. The error's type, message and hint are the same three fields every other
+   surface reports; nothing is softened and nothing is invented. #}
+<div class="panel bad" role="status">
+  <p class="op">{{ panel.op }} failed</p>
+  {% if panel.error %}
+  <p class="type">{{ panel.error.type }}</p>
+  <p>{{ panel.error.message }}</p>
+  {% if panel.error.hint %}<p class="hint">{{ panel.error.hint }}</p>{% endif %}
+  {% endif %}
+</div>
+{% endmacro %}
+
+{% macro counts(table) %}
+{# A `by_*` counter table, in the payload's own order. #}
+<ul class="counts">
+  {% for key, value in table | items %}
+  <li><span>{{ key }}</span><b>{{ value }}</b></li>
+  {% endfor %}
+</ul>
+{% endmacro %}
+
+{% macro trail(parts) %}
+{% if parts %}<span class="trail">{{ parts | join(' › ') }}</span>{% endif %}
+{% endmacro %}
+
+{% macro citation(item) %}
+{# One citation of an owner's conversation: full, because the reader holds a key for this
+   workspace and could have retrieved the passage themselves. The anonymous projection is a
+   different type rendered by `shared.html`, and it is produced in storage rather than here. #}
+<li class="cite">
+  <span class="slot">[{{ item.slot }}]</span>
+  {# The owner may follow the citation to the passage it came from; a guest may not, and the
+     anonymous view has no document id on it to build such a link from. That difference is
+     structural rather than a branch in this macro. #}
+  <a class="title" href="/ui/documents/{{ item.document_id }}">{{ item.title }}</a>
+  {{ trail(item.heading_path) }}
+  <span class="verdict verdict-{{ item.verification }}">{{ item.verification }}</span>
+  {% if item.quote %}<blockquote>{{ item.quote }}</blockquote>{% endif %}
+</li>
+{% endmacro %}
+
+{% macro state(value) %}
+<span class="state state-{{ value }}">{{ value }}</span>
+{% endmacro %}
+
+{% macro empty(message) %}
+<p class="muted empty">{{ message }}</p>
+{% endmacro %}

@@ -23,6 +23,12 @@ a user visits can read it with whatever the browser will send.
 ``frame-ancestors`` naming ``security.transport.widget_allowed_domains``, and ``'none'`` when
 that list is empty. A chat surface inside an invisible frame is a clickjacking target, and the
 default answer to a framing attempt is no.
+
+**A cross-site request may not change anything.** :mod:`manicule.api.origins` decides that, and
+it is checked here — before routing — because a rule applied per route is a rule missing from
+the route somebody added last. The question only arose with the browser surface: the shipped
+posture is loopback with no credential at all, which is precisely the ambient authority a page
+on another origin can spend on the user's behalf.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from manicule.api.envelopes import AUTH_ERRORS, malformed, refusal
+from manicule.api.origins import FETCH_SITE, ORIGIN, REFUSAL, permitted
 from manicule.api.proxy import ProxyPolicy
 from manicule.api.routes import (
     admin,
@@ -140,6 +147,13 @@ def build_app(service: ApplicationService, *, bind: Bind | None = None) -> FastA
         PolicyError: The application would serve an unauthenticated surface on something that
             is not loopback.
     """
+    # The browser surface, imported here rather than at module scope. Its pages are routes
+    # over the same dependencies this package defines, so importing it from the top would make
+    # `manicule.api` and `manicule.web` import each other — and which one won would depend on
+    # which a caller reached for first.
+    from manicule.web.pages import router as web_router  # noqa: PLC0415
+    from manicule.web.security import PageRefusedError, refused_page  # noqa: PLC0415
+
     settings = service.settings
     _require_auth_for_wide_bind(service, bind)
 
@@ -177,14 +191,15 @@ def build_app(service: ApplicationService, *, bind: Bind | None = None) -> FastA
     async def identify(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        """Resolve the caller once, before any route sees the request.
+        """Refuse a cross-site write, resolve the caller, and dress the response.
 
-        Once rather than per dependency, so that the address decision — which reads a header
-        and a socket peer — happens in exactly one place and every route, including the ones
-        that need no credential, sees the same principal.
+        All three here rather than per dependency, so that the address decision — which reads
+        a header and a socket peer — happens in exactly one place, every route including the
+        ones that need no credential sees the same principal, and the cross-site refusal
+        applies to routes that do not exist yet.
         """
         request.state.principal = await resolve(service, app.state.proxy_policy, request)
-        response = await call_next(request)
+        response = _refuse_cross_site(service, request) or await call_next(request)
         for header, value in SECURITY_HEADERS.items():
             response.headers.setdefault(header, value)
         response.headers.setdefault(
@@ -213,6 +228,10 @@ def build_app(service: ApplicationService, *, bind: Bind | None = None) -> FastA
     for failure in AUTH_ERRORS:
         app.add_exception_handler(failure, refuse)
     app.add_exception_handler(RequestValidationError, unreadable)
+    # The browser surface renders its refusals as pages. Registered here rather than inside
+    # `manicule.web` because an exception handler belongs to the application, and there is one
+    # application.
+    app.add_exception_handler(PageRefusedError, refused_page)
 
     for router in (
         health_routes.router,
@@ -226,9 +245,38 @@ def build_app(service: ApplicationService, *, bind: Bind | None = None) -> FastA
         workbench.router,
         sockets.router,
         widget_router,
+        # The browser surface (#12). Mounted on the same application because it is the same
+        # service, the same principal resolution and the same middleware — and because a
+        # second application would be a second place for a security header to be forgotten.
+        web_router,
     ):
         app.include_router(router)
     return app
+
+
+def _refuse_cross_site(service: ApplicationService, request: Request) -> JSONResponse | None:
+    """Refuse an unsafe method a browser says came from another site, or return ``None``.
+
+    The decision itself is :func:`manicule.api.origins.permitted`, which is a pure function of
+    four header values so it can be exercised without a server. This carries the headers to it
+    and renders the refusal as the ordinary envelope — ``PolicyError``, therefore 403, by the
+    same table every other failure uses.
+    """
+    origin = request.headers.get(ORIGIN)
+    if permitted(
+        request.method,
+        fetch_site=request.headers.get(FETCH_SITE),
+        origin=origin,
+        host=request.headers.get("host"),
+        allowed_origins=service.settings.security.transport.allowed_origins,
+    ):
+        return None
+    logger.warning("refused a cross-site %s from %r", request.method, origin or "an unnamed origin")
+    return refusal(
+        _op_of(request),
+        service.workspace,
+        PolicyError(REFUSAL.format(method=request.method, origin=origin or "")),
+    )
 
 
 def _op_of(request: Request) -> str:

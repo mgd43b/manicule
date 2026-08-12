@@ -8,11 +8,19 @@ service call, so the ``op`` on its envelope comes from the matched route rather 
 call — and without an explicit name that is the handler's Python function name, which is a
 different vocabulary from the one every successful envelope uses. An access log of refusals
 would then be unjoinable to one of successes, quietly.
+
+**The enumeration proves it ran before it reports what it found.** ``app.routes`` is not a flat
+list of routes on every FastAPI: from 0.13x an included router appears as a wrapper object, and
+a walk that only recognised :class:`~fastapi.routing.APIRoute` therefore found **nothing at
+all** — and reported success, because "no route is misnamed" is trivially true of no routes.
+That is the failure mode this file exists to not have, so :func:`_routes` descends into
+whatever shape the framework used and :data:`MINIMUM_ROUTES` is a floor below which the walk is
+assumed to have collapsed rather than the surface to have shrunk.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from fastapi.routing import APIRoute, APIWebSocketRoute
@@ -23,7 +31,7 @@ from manicule.mcp.server import TOOL_NAMES
 from tests.api.support import backend_with_a_document, client_for, envelope
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
 
 UNAUTHORIZED = 401
 
@@ -82,15 +90,68 @@ NOT_OPERATIONS: frozenset[str] = frozenset(
         "swagger_ui_html",
         "swagger_ui_redirect",
         "openapi",
+        # The browser surface (#12). A page is not an operation: it runs several of them and
+        # renders HTML, and naming it after one of them would put a page's name on an envelope
+        # that some other operation produced. Its refusals are rendered as pages rather than
+        # as envelopes, so none of these ever reaches the `op` field this file is about.
+        "ui_admin",
+        "ui_auth",
+        "ui_chat",
+        "ui_collections",
+        "ui_connectors",
+        "ui_conversation",
+        "ui_dashboard",
+        "ui_document",
+        "ui_documents",
+        "ui_health",
+        "ui_plugins",
+        "ui_script",
+        "ui_search",
+        "ui_settings",
+        "ui_shared",
+        "ui_stylesheet",
+        "ui_trash",
+        "ui_workspaces",
     }
 )
 
+MINIMUM_ROUTES = 40
+"""A floor on how many routes the walk below must find.
 
-def _routes() -> Iterator[APIRoute | APIWebSocketRoute]:
-    backend, _ = backend_with_a_document()
-    for route in build_app(ApplicationService(backend)).routes:
+Far below the real count, and present to catch a walk that collapsed rather than to track the
+size of the surface. It has caught one: on FastAPI 0.141 an included router is a wrapper object
+rather than its routes, and the previous walk found **zero** — with every assertion in this
+file passing, because each of them is a statement about every route and there were none.
+"""
+
+
+def _descend(routes: Iterable[object]) -> Iterator[APIRoute | APIWebSocketRoute]:
+    """Every route, whichever shape this FastAPI put them in.
+
+    A router included with ``include_router`` may appear on ``app.routes`` as its routes or as
+    one object standing for them, depending on the version. Both are followed, so this file
+    keeps enumerating the surface across an upgrade instead of quietly enumerating none of it.
+    """
+    for route in routes:
         if isinstance(route, (APIRoute, APIWebSocketRoute)):
             yield route
+            continue
+        inner = getattr(route, "routes", None)
+        if inner is None:
+            inner = getattr(getattr(route, "original_router", None), "routes", None)
+        if inner:
+            yield from _descend(cast("Iterable[object]", inner))
+
+
+def _routes() -> list[APIRoute | APIWebSocketRoute]:
+    backend, _ = backend_with_a_document()
+    found = list(_descend(build_app(ApplicationService(backend)).routes))
+    assert len(found) >= MINIMUM_ROUTES, (
+        f"the walk found {len(found)} route(s), below the floor of {MINIMUM_ROUTES}. Every "
+        f"assertion in this file is a statement about *every* route, so a walk that found "
+        f"none passes them all. Fix the walk rather than the floor."
+    )
+    return found
 
 
 def test_every_route_is_named_for_the_operation_it_runs() -> None:
