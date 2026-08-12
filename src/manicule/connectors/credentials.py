@@ -133,7 +133,16 @@ class TokenCredential:
         return f"Check the token has not been revoked{where}."
 
     def account(self) -> str:
-        return self.subject
+        """Unknown, deliberately, even for Cloud where :attr:`subject` holds an email.
+
+        The account is compared against ``X-AUSERNAME``, which is the instance's own name for
+        the authenticated user — an account id on Cloud, a username on Server. Cloud's Basic
+        credential is spelled with an email address, which is a different identifier for the
+        same person, and returning it here would make every Cloud response look as though it
+        came back as somebody else. Only a session captured *from* an instance knows a name
+        that instance will repeat.
+        """
+        return ""
 
 
 @dataclass(frozen=True, slots=True)

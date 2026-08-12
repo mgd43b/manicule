@@ -46,7 +46,13 @@ from manicule.connectors.errors import (
     SessionExpiredError,
     UntrustedLinkError,
 )
-from manicule.connectors.intercept import Answer, offsite, signed_out, signin_path
+from manicule.connectors.intercept import (
+    SEARCHED_BYTES,
+    Answer,
+    offsite,
+    signed_out,
+    signin_path,
+)
 from manicule.connectors.pagination import next_page, origin_of
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
@@ -311,9 +317,17 @@ class ConfluenceClient:
                     chunks: list[bytes] = []
                     total = 0
                     async for chunk in response.aiter_bytes():
-                        if not chunks:
+                        if total < SEARCHED_BYTES:
+                            # Checked against the accumulated opening rather than against one
+                            # chunk, because a chunk boundary is wherever the network put it
+                            # and a marker split across two would be a marker nobody saw.
                             self._verify(
-                                Answer(url, response.status_code, dict(response.headers), chunk)
+                                Answer(
+                                    url,
+                                    response.status_code,
+                                    dict(response.headers),
+                                    b"".join([*chunks, chunk]),
+                                )
                             )
                         total += len(chunk)
                         if total > max_bytes:

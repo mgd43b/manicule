@@ -314,6 +314,16 @@ class ConfluenceConfig(BaseModel):
                 "'browser_session' if this instance's identity provider has disabled them."
             )
             raise ValueError(msg)
+        if (
+            self.auth is AuthMethod.PERSONAL_ACCESS_TOKEN
+            and self.deployment is not Deployment.SERVER
+        ):
+            msg = (
+                "auth = 'personal_access_token' is a Server/Data Center credential and this is "
+                "configured as Cloud, which issues API tokens instead. Use 'api_token' with the "
+                "email the token belongs to."
+            )
+            raise ValueError(msg)
         return self
 
     @property

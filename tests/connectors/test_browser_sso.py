@@ -16,6 +16,7 @@ that page and the index.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from unittest.mock import patch
@@ -329,6 +330,74 @@ async def test_the_account_the_session_was_captured_as_is_accepted() -> None:
     assert [item.source_id for item in found] == ["1", "att-9"]
 
 
+async def test_a_cloud_sync_is_not_refused_for_being_a_different_account() -> None:
+    """Cloud's Basic credential is spelled with an email; ``X-AUSERNAME`` is an account id.
+
+    They are two identifiers for one person, and comparing them would make every Cloud response
+    look as though it came back as somebody else — a working configuration refused on every
+    request. Only a session captured *from* an instance knows a name that instance will repeat,
+    so a token supplies no expected account at all.
+    """
+    instance = FakeConfluence(pages=[FakePage(id="1", title="A", space="ENG")])
+    instance.headers["X-AUSERNAME"] = "5b10ac8d82e05b22cc7d4ef5"
+    connector = await connected(instance, cloud_config(base_url=instance.base_url))
+    try:
+        found = await drain(connector.discover(None))
+    finally:
+        await connector.teardown()
+
+    assert [item.source_id for item in found] == ["1"]
+
+
+async def test_a_cloud_sync_is_still_refused_when_it_is_anonymous() -> None:
+    """Dropping the account comparison for tokens must not drop the check that matters."""
+    instance = FakeConfluence(pages=[FakePage(id="1", title="A", space="ENG")])
+    instance.headers["X-AUSERNAME"] = "anonymous"
+    connector = await connected(instance, cloud_config(base_url=instance.base_url))
+    try:
+        with pytest.raises(SessionExpiredError, match="anonymous"):
+            await drain(connector.discover(None))
+    finally:
+        await connector.teardown()
+
+
+async def test_a_sign_in_page_split_across_chunks_is_still_refused() -> None:
+    """The marker is looked for in the accumulated opening, not in one chunk.
+
+    A chunk boundary is wherever the network put it. A check that read only the first chunk
+    would miss a marker straddling two, and what got through would be a sign-in page indexed as
+    an attachment.
+    """
+    config = sso_config(SERVER_BASE)
+    page = (
+        b'<html><head><title>Log in</title></head><body><form name="loginform">'
+        b'<input name="os_username"></form></body></html>'
+    )
+
+    async def dribble() -> AsyncIterator[bytes]:
+        for index in range(0, len(page), 7):
+            yield page[index : index + 7]
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200, content=dribble(), headers={"content-type": "text/html;charset=UTF-8"}
+        )
+
+    client = ConfluenceClient(
+        config,
+        credential=browser_session(config),
+        transport=httpx.MockTransport(serve),
+        clock=lambda: 0.0,
+    )
+    await client.setup()
+    try:
+        with pytest.raises(SessionExpiredError, match="sign-in page"):
+            await client.download(f"{SERVER_BASE}/download/attachments/1/x.pdf", max_bytes=99999)
+    finally:
+        await client.teardown()
+
+
 def test_a_percent_encoded_username_is_compared_decoded() -> None:
     """Atlassian percent-encodes the header, and a comparison that did not decode it would
     report every account with a space or an accent in its name as somebody else."""
@@ -519,6 +588,20 @@ def test_an_api_token_on_server_is_refused() -> None:
                 "base_url": SERVER_BASE,
                 "deployment": Deployment.SERVER,
                 "auth": AuthMethod.API_TOKEN,
+            }
+        )
+
+
+def test_a_personal_access_token_on_cloud_is_refused() -> None:
+    """The mirror of the row above. Without it the refusal arrives from the credential builder
+    as "no personal_access_token is set", which is true and describes the wrong problem: the
+    setting to change is the deployment or the method, not the missing token."""
+    with pytest.raises(ValidationError, match="issues API tokens instead"):
+        ConfluenceConfig.model_validate(
+            {
+                "base_url": "https://example.atlassian.net/wiki",
+                "deployment": Deployment.CLOUD,
+                "auth": AuthMethod.PERSONAL_ACCESS_TOKEN,
             }
         )
 
