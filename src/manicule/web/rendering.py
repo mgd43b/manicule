@@ -58,6 +58,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from manicule.api.envelopes import OK, status_for
 from manicule.app.dispatch import run_op
+from manicule.core.errors import ManiculeError
 from manicule.core.version import CORE_VERSION
 from manicule.web.areas import NAVIGATION
 
@@ -236,14 +237,20 @@ def render(
         primary: The panel this page *is*. When that one failed there is no page to render —
             a document detail with no document is not a page with an empty section — so the
             response becomes the problem page, with the status the error's type implies.
-        extra: Page-specific context. Merged last, and deliberately not able to overwrite the
-            frame's own keys.
+        extra: Page-specific context. It may not name a key the frame supplies, and a
+            collision is **refused** rather than resolved: silently winning would let a page
+            put its own value where the workspace name or the reader's role goes, and silently
+            losing would make a page render without the value it passed. Both are the kind of
+            wrong that looks right.
         layout: The frame to extend. The shared-conversation page passes a smaller one,
             because an anonymous reader has no business being shown a navigation full of
             links they cannot follow.
+
+    Raises:
+        ManiculeError: ``extra`` names a key the frame already supplies.
     """
     failed = panels.get(primary) if primary is not None else None
-    context: dict[str, Any] = {
+    frame: dict[str, Any] = {
         "area": area,
         "title": title,
         "navigation": NAVIGATION,
@@ -256,8 +263,15 @@ def render(
         "stylesheet": STYLESHEET_PATH,
         "script": SCRIPT_PATH,
         "layout": layout,
-        **(extra or {}),
     }
+    clash = sorted(set(extra or {}) & set(frame))
+    if clash:
+        msg = (
+            f"the page context {clash} would overwrite the frame's own. Rename the page's key: "
+            f"a template reading 'workspace' or 'role' must get the one this request resolved."
+        )
+        raise ManiculeError(msg)
+    context: dict[str, Any] = {**frame, **(extra or {})}
     if failed is not None and not failed.ok:
         return html_response(
             ENVIRONMENT.get_template("problem.html").render(

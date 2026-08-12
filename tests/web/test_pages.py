@@ -18,9 +18,18 @@ from pathlib import Path
 
 import pytest
 
+from manicule.api.security import Principal
 from manicule.app.service import ApplicationService
+from manicule.core.errors import ManiculeError
 from manicule.web.areas import AREAS, NAVIGATION
-from manicule.web.rendering import ENVIRONMENT, SCRIPT, STYLESHEET, TEMPLATE_DIR, UI_POLICY
+from manicule.web.rendering import (
+    ENVIRONMENT,
+    SCRIPT,
+    STYLESHEET,
+    TEMPLATE_DIR,
+    UI_POLICY,
+    render,
+)
 from tests.web.support import (
     CONVERSATION,
     SHARE_TOKEN,
@@ -105,6 +114,29 @@ def test_every_template_is_reachable_through_the_loader_and_is_rendered_by_a_pag
     frames = {"layout.html", "bare.html", "macros.html", "problem.html", "refused.html"}
     unrendered = sorted(name for name in available - frames if f'"{name}"' not in source)
     assert unrendered == [], f"templates no page renders: {unrendered}"
+
+
+def test_a_page_may_not_overwrite_the_frames_own_context() -> None:
+    """A collision is refused rather than resolved, in either direction.
+
+    Merged last it would silently win, and a page could put its own value where the workspace
+    name or the reader's role goes; merged first it would silently lose, and a page would
+    render without the value it passed. Both are the kind of wrong that looks right, so the
+    call fails instead — which is also what this function's docstring has always claimed.
+    """
+    backend, _ = backend_with_a_document()
+    service = ApplicationService(backend)
+    principal = Principal(identity=asyncio.run(service.authenticate("")))
+    with pytest.raises(ManiculeError, match="would overwrite the frame"):
+        render(
+            "dashboard.html",
+            area="dashboard",
+            title="Dashboard",
+            service=service,
+            caller=principal,
+            panels={},
+            extra={"workspace": "somebody-elses"},
+        )
 
 
 @pytest.mark.parametrize(("area", "path"), sorted(PAGE_FOR_AREA.items()))
