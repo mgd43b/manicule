@@ -45,8 +45,10 @@ from pathlib import Path
 import pytest
 
 from manicule import vocabularies
+from manicule.chunking.tokens import TIKTOKEN_ENCODING
 from manicule.core.errors import ConfigError
-from manicule.retrieval.tokens import ContextTokenCounter
+from manicule.generation.budget import GENERATION_ENCODING
+from manicule.retrieval.tokens import DEFAULT_ENCODING, ContextTokenCounter
 from manicule.vocabularies import bundle as bundles
 from tests.vocabulary_support import (
     BUNDLE_ENCODINGS,
@@ -871,15 +873,26 @@ def test_the_encodings_a_pre_seed_needs_come_from_the_code_that_asks_for_them() 
     vocabulary and not the fitter's — an install that indexes and then cannot answer, which is
     the exact shape of the defect this package closes.
     """
-    from manicule.chunking.tokens import TIKTOKEN_ENCODING  # noqa: PLC0415
-    from manicule.generation.budget import GENERATION_ENCODING  # noqa: PLC0415
-    from manicule.retrieval.tokens import DEFAULT_ENCODING  # noqa: PLC0415
-
     required = vocabularies.required_encodings()
 
     assert TIKTOKEN_ENCODING in required
     assert DEFAULT_ENCODING in required
     assert GENERATION_ENCODING in required
+
+
+def test_a_caller_with_resolved_settings_pre_seeds_the_encoding_it_configured() -> None:
+    """A diagnostic that read manicule's defaults would describe a different installation.
+
+    An install that set ``rag.context.encoding`` to something else must pre-seed *that*, or
+    the pre-seed reports success over a vocabulary the fitter will never ask for and the
+    refusal arrives at the first question anyway. The caller that already resolved settings
+    says which one; the pre-seed script, which has none, reads them.
+    """
+    assert "p50k_base" in vocabularies.required_encodings("p50k_base")
+    assert "p50k_base" not in vocabularies.required_encodings("o200k_base")
+    # The generation budget's encoding is a constant rather than a setting, so it is in both
+    # sets — which is the point of assembling the list here instead of at each caller.
+    assert GENERATION_ENCODING in vocabularies.required_encodings("p50k_base")
 
 
 def test_an_encoding_this_install_does_not_know_is_a_configuration_error() -> None:

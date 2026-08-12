@@ -87,6 +87,7 @@ __all__ = [
     "missing_vocabularies",
     "prefetch",
     "required_encodings",
+    "tiktoken_version",
 ]
 
 CACHE_DIR_ENV: Final = "TIKTOKEN_CACHE_DIR"
@@ -159,28 +160,49 @@ class Blob:
         return cache_key(self.url)
 
 
-def required_encodings() -> tuple[str, ...]:
+def required_encodings(context_encoding: str | None = None) -> tuple[str, ...]:
     """Every encoding this install will ask for, sorted.
 
-    One definition, read by the pre-seed, the bundle builder, the container build and CI,
-    because three copies of a list of encoding names is how a host ends up with the chunker's
-    vocabulary and not the fitter's — an install that indexes and cannot answer, which is the
-    exact shape of the defect this package exists to close.
+    One definition, read by the pre-seed, the bundle builder, the container build, ``doctor``
+    and CI, because copies of a list of encoding names is how a host ends up with the
+    chunker's vocabulary and not the fitter's — an install that indexes and then cannot
+    answer, which is the exact shape of the defect this package exists to close.
 
     The names come from the code that asks for them rather than from a constant beside them:
     the chunker's stand-in, the context fitter's configured encoding, and the generation
-    budget's. The middle one is read through settings, so an install that configured
-    ``rag.context.encoding`` to something else pre-seeds *that* rather than the default and
-    then discovers the difference at a question.
+    budget's.
+
+    Args:
+        context_encoding: The configured ``rag.context.encoding``. Omitted, it is read from
+            settings, which is right for a pre-seed script or an image build with nothing
+            resolved in front of it — and wrong for a caller that has already resolved
+            settings of its own, which would otherwise be told about a different installation.
     """
     from manicule.chunking.tokens import TIKTOKEN_ENCODING  # noqa: PLC0415 - lazy, see below
-    from manicule.config.settings import ContextSettings  # noqa: PLC0415
     from manicule.generation.budget import GENERATION_ENCODING  # noqa: PLC0415
 
     # Imported inside the function for the reason every import in this module is: a process
     # that only loads an encoding must not pay for the settings model, and nothing about a
     # pre-seed is on a hot path.
-    return tuple(sorted({TIKTOKEN_ENCODING, ContextSettings().encoding, GENERATION_ENCODING}))
+    if context_encoding is None:
+        from manicule.config.settings import ContextSettings  # noqa: PLC0415
+
+        context_encoding = ContextSettings().encoding
+    return tuple(sorted({TIKTOKEN_ENCODING, context_encoding, GENERATION_ENCODING}))
+
+
+def tiktoken_version() -> str:
+    """The installed ``tiktoken`` release.
+
+    Read from distribution metadata rather than from the module, so asking costs no import of
+    the Rust extension. One definition, because three things say it and they must agree: the
+    identity a provisional chunk records, the provenance a bundle carries, and what a status
+    report prints. A vocabulary's bytes are verified against the digest *this* release
+    declares, so the release is the honest name for what did the counting.
+    """
+    from importlib.metadata import version  # noqa: PLC0415 - see docstring
+
+    return version("tiktoken")
 
 
 def cache_key(url: str) -> str:

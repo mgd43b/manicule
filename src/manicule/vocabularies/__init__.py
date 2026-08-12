@@ -34,6 +34,7 @@ from manicule.vocabularies.store import (
     missing_vocabularies,
     prefetch,
     required_encodings,
+    tiktoken_version,
 )
 
 __all__ = [
@@ -49,4 +50,5 @@ __all__ = [
     "missing_vocabularies",
     "prefetch",
     "required_encodings",
+    "tiktoken_version",
 ]

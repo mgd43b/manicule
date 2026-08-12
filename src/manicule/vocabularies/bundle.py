@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 from manicule.core.errors import ManiculeError
-from manicule.vocabularies.store import Blob, blobs_for, cache_key, cache_path
+from manicule.vocabularies.store import Blob, blobs_for, cache_key, cache_path, tiktoken_version
 
 __all__ = [
     "BUNDLE_DIR_ENV",
@@ -515,7 +515,7 @@ def build(encodings: Sequence[str], destination: Path) -> VocabularyBundle:
 
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        "tiktoken_version": _installed_tiktoken_version(),
+        "tiktoken_version": tiktoken_version(),
         "encodings": {name: list(urls) for name, urls in table.items()},
         "vocabularies": {url: entry.as_json() for url, entry in files.items()},
     }
@@ -556,15 +556,3 @@ def _copy_into(blob: Blob, vocabulary_dir: Path) -> BundledVocabulary:
         raise VocabularyBundleError(msg)
     shutil.copyfile(source, vocabulary_dir / cache_key(blob.url))
     return BundledVocabulary(url=blob.url, sha256=digest, size=len(content))
-
-
-def _installed_tiktoken_version() -> str:
-    """The ``tiktoken`` release a bundle was built against, for provenance rather than a gate.
-
-    Recorded so that a bundle can say what asked for these files, and reported by
-    :func:`manicule.vocabularies.store.bundle_status`. Not checked on read: see this module's
-    docstring for why a version mismatch is not, on its own, a reason to refuse.
-    """
-    from importlib.metadata import version  # noqa: PLC0415 - only needed when building
-
-    return version("tiktoken")
