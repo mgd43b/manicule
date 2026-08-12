@@ -82,7 +82,11 @@ def test_the_layout_area_is_the_frame_every_other_page_extends() -> None:
     pages = sorted(
         path
         for path in TEMPLATE_DIR.glob("*.html")
-        if path.name not in {"layout.html", "bare.html", "macros.html", "refused.html"}
+        # `refused.html` and `notfound.html` are deliberately standalone: both render before
+        # anything has decided whether the reader may see this workspace, and the frame's
+        # navigation is a description of what the installation holds.
+        if path.name
+        not in {"layout.html", "bare.html", "macros.html", "refused.html", "notfound.html"}
     )
     assert len(pages) >= 10, f"only {len(pages)} page templates found; the scan is looking wrong"
     for page in pages:
@@ -110,8 +114,15 @@ def test_every_template_is_reachable_through_the_loader_and_is_rendered_by_a_pag
     assert STYLESHEET.strip(), "the stylesheet was not packaged with the templates"
     assert SCRIPT.strip(), "the script was not packaged with the templates"
 
+    # Both source files, because two templates are rendered from the exception handlers in
+    # `web.security` rather than from a page. Naming that file here rather than adding those
+    # two to the excused set keeps the property the assertion is for: every template is
+    # rendered by *something*, and the something is named.
+    from manicule.web import security as security_module  # noqa: PLC0415 - read as source
+
     source = Path(page_module.__file__).read_text(encoding="utf-8")
-    frames = {"layout.html", "bare.html", "macros.html", "problem.html", "refused.html"}
+    source += Path(security_module.__file__).read_text(encoding="utf-8")
+    frames = {"layout.html", "bare.html", "macros.html", "problem.html"}
     unrendered = sorted(name for name in available - frames if f'"{name}"' not in source)
     assert unrendered == [], f"templates no page renders: {unrendered}"
 

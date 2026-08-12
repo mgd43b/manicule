@@ -86,6 +86,22 @@
     }
   }
 
+  /* What the page currently *looks* like, which is not the same as what it was told to be.
+   * With no stored preference there is no `data-theme` attribute and the stylesheet follows
+   * `prefers-color-scheme`, so reading the attribute alone reports "light" for a page that is
+   * plainly dark. The toggle did exactly that: on a machine set to dark, the first press
+   * computed "not dark, therefore go dark" and changed nothing a person could see. */
+  function effectiveTheme() {
+    var explicit = document.documentElement.getAttribute("data-theme");
+    if (explicit === "light" || explicit === "dark") { return explicit; }
+    try {
+      if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+        return "dark";
+      }
+    } catch (error) { /* matchMedia is absent in some embedded views */ }
+    return "light";
+  }
+
   function startTheme() {
     var stored = null;
     try { stored = window.localStorage.getItem(THEME_KEY); } catch (error) { stored = null; }
@@ -93,8 +109,7 @@
     var button = document.querySelector("[data-theme-toggle]");
     if (!button) { return; }
     button.addEventListener("click", function () {
-      var dark = document.documentElement.getAttribute("data-theme") === "dark";
-      var next = dark ? "light" : "dark";
+      var next = effectiveTheme() === "dark" ? "light" : "dark";
       applyTheme(next);
       /* The only thing this page stores. A theme is not a credential; the widget stores
        * nothing at all precisely because what it holds is one. */
@@ -137,7 +152,16 @@
       return shown;
     }
 
+    /* Where focus was before the palette took it. Closing a dialog without putting focus back
+     * leaves it on an element that is now `hidden`, so the browser drops it to <body> and the
+     * next Tab restarts from the top of the page — a keyboard user loses their place every
+     * time they press Escape. */
+    var returnFocusTo = null;
+
     function open() {
+      if (palette.hidden) {
+        returnFocusTo = document.activeElement;
+      }
       palette.hidden = false;
       input.value = "";
       selected = 0;
@@ -146,7 +170,12 @@
     }
 
     function close() {
+      if (palette.hidden) { return; }
       palette.hidden = true;
+      if (returnFocusTo && typeof returnFocusTo.focus === "function") {
+        returnFocusTo.focus();
+      }
+      returnFocusTo = null;
     }
 
     document.querySelectorAll("[data-palette-open]").forEach(function (button) {
@@ -263,7 +292,11 @@
       var data = envelope.data || {};
       var parts = [];
       if (data.confidence !== null && data.confidence !== undefined) {
-        parts.push("confidence " + data.confidence + " (" + (data.confidence_band || "") + ")");
+        /* Two decimals, matching `manicule ask`. The raw value arrives as a double and read
+         * as "confidence 0.5232638788223267", which claims sixteen digits of precision for an
+         * uncalibrated number and disagrees with the command line about the same answer. */
+        parts.push("confidence " + Number(data.confidence).toFixed(2) +
+                   " (" + (data.confidence_band || "") + ")");
       } else {
         parts.push("the corpus was not consulted, so there is no confidence to report");
       }

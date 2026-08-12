@@ -18,11 +18,18 @@
   <button type="submit">Search</button>
 </form>
 
-{% if panels.search.ok %}
+{# No query yet — a bookmark, a typed URL, or Enter in an empty search box. The form above is
+   the whole page in that state; nothing is run and nothing is claimed. #}
+{% if not query %}
+{{ m.empty('Type a query above to rank passages. Nothing is sent to a model — this is retrieval only.') }}
+{% elif panels.search.ok %}
 {% set found = panels.search.data %}
 <p class="muted">
   {{ found.count }} passages · profile {{ found.profile }} · route {{ found.route or 'default' }}
-  {% if found.confidence is not none %} · confidence {{ found.confidence }} ({{ found.confidence_band }}){% endif %}
+  {# Scores and confidence are formatted to the same widths the command line uses. A raw float
+     renders as 0.5232638788223267, which reads as precision this number does not have and
+     disagrees with `manicule search` about the same value. #}
+  {% if found.confidence is not none %} · confidence {{ "%.2f" | format(found.confidence) }} ({{ found.confidence_band }}){% endif %}
   {% if found.cached %} · cached{% endif %}{% if found.truncated %} · truncated{% endif %}
 </p>
 {% if found.confidence_reason %}<p class="muted">{{ found.confidence_reason }}</p>{% endif %}
@@ -33,13 +40,13 @@
     <p class="meta">
       <a href="/ui/documents/{{ hit.document_id }}">{{ hit.title or hit.uri }}</a>
       {{ m.trail(hit.heading_path) }}
-      <span class="score">{{ hit.score }}</span>
+      <span class="score">{{ "%.4f" | format(hit.score) }}</span>
     </p>
     <pre>{{ hit.text }}</pre>
-    {% if hit.scores %}<p class="muted">{% for stage, value in hit.scores | items %}{{ stage }} {{ value }} {% endfor %}</p>{% endif %}
+    {% if hit.scores %}<p class="muted">{% for stage, value in hit.scores | items %}{{ stage }} {{ "%.4f" | format(value) }} {% endfor %}</p>{% endif %}
   </li>
   {% endfor %}
 </ol>
-{% else %}{{ m.empty('Nothing matched.') }}{% endif %}
+{% else %}{{ m.empty('Nothing matched that query. Every indexed passage was considered; none was close enough to return.') }}{% endif %}
 {% else %}{{ m.failed(panels.search) }}{% endif %}
 {% endblock %}

@@ -44,6 +44,8 @@ from manicule.api.security import (
 from manicule.config.settings import Role
 from manicule.core.errors import ManiculeError
 
+NOT_FOUND = 404
+
 if TYPE_CHECKING:
     from fastapi.responses import HTMLResponse
 
@@ -117,4 +119,70 @@ def refused_page(request: Request, exc: Exception) -> HTMLResponse:
     return html_response(body, status=status)
 
 
-__all__ = ["Guest", "Operator", "PageRefusedError", "Reader", "refused_page"]
+UI_PREFIX = "/ui"
+"""The prefix a request must be under to be answered with a page rather than an envelope."""
+
+
+def is_page_request(request: Request) -> bool:
+    """Whether this 404 is a browser looking at the browser surface.
+
+    Three conditions, and each excludes something that must keep its envelope:
+
+    * **under ``/ui``** — the JSON API's 404 is part of its contract, and a program parsing
+      ``{"detail": "Not Found"}`` must keep getting one;
+    * **``GET``** — a ``POST`` to a path that does not exist is a program, or an attempt at an
+      operation this surface deliberately does not have, and neither wants HTML;
+    * **asks for HTML** — ``fetch()`` from this surface's own script sends ``Accept:
+      application/json`` and parses what comes back as an envelope.
+    """
+    return (
+        request.url.path.startswith(UI_PREFIX)
+        and request.method == "GET"
+        and "text/html" in request.headers.get("accept", "")
+    )
+
+
+def not_found_page(request: Request, exc: Exception) -> HTMLResponse:
+    """Render a 404 under ``/ui`` as a page, at the status it already had.
+
+    **An exception handler rather than a catch-all route, and the distinction is the point.**
+    A ``GET /ui/{rest:path}`` route would make every path under ``/ui`` *exist*, so
+    ``POST /ui/index`` would stop answering "there is no such thing" (404) and start answering
+    "not that method" (405). ``tests/web/test_boundaries.py`` accepts either, so it would have
+    gone on passing — for the new reason that everything under ``/ui`` matches something, which
+    is precisely the assertion it exists to make. Routing is left exactly as it was; only the
+    rendering of a 404 that was already happening changes.
+
+    The status is **404**, not a 200 carrying an apology. A page that is not there says so to
+    the client as well as to the reader.
+    """
+    from manicule.web.rendering import (  # noqa: PLC0415 - avoids a cycle
+        ENVIRONMENT,
+        STYLESHEET_PATH,
+        html_response,
+    )
+
+    del exc  # the framework's own "Not Found"; the page says it better
+    body = ENVIRONMENT.get_template("notfound.html").render(
+        {
+            "title": "Not found",
+            "status": NOT_FOUND,
+            # The path only, never the query string — the same rule the refusal page follows,
+            # for the same reason: a query value is a place credentials end up.
+            "path": request.url.path,
+            "stylesheet": STYLESHEET_PATH,
+        }
+    )
+    return html_response(body, status=NOT_FOUND)
+
+
+__all__ = [
+    "UI_PREFIX",
+    "Guest",
+    "Operator",
+    "PageRefusedError",
+    "Reader",
+    "is_page_request",
+    "not_found_page",
+    "refused_page",
+]

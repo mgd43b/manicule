@@ -34,12 +34,14 @@ on another origin can spend on the user's behalf.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from manicule.api.envelopes import AUTH_ERRORS, malformed, refusal
 from manicule.api.origins import FETCH_SITE, ORIGIN, REFUSAL, permitted
@@ -62,6 +64,8 @@ from manicule.app.bind import is_loopback
 from manicule.config.settings import AuthMode
 from manicule.core.errors import PolicyError
 from manicule.core.version import CORE_VERSION
+
+NOT_FOUND = 404
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -132,7 +136,9 @@ def frame_policy(origins: tuple[str, ...]) -> str:
     return f"default-src 'none'; frame-ancestors {ancestors}"
 
 
-def build_app(service: ApplicationService, *, bind: Bind | None = None) -> FastAPI:
+def build_app(
+    service: ApplicationService, *, bind: Bind | None = None, web: bool = True
+) -> FastAPI:
     """Mount every route group over ``service`` and return the application.
 
     Args:
@@ -142,6 +148,10 @@ def build_app(service: ApplicationService, *, bind: Bind | None = None) -> FastA
             Passed so the auth check below can see a *decided* address rather than only the
             configured one — ``manicule start --host`` can name an address configuration does
             not.
+        web: Whether to mount the browser surface. ``manicule start --no-web`` sets this
+            false. It is a parameter rather than a setting because the flag exists to *reduce*
+            what a running process exposes, and a reduction that a configuration file could
+            undo is not one.
 
     Raises:
         PolicyError: The application would serve an unauthenticated surface on something that
@@ -152,7 +162,12 @@ def build_app(service: ApplicationService, *, bind: Bind | None = None) -> FastA
     # `manicule.api` and `manicule.web` import each other — and which one won would depend on
     # which a caller reached for first.
     from manicule.web.pages import router as web_router  # noqa: PLC0415
-    from manicule.web.security import PageRefusedError, refused_page  # noqa: PLC0415
+    from manicule.web.security import (  # noqa: PLC0415
+        PageRefusedError,
+        is_page_request,
+        not_found_page,
+        refused_page,
+    )
 
     settings = service.settings
     _require_auth_for_wide_bind(service, bind)
@@ -233,7 +248,20 @@ def build_app(service: ApplicationService, *, bind: Bind | None = None) -> FastA
     # application.
     app.add_exception_handler(PageRefusedError, refused_page)
 
-    for router in (
+    async def missing(request: Request, exc: Exception) -> Response:
+        """A 404 under ``/ui`` is a page; everywhere else it stays the framework's envelope.
+
+        Registered only when the browser surface is mounted — with ``--no-web`` there is no
+        browser surface, so a ``/ui`` path is as absent as any other and says so in JSON.
+        """
+        if is_page_request(request):
+            return not_found_page(request, exc)
+        return await http_exception_handler(request, cast("StarletteHTTPException", exc))
+
+    if web:
+        app.add_exception_handler(NOT_FOUND, missing)
+
+    routers = [
         health_routes.router,
         documents.router,
         chat.router,
@@ -245,11 +273,18 @@ def build_app(service: ApplicationService, *, bind: Bind | None = None) -> FastA
         workbench.router,
         sockets.router,
         widget_router,
+    ]
+    if web:
         # The browser surface (#12). Mounted on the same application because it is the same
         # service, the same principal resolution and the same middleware — and because a
         # second application would be a second place for a security header to be forgotten.
-        web_router,
-    ):
+        #
+        # Conditional because `--no-web` exists to switch it off. It was mounted
+        # unconditionally from #12 until this was noticed: the flag had been accepted and
+        # discarded since #8, so an operator who passed `--no-web` was served the whole
+        # browser surface anyway. `tests/app/test_serving.py` holds that shut.
+        routers.append(web_router)
+    for router in routers:
         app.include_router(router)
     return app
 
