@@ -328,3 +328,92 @@ async def test_titles_shared_by_two_documents_are_not_used_as_probes(
 
     assert "aurora ledger configuration" not in {item.text for item in items}
     assert items, "the rest of the corpus should still yield probe items"
+
+
+async def test_a_corpus_titled_with_filenames_still_yields_a_probe(
+    store: SqliteDocStore,
+) -> None:
+    """The guard that decides whether this package's headline check runs at all.
+
+    Documents ingested from a filesystem are titled with their filenames — one word each. The
+    rule here used to require two, so **every** document was rejected, ``probe_from_titles``
+    returned nothing, and :class:`DiscriminationProbe` raised rather than measuring. The
+    at-chance guard was absent on the most ordinary corpus manicule has, and nothing said so.
+    """
+    from tests.storage_helpers import make_document  # noqa: PLC0415 - only these tests need it
+
+    names = ("retrieval", "storage", "embeddings", "generation", "contracts", "parsing")
+    for name in names:
+        await store.upsert_document(
+            make_document(
+                source="fixture",
+                source_id=name,
+                title=f"{name}.md",
+                uri=f"file:///{name}.md",
+                body=name.encode(),
+            )
+        )
+
+    items = await probe_from_titles(store, workspace_ids=SCOPE, limit=100)
+
+    assert {item.text for item in items} == set(names), (
+        "a filename-titled corpus must yield probe items, and the extension is not part of the "
+        "question"
+    )
+
+
+async def test_two_documents_differing_only_by_extension_are_not_used_as_probes(
+    store: SqliteDocStore,
+) -> None:
+    """Stripping the extension makes the uniqueness check stricter, which is the point.
+
+    ``notes.md`` and ``notes.txt`` were always two documents with one name; before the strip they
+    read as two distinct titles and each became a probe the other could satisfy.
+    """
+    from tests.storage_helpers import make_document  # noqa: PLC0415 - only these tests need it
+
+    for extension in ("md", "txt"):
+        await store.upsert_document(
+            make_document(
+                source="fixture",
+                source_id=f"notes-{extension}",
+                title=f"notes.{extension}",
+                uri=f"file:///notes.{extension}",
+                body=b"notes",
+            )
+        )
+    await store.upsert_document(
+        make_document(
+            source="fixture",
+            source_id="unique",
+            title="glossary.md",
+            uri="file:///glossary.md",
+            body=b"glossary",
+        )
+    )
+
+    items = await probe_from_titles(store, workspace_ids=SCOPE, limit=100)
+
+    assert {item.text for item in items} == {"glossary"}
+
+
+async def test_a_version_number_in_a_title_is_not_mistaken_for_an_extension(
+    store: SqliteDocStore,
+) -> None:
+    """``pathlib`` would take ``release 2.1 notes`` to ``release 2``, inventing a collision."""
+    from tests.storage_helpers import make_document  # noqa: PLC0415 - only these tests need it
+
+    for suffix in ("1", "2"):
+        await store.upsert_document(
+            make_document(
+                source="fixture",
+                source_id=f"release-2-{suffix}",
+                title=f"release 2.{suffix} notes",
+                uri=f"file:///release-2-{suffix}.md",
+                body=b"release",
+            )
+        )
+
+    items = await probe_from_titles(store, workspace_ids=SCOPE, limit=100)
+
+    assert {item.text for item in items} == {"release 2.1 notes", "release 2.2 notes"}

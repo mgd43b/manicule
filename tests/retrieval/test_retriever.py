@@ -15,6 +15,7 @@ from manicule.core.retrieval import ConfidenceBand, Filter, Query
 from manicule.plugins.registry import ComponentRegistry
 from manicule.retrieval.assembly import ContextAssembler
 from manicule.retrieval.cache import L1QueryCache
+from manicule.retrieval.confidence import AGREEMENT
 from manicule.retrieval.dense import DenseStage
 from manicule.retrieval.fusion import RRFStage
 from manicule.retrieval.lexical import LexicalStage
@@ -284,6 +285,35 @@ async def test_a_reranked_run_can_reach_high_confidence_and_an_unreranked_one_ca
     assert plain.confidence.ceiling == pytest.approx(0.70)
     assert reranked.confidence.ceiling > plain.confidence.ceiling
     assert plain.confidence.band is not ConfidenceBand.HIGH
+
+
+async def test_a_lexical_leg_that_matched_nothing_still_pays_the_agreement_penalty(
+    store: SqliteDocStore,
+) -> None:
+    """The wiring between the retriever and the scorer, which is where the defect lived.
+
+    ``score_confidence`` is told the legs this pipeline *declares*. The retriever used to derive
+    a ``degraded_legs`` list instead — the legs no context passage carried a score for — which
+    reads a leg that ran and matched nothing as a leg that failed, and then **waives** its
+    component. A nonsense query matches no keywords, so it paid no agreement penalty at all while
+    a real question that matched some paid one in full.
+
+    A query of pure punctuation tokenises to nothing for FTS5 and matches lexically zero times,
+    while the dense leg still returns its nearest neighbours: exactly the shape that used to be
+    excused.
+    """
+    chunks = await _corpus(store)
+
+    result = await _retriever(store, chunks).retrieve(a_query("!!! ??? ###"))
+
+    assert result.confidence is not None
+    assert not any("lexical" in candidate.scores for candidate in result.context.passages), (
+        "this query is only interesting if the lexical leg really did match nothing"
+    )
+    assert AGREEMENT not in result.confidence.suppressed, (
+        "a leg that ran and matched nothing reported a fact about the query, not a fault"
+    )
+    assert result.confidence.components.get(AGREEMENT) == 0.0
 
 
 async def test_a_query_that_matches_nothing_reports_none_with_a_reason(

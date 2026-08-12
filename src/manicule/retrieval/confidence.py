@@ -204,6 +204,59 @@ def rescale_similarity(cosine: float, *, noise: float, strong: float) -> float:
     return min(1.0, max(0.0, (cosine - noise) / (strong - noise)))
 
 
+def _similarity(
+    passages: Sequence[Candidate], dense_leg: str | None, *, noise: float, strong: float
+) -> tuple[float, str]:
+    """The rescaled similarity component, or why there is none.
+
+    Returns the value and an empty string, or ``0.0`` and the reason it is unavailable. Absent
+    and zero are different answers here and the caller must not be able to confuse them, which
+    is why the reason rather than the number carries the signal.
+
+    **Only the passages the dense leg actually scored are averaged.** ``.get(leg, 0.0)`` was the
+    defect this replaces: a passage the lexical leg found and the dense leg never ranked has *no*
+    measured similarity, and reading the absent key as 0.0 asserts the dense leg looked at it and
+    judged it orthogonal to the query. It never looked. On the query that exposed this, BM25's top
+    hit was averaged in as a zero and cost the best answer in the corpus a twentieth of a point —
+    the not-measured-versus-measured-zero conflation this module forbids one component along,
+    committed in a default argument.
+    """
+    if dense_leg is None:
+        # A pipeline with no fusion names no legs, so nothing here has a similarity to average.
+        # Suppressed rather than scored zero: a zero would report weak evidence for what is a
+        # property of the pipeline.
+        return 0.0, "this pipeline declares no retrieval legs to read a similarity from"
+    scored = [
+        candidate.scores[dense_leg] for candidate in passages if dense_leg in candidate.scores
+    ]
+    if not scored:
+        return 0.0, (
+            f"no passage in the context carries a {dense_leg!r} score, so there is no similarity "
+            f"this run could average — absent, not zero"
+        )
+    return rescale_similarity(
+        _mean([max(value, 0.0) for value in scored]), noise=noise, strong=strong
+    ), ""
+
+
+def _rerank(passages: Sequence[Candidate], stage: str | None) -> tuple[float, str]:
+    """The reranker component, or why there is none. Same absent-versus-zero contract as
+    :func:`_similarity`."""
+    if stage is None:
+        return 0.0, (
+            "no reranker ran, so there is no verification step to report. Its weight is not "
+            "redistributed: a pipeline that skipped the check must not be able to claim it"
+        )
+    logits = [
+        _sigmoid(candidate.scores[stage]) for candidate in passages if stage in candidate.scores
+    ]
+    if not logits:
+        return 0.0, (
+            f"the {stage!r} stage ran but scored none of the passages that reached the context"
+        )
+    return _mean(logits), ""
+
+
 def score_confidence(
     passages: Sequence[Candidate],
     *,
@@ -246,37 +299,13 @@ def score_confidence(
     components: dict[str, float] = {}
     suppressed: dict[str, str] = {}
 
-    dense_leg = legs[0] if legs else None
-    # Only the passages the dense leg actually scored. `.get(leg, 0.0)` was the bug this
-    # replaces: a passage the lexical leg found and the dense leg never ranked has *no*
-    # measured similarity, and reading the absent key as 0.0 asserts the dense leg looked at it
-    # and found it orthogonal to the query. It did not look. On the query that exposed this,
-    # BM25's top hit was averaged in as a zero and cost the best answer in the corpus a twentieth
-    # of a point — the not-measured-versus-measured-zero conflation this module forbids one
-    # component along, committed here in a default argument.
-    scored = (
-        [candidate.scores[dense_leg] for candidate in passages if dense_leg in candidate.scores]
-        if dense_leg is not None
-        else []
+    measured, unavailable = _similarity(
+        passages, legs[0] if legs else None, noise=noise_similarity, strong=strong_similarity
     )
-    if dense_leg is None:
-        # A pipeline with no fusion names no legs, so nothing here has a similarity to average.
-        # Suppressed rather than scored zero: a zero would report weak evidence for what is a
-        # property of the pipeline.
-        suppressed[SIMILARITY] = (
-            "this pipeline declares no retrieval legs to read a similarity from"
-        )
-    elif not scored:
-        suppressed[SIMILARITY] = (
-            f"no passage in the context carries a {dense_leg!r} score, so there is no similarity "
-            f"this run could average — absent, not zero"
-        )
+    if unavailable:
+        suppressed[SIMILARITY] = unavailable
     else:
-        components[SIMILARITY] = rescale_similarity(
-            _mean([max(value, 0.0) for value in scored]),
-            noise=noise_similarity,
-            strong=strong_similarity,
-        )
+        components[SIMILARITY] = measured
 
     # Suppressed on the shape of the *pipeline*, never on what this query happened to match. A
     # lexical leg that ran and matched nothing has reported a fact about the query, and waiving
@@ -292,24 +321,11 @@ def score_confidence(
         agreeing = sum(1 for candidate in passages if all(leg in candidate.scores for leg in legs))
         components[AGREEMENT] = agreeing / len(passages)
 
-    if rerank_stage is None:
-        suppressed[RERANK] = (
-            "no reranker ran, so there is no verification step to report. Its weight is not "
-            "redistributed: a pipeline that skipped the check must not be able to claim it"
-        )
+    verified, unverifiable = _rerank(passages, rerank_stage)
+    if unverifiable:
+        suppressed[RERANK] = unverifiable
     else:
-        logits = [
-            _sigmoid(candidate.scores[rerank_stage])
-            for candidate in passages
-            if rerank_stage in candidate.scores
-        ]
-        if logits:
-            components[RERANK] = _mean(logits)
-        else:
-            suppressed[RERANK] = (
-                f"the {rerank_stage!r} stage ran but scored none of the passages that reached "
-                f"the context"
-            )
+        components[RERANK] = verified
 
     score = sum(WEIGHTS[name] * value for name, value in components.items())
     ceiling = sum(WEIGHTS[name] for name in components)

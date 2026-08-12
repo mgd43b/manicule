@@ -208,9 +208,7 @@ def test_noise_scores_below_a_weaker_but_real_match() -> None:
 def test_confidence_is_monotonic_in_similarity() -> None:
     """A better-matched query is never reported as less confident than a worse one."""
     scores = [
-        score_confidence(
-            [passage(FIRST, 0, dense=cosine, lexical=1.0)], rerank_stage=None
-        ).score
+        score_confidence([passage(FIRST, 0, dense=cosine, lexical=1.0)], rerank_stage=None).score
         for cosine in (0.30, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80)
     ]
 
