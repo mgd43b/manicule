@@ -203,7 +203,7 @@ def print_envelope(envelope: Envelope) -> None:
             raise typer.Exit(1)
         return
     if envelope.ok and envelope.data is not None:
-        payload = _PAYLOADS[envelope.op].model_validate(envelope.data)
+        payload = PAYLOADS[envelope.op].model_validate(envelope.data)
         console = render.console()
         if isinstance(payload, r.AnswerResultPayload):
             console.print()
@@ -216,7 +216,7 @@ def print_envelope(envelope: Envelope) -> None:
     raise typer.Exit(1)
 
 
-_PAYLOADS: dict[str, type[Payload]] = {
+PAYLOADS: dict[str, type[Payload]] = {
     "ask": r.AnswerResultPayload,
     "search": r.SearchResult,
     "index_path": r.IngestReport,
@@ -257,6 +257,11 @@ _PAYLOADS: dict[str, type[Payload]] = {
 The envelope carries JSON, so rendering has to know what to parse it back into. A table rather
 than a field on the envelope, because the wire format is what an external consumer reads and
 a Python class name means nothing to one.
+
+Public, because it is half of a contract with :data:`manicule.cli.render.RENDERERS` — every
+type named here must have a renderer there, and every renderer there must be reachable from
+some operation here. Neither table can state that on its own, so
+``tests/app/test_cli.py`` states it about the pair.
 """
 
 
@@ -693,9 +698,20 @@ def reset_index(
 
 
 @app.command()
-def doctor() -> None:
-    """Check configuration, plugins, storage, the index and the network bind."""
-    emit("doctor", lambda service: service.doctor())
+def doctor(
+    fix: Annotated[
+        bool,
+        typer.Option(
+            "--fix",
+            help="Repair what can be repaired, then report. Today that is one thing: seeding "
+            "the declared code grammars, from an offline bundle if one is installed and from "
+            "the grammar release otherwise. It is the only part of this command that writes "
+            "to the machine or uses the network, which is why it is a flag.",
+        ),
+    ] = False,
+) -> None:
+    """Check configuration, plugins, storage, the index, grammars and the network bind."""
+    emit("doctor", lambda service: service.doctor(fix=fix))
 
 
 @app.command()
@@ -811,6 +827,7 @@ def main() -> None:
 __all__ = [
     "BACKUP_IS_NOT_A_RESTORE",
     "BACKUP_NEEDS_A_TARGET",
+    "PAYLOADS",
     "RESET_NEEDS_CONFIRMATION",
     "STATE",
     "State",
