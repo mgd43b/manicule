@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from manicule.core.content import DocumentStatus
 from manicule.core.provenance import PROVENANCE_KEY, LocalSnapshot, Provenance, SourceMetadata
+from manicule.ingest.reindex import re_parse
 from tests.ingest import fakes
 from tests.ingest.test_pipeline import build
 
@@ -249,6 +250,84 @@ async def test_a_refused_record_is_stored_so_the_refusal_is_visible() -> None:
     assert document.status is DocumentStatus.INDEXED, (
         "an unusable manifest never costs anybody the document beside it"
     )
+
+
+async def test_a_connectors_own_metadata_keys_survive_beside_the_record() -> None:
+    """The generic record does not displace a connector's own vocabulary, and must not.
+
+    **This is the contract that keeps the interface product-neutral without making it useless.**
+    A record carries what *every* source has — a title, an address, an identity, a version, a
+    hierarchy. Anything a particular product means and others do not has no business in it: a
+    wiki's space key, a page's content status, its labels, its attachment references. Those stay
+    in the connector's own metadata keys, which is where they already live
+    (``connectors/confluence.py`` sets ``space_key`` today).
+
+    So the two have to coexist, and the assignment in ``_store_record`` writes one key rather
+    than replacing the mapping. If it ever replaced it, every connector-specific fact in the
+    corpus would vanish the moment its connector started supplying a record — and the symptom
+    would be a citation that looked complete while having quietly lost the field a reader of that
+    particular product actually navigates by.
+    """
+    connector = a_connector(metadata=a_record())
+    connector.metadata[MIRRORED] = {
+        **a_record(),
+        "space_key": "ENG",
+        "content_status": "current",
+        "labels": ["runbook", "on-call"],
+        "attachments": [{"id": "att-1", "filename": "diagram.png"}],
+    }
+    _, document = await ingest_once(connector)
+
+    assert document.provenance is not None
+    assert document.provenance.source is not None
+    assert document.provenance.source.title == "Retry policy"
+    # The connector's own keys, untouched and beside the record rather than inside it.
+    assert document.metadata["space_key"] == "ENG"
+    assert document.metadata["content_status"] == "current"
+    assert document.metadata["labels"] == ["runbook", "on-call"]
+    assert document.metadata["attachments"] == [{"id": "att-1", "filename": "diagram.png"}]
+    # And none of them leaked into the generic vocabulary, which has nowhere to put them.
+    assert not hasattr(document.provenance.source, "space_key")
+
+
+async def test_a_re_parse_from_retained_bytes_keeps_the_record_and_the_citation() -> None:
+    """The raw snapshot is the authority; text and vectors are replaceable derivatives.
+
+    Re-parsing is rung 3 of ``docs/storage.md`` §1's blast-radius ladder — the retained bytes are
+    read back and run through the current chain, with no network and no re-fetch. The record has
+    to survive that, because it is a fact about the *document* rather than about any particular
+    derivation of it: a parser upgrade must not be able to demote a citation back to its filename.
+
+    That relationship is what makes "the raw snapshot remains the source of authority" more than
+    a slogan, and it is stronger than a stored checksum: ``original_ref`` names the bytes,
+    ``parse_fp`` names the process that produced this text from them, and the citation's identity
+    is independent of both.
+
+    **The record reaches a re-parse by two independent routes, and this test pins neither of them
+    on its own.** Found by disabling them: ``reindex.re_parse`` copies ``document.metadata`` onto
+    the rebuilt ``RawDocument``, *and* ``_store_record``'s merge carries ``existing.metadata`` —
+    so blanking either one leaves this green, and only blanking both turns it red. Written down
+    because the consequence is a trap: somebody removing one route would see this test pass and
+    reasonably conclude the route they deleted was dead. It was not; it was redundant. The
+    property is what is asserted here, deliberately, and the redundancy is why it holds.
+    """
+    blobs = fakes.MemoryBlobs()
+    pipeline, store, _ = build(blobs=blobs)
+    await pipeline.run(a_connector(metadata=a_record()))
+    document = await store.find_document("memory", MIRRORED)
+    assert document is not None
+    assert document.original_ref, "the bytes must have been retained for a re-parse to be possible"
+
+    report = await re_parse([document], pipeline=pipeline, blobs=blobs)
+
+    assert report.documents == 1
+    after = await store.find_document("memory", MIRRORED)
+    assert after is not None
+    assert after.provenance is not None, "a re-parse must not discard the source record"
+    assert after.provenance.source is not None
+    assert after.provenance.source.version == "7"
+    assert after.title == "Retry policy", "nor demote the citation back to a local name"
+    assert after.uri == CANONICAL
 
 
 async def test_a_hostile_stored_record_cannot_take_over_the_citation() -> None:

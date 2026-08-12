@@ -947,8 +947,14 @@ class IngestPipeline:
         # a corpus ends up citing a title nothing in it holds. The local facts are not lost:
         # `source_id` is still the path this connector fetched by, `content_hash` still digests
         # these bytes, and the snapshot's location is in the record's own snapshot half.
-        # `raw.uri` is deliberately left alone upstream of here, so a parser's error messages
-        # still name the file on disk rather than a web page nobody can open locally.
+        # `raw.uri` is deliberately left alone upstream of here, so on the **fetch** path a
+        # parser's diagnostics still name the artefact it actually read rather than a web page
+        # nobody can open locally. That is a property of this path only, and the exception is
+        # worth stating rather than discovering: `reindex.re_parse` rebuilds a `RawDocument` from
+        # `document.uri`, which by then *is* the canonical address — so a re-parse diagnostic
+        # names the document rather than the bytes. Defensible, because on that path the bytes
+        # came from the blob store and neither URI describes where they were read from, but not
+        # the same claim.
         record = Provenance.from_metadata(metadata)
         canonical = record.source if record is not None else None
         document = Document(
