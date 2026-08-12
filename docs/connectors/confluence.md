@@ -2,9 +2,11 @@
 
 Design for the Confluence connector. Ticket [#9](https://github.com/mgd43b/manicule/issues/9).
 
-OpenDocuments fetches `body.storage` and runs `html.replace(/<[^>]+>/g, ' ')` over it —
-every table, code block and heading collapses into a run of words. This is the subsystem
-with the widest gap between what it should do and what it does.
+The structure of a Confluence page is most of what makes it retrievable, and it is thrown away
+by the obvious implementation: fetch `body.storage`, strip the angle brackets, index the words.
+Every table, code block and heading collapses into one run of prose, and nothing downstream can
+tell that it happened. manicule fetches a typed document tree where one exists and parses the
+markup with a real parser where one does not, so a table stays a table.
 
 ---
 
@@ -347,7 +349,8 @@ Two details worth stating:
   `metadata.mediaType` first, the response's `Content-Type` next, and the filename extension
   last; nothing is guessed ahead of what was actually said.
 
-OpenDocuments ignores attachments entirely.
+Attachments are documents. A connector that indexed only page bodies would leave the diagram,
+the spreadsheet and the specification PDF unsearchable while reporting that the space was synced.
 
 ## 7. Chunking and breadcrumbs
 
@@ -380,8 +383,9 @@ carry.
 ```
 
 Confluence derives heading anchors from heading text, so a citation can deep-link to the
-**exact section**, not just the page. This is strictly better than the page-level citation
-OpenDocuments produces, and it costs nothing since the heading is already known from §5.
+**exact section**, not just the page. It costs nothing, since the heading is already known from
+§5, and it is the difference between an answer a reader can check in one click and one that
+hands them a page to search.
 
 The page URL is taken from the source's own `_links.webui`, joined to `_links.base`, rather
 than assembled from a slug. `storage.md` §4.2 declines to claim the slug is title-derived and
@@ -446,20 +450,26 @@ differ, it is here — check these first when one is available:
 
 ---
 
-## Summary of what changes
+## Summary
 
-| | OpenDocuments | manicule |
+Each row is a property this connector holds, beside the thing that happens without it. The
+right-hand column is what a Confluence sync looks like when each decision above is skipped —
+and every one of those failures is quiet, which is why they are worth listing.
+
+| | manicule | Without it |
 |---|---|---|
-| Discovery | full space walk every sync | CQL watermark, cursor pagination |
-| Deletions | never detected | reconciliation diff |
-| Body format | `body.storage` XHTML | ADF on Cloud, parsed storage on Server |
-| Extraction | `replace(/<[^>]+>/g, ' ')` | typed ADF node walk |
-| Tables | destroyed | preserved whole |
-| Code blocks | destroyed | preserved, language-tagged |
-| Macros | ignored | resolved, with cycle detection |
-| Attachments | ignored | parser chain |
-| Context | page title | full ancestor breadcrumb |
-| Citation | page URL | deep link to heading anchor |
+| Discovery | CQL watermark, cursor pagination | a full space walk every sync |
+| Deletions | reconciliation diff | removed pages served forever |
+| Body format | ADF on Cloud, parsed storage on Server | one dialect handled, the other guessed at |
+| Extraction | typed node walk | markup stripped to a run of words |
+| Tables | preserved whole | split across chunks, or flattened |
+| Code blocks | preserved, language-tagged | prose-chunked |
+| Macros | resolved, with cycle detection | content visible in the UI and absent from the index |
+| Attachments | routed through the parser chain | unsearchable |
+| Context | full ancestor breadcrumb | a section called "Configuration", of nothing |
+| Citation | deep link to a heading anchor | a page URL to search by hand |
+| Credential | token, or a browser session behind SSO | an instance nobody can authenticate to |
+| A sign-in page | refused, twice over | indexed once per page the sync tried to read |
 
 ---
 
