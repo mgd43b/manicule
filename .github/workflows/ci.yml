@@ -306,6 +306,13 @@ jobs:
       # newly declared language missing from a cache that still hits — and the staging step
       # below refuses to download on a hit, so that would surface as a hard failure rather than
       # a slow build. Platform is in the key because a bundle is valid for one of those.
+      #
+      # Installed in its own step, as every other job here does, rather than left to the first
+      # `uv run`. The next step redirects its output into `$GITHUB_OUTPUT`, so anything uv chose
+      # to print on the way past would land in a cache key — and a malformed key is the quietest
+      # possible failure of this whole change: the cache stops hitting, the build goes back to
+      # downloading the release on every run, and the job stays green.
+      - run: uv sync --extra parsers
       - name: what the staged grammars would be valid for
         id: grammars
         run: >-
