@@ -57,4 +57,19 @@ def chunk_id(document_id_: str, position: int, text: str) -> str:
     return _digest("chunk", document_id_, str(position), text)
 
 
-__all__ = ["chunk_id", "content_hash", "document_id"]
+def glossary_entry_id(chunk_id_: str, acronym: str, expansion: str) -> str:
+    """A glossary entry's id.
+
+    Derived from the chunk that states the definition and from the definition itself, so
+    re-ingesting an unchanged glossary replaces its rows instead of accumulating a second copy
+    of every term. Including the expansion means editing a definition produces a new id, which
+    is what makes "this document now says something different" a visible change rather than an
+    in-place overwrite of a row somebody may already have cited.
+
+    The chunk id already carries the document, which already carries the workspace, so an entry
+    minted for one tenant cannot collide with another's.
+    """
+    return _digest("glossary", chunk_id_, acronym, expansion)
+
+
+__all__ = ["chunk_id", "content_hash", "document_id", "glossary_entry_id"]

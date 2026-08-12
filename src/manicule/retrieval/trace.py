@@ -203,6 +203,61 @@ class AssemblyReport(BaseModel):
     )
 
 
+class GlossaryReport(BaseModel):
+    """What glossary lookup did to one query.
+
+    On the trace beside :class:`AssemblyReport` rather than in a stage's diagnostics, because
+    expansion is not a stage: it runs before the pipeline and produces the *second query* the
+    pipeline is then run over. A span would attribute it to whichever stage happened to be
+    first.
+
+    **A conflict is recorded even though nothing was expanded**, and that asymmetry is the
+    point of the field. "Two definitions disagree" is the single most useful thing this feature
+    can tell anybody, and it is the one outcome where the ranking looks exactly like a run in
+    which no glossary existed.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    consulted: bool = Field(
+        default=False,
+        description="Whether a glossary was consulted at all. ``False`` covers both 'expansion "
+        "is off' and 'no store could answer', which are different from 'consulted and found "
+        "nothing' — and a reader trying to work out why an obvious term did not expand needs "
+        "to be able to tell them apart.",
+    )
+    expanded_query: str = Field(
+        default="", description="The second query form. Empty when nothing fired."
+    )
+    terms: tuple[str, ...] = Field(
+        default=(), description="The normalised keys that fired, in query order."
+    )
+    reasons: tuple[str, ...] = Field(
+        default=(),
+        description="Which rule admitted each fired term, positionally. Recorded because these "
+        "are the rules that stop the feature rewriting every ordinary English word, and a rule "
+        "nobody can see fire is a rule nobody can check.",
+    )
+    conflicts: tuple[str, ...] = Field(
+        default=(), description="Keys with more than one definition in scope, so none expanded."
+    )
+    promoted: int = Field(
+        default=0, ge=0, description="Definition passages lifted to the head of the ranking."
+    )
+    promoted_from_store: int = Field(
+        default=0,
+        ge=0,
+        description="Of those, how many neither search returned and had to be fetched by id. "
+        "This is the number that says whether the feature is doing anything a better ranking "
+        "would have done anyway: zero means similarity already had them.",
+    )
+    second_pass: bool = Field(
+        default=False,
+        description="Whether the declared pipeline was run a second time. The cost of the "
+        "feature, on the record rather than inferred from a latency that doubled.",
+    )
+
+
 class StageSpan(BaseModel):
     """One stage's turn: how long it took, what went in, what came out, what it was.
 
@@ -248,6 +303,10 @@ class RetrievalTrace(BaseModel):
     total_ms: float = Field(default=0.0, ge=0.0)
     stages: tuple[StageSpan, ...] = ()
     assembly: AssemblyReport | None = None
+    glossary: GlossaryReport | None = None
+    """``None`` when the retriever has no glossary wired at all, which is a different statement
+    from a report saying ``consulted=False``: the first means the capability is absent, the
+    second means it was present and declined."""
     incomparable: tuple[str, ...] = Field(
         default=(),
         description="Why this run may not be compared with another. Empty means it may.",
@@ -388,6 +447,7 @@ __all__ = [
     "AssemblyReport",
     "DenseReport",
     "FusionReport",
+    "GlossaryReport",
     "LexicalReport",
     "Regime",
     "RerankReport",

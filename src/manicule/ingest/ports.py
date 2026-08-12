@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
     from manicule.core.content import Chunk, Document, DocumentStatus, Metadata
     from manicule.core.embedding import IndexFingerprints
+    from manicule.core.glossary import GlossaryEntry
     from manicule.core.retrieval import Filter
     from manicule.core.sources import SourceId, Watermark
 
@@ -224,4 +225,26 @@ class IngestStore(Protocol):
         ...
 
 
-__all__ = ["IngestStore"]
+@runtime_checkable
+class GlossaryWriter(Protocol):
+    """A store that can hold the definitions a document states.
+
+    Separate from :class:`IngestStore` rather than another method on it, and the separation is
+    the point: glossary detection is a feature that can be switched off, and a store that does
+    not implement this must remain a perfectly good ingest target. Folding it in would make
+    every conformant store owe an implementation of an optional feature.
+    """
+
+    async def replace_glossary_entries(
+        self, document_id: str, entries: Sequence[GlossaryEntry]
+    ) -> None:
+        """Make this document's entries exactly ``entries``.
+
+        Replace rather than merge, on the same principle as ``replace_chunks``: a document is
+        re-ingested whole, so merging would leave definitions from a version of the page that
+        no longer exists — still queryable, still citing a passage nobody can read.
+        """
+        ...
+
+
+__all__ = ["GlossaryWriter", "IngestStore"]
