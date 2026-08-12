@@ -715,6 +715,8 @@ class FakeMaintenance:
     flag that parses but never arrives is indistinguishable from one that works right up until
     somebody needs it.
     """
+    exports: list[tuple[Path, bool]] = field(default_factory=list[tuple[Path, bool]])
+    """Every export asked for, on the same terms and for the same reason as :attr:`backups`."""
     backup_error: Exception | None = None
     """Raised instead of writing, for tests about how a refusal reaches the caller."""
 
@@ -742,8 +744,10 @@ class FakeMaintenance:
         self.resets += 1
         return self.reset
 
-    async def export_corpus(self, target: Path) -> tuple[int, int]:
-        del target
+    async def export_corpus(
+        self, target: Path, *, allow_insecure_target: bool = False
+    ) -> tuple[int, int]:
+        self.exports.append((target, allow_insecure_target))
         return 0, 0
 
     async def workspaces(self) -> Sequence[tuple[str, str, str]]:

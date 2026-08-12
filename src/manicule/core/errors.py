@@ -146,6 +146,20 @@ class ReconciliationRefusedError(ManiculeError):
     """
 
 
+class InsecureTargetError(ManiculeError):
+    """A command was asked to write a copy of the corpus somewhere other accounts can read it.
+
+    Raised by :func:`manicule.storage.engine.secure_output_dir` for `backup` and for `export`
+    alike, and one type rather than two because it is one condition: a directory carrying group
+    or other permission bits, about to receive every retained source byte this installation
+    holds. A caller that wants to branch on "the operator pointed this at a shared place" has
+    one thing to catch, and the message that names the path is written once.
+
+    Not a subclass of any command's own error, deliberately. It says what is wrong with the
+    *destination*, which is the same fact whichever command was carrying the bytes.
+    """
+
+
 class InstanceLockedError(ManiculeError):
     """Another manicule process already holds this data directory.
 
@@ -272,6 +286,7 @@ __all__ = [
     "FingerprintMismatchError",
     "GenerationError",
     "IncompatiblePluginError",
+    "InsecureTargetError",
     "InstanceLockedError",
     "ManiculeError",
     "MiddlewareViolationError",

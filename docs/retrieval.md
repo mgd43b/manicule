@@ -9,9 +9,10 @@ The stores are settled and built ([`storage.md`](storage.md)), the embedder is s
 and those stores, what runs, in what order, what each step is allowed to see, and what the
 result is allowed to claim.
 
-> **Prior art.** OpenDocuments is referenced in clearly-marked callouts like this one, where
-> the comparison carries design information. Everything outside these callouts stands on its
-> own.
+> **Prior art.** Clearly-marked callouts like this one record a design manicule considered and
+> rejected, and say what the rejection buys. They are here because a decision is only legible
+> beside the alternative it ruled out. Every claim in this document stands on manicule's own
+> behaviour and is checkable against this repository.
 
 ---
 
@@ -557,7 +558,7 @@ was satisfied, because the two ran different amounts of search.
 
 ### 4.5 `min_score` belongs to the dense leg and to nothing else
 
-`ProfileConfig.min_score` ships as 0.5 / 0.3 / 0.15 with a `ge=0.0, le=1.0` bound and the
+`ProfileConfig.min_score` ships as 0.35 for every profile with a `ge=0.0, le=1.0` bound and the
 description "floor below which a candidate drops". Where it is applied is the whole question, and
 two of the three plausible places are unusable — the first arithmetically, the second because the
 quantity has no absolute scale to compare a constant against.
@@ -576,12 +577,38 @@ L2-normalised and the metric is cosine, so the score really is a cosine similari
 ([`storage.md`](storage.md) §6.2) — the one number in the pipeline with an absolute meaning that
 survives leaving the run it was computed in. Negative similarities clamp to 0 before comparison.
 
-**And the shipped values are inherited, not measured.** 0.5 / 0.3 / 0.15 came across from prior
-art. BGE-M3's cosine similarities are not centred on zero for unrelated text, so a 0.5 floor on
-`fast` may be discarding relevant passages and a 0.15 floor on `precise` may be doing nothing at
-all. Calibrating them is a #15 measurement — sweep the floor against recall on the fixed query
-set — and until it runs, the honest statement is that the numbers are placeholders in the right
-place rather than tuned values.
+**The shipped values have been measured, and all three were wrong.** They were 0.5 / 0.3 / 0.15,
+inherited rather than calibrated. Swept against the query set in §8.4:
+
+| Floor | Relevant passages kept | Answerable queries still answered | Nonsense passages kept |
+|---|---|---|---|
+| 0.15, 0.30 | 160/160 | 16/16 | **210/210** |
+| 0.40 | 160/160 | 16/16 | 64/210 |
+| 0.45 | 160/160 | 16/16 | 9/210 |
+| 0.50 | **153/160** | 16/16 | 0/210 |
+| 0.60 | 42/160 | **15/16** | 0/210 |
+
+So `balanced`'s 0.3 and `precise`'s 0.15 sat *below the noise* and could not fire — every passage
+of every unanswerable query survived them. `fast`'s 0.5 sat *inside* the relevant range and was
+discarding 7 of 160 passages a real query wanted. One floor was eating answers and two were
+decorative.
+
+**All three are now 0.35, and they no longer vary by profile**, because the quantity does not:
+junk is junk at any cost setting, and what a profile actually trades is `candidates`,
+`final_top_k` and `rerank`.
+
+**0.35 sits deliberately below the point that separates the two populations, not on it.** That is
+the whole design decision, and the reason is [`embeddings.md`](embeddings.md)'s runtime parity
+guarantee. MLX and ONNX agree to cosine 0.9999 per vector, which permits roughly 0.01 of movement
+in a query-passage cosine. A floor placed at the separation — around 0.45-0.48, where the sweep's
+knee is — would put the decision boundary within backend drift of real passages, so the same
+query could return a passage on Apple Silicon and drop it on x86. **Platform may change
+throughput; it must never change output.** A threshold is a cliff, and a cliff is the wrong
+instrument for a judgement this close.
+
+So the floor is a junk filter and **not** the relevance decision. The relevance decision lives in
+confidence (§8.4), which is continuous: backend drift nudges a reported number by a thousandth
+and never changes which passages come back.
 
 **Interaction with over-fetch:** the floor is applied *after* the hydrating join, so a discarded
 low-similarity candidate does not count as a survivor, and the retry in §4.4 can be triggered by
@@ -946,10 +973,27 @@ Only quantities with a defined scale are admissible.
 
 | Component | Weight | Source |
 |---|---|---|
-| Similarity | 0.40 | Mean of `scores["dense"]` over the passages that reached the context, negatives clamped to 0 |
+| Similarity | 0.55 | Mean of `scores["dense"]` over the context passages **that carry one**, negatives clamped to 0, then rescaled against the corpus noise level (§8.4) |
 | Cross-leg agreement | 0.15 | Fraction of context passages carrying **both** leg scores |
-| Support breadth | 0.15 | `min(distinct document count / 3, 1.0)` |
 | Reranker | 0.30 | Mean `sigmoid(logit)` over the context passages — **present only when a reranker ran** |
+
+Two details in the similarity row are load-bearing, and both were defects fixed by measurement:
+
+- **"that carry one."** A passage the lexical leg found and the dense leg never ranked has *no*
+  similarity. Reading the absent score as `0.0` asserts the dense leg looked at it and found it
+  orthogonal to the query — it never looked. On the query that exposed this, BM25's top hit was
+  averaged in as a zero and cost the best answer in the corpus a twentieth of a point.
+- **"rescaled."** Raw cosine is not centred on zero, so unrelated text scores ~0.45 rather than
+  ~0.0 and lands in the same band as a real match. §8.4 is the measurement and the constants.
+
+**There is no support-breadth term, and its removal was a measured correction.** `min(distinct
+documents / 3, 1.0)` was meant to read as corroboration and read as *diffusion* instead: noise
+scatters across a corpus and a good answer concentrates in one place, so the term systematically
+paid the worse result. On the pair that exposed the defect, a nonsense query reached four
+documents and took the full 0.15 while a correctly-focused answer reached one and took 0.05.
+Telling corroboration from diffusion means knowing whether the documents *agree*, which is an
+entailment check and not a count. Its weight went to similarity, which keeps the total at 1.0 and
+therefore keeps `fast`'s 0.70 ceiling exactly where §8.3 puts it.
 
 What is excluded, and why:
 
@@ -971,30 +1015,35 @@ them.
 **An `exhausted_budget` leg (§4.4) caps confidence at `medium`,** because the retrieval is known
 to be a floor rather than a result.
 
-**A degraded leg (§5.3) suppresses every component that depended on it, rather than scoring
-them zero.** This one matters and is easy to get backwards, and building it showed the rule is
-about the *cause* rather than about one named term: if the dense leg is the one that returned
-nothing, no passage carries a similarity either, and a similarity term computed as 0 reports
-weak evidence for what is a fault in the pipeline — the same mistake the paragraph below
-forbids, one component along. So the rule is stated once and applies to both. If the lexical leg returned nothing, no passage can carry
-both leg scores, so cross-leg agreement computes to 0 and drags confidence down by up to 0.15 —
-reporting lower confidence because *FTS5 threw*, which is a statement about the system dressed up
-as a statement about the evidence. So when a leg is degraded, the agreement component is absent
-in the same sense the reranker component is absent under `fast`: it contributes nothing and is
-not renormalised, the ceiling drops accordingly, and the trace says which component was
-suppressed and why. Confidence never blames the corpus for a fault in the pipeline.
+**Suppression tracks the shape of the pipeline, never what one query happened to match.** A
+component is suppressed when the pipeline could not produce it — no reranker ran, or fewer than
+two legs are *declared*, or no context passage carries a dense score at all. It contributes
+nothing, its weight is not redistributed, the ceiling drops accordingly, and the trace says which
+component went and why.
+
+What suppression is **not** for is a leg that ran and found nothing, and getting that backwards
+was most of the reported defect. The rule used to key on "no context passage carries this leg's
+score", which reads as a broken leg and is nothing of the kind: neither leg catches exceptions,
+so a leg that returns has run, and an empty return means *it ran and the query matched nothing* —
+a fact about the query, and evidence. The same test also fired when a leg found plenty and none
+of its hits survived into the final few. The consequence ran exactly the wrong way: a nonsense
+query matches no keywords, so it had its agreement component **waived**, while a real question
+that matched some paid the penalty in full. Confidence must not blame the corpus for a fault in
+the pipeline — and it must not excuse a query for being too poor to match anything either.
 
 ### 8.3 No fallback term, and why `fast` cannot report high confidence
 
 When no reranker ran, the reranker term **contributes zero and the remaining weights are not
 renormalised.** The arithmetic maximum under `fast` is therefore 0.70.
 
-> **Prior art, and the bug this rule exists to avoid.** `calculateConfidence` computes
-> `avgRerank = rerankScores.length > 0 ? average(rerankScores) : avgRetrieval` — when no reranker
-> ran, the retrieval average is substituted into the reranker's slot. Retrieval then counts for
-> `0.4 + 0.3 = 0.7` instead of 0.4, and **turning the reranker off raises the reported
-> confidence** for identical retrieval. The weaker pipeline claims more. Renormalising the
-> remaining weights would have the same effect by a more respectable route.
+> **The rule, stated as the property it protects.** A component that did not run must never be
+> filled in from one that did. Substituting the retrieval average into the reranker's empty slot
+> is the tempting shape, because it keeps the scale full — and it would make retrieval count for
+> `0.55 + 0.30 = 0.85` instead of 0.55, so **turning the reranker off would raise the reported
+> confidence** for identical retrieval. The pipeline that skipped the verification step would
+> claim more than the one that ran it. Renormalising the remaining weights reaches the same place
+> by a more respectable route and is refused for the same reason: manicule reports what it
+> measured, and a measurement not taken lowers the ceiling rather than borrowing a number.
 
 Bands, applied to that single absolute scale:
 
@@ -1002,8 +1051,15 @@ Bands, applied to that single absolute scale:
 |---|---|---|
 | `high` | ≥ 0.75 | `balanced`, `precise` |
 | `medium` | ≥ 0.45 | all |
-| `low` | ≥ 0.20 | all |
-| `none` | < 0.20, or nothing retrieved | all |
+| `low` | ≥ 0.10 | all |
+| `none` | < 0.10, or nothing retrieved | all |
+
+**The `none` boundary is 0.10 because that is where the measurement put the gap** (§8.4). Once
+similarity is rescaled the two populations separate with nothing between them — unanswerable
+questions reached at most 0.032 and real ones at least 0.162, across all three profiles. A
+boundary at 0.20 sat *inside* the real population, so `precise`, the profile that looks hardest,
+reported "nothing here resembles your question" for questions the corpus answers. That is the
+original defect wearing the other mask.
 
 **`fast` topping out at `medium` is the intended behaviour, not an artefact.** `fast` is the
 profile that skips the verification step; it should not be able to claim it verified. This is
@@ -1013,6 +1069,64 @@ cost of choosing `fast` visible at the moment it matters.
 **The scalar is never reported alone.** `Confidence` carries the band, the components that
 produced it, and the pipeline identity. A number that cannot say why it is 0.62 is a number
 nobody can act on, and one that cannot say what produced it is one #15 cannot compare.
+
+### 8.4 Calibrating similarity against the corpus's own noise
+
+**Cosine is not centred on zero, and pretending otherwise is what let nonsense outrank a real
+question.** Dense retrieval always returns its nearest neighbours; on a corpus with nothing
+relevant in it, those neighbours are still returned and are *not* far away in absolute terms.
+
+The measurement, over manicule's own documentation — 13 documents, 604 chunks, BGE-M3, all
+three profiles — asked 16 questions the corpus answers and 22 it demonstrably cannot (subjects
+absent from it, plus gibberish). Read as the mean cosine over the passages that reached a
+context, which is the quantity confidence actually scores:
+
+| Query set | min | median | max |
+|---|---|---|---|
+| Questions the corpus answers (16) | 0.531 | 0.597 | 0.641 |
+| Questions it cannot (16) | 0.353 | 0.391 | 0.457 |
+| Gibberish (6) | 0.356 | 0.372 | 0.451 |
+
+The two populations are cleanly separated and **neither is near zero**. Fed in raw, the worst
+real question and the best nonsense one differ by 0.07 on a scale whose bands are cut at 0.45 —
+so they land in the same band, which is exactly what was observed. So similarity is rescaled:
+
+```
+component = clamp01((mean_cosine − NOISE_SIMILARITY) / (STRONG_SIMILARITY − NOISE_SIMILARITY))
+                     NOISE_SIMILARITY = 0.45      STRONG_SIMILARITY = 0.65
+```
+
+Below the noise level the answer is 0.0, because "further from the query than unrelated text" is
+not a finer grade of relevance. Both constants are calibrated against the **context mean**, not
+a top-1 cosine — top-1 runs about 0.08 higher, and calibrating to it puts the whole scale out by
+that much and caps a flawless retrieval at roughly half the component.
+
+**These are properties of the embedder and the corpus, not universal constants.** Re-measure them
+the way they were measured — ask questions the corpus demonstrably cannot answer, and read where
+their similarities land — rather than adjusting them until one example looks right.
+
+#### What the rescale did
+
+Same index, same queries, before and after:
+
+| Query | Before | After |
+|---|---|---|
+| `zzzqqq unrelated nonsense xyzzy` | 0.330 `low` | **0.002 `none`** |
+| `how are citations verified` | 0.246 `low` | **0.449 `low`** |
+
+And across the whole query set, on every profile: every one of the 16 answerable questions scores
+`low` or better, every one of the 22 unanswerable ones scores `none`, and **all 16 answerable
+questions still return passages** — the floor change costs no recall. Worst answerable score
+against best unanswerable score: 0.332 vs 0.032 (`fast`), 0.252 vs 0.019 (`balanced`), 0.162 vs
+0.000 (`precise`).
+
+#### Confidence is not comparable across profiles, and this is where you see it
+
+`precise` scores the same query lower than `balanced` does, because its context holds ten
+passages rather than five and the mean is dragged down by the weaker tail. That is honest — the
+mean describes what you were actually shown — and it is why `PipelineIdentity` travels with every
+score and why §8.1 says the number is not comparable across configurations. It is a reason to
+compare a profile against itself over time, never against another profile.
 
 ---
 
@@ -1249,7 +1363,7 @@ Named settings are only useful if the names mean something specific. What actual
 |---|---|---|---|
 | Candidates per leg | 10 | 20 | 50 |
 | Dense rows fetched (floor, §4.3) | 30 | 60 | 150 |
-| `min_score` on the dense leg | 0.5 | 0.3 | 0.15 |
+| `min_score` on the dense leg | 0.35 | 0.35 | 0.35 |
 | Fused set, before rerank | ≤ 20 | ≤ 40 | ≤ 100 |
 | Cross-encoder | **not loaded** | 20 pairs | 50 pairs |
 | Passages into context | 3 | 5 | 10 |
@@ -1300,8 +1414,9 @@ that the rail is now a real one: the fitter still cannot bind on a shipped profi
 within a factor of 1.5 of doing so rather than a factor of five, so an override that pushes past
 it is an override a reader can see coming.
 
-The similarity floors are the one set of numbers here that stay inherited. §4.5 says why, and
-that they are placeholders in the right place rather than tuned values.
+The similarity floor no longer varies by profile and is no longer inherited: §4.5 carries the
+sweep that set it to 0.35 everywhere, and §8.4 the reason the relevance decision lives in
+confidence rather than in a threshold.
 
 Every knob is overridable per field (`ProfileConfig` + `rag.overrides`), and overrides start from
 the named profile so changing one cannot silently move another.
@@ -1362,7 +1477,7 @@ Calls made in the absence of a stated position.
 | Over-fetch is derived from a measured `live_fraction`, with floor, cap and row cap | §4.3 |
 | `live_fraction` is workspace-scoped only, so it stays cacheable per `(generation, workspace)` | §4.3 |
 | Three distinct shortfall outcomes; `exhausted_budget` is a defect and the others are not | §4.4 |
-| `min_score` applies to dense cosine only, and the shipped values are placeholders | §4.5 |
+| `min_score` applies to dense cosine only, is 0.35 everywhere, and is a junk filter rather than the relevance decision | §4.5, §8.4 |
 | RRF is rank-only: no score weighting, no leg weighting, no normalisation | §5.1 |
 | Per-leg ranks are recovered from `Candidate.scores`; the fusion stage is configured with leg names | §5.2 |
 | A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |

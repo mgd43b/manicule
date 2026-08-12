@@ -234,6 +234,34 @@ def test_allow_insecure_target_is_refused_on_a_restore_rather_than_ignored(
     assert result.exit_code != 0
 
 
+def test_an_export_consents_to_nothing_unless_the_flag_is_typed(
+    bound: ApplicationService,
+) -> None:
+    """The same default as `backup`, because it is the same corpus in the same danger."""
+    result = run(["--json", "export", "--output", "/tmp/somewhere"])  # noqa: S108 - the fake never writes
+    assert result.exit_code == 0
+    maintenance = asyncio.run(bound.backend.maintenance())
+    assert isinstance(maintenance, FakeMaintenance)
+    assert maintenance.exports == [(Path("/tmp/somewhere"), False)]  # noqa: S108
+
+
+def test_export_gets_the_same_escape_hatch_under_the_same_name(
+    bound: ApplicationService,
+) -> None:
+    """One flag spelled one way across both commands that write a copy of the corpus.
+
+    An operator who learned it on `backup` should not discover that `export` calls it
+    something else, or has nothing.
+    """
+    result = run(
+        ["--json", "export", "--output", "/tmp/somewhere", "--allow-insecure-target"]  # noqa: S108
+    )
+    assert result.exit_code == 0
+    maintenance = asyncio.run(bound.backend.maintenance())
+    assert isinstance(maintenance, FakeMaintenance)
+    assert maintenance.exports == [(Path("/tmp/somewhere"), True)]  # noqa: S108
+
+
 # --- completion ---------------------------------------------------------------------------------
 
 

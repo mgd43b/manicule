@@ -979,3 +979,26 @@ async def test_upgrade_backs_up_and_then_refuses_to_run_a_package_manager(
 
 async def test_upgrade_can_skip_the_backup_when_asked(service: ApplicationService) -> None:
     assert (await service.upgrade(skip_backup=True)).backup is None
+
+
+async def test_upgrade_names_a_destination_without_creating_one(tmp_path: Path) -> None:
+    """The service decides *where*; the backend is what touches a disk.
+
+    Caught in review of the change that moved this destination out of the data directory: the
+    service was creating the parent itself, so an ``upgrade`` against a backend that writes
+    nothing still left a directory behind — in a real data directory's sibling, from a unit
+    test that had asked for no filesystem at all.
+
+    Its own backend and its own ``data_dir``, rather than the shared fixture's, because the
+    assertion is about a path on disk and the shared one resolves to wherever this machine
+    keeps its data directory.
+    """
+    data_dir = tmp_path / "data"
+    service = ApplicationService(FakeBackend(settings=Settings(data_dir=data_dir)))
+    sibling = tmp_path / "data-backups"
+
+    report = await service.upgrade()
+
+    assert report.backup is not None, "the destination is still named"
+    assert report.backup.startswith(str(sibling)), "and it is the sibling, not a subdirectory"
+    assert not sibling.exists(), "a service call that reached no storage created a directory"

@@ -256,16 +256,22 @@ class Retriever:
     def _confidence(
         self, context: Context, identity: PipelineIdentity, *, exhausted_budget: bool
     ) -> Confidence:
-        degraded = [
-            leg
-            for leg in self._legs
-            if not any(leg in candidate.scores for candidate in context.passages)
-        ]
+        """Score the run, passing the legs this pipeline *declares*.
+
+        It used to derive a ``degraded_legs`` list here — the legs no context passage carried a
+        score for — and hand that over so their components would be suppressed. That was wrong
+        twice. A leg is degraded when it *failed*, and no leg here can fail silently: neither
+        catches exceptions, so a leg that returns has run and an empty return means it ran and
+        matched nothing. The test also fires when a leg found plenty and none of its hits
+        survived into the final few. Both readings turn a fact about the query into a fault of
+        the system, and the suppression then *waived the penalty for the queries that earned
+        it*: a nonsense query matches no keywords, so it paid no agreement penalty at all, while
+        a real question that matched some paid one in full.
+        """
         return score_confidence(
             context.passages,
             identity=identity,
             legs=self._legs,
-            degraded_legs=degraded,
             rerank_stage=self._rerank_stage,
             exhausted_budget=exhausted_budget,
         )

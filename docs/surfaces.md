@@ -370,9 +370,10 @@ one that is not, it reports the command that would install it and runs nothing. 
 assistant can call unattended must not be able to fetch and execute a package.
 
 **manicule does not upgrade itself.** `upgrade` takes a backup — the part that is dangerous to
-skip — and reports the exact command. A failure part-way through an install leaves the
-installation holding your index broken, and that is not a state to reach from a command that
-reads like a version bump.
+skip — into `<data_dir>-backups/pre-upgrade-<unix-seconds>`, names that path in its payload,
+and reports the exact command. A failure part-way through an install leaves the installation
+holding your index broken, and that is not a state to reach from a command that reads like a
+version bump.
 
 Both are design decisions rather than omissions, and both are stated in the output rather than
 left to be discovered.
