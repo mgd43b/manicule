@@ -240,7 +240,7 @@ class ApplicationService:
         )
         retriever = await self._backend.retriever()
         retrieved = await retriever.retrieve(query)
-        await self._require_scoped_context(retrieved)
+        documents = await self._require_scoped_context(retrieved)
         # After the tenancy check and before the model. Recording first would put another
         # tenant's chunk ids into this workspace's telemetry on the exact path the check
         # exists to stop.
@@ -275,7 +275,7 @@ class ApplicationService:
             record.message_id = result.message_id
             if envelope is not None:
                 record.payload = self._answer_payload(
-                    question, envelope, record, started, conversation_id
+                    question, envelope, record, started, conversation_id, documents=documents
                 )
 
     async def search(
@@ -318,6 +318,7 @@ class ApplicationService:
                 heading_path=candidate.chunk.heading_path,
                 kind=candidate.chunk.kind.value,
                 anchor=_json_object(candidate.chunk.anchor.model_dump(mode="json")),
+                provenance=source_reference(documents.get(candidate.chunk.document_id)),
                 score=candidate.score,
                 scores=dict(candidate.scores),
                 text=candidate.chunk.text,
@@ -2723,9 +2724,17 @@ class ApplicationService:
             resolved.add(found.id)
         return frozenset(resolved)
 
-    async def _require_scoped_context(self, retrieved: RetrievalResult) -> None:
-        """Prove every retrieved passage belongs to this workspace, before anything leaves."""
-        await self._require_scoped_chunks(
+    async def _require_scoped_context(self, retrieved: RetrievalResult) -> dict[str, Document]:
+        """Prove every retrieved passage belongs to this workspace, before anything leaves.
+
+        Returns the documents it resolved, which it previously discarded. Every document a
+        citation can name is in here — a citation's chunk is one of these passages — so the
+        answer path builds its source references from this hydration rather than reading the
+        same rows again after the model has run. Re-reading them later would also have to happen
+        in the ``finally`` that assembles the payload, which runs on cancellation, and a database
+        read on a cancelled path is a second failure mode on top of the first.
+        """
+        return await self._require_scoped_chunks(
             candidate.chunk for candidate in retrieved.context.passages
         )
 
@@ -2777,6 +2786,8 @@ class ApplicationService:
         aside: AskAside,
         started: float,
         conversation_id: str | None,
+        *,
+        documents: dict[str, Document],
     ) -> r.AnswerResultPayload:
         return r.AnswerResultPayload(
             question=question,
@@ -2793,6 +2804,7 @@ class ApplicationService:
                     anchor=_json_object(citation.anchor.model_dump(mode="json")),
                     quote=citation.quote,
                     verification=citation.verification.value,
+                    provenance=source_reference(documents.get(citation.document_id)),
                 )
                 for citation in envelope.citations
             ),
@@ -3001,8 +3013,60 @@ def _conversation(record: ConversationRecord) -> r.ConversationSummary:
     )
 
 
+def source_reference(document: Document | None) -> r.SourceReference | None:
+    """A document's authoritative source metadata, in the shape every surface reports.
+
+    ``None`` when the document carries no record, which is the ordinary case for a local file and
+    is why the field is nullable rather than an empty object: "there is no canonical address" and
+    "the canonical address is the empty string" are different claims.
+
+    Built here, once, because four callers need it — a search hit, an answer citation, a document
+    summary and the workbench — and a second copy of this mapping is the field nobody remembers
+    when :class:`~manicule.core.provenance.SourceMetadata` gains one.
+
+    **Three timestamps go in under three names and none substitutes for another.**
+    ``modified_at`` is the source's, ``retrieved_at`` is the snapshot's, ``indexed_at`` is this
+    installation's. ``snapshot_checksum`` is read off ``content_hash`` rather than from the record,
+    because that column is the one authority for the digest of these bytes and the record
+    deliberately keeps no second copy of it.
+    """
+    if document is None:
+        return None
+    record = document.provenance
+    if record is None:
+        return None
+    published = record.source
+    snapshot = record.snapshot
+    return r.SourceReference(
+        title=published.title if published else "",
+        canonical_uri=published.canonical_uri if published else "",
+        source_id=published.source_id if published else "",
+        version=published.version if published else "",
+        modified_at=(
+            published.modified_at.isoformat() if published and published.modified_at else None
+        ),
+        section_path=published.section_path if published else (),
+        snapshot_path=snapshot.path if snapshot else "",
+        snapshot_checksum=document.content_hash,
+        retrieved_at=(
+            snapshot.retrieved_at.isoformat() if snapshot and snapshot.retrieved_at else None
+        ),
+        indexed_at=document.indexed_at.isoformat() if document.indexed_at else None,
+        unavailable_reason=record.unavailable_reason,
+    )
+
+
 def _citation(citation: Citation) -> r.AnswerCitation:
-    """One stored citation, in the shape every surface reports citations in."""
+    """One stored citation, in the shape every surface reports citations in.
+
+    **No source reference, deliberately.** A stored citation is a record of what was cited, and
+    its ``title`` and ``uri`` are the canonical values frozen at the moment the answer was given.
+    :func:`source_reference` reports the document *now* — its current version, its current
+    snapshot — so attaching one here would put live state inside a historical record and let a
+    replayed conversation claim it had cited a version that did not exist yet. The rule across
+    the surfaces is one sentence: a citation says what was shown, a source reference says what is
+    true, and a replay only has the first.
+    """
     return r.AnswerCitation(
         slot=citation.slot,
         document_id=citation.document_id,
@@ -3048,6 +3112,7 @@ def _summary(document: Document, *, chunk_count: int | None = None) -> r.Documen
         failed_stage=document.failed_stage.value if document.failed_stage else None,
         content_hash=document.content_hash,
         chunk_count=chunk_count,
+        provenance=source_reference(document),
     )
 
 

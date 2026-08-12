@@ -20,6 +20,16 @@ moved and the bytes did not — a ``touch``, or a checkout that rewrites every f
 ``/etc/mime.types`` and the Windows registry, so the same file would be routed to different
 parsers on two machines and therefore chunked two different ways. The platform may change how
 fast this runs; it may not change what ends up in the index.
+
+**A file may say what it is a copy of.** A mirrored page stored as ``123456.html`` cites as
+``123456.html`` unless something tells the connector otherwise, and :mod:`.sidecar` is that
+something: an adjacent manifest supplies the document's real title, canonical address, source
+identity and version, and the connector attaches it to the fetched bytes. Three consequences
+land here rather than there — a manifest is walked over instead of being indexed as a document
+of its own, the change token covers the pair so that editing a manifest is a change to the
+document it describes, and the record is built at fetch because checking a declared checksum
+needs the bytes. Nothing about it is specific to any documentation product, and a directory with
+no manifests behaves exactly as it did before it existed.
 """
 
 from __future__ import annotations
@@ -29,8 +39,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from manicule.connectors import sidecar
 from manicule.connectors.errors import NotFoundError
 from manicule.core.content import RawDocument
+from manicule.core.ids import content_hash
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.parsers.grammars import MEDIA_TYPES as GRAMMAR_MEDIA_TYPES
 
@@ -148,12 +160,28 @@ def version_token(path: Path) -> str | None:
     ``None`` is honest rather than convenient: it means "fetch and hash to find out", which is
     what a source with no change signal is entitled to ask for. Inventing a token that does
     not move would skip a changed file forever.
+
+    **A document with a sidecar manifest has two files, and the token covers both.** This is not
+    tidiness. A manifest is where the citable facts live, so a manifest edited to correct a
+    title or record a new source version changes what a citation says while leaving the
+    document's own bytes untouched. A token taken from the document alone would not move,
+    ``_unchanged_by_token`` would skip before fetching, and the corrected manifest would never
+    be read — a corpus citing a version it was told about and then declined to look at. Folding
+    the sibling's size and modification time in makes an edit to either side a change to the
+    pair, which is what a "document plus its manifest" actually is.
     """
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
-    return f"{stat.st_size}:{stat.st_mtime_ns}"
+    stamps: list[str] = []
+    for candidate in (path, sidecar.manifest_path_for(path)):
+        try:
+            stat = candidate.stat()
+        except OSError:
+            # The document itself being unstattable means no token at all; a missing manifest is
+            # the ordinary case and contributes nothing.
+            if candidate == path:
+                return None
+            continue
+        stamps.append(f"{stat.st_size}:{stat.st_mtime_ns}")
+    return "+".join(stamps)
 
 
 class FilesystemConnector:
@@ -249,11 +277,19 @@ class FilesystemConnector:
         except OSError as exc:
             msg = f"cannot read {ref.source_id}: {exc}"
             raise NotFoundError(msg) from exc
+        # Read here rather than at discovery, because building the record needs the digest of
+        # the bytes to check a declared checksum against — and discovery must stay decidable
+        # without reading a file. `_within_root` above has already refused anything outside the
+        # tree, so the path handed to the reader is one this connector was willing to open.
+        provenance = await asyncio.to_thread(
+            sidecar.provenance_for, path, root=self._root, checksum=content_hash(content)
+        )
         return RawDocument(
             source_id=ref.source_id,
             uri=ref.uri,
             media_type=media_type_for(path),
             content=content,
+            metadata=sidecar.with_provenance({}, provenance),
         )
 
     async def reconcile(self) -> AsyncIterator[SourceId]:
@@ -296,6 +332,13 @@ class FilesystemConnector:
                     continue
                 yield from self._walk_directory(entry)
             elif entry.is_file():
+                if sidecar.is_manifest(entry):
+                    # A manifest is metadata about the document beside it, not a document. Walked
+                    # over here rather than filtered at ingest so that `discover` and `reconcile`
+                    # agree: a manifest yielded by one and not the other would be reported as a
+                    # deletion on every sync, or indexed as a contentless entry that cites
+                    # nothing and dilutes every result set it appears in.
+                    continue
                 yield entry
 
     def _within_root(self, path: Path) -> bool:

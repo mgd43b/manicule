@@ -583,11 +583,36 @@ class StructuralChunker:
     def _breadcrumb(self, document: Document, heading_path: Sequence[str]) -> str:
         parts = breadcrumb.elements(
             _string_list(document.metadata.get("breadcrumb_prefix")) or (),
-            _string_list(document.metadata.get("ancestors")) or (),
+            _source_hierarchy(document),
             (document.title,),
             heading_path,
         )
         return breadcrumb.render(parts, self._counter, self._breadcrumb_tokens)
+
+
+def _source_hierarchy(document: Document) -> tuple[str, ...]:
+    """Where a document sits in its source, coarsest first.
+
+    Two spellings of one fact, in precedence order, because they arrived in that order. A
+    validated :class:`~manicule.core.provenance.SourceMetadata` is preferred when the document
+    carries one; ``metadata["ancestors"]`` is the older untyped convention that connectors
+    without a record still fill in, and it keeps working exactly as it did.
+
+    **The record wins where both are present, and that is the safe way round.** Its
+    ``section_path`` has been through depth, length and control-character validation;
+    ``ancestors`` has been through none. Preferring the unvalidated spelling would mean a
+    connector that supplied both got the weaker of its own two answers embedded into every
+    vector — and a breadcrumb is not something anybody reads afterwards to check.
+
+    This is also the whole of what propagates from a document's source record into a chunk, and
+    it propagates as *text the embedder reads* rather than as a copy on the chunk row. Nothing
+    document-level is duplicated per chunk; ``docs/contracts.md`` §2 fixes what a chunk is, and
+    a citation resolves the rest through ``document_id``.
+    """
+    record = document.provenance
+    if record is not None and record.source is not None and record.source.section_path:
+        return record.source.section_elements
+    return tuple(_string_list(document.metadata.get("ancestors")) or ())
 
 
 # --- anchor merging ----------------------------------------------------------------------

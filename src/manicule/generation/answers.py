@@ -144,14 +144,6 @@ class Citation(BaseModel):
         "attestation is supposed to name. Inferring it from the anchor type gets both wrong — "
         "Markdown emits a LineAnchor for prose.",
     )
-    kind: BlockKind = Field(
-        default=BlockKind.PROSE,
-        description="What the cited block is. Carried because *whether a breadcrumb may be "
-        "disclosed* depends on it: a spreadsheet chunk's heading path is its sheet name and a "
-        "code chunk's is its symbol chain, while a document's is the section title an "
-        "attestation is supposed to name. Inferring it from the anchor type gets both wrong — "
-        "Markdown emits a LineAnchor for prose.",
-    )
     quote: str = Field(
         description="``Chunk.text``, whole and byte for byte. Never ``embed_text``, which "
         "carries the retrieval breadcrumb; never normalised, because showing a "

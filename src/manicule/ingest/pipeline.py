@@ -49,6 +49,7 @@ from manicule.core.errors import (
     MiddlewareViolationError,
 )
 from manicule.core.ids import content_hash, document_id
+from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.ingest.embedding import embed_chunks
 from manicule.ingest.refusals import require_measured
 from manicule.ingest.workers import AttemptResult
@@ -887,6 +888,17 @@ class IngestPipeline:
             **(existing.metadata if existing else {}),
             **result.metadata,
         }
+        # **The source record is this run's conclusion, so it is assigned rather than merged.**
+        # The layers above put `existing.metadata` over `raw.metadata`, which is right for
+        # accumulated per-document state and wrong for anything a connector re-derives on every
+        # fetch: under the merge alone a record read now loses to the one already stored, so a
+        # manifest edited to declare a higher source version would be found, validated, and then
+        # discarded in favour of the version it supersedes. The document would cite the old one
+        # for ever and nothing would look wrong. A connector that supplies no record leaves
+        # whatever is stored alone, so this cannot erase one either.
+        fresh = Provenance.from_metadata(raw.metadata)
+        if fresh is not None:
+            metadata[PROVENANCE_KEY] = fresh.as_metadata_value()
         if keep_status:
             # The document keeps everything a reader can see, and the failure still goes on the
             # record. It simply does not cost anybody a document that was working.
@@ -895,12 +907,26 @@ class IngestPipeline:
                 "detail": result.status_detail,
             }
         settled = existing if keep_status and existing else None
+        # **What a citation shows comes from the record when there is one.** Read back out of
+        # `metadata` rather than from `fresh`, so that the record which decides the citation is
+        # by construction the record that gets stored — reading one and storing the other is how
+        # a corpus ends up citing a title nothing in it holds. The local facts are not lost:
+        # `source_id` is still the path this connector fetched by, `content_hash` still digests
+        # these bytes, and the snapshot's location is in the record's own snapshot half.
+        # `raw.uri` is deliberately left alone upstream of here, so a parser's error messages
+        # still name the file on disk rather than a web page nobody can open locally.
+        record = Provenance.from_metadata(metadata)
+        canonical = record.source if record is not None else None
         document = Document(
             id=identifier,
             source=source,
             source_id=raw.source_id,
-            uri=raw.uri,
-            title=title or (existing.title if existing else ""),
+            uri=(canonical.canonical_uri if canonical and canonical.canonical_uri else raw.uri),
+            title=(
+                canonical.title
+                if canonical and canonical.title
+                else title or (existing.title if existing else "")
+            ),
             content_hash=settled.content_hash if settled else digest,
             version_token=version_token,
             original_ref=settled.original_ref if settled else retention.ref,
