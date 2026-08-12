@@ -167,13 +167,19 @@ async def test_a_redirect_to_the_identity_provider_is_refused_and_never_followed
     Following would fetch the provider's sign-in page and turn a 302 into a 200 with a body —
     the shape nothing downstream can catch — and it would offer this account's session cookies
     to a host that is not Confluence. Both are avoided by refusing at the redirect.
+
+    The message is asserted, not only the exception type. The pre-existing origin check on every
+    outbound URL would also stop this one, a step later, saying "refusing to request" — a true
+    sentence about a link nobody wrote down, where what actually happened is that a response
+    sent the sync somewhere. Two guards over one hazard is the intent; the second one being the
+    only one with a legible account of it is not.
     """
     instance = _instance()
     instance.redirect(f"{IDENTITY_PROVIDER}/sso/saml?RelayState=x", "/rest/api/space")
     config = sso_config(instance.base_url)
     connector = await connected(instance, config, credential=browser_session(config))
     try:
-        with pytest.raises(UntrustedLinkError, match=r"idp\.example\.com"):
+        with pytest.raises(UntrustedLinkError, match=r"redirected the sync to.*idp\.example\.com"):
             await drain(connector.discover(None))
     finally:
         await connector.teardown()
@@ -227,10 +233,22 @@ async def test_an_ordinary_same_origin_redirect_is_followed() -> None:
 
 
 async def test_a_redirect_that_never_arrives_anywhere_stops_rather_than_looping() -> None:
-    """An instance insisting on a sign-in a cookie-only client cannot complete does this."""
+    """An instance insisting on a sign-in a cookie-only client cannot complete does this.
+
+    How many requests it takes is asserted as well as the refusal, because "it stops
+    eventually" is true of any ceiling at all, and what is being decided is how hard a looping
+    instance gets hit before manicule gives up on it: six requests, not six hundred.
+
+    Written as a number rather than read back from ``MAX_REDIRECTS``. A test that imports the
+    constant it is checking moves whenever the constant does, and then asserts only that the
+    code agrees with itself.
+    """
     config = sso_config(SERVER_BASE)
+    hops = 0
 
     def circle(request: httpx.Request) -> httpx.Response:
+        nonlocal hops
+        hops += 1
         del request
         return httpx.Response(302, headers={"location": f"{SERVER_BASE}/rest/api/space"})
 
@@ -246,6 +264,8 @@ async def test_a_redirect_that_never_arrives_anywhere_stops_rather_than_looping(
             await client.get_json(client.url("/rest/api/space"))
     finally:
         await client.teardown()
+
+    assert hops == 6
 
 
 # --- what the instance says about who it thinks you are --------------------------------------
