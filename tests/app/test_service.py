@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -20,6 +20,8 @@ from manicule.config.settings import Settings, config_file
 from manicule.core.content import DocumentStatus
 from manicule.core.errors import ConfigError, UnknownEntityError
 from manicule.core.retrieval import Candidate, RetrievalProfile
+from manicule.embedding.runtimes import hub
+from manicule.embedding.runtimes.hub import OFFLINE_ENV
 from manicule.ingest.pipeline import RunReport
 from manicule.plugins.registry import discover
 from tests.app.fakes import FakeBackend, make_chunk, make_document
@@ -1002,3 +1004,111 @@ async def test_upgrade_names_a_destination_without_creating_one(tmp_path: Path) 
     assert report.backup is not None, "the destination is still named"
     assert report.backup.startswith(str(sibling)), "and it is the sibling, not a subdirectory"
     assert not sibling.exists(), "a service call that reached no storage created a directory"
+
+
+# --- the weights, which nothing pre-seeds ----------------------------------------------------
+
+
+@pytest.fixture
+def weights_on_disk(monkeypatch: pytest.MonkeyPatch) -> Callable[[bool], None]:
+    """Decide what the model cache holds, without one being on the machine running the test.
+
+    The probe is a real cache lookup, so on a developer's laptop it answers "present" and on a
+    fresh CI runner it answers "absent" — which would make every assertion below true or false
+    depending on who ran it. Patched at the hub seam, which is also the only place the cache is
+    consulted.
+    """
+
+    def decide(present: bool) -> None:
+        def cached(*_args: object, **_kwargs: object) -> bool:
+            return present
+
+        monkeypatch.setattr(hub, "is_cached", cached)
+
+    return decide
+
+
+async def test_doctor_says_a_first_index_has_a_download_in_front_of_it(
+    backend: FakeBackend, weights_on_disk: Callable[[bool], None]
+) -> None:
+    """The pause this exists to explain is minutes long and produces no manicule output at all.
+
+    ``ok`` rather than ``degraded``: a machine that has not downloaded a model yet is not a
+    broken machine, and a red check on a healthy install is how an operator learns to stop
+    reading ``doctor``. What it owes the reader is the sentence, not the alarm.
+    """
+    weights_on_disk(False)
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "ok"
+    assert "is not on this machine yet" in check.detail
+    assert "1.1 GB" in check.detail
+    # The rollup is not asserted equal to "ok" — other checks in this fixture report
+    # "unknown" — but a pending download must not be what makes a machine look unwell.
+    assert diagnosis.state not in {"degraded", "failing"}
+
+
+async def test_doctor_names_the_narrow_pre_seed_rather_than_the_suite_s_own(
+    backend: FakeBackend, weights_on_disk: Callable[[bool], None]
+) -> None:
+    """``--full --mlx`` fetches 3.6 GB to seed a backend that loads 1.17 GB of it.
+
+    Advice that costs the reader three times what saying nothing would is worse than silence,
+    so the command named is the one that fetches exactly the configured backend's artefact.
+    """
+    weights_on_disk(False)
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert "--backend mlx" in check.detail
+    assert "--full" not in check.detail
+
+
+async def test_doctor_is_quiet_about_weights_that_are_already_here(
+    backend: FakeBackend, weights_on_disk: Callable[[bool], None]
+) -> None:
+    weights_on_disk(True)
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "ok"
+    assert "no download is pending" in check.detail
+
+
+async def test_weights_that_cannot_be_fetched_and_are_not_here_is_a_failure(
+    backend: FakeBackend, weights_on_disk: Callable[[bool], None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one genuinely broken state, and the reason this check can fail at all.
+
+    An install that has told the hub it may not look and has no weights cannot answer a
+    question, and will not say so until somebody asks one. Everything else here is a machine
+    part-way through a normal first run.
+    """
+    weights_on_disk(False)
+    monkeypatch.setenv(OFFLINE_ENV, "1")
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "failing"
+    assert OFFLINE_ENV in check.detail
+    assert diagnosis.state == "failing"
+
+
+async def test_doctor_never_downloads_a_model_to_report_on_one(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A diagnostic that fetched a gigabyte to report on a gigabyte would be absurd.
+
+    ``snapshot`` is the only route to the network in the embedding stack, so a ``doctor`` that
+    never reaches it is a ``doctor`` that never downloads.
+    """
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        message = "doctor reached the network to answer whether it would need to"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(hub, "snapshot", refuse)
+    diagnosis = await ApplicationService(backend).doctor()
+
+    assert any(check.name == "models" for check in diagnosis.checks)

@@ -916,6 +916,15 @@ class InitReport(Payload):
     llm_model: str
     hardware: dict[str, JsonValue] = Field(default_factory=dict)
     notes: tuple[str, ...] = ()
+    weights_pending: bool = Field(
+        default=False,
+        description="Whether the embedding weights are still to be downloaded, so the first "
+        "`index` spends minutes fetching before it indexes anything. A field rather than a "
+        "sentence a renderer finds in `notes`: it is the one fact that changes what the next "
+        "command feels like, and every surface should be able to say so in its own voice. "
+        "`False` also covers 'could not be determined' — a backend manicule knows no artefact "
+        "route for is not one it may announce a download on behalf of.",
+    )
 
 
 class ServerAddress(Payload):

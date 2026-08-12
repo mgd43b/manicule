@@ -700,3 +700,120 @@ def test_the_scan_accounts_for_every_payload_entry() -> None:
         f"print_envelope through a call shape this scan does not know about — in which case "
         f"add the shape to OP_TAKING_CALLS, or the whole surface loses the guarantee."
     )
+
+
+# --- what a reader is told when the number alone would mislead -------------------------------
+
+
+def _search_output(
+    capsys: pytest.CaptureFixture[str], *, band: str, reason: str, hits: int = 1
+) -> str:
+    """Render one search result and hand back what reached the terminal."""
+    render.render_search(
+        render.console(),
+        r.SearchResult(
+            query="how do I fix a carburettor on a 1974 Norton",
+            profile="balanced",
+            count=hits,
+            hits=tuple(
+                r.SearchHit(
+                    document_id="d",
+                    chunk_id=f"c{index}",
+                    uri="file:///x",
+                    title="x.md",
+                    score=0.0,
+                    text="something",
+                )
+                for index in range(hits)
+            ),
+            confidence=0.0,
+            confidence_band=band,
+            confidence_reason=reason,
+        ),
+    )
+    return capsys.readouterr().out
+
+
+REASON = (
+    "every passage retrieved sits at or below the level this corpus returns for a question "
+    "it has no answer to"
+)
+
+
+def test_a_search_the_corpus_cannot_answer_says_why_rather_than_only_how_much(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The failure this closes is a reader trusting three passages because they look like prose.
+
+    Retrieval computes the reason and the payload has always carried it; the browser surface
+    renders it and this one dropped it, so the same query explained itself in one place and
+    printed a bare ``0.00 (none)`` above plausible-looking excerpts in the other.
+    """
+    out = _search_output(capsys, band="none", reason=REASON)
+    assert REASON in " ".join(out.split())
+
+
+def test_a_confident_search_does_not_explain_itself(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A reason nobody needed, printed every time, is how a reader learns to skip the last line.
+
+    The scores beside each hit already say why a high-confidence result is high-confidence.
+    """
+    out = _search_output(capsys, band="high", reason="the passages scored well")
+    assert "the passages scored well" not in " ".join(out.split())
+
+
+def test_a_low_confidence_search_explains_itself_too(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``low`` and ``none`` are both bands where the number needs a sentence beside it."""
+    out = _search_output(capsys, band="low", reason=REASON)
+    assert REASON in " ".join(out.split())
+
+
+def test_a_pending_model_download_is_announced_before_the_command_that_pays_for_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``init`` recommends ``index``, and on a fresh machine that command downloads a gigabyte.
+
+    Asserted on the rendered output rather than the payload, because the whole failure being
+    fixed is one of *emphasis*: the fact was reachable in ``notes`` all along and nobody read
+    it there.
+    """
+    render.render_init(
+        render.console(),
+        r.InitReport(
+            path="/x/config.toml",
+            data_dir="/x/data",
+            embedding_provider="mlx",
+            embedding_model="BAAI/bge-m3",
+            llm_provider="ollama",
+            llm_model="qwen2.5:14b",
+            weights_pending=True,
+        ),
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert "not on this machine yet" in out
+    assert "Expect minutes, once." in out
+
+
+def test_an_install_with_its_weights_already_here_is_not_warned_about_a_download(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Second ``init`` on a working machine, where the warning would be a lie."""
+    render.render_init(
+        render.console(),
+        r.InitReport(
+            path="/x/config.toml",
+            data_dir="/x/data",
+            embedding_provider="mlx",
+            embedding_model="BAAI/bge-m3",
+            llm_provider="ollama",
+            llm_model="qwen2.5:14b",
+            weights_pending=False,
+        ),
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert "not on this machine yet" not in out
+    assert "next:" in out
