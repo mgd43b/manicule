@@ -417,7 +417,7 @@ class IngestPipeline:
         if existing is None:
             existing = await self._store.find_document(source, raw.source_id)
 
-        if not force and self._unchanged_by_hash(existing, digest):
+        if not force and self._unchanged_by_hash(existing, digest, raw):
             await self._store.record_seen(existing.id, version_token=version_token)  # pyright: ignore[reportOptionalMemberAccess]
             return (
                 DocumentOutcome(
@@ -767,19 +767,53 @@ class IngestPipeline:
             and self._parse_lineage_is_current(existing)
         )
 
-    def _unchanged_by_hash(self, existing: Document | None, digest: str) -> bool:
+    def _unchanged_by_hash(
+        self, existing: Document | None, digest: str, raw: RawDocument | None = None
+    ) -> bool:
         """Level 2: the bytes are identical, whatever the source claimed.
 
         Level 1 can lie — a source that touches its modification date on every save reports a
         new token for an unchanged body — and this catches it before the expensive part, which
         is parse, chunk and embed rather than the fetch.
+
+        ``raw`` is the fetched document, so that the source record can be compared as well; it is
+        optional only for callers that have no fetch in hand, and those cannot have a changed
+        record either.
         """
         return (
             existing is not None
             and existing.status in SETTLED
             and existing.content_hash == digest
             and self._parse_lineage_is_current(existing)
+            and self._source_record_is_current(existing, raw)
         )
+
+    @staticmethod
+    def _source_record_is_current(existing: Document, raw: RawDocument | None) -> bool:
+        """Whether the stored source record is the one this fetch just brought back.
+
+        **Identical bytes are not an unchanged document when the metadata is what moved**, and
+        this is the same trap ``_parse_lineage_is_current`` exists for, one field along. A
+        mirrored page whose manifest is corrected — a title fixed, a new source version declared
+        — has byte-for-byte the same body, so the hash agrees and level 2 skips. Worse than
+        merely skipping: the skip path calls ``record_seen`` with the *new* version token, so the
+        corrected record is never read again on any later sync either. The corpus cites a version
+        it was told about and then declined to look at, and nothing anywhere reports a problem.
+
+        Compared through the validating accessor on both sides, so an unusable record on either
+        one reads as absent and compares equal to another absent one — which is right: two
+        documents about which nothing authoritative is known are not different documents.
+
+        A fetch that brings no record leaves a stored one alone rather than counting as a change,
+        matching the assignment rule in ``_store_record``. Otherwise a connector that supplies
+        metadata on only some paths would re-ingest its whole corpus on every run.
+        """
+        if raw is None:
+            return True
+        fresh = Provenance.from_metadata(raw.metadata)
+        if fresh is None:
+            return True
+        return fresh == existing.provenance
 
     def _parse_lineage_is_current(self, existing: Document) -> bool:
         """Whether the stored text was produced by the parser version installed now.

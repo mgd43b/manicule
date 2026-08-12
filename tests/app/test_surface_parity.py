@@ -548,3 +548,169 @@ def test_the_json_payload_names_the_same_operation_the_tool_does(
     envelope = _tool(service, "search", {"query": "retry"})
     assert envelope["op"] == "search"
     assert envelope["op"] in TOOL_NAMES
+
+
+# --- source metadata, through every surface ---------------------------------------------------
+
+
+SOURCE_PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, tuple[str | int, ...]], ...] = (
+    (
+        "search",
+        {"query": "retry"},
+        ["search", "retry"],
+        ("GET", "/api/v1/search", {"params": {"q": "retry"}}),
+        ("hits", 0, "provenance"),
+    ),
+    (
+        "document_list",
+        {},
+        ["document", "list"],
+        ("GET", "/api/v1/documents", {}),
+        ("documents", 0, "provenance"),
+    ),
+)
+"""The operations that report a document's source metadata, and where it sits in each payload.
+
+``ask`` is deliberately absent: the fake backend answers without a model, so there is no answer
+envelope to compare across surfaces here. ``tests/app/test_service.py`` covers the citation's own
+copy of this block.
+"""
+
+
+def _service_ranking_one_document(*, with_record: bool) -> ApplicationService:
+    """A service whose single document is also the one thing retrieval ranks.
+
+    The module's own ``backend`` fixture leaves the fake retriever with no candidates, so
+    ``search`` there renders no hits at all — which is fine for comparing envelopes and useless
+    for asserting anything about a hit's contents. Both source-metadata cases need a hit, so both
+    come from here and differ in one argument.
+    """
+    from manicule.core.provenance import LocalSnapshot, Provenance, SourceMetadata  # noqa: PLC0415
+    from manicule.core.retrieval import Candidate  # noqa: PLC0415 - only this helper ranks one
+
+    record = (
+        Provenance(
+            source=SourceMetadata(
+                title="Retry policy",
+                canonical_uri="https://docs.example.test/pages/123456/retry-policy",
+                source_id="123456",
+                version="7",
+                section_path=("Engineering", "Runbooks"),
+            ),
+            snapshot=LocalSnapshot(path="mirror/123456.html"),
+        )
+        if with_record
+        else None
+    )
+    made = FakeBackend()
+    document = make_document(
+        WORKSPACE, source_id="123456.html", title="Retry policy", provenance=record
+    )
+    chunk = make_chunk(document)
+    made.store.add(document, chunk)
+    made.retriever_.candidates = [Candidate(chunk=chunk, score=0.5)]
+    return ApplicationService(made)
+
+
+@pytest.fixture
+def sourced() -> ApplicationService:
+    """A service whose one document carries authoritative source metadata.
+
+    A fixture of its own rather than an extension of the module's, so that every other test in
+    this file keeps running against a document with **no** record — that is the case which has to
+    stay unchanged, and a shared fixture would quietly stop covering it.
+    """
+    return _service_ranking_one_document(with_record=True)
+
+
+@pytest.mark.parametrize(("tool", "arguments", "argv", "request_", "keys"), SOURCE_PAIRS)
+def test_source_metadata_serialises_identically_on_every_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    sourced: ApplicationService,
+    *,
+    tool: str,
+    arguments: dict[str, Any],
+    argv: list[str],
+    request_: HttpCall,
+    keys: tuple[str | int, ...],
+) -> None:
+    """One record, four ways out, and the same bytes each time.
+
+    The block is nested inside a payload, which is the thing worth checking rather than assuming:
+    a surface that flattened it, dropped it because it was optional, or serialised a
+    :class:`~datetime.datetime` its own way would produce a consumer-visible difference that the
+    envelope comparison at the top of this file would catch only if some row happened to carry
+    one. None did until this fixture.
+
+    The three timestamp fields are the specific hazard. They are ``str | None`` on the payload and
+    ``datetime | None`` on the record, so exactly one place converts them; a second converter
+    anywhere would give one surface an offset and another a ``Z``.
+    """
+    from_tool = _tool(sourced, tool, arguments)
+    from_cli = _cli(monkeypatch, sourced, argv)
+    produced = [from_tool, from_cli]
+    if request_ is not None:
+        method, path, kwargs = request_
+        produced.append(_http(sourced, method, path, **kwargs))
+
+    blocks = [_at(envelope["data"], keys) for envelope in produced]
+    assert blocks[0] is not None, (
+        f"{tool} reported no source metadata at {'.'.join(str(key) for key in keys)}, so this "
+        f"test is comparing four copies of null"
+    )
+    assert blocks[0]["canonical_uri"] == "https://docs.example.test/pages/123456/retry-policy"
+    assert blocks[0]["source_id"] == "123456"
+    assert blocks[0]["version"] == "7"
+    assert blocks[0]["section_path"] == ["Engineering", "Runbooks"]
+    assert blocks[0]["snapshot_path"] == "mirror/123456.html"
+    assert blocks[0]["snapshot_checksum"], "the local snapshot's digest is part of the citation"
+    for other in blocks[1:]:
+        assert other == blocks[0]
+
+
+def test_the_canonical_identity_and_the_local_one_are_both_on_the_wire(
+    sourced: ApplicationService,
+) -> None:
+    """Neither identity is dropped in favour of the other on the way out.
+
+    ``title`` and ``uri`` on the hit are the canonical ones, because that is what a citation
+    should show. The local snapshot is still reachable in the same payload — its path in the
+    record, its digest beside it, and the file it was fetched by in ``source_id`` on the document
+    summary. A consumer auditing what was actually read never has to go and ask a second
+    question.
+    """
+    hit = _tool(sourced, "search", {"query": "retry"})["data"]["hits"][0]
+    summary = _tool(sourced, "document_list", {})["data"]["documents"][0]
+
+    assert hit["title"] == "Retry policy"
+    assert hit["provenance"]["snapshot_path"] == "mirror/123456.html"
+    assert summary["source_id"] == "123456.html", "the local artefact it was fetched by"
+    assert summary["provenance"]["canonical_uri"].startswith("https://docs.example.test/")
+
+
+def test_a_document_with_no_source_metadata_reports_null_rather_than_an_empty_block() -> None:
+    """Absent, not blank. "There is no canonical address" is not "the address is empty".
+
+    A consumer branching on presence gets one thing to look at rather than a shape it has to
+    inspect field by field to find out whether anything is in it. This is also the assertion that
+    keeps the ordinary local file — the overwhelming majority of any corpus — visibly on the old
+    path rather than on a new one that merely produces blanks.
+    """
+    plain = _service_ranking_one_document(with_record=False)
+    hit = _tool(plain, "search", {"query": "retry"})["data"]["hits"][0]
+    summary = _tool(plain, "document_list", {})["data"]["documents"][0]
+
+    assert hit["provenance"] is None
+    assert summary["provenance"] is None
+    assert hit["title"] == "Retry policy", "the fixture must still have produced a real hit"
+
+
+def _at(payload: Any, keys: tuple[str | int, ...]) -> Any:
+    """One nested value out of a payload, or ``None`` if the path does not resolve."""
+    value: Any = payload
+    for key in keys:
+        try:
+            value = value[key]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return value

@@ -505,6 +505,23 @@ class DictConnector:
         self.fail_fetch: set[str] = set()
         self.reconcile_fails_after: int | None = None
         self.hidden: set[str] = set()
+        self.metadata: dict[str, Metadata] = {}
+        """What this connector attaches to fetched bytes, per source id.
+
+        A dictionary is about as far from a filesystem as a source gets, which is why the
+        source-metadata tests drive the pipeline through *this* connector rather than through the
+        one that reads sidecar manifests. If a record only worked when it came from a real
+        directory, the interface would be coupled to the connector that happens to populate it
+        today, and the next connector to supply one would need the pipeline changed.
+        """
+        self.tokens: dict[str, str] = {}
+        """Overrides the content-derived version token, per source id.
+
+        Real change signals move independently of the bytes: a page's version number moves when
+        its title is corrected. Without an override, every test is confined to the case where a
+        token and a content hash always agree — which is exactly the case that hides a document
+        whose metadata went stale while its bytes stood still.
+        """
 
     @property
     def watermark(self) -> Watermark | None:
@@ -520,7 +537,7 @@ class DictConnector:
         for source_id, text in sorted(self.documents.items()):
             yield DiscoveredDoc(
                 ref=DocRef(source_id=source_id, uri=f"memory://{source_id}"),
-                version_token=content_hash(text),
+                version_token=self.tokens.get(source_id, content_hash(text)),
                 media_type=self.media_types.get(source_id, MEDIA_TYPE),
             )
 
@@ -534,6 +551,7 @@ class DictConnector:
             uri=ref.uri,
             media_type=self.media_types.get(ref.source_id, MEDIA_TYPE),
             content=self.documents[ref.source_id],
+            metadata=dict(self.metadata.get(ref.source_id, {})),
         )
 
     async def reconcile(self) -> AsyncIterator[SourceId]:

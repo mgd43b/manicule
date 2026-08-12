@@ -126,17 +126,32 @@ class _Manifest(BaseModel):
     )
 
     def source(self) -> SourceMetadata:
-        """The canonical half, in manicule's vocabulary. Raises on anything invalid."""
-        return SourceMetadata(
-            title=self.title,
-            canonical_uri=self.canonical_uri,
-            source_id=self.source_id,
-            version=self.version,
-            created_at=self.created_at,
-            modified_at=self.modified_at,
-            content_type=self.content_type,
-            section_path=self.section_path,
-        )
+        """The canonical half, in manicule's vocabulary.
+
+        Raises:
+            _UnusableManifestError: Any field the interface refuses, named. **Translated here
+                rather than allowed to propagate as a**
+                :class:`~pydantic.ValidationError`: this is the second of two validation passes
+                — the wire format above, then manicule's own vocabulary — and only the first was
+                reached by parsing. A ``ValidationError`` escaping this method leaves the caller's
+                refusal handler catching the wrong type, and a manifest whose canonical URI is
+                ``javascript:`` then takes down the *fetch* instead of being softly refused, so a
+                metadata typo costs the document.
+        """
+        try:
+            return SourceMetadata(
+                title=self.title,
+                canonical_uri=self.canonical_uri,
+                source_id=self.source_id,
+                version=self.version,
+                created_at=self.created_at,
+                modified_at=self.modified_at,
+                content_type=self.content_type,
+                section_path=self.section_path,
+            )
+        except ValidationError as exc:
+            msg = f"declares metadata this index will not cite ({_reasons(exc)})"
+            raise _UnusableManifestError(msg) from exc
 
 
 def manifest_path_for(document: Path) -> Path:
