@@ -15,10 +15,11 @@ that page and the index.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Final, cast
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -69,6 +70,25 @@ from tests.connectors.support import (
     server_config,
     sso_config,
 )
+
+REQUIRE_KEYCHAIN_ENV: Final = "REQUIRE_KEYCHAIN"
+"""Set to any non-empty value to turn this suite's Keychain skips into failures. CI sets it.
+
+Read at import, before a fixture has had the chance to touch the environment, and named
+outside manicule's own ``MANICULE_`` namespace — which the test environment fixture empties
+before each test, and which has already once disarmed a switch of exactly this kind.
+"""
+
+KEYCHAIN_REQUIRED: Final = bool(os.environ.get(REQUIRE_KEYCHAIN_ENV, "").strip())
+
+NO_KEYCHAIN: Final = not KeychainStore.available() and not KEYCHAIN_REQUIRED
+"""Whether to skip the cases that need a real Keychain.
+
+The Keychain is macOS's, so on Linux these skip — and on the ubuntu matrix that is all of them,
+which would leave the tests holding the most dangerous credential manicule stores running on
+one developer's machine and nowhere else. The macOS job sets the variable, and then a missing
+``/usr/bin/security`` is a failure that says so rather than a skip nobody reads.
+"""
 
 
 def _instance(**overrides: object) -> FakeConfluence:
@@ -734,7 +754,7 @@ def test_a_session_the_keychain_cannot_parse_says_how_to_replace_it() -> None:
         BrowserSession.from_json('{"base_url": "x", "captured_at": "2026-08-12T09:00:00+00:00"}')
 
 
-@pytest.mark.skipif(not KeychainStore.available(), reason="the Keychain is macOS's")
+@pytest.mark.skipif(NO_KEYCHAIN, reason="the Keychain is macOS's")
 def test_the_keychain_really_holds_a_session_and_gives_it_back() -> None:
     """Against the real ``/usr/bin/security``, because that is the decision being tested.
 
@@ -770,7 +790,7 @@ def test_the_keychain_really_holds_a_session_and_gives_it_back() -> None:
         store.forget(SERVER_BASE)
 
 
-@pytest.mark.skipif(not KeychainStore.available(), reason="the Keychain is macOS's")
+@pytest.mark.skipif(NO_KEYCHAIN, reason="the Keychain is macOS's")
 def test_a_session_larger_than_the_keychains_stdin_buffer_survives() -> None:
     """The defect a real Keychain found, kept caught.
 
@@ -802,7 +822,7 @@ def test_a_session_larger_than_the_keychains_stdin_buffer_survives() -> None:
         store.forget(SERVER_BASE)
 
 
-@pytest.mark.skipif(not KeychainStore.available(), reason="the Keychain is macOS's")
+@pytest.mark.skipif(NO_KEYCHAIN, reason="the Keychain is macOS's")
 def test_a_keychain_that_gives_back_something_else_stores_nothing() -> None:
     """The read-back is what turns a *different* buffer limit into a loud failure.
 
@@ -829,7 +849,7 @@ def test_a_keychain_that_gives_back_something_else_stores_nothing() -> None:
         store.forget(SERVER_BASE)
 
 
-@pytest.mark.skipif(not KeychainStore.available(), reason="the Keychain is macOS's")
+@pytest.mark.skipif(NO_KEYCHAIN, reason="the Keychain is macOS's")
 def test_a_session_is_filed_under_the_site_it_came_from() -> None:
     """A session is not portable between instances, and one offered to the wrong site would
     authenticate as nobody there while looking configured."""
@@ -849,7 +869,7 @@ def test_a_session_is_filed_under_the_site_it_came_from() -> None:
         store.forget(SERVER_BASE)
 
 
-@pytest.mark.skipif(not KeychainStore.available(), reason="the Keychain is macOS's")
+@pytest.mark.skipif(NO_KEYCHAIN, reason="the Keychain is macOS's")
 def test_the_session_never_reaches_the_command_line() -> None:
     """``security`` reads it from stdin. Passing it as an argument would put a live corporate
     session in this process's command line, where anything on the machine can read it."""
