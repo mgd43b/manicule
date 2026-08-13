@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from manicule.core.protocols import Connector, Parser, VectorStore
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport
     from manicule.ingest.ports import IngestStore
-    from manicule.ingest.reindex import ReindexReport
+    from manicule.ingest.reindex import ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
 
 ARCHIVE_MANIFEST = "manicule-export.json"
@@ -639,6 +639,39 @@ class _Ingestion:
             store=store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
             pipeline=await self._runtime.pipeline(),
             blobs=await self._runtime.blobs(),
+        )
+
+    async def reparse_stale(self, *, batch: int, dry_run: bool = False) -> StaleSweep:
+        """Sweep the corpus for documents an installed parser has moved past.
+
+        ``current_parse_fingerprints`` is read here, once per run, and it *raises* when a
+        declared distribution is missing. That is the right place for it to raise: a partial
+        set of current fingerprints makes every document the absent parser produced look
+        stale, and a sweep that reparsed them would rebuild a corpus with a parser that is not
+        there. Failing before the first document beats reporting a repair that could not have
+        happened.
+        """
+        from manicule.ingest.reindex import plan_stale, re_parse_stale  # noqa: PLC0415
+        from manicule.parsers.versions import current_parse_fingerprints  # noqa: PLC0415
+
+        store = await self._runtime.documents()
+        current = current_parse_fingerprints()
+        if dry_run:
+            # Before the pipeline, deliberately. Building one constructs a chunker, an
+            # embedder, a vector store and a pool of parse workers, and then refuses outright
+            # if the index disagrees with any of them — which is right for a run that is about
+            # to write and wrong for a survey of what it would touch. A plan reads rows.
+            return await plan_stale(
+                store=store,  # pyright: ignore[reportArgumentType] - it satisfies IngestStore
+                parse_fingerprints=current,
+                batch=batch,
+            )
+        return await re_parse_stale(
+            store=store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
+            pipeline=await self._runtime.pipeline(),
+            blobs=await self._runtime.blobs(),
+            parse_fingerprints=current,
+            batch=batch,
         )
 
     async def import_archive(self, path: Path, *, force: bool = False) -> RunReport:

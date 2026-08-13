@@ -551,6 +551,63 @@ class DocumentReindexed(Payload):
     detail: str = ""
 
 
+class StaleReparseReport(Payload):
+    """What a corpus-wide re-parse of stale documents did.
+
+    Counts rather than a document list. A sweep over a personal corpus names hundreds of ids
+    that nobody reads and nothing can act on, while the two lists that *are* here name the
+    documents an operator has to do something about — which is the whole difference between a
+    report and a log.
+
+    **No field carries document text.** Every string here is an id, a URI or a reason, because
+    this payload is printed to a terminal, written to whatever a shell pipeline points at, and
+    returned by an operation whose entire subject is retained content.
+    """
+
+    dry_run: bool = False
+    """Whether this was a plan. A dry run reports ``selected`` and nothing it did."""
+
+    selected: int = Field(default=0, ge=0)
+    """Documents whose recorded parse fingerprint is not one an installed parser produces."""
+
+    reparsed: int = Field(default=0, ge=0)
+    """Documents rebuilt from retained bytes."""
+
+    unchanged: int = Field(default=0, ge=0)
+    """Of ``reparsed``, those that came out with the chunk ids they went in with.
+
+    The expected majority after a rules bump, and the number that says the bump was narrow. A
+    ``parse_fp`` records the parser's version rather than the document's content, so every
+    document that parser produced is stale — and nothing can tell which ones come out different
+    without parsing them.
+    """
+
+    changed: int = Field(default=0, ge=0)
+    """Of ``reparsed``, those whose chunk set moved."""
+
+    chunks_new: int = Field(default=0, ge=0)
+    """Chunks produced that were not already stored. These are the ones with new vectors."""
+
+    chunks_kept: int = Field(default=0, ge=0)
+    """Chunks that survived with their id, and so with the vector row already stored.
+
+    Chunk ids are content-derived, so a chunk the re-parse did not move keeps its id, keeps its
+    vector, and keeps every citation that resolves to it.
+    """
+
+    unrepairable: int = Field(default=0, ge=0)
+    """Documents that cannot be re-parsed, because there are no retained bytes to read."""
+
+    failed: int = Field(default=0, ge=0)
+    """Documents whose re-parse was attempted and did not finish."""
+
+    unrepairable_documents: tuple[str, ...] = ()
+    """One line per unrepairable document: which it is, why, and what would repair it."""
+
+    failures: tuple[str, ...] = ()
+    """One line per failure. Neither list fails the sweep — the rest of the corpus completes."""
+
+
 # --- conversations -------------------------------------------------------------------------
 
 

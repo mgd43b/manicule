@@ -544,3 +544,28 @@ async def test_not_selecting_on_parse_lineage_selects_everything(store: SqliteDo
 
     assert len(await store.select_documents()) == 1
     assert len(await store.select_documents(parse_fp_current=[])) == 1
+
+
+async def test_paging_the_selection_returns_each_document_once_and_in_one_order(
+    store: SqliteDocStore,
+) -> None:
+    """What a corpus-wide repair pages through, asserted as a partition rather than a count.
+
+    A page size and an offset that agreed on how many rows there were but not on *which* would
+    still add up to the total while returning one document twice and another never — which is a
+    repair that silently skips documents, and the only failure this could have. So the pages
+    are concatenated and compared to the unpaged answer, element by element and in order.
+    """
+    for index in range(5):
+        await store.upsert_document(make_document(source_id=f"page-{index}"))
+    every = [document.id for document in await store.select_documents()]
+
+    paged = [
+        document.id
+        for offset in (0, 2, 4)
+        for document in await store.select_documents(limit=2, offset=offset)
+    ]
+
+    assert len(every) == 5
+    assert paged == every, "two pages disagreed about which documents lie between them"
+    assert await store.select_documents(offset=5) == []

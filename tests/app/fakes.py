@@ -50,7 +50,7 @@ from manicule.generation.ports import (
 )
 from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.ingest.pipeline import RunReport
-from manicule.ingest.reindex import ReindexReport
+from manicule.ingest.reindex import ReindexReport, StaleSweep
 from manicule.retrieval.retriever import RetrievalResult
 from manicule.storage.organisation import normalise_name
 
@@ -761,6 +761,17 @@ class FakeIngestion:
     asked: list[str] = field(default_factory=list[str])
     """Which instances :meth:`connector` was asked for, so a test can show it was consulted."""
 
+    sweeps: list[tuple[int, bool]] = field(default_factory=list[tuple[int, bool]])
+    """``(batch, dry_run)`` per corpus-wide re-parse, so a test can show what reached the port."""
+
+    sweep: StaleSweep = field(
+        default_factory=lambda: StaleSweep(
+            selected=2, reparsed=2, unchanged=1, changed=1, chunks_new=1, chunks_kept=4
+        )
+    )
+    """What the sweep reports. Deliberately not all-zeroes: a payload that dropped a field would
+    still compare equal across surfaces if every count were the same number."""
+
     async def index_path(
         self, path: Path, *, name: str, limit: int | None = None, force: bool = False
     ) -> RunReport:
@@ -792,6 +803,12 @@ class FakeIngestion:
     async def reindex(self, document_id: str) -> ReindexReport:
         self.reindexed.append(document_id)
         return ReindexReport(documents=1, chunks=3)
+
+    async def reparse_stale(self, *, batch: int, dry_run: bool = False) -> StaleSweep:
+        self.sweeps.append((batch, dry_run))
+        if dry_run:
+            return StaleSweep(dry_run=True, selected=self.sweep.selected)
+        return self.sweep
 
     async def import_archive(self, path: Path, *, force: bool = False) -> RunReport:
         del force

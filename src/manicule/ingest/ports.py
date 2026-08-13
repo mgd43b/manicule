@@ -160,6 +160,7 @@ class IngestStore(Protocol):
         chunk_fp_other_than: str | None = None,
         parse_fp_current: Collection[str] | None = None,
         limit: int | None = None,
+        offset: int = 0,
     ) -> Sequence[Document]:
         """The selection ``reindex`` runs over. A query, never a scan.
 
@@ -175,6 +176,15 @@ class IngestStore(Protocol):
                 fingerprint: a corpus holds as many as it has parsers, and a ``pypdfium2``
                 bump moves exactly one of them.
             limit: Cap the result.
+            offset: How many of the selected documents to skip, in the store's own order.
+
+                What lets a corpus-wide repair page through the selection **while repairing
+                it**. A repaired document leaves the set, so paging by a fixed page number
+                would skip the documents that shifted forward into the slots it vacated; a
+                repair that cannot be repaired stays, and re-reading it every page is a loop
+                that never ends. Advancing this by the number of documents a pass *left
+                behind* is the one cursor that is right in both directions, and it is only
+                sound because the order is stable across calls.
         """
         ...
 

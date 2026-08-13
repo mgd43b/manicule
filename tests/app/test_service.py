@@ -293,6 +293,60 @@ async def test_reindexing_reports_what_could_not_be_repaired(
     assert "no retained bytes" in outcome.detail
 
 
+async def test_a_corpus_sweep_carries_every_count_the_ingest_layer_produced(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Nine numbers and two lists across a layer boundary, and each is a chance to drop one.
+
+    Every count is a *different* number on purpose. With all-zeroes or all-ones, a mapping that
+    wrote ``changed`` into ``unchanged`` — or dropped a field to its default — would produce a
+    payload that compared equal to the right one. The pairing is checked field by field rather
+    than by a total, because a total is exactly what a swap preserves.
+    """
+    from manicule.ingest.reindex import StaleSweep  # noqa: PLC0415
+
+    backend.ingestion_.sweep = StaleSweep(
+        selected=9,
+        reparsed=7,
+        unchanged=5,
+        changed=2,
+        chunks_new=3,
+        chunks_kept=11,
+        unrepairable=1,
+        failed=1,
+        unrepairable_documents=["doc-a (https://docs.example.test/a): no retained bytes"],
+        failures=["doc-b: the parser gave up"],
+    )
+
+    report = await service.document_reindex_stale(batch=4)
+
+    assert backend.ingestion_.sweeps == [(4, False)]
+    assert (report.selected, report.reparsed) == (9, 7)
+    assert (report.unchanged, report.changed) == (5, 2)
+    assert (report.chunks_new, report.chunks_kept) == (3, 11)
+    assert (report.unrepairable, report.failed) == (1, 1)
+    assert report.unrepairable_documents == (
+        "doc-a (https://docs.example.test/a): no retained bytes",
+    )
+    assert report.failures == ("doc-b: the parser gave up",)
+    assert report.dry_run is False
+
+
+async def test_a_dry_sweep_says_it_was_one_and_reaches_the_ingest_layer_as_one(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The flag has to arrive, and the payload has to admit what it is.
+
+    A plan indistinguishable from a run is worse than no plan: an operator reading ``selected:
+    412`` with nothing marking it as hypothetical has been told the corpus was repaired.
+    """
+    report = await service.document_reindex_stale(batch=8, dry_run=True)
+
+    assert backend.ingestion_.sweeps == [(8, True)]
+    assert report.dry_run is True
+    assert report.reparsed == 0
+
+
 # --- ingest --------------------------------------------------------------------------------
 
 

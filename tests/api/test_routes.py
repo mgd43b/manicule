@@ -251,6 +251,18 @@ ABSENT: tuple[tuple[str, str, Reach, str], ...] = (
         Reach.UNROUTED,
         "the same operation under an admin path",
     ),
+    (
+        "POST",
+        "/api/v1/admin/reindex",
+        Reach.UNROUTED,
+        "a corpus-wide re-parse runs the embedder over everything a parser bump touched",
+    ),
+    (
+        "POST",
+        "/api/v1/documents/reindex",
+        Reach.SHADOWED,
+        "the same sweep where the per-document verb lives",
+    ),
 )
 """Operations that exist elsewhere in manicule and are deliberately not routes here.
 

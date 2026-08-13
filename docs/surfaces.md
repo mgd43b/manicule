@@ -260,7 +260,8 @@ commands group several operations, and some operations have no tool at all.
 | `document_list` | ✓ | `document list` | a page of documents |
 | `document_get` | ✓ | `document get` | one document, optionally its chunks |
 | `document_delete` | ✓ | `document delete` | what was removed, and how |
-| `document_reindex` | ✓ | `document reindex` | what was repaired |
+| `document_reindex` | ✓ | `document reindex <id>` | what was repaired |
+| `document_reindex_stale` | — | `document reindex --stale` | counts for a corpus-wide re-parse |
 | `doctor` | ✓ | `doctor` | diagnostics |
 | `connector_list` | ✓ | `connector list` | configured sources |
 | `connector_sync` | ✓ | `connector sync` | run counters |
@@ -284,11 +285,18 @@ commands group several operations, and some operations have no tool at all.
 
 ### Operations with no MCP tool, and why
 
-`reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login` and
-the `auth` verbs are command-line only. Each of them either destroys data, mints a credential,
-or changes what the installation *is* — and a tool an assistant can call unattended should not
-be able to do any of that. The nineteen tools read the corpus, write documents into it, and
-adjust configuration. That is the whole surface.
+`reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,
+`document_reindex_stale` and the `auth` verbs are command-line only. Each of them either
+destroys data, mints a credential, or changes what the installation *is* — and a tool an
+assistant can call unattended should not be able to do any of that. The nineteen tools read the
+corpus, write documents into it, and adjust configuration. That is the whole surface.
+
+`document_reindex_stale` is there for a fourth reason, and it is the one that also keeps it off
+the HTTP surface (`tests/api/test_routes.py`). It re-parses, re-chunks and re-embeds every
+document a parser bump touched, and it takes as long as the corpus is long — so an unattended
+caller able to start one has the machine's accelerator for an hour, which is the argument
+already made for refusing a benchmark endpoint. `document_reindex` stays on every surface,
+because one document is a bound.
 
 `connector_login` is in that list for the credential reason and for one more: it reads a secret
 from a terminal without echoing it. A surface that cannot do that would have to accept the

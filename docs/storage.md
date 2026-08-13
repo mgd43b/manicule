@@ -1018,7 +1018,8 @@ So the comparison lives where the fact does. Two consumers read it:
 SELECT id FROM documents WHERE parse_fp IS NULL OR parse_fp NOT IN (:current_fingerprints)
 ```
 
-`reindex --re-parse` runs over exactly that set — rung 3, retained bytes, no network — and
+`manicule document reindex --stale` runs over exactly that set — rung 3, retained bytes, no
+network — and
 ingest's change detection asks the same question per document, so a stale one stops counting
 as unchanged and is re-parsed on the next sync. **`NULL` is not backfilled.** Every row
 predating the column keeps it, and reads as "no evidence this text is current", because

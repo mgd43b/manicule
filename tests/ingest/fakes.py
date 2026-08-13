@@ -233,6 +233,7 @@ class MemoryIngestStore:
         chunk_fp_other_than: str | None = None,
         parse_fp_current: Collection[str] | None = None,
         limit: int | None = None,
+        offset: int = 0,
     ) -> Sequence[Document]:
         chosen = [
             self._with_lineage(d) for d in self.documents.values() if d.id not in self.deleted_at
@@ -252,6 +253,9 @@ class MemoryIngestStore:
         if parse_fp_current is not None:
             current = set(parse_fp_current)
             chosen = [d for d in chosen if d.parse_fp is None or d.parse_fp not in current]
+        # Sliced after every predicate, in that order, because the store applies `OFFSET` to the
+        # filtered result and a fake that skipped first would page through a different set.
+        chosen = chosen[offset:]
         return chosen[:limit] if limit is not None else chosen
 
     # sync state

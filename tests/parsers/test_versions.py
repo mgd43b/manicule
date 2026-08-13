@@ -168,7 +168,9 @@ def test_a_missing_distribution_raises_rather_than_defaulting(
 
 
 def test_the_current_set_covers_every_shipped_parser() -> None:
-    """What ``reindex --re-parse`` compares against. A partial set is a repair that cannot end."""
+    """What ``document reindex --stale`` compares against.
+
+    A partial set is a repair that cannot end."""
     current = current_parse_fingerprints()
 
     assert {fingerprint.parser for fingerprint in current} == set(PARSERS)

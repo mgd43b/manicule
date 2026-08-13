@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     )
     from manicule.generation.sharing import ShareLink
     from manicule.ingest.pipeline import RunReport
-    from manicule.ingest.reindex import ReindexReport
+    from manicule.ingest.reindex import ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
 
@@ -149,6 +149,22 @@ class Ingesting(Protocol):
 
     async def reindex(self, document_id: str) -> ReindexReport:
         """Re-parse one document from its retained bytes. No network."""
+        ...
+
+    async def reparse_stale(self, *, batch: int, dry_run: bool = False) -> StaleSweep:
+        """Re-parse every document whose recorded parse lineage is no longer installed.
+
+        The corpus-wide end of :meth:`reindex`, and it is on the port rather than assembled in
+        the service for one reason: the selection is a query over lineage columns that
+        :class:`DocumentSurface` deliberately cannot reach, and the pipeline it runs through
+        has to be the *same* object a sync would use so that the two share one embedding lock.
+        A service that built either for itself would be a second answer to a question the
+        runtime already answers.
+
+        Which fingerprints count as current is decided here rather than passed in. A partial
+        set makes every document its parser produced look stale, which is a repair that cannot
+        end, so no surface is given the chance to supply one.
+        """
         ...
 
     async def import_archive(self, path: Path, *, force: bool = False) -> RunReport:

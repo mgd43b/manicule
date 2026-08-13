@@ -53,6 +53,7 @@ from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id
 from manicule.core.retrieval import Filter, Query, RetrievalProfile
 from manicule.core.version import CORE_VERSION
+from manicule.ingest.reindex import DEFAULT_SWEEP_BATCH
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
@@ -999,6 +1000,40 @@ class ApplicationService:
         status = "reindexed" if report.documents else ("failed" if detail else "unchanged")
         return r.DocumentReindexed(
             document_id=document_id, status=status, chunks=report.chunks, detail=detail
+        )
+
+    async def document_reindex_stale(
+        self, *, batch: int = DEFAULT_SWEEP_BATCH, dry_run: bool = False
+    ) -> r.StaleReparseReport:
+        """Re-parse every document a parser upgrade left behind. Touches no network.
+
+        The corpus-wide end of :meth:`document_reindex`. A parser's fingerprint records the
+        version that produced a document's text, so bumping one makes every document it read
+        stale at once — and until this ran, closing that window meant waiting for each document
+        to come round again on a connector sync, with every anchor stored under the old version
+        being resolved by the new one in the meantime.
+
+        Nothing here is fetched. Every byte comes out of the blob store, and a document whose
+        bytes were never retained is named with the reason rather than failing the sweep.
+
+        Args:
+            batch: Documents per page of the selection.
+            dry_run: Report the selection and write nothing at all.
+        """
+        ingestion = await self._backend.ingestion()
+        sweep = await ingestion.reparse_stale(batch=batch, dry_run=dry_run)
+        return r.StaleReparseReport(
+            dry_run=sweep.dry_run,
+            selected=sweep.selected,
+            reparsed=sweep.reparsed,
+            unchanged=sweep.unchanged,
+            changed=sweep.changed,
+            chunks_new=sweep.chunks_new,
+            chunks_kept=sweep.chunks_kept,
+            unrepairable=sweep.unrepairable,
+            failed=sweep.failed,
+            unrepairable_documents=tuple(sweep.unrepairable_documents),
+            failures=tuple(sweep.failures),
         )
 
     # --- state ----------------------------------------------------------------------------
