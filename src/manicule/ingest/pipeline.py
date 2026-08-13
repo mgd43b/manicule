@@ -148,6 +148,22 @@ class Change(StrEnum):
     (``docs/storage.md`` §6.4). Neither the bytes nor the metadata moved; what we make of them
     did."""
 
+    ROUTING = "routing"
+    """The source now declares a different media type, so a **different parser** would read it.
+
+    Distinct from :attr:`LINEAGE`, and the distinction is not academic. Lineage asks whether the
+    parser that ran has since changed *version*, and it answers by looking up ``parser_used`` — so
+    when a document is re-routed to a different parser entirely, lineage compares the old parser
+    against itself, finds it unchanged, and reports the document current. Nothing else notices
+    either: the bytes are identical and the source record has not moved.
+
+    The consequence is a corpus that keeps text produced by a parser nothing routes to any more,
+    for ever, with no signal — and unlike a version bump there is no number to move that would fix
+    it, because the parser's *identity* changed rather than its version. Introducing a media type is
+    exactly the operation that does this, which is why this axis exists before the first one is
+    introduced rather than after.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class DocumentOutcome:
@@ -873,6 +889,8 @@ class IngestPipeline:
             found.add(Change.METADATA)
         if not self._parse_lineage_is_current(existing):
             found.add(Change.LINEAGE)
+        if raw is not None and existing.media_type != raw.media_type:
+            found.add(Change.ROUTING)
         return frozenset(found)
 
     @staticmethod
