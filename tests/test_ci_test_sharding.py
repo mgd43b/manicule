@@ -39,6 +39,8 @@ import shlex
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 DURATIONS = REPO_ROOT / ".test_durations"
@@ -64,6 +66,19 @@ def suite_job() -> dict[str, Any]:
     return cast("dict[str, Any]", jobs["test"])
 
 
+def carries(command: list[str], name: str) -> bool:
+    """Whether ``command`` passes ``name``, in either spelling :func:`flag` reads.
+
+    The pair below has to agree about what "the command carries ``--splits``" means. Finding the
+    step tested for the standalone token only while reading its value accepted ``--splits=3`` as
+    well, so the equals form would have found *no* sharded command and failed the search rather
+    than the check — the assertion below would report "found 0" about a workflow that shards
+    correctly. Loud rather than silent, but wrong about which thing is broken, and the fix is to
+    ask one question in one place.
+    """
+    return name in command or any(word.startswith(f"{name}=") for word in command)
+
+
 def split_command() -> list[str]:
     """The job's ``pytest`` invocation, as words.
 
@@ -72,7 +87,7 @@ def split_command() -> list[str]:
     """
     steps = cast("list[dict[str, Any]]", suite_job()["steps"])
     commands = [shlex.split(str(step.get("run", ""))) for step in steps]
-    sharded = [words for words in commands if "--splits" in words]
+    sharded = [words for words in commands if carries(words, "--splits")]
     assert len(sharded) == 1, (
         f"expected exactly one `--splits` command in the test job, found {len(sharded)}. The "
         f"shard count is asserted against the matrix below, and neither zero commands nor two "
@@ -90,6 +105,29 @@ def flag(command: list[str], name: str) -> str:
             return word.split("=", 1)[1]
     message = f"no {name} in the test job's pytest command: {' '.join(command)}"
     raise AssertionError(message)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["pytest", "--splits", "3"], ["pytest", "--splits=3"]],
+    ids=["separate", "equals"],
+)
+def test_finding_the_sharded_command_accepts_both_spellings_reading_it_does(
+    command: list[str],
+) -> None:
+    """The two halves of this module have to agree about what carrying a flag means.
+
+    ``flag()`` documents accepting ``--splits 3`` and ``--splits=3`` alike, and both are valid
+    ``pytest``. Finding the step tested membership of the word list, which is only the first —
+    so switching the workflow to the equals form would have made ``split_command()`` find zero
+    sharded commands and assert "found 0" about a job that shards perfectly well. A guard that
+    fails for a reason it names wrongly sends the next person to the wrong file.
+
+    Asserted on the pair rather than on either alone: the property is agreement, and each half
+    passes its own spelling on its own.
+    """
+    assert carries(command, "--splits")
+    assert flag(command, "--splits") == "3"
 
 
 def test_the_split_count_and_the_shard_matrix_are_the_same_number() -> None:
