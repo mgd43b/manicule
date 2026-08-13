@@ -4275,4 +4275,4 @@ def _json_object(value: object) -> dict[str, JsonValue]:
     return value if isinstance(value, dict) else {}  # pyright: ignore[reportUnknownVariableType]
 
 
-__all__ = ["DEFAULT_SOURCE", "ApplicationService", "AskAside", "hardware"]
+__all__ = ["DEFAULT_SOURCE", "DEFAULT_SWEEP_BATCH", "ApplicationService", "AskAside", "hardware"]

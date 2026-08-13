@@ -766,17 +766,19 @@ of the blast-radius ladder (`storage.md` §1):
 | `repair` | `chunks` | 1–2 | none | `ingest.reindex.repair`, no command |
 | `re-embed` | `chunks.embed_text` | 2 | none | `ingest.reindex.re_embed`, no command |
 | **re-parse** | `blobs` | 3 | none | `document reindex <id>`, `document reindex --stale` |
-| a forced sync | the source | 4 | yes, rate-limited, **may fail** | `index <path> --reindex` |
+| a forced sync | the source | 4 | yes, rate-limited, **may fail** | `index <path> --reindex`, for a path |
 
 **Only the last one can fail for reasons outside the machine**, and it is the only one that is
 not reproducible. Everything above it is a pure function of what is already on disk. That is
 the whole return on retaining bytes, and it is why re-parse is a first-class verb rather
 than a flag on sync.
 
-The right-hand column is there because two of these rungs are **internal functions with no
-operator-facing command**, and a table that listed them as commands would be describing an
-interface nobody can type. Repair runs on the recovery path; re-embed has no shipped surface at
-all. Re-parse has both ends of its verb.
+The right-hand column is there because most of this table is **not** an operator-facing command,
+and listing them all as commands would describe an interface nobody can type. Repair runs on the
+recovery path and re-embed has no shipped surface at all, so both are reachable only from
+Python. Re-parse has both ends of its verb. And rung 4 ships for a *path* — `index <path>
+--reindex` skips change detection — while a configured connector has no `--force`, so the only
+way to make one re-fetch today is to change what the source reports.
 
 **Selection is a query, not a scan**, because of the per-document lineage in `storage.md` §6.4:
 
@@ -861,7 +863,7 @@ cursor is the number of documents a pass *left behind* rather than a page number
 document leaves the selection, so the set shrinks under the iteration: counting pages would
 skip the documents that shift forward into the vacated slots, and restarting at zero each time
 would re-read an unrepairable prefix for ever. Embedding batches are the pipeline's own
-(`embedding.md`), unchanged — the sweep introduces no second consumer of the model, which is
+(`embeddings.md`), unchanged — the sweep introduces no second consumer of the model, which is
 also what makes a concurrent sync and a sweep serialise rather than contend.
 
 **Idempotence, and its one exception.** A second run immediately afterwards selects nothing and

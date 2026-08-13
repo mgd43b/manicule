@@ -36,12 +36,11 @@ from manicule.app import results as r
 from manicule.app.dispatch import error_info, run_op
 from manicule.app.results import Envelope, failed
 from manicule.app.runtime import Runtime
-from manicule.app.service import DEFAULT_SOURCE, ApplicationService
+from manicule.app.service import DEFAULT_SOURCE, DEFAULT_SWEEP_BATCH, ApplicationService
 from manicule.cli import render
 from manicule.core.errors import ConfigError, ManiculeError
 from manicule.core.version import CORE_VERSION
 from manicule.generation.answers import EventKind
-from manicule.ingest.reindex import DEFAULT_SWEEP_BATCH
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
