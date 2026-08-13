@@ -683,29 +683,26 @@ async def test_consecutive_paragraphs_in_a_macro_body_stay_separate_paragraphs(
     )
 
 
-async def test_an_inline_br_is_not_a_paragraph_boundary(corpus: Path) -> None:
+async def test_an_inline_br_is_a_line_break_and_not_a_paragraph_boundary(corpus: Path) -> None:
     """The distinction the rule must not flatten: a line break inside a paragraph is one.
 
-    **``<br>`` contributes nothing at all today, and that is a separate defect left alone
-    here.** ``_inline_parts`` yields no text for it and ``_collapse`` would fold a newline into
-    a space regardless, so ``a<br/>b`` reads ``ab`` — in this parser and, identically, in the
-    web parser it shares the convention with. Making it a genuine line break means changing
-    what ``_collapse`` does to every table cell, heading and list item, which is a wider change
-    than a paragraph-boundary fix and belongs in its own.
+    Two failures, in opposite directions, and this asserts against both at once. Under the
+    version this fixture was written for, the ``<br>`` contributed *no* character and the two
+    clauses were glued into ``break.The clause``; the over-correction is a ``\\n\\n``, which
+    would restore the break by inventing a paragraph boundary the page does not have.
 
-    What is asserted is the property this change is responsible for: the ``<br>`` did not
-    *become* a paragraph. The exact joined text is asserted with it so the day ``<br>`` starts
-    contributing something, this test says so rather than passing quietly.
+    Asserted on the joined text and on ``paragraphs`` together, because a substring assertion
+    passes under both mistakes.
     """
     blocks = await _corpus_blocks(corpus, "macro-body.storage")
-    written = next(
-        part for part in paragraphs(_macro_body(blocks).text) if "line break inside" in part
-    )
+    body = _macro_body(blocks)
+    written = next(part for part in paragraphs(body.text) if "line break inside" in part)
 
     assert written == (
-        "A line break inside a paragraph is not a paragraph break.The clause after the br "
+        "A line break inside a paragraph is not a paragraph break.\nThe clause after the br "
         "element belongs to the paragraph that opened above it."
-    ), "one paragraph, and `<br>` currently contributes no character of its own"
+    ), "one paragraph, holding the one newline the `<br>` contributes"
+    assert body.text.count("break.\nThe clause") == 1, "and exactly one, rather than a blank line"
 
 
 async def test_a_structured_block_inside_a_macro_body_is_still_its_own_block(
@@ -818,6 +815,157 @@ async def test_an_anchor_still_resolves_to_the_text_the_reassembled_body_claims(
     assert resolved is not None
     for paragraph in paragraphs(body.text):
         assert normalise(paragraph) in normalise(resolved)
+
+
+# --- inline line breaks ------------------------------------------------------------------------
+
+
+async def test_a_break_in_storage_prose_reads_as_it_does_in_html() -> None:
+    """The two parsers read the same page from two APIs and must agree about a ``<br>``.
+
+    Storage format and rendered HTML are two spellings of one document, so a break that is a
+    newline in one and nothing in the other would make the same page index two ways depending
+    on which connector fetched it.
+    """
+    source = "<p>primary endpoint<br/>secondary endpoint</p>"
+    storage = await _blocks(source)
+    html = await read_blocks(WebParser(WebConfig()), raw_of(source, "text/html"))
+
+    assert [block.text for block in storage] == ["primary endpoint\nsecondary endpoint"]
+    assert [block.text for block in html] == [block.text for block in storage]
+
+
+async def test_two_breaks_are_a_blank_line_and_more_are_capped_at_one() -> None:
+    two = await _blocks("<p>alpha<br/><br/>beta</p>")
+    four = await _blocks("<p>alpha<br/><br/><br/><br/>beta</p>")
+
+    assert [block.text for block in two] == ["alpha\n\nbeta"]
+    assert paragraphs(two[0].text) == ["alpha", "beta"]
+    assert [block.text for block in four] == ["alpha\n\nbeta"]
+
+
+async def test_a_break_at_the_edge_of_a_container_creates_no_empty_block() -> None:
+    assert [block.text for block in await _blocks("<p><br/>alpha</p>")] == ["alpha"]
+    assert [block.text for block in await _blocks("<p>alpha<br/></p>")] == ["alpha"]
+    assert await _blocks("<p><br/></p>") == []
+
+
+async def test_a_break_in_a_heading_does_not_split_the_heading_path() -> None:
+    """A heading's text is a path element, and a path element with a newline in it reaches the
+    embedder through the breadcrumb as two headings the page does not have."""
+    blocks = await _blocks("<h1>Signal routing<br/>and delivery</h1><p>Body.</p>")
+
+    assert blocks[0].text == "Signal routing and delivery"
+    assert blocks[1].heading_path == ("Signal routing and delivery",)
+
+
+async def test_a_break_in_a_table_cell_does_not_become_a_row() -> None:
+    """``text`` is ``"\\n".join(rows)``, so a newline in a cell would describe two tables."""
+    blocks = await _blocks(
+        "<table><tr><th>Signal</th><th>Meaning</th></tr>"
+        "<tr><td>lease age<br/>seconds</td><td>how stale the lease is</td></tr></table>"
+    )
+    table = blocks[0]
+
+    assert table.kind is BlockKind.TABLE
+    assert table.text == "Signal | Meaning\nlease age seconds | how stale the lease is"
+    assert table.metadata["rows"] == table.text.splitlines()
+
+
+async def test_a_break_in_a_list_item_does_not_become_an_item() -> None:
+    """A markerless line is not an item, and the marker is what glossary detection strips."""
+    blocks = await _blocks("<ul><li>green means<br/>the lease is fresh</li><li>amber</li></ul>")
+
+    assert blocks[0].text.splitlines() == ["- green means the lease is fresh", "- amber"]
+
+
+async def test_a_break_in_a_task_body_does_not_become_a_task() -> None:
+    """One line per task, each carrying its own state, so a break inside one is a space."""
+    blocks = await _blocks(
+        "<ac:task-list><ac:task><ac:task-id>1</ac:task-id>"
+        "<ac:task-status>complete</ac:task-status>"
+        "<ac:task-body>drain the queue<br/>then restart</ac:task-body></ac:task>"
+        "</ac:task-list>"
+    )
+
+    assert blocks[0].text == "- [x] drain the queue then restart"
+    assert blocks[0].metadata == {"tasks": 1, "complete": 1}
+
+
+async def test_a_break_inside_a_link_body_reaches_the_paragraph_around_it() -> None:
+    """The link is inline, so a break in its body belongs to the sentence it sits in."""
+    blocks = await _blocks(
+        "<p>see <ac:link><ri:page ri:content-title='Runbook'/>"
+        "<ac:plain-text-link-body>first line<br/>second line</ac:plain-text-link-body>"
+        "</ac:link> now</p>"
+    )
+
+    assert blocks[0].text == "see first line\nsecond line now"
+    assert blocks[0].metadata["links"] == [{"kind": "page", "title": "Runbook"}], (
+        "and the reference is still recorded beside the text rather than inside it"
+    )
+
+
+async def test_a_break_in_a_panel_body_is_a_line_break_and_the_panel_keeps_its_severity() -> None:
+    """Requirement seven: the break changes the words, never the kind of block they are in."""
+    blocks = await _blocks(
+        '<ac:structured-macro ac:name="warning"><ac:rich-text-body>'
+        "<p>do not run this<br/>against production</p>"
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+
+    assert blocks[0].kind is BlockKind.PANEL
+    assert blocks[0].text == "do not run this\nagainst production"
+    assert blocks[0].metadata == {"macro": "warning", "severity": "warning"}
+
+
+async def test_a_break_in_an_unsupported_macro_body_keeps_the_body_prose() -> None:
+    blocks = await _blocks(
+        '<ac:structured-macro ac:name="expand"><ac:rich-text-body>'
+        "<p>first clause<br/>second clause</p><p>a second paragraph</p>"
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+    prose = next(block for block in blocks if block.kind is BlockKind.PROSE)
+
+    assert prose.text == "first clause\nsecond clause\n\na second paragraph", (
+        "the break is a line break and the paragraph boundary is still a blank line"
+    )
+    assert paragraphs(prose.text) == ["first clause\nsecond clause", "a second paragraph"]
+
+
+async def test_a_verbatim_body_is_byte_faithful_whatever_the_break_rule_does() -> None:
+    """Requirement six: a code, ``noformat`` or Graphviz body is source and is never reflowed.
+
+    Its body arrives as CDATA text, so there is no ``<br>`` element inside one to preserve —
+    which is the reason this limit costs nothing here, and it is asserted rather than assumed.
+    """
+    blocks = await _blocks(
+        '<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">yaml'
+        "</ac:parameter><ac:plain-text-body><![CDATA[gateways:\n  - name: primary<br/>\n"
+        "    retries: 3]]></ac:plain-text-body></ac:structured-macro>"
+    )
+
+    assert blocks[0].kind is BlockKind.CODE
+    assert blocks[0].text == "gateways:\n  - name: primary<br/>\n    retries: 3"
+    assert blocks[0].lang == "yaml"
+
+
+async def test_an_anchor_still_resolves_to_the_section_holding_a_break() -> None:
+    """Requirement eight: text surrounding a break resolves to the element that contains it."""
+    parser = _parser()
+    raw = raw_of(
+        '<h1 id="routing">Routing</h1><p>primary endpoint<br/>secondary endpoint</p>',
+        MEDIA_TYPE,
+        title="Signal routing",
+    )
+    blocks = await read_blocks(parser, raw)
+    prose = next(block for block in blocks if block.kind is BlockKind.PROSE)
+
+    resolved = await parser.resolve(prose.anchor, raw)
+
+    assert prose.anchor == HeadingAnchor(path=("Routing",), fragment="routing")
+    assert resolved is not None
+    assert normalise(prose.text) in normalise(resolved)
 
 
 # --- anchors -------------------------------------------------------------------------------

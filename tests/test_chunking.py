@@ -346,6 +346,40 @@ def test_an_oversized_paragraph_splits_at_sentences_before_it_splits_at_tokens()
     assert not any(chunk.metadata.get("hard_split") for chunk in chunks)
 
 
+def test_an_inline_break_stays_inside_the_chunk_that_holds_it() -> None:
+    """A block under the budget reaches a chunk with its line breaks intact.
+
+    ``text`` is what is cited and shown, so a break the page drew has to survive packing —
+    otherwise the parser's fidelity is undone one step later and nothing says so.
+    """
+    chunks = make_chunker().chunk(document(), [prose("primary endpoint\nsecondary endpoint")])
+
+    assert len(chunks) == 1
+    assert chunks[0].text == "primary endpoint\nsecondary endpoint"
+
+
+def test_only_a_blank_line_splits_an_oversized_block_and_a_lone_break_never_does() -> None:
+    """§4.5's rule, asserted from the chunker's side of it.
+
+    Two paragraphs, each with an inline break in it, and each too long to sit with the other.
+    The break must not become a boundary — a chunk beginning at one would start mid-paragraph
+    — and the blank line must, which is the entire distinction the parsers owe.
+    """
+    first = " ".join(f"Alpha sentence {index} explains the rollout." for index in range(120))
+    second = " ".join(f"Beta sentence {index} explains the rollback." for index in range(120))
+    body = f"{first}\ninline continuation of the first.\n\n{second}\ninline continuation."
+
+    chunks = make_chunker().chunk(document(), [prose(body)])
+
+    assert len(chunks) > 1
+    assert not any(chunk.text.startswith("inline continuation") for chunk in chunks), (
+        "a lone newline is not a boundary, so no chunk may begin at one"
+    )
+    assert any("rollout.\ninline continuation of the first." in chunk.text for chunk in chunks), (
+        "and the break survives inside the paragraph it belongs to"
+    )
+
+
 def test_a_single_sentence_longer_than_the_budget_is_recorded_as_a_hard_split() -> None:
     """A minified line or a pasted base64 blob has no sentence to cut at.
 

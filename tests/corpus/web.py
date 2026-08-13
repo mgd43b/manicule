@@ -8,10 +8,17 @@ The four kinds ``docs/parsing.md`` §3.5 requires, and what each is here to catc
 **Typical** — an ordinary documentation page: a ``<title>``, headings with ``id=``, a table
 with a ``<thead>``, a ``<pre><code class="language-…">`` block and a nested list.
 
-**Structurally hard** — a list nested five deep; a table; a code block; a heading addressed by
-the empty anchor element before it rather than by an ``id`` of its own; and two sibling
-headings with the same title and no published address, which is the case that has to come
-back :class:`~manicule.core.anchors.Unlocated` rather than pick one of them.
+**Structurally hard** — a list nested five deep; a table; a code block; an inline ``<br>``,
+which is the one element that contributes a character to ``text`` that is not in any text node
+of the source; a heading addressed by the empty anchor element before it rather than by an
+``id`` of its own; and two sibling headings with the same title and no published address, which
+is the case that has to come back :class:`~manicule.core.anchors.Unlocated` rather than pick one
+of them.
+
+The break is in the corpus rather than only in a focused test because it is what puts a newline
+*inside* a block's text, and the round-trip assertions are where that has to survive:
+:func:`~manicule.testing.normalise.normalise` reduces it to a space on both sides of every
+comparison, so containment and tightness hold across it or the fixture says so.
 
 **Degenerate** — zero bytes, a heading with nothing under it, and a file with no trailing
 newline.
@@ -81,7 +88,7 @@ _STRUCTURE = """<!doctype html>
   <h1 id="fabric">Fabric</h1>
   <p>Every rack holds eight machines, one spare, and a pair of switches.</p>
   <h2 id="cabling">Cabling</h2>
-  <p>Each machine takes two uplinks, and no two uplinks share a switch.</p>
+  <p>Each machine takes two uplinks,<br/>and no two uplinks share a switch.</p>
   <pre><code class="language-python">def uplinks(machine: str) -> tuple[str, str]:
     return (machine + "-a", machine + "-b")</code></pre>
   <table>

@@ -41,7 +41,7 @@ HTML_BODY = """<html>
     <p>Ingest throughput rose by a fifth over the quarter, with no change to the chunk
        budget and therefore no re-embedding.</p>
     <h2>What moved</h2>
-    <p>The reconciler now runs on its own schedule, which removed the long tail of deletions
+    <p>The reconciler now runs on its own schedule,<br/>which removed the long tail of deletions
        that used to arrive a day late.</p>
     <ul>
       <li>Watermarks are written per page</li>
@@ -57,6 +57,11 @@ suite compares *text*: the subject is inside the header block, so an identical h
 body would make resolving the header return the heading block's text and fail assertion 3
 against a parser that is behaving perfectly. The realistic collision belongs in a test of the
 assertion, not in a fixture whose job is to exercise the pinned HTML conversion.
+
+**The ``<br>`` is the reason this parser's version moves when the web parser's does.** A break
+puts a newline inside a block, ``_html_to_text`` joins blocks and hands the result to
+``lines_of``, and every ``LineAnchor`` after the break moves by a line. Keeping one in the
+fixture means the round-trip suite resolves across it rather than only around it.
 """
 
 ATTACHMENT_TEXT = """Rollout checklist

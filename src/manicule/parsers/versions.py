@@ -87,19 +87,39 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # more than one prose block now produces different text and different chunk boundaries, so
     # the bump is what re-parses them from retained bytes instead of leaving a corpus that
     # disagrees with the parser behind a fingerprint claiming it is current.
-    "confluence": ParserVersions(rules="2", distributions=("selectolax",)),
+    #
+    # 2 -> 3: an inline `<br>` contributes a newline. Under version 2 it contributed no
+    # character at all, so `a<br/>b` read `ab` — two fragments glued into a word the page does
+    # not contain. Every storage document with a break in prose gains a newline, and every one
+    # with a break in a heading, a table cell, a list item or a task body gains the space that
+    # was missing between the fragments either side of it.
+    "confluence": ParserVersions(rules="3", distributions=("selectolax",)),
     "docx": ParserVersions(rules="1", distributions=("python-docx", "lxml")),
     # 1 -> 2: an HTML-only mail body's line numbers address the text
     # `mail._html_to_text` builds from the web parser's blocks, and the web parser now
     # recovers CDATA sections instead of deleting them — so a recovered body becomes a block
     # and every line after it moves. Bumped even though this parser's own rules are
     # unchanged, because what it extracts changed and `parse_fp` is what re-parses it.
-    "email": ParserVersions(rules="2", distributions=("selectolax",)),
+    #
+    # 2 -> 3: the same reasoning, one change along. A `<br>` in an HTML-only body now puts a
+    # newline *inside* a block, and `_html_to_text` hands the result to `lines_of` — so the
+    # break becomes a line of the canonical text and every `LineAnchor` after it moves by one.
+    # This parser's own rules are again unchanged; what it extracts is not.
+    "email": ParserVersions(rules="3", distributions=("selectolax",)),
     # 1 -> 2: CDATA sections are recovered as text rather than deleted by the HTML parser's
     # bogus-comment reparse. Every document containing one produces different text now, and
     # the bump is what re-parses them from retained bytes instead of leaving a corpus that is
     # wrong behind a fingerprint claiming it is current.
-    "html": ParserVersions(rules="2", distributions=("selectolax",)),
+    #
+    # 2 -> 3: an inline `<br>` contributes a newline, where it contributed no character at all
+    # before and `a<br/>b` read `ab`. Every HTML document with a break in prose gains a newline;
+    # every one with a break in a heading, a table cell or a list item gains the space that was
+    # missing between the fragments either side of it. `html_text_version` is deliberately not
+    # bumped with it: `web-blocks/1` names the *rule* email applies to these blocks — join them
+    # with a blank line — and that rule is unchanged. It sits in `ChunkFingerprint.version`,
+    # where a bump refuses ingest against the whole corpus; a change to what one parser extracts
+    # is what `parse_fp` is for, which is the division the 1 -> 2 pair above already drew.
+    "html": ParserVersions(rules="3", distributions=("selectolax",)),
     "markdown": ParserVersions(rules="1", distributions=("markdown-it-py",)),
     "notebook": ParserVersions(rules="1", distributions=("nbformat",)),
     "pdf": ParserVersions(rules="1", distributions=("pypdfium2",)),

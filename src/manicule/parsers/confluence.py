@@ -55,6 +55,14 @@ from manicule.core.anchors import Anchor, HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, JsonValue, Metadata, ParsedBlock, RawDocument
 from manicule.parsers.base import HeadingStack, ParserProfile, decode
 from manicule.parsers.config import CONFLUENCE_MEDIA_TYPES, ConfluenceConfig
+from manicule.parsers.inline import (
+    LINE_BREAK,
+    InlinePart,
+    collapse,
+    collapse_lines,
+    collapse_run,
+    collapse_segments,
+)
 from manicule.parsers.web import recover_cdata
 
 __all__ = [
@@ -172,6 +180,11 @@ _INLINE_TAGS = frozenset(
         "sub", "sup", "time", "u", "var", "wbr",
     }
 )  # fmt: skip
+
+_BREAK = "br"
+
+_NESTED_LISTS = frozenset({"ul", "ol"})
+"""Direct children a list item renders separately rather than as part of its own text."""
 
 _ATOMIC = frozenset({"table", "ul", "ol", "dl", "pre", TASK_LIST, MACRO, IMAGE})
 """Elements that are a block on their own. Anything else is either inline, or a container whose
@@ -327,7 +340,7 @@ def _title(raw: RawDocument, tree: LexborHTMLParser) -> str:
     if isinstance(declared, str) and declared.strip():
         return declared.strip()
     element = tree.css("title")
-    return _collapse(element[0].text(deep=True)) if element else ""
+    return collapse(element[0].text(deep=True)) if element else ""
 
 
 # --- the walk ----------------------------------------------------------------------------------
@@ -340,15 +353,15 @@ def _walk(node: LexborNode, config: ConfluenceConfig) -> Iterator[_Found]:
     written without a ``<p>`` is still a paragraph. What differs is that the run is interrupted by
     Confluence's own block constructs, and that configuration elements never enter it at all.
     """
-    pending: list[str] = []
+    pending: list[InlinePart] = []
     refs: list[JsonValue] = []
     fragment: str | None = None
     for child in node.iter(include_text=True):
         tag = child.tag or ""
         _record(child, refs)
-        inline = _run_text(child, tag, refs)
+        inline = _run_parts(child, tag, refs)
         if inline is not None:
-            pending.append(inline)
+            pending.extend(inline)
             continue
         yield from _flush(pending, refs)
         if tag in _HEADING_LEVELS:
@@ -418,41 +431,47 @@ def _reference(node: LexborNode) -> Metadata | None:
     if entry is None:
         return None
     kind, attribute, field = entry
-    value = _collapse(node.attributes.get(attribute) or "")
+    value = collapse(node.attributes.get(attribute) or "")
     if not value:
         return None
     reference: Metadata = {"kind": kind, field: value}
-    space = _collapse(node.attributes.get("ri:space-key") or "") if tag == "ri:page" else ""
+    space = collapse(node.attributes.get("ri:space-key") or "") if tag == "ri:page" else ""
     if space:
         reference["space"] = space
     return reference
 
 
-def _run_text(child: LexborNode, tag: str, refs: list[JsonValue] | None = None) -> str | None:
+def _run_parts(
+    child: LexborNode, tag: str, refs: list[JsonValue] | None = None
+) -> tuple[InlinePart, ...] | None:
     """What ``child`` adds to the run of text around it, or ``None`` if it starts a block.
 
-    ``""`` and ``None`` mean different things and the difference is the parameter rule: a
-    configuration element contributes *nothing to the text* but must not interrupt the sentence
-    it sits in, while a table starts a new block.
+    An empty tuple and ``None`` mean different things and the difference is the parameter rule:
+    a configuration element contributes *nothing to the text* but must not interrupt the
+    sentence it sits in, while a table starts a new block.
+
+    ``br`` is answered before :data:`_INLINE_TAGS`, which it belongs to. Every other member is
+    understood by flattening what is inside it, and a break has nothing inside it — routed the
+    general way it would contribute the empty string, which is how it came to disappear.
     """
     if child.is_text_node:
-        return child.text_content or ""
-    if child.is_comment_node:
-        return ""
-    if tag in _CONFIGURATION_ONLY:
-        # A stray parameter outside a macro. Skipped here as well as inside the macro handler,
-        # so the rule holds however malformed the document is.
-        return ""
+        return (child.text_content or "",)
+    if tag == _BREAK:
+        return (LINE_BREAK,)
     if tag == LINK:
-        return _link_text(child, refs)
+        return collapse_segments(_link_parts(child, refs))
     if tag in _INLINE_TAGS:
-        return _inline_text(child, refs)
+        return collapse_segments(_inline_parts(child, refs))
+    if child.is_comment_node or tag in _CONFIGURATION_ONLY:
+        # A comment, or a stray parameter outside a macro. Parameters are skipped here as well
+        # as inside the macro handler, so the rule holds however malformed the document is.
+        return ()
     return None
 
 
-def _flush(pending: list[str], refs: list[JsonValue] | None = None) -> Iterator[_Found]:
+def _flush(pending: list[InlinePart], refs: list[JsonValue] | None = None) -> Iterator[_Found]:
     """Emit the loose inline run collected so far, if it holds anything, and clear it."""
-    text = _collapse("".join(pending))
+    text = collapse_lines(pending)
     collected = list(refs) if refs else []
     pending.clear()
     if refs is not None:
@@ -712,7 +731,7 @@ def _anchor_name(node: LexborNode) -> str | None:
             continue
         key = (parameter.attributes.get("ac:name") or "").strip()
         if key in {"", "0"}:
-            return _collapse(parameter.text(deep=True)) or None
+            return collapse(parameter.text(deep=True)) or None
     return None
 
 
@@ -724,7 +743,7 @@ def _parameter(node: LexborNode, name: str) -> str:
     """
     for parameter in _own_parameters(node):
         if (parameter.attributes.get("ac:name") or "").strip() == name:
-            return _collapse(parameter.text(deep=True))
+            return collapse(parameter.text(deep=True))
     return ""
 
 
@@ -847,7 +866,7 @@ def _task_list(node: LexborNode) -> tuple[str, Metadata]:
         body = ""
         for part in _descendants(task, frozenset({TASK_LIST})):
             if part.tag == TASK_STATUS:
-                status = _collapse(part.text(deep=True)).lower()
+                status = collapse(part.text(deep=True)).lower()
             elif part.tag == TASK_BODY:
                 body = _inline_text(part)
         if not body.strip():
@@ -864,11 +883,16 @@ def _inline_text(node: LexborNode, refs: list[JsonValue] | None = None) -> str:
     The single place the parameter rule is enforced for nested content: everything that flattens
     an element to a string goes through here rather than through ``text(deep=True)``, so a macro
     inside a table cell, a list item or a heading cannot leak its configuration into the text.
+
+    One line, because every caller is a rendering whose own newline means something else — a
+    heading, a table cell, a list item, a task body, a link body. A break inside one is a space
+    (``docs/parsing.md`` §4.5); prose reaches :func:`collapse_lines` through :func:`_flush`
+    instead.
     """
-    return _collapse("".join(_inline_parts(node, refs)))
+    return collapse_run(_inline_parts(node, refs))
 
 
-def _inline_parts(node: LexborNode, refs: list[JsonValue] | None = None) -> Iterator[str]:
+def _inline_parts(node: LexborNode, refs: list[JsonValue] | None = None) -> Iterator[InlinePart]:
     for child in node.iter(include_text=True):
         _record(child, refs)
         if child.is_text_node:
@@ -879,8 +903,10 @@ def _inline_parts(node: LexborNode, refs: list[JsonValue] | None = None) -> Iter
         tag = child.tag or ""
         if tag in _CONFIGURATION_ONLY:
             continue
-        if tag == LINK:
-            yield _link_text(child, refs)
+        if tag == _BREAK:
+            yield LINE_BREAK
+        elif tag == LINK:
+            yield from collapse_segments(_link_parts(child, refs))
         elif tag == IMAGE:
             yield _image(child)[0]
         elif tag == MACRO:
@@ -900,11 +926,11 @@ def _inline_macro_text(node: LexborNode) -> str:
     """
     name = _macro_name(node)
     if name in _PANEL_SEVERITIES:
-        return _collapse(_plain_or_rich(node))
+        return collapse(_plain_or_rich(node))
     if name in _CODE_MACROS or name in GRAPHVIZ_MACROS:
         # The body, not a placeholder: a command in a table cell is the cell's whole point, and
         # dropping it here would be the silent discard this parser exists to stop.
-        return _collapse(_plain_text_body(node))
+        return collapse(_plain_text_body(node))
     return f"[unsupported macro: {name}]"
 
 
@@ -915,23 +941,28 @@ def _plain_or_rich(node: LexborNode) -> str:
     return ""
 
 
-def _link_text(node: LexborNode, refs: list[JsonValue] | None = None) -> str:
+def _link_parts(node: LexborNode, refs: list[JsonValue] | None = None) -> Iterator[InlinePart]:
     """What an ``ac:link`` contributes: what a reader would see, never an identifier.
 
     The body the author wrote wins, because it is what the sentence reads as. Failing that the
     referenced thing names itself — a page by its title, an attachment by its filename, a person
     by a display reference.
+
+    Parts rather than a string, so a break inside the body reaches the paragraph the link sits
+    in. Whether a body counts as written is still decided on the text it collapses to, which is
+    the same question ``if body:`` asked.
     """
     for child in _descendants(node, frozenset({LINK})):
         _record(child, refs)
         if child.tag in {LINK_BODY, PLAIN_TEXT_LINK_BODY}:
-            body = _inline_text(child)
-            if body:
-                return body
+            body = tuple(_inline_parts(child))
+            if collapse_run(body):
+                yield from body
+                return
     for child in _descendants(node, frozenset({LINK})):
         if (child.tag or "").startswith("ri:"):
-            return _resource_text(child)
-    return ""
+            yield _resource_text(child)
+            return
 
 
 def _resource_text(node: LexborNode) -> str:
@@ -947,16 +978,16 @@ def _resource_text(node: LexborNode) -> str:
     attributes = node.attributes
     if tag == "ri:user":
         display = attributes.get("ri:username") or attributes.get("ri:display-name")
-        return f"@{_collapse(display)}" if display and display.strip() else "@user"
+        return f"@{collapse(display)}" if display and display.strip() else "@user"
     if tag == "ri:page":
         title = attributes.get("ri:content-title") or ""
-        return _collapse(title)
+        return collapse(title)
     if tag == "ri:attachment":
-        return _collapse(attributes.get("ri:filename") or "")
+        return collapse(attributes.get("ri:filename") or "")
     if tag == "ri:space":
-        return _collapse(attributes.get("ri:space-key") or "")
+        return collapse(attributes.get("ri:space-key") or "")
     if tag == "ri:url":
-        return _collapse(attributes.get("ri:value") or "")
+        return collapse(attributes.get("ri:value") or "")
     return ""
 
 
@@ -972,11 +1003,11 @@ def _image(node: LexborNode) -> tuple[str, Metadata]:
     for child in _descendants(node):
         tag = child.tag or ""
         if tag == "ri:attachment":
-            filename = _collapse(child.attributes.get("ri:filename") or "")
+            filename = collapse(child.attributes.get("ri:filename") or "")
             metadata["attachment"] = filename
         elif tag == "ri:url":
-            metadata["src"] = _collapse(child.attributes.get("ri:value") or "")
-    text = _collapse(alt) or filename or _collapse(str(metadata.get("src") or ""))
+            metadata["src"] = collapse(child.attributes.get("ri:value") or "")
+    text = collapse(alt) or filename or collapse(str(metadata.get("src") or ""))
     return text, metadata
 
 
@@ -987,7 +1018,9 @@ def _table_rows(node: LexborNode, refs: list[JsonValue] | None = None) -> list[s
     """A table's rows, one rendered line each, cells separated by pipes.
 
     Cells are flattened through :func:`_inline_text` rather than ``text(deep=True)``, which is the
-    difference that keeps a macro's parameters out of a cell.
+    difference that keeps a macro's parameters out of a cell — and which makes a cell one line, so
+    a break inside one is a space. ``text`` is ``"\\n".join(rows)`` (``docs/parsing.md`` §4.4), so
+    a newline inside a cell would put a row in ``text`` that is not in ``rows``.
 
     **Returned as a list because the chunker needs the boundaries, not just the text.**
     :meth:`~manicule.chunking.chunker.StructuralChunker._split_table` splits at row boundaries
@@ -1017,24 +1050,37 @@ def _header_rows(node: LexborNode) -> int:
 
 
 def _list_lines(node: LexborNode, depth: int, refs: list[JsonValue] | None = None) -> Iterator[str]:
-    """A list rendered with its nesting preserved as indentation."""
+    """A list rendered with its nesting preserved as indentation.
+
+    One line per item, so a break inside one is a space: the newline is what says where an item
+    ends, and :data:`~manicule.ingest.glossary._LIST_MARKER_RE` reads the marker at the start of
+    each of them. A break that produced a newline would produce an item with no marker.
+    """
     marker = "1." if node.tag == "ol" else "-"
     for item in node.iter():
         if item.tag not in {"li", "dt", "dd"}:
             continue
-        own = _collapse(
-            "".join(
-                part.text_content or ""
-                if part.is_text_node
-                else ("" if part.tag in {"ul", "ol"} else _inline_text(part, refs))
-                for part in item.iter(include_text=True)
-            )
-        )
+        own = collapse_run(_item_parts(item, refs))
         if own:
             yield f"{_INDENT * depth}{marker} {own}"
         for nested in item.iter():
-            if nested.tag in {"ul", "ol"}:
+            if nested.tag in _NESTED_LISTS:
                 yield from _list_lines(nested, depth + 1, refs)
+
+
+def _item_parts(item: LexborNode, refs: list[JsonValue] | None = None) -> Iterator[InlinePart]:
+    """One list item's own text, without the list nested inside it."""
+    for part in item.iter(include_text=True):
+        if part.is_text_node:
+            yield part.text_content or ""
+            continue
+        tag = part.tag or ""
+        if tag in _NESTED_LISTS:
+            continue
+        if tag == _BREAK:
+            yield LINE_BREAK
+        else:
+            yield from collapse_segments(_inline_parts(part, refs))
 
 
 def _code_language(node: LexborNode) -> str | None:
@@ -1047,11 +1093,6 @@ def _code_language(node: LexborNode) -> str | None:
             if name.startswith(prefix) and len(name) > len(prefix):
                 return name[len(prefix) :]
     return None
-
-
-def _collapse(text: str) -> str:
-    """Whitespace as a reader sees it: runs become single spaces, ends are trimmed."""
-    return " ".join(text.split())
 
 
 # --- sections ----------------------------------------------------------------------------------

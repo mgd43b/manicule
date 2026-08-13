@@ -21,6 +21,7 @@ from typing import override
 import pytest
 
 from manicule.chunking import StructuralChunker
+from manicule.chunking.sentences import paragraphs
 from manicule.core.anchors import HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
@@ -28,6 +29,7 @@ from manicule.core.protocols import Parser, read_blocks
 from manicule.parsers.base import slugify
 from manicule.parsers.web import WebConfig, WebParser, recover_cdata
 from manicule.testing import assert_round_trip
+from manicule.testing.normalise import contains_claimed_text
 from tests.parsers.support import check_corpus, check_fixture, raw_from, raw_of
 
 MEDIA_TYPE = "text/html"
@@ -366,6 +368,174 @@ async def test_an_image_contributes_its_alt_text_and_nothing_else(corpus: Path) 
     assert media[0].metadata == {"src": "topology.png"}
 
     assert await _blocks('<img src="undescribed.png">') == []
+
+
+# --- inline line breaks ------------------------------------------------------------------
+
+
+async def test_an_inline_break_is_one_newline_inside_one_paragraph() -> None:
+    """The defect: a ``<br>`` contributed no character, so ``a<br/>b`` read ``ab``.
+
+    Asserted on the exact text *and* on the splitter, because each catches what the other
+    misses. The literal catches a break that contributes nothing, or two characters where one
+    was owed; ``paragraphs`` catches the opposite over-correction, where the fix restores the
+    break by inventing a paragraph boundary the page does not have.
+    """
+    blocks = await _blocks("<p>primary endpoint<br/>secondary endpoint</p>")
+
+    assert [block.text for block in blocks] == ["primary endpoint\nsecondary endpoint"]
+    assert paragraphs(blocks[0].text) == ["primary endpoint\nsecondary endpoint"], (
+        "one paragraph: `chunking.sentences.paragraphs` is what the chunker splits on"
+    )
+
+
+@pytest.mark.parametrize("spelling", ["<br>", "<br/>", "<br />", "<BR/>"])
+async def test_every_spelling_of_the_element_is_the_same_break(spelling: str) -> None:
+    """A void element written four ways, all of which real pages contain."""
+    blocks = await _blocks(f"<p>alpha{spelling}beta</p>")
+
+    assert [block.text for block in blocks] == ["alpha\nbeta"]
+
+
+async def test_whitespace_around_a_break_produces_no_extra_space() -> None:
+    """The collapse runs per line, so the spaces either side of a break are line ends."""
+    blocks = await _blocks("<p>alpha  <br/>\n   beta</p>")
+
+    assert [block.text for block in blocks] == ["alpha\nbeta"]
+
+
+async def test_two_breaks_are_the_blank_line_they_draw_and_more_are_capped_at_one() -> None:
+    """Two breaks render an empty line, and an empty line is a paragraph boundary.
+
+    The cap is asserted beside it because the two are one decision: the model has a line break
+    and a paragraph break and nothing further, so a third break has nothing left to say.
+    """
+    two = await _blocks("<p>alpha<br/><br/>beta</p>")
+    five = await _blocks("<p>alpha<br/><br/><br/><br/><br/>beta</p>")
+
+    assert [block.text for block in two] == ["alpha\n\nbeta"]
+    assert paragraphs(two[0].text) == ["alpha", "beta"]
+    assert [block.text for block in five] == ["alpha\n\nbeta"]
+
+
+async def test_a_break_at_the_edge_of_a_container_creates_no_empty_block() -> None:
+    """There is no text on the other side of it, and a block with no text is not a block."""
+    assert [block.text for block in await _blocks("<p><br/>alpha</p>")] == ["alpha"]
+    assert [block.text for block in await _blocks("<p>alpha<br/></p>")] == ["alpha"]
+    assert await _blocks("<p><br/></p>") == []
+    assert await _blocks("<p><br/><br/></p>") == []
+
+
+async def test_nested_formatting_either_side_of_a_break_stays_in_order() -> None:
+    """A break inside a run must not reorder the run, and it is inline structure that would."""
+    blocks = await _blocks(
+        "<p>see <strong>the <em>first</em> host</strong><br/>"
+        "<em>then</em> the <code>second</code></p>"
+    )
+
+    assert [block.text for block in blocks] == ["see the first host\nthen the second"]
+
+
+async def test_a_break_inside_a_link_reaches_the_paragraph_around_it() -> None:
+    """The link is inline, so its break belongs to the sentence the link sits in."""
+    blocks = await _blocks(
+        '<p>see <a href="https://docs.example.test/routing">first line<br/>second line</a> now</p>'
+    )
+
+    assert [block.text for block in blocks] == ["see first line\nsecond line now"]
+
+
+async def test_a_break_in_a_heading_does_not_split_the_heading_path() -> None:
+    """A heading's text becomes a path element and a breadcrumb, both of which are one line."""
+    blocks = await _blocks("<h1>Signal routing<br/>and delivery</h1><p>Body.</p>")
+
+    assert blocks[0].kind is BlockKind.HEADING
+    assert blocks[0].text == "Signal routing and delivery"
+    assert blocks[1].heading_path == ("Signal routing and delivery",), (
+        "one path element, so the breadcrumb the embedder sees holds no newline"
+    )
+
+
+async def test_a_break_in_a_table_cell_does_not_become_a_row() -> None:
+    """``text`` is ``"\\n".join(rows)`` (§4.4), so a newline in a cell would invent a row.
+
+    The row count is asserted against ``rows`` metadata as well as against the text, because
+    the chunker splits on the metadata and a table whose two descriptions disagree would be
+    reassembled as one the parser never produced.
+    """
+    blocks = await _blocks(
+        "<table><tr><th>Signal</th><th>Meaning</th></tr>"
+        "<tr><td>lease age<br/>seconds</td><td>how stale the write lease is</td></tr></table>"
+    )
+    table = blocks[0]
+
+    assert table.kind is BlockKind.TABLE
+    assert table.text == "Signal | Meaning\nlease age seconds | how stale the write lease is"
+    assert table.metadata["rows"] == table.text.splitlines()
+    assert len(table.text.splitlines()) == 2, "two rows, which is how many the source has"
+
+
+async def test_a_break_in_a_list_item_does_not_become_an_item() -> None:
+    """One line per item is what carries the marker, and a markerless line is not an item."""
+    blocks = await _blocks("<ul><li>green means<br/>the lease is fresh</li><li>amber</li></ul>")
+
+    assert blocks[0].kind is BlockKind.LIST
+    assert blocks[0].text.splitlines() == ["- green means the lease is fresh", "- amber"]
+
+
+async def test_a_break_in_loose_text_is_kept_without_starting_a_block() -> None:
+    """Text with no ``<p>`` around it is still a paragraph, breaks and all."""
+    blocks = await _blocks("<div>Loose <b>inline</b> text<br/>continued.<p>A real one.</p></div>")
+
+    assert [block.text for block in blocks] == ["Loose inline text\ncontinued.", "A real one."]
+
+
+async def test_a_break_in_a_blockquote_is_a_line_break_like_any_other_prose() -> None:
+    blocks = await _blocks("<blockquote>quoted line<br/>and its second</blockquote>")
+
+    assert [block.text for block in blocks] == ["quoted line\nand its second"]
+
+
+async def test_preformatted_text_is_not_touched_by_the_break_rule() -> None:
+    """``<pre>`` is taken verbatim, and the rule is not allowed to reflow it.
+
+    A ``<br>`` inside one therefore still contributes nothing, which is a deliberate limit
+    rather than an oversight: ``<pre>`` draws its lines with real newlines and those come back
+    exactly, indentation included. Asserted with the glued word spelled out, so the limit is
+    visible in the suite rather than merely absent from it.
+    """
+    blocks = await _blocks("<pre>first line\n    indented line<br/>glued</pre>")
+
+    assert blocks[0].kind is BlockKind.CODE
+    assert blocks[0].text == "first line\n    indented lineglued"
+
+
+async def test_parsing_a_document_with_breaks_twice_produces_the_same_blocks() -> None:
+    """Chunk ids are derived from content, so a parser that varies churns the whole document."""
+    html = "<h1>Head<br/>ing</h1><p>alpha<br/><br/>beta</p><ul><li>one<br/>two</li></ul>"
+
+    assert [block.text for block in await _blocks(html)] == [
+        block.text for block in await _blocks(html)
+    ]
+
+
+async def test_an_anchor_still_resolves_to_the_section_holding_a_break(corpus: Path) -> None:
+    """Requirement 8: text surrounding a break resolves to the element that contains it.
+
+    The corpus fixture carries the break, so this asks the shipped ``resolve`` — which re-reads
+    the bytes rather than consulting anything ``parse`` left behind — for the section, and
+    checks that the block claiming a newline is inside what that section resolves to.
+    """
+    raw = raw_from(corpus / "web" / "structure.html", MEDIA_TYPE)
+    blocks = await read_blocks(_parser(), raw)
+    broken = next(block for block in blocks if "\n" in block.text and block.kind is BlockKind.PROSE)
+    resolved = await _parser().resolve(broken.anchor, raw)
+
+    assert broken.text == "Each machine takes two uplinks,\nand no two uplinks share a switch."
+    assert resolved is not None
+    assert contains_claimed_text(resolved, broken.text), (
+        "the citation predicate used at answer time, not a looser one written for a test"
+    )
 
 
 # --- degenerate and hostile input --------------------------------------------------------

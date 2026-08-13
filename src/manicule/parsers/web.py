@@ -33,6 +33,13 @@ from manicule.core.anchors import Anchor, HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, Metadata, ParsedBlock, RawDocument
 from manicule.parsers.base import HeadingStack, ParserProfile, decode
 from manicule.parsers.config import WEB_MEDIA_TYPES, WebConfig
+from manicule.parsers.inline import (
+    LINE_BREAK,
+    InlinePart,
+    collapse,
+    collapse_lines,
+    collapse_run,
+)
 
 __all__ = ["WEB_MEDIA_TYPES", "WebConfig", "WebParser", "recover_cdata"]
 
@@ -63,6 +70,11 @@ _INLINE_TAGS = frozenset(
 )  # fmt: skip
 """Elements that are part of the sentence around them. Their text joins the run being
 collected rather than starting a block, so ``<p>`` is not split at every ``<strong>``."""
+
+_BREAK = "br"
+
+_NESTED_LISTS = frozenset({"ul", "ol"})
+"""Direct children a list item renders separately rather than as part of its own text."""
 
 _INDENT = "  "
 
@@ -223,6 +235,11 @@ def _title(raw: RawDocument, tree: LexborHTMLParser) -> str:
 
     The connector's is preferred because it is what the rest of the record is keyed on; the
     ``<title>`` element is the honest fallback for a page fetched with nothing alongside it.
+
+    Flattened rather than walked for breaks, and the exemption is the specification's rather
+    than a shortcut: ``<title>`` is RCDATA, so a tokenizer produces one text node from its
+    whole content and ``<br/>`` inside one is the six characters an author typed. There is no
+    element there to preserve.
     """
     declared = raw.metadata.get("title")
     if isinstance(declared, str) and declared.strip():
@@ -230,7 +247,7 @@ def _title(raw: RawDocument, tree: LexborHTMLParser) -> str:
     # `css` rather than `css_first`: the stub's first overload defaults to the strict form,
     # so a bare `css_first` is typed as always finding something, which a `<title>` is not.
     element = tree.css("title")
-    return _collapse(element[0].text(deep=True)) if element else ""
+    return collapse(element[0].text(deep=True)) if element else ""
 
 
 def _walk(node: LexborNode) -> Iterator[_Found]:
@@ -240,7 +257,7 @@ def _walk(node: LexborNode) -> Iterator[_Found]:
     than dropped: a paragraph written without a ``<p>`` is still a paragraph, and a document
     that loses it indexes as shorter than it is.
     """
-    pending: list[str] = []
+    pending: list[InlinePart] = []
     for child in node.iter(include_text=True):
         if child.is_text_node:
             pending.append(child.text_content or "")
@@ -249,7 +266,7 @@ def _walk(node: LexborNode) -> Iterator[_Found]:
             continue
         tag = child.tag or ""
         if tag in _INLINE_TAGS:
-            pending.append(child.text(deep=True))
+            pending.extend(_parts(child))
             continue
         yield from _flush(pending)
         if tag in _HEADING_LEVELS:
@@ -268,9 +285,33 @@ def _walk(node: LexborNode) -> Iterator[_Found]:
     yield from _flush(pending)
 
 
-def _flush(pending: list[str]) -> Iterator[_Found]:
+def _parts(node: LexborNode, skip: frozenset[str] = frozenset()) -> Iterator[InlinePart]:
+    """What ``node`` contributes to the run around it: its text, and the breaks it draws.
+
+    This is what ``text(deep=True)`` is replaced by wherever the result is inline content, and
+    the difference is one element. A ``<br>`` has no text of its own, so asking the tree for
+    characters returns none and the break is gone before any collapse could have kept it.
+
+    ``skip`` names direct children the caller renders separately — the nested list inside a
+    list item — and applies to that level only, as the flatten it replaces did.
+    """
+    if node.is_text_node:
+        yield node.text_content or ""
+        return
+    if node.is_comment_node:
+        return
+    if node.tag == _BREAK:
+        yield LINE_BREAK
+        return
+    for child in node.iter(include_text=True):
+        if (child.tag or "") in skip:
+            continue
+        yield from _parts(child)
+
+
+def _flush(pending: list[InlinePart]) -> Iterator[_Found]:
     """Emit the loose inline run collected so far, if it holds anything, and clear it."""
-    text = _collapse("".join(pending))
+    text = collapse_lines(pending)
     pending.clear()
     if text:
         yield _Found(kind=BlockKind.PROSE, text=text)
@@ -279,7 +320,7 @@ def _flush(pending: list[str]) -> Iterator[_Found]:
 def _heading(node: LexborNode, tag: str) -> _Found:
     return _Found(
         kind=BlockKind.HEADING,
-        text=_collapse(node.text(deep=True)),
+        text=collapse_run(_parts(node)),
         level=_HEADING_LEVELS[tag],
         fragment=_published_fragment(node),
     )
@@ -323,15 +364,10 @@ def _block(node: LexborNode, tag: str) -> _Found | None:
         source = node.attributes.get("src")
         metadata = {"src": source} if source else {}
     else:
-        text = _collapse(node.text(deep=True))
+        text = collapse_lines(_parts(node))
     if not text.strip():
         return None
     return _Found(kind=kind, text=text, lang=lang, metadata=metadata)
-
-
-def _collapse(text: str) -> str:
-    """Whitespace as a reader sees it: runs become single spaces, ends are trimmed."""
-    return " ".join(text.split())
 
 
 def _media_text(node: LexborNode) -> str:
@@ -339,11 +375,14 @@ def _media_text(node: LexborNode) -> str:
 
     With OCR out of scope, an image with neither is not indexable, and emitting an empty
     block for it would put a vector of nothing into the index.
+
+    One line, because this is the block's label rather than its prose: a caption is what a
+    reader is shown beside the picture, and a media block has no paragraphs to keep apart.
     """
     alt = node.attributes.get("alt")
     if alt and alt.strip():
-        return _collapse(alt)
-    return _collapse(node.text(deep=True))
+        return collapse(alt)
+    return collapse_run(_parts(node))
 
 
 def _code_language(node: LexborNode) -> str | None:
@@ -382,29 +421,30 @@ def _table_rows(node: LexborNode) -> list[str]:
     them :meth:`~manicule.chunking.chunker.StructuralChunker._split_table` falls back to prose
     splitting and cuts mid-row, which produces a line that still looks like ``TERM | expansion``
     while its expansion is a fragment.
+
+    A cell is one line, and that is what a break inside one becomes a space for. ``text`` is
+    ``"\\n".join(rows)`` (``docs/parsing.md`` §4.4), so a newline inside a cell would put a row
+    in ``text`` that is not in ``rows`` and the two would stop describing the same table.
     """
     rows: list[str] = []
     for row in node.css("tr"):
-        cells = [_collapse(cell.text(deep=True)) for cell in row.css("th, td")]
+        cells = [collapse_run(_parts(cell)) for cell in row.css("th, td")]
         if any(cells):
             rows.append(" | ".join(cells))
     return rows
 
 
 def _list_lines(node: LexborNode, depth: int) -> Iterator[str]:
-    """A list rendered with its nesting preserved as indentation."""
+    """A list rendered with its nesting preserved as indentation.
+
+    One line per item, for the reason a table keeps one line per row: the newline is what says
+    where an item ends, so a break inside one is a space.
+    """
     marker = "1." if node.tag == "ol" else "-"
     for item in node.iter():
         if item.tag not in {"li", "dt", "dd"}:
             continue
-        own = _collapse(
-            "".join(
-                part.text_content or ""
-                if part.is_text_node
-                else ("" if part.tag in {"ul", "ol"} else part.text(deep=True))
-                for part in item.iter(include_text=True)
-            )
-        )
+        own = collapse_run(_parts(item, skip=_NESTED_LISTS))
         if own:
             yield f"{_INDENT * depth}{marker} {own}"
         for nested in item.iter():
