@@ -21,11 +21,13 @@ import pytest
 from manicule.core.content import BlockKind
 from manicule.core.glossary import MatchReason
 from manicule.core.retrieval import ConfidenceBand, Query
+from manicule.ingest.glossary import detect_entries
 from manicule.retrieval.cache import L1QueryCache
 from manicule.retrieval.confidence import DEFINITION_CITED, NOTHING_RESEMBLES
 from manicule.retrieval.expansion import GLOSSARY_SCORE_KEY, ExpansionPolicy
 from tests.evaluation.fakes import BagOfWordsEmbedder
 from tests.glossary import corpus, system
+from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -738,3 +740,72 @@ async def test_a_cache_hit_reports_the_same_expansion_a_miss_did(
     assert hit.expansion is not None
     assert hit.expansion.matches[0].entry.chunk_id == miss.expansion.matches[0].entry.chunk_id
     assert _texts(hit) == _texts(miss)
+
+
+async def test_a_heading_section_cannot_suppress_a_real_definition_elsewhere(
+    store: SqliteDocStore, indexed: list[Chunk], definition: str
+) -> None:
+    """**The harm the heading rule exists to prevent, asserted where it actually lands.**
+
+    Not "the bogus entry is absent" — that assertion passes on any implementation that breaks
+    retrieval some other way, and absence was never the property anybody cared about. What
+    matters is that the *correct* definition still answers, so that is what is asserted: rank 1,
+    cited, with ``explicit_definition`` true.
+
+    The failure it guards is not a false statement, it is the feature disabling itself. Two
+    disagreeing expansions of one term are an ``ExpansionConflict``, and ``resolve_expansion``
+    correctly refuses to choose between them — so before this rule, **one** heading section
+    naming an acronym on a second page took the real 0.95 definition from rank 1 to absent, with
+    no match at all and ``explicit_definition`` false, while reporting a conflict. A conflict is
+    a legitimate state, so nothing looked broken.
+
+    Measured on ``origin/main`` with exactly this fixture:
+
+    .. code-block:: text
+
+        matches   : []
+        conflicts : [ExpansionConflict(key='NOW', entries=(
+                       ...'Network Operations Workspace',                     EM_DASH, 0.95,
+                       ...'The Network Operations Workspace holds the runbooks', HEADING, 0.6))]
+        explicit_definition = False
+        rank of a NOW-defining chunk = None
+
+    The corpus needs both pages, and that is the whole fixture: a heading page alone would show
+    the bogus entry refused and would say nothing about the collision, which is the case a real
+    corpus produces as soon as it holds a glossary and any ordinary structured documentation.
+    """
+    appendix = make_document(
+        source="fixture",
+        source_id="appendix",
+        title="Operations glossary appendix",
+        uri="file:///appendix.md",
+        body=b"The Network Operations Workspace holds the runbooks",
+    )
+    await store.upsert_document(appendix)
+    # The heading route the structural chunker actually takes: the term is the breadcrumb's
+    # last element and never appears in the chunk's own text.
+    section = [
+        make_chunk(
+            appendix,
+            0,
+            "The Network Operations Workspace holds the runbooks",
+            heading_path=("Operations glossary appendix", corpus.ACRONYM),
+        )
+    ]
+    await store.replace_chunks(appendix.id, section)
+    await store.replace_glossary_entries(
+        appendix.id, detect_entries(section, title="Operations glossary appendix")
+    )
+    retriever = await _with_glossary(store, [*indexed, *section])
+
+    result = await retriever.retrieve(_ask(corpus.QUERY_ACRONYM))
+
+    assert result.expansion is not None
+    assert [match.entry.expansion for match in result.expansion.matches] == [corpus.EXPANSION], (
+        "the real definition must still expand the query; an empty match list is the "
+        "conflict-suppression failure this rule exists to prevent"
+    )
+    assert result.expansion.conflicts == ()
+    assert system.rank_of(result.context.passages, definition) == 1
+    assert result.confidence is not None
+    assert result.confidence.explicit_definition

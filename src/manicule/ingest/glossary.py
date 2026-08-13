@@ -661,6 +661,57 @@ def core_expansion(acronym: str, expansion: str, *, display: str = "") -> str:
     return ""
 
 
+def a_heading_may_define(acronym: str, expansion: str, *, display: str = "") -> bool:
+    """Whether a heading and the text beneath it may be read as a definition at all.
+
+    **The one form whose separator nobody typed.** Every other written form carries a mark the
+    author chose to mean "is defined as" — a dash, a colon, a definition list, a table cell
+    boundary, a pair of parentheses. A heading followed by a paragraph carries none: it is the
+    shape of *every structured document ever written*, so the relationship is inferred here and
+    asserted nowhere in the source. Pairing the weakest possible form with a page-level title
+    check meant that on any page whose title said "glossary", **every section became a
+    definition**: ``_FORM_WEIGHT[HEADING]`` 0.45 plus :data:`GLOSSARY_CONTEXT_EVIDENCE` 0.15 is
+    exactly :data:`MIN_DEFINITION_CONFIDENCE`, cleared by being equal. Measured on ten heading
+    sections whose bodies were ordinary sentences, ten of ten were stored, including ``NOW`` as
+    ``'The Network Operations Workspace holds the runbooks'``.
+
+    So the two strings have to agree. Initials agreement is a property of the term and the
+    phrase rather than of the page around them, which is what the page title could never supply.
+
+    **The harm this prevents is not the false statement, it is the feature disabling itself.**
+    A wrong entry is not merely a bad answer sitting in an index: two disagreeing expansions of
+    one term are an
+    :class:`~manicule.core.glossary.ExpansionConflict`, and
+    :func:`~manicule.retrieval.expansion.resolve_expansion` correctly refuses to choose between
+    them. So one heading section naming an acronym takes a **correct** 0.95 definition on another
+    page from rank 1 to absent from the context, with ``explicit_definition`` false and no match
+    at all — and reports a conflict, which is a legitimate state, so nothing looks broken. A
+    corpus holding a real glossary and ordinary heading-structured documentation degrades term by
+    term as those pages accumulate.
+
+    **What this costs, both halves, because only the pair is honest.** Against
+    ``REAL_DEFINITIONS_WITHOUT_INITIALS`` — the curated population of ordinary definitions whose
+    initials do not spell them, ``CPU``/``central processor``, ``ITSM``/``IT service
+    management`` — the answer depends entirely on the form the content is authored in:
+
+    - **As the repository actually writes them**, ``TERM — expansion``, this costs **nothing**:
+      10 of 10 detected and 10 of 10 kept, because a dash is a separator its author typed. The
+      six near-miss backronyms on the canonical glossary page are likewise untouched, and so is
+      every other entry in that corpus.
+    - **Authored as heading sections**, the same ten are all refused: 10 of 10 lost.
+
+    Read only the second and this rule looks expensive; read only the first and it looks free.
+    Before relaxing it, note that the population it refuses and the population it exists to stop
+    are the same shape — a heading, a body, and no agreement between them — and nothing available
+    here tells them apart. ``tests/glossary/test_detection.py`` records the search for a cheaper
+    discriminator: word count is refuted (20 of 49 real expansions are exactly six words), and
+    "contains a determiner" scores perfectly on the corpus while missing 4 of 10 of the real
+    failure class and refusing the ``National Association for **the** Advancement…`` class the
+    corpus happens to contain none of.
+    """
+    return initials_match(acronym, expansion, display=display)
+
+
 def score_definition(
     acronym: str,
     expansion: str,
@@ -845,6 +896,10 @@ def detect_in_chunk(chunk: Chunk, *, glossary_context: bool = False) -> list[Glo
         expansion = core_expansion(acronym, candidate.expansion, display=candidate.display)
         if not acronym or not expansion or normalise_acronym(expansion) == acronym:
             continue
+        if candidate.form is DefinitionForm.HEADING and not a_heading_may_define(
+            acronym, expansion, display=candidate.display
+        ):
+            continue
         confidence = score_definition(
             acronym,
             expansion,
@@ -908,6 +963,7 @@ __all__ = [
     "MAX_EXPANSION_WORDS",
     "MIN_DEFINITION_CONFIDENCE",
     "MIN_SKELETON_LENGTH",
+    "a_heading_may_define",
     "acronym_shaped",
     "core_expansion",
     "detect_entries",
