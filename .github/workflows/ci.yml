@@ -31,9 +31,14 @@ jobs:
       - name: ruff check
         run: uv run ruff check .
       - name: ruff format
-        # tools/ is excluded from formatting only: it is generator scripts owned by the
-        # documentation they produce. It is still linted above.
-        run: uv run ruff format --check src tests packages
+        # `.`, deliberately, and with no path list. What the formatter owns is decided in
+        # `[tool.ruff.format] exclude` in pyproject.toml, so this is the same command over the
+        # same files as the `ruff format .` a developer runs. A path list here would be a
+        # second scope that could disagree with the first, which is what it used to do:
+        # `src tests packages` left `tools/` and the Python in markdown documents formatted by
+        # the obvious command and verified by nothing. tests/test_ci_format_scope.py holds
+        # this to `.`.
+        run: uv run ruff format --check .
 
   typecheck:
     name: typecheck
