@@ -553,6 +553,16 @@ def test_a_parenthetical_survives_when_no_prefix_before_it_spells_the_term() -> 
     That is the difference between offering a position and awarding a cut, tested on a line where
     the two rules disagree rather than on one where the candidate is rejected outright and any
     implementation would look correct.
+
+    **Retained for the right reason, which was checked rather than assumed.** There are two ways
+    a bracket survives and only one of them is evidence. This is the evidence one: the boundary
+    *was* offered at position 18 and the prefix was refused. The other route — the whole
+    right-hand side matching because :func:`~manicule.ingest.glossary.initials_of` dropped the
+    bracketed tokens, so no boundary was ever consulted — is the accidental one, and it is
+    pinned separately by
+    ``test_whether_a_trailing_parenthetical_survives_depends_on_its_first_character``. Measured
+    here: ``initials_forms('central processor (the execution unit)')`` is ``{'CPEU'}`` against a
+    term of ``CPU``, so no reading spells it and the filter is not what saved the bracket.
     """
     entries = detect_in_chunk(chunk("CPU — central processor (the execution unit)"))
 
@@ -587,6 +597,42 @@ def test_a_bracketed_qualifier_is_kept_whole_and_dropped_when_cutting(
     the longest agreeing prefix at a bracket — inverts shortest-wins for one position only, and
     would keep ``Regional Network Edge (e.g., a gateway)`` for the same reason. Nothing here tells
     a qualifier from an example, so the choice is which way to be wrong.
+    """
+    entries = detect_in_chunk(chunk(line))
+
+    assert [entry.expansion for entry in entries] == [expected]
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("RNE — Regional Network Edge (Type 2)", "Regional Network Edge (Type 2)"),
+        ("RNE — Regional Network Edge (Type Two)", "Regional Network Edge"),
+    ],
+    ids=["digit-inside-keeps-it", "letter-inside-drops-it"],
+)
+def test_whether_a_trailing_parenthetical_survives_depends_on_its_first_character(
+    line: str, expected: str
+) -> None:
+    """**A known limitation, pinned so it is found here rather than in a corpus.**
+
+    Two lines that mean the same thing are treated differently, and what decides it is the
+    ``word[:1].isalpha()`` filter in :func:`~manicule.ingest.glossary.initials_of` — the same
+    filter whose misfiring is the defect this change exists to fix. Removing its bad consequence
+    at the boundary did not remove its influence on retention.
+
+    ``(Type 2)``: ``(Type`` starts with ``(`` and ``2)`` with a digit, so both are dropped, the
+    surviving three words spell ``RNE``, the **whole** right-hand side matches, and no boundary
+    is ever consulted — the bracket is kept by accident rather than by evidence.
+
+    ``(Type Two)``: ``Two)`` starts with ``T``, so the initials read ``RNET``, the whole no
+    longer spells the term, the boundary search runs, and the prefix before the bracket earns the
+    cut.
+
+    Recorded rather than fixed: the two cases want opposite outcomes and nothing here
+    distinguishes them. Making the filter keep bracketed tokens would change what *every*
+    expansion's initials are — a far wider change than this one, wanting its own measurement.
+    Asserted in both directions so that if somebody does make them agree, this fails and says so.
     """
     entries = detect_in_chunk(chunk(line))
 

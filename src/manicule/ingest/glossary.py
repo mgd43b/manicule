@@ -351,6 +351,24 @@ def _description_boundaries(text: str) -> list[int]:
     term. Evidence does the work, so the marker list would be decoration that fails on the first
     parenthetical nobody enumerated.
 
+    **Known limitation: whether a trailing parenthetical is kept depends on the first character
+    inside it.** Two lines that mean the same thing are treated differently, and the mechanism
+    deciding it is the ``word[:1].isalpha()`` filter in :func:`initials_of` — the same filter
+    whose misfiring is the defect this function was written to fix. Measured:
+
+    - ``RNE — Regional Network Edge (Type 2)`` keeps its bracket. ``(Type`` starts with ``(`` and
+      ``2)`` with a digit, so both are dropped by the filter, the surviving three words spell
+      ``RNE``, the *whole* right-hand side matches and no boundary is ever consulted.
+    - ``RNE — Regional Network Edge (Type Two)`` loses it. ``Two)`` starts with ``T``, which is
+      alphabetic, so the initials read ``RNET``, the whole no longer spells the term,
+      :func:`_phrase_after` runs, and the prefix before the bracket earns the cut.
+
+    Removing the bad consequence at the boundary did not remove the filter's influence on
+    retention, and this is recorded rather than fixed because the two cases want opposite
+    outcomes and nothing available here distinguishes them. Making the filter keep bracketed
+    tokens would change what every expansion's initials are, which is a far wider change than
+    this one and would want its own measurement.
+
     """
     depth = 0
     depths: list[int] = []
