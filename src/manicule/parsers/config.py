@@ -51,6 +51,8 @@ __all__ = [
     "ADF_MEDIA_TYPE",
     "ADF_MEDIA_TYPES",
     "ARCHIVE_MEDIA_TYPES",
+    "CONFLUENCE_MEDIA_TYPE",
+    "CONFLUENCE_MEDIA_TYPES",
     "CSV_MEDIA_TYPE",
     "MAIL_MEDIA_TYPES",
     "MARKDOWN_MEDIA_TYPES",
@@ -69,6 +71,7 @@ __all__ = [
     "XLSX_MEDIA_TYPE",
     "ADFConfig",
     "ArchiveConfig",
+    "ConfluenceConfig",
     "MailConfig",
     "MarkdownConfig",
     "NotebookConfig",
@@ -106,6 +109,22 @@ ADF_MEDIA_TYPE = "application/json;profile=atlas-doc-format"
 registers under the profile parameter the API itself uses."""
 
 ADF_MEDIA_TYPES = frozenset({ADF_MEDIA_TYPE})
+
+CONFLUENCE_MEDIA_TYPE = "application/xhtml+xml;profile=confluence-storage"
+"""Storage format is not a file type either, and it is not quite XHTML.
+
+The base type is honest — a storage-format body really is XHTML, and reading it with an HTML
+engine is the right way to read it — but the profile is what makes it addressable. Without one
+there is no way to say "this is Confluence" at routing time, so ``ac:structured-macro`` reaches
+a parser with no vocabulary for it and a code macro's language, a panel's severity and a task's
+state are flattened to prose. The profile parameter is the device :data:`ADF_MEDIA_TYPE`
+already uses for the other Confluence body format, for the same reason.
+
+Deliberately **not** a bare ``application/xhtml+xml``, which :data:`WEB_MEDIA_TYPES` already
+claims: resolution is by exact media type, so a bare one would route to the HTML parser and the
+distinction this exists to draw would silently not happen."""
+
+CONFLUENCE_MEDIA_TYPES = frozenset({CONFLUENCE_MEDIA_TYPE})
 
 WORD_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -269,6 +288,31 @@ class WebConfig(BaseModel):
     )
     """These carry no prose. Indexing a script body puts identifiers and punctuation into the
     vector, where they match queries by accident and cite a line no reader ever saw."""
+
+
+class ConfluenceConfig(BaseModel):
+    """Configuration for :class:`~manicule.parsers.confluence.ConfluenceStorageParser`."""
+
+    drop_tags: frozenset[str] = Field(
+        default=frozenset({"script", "style", "noscript", "template"}),
+        description="Elements removed, with their contents, before any text is extracted.",
+    )
+    """Storage format is authored through a rich-text editor, but it is not therefore safe: a
+    space administrator can place raw HTML on a page, and an export is a file anyone can edit
+    before it is ingested. The same elements the HTML parser drops are dropped here, for the
+    same reason — a script body in the vector matches queries by accident and cites a line no
+    reader ever saw."""
+
+    keep_unsupported_macros: bool = Field(
+        default=True,
+        description="Emit a named placeholder where a macro has no reader here.",
+    )
+    """**Off is a real choice and a lossy one.** A placeholder is how a reader learns that the
+    page said something this parser could not read; without it the omission is indistinguishable
+    from the page having been empty there. Turning it off suits a corpus whose pages carry a
+    navigation macro on every one of them, where the placeholders are noise repeated ten
+    thousand times — but the content is gone from the index either way, and only the notice is
+    configurable."""
 
 
 class ADFConfig(BaseModel):

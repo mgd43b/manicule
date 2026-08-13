@@ -53,6 +53,7 @@ from manicule.connectors.macros import (
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.lifecycle import HealthReport, Metric
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
+from manicule.parsers.config import CONFLUENCE_MEDIA_TYPE
 
 __all__ = [
     "ADF_BODY",
@@ -65,31 +66,37 @@ __all__ = [
 ADF_BODY = "atlas_doc_format"
 STORAGE_BODY = "storage"
 
-STORAGE_MEDIA_TYPE = "text/html"
-"""What a storage-format body is routed as.
+STORAGE_MEDIA_TYPE = CONFLUENCE_MEDIA_TYPE
+"""What a storage-format body is routed as: its own profiled type, read by its own parser.
 
-Storage format is XHTML with Confluence's own ``ac:`` and ``ri:`` elements mixed in, and the HTML
-parser reads it with a real HTML engine rather than by stripping angle brackets. What it recovers
-is the structure HTML and storage format share: headings, paragraphs, lists, tables, ``<pre>``.
+**This constant was ``text/html`` for as long as this connector existed, and its docstring twice
+argued that it should be.** Both arguments are kept below, because each was wrong in a way worth
+remembering rather than deleting.
 
-**This docstring used to claim more, and the claim was false.** It said the parser "keeps the
-structure that survives" and that calling storage format something else "would only mean writing a
-second parser for a dialect of the same thing". It is not the same thing, and the difference
-destroyed content: storage format wraps the body of every ``code``, ``noformat`` and ``graphviz``
-macro in ``<![CDATA[…]]>``, which HTML does not have outside foreign content — so a conforming
-parser reparsed each one as a bogus comment and **deleted the body**. Every code block on every
-Server or Data Center page was absent from the index, with a fragment of it indexed as prose, for
-as long as this connector has existed.
+The first said the HTML parser "keeps the structure that survives" and that naming storage format
+separately "would only mean writing a second parser for a dialect of the same thing". It is not
+the same thing, and the difference destroyed content: storage format wraps the body of every
+``code``, ``noformat`` and ``graphviz`` macro in ``<![CDATA[…]]>``, which HTML has no equivalent
+of outside foreign content — so a conforming parser reparsed each as a *bogus comment* and deleted
+the body. Every code block on every Server or Data Center page was missing from the index, with a
+fragment of it indexed as prose, and nothing raised.
 
-``manicule.parsers.web`` now recovers those sections as escaped text, so the routing above is
-honest about the structure it claims. What it still does *not* do is read ``ac:*`` and ``ri:*`` as
-Confluence: a code macro's language, a warning panel's severity, a task list's state and a Graphviz
-macro's engine are all flattened to prose. That is a missing feature rather than lost content, and
-it is what a storage-format parser is for.
+The second survived that fix. It conceded the vocabulary was unread but called it "a missing
+feature rather than lost content" — and that was wrong too, in the direction nobody checked.
+Reading ``ac:parameter`` as generic HTML did not merely lose a code block's language; it *indexed*
+it. The language, the diagram engine and a Jira macro's **JQL query** each became a prose block,
+went into the vector, and were quotable in a citation as words the page had said. A task's status
+arrived as a one-word block reading ``complete``. That is not a missing feature; it is the index
+asserting things the document does not contain.
 
-The lesson worth keeping is about the sentence rather than the bug. It was written from intent,
-never executed, and it read as a settled argument against doing the work — while being wrong. A
-claim about what a parser keeps is checkable in four lines.
+:mod:`manicule.parsers.confluence` reads the vocabulary now, so this declares what the bytes
+actually are. Changing it **re-routes every page already ingested under the old type** — which
+nothing would otherwise notice, because the bytes are identical and the stored lineage names the
+parser that read them last. ``Change.ROUTING`` is what notices, and it exists for this.
+
+The lesson is about the sentences rather than the bugs. Both were written from intent, never
+executed, and both read as settled arguments against doing the work. What a parser keeps, and
+what it puts in the index, are each checkable in four lines.
 """
 
 _SEARCH_PATH = "/rest/api/content/search"

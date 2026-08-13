@@ -83,7 +83,7 @@ def test_no_parser_records_a_version_for_a_library_it_does_not_use() -> None:
         "python-pptx": ("pptx",),
         "pypdfium2": ("pdf",),
         "ruamel-yaml": ("structured",),
-        "selectolax": ("html", "email"),
+        "selectolax": ("html", "email", "confluence"),
         "tree-sitter": ("sourcecode",),
     }
 

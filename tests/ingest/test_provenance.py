@@ -400,9 +400,8 @@ async def test_a_source_that_declares_a_new_media_type_reports_it_as_its_own_axi
     digest = stored.content_hash
 
     # The same bytes, the same record, declared as something else.
-    assert pipeline.changes_since(stored, digest, _raw(a_record(version="7"), media_type=RE_ROUTED)) == {
-        Change.ROUTING
-    }
+    re_routed = _raw(a_record(version="7"), media_type=RE_ROUTED)
+    assert pipeline.changes_since(stored, digest, re_routed) == {Change.ROUTING}
 
     # And it is reported *beside* the others rather than instead of them.
     assert pipeline.changes_since(

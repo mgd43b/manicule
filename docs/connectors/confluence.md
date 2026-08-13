@@ -248,23 +248,32 @@ GET /wiki/api/v2/pages/{id}?body-format=atlas_doc_format
 ```
 
 **Server / DC — storage format.** ADF is Cloud-only, so Server falls back to
-`body.storage` XHTML, which is parsed with a real HTML engine rather than by stripping
-angle brackets. It is routed as `text/html`, so the parser chain's HTML parser
-(`selectolax`, `docs/parsing.md` §7) handles it, recovering the structure HTML and storage
-format share: headings, paragraphs, lists, tables, `<pre>`.
+`body.storage` XHTML. It is routed as `application/xhtml+xml;profile=confluence-storage` and
+read by `manicule.parsers.confluence` (`docs/parsing.md` §2.4), which understands `ac:*` and
+`ri:*` as Confluence rather than as unknown HTML elements: a code macro's declared language, a
+panel's severity, a task's state, a Graphviz macro's engine and its DOT source, page and
+external links, user mentions as display references, and a named placeholder wherever a macro
+has no reader here.
 
-> **This paragraph used to end "a second parser for a dialect of the same thing would be two
-> implementations of one job", and that reasoning was wrong in a way that destroyed content.**
-> Storage format wraps the body of every `code`, `noformat` and `graphviz` macro in
+> **This section twice argued that storage format needed no parser of its own, and both
+> arguments were wrong — the second in the direction nobody checked.**
+>
+> The first ended "a second parser for a dialect of the same thing would be two implementations
+> of one job". Storage format wraps the body of every `code`, `noformat` and `graphviz` macro in
 > `<![CDATA[…]]>`, which HTML does not have outside foreign content — so the HTML parser reparsed
 > each one as a bogus comment and **deleted the body**. Every code block on every Server or DC
 > page was missing from the index, with a fragment of it indexed as prose, for as long as this
-> connector has existed. `manicule.parsers.web` now recovers CDATA sections as escaped text.
+> connector existed. `manicule.parsers.web` now recovers CDATA sections as escaped text.
 >
-> It is still not the same thing. `ac:*` and `ri:*` are not read as Confluence: a code macro's
-> language, a warning panel's severity, a task list's state and a Graphviz macro's engine are all
-> flattened to prose. That is a missing feature rather than lost content, and it is what a
-> storage-format parser is for. The argument against writing one was never a measurement.
+> The second survived that fix. It conceded `ac:*` was unread but called it "a missing feature
+> rather than lost content". It was not merely missing. Read as generic HTML, `<ac:parameter>` is
+> an unknown element wrapping a text node, so a macro's **configuration was indexed as document
+> text**: a code block's language, a diagram's engine and a Jira macro's **JQL query** each
+> became a prose block, went into the vector, and were quotable in a citation as words the page
+> had said. A task's status arrived as a one-word block reading `complete`. The index was
+> asserting things the document did not contain, which is the opposite of a missing feature.
+>
+> Neither argument was ever a measurement. Both were checkable in four lines.
 
 Ancestors — the page hierarchy used for breadcrumbs in §7 — come from discovery, which
 expands them for every page it returns, so the fetch needs no second call. A ref built
