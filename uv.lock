@@ -1726,6 +1726,7 @@ storage = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "coverage" },
     { name = "httpx2" },
     { name = "manicule", extra = ["connectors", "embeddings", "generation", "ingest", "parsers", "retrieval", "serve", "storage"] },
     { name = "manicule-plugin-example" },
@@ -1786,6 +1787,7 @@ provides-extras = ["storage", "embeddings", "ingest", "parsers", "retrieval", "r
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "coverage", specifier = ">=7.15" },
     { name = "httpx2", specifier = ">=2.10" },
     { name = "manicule", extras = ["connectors"], editable = "." },
     { name = "manicule", extras = ["embeddings"], editable = "." },

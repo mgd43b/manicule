@@ -167,6 +167,13 @@ dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
   "pytest-cov>=6.0",
+  # Declared directly, though pytest-cov already brings it, because `[tool.coverage.run] core`
+  # is now load-bearing and `pytest-cov>=6.0` does not imply a coverage that has heard of it.
+  # coverage warns on an option it does not recognise, and `filterwarnings = ["error"]` turns
+  # that into a hard stop — so on too old a release the suite does not run slower, it refuses
+  # to run, reporting an unrecognised option rather than anything about the version. The floor
+  # is the release the timings in that comment were measured on.
+  "coverage>=7.15",
   "ruff>=0.8",
   "pyright>=1.1.390",
   # Fixture generation (docs/parsing.md §3.5): fixtures are built by a checked-in script
