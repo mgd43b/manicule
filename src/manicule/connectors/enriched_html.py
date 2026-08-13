@@ -290,12 +290,16 @@ def _convert(page: Path, *, root: Path, force: bool) -> SidecarOutcome:
             page, skipped_reason="a manifest is already there; pass --force to replace it"
         )
     try:
-        raw = page.read_bytes()
+        raw = _read_bounded(page)
     except OSError as exc:
         return SidecarOutcome(page, skipped_reason=f"could not be read ({exc.strerror or exc})")
-    if len(raw) > MAX_HTML_BYTES:
+    if raw is None:
+        # ``stat`` for the message only, never for the decision — that was already made by a
+        # bounded read. Whether the file is one byte over the limit or a thousand times it is
+        # what decides between raising the limit and looking at what is in that directory.
         return SidecarOutcome(
-            page, skipped_reason=f"is {len(raw)} bytes, over the {MAX_HTML_BYTES}-byte limit"
+            page,
+            skipped_reason=f"is {page.stat().st_size} bytes, over the {MAX_HTML_BYTES}-byte limit",
         )
     try:
         extracted = extract(raw.decode("utf-8", errors="replace"))
@@ -310,8 +314,30 @@ def _convert(page: Path, *, root: Path, force: bool) -> SidecarOutcome:
     return SidecarOutcome(page, written=True)
 
 
+def _read_bounded(page: Path) -> bytes | None:
+    """``page``'s bytes, or ``None`` when it is over :data:`MAX_HTML_BYTES`.
+
+    Reads one byte past the limit and stops, rather than reading the file and measuring what came
+    back. Measuring afterwards is what the first version of this did, and it made the limit
+    decorative: the whole file was already in memory by the time anything decided it was too big,
+    which is precisely the allocation the limit exists to prevent.
+
+    Bounding the read rather than trusting ``stat`` also closes the gap between asking a file how
+    big it is and reading it, which is not hypothetical for a directory something else is writing.
+    """
+    with page.open("rb") as handle:
+        raw = handle.read(MAX_HTML_BYTES + 1)
+    return None if len(raw) > MAX_HTML_BYTES else raw
+
+
 def _walk(directory: Path, *, root: Path) -> Iterator[Path]:
-    """Every HTML file under ``directory``, in a stable order, following no symlink."""
+    """Every HTML file under ``directory``, in a stable order, following no symlink.
+
+    A manifest is not filtered here and does not need to be: it is ``<page>.source.json``, whose
+    suffix is ``.json``, so the extension test below has already excluded it. An
+    :func:`.sidecar.is_manifest` call as well would read as a second defence and be dead code —
+    unreachable, unexercised, and quietly wrong the day the extension test changed.
+    """
     try:
         entries: Sequence[Path] = sorted(directory.iterdir())
     except OSError:
@@ -321,9 +347,11 @@ def _walk(directory: Path, *, root: Path) -> Iterator[Path]:
             continue
         if entry.is_dir():
             yield from _walk(entry, root=root)
-        elif entry.is_file() and entry.suffix.lower() in {".html", ".htm"}:
-            if sidecar.is_manifest(entry) or not _within(entry, root=root):
-                continue
+        elif (
+            entry.is_file()
+            and entry.suffix.lower() in {".html", ".htm"}
+            and _within(entry, root=root)
+        ):
             yield entry
 
 
@@ -343,30 +371,45 @@ def _fields(section: LexborNode) -> dict[str, str]:
             than resolved by order, because "the first one wins" is a rule nobody writing an
             exporter knows about, and the two values are equally likely to be the right one.
     """
-    found: dict[str, str] = {}
-    for label, value in _rows(section):
+    found: dict[str, tuple[str, str]] = {}
+    for label, node, without in _rows(section):
         field = _LABELS.get(label)
-        if field is None or not value:
+        if field is None:
+            continue
+        value = _value(node, without=without, prefer_href=field == "canonical_uri")
+        if not value:
             continue
         previous = found.get(field)
-        if previous is not None and previous != value:
+        if previous is not None and previous[1] != value:
+            # The *field* is what collides, and two different labels can fill one — "Source" and
+            # "Canonical URL" both name the address. Reporting "declares 'canonical url' twice"
+            # when the other statement was spelled "Source" sends the reader looking for a
+            # duplicate row that is not there, so both labels are named.
+            first_label, first_value = previous
+            spelling = (
+                f"{first_label!r}" if first_label == label else f"{first_label!r} and {label!r}"
+            )
             msg = (
-                f"declares {label!r} twice, as {previous!r} and {value!r}. Which is the page's "
-                f"is not something this can decide"
+                f"declares {spelling} twice, as {first_value!r} and {value!r}. Which is the "
+                f"page's is not something this can decide"
             )
             raise UnusablePageError(msg)
-        found[field] = value
-    return found
+        found[field] = (label, value)
+    return {field: value for field, (_, value) in found.items()}
 
 
-def _rows(section: LexborNode) -> Iterator[tuple[str, str]]:
-    """``(normalised label, value)`` for every labelled row, however the exporter wrote it."""
+def _rows(section: LexborNode) -> Iterator[tuple[str, LexborNode, str]]:
+    """``(normalised label, the node holding the value, text to strip)`` for every labelled row.
+
+    The node rather than its text, because how a value should be read depends on which field it
+    fills and only the caller knows that — see :func:`_value`.
+    """
     for node in section.css("dt"):
         sibling = node.next
         while sibling is not None and sibling.tag == "-text":
             sibling = sibling.next
         if sibling is not None and sibling.tag == "dd":
-            yield _label(node.text(deep=True)), _value(sibling)
+            yield _label(node.text(deep=True)), sibling, ""
     for marker in section.css("strong, b, th"):
         parent = marker.parent
         if parent is None:
@@ -375,23 +418,26 @@ def _rows(section: LexborNode) -> Iterator[tuple[str, str]]:
         marked = _collapse(marker.text(deep=True))
         if not whole.startswith(marked):
             continue
-        yield _label(marked), _value(parent, without=marked)
+        yield _label(marked), parent, marked
 
 
-def _value(node: LexborNode, *, without: str = "") -> str:
-    """``node``'s value: an anchor's address where it has one, otherwise its text.
+def _value(node: LexborNode, *, without: str = "", prefer_href: bool = False) -> str:
+    """``node``'s value: its text, or an anchor's address for a field that holds one.
 
-    The address is preferred because a canonical link is written ``<a href="…">canonical
-    page</a>`` at least as often as it is written out in full, and recording the words "canonical
-    page" as the page's address would be a citation pointing at nothing.
+    ``prefer_href`` is per field and not a property of the markup, which is the correction this
+    signature exists to make. A canonical link is written ``<a href="…">canonical page</a>`` at
+    least as often as it is written out, and recording the words "canonical page" as the page's
+    address would be a citation pointing at nothing — but preferring the ``href`` *everywhere*
+    turns ``<strong>Title:</strong> <a href="…">Retry policy</a>`` into a title that is a URL, and
+    a linked title is not a rare document.
 
     **Read, never dereferenced.** Nothing in this module opens a URL.
     """
-    anchors = node.css("a")
-    for anchor in anchors:
-        href = (anchor.attributes.get("href") or "").strip()
-        if href:
-            return href
+    if prefer_href:
+        for anchor in node.css("a"):
+            href = (anchor.attributes.get("href") or "").strip()
+            if href:
+                return href
     text = _collapse(node.text(deep=True))
     return text[len(without) :].strip().lstrip(":").strip() if without else text
 

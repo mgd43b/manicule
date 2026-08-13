@@ -10,9 +10,11 @@ Fixtures are synthetic — ``https://docs.example.test/``, invented page ids, te
 
 from __future__ import annotations
 
+import io
 import json
 import socket
 from pathlib import Path
+from typing import Any, override
 
 import pytest
 
@@ -427,3 +429,66 @@ def test_every_page_that_produced_nothing_is_reported_with_its_reason(tmp_path: 
     }
     assert "plain.html" in skipped
     assert "data-source-metadata" in skipped["plain.html"]
+
+
+# --- found by self-review ------------------------------------------------------------------------
+
+
+def test_a_linked_title_is_the_title_and_not_the_link() -> None:
+    """The href is preferred for the address field only, never for every field.
+
+    An earlier version preferred an anchor's ``href`` wherever it found one, so a page whose
+    title happened to be a link recorded the URL as its title — a citation captioned with its own
+    address, on every surface.
+    """
+    extracted = extract(
+        page(
+            rows_with(("Title", '<a href="https://docs.example.test/pages/1002">Retry policy</a>'))
+        )
+    )
+
+    assert extracted.source.title == "Retry policy"
+    assert extracted.source.canonical_uri == CANONICAL
+
+
+def test_two_spellings_of_one_field_are_both_named_in_the_refusal() -> None:
+    """ "Source" and "Canonical URL" fill the same field, and a reader needs to be told both.
+
+    Reporting only the second spelling sends them looking for a duplicate row that is not there.
+    """
+    with pytest.raises(UnusablePageError, match="'source' and 'canonical url'"):
+        extract(page(rows_with(("Canonical URL", "https://docs.example.test/pages/9999"))))
+
+
+def test_an_oversized_page_is_never_read_into_memory(tmp_path: Path) -> None:
+    """The limit has to bound the *read*, not measure what came back from an unbounded one.
+
+    The first version called ``read_bytes()`` and checked the length, so the whole file was
+    already resident by the time anything decided it was too big — which is exactly the
+    allocation the limit exists to prevent. This pins the read itself.
+    """
+    target = tmp_path / "huge.html"
+    target.write_bytes(b"<html>" + b"x" * (MAX_HTML_BYTES + 1024))
+    reads: list[int | None] = []
+
+    class Recording(io.BufferedReader):
+        """A real file handle that remembers how much each read asked for."""
+
+        @override
+        def read(self, size: int | None = -1, /) -> bytes:
+            reads.append(size)
+            return super().read(size)
+
+    def recording(self: Path, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        return Recording(io.FileIO(str(self), "rb"))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "open", recording)
+        outcomes = write_sidecars(tmp_path)
+
+    assert not outcomes[0].written
+    assert reads, "the page was never opened, so this asserts nothing about how it was read"
+    assert all(size is not None and 0 <= size <= MAX_HTML_BYTES + 1 for size in reads), (
+        f"an unbounded read reached the file: {reads}"
+    )
