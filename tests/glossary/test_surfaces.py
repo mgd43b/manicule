@@ -29,7 +29,7 @@ system or document.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, override
 
 import pytest
@@ -242,7 +242,6 @@ class _Recorded:
 
     search: SearchResult
     answer: AnswerResultPayload
-    service: ApplicationService = field(repr=False)
 
 
 @pytest.fixture
@@ -259,9 +258,10 @@ async def _service(
     overrides: Mapping[str, object] | None = None,
     retrieval: Retrieving | None = None,
 ) -> ApplicationService:
-    """The real service over the real retriever, or over one the caller has wrapped."""
-    built = await _retriever(store, chunks, cache=cache, router=router, overrides=overrides)
-    return ApplicationService(_Wired(docstore=store, retrieval=retrieval or built))
+    """The real service over the real retriever, or over one the caller has already wrapped."""
+    if retrieval is None:
+        retrieval = await _retriever(store, chunks, cache=cache, router=router, overrides=overrides)
+    return ApplicationService(_Wired(docstore=store, retrieval=retrieval))
 
 
 async def _retriever(
@@ -282,7 +282,7 @@ async def _both(service: ApplicationService, text: str) -> _Recorded:
     """The same question through ``search`` and through ``ask``, on one service."""
     found = await service.search(text, limit=LIMIT)
     answered = await service.ask(text, limit=LIMIT)
-    return _Recorded(search=found, answer=answered, service=service)
+    return _Recorded(search=found, answer=answered)
 
 
 async def _run(

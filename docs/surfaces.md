@@ -363,9 +363,10 @@ It is prose written for a person: parse the boolean, not the sentence.
 
 ### `provenance` → `SourceReference`
 
-On every search hit, every answer citation, every glossary expansion and every document summary
-— and `null` on all four unless the document carries authoritative source metadata ([`storage.md`](storage.md) §4.2.1): a
-locally mirrored page with a sidecar manifest, or any connector supplying the same record.
+On every search hit, every answer citation, every glossary expansion and every document
+summary — and `null` on all four unless the document carries authoritative source metadata
+([`storage.md`](storage.md) §4.2.1): a locally mirrored page with a sidecar manifest, or any
+connector supplying the same record.
 
 `title`, `canonical_uri`, `source_id`, `version`, `modified_at` and `section_path` describe the
 **publication**. `snapshot_path`, `snapshot_checksum` and `retrieved_at` describe **this
