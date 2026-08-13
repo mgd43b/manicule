@@ -24,12 +24,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from manicule.config.profiles import profile_config
-from manicule.config.settings import Settings
+from manicule.config.settings import ConnectorSettings, Settings
 from manicule.container import keys
 from manicule.core.errors import (
     CircularDependencyError,
@@ -162,13 +162,28 @@ class Container:
 
     def _config_for(self, record: ComponentRecord[object]) -> BaseModel:
         raw = self.settings.component_config(record.kind.value, record.name)
-        slot = f"{record.kind.value}.{record.name}"
+        where = f"plugins.config[{f'{record.kind.value}.{record.name}'!r}]"
+        return self._validated_config(record, raw, where)
+
+    def _validated_config(
+        self,
+        record: ComponentRecord[object],
+        raw: Mapping[str, object],
+        where: str,
+    ) -> BaseModel:
+        """``raw``, checked against ``record``'s declared model.
+
+        ``where`` names the setting's location in configuration and appears in every error
+        this raises. It is a parameter rather than derived from ``record`` because one
+        component's settings now arrive from two places — the global
+        ``plugins.config."connector.<type>"`` slot and a named instance's own ``options`` —
+        and an error naming the wrong one sends the author to a file that is not the problem.
+        """
         if record.config_model is None:
             if raw:
                 msg = (
-                    f"plugins.config[{slot!r}] was supplied, but {record.plugin!r} declares no "
-                    f"configuration model for it. Remove the setting, or ask its author to "
-                    f"declare one."
+                    f"{where} was supplied, but {record.plugin!r} declares no configuration "
+                    f"model for it. Remove the setting, or ask its author to declare one."
                 )
                 raise ConfigError(msg)
             return NoConfig()
@@ -180,16 +195,13 @@ class Container:
             unknown = sorted(set(raw) - set(record.config_model.model_fields))
             if unknown:
                 known = ", ".join(sorted(record.config_model.model_fields)) or "none"
-                msg = (
-                    f"invalid plugins.config[{slot!r}]: no such setting(s) "
-                    f"{', '.join(unknown)}. Accepted: {known}"
-                )
+                msg = f"invalid {where}: no such setting(s) {', '.join(unknown)}. Accepted: {known}"
                 raise ConfigError(msg)
         try:
             return record.config_model.model_validate(dict(raw))
         except ValidationError as exc:
             lines = [f"  {'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()]
-            msg = f"invalid plugins.config[{slot!r}]:\n" + "\n".join(lines)
+            msg = f"invalid {where}:\n" + "\n".join(lines)
             raise ConfigError(msg) from exc
 
     # --- subsystem views ------------------------------------------------------------
@@ -284,13 +296,80 @@ class Container:
 
         Sources are named by the user and typed by configuration, so two Confluence spaces
         are two connectors of one type rather than one connector serving two configurations.
+
+        **Cached per instance, not per type**, which is what makes the sentence above true.
+        The ordinary :meth:`get` path keys its cache on the *component* name, and connectors
+        are the one kind where that is the wrong key: configuration lists sources, and two of
+        them naming one implementation are two sources. Sharing the constructed object would
+        give the second instance the first's root, and — because ``Connector.name`` becomes
+        the ``source`` half of ``document_id`` — file its documents under the first's identity.
         """
         configured = self.settings.connectors.get(instance)
         if configured is None:
             known = ", ".join(sorted(self.settings.connectors)) or "none configured"
             msg = f"no connector named {instance!r} in configuration. Configured: {known}"
             raise UnknownComponentError(msg)
-        return await self.aget(keys.CONNECTOR.named(configured.type))
+
+        slot = (ComponentKind.CONNECTOR, instance)
+        existing = self._instances.get(slot)
+        if existing is not None:
+            await self._setup_pending()
+            return cast("Connector", existing)
+
+        record = self.registry.record(keys.CONNECTOR.named(configured.type))
+        built = record.factory(
+            BuildContext(
+                settings=self.settings,
+                config=self._connector_config(record, configured, instance),
+                data_dir=self.settings.data_dir,
+                cache_dir=self.settings.cache_dir,
+                components=self,
+                instance=instance,
+            )
+        )
+        self._instances[slot] = built
+        self._order.append(slot)
+        self._pending.append(slot)
+        await self._setup_pending()
+        return built
+
+    def _connector_config(
+        self,
+        record: ComponentRecord[object],
+        configured: ConnectorSettings,
+        instance: str,
+    ) -> BaseModel:
+        """One instance's settings: its own ``options`` over the type's global defaults.
+
+        Two layers, shallowest first, because both have a job and neither subsumes the other:
+
+        ``plugins.config."connector.<type>"`` supplies defaults for every instance of a type.
+            It is also the *only* place settings could go before named instances carried their
+            own, so reading it keeps every existing single-instance configuration working
+            without its author editing anything.
+
+        ``[connectors.<name>.options]`` is what that source actually is.
+            It wins field by field, because it is the more specific statement. A shallow merge
+            rather than a replacement so that a global ``include_hidden`` stays in force for an
+            instance that only wanted to name its own root — replacing wholesale would silently
+            drop settings the author can still see in the file.
+
+        Validated here rather than at first use, so a misspelled option is a startup error
+        naming the instance rather than a setting that appears to be in force and is not. When
+        both layers carry something the error names both, because the merged value came from
+        both and blaming one would send the author to the wrong line half the time.
+        """
+        globals_ = self.settings.component_config(record.kind.value, record.name)
+        merged: dict[str, object] = {**globals_, **configured.options}
+        slot = f"plugins.config[{f'{record.kind.value}.{record.name}'!r}]"
+        own = f"connectors[{instance!r}].options"
+        if configured.options and globals_:
+            where = f"{own} merged over {slot}"
+        elif configured.options:
+            where = own
+        else:
+            where = slot
+        return self._validated_config(record, merged, where)
 
     # --- lifecycle ------------------------------------------------------------------
 

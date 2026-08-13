@@ -253,7 +253,7 @@ class Document(Base):
     workspace_id:  Mapped[str]  = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"))
     connector_id:  Mapped[str]  = mapped_column(ForeignKey("connectors.id", ondelete="RESTRICT"))
 
-    source:        Mapped[str]  = mapped_column(Text)          # "confluence", "filesystem"
+    source:        Mapped[str]  = mapped_column(Text)          # "team-handbook" — the instance
     source_id:     Mapped[str]  = mapped_column(Text)          # connector-stable identity
     uri:           Mapped[str]  = mapped_column(Text)          # citable location; mutable
     title:         Mapped[str]  = mapped_column(Text)
@@ -295,6 +295,16 @@ The cost is real and small. The same source synced into two workspaces produces 
 two chunk sets and two sets of vectors, which is what isolation *means*. It does not duplicate
 the corpus: retained bytes are content-addressed (§7), so both workspaces reference one blob.
 The partial unique index below is then a second line of defence rather than the mechanism.
+
+**`source` is the configured instance, not the connector type.** `[connectors.team-handbook]`
+stores `source = "team-handbook"`; the `confluence-snapshot` implementation it names is not
+recorded here at all, because two sources are entitled to share one. The column was called
+`source_type` once (§13) and the rename to `source` did not revisit what it holds, which is how
+the two came to be one thing. They cannot be: `source_id` for a mirrored wiki page is the page
+id, so two instances mirroring two deployments both hold a page `1001`, and a `source` naming
+the implementation makes those one row on the index below — the second sync overwriting the
+first with nothing raised. It is the workspace argument to `document_id` one level down, and it
+fails the same way.
 
 **`source_id` is the other half of it.** Document identity must be whatever the
 connector can *promise* is stable, and a URI is not that. A URI is display data — the string
