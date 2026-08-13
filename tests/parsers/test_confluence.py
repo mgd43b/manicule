@@ -32,9 +32,20 @@ from manicule.core.anchors import HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.core.protocols import aclose, parsing, read_blocks
-from manicule.parsers.config import CONFLUENCE_MEDIA_TYPE, ConfluenceConfig
-from manicule.parsers.confluence import ConfluenceStorageParser, dot_parse_warning
-from manicule.parsers.web import recover_cdata
+from manicule.parsers.config import (
+    CONFLUENCE_MEDIA_TYPE,
+    CONFLUENCE_MEDIA_TYPES,
+    WEB_MEDIA_TYPES,
+    ConfluenceConfig,
+    WebConfig,
+)
+from manicule.parsers.confluence import (
+    INTERPRETED_MACROS,
+    ConfluenceStorageParser,
+    dot_parse_warning,
+)
+from manicule.parsers.plugin import PARSERS
+from manicule.parsers.web import WebParser, recover_cdata
 from manicule.testing import assert_round_trip
 from tests.corpus.confluence import ACCOUNT_ID, JQL_QUERY, SCRIPT_PAYLOAD, TOPOLOGY_DOT
 from tests.parsers.support import check_corpus, check_fixture, raw_from, raw_of
@@ -182,6 +193,50 @@ async def test_a_task_state_is_a_property_of_its_task_rather_than_a_block(corpus
     assert not any(block.text.strip() in {"1", "2", "3"} for block in blocks), (
         "nor may a task's database id become a block"
     )
+
+
+async def test_a_rendered_title_survives_beside_a_body_that_must_stay_verbatim() -> None:
+    """A code macro's title is the caption Confluence draws above the block, so it is content.
+
+    It cannot be merged into the block it captions: a code body has to come back character for
+    character, and a caption spliced into the first line is no longer the source the page holds.
+    So it is a block above the block, which is what Confluence draws.
+    """
+    blocks = await _blocks(
+        '<ac:structured-macro ac:name="code">'
+        '<ac:parameter ac:name="language">python</ac:parameter>'
+        '<ac:parameter ac:name="title">rotate.py</ac:parameter>'
+        "<ac:plain-text-body><![CDATA[import os]]></ac:plain-text-body>"
+        "</ac:structured-macro>"
+    )
+
+    assert [(block.kind, block.text) for block in blocks] == [
+        (BlockKind.PROSE, "rotate.py"),
+        (BlockKind.CODE, "import os"),
+    ]
+    assert blocks[0].metadata["caption"] is True
+    assert "python" not in _texts(blocks), "the language is still configuration"
+
+
+async def test_a_macro_nobody_enumerated_keeps_its_title_out_of_the_index() -> None:
+    """The enumeration fails safe, which is the whole reason it is a table.
+
+    ``jira`` renders a title too, but until somebody adds it to :data:`RENDERED_PARAMETERS` the
+    parser does not guess. Being wrong this way costs a caption; being wrong the other way puts a
+    JQL query in a citation, so the default has to be silence.
+    """
+    blocks = await _blocks(
+        '<ac:structured-macro ac:name="jira">'
+        '<ac:parameter ac:name="title">Open orders</ac:parameter>'
+        f'<ac:parameter ac:name="jqlQuery">{JQL_QUERY}</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+
+    assert _texts(blocks) == "[unsupported macro: jira]"
+    assert blocks[0].metadata["parameters"] == ["title", "jqlQuery"], (
+        "both names recorded, so the omission is auditable"
+    )
+    assert "Open orders" not in str(blocks[0].metadata), "and neither value is"
 
 
 async def test_a_panel_title_is_the_one_parameter_that_is_content() -> None:
@@ -695,6 +750,86 @@ async def _is_closed(stream: AsyncIterator[object]) -> bool:
     except StopAsyncIteration:
         return True
     return False
+
+
+# --- the declaration the connector reads -------------------------------------------------------
+
+
+@pytest.mark.parametrize("macro", sorted(INTERPRETED_MACROS))
+async def test_every_macro_declared_interpreted_is_actually_read(macro: str) -> None:
+    """The set the snapshot connector filters its diagnostic by, checked against behaviour.
+
+    Derived from the dispatch tables, so reading it back would prove only that a set equals
+    itself. What matters is the claim it makes to another package — "this one is understood" — and
+    the only honest check is to hand the parser one of each and see that none of them comes back
+    as a placeholder. A macro named here but not really read would make the connector under-report
+    a genuine loss, which is the direction that matters.
+    """
+    blocks = await _blocks(
+        f'<ac:structured-macro ac:name="{macro}">'
+        '<ac:parameter ac:name="">named</ac:parameter>'
+        "<ac:plain-text-body><![CDATA[digraph g { a -> b }]]></ac:plain-text-body>"
+        "<ac:rich-text-body><p>Body prose.</p></ac:rich-text-body>"
+        "</ac:structured-macro>"
+    )
+
+    assert not any(block.metadata.get("unsupported") for block in blocks), (
+        f"{macro} is declared interpreted but came back as a placeholder"
+    )
+
+
+async def test_a_macro_outside_the_declaration_is_a_placeholder() -> None:
+    """The negative control. A declaration everything satisfies distinguishes nothing."""
+    blocks = await _blocks('<ac:structured-macro ac:name="roadmap-planner"/>')
+
+    assert [block.metadata.get("unsupported") for block in blocks] == [True]
+    assert "roadmap-planner" not in INTERPRETED_MACROS
+
+
+# --- the generic HTML parser must not regress --------------------------------------------------
+
+
+async def test_the_html_parser_still_owns_html_and_is_untouched_by_this_one(corpus: Path) -> None:
+    """A new parser for a dialect must not change what the general one does.
+
+    Two ways this could go wrong and neither would raise. The profiled media type could be claimed
+    by both parsers, making routing depend on registration order; or storage-format handling could
+    have been added to ``web.py`` and changed what an ordinary web page produces. The first is
+    asserted against the registry, the second by reading a plain HTML fixture through the HTML
+    parser and requiring the blocks it always produced.
+
+    ``web.py`` is deliberately unmodified by this change. That is easy to assert today and easy to
+    stop being true, which is why it is a test rather than a sentence in a commit message.
+    """
+    claiming = {
+        registration.name
+        for registration in PARSERS
+        if CONFLUENCE_MEDIA_TYPE in registration.media_types
+    }
+    assert claiming == {"confluence"}, "the profiled type routes to exactly one parser"
+    assert CONFLUENCE_MEDIA_TYPE not in WEB_MEDIA_TYPES
+    assert "text/html" not in CONFLUENCE_MEDIA_TYPES, "and the general type is not claimed here"
+
+    web = WebParser(WebConfig())
+    blocks = await read_blocks(web, raw_from(corpus / "web" / "typical.html", "text/html"))
+    assert blocks, "the HTML parser still reads ordinary HTML"
+    assert all(block.text.strip() for block in blocks)
+
+
+async def test_the_html_parser_still_recovers_cdata_for_documents_that_are_not_confluence(
+    corpus: Path,
+) -> None:
+    """#90 is not superseded by this parser, and must not be quietly reverted by it.
+
+    A CDATA section in any HTML document is content its author intended. Storage format is no
+    longer routed through the HTML parser, so the obvious tidy-up is to decide the recovery was a
+    Confluence special case and remove it — it never was, and removing it would silently delete
+    content from every other document carrying one.
+    """
+    recovered = recover_cdata("<p>before</p><![CDATA[kept & <b>escaped</b>]]><p>after</p>")
+    blocks = await read_blocks(WebParser(WebConfig()), raw_of(recovered, "text/html"))
+
+    assert any("kept & <b>escaped</b>" in block.text for block in blocks)
 
 
 # --- the corpus ------------------------------------------------------------------------------

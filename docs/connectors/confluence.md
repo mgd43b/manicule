@@ -631,19 +631,33 @@ A stable-looking placeholder would instead leave two live documents for one page
 ### 12.6 What this connector cannot yet do, and says so
 
 Storage-format XHTML is routed as `text/html` and read by the generic HTML parser — which is
-exactly what the live connector does for Server and Data Center today, so this is no worse than
-shipped behaviour. It is, however, **lossy in a way nothing reported**:
+exactly what the live connector does for Server and Data Center today.
 
-> An HTML parser has no CDATA in that context. Every `<ac:plain-text-body>` — the body of every
-> `code`, `noformat` and `graphviz` macro — reparses as a bogus comment, and its content is
-> **absent from the document**, not merely stripped of its semantics.
+**Both of the losses this paragraph used to describe are now fixed, and the diagnostic that
+described them had to be narrowed twice.** It is recorded here rather than deleted, because the
+shape of the mistake is more instructive than either bug.
 
-So every fetched page is scanned for the macros it contains, and the finding is recorded under
-`metadata["uninterpreted_macros"]`, with a distinct entry when a CDATA body means content was lost
-rather than flattened. A partial parse that reports itself is a usable interim; a partial parse
-that reports success is a corpus that is quietly wrong.
+It first said every `<ac:plain-text-body>` reparsed as a bogus comment so its content was *absent
+from the document*. That was true, and #90 fixed it — `recover_cdata` recovers those sections as
+escaped text. The diagnostic was not narrowed with the fix, so for as long as #90 has been merged
+the connector emitted `!body-content-dropped: … content is absent from this document …` for bodies
+that reached the index intact. A warning that outlives its bug sends somebody looking for content
+that is already there, and teaches them to distrust the ones that are still true.
 
-A storage-format parser that understands `ac:*` and `ri:*` — including Graphviz DOT preserved
-inert, task lists, and unsupported macros as explicit placeholders — is the next piece of work, and
-it is what removes this warning. `parsing.md` §2.4's anchor table gains its row then, with the
-media type that gives it meaning.
+It then said the macros themselves were uninterpreted, listing every macro on the page. That was
+true until the storage-format parser existed. It now reads most of them, so the list is filtered
+against what the parser declares it understands — asked of the parser rather than restated here,
+because two copies of that answer drift the first time a macro is taught to one and not the other.
+
+What remains is narrow and true:
+
+- `metadata["uninterpreted_macros"]` — the macros with **no reader**, which the parser emits an
+  explicit placeholder for. Absent when there are none.
+- `metadata["unrecoverable_macro_body"]` — a CDATA section that is **never closed**, so recovery
+  leaves it as it found it rather than guessing where it ended and its content really is absent.
+  Separate from the first because "we did not understand this" and "we do not have this" are
+  different claims, and only the second is data loss.
+
+The general lesson: **a diagnostic is a claim about behaviour, and it goes stale exactly when the
+behaviour improves** — which is the moment nobody is looking at it. `parsing.md` §2.4 carries the
+anchor row, with the media type that gives it meaning.

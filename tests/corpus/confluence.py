@@ -24,8 +24,8 @@ instructions*: a CDATA body holding a ``<script>`` element, a parameter value ho
 source holding one, an ``onerror`` attribute, a mention carrying an account id that must never
 be indexed, and a Jira macro whose JQL query is configuration rather than text. Plus malformed
 UTF-8, which must be declined rather than indexed as replacement characters, and storage XHTML
-that is simply broken — unclosed macros, a stray parameter outside any macro, and a task list
-that ends mid-task.
+that is simply broken — unclosed macros, a stray parameter outside any macro, an **unterminated
+CDATA section** whose body genuinely cannot be recovered, and a task list that ends mid-task.
 
 Two rules constrain every line here, both from the round-trip contract rather than from taste:
 
@@ -267,6 +267,11 @@ MALFORMED = """<h1>Storage format that is simply broken</h1>
 <ac:structured-macro ac:name="code">
   <ac:parameter ac:name="language">go</ac:parameter>
   <ac:plain-text-body><![CDATA[func main() { println("unterminated macro follows") }]]>
+</ac:structured-macro>
+<ac:structured-macro ac:name="noformat">
+  <ac:plain-text-body><![CDATA[An export truncated inside a CDATA section. It never closes, so
+recovery leaves it exactly as it found it rather than guessing where the author meant it to end,
+and this text genuinely does not reach the index.
 </ac:structured-macro>
 <ac:structured-macro ac:name="info">
   <ac:rich-text-body><p>An info panel whose closing tags never arrive.

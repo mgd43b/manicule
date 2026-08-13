@@ -12,8 +12,10 @@ configuration. Walked as generic HTML it is an unknown element with a text node 
 became a prose block, went into the vector, and was quotable in a citation as though the page
 had said it. The engine name of a diagram, the language of a code block and — the case that
 makes this more than untidy — the **JQL query** of a Jira macro were all indexed as things the
-document says. This parser consumes parameters as configuration and never as text, and the rule
-has exactly one exception, named below.
+document says. This parser consumes parameters as configuration and never as text, with one
+exception drawn as an explicit table rather than applied as a judgement: :data:`RENDERED_PARAMETERS`
+names which macro's which parameter Confluence actually draws on the page. Anything not in it stays
+configuration, so a macro nobody has enumerated fails in the harmless direction.
 
 **Nothing here is rendered, executed or evaluated.** A storage-format body is authored by anyone
 with write access to the page, so every string in it is untrusted input: macro bodies, DOT
@@ -57,6 +59,7 @@ from manicule.parsers.web import recover_cdata
 
 __all__ = [
     "CONFLUENCE_MEDIA_TYPES",
+    "INTERPRETED_MACROS",
     "ConfluenceConfig",
     "ConfluenceStorageParser",
     "close_empty_elements",
@@ -87,13 +90,31 @@ The whole of the defect this parser was written for. ``ac:parameter`` holds a ma
 which is a *property of* a task rather than a line of the page — it appeared in the index as its
 own one-word block reading "complete"."""
 
-RENDERED_PARAMETERS = frozenset({"title"})
-"""The one exception to "a parameter is never text", and the reason it is not a slippery slope.
+RENDERED_PARAMETERS: Mapping[str, tuple[str, ...]] = {
+    "code": ("title",),
+    "noformat": ("title",),
+    "expand": ("title",),
+    "info": ("title",),
+    "note": ("title",),
+    "panel": ("title",),
+    "tip": ("title",),
+    "warning": ("title",),
+}
+"""The exception to "a parameter is never text": which macro's which parameter a reader sees.
 
-A panel's ``title`` is drawn on the page in the panel's own header: a reader sees it, quotes it,
-and searches for it. It is content that happens to be *carried* as a parameter. ``language``,
-``engine`` and ``jqlQuery`` are not rendered anywhere — they change what the macro does. The
-test is whether Confluence shows the value to a reader, not where it sits in the markup."""
+A panel's ``title`` is drawn in the panel's own header, an ``expand``'s is the clickable label,
+and a ``code`` macro's is the caption above the block. A reader sees each of them, quotes them and
+searches for them, so they are content that happens to be *carried* as a parameter. ``language``,
+``engine`` and ``jqlQuery`` are rendered nowhere — they change what the macro does.
+
+**An enumeration rather than a rule applied per macro, and it fails safe.** "Is this rendered?"
+answered by judgement gets answered differently by the next person, and it fails in the direction
+that puts a JQL query or a user's name in a citation. A table fails the other way: a macro nobody
+has added an entry for keeps its parameters out of the index, which is the harmless mistake.
+
+Writing it out found two silent discards that a global rule had hidden — ``expand`` and ``code``
+both render a title, and both were being dropped while their bodies were kept. That is the value
+of the enumeration: it makes each answer visible enough to be wrong in review."""
 
 _PANEL_SEVERITIES: Mapping[str, str] = {
     "info": "info",
@@ -127,6 +148,22 @@ _TOC_MACROS = frozenset({"toc", "children", "pagetree"})
 
 They are unsupported in the sense that matters — there is nothing to preserve, because the page
 does not contain the text they would produce — so they get a placeholder and no body."""
+
+INTERPRETED_MACROS: frozenset[str] = (
+    _CODE_MACROS | GRAPHVIZ_MACROS | frozenset(_PANEL_SEVERITIES) | frozenset({_ANCHOR_MACRO})
+)
+"""Every macro name this parser reads as something other than an opaque placeholder.
+
+**Derived from the dispatch tables rather than written out beside them**, so the declaration
+cannot come to disagree with the behaviour. One caller needs it and is in another package: the
+snapshot connector records which of a page's macros will not be understood, and a second, hand-kept
+list of that answer would go stale the first time a macro was taught here and not there — which is
+the same reasoning that makes the connector import its media type from the registration module
+rather than spelling it again.
+
+``tests/parsers/test_confluence.py`` checks the claim by parsing one of each rather than by reading
+this expression, because a set that agrees with itself proves nothing."""
+
 
 _INLINE_TAGS = frozenset(
     {
@@ -423,11 +460,25 @@ def _macro(node: LexborNode, name: str, config: ConfluenceConfig) -> Iterator[_F
     yield from _unsupported_macro(node, name, config)
 
 
+def _caption(node: LexborNode, name: str) -> Iterator[_Found]:
+    """A verbatim-bodied macro's rendered title, as its own block above the body.
+
+    Merged into the body it captions it would corrupt it: a code or diagram body has to come back
+    character for character, and a caption spliced into the first line is no longer the source the
+    page holds. Confluence draws it as a bar above the block, so a block above the block is what
+    it is.
+    """
+    caption = _rendered_text(node, name)
+    if caption.strip():
+        yield _Found(kind=BlockKind.PROSE, text=caption, metadata={"macro": name, "caption": True})
+
+
 def _code_macro(node: LexborNode, name: str) -> Iterator[_Found]:
     """A ``code`` or ``noformat`` macro: the body verbatim, with the language it declares."""
     body = _plain_text_body(node)
     if not body.strip():
         return
+    yield from _caption(node, name)
     language = _parameter(node, "language")
     yield _Found(
         kind=BlockKind.CODE,
@@ -451,6 +502,7 @@ def _graphviz_macro(node: LexborNode, name: str) -> Iterator[_Found]:
     body = _plain_text_body(node)
     if not body.strip():
         return
+    yield from _caption(node, name)
     metadata: Metadata = {
         "macro": name,
         "engine": _parameter(node, "engine") or _DEFAULT_DOT_ENGINE,
@@ -528,7 +580,7 @@ def _panel_macro(node: LexborNode, name: str, config: ConfluenceConfig) -> Itera
     that matters, because the inner one is usually the more urgent.
     """
     prose, structured = _body_blocks(node, config)
-    text = "\n".join(part for part in (_rendered_text(node), *prose) if part.strip())
+    text = "\n".join(part for part in (_rendered_text(node, name), *prose) if part.strip())
     if text.strip():
         yield _Found(
             kind=BlockKind.PANEL,
@@ -560,7 +612,7 @@ def _unsupported_macro(node: LexborNode, name: str, config: ConfluenceConfig) ->
     """
     generated = name in _TOC_MACROS
     prose, structured = ([], []) if generated else _body_blocks(node, config)
-    body_text = "\n".join(part for part in (_rendered_text(node), *prose) if part.strip())
+    body_text = "\n".join(part for part in (_rendered_text(node, name), *prose) if part.strip())
     plain = "" if generated else _plain_text_body(node)
     if config.keep_unsupported_macros:
         metadata: Metadata = {"macro": name, "unsupported": True}
@@ -669,9 +721,13 @@ def _body_blocks(node: LexborNode, config: ConfluenceConfig) -> tuple[list[str],
     return prose, structured
 
 
-def _rendered_text(node: LexborNode) -> str:
-    """The parameters Confluence draws on the page, which are content rather than settings."""
-    values = [_parameter(node, name) for name in sorted(RENDERED_PARAMETERS)]
+def _rendered_text(node: LexborNode, macro: str) -> str:
+    """The parameters Confluence draws on the page for *this* macro, which are content.
+
+    Keyed by macro rather than by parameter name, so a ``title`` on a macro nobody has enumerated
+    stays configuration. That is the safe direction to be wrong in.
+    """
+    values = [_parameter(node, name) for name in RENDERED_PARAMETERS.get(macro, ())]
     return "\n".join(value for value in values if value.strip())
 
 
