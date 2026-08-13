@@ -769,10 +769,18 @@ moves when a re-parse of the same retained bytes commits. `status` is deliberate
 it: a re-parse takes a document through `parsing` and back to `indexed`, so a revision carrying
 it would fail against the re-parse's own earlier write.
 
-**Who is guarded.** Only an operation that derived its content from something already stored,
-which today means `document reindex` and `document reindex --stale`. **A connector sync is
-never guarded**, and that is not an omission: it is holding the newest bytes the source has, so
-there is nothing it could be losing to. A sync always wins.
+**Who is guarded.** Every operation that derives its content from something already stored and
+has a command to reach it: `document reindex <id>` and `document reindex --stale`, both of which
+run through `reindex.re_parse`. **A connector sync is never guarded**, and that is not an
+omission: it is holding the newest bytes the source has, so there is nothing it could be losing
+to. A sync always wins.
+
+`reindex.repair` and `reindex.re_embed` — rungs 1 and 2 of §10's ladder — are **not** guarded.
+Both would need it: each reads a document, derives from it and writes back, which is the shape
+this section is about. Neither is reachable, because neither has a caller anywhere in `src/`;
+they are library verbs with tests and no command. Stated rather than left implicit, because the
+day one of them gets a surface is the day it needs an expected revision, and the omission would
+otherwise have to be rediscovered.
 
 **Where the check is.** In the write, not before it. The comparison and the replacement are one
 statement in one transaction — a conditional `UPDATE` whose `WHERE` clause is the expected

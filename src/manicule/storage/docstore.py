@@ -55,6 +55,19 @@ _INDEX_STATE_ID = 1
 """``index_state`` holds one row, because a data directory holds one index."""
 
 
+def _cross_workspace(document_id: str, holder: str, asked: str) -> str:
+    """Why an id that resolves to a row is still not this workspace's to touch.
+
+    One wording for the two writes that refuse it, so a caller cannot learn the message from the
+    guarded write and fail to recognise it from the unguarded one.
+    """
+    return (
+        f"document id {document_id!r} belongs to workspace {holder!r}, not {asked!r}. Ids from "
+        f"manicule.core.ids.document_id include the workspace, so this id was built some other "
+        f"way."
+    )
+
+
 LISTABLE_FILTER_FIELDS: Final = frozenset(
     {
         "workspace_ids",
@@ -179,6 +192,16 @@ class SqliteDocStore(
                 ),
             )
             row = await session.get(models.Document, document.id)
+            if row is not None and row.workspace_id != self._workspace_id:
+                # Before the row is read out, and not only on the path that writes. The
+                # ``UPDATE`` above is workspace-scoped, so an id belonging to another tenant
+                # misses it — and reporting that as an ordinary supersession would answer a
+                # caller in this workspace with another workspace's document attached. It is the
+                # same programming error :meth:`upsert_document` has always refused, and it gets
+                # the same refusal rather than a plausible-looking result.
+                raise CrossWorkspaceCollisionError(
+                    _cross_workspace(document.id, row.workspace_id, self._workspace_id)
+                )
             stored = None if row is None else to_document(row)
             if matched.rowcount != 1:
                 return Commit(committed=False, stored=stored)
@@ -199,13 +222,9 @@ class SqliteDocStore(
         """
         row = await session.get(models.Document, document.id)
         if row is not None and row.workspace_id != self._workspace_id:
-            msg = (
-                f"document id {document.id!r} belongs to workspace "
-                f"{row.workspace_id!r}, not {self._workspace_id!r}. Ids from "
-                f"manicule.core.ids.document_id include the workspace, so this id was "
-                f"built some other way."
+            raise CrossWorkspaceCollisionError(
+                _cross_workspace(document.id, row.workspace_id, self._workspace_id)
             )
-            raise CrossWorkspaceCollisionError(msg)
         if row is None:
             row = models.Document(id=document.id, workspace_id=self._workspace_id)
             session.add(row)

@@ -687,6 +687,43 @@ async def test_the_stores_guard_refuses_on_a_corrected_record_over_bytes_that_ne
     assert miss.stored.provenance == corrected.provenance
 
 
+async def test_the_guarded_write_refuses_another_workspaces_id_rather_than_reporting_a_miss(
+    engine: AsyncEngine,
+) -> None:
+    """A tenancy refusal, checked on the *guarded* write rather than only on the plain one.
+
+    The conditional ``UPDATE`` is workspace-scoped, so an id belonging to another tenant matches
+    nothing and comes back through the ordinary "somebody got there first" path — which is the
+    trap: that path returns the row it found so that a caller can report what overtook it, and
+    the row it found here belongs to somebody else. A caller in this workspace would be handed
+    another workspace's title, URI and metadata, in a result that looks entirely routine.
+
+    ``upsert_document`` has always refused this outright, and a guarded write that answered
+    differently would make the refusal a property of which method was called.
+    """
+    from manicule.core.errors import ManiculeError  # noqa: PLC0415
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from manicule.storage.scoped import CrossWorkspaceCollisionError  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    theirs = SqliteDocStore(engine, workspace_id="them")
+    await theirs.ensure_workspace()
+    document = await theirs.upsert_document(
+        make_document(workspace_id="them", title="their private title")
+    )
+    ours = SqliteDocStore(engine, workspace_id="us")
+    await ours.ensure_workspace()
+
+    with pytest.raises(CrossWorkspaceCollisionError) as refused:
+        await ours.commit_document(document, expected=document.revision)
+
+    assert isinstance(refused.value, ManiculeError)
+    assert "their private title" not in str(refused.value), (
+        "the refusal names the workspaces and the id, not what the other tenant's row holds"
+    )
+    assert "them" in str(refused.value)
+
+
 async def test_the_blob_store_speaks_the_retention_vocabulary(
     data_dir: Path,
     engine: AsyncEngine,
