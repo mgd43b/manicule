@@ -40,6 +40,7 @@ from manicule.retrieval.confidence import score_confidence
 from manicule.retrieval.expansion import (
     GLOSSARY_SCORE_KEY,
     ExpansionPolicy,
+    definitional_frame,
     mark_authoritative,
     merge_rankings,
     resolve_expansion,
@@ -255,7 +256,12 @@ class Retriever:
         return RetrievalResult(
             context=context,
             candidates=candidates,
-            confidence=self._confidence(context, identity, exhausted_budget=exhausted),
+            confidence=self._confidence(
+                context,
+                identity,
+                exhausted_budget=exhausted,
+                explicit_definition=cites_a_definition(query, expansion, context),
+            ),
             trace=RetrievalTrace(
                 route=routing.route,
                 pipeline=identity,
@@ -505,7 +511,13 @@ class Retriever:
             context=context,
             candidates=candidates,
             confidence=self._confidence(
-                context, entry.identity, exhausted_budget=entry.exhausted_budget
+                context,
+                entry.identity,
+                exhausted_budget=entry.exhausted_budget,
+                # The expansion is recomputed on a hit rather than cached, so the classification
+                # is computed from the same three facts a miss would use and a cached answer
+                # cannot report the contradiction a fresh one no longer can.
+                explicit_definition=cites_a_definition(query, expansion, context),
             ),
             trace=RetrievalTrace(
                 route=Route.RETRIEVE,
@@ -524,7 +536,12 @@ class Retriever:
         )
 
     def _confidence(
-        self, context: Context, identity: PipelineIdentity, *, exhausted_budget: bool
+        self,
+        context: Context,
+        identity: PipelineIdentity,
+        *,
+        exhausted_budget: bool,
+        explicit_definition: bool = False,
     ) -> Confidence:
         """Score the run, passing the legs this pipeline *declares*.
 
@@ -544,7 +561,43 @@ class Retriever:
             legs=self._legs,
             rerank_stage=self._rerank_stage,
             exhausted_budget=exhausted_budget,
+            explicit_definition=explicit_definition,
         )
+
+
+def cites_a_definition(query: Query, expansion: QueryExpansion, context: Context) -> bool:
+    """Whether this result answers a question about a term by showing that term's definition.
+
+    Three conditions, and dropping any one of them turns a classification into a boost.
+
+    1. **A glossary entry fired for the term**, which already means the entry cleared the
+       policy's confidence floor and that no second definition of the term was in scope —
+       :func:`~manicule.retrieval.expansion.resolve_expansion` reports disagreement as a conflict
+       and produces no match for it. So a contested term never reaches this, and conflicts stay
+       visible as conflicts instead of one of them being quietly promoted to "explicit".
+
+    2. **The question asked what the term means.** Tested with
+       :func:`~manicule.retrieval.expansion.definitional_frame` rather than by reading
+       :class:`~manicule.core.glossary.MatchReason`, and that is a correction rather than a
+       preference: the reasons are tried in order and ``exact_case`` wins first, so ``What is
+       NOW?`` is recorded as ``exact_case`` and a check for ``definitional_frame`` in the reason
+       would miss the central example of the feature. It also excludes the case that matters for
+       the specification's requirement 7 — ``restart NOW before the window`` fires ``unambiguous``
+       on a term that is not a common word, and a passage defining it is not an answer to that.
+
+    3. **The defining passage is actually in the context.** Promotion can fail: the chunk may be
+       outside the query's ``kinds`` or ``langs``, or assembly may have dropped it to fit the
+       window. "We found a definition" and "we are showing you a definition" are different
+       claims, and only the second may contradict "nothing here resembles your question", because
+       only the second puts a counter-example in front of the reader.
+    """
+    if not expansion.matches:
+        return False
+    shown = {candidate.chunk.id for candidate in context.passages}
+    return any(
+        match.entry.chunk_id in shown and definitional_frame(query.text, match.surface)
+        for match in expansion.matches
+    )
 
 
 def _reworded(query: Query, text: str) -> Query:
@@ -642,4 +695,5 @@ __all__ = [
     "RetrievalResult",
     "Retriever",
     "build_retriever",
+    "cites_a_definition",
 ]

@@ -100,7 +100,79 @@ GLOSSARY_WORDS: Final[frozenset[str]] = frozenset(
 )
 
 MAX_EXPANSION_WORDS: Final = 10
-"""Longer than this and it is a sentence about the term, not the term written out."""
+"""Longer than this and it is a sentence about the term, not the term written out.
+
+Applied to whichever reading of the right-hand side :func:`core_expansion` settles on, so a
+definition trailed by a description is measured on its expansion rather than on the description
+— which is what stopped ``NOVA — Network Operations Visibility Assistant, a service used to
+correlate operational signals across systems`` from being recorded at all.
+"""
+
+_CLAUSE_OPENINGS: Final[frozenset[str]] = frozenset(
+    {
+        # Subordinators. A phrase they introduce is a circumstance in which something is true,
+        # never the thing itself: ``when enabled, the process starts automatically`` says when,
+        # and no acronym is named ``when``.
+        "after",
+        "although",
+        "because",
+        "before",
+        "if",
+        "once",
+        "since",
+        "though",
+        "unless",
+        "until",
+        "when",
+        "whenever",
+        "whether",
+        "while",
+        # Subjects. A pronoun or demonstrative in this position is pointing back at the term
+        # rather than writing it out — ``this paragraph describes an operational consideration``
+        # is prose *about* the entry above it.
+        "he",
+        "it",
+        "she",
+        "that",
+        "these",
+        "they",
+        "this",
+        "those",
+        "we",
+        "you",
+        # Existential ``there``. ``there is no supported route`` is a statement, not a name.
+        "there",
+    }
+)
+"""Words that begin a clause, so a phrase beginning with one is not a term written out.
+
+**The rule that refuses prose on a page that admits everything else.** A spaced hyphen on a page
+titled "Glossary" scores exactly ``MIN_DEFINITION_CONFIDENCE`` — ``_FORM_WEIGHT[EM_DASH]`` plus
+:data:`GLOSSARY_CONTEXT_EVIDENCE`, 0.45 + 0.15 — so *every* upper-case token followed by a dash
+is admitted there on the strength of the page alone. Measured on ``origin/main`` before this
+rule existed, both ``NOTE - this paragraph describes an operational consideration, not a term``
+and ``API - when enabled, the process starts automatically`` were recorded as definitions: nine
+words and six, so :data:`MAX_EXPANSION_WORDS` never fired on either and nothing else looked.
+
+An expansion is a **noun phrase** — the term written out — and none of these can begin one.
+Deliberately not a verb list as well: "the phrase has a finite verb in it" is the same question
+a parser answers and a word list only pretends to, and a longer list that is wrong in the middle
+is worse than a short one that is right at the edges. This one is checked at the *first* word
+only, which is where a clause declares itself.
+
+It never overrides initials evidence. If a phrase's initials spell the term then the two strings
+agree about what the term is, which is stronger than anything the first word can say.
+"""
+
+_DESCRIPTION_BOUNDARY_RE: Final = re.compile(r"[,;]|(?<=[.!?])\s")
+"""Where a description may begin: a comma, a semicolon, or the end of a sentence.
+
+Each match yields a *candidate* prefix and nothing more. Truncating at the first comma
+unconditionally is the obvious version of this and it is wrong in both directions — it would cut
+``Retention And Vault Index Node Export, Cold`` in half, and it would hand
+``when enabled, the process starts automatically`` a two-word prefix that looks far more like an
+expansion than the sentence it came from. :func:`core_expansion` still has to be convinced.
+"""
 
 _UPPERCASE_SHARE: Final = 0.6
 """How much of a term's alphabetic content must be upper case.
@@ -200,6 +272,59 @@ def _usable_expansion(expansion: str) -> str:
     if not any(character.isalpha() for character in trimmed):
         return ""
     return trimmed
+
+
+def opens_a_clause(expansion: str) -> bool:
+    """Whether ``expansion`` begins with a word that can only begin a clause.
+
+    Read as: does this read as a *statement about* the term rather than as the term written out.
+    First word only — that is where a clause declares itself, and a later ``when`` is ordinary
+    inside a noun phrase.
+    """
+    first = next((word for word in re.split(r"[^\w'’]+", expansion) if word), "")  # noqa: RUF001
+    return first.casefold() in _CLAUSE_OPENINGS
+
+
+def core_expansion(acronym: str, expansion: str) -> str:
+    """The term written out, with any trailing description removed. Empty if there is none.
+
+    **The boundary decision is conditional on evidence, never applied first and scored
+    afterwards**, and that ordering is the whole of this function. Cutting at the first comma and
+    then scoring the prefix inverts the two rules that were doing the work: measured on
+    ``origin/main``, ``API - when enabled, the process starts automatically`` truncates to the
+    two-word ``when enabled``, which is *shorter* and therefore *more* expansion-shaped by every
+    length rule in this module. Truncation removes the very thing that was refusing it.
+
+    So a prefix has to earn the cut, and only one signal is strong enough to award it:
+
+    1. **Initials, whole then trimmed.** If the entire right-hand side spells the term it is kept
+       entire — ``ATLAS — Automated Transfer Ledger And Scheduler`` has no description to strip.
+       Otherwise each description boundary is tried in turn and the first prefix whose initials
+       spell the term wins. ``NOVA — Network Operations Visibility Assistant, a service used to
+       correlate operational signals across systems`` is thirteen words and refused outright
+       today; its four-word prefix spells ``NOVA``, and that agreement between the two strings is
+       what says where the term ends and the prose begins. Nothing else in this module knows.
+
+    2. **No initials, no cut.** The right-hand side is then taken whole or not at all, and it is
+       refused if it opens a clause. Keeping it whole is the conservative reading: without
+       initials there is no evidence about *where* an expansion ends, and a guess would store a
+       phrase the source never wrote. ``HTTP — HyperText Transfer Protocol, the protocol of the
+       web`` therefore keeps its description, which is what it did before this function existed;
+       :data:`MAX_EXPANSION_WORDS` still bounds it.
+
+    The clause test is applied only in the second case. Initials agreement is a property of two
+    strings and outranks a judgement made from one word of one of them.
+    """
+    whole = _usable_expansion(expansion)
+    if whole and initials_match(acronym, whole):
+        return whole
+    for boundary in _DESCRIPTION_BOUNDARY_RE.finditer(expansion):
+        prefix = _usable_expansion(expansion[: boundary.start()])
+        if prefix and initials_match(acronym, prefix):
+            return prefix
+    if whole and not opens_a_clause(whole):
+        return whole
+    return ""
 
 
 def score_definition(
@@ -363,7 +488,7 @@ def detect_in_chunk(chunk: Chunk, *, glossary_context: bool = False) -> list[Glo
         if not acronym_shaped(candidate.display):
             continue
         acronym = normalise_acronym(candidate.display)
-        expansion = _usable_expansion(candidate.expansion)
+        expansion = core_expansion(acronym, candidate.expansion)
         if not acronym or not expansion or normalise_acronym(expansion) == acronym:
             continue
         confidence = score_definition(acronym, expansion, candidate.form, glossary_context=context)
@@ -423,9 +548,11 @@ __all__ = [
     "MAX_EXPANSION_WORDS",
     "MIN_DEFINITION_CONFIDENCE",
     "acronym_shaped",
+    "core_expansion",
     "detect_entries",
     "detect_in_chunk",
     "initials_match",
     "initials_of",
+    "opens_a_clause",
     "score_definition",
 ]

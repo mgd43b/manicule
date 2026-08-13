@@ -35,6 +35,17 @@ The distractors deliberately **do not** contain the literal expansion. An earlie
 every passage the phrase "network operations workspace", which made the expanded query rank the
 glossary *last* — a fixture that would have proved expansion harmful, for a reason no corpus
 has.
+
+**What the page carries beyond bare definitions**, added for the description-boundary work and
+each earning its place by being a category the extraction rules can get wrong:
+
+* :data:`DESCRIBED_ENTRY` — a definition trailed by nine words of prose, which the detector
+  refused wholesale before it could tell an expansion from a description.
+* :data:`STYLIZED_ENTRY` — the same shape with a stylized spelling, so display preservation and
+  description-trimming are proved *together* rather than on two fixtures each built for one.
+* :data:`PROSE_ON_THE_GLOSSARY_PAGE` — three lines that look like definitions and are not, on
+  the page where the confidence arithmetic admits them. Two of the three were recorded as real
+  entries before this fixture existed.
 """
 
 from __future__ import annotations
@@ -45,6 +56,46 @@ GLOSSARY_TITLE: Final = "Glossary of terms"
 
 ACRONYM: Final = "NOW"
 EXPANSION: Final = "Network Operations Workspace"
+
+DESCRIBED_ACRONYM: Final = "NOVA"
+DESCRIBED_EXPANSION: Final = "Network Operations Visibility Assistant"
+DESCRIBED_ENTRY: Final = (
+    f"{DESCRIBED_ACRONYM} — {DESCRIBED_EXPANSION}, a service used to correlate operational "
+    "signals across systems."
+)
+"""A definition trailed by a description: four words of term, nine of prose.
+
+Recorded as no entry at all before ``core_expansion`` existed — thirteen words is over
+``MAX_EXPANSION_WORDS``, so the whole line was refused and nothing downstream could help.
+"""
+
+STYLIZED_DISPLAY: Final = "ReLAY"
+STYLIZED_ACRONYM: Final = "RELAY"
+STYLIZED_EXPANSION: Final = "Retention Export Ledger And Yield"
+STYLIZED_ENTRY: Final = (
+    f"{STYLIZED_DISPLAY} — {STYLIZED_EXPANSION}, the nightly export path between zones."
+)
+"""A term whose spelling is stylized, carrying a description as well.
+
+Two requirements on one line on purpose. A fixture proving stylized display on a bare definition
+and a second proving description-trimming on an ordinary term would leave the case where both
+apply untested, and that is the case a real glossary is full of.
+"""
+
+PROSE_ON_THE_GLOSSARY_PAGE: Final[tuple[str, ...]] = (
+    "NOTE - this paragraph describes an operational consideration, not a term.",
+    "Today - the system is operating normally.",
+    "API - when enabled, the process starts automatically.",
+)
+"""Prose that looks like a definition, **sitting on the glossary page itself**.
+
+Placed here rather than in a separate document because that placement is the whole test. On an
+ordinary page a spaced hyphen scores 0.45 against a 0.60 threshold and every line here is
+refused by arithmetic that has nothing to do with this feature. On a page titled "Glossary of
+terms" the context evidence adds the missing 0.15, the total is exactly the threshold, and the
+scoring gate admits all three — so this is the only placement where refusing them proves
+anything. Do not move them.
+"""
 
 GLOSSARY_ENTRIES: Final[tuple[str, ...]] = (
     "ATLAS — Automated Transfer Ledger And Scheduler",
@@ -60,10 +111,12 @@ GLOSSARY_ENTRIES: Final[tuple[str, ...]] = (
     "MISTRAL — Metrics Ingest Stream Transfer And Load",
     "NIMBUS — Node Inventory Metrics Bucket Update Service",
     f"{ACRONYM} — {EXPANSION}",
+    DESCRIBED_ENTRY,
     "OBSIDIAN — Observation Buffer Storage Index And Node",
     "PUMICE — Pipeline Update Metrics Index Collection Engine",
     "QUARTZ — Query Uptime And Retention Tracking Zone",
     "RAVINE — Retention And Vault Index Node Export",
+    STYLIZED_ENTRY,
     "SIERRA — Storage Index Export Retention Relay Agent",
     "TUNDRA — Tooling Under Node Data Retention Agent",
     "UMBER — Update Metrics Buffer And Export Relay",
@@ -73,7 +126,12 @@ GLOSSARY_ENTRIES: Final[tuple[str, ...]] = (
     "YARROW — Yield And Retention Reporting Observation Window",
     "ZEPHYR — Zone Export Pipeline Health Yield Runner",
 )
-"""Twenty-five terms on one page. The count is the dilution, and the dilution is the point."""
+"""Twenty-seven terms on one page. The count is the dilution, and the dilution is the point.
+
+Twenty-five of them are bare ``TERM — Expansion`` lines. The other two carry descriptions, and
+they are interleaved among the rest rather than appended, so nothing downstream can be right by
+position.
+"""
 
 ORDINARY: Final[tuple[str, ...]] = (
     "The nightly reconciliation job is running now, so the report will lag by one cycle. "
@@ -219,11 +277,28 @@ QUERY_PUNCTUATED: Final = "What is N.O.W.?"
 QUERY_FULL: Final = f"What is the {EXPANSION}?"
 QUERY_ORDINARY_USE: Final = "should I restart the daemon now or wait for the window"
 QUERY_ABSENT: Final = "What is ZZQX?"
+QUERY_DESCRIBED: Final = f"What is {DESCRIBED_ACRONYM}?"
+QUERY_STYLIZED: Final = f"What is {STYLIZED_DISPLAY}?"
+QUERY_STYLIZED_LOWER: Final = f"what does {STYLIZED_ACRONYM.lower()} stand for?"
+QUERY_UNRELATED: Final = "how do I renew a passport at the post office"
+"""A question about nothing in this corpus, phrased as a real question rather than as a
+nonsense token — ``QUERY_ABSENT`` already covers a term that does not exist, and the two fail
+differently: one has no lexical match anywhere, the other is ordinary English about a subject
+the corpus never mentions."""
 
 
 def glossary_page() -> str:
-    """The glossary as one chunk, which is how 512/64 chunking delivers it."""
-    return f"{GLOSSARY_TITLE}\n\n" + "\n".join(GLOSSARY_ENTRIES)
+    """The glossary as one chunk, which is how 512/64 chunking delivers it.
+
+    The prose lines sit inside it, which is what makes them a real test of detection rather than
+    of arithmetic — see :data:`PROSE_ON_THE_GLOSSARY_PAGE`.
+    """
+    return (
+        f"{GLOSSARY_TITLE}\n\n"
+        + "\n".join(GLOSSARY_ENTRIES)
+        + "\n"
+        + "\n".join(PROSE_ON_THE_GLOSSARY_PAGE)
+    )
 
 
 def passages() -> tuple[str, ...]:
@@ -233,18 +308,30 @@ def passages() -> tuple[str, ...]:
 
 __all__ = [
     "ACRONYM",
+    "DESCRIBED_ACRONYM",
+    "DESCRIBED_ENTRY",
+    "DESCRIBED_EXPANSION",
     "EXPANSION",
     "GLOSSARY_ENTRIES",
     "GLOSSARY_TITLE",
     "IN_USE",
     "ORDINARY",
+    "PROSE_ON_THE_GLOSSARY_PAGE",
     "QUERY_ABSENT",
     "QUERY_ACRONYM",
+    "QUERY_DESCRIBED",
     "QUERY_FULL",
     "QUERY_LOWER",
     "QUERY_MIXED_CASE",
     "QUERY_ORDINARY_USE",
     "QUERY_PUNCTUATED",
+    "QUERY_STYLIZED",
+    "QUERY_STYLIZED_LOWER",
+    "QUERY_UNRELATED",
+    "STYLIZED_ACRONYM",
+    "STYLIZED_DISPLAY",
+    "STYLIZED_ENTRY",
+    "STYLIZED_EXPANSION",
     "glossary_page",
     "passages",
 ]

@@ -243,6 +243,18 @@ class Confidence(BaseModel):
         default="",
         description="Why the band is what it is, when the number alone would mislead.",
     )
+    explicit_definition: bool = Field(
+        default=False,
+        description="Whether the context contains a glossary entry that explicitly defines a "
+        "term this query asked the meaning of. A **classification, not a quantity**: it does "
+        "not enter :attr:`score` and does not move :attr:`band`. A detector's confidence that "
+        "some text is a definition and a cosine between a question and a passage are different "
+        "measurements on different scales, and adding one to the other would be the "
+        "substitution this module refuses everywhere else. What it does is make one sentence "
+        "unsayable — a result citing an exact definition can no longer also report that nothing "
+        "in the corpus resembles the question, because that sentence is false in this state "
+        "whatever the similarity happens to be.",
+    )
     pipeline: PipelineIdentity = Field(default_factory=PipelineIdentity)
 
 

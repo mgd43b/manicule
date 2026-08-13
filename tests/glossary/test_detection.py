@@ -102,6 +102,109 @@ def test_a_parenthetical_listing_two_short_forms_records_the_second_as_an_alias(
     assert entries[0].keys == ("NOW", "NETOPS")
 
 
+# --- a definition followed by a description ---------------------------------------------------
+
+DESCRIBED = (
+    "NOVA - Network Operations Visibility Assistant, a service used to correlate operational "
+    "signals across systems."
+)
+"""Thirteen words on the right of the dash, of which four are the term.
+
+Refused outright before ``core_expansion`` existed: :data:`MAX_EXPANSION_WORDS` is 10, so the
+whole line produced no entry, and query expansion and promotion had nothing to work with.
+"""
+
+
+@pytest.mark.parametrize(
+    ("boundary", "text"),
+    [
+        ("comma", DESCRIBED),
+        (
+            "semicolon",
+            "NOVA — Network Operations Visibility Assistant; it correlates operational signals.",
+        ),
+        (
+            "sentence",
+            "NOVA: Network Operations Visibility Assistant. It correlates operational signals "
+            "across every connected system.",
+        ),
+    ],
+)
+def test_a_description_after_a_boundary_is_dropped(boundary: str, text: str) -> None:
+    """The three boundaries the specification names, one case each.
+
+    Each right-hand side is a different length and a different form; what they share is that the
+    words before the boundary spell ``NOVA`` and the words after them do not.
+    """
+    entries = detect_in_chunk(chunk(text))
+
+    assert [entry.expansion for entry in entries] == ["Network Operations Visibility Assistant"], (
+        f"the {boundary} boundary did not separate the expansion from the description"
+    )
+
+
+def test_a_description_after_a_sentence_boundary_is_dropped() -> None:
+    """The case that used to be asserted as a refusal, now asserted as an extraction.
+
+    Named separately from the parametrised sweep because it is the fixture whose expectation
+    this change *inverts*, and a reviewer looking for that should find it by name.
+    """
+    entries = detect_in_chunk(
+        chunk(f"NOW — {EXPANSION}. It replaced three spreadsheets and a mailbox")
+    )
+
+    assert [entry.expansion for entry in entries] == [EXPANSION]
+
+
+def test_the_whole_passage_survives_for_citation_after_the_expansion_is_trimmed() -> None:
+    """Trimming the expansion must not trim the evidence.
+
+    The stored expansion is four words; the passage the entry cites is the whole line including
+    the description. An entry whose citation resolved to the trimmed phrase would be pointing at
+    text no document contains — which is the one thing a citation may never do.
+    """
+    passage = chunk(DESCRIBED)
+
+    entry = detect_in_chunk(passage)[0]
+
+    assert entry.expansion == "Network Operations Visibility Assistant"
+    assert entry.chunk_id == passage.id
+    assert passage.text == DESCRIBED, "the chunk itself is untouched"
+    assert "a service used to correlate operational signals" in passage.text
+
+
+def test_a_stylized_spelling_is_displayed_and_a_normalised_key_is_stored() -> None:
+    """Requirement 4, at the point of detection.
+
+    ``ReLAY`` is written with deliberate internal case. What is *shown* is the source's own
+    spelling; what is *looked up* is the normalised key, and a reader who types either finds it.
+    The same line also carries a description, so the two features are proved to compose rather
+    than each being proved on a fixture built for it alone.
+    """
+    entries = detect_in_chunk(
+        chunk("ReLAY — Retention Export Ledger And Yield, the nightly export path.")
+    )
+
+    assert [entry.acronym for entry in entries] == ["RELAY"]
+    assert entries[0].display == "ReLAY"
+    assert entries[0].expansion == "Retention Export Ledger And Yield"
+
+
+def test_a_right_hand_side_with_no_initials_evidence_is_kept_whole() -> None:
+    """The conservative half of the boundary rule, stated as a test rather than left implicit.
+
+    ``HyperText Transfer Protocol`` does not spell ``HTTP``, so nothing here knows where the
+    expansion ends, and guessing at the comma would store a phrase on no evidence at all. The
+    whole right-hand side is kept — exactly what happened before this change — and the length
+    rule still bounds it. This is a limitation being pinned down, not a behaviour being praised.
+    """
+    entries = detect_in_chunk(chunk("HTTP — HyperText Transfer Protocol, used by every browser"))
+
+    assert [entry.expansion for entry in entries] == [
+        "HyperText Transfer Protocol, used by every browser"
+    ]
+
+
 # --- refusing prose -------------------------------------------------------------------------
 
 
@@ -140,14 +243,77 @@ def test_a_glossary_page_does_not_admit_the_prose_inside_it() -> None:
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        "NOTE - this paragraph describes an operational consideration, not a term.",
+        "Today - the system is operating normally.",
+        "API - when enabled, the process starts automatically.",
+    ],
+    ids=["note", "today", "api"],
+)
+def test_prose_on_a_glossary_page_is_still_refused(text: str) -> None:
+    """The negatives, **on a page that says it is a glossary**, where the margin is exactly zero.
+
+    *Do not move these off a glossary page.* ``chunk()`` puts them on one, and that placement is
+    the entire test. Off a glossary page a spaced hyphen scores ``_FORM_WEIGHT[EM_DASH]`` = 0.45
+    against a 0.60 threshold, so every line here would be refused by arithmetic that has nothing
+    to do with this change and the test would pass whether the change was right or wrong. On a
+    glossary page :data:`GLOSSARY_CONTEXT_EVIDENCE` adds the missing 0.15, the total is exactly
+    0.60, and the scoring gate admits all three. ``test_the_negatives_are_admitted_by_score``
+    below asserts that margin directly, so this docstring cannot quietly go out of date.
+
+    Two of the three were **live false positives** before this change rather than hypothetical
+    ones. Measured on ``origin/main``: ``NOTE`` produced the entry ``this paragraph describes an
+    operational consideration, not a term`` (nine words) and ``API`` produced ``when enabled, the
+    process starts automatically`` (six). Both sit under :data:`MAX_EXPANSION_WORDS`, so no length
+    rule ever looked at them. What refuses them now is that neither opens a noun phrase.
+
+    ``Today`` is the weakest of the three and is refused by :func:`acronym_shaped` — one of five
+    letters upper — as it was before. It is kept because the specification names it, and it must
+    not be read as evidence for the rule the other two exercise.
+    """
+    assert detect_in_chunk(chunk(text)) == []
+
+
+def test_the_negatives_are_admitted_by_score_and_refused_by_shape() -> None:
+    """Why the fixtures above have to sit on a glossary page, asserted rather than described.
+
+    If this ever fails, the negatives above have stopped being load-bearing: their refusal would
+    have moved into the confidence arithmetic, where it would hold for every dash form on the
+    page rather than for prose specifically.
+    """
+    score = score_definition(
+        "API",
+        "when enabled, the process starts automatically",
+        DefinitionForm.EM_DASH,
+        glossary_context=True,
+    )
+
+    assert score == pytest.approx(0.45 + GLOSSARY_CONTEXT_EVIDENCE)
+    assert score >= MIN_DEFINITION_CONFIDENCE, (
+        "the scoring gate admits this line; only the expansion rules refuse it"
+    )
+
+
+@pytest.mark.parametrize(
     "expansion",
     [
         "a workspace where the network operations team keeps every runbook it owns today",
-        "Network Operations Workspace. It replaced three spreadsheets",
+        "a shared place for runbooks. It replaced three spreadsheets",
     ],
     ids=["too-long", "more-than-one-sentence"],
 )
 def test_an_expansion_that_is_really_a_sentence_is_refused(expansion: str) -> None:
+    """Neither reading of the right-hand side spells the term, so neither is taken.
+
+    The second case used to read ``Network Operations Workspace. It replaced three
+    spreadsheets`` and asserted a refusal. It is now *admitted*, trimmed to the expansion, and
+    that is the required behaviour rather than a regression — a sentence boundary is one of the
+    description boundaries a definition is allowed to be followed by, and the initials of the
+    first sentence spell ``NOW``. ``test_a_description_after_a_sentence_boundary_is_dropped``
+    covers it. What survives here is the case the guard was always really about: prose with
+    **nothing** saying where a term ends is refused whole, at every boundary in it.
+    """
     assert detect_in_chunk(chunk(f"NOW — {expansion}")) == []
 
 

@@ -20,8 +20,9 @@ import pytest
 
 from manicule.core.content import BlockKind
 from manicule.core.glossary import MatchReason
-from manicule.core.retrieval import Query
+from manicule.core.retrieval import ConfidenceBand, Query
 from manicule.retrieval.cache import L1QueryCache
+from manicule.retrieval.confidence import DEFINITION_CITED, NOTHING_RESEMBLES
 from manicule.retrieval.expansion import GLOSSARY_SCORE_KEY, ExpansionPolicy
 from tests.evaluation.fakes import BagOfWordsEmbedder
 from tests.glossary import corpus, system
@@ -201,6 +202,128 @@ async def test_two_terms_defined_in_one_chunk_promote_one_passage(
     assert result.trace.glossary.promoted == 1, "one passage moved, so one promotion"
     assert result.trace.glossary.promoted_from_store <= 1
     assert [passage.chunk.id for passage in result.context.passages].count(definition) == 1
+
+
+# --- definitions carrying descriptions, and stylized spellings ---------------------------------
+
+
+async def test_a_definition_with_a_description_is_retrieved_by_its_core_expansion(
+    store: SqliteDocStore, indexed: list[Chunk]
+) -> None:
+    """The motivating example, end to end: ``What is NOVA?``.
+
+    Before extraction learned where a description begins, this question had nothing to find.
+    The line is thirteen words on the right of the dash, so no entry was written, so no alias
+    could fire, so no passage was promoted — the failure is upstream of retrieval entirely and
+    no amount of ranking work reaches it.
+
+    What is asserted is the *expansion*, not merely that something was retrieved: an entry
+    carrying the whole right-hand side would also promote the right passage, and would then
+    splice nine words of prose into the second query and show the reader a description where a
+    term belongs.
+    """
+    retriever = await _with_glossary(store, indexed)
+
+    result = await retriever.retrieve(_ask(corpus.QUERY_DESCRIBED))
+
+    assert result.expansion is not None
+    assert result.expansion.matches, f"no glossary entry fired for {corpus.QUERY_DESCRIBED!r}"
+    match = result.expansion.matches[0]
+    assert match.entry.acronym == corpus.DESCRIBED_ACRONYM
+    assert match.entry.expansion == corpus.DESCRIBED_EXPANSION
+    assert system.rank_of(result.context.passages, match.entry.chunk_id) == 1
+
+
+async def test_the_promoted_passage_still_carries_the_description_it_was_trimmed_of(
+    store: SqliteDocStore, indexed: list[Chunk]
+) -> None:
+    """Requirement 1's second half: the entry is trimmed, the evidence is not.
+
+    The reader is shown four words as the expansion and can follow the citation to a passage
+    that states the whole thing. Trimming the *passage* to match the entry would be the version
+    of this feature that quietly discards corpus text, and the citation would then resolve to
+    something the document does not contain.
+    """
+    retriever = await _with_glossary(store, indexed)
+
+    result = await retriever.retrieve(_ask(corpus.QUERY_DESCRIBED))
+
+    assert result.expansion is not None
+    match = result.expansion.matches[0]
+    passage = next(
+        candidate
+        for candidate in result.context.passages
+        if candidate.chunk.id == match.entry.chunk_id
+    )
+    assert corpus.DESCRIBED_ENTRY in passage.chunk.text
+    assert "a service used to correlate operational signals" in passage.chunk.text
+    assert match.entry.expansion not in {corpus.DESCRIBED_ENTRY, passage.chunk.text}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [corpus.QUERY_STYLIZED, corpus.QUERY_STYLIZED_LOWER],
+    ids=["as-written", "lower-case"],
+)
+async def test_a_stylized_term_resolves_through_its_normalised_key(
+    store: SqliteDocStore, indexed: list[Chunk], text: str
+) -> None:
+    """Requirement 4, end to end and through storage rather than in the detector alone.
+
+    Both spellings reach the same entry: the key is normalised, so ``relay`` finds it, and the
+    display is not, so what comes back is the document's own ``ReLAY``. The lower-case form also
+    proves the key survived a database round trip — a store that normalised on write and read
+    back differently would fail here and nowhere else.
+    """
+    retriever = await _with_glossary(store, indexed)
+
+    result = await retriever.retrieve(_ask(text))
+
+    assert result.expansion is not None
+    assert result.expansion.matches, f"no entry fired for {text!r}"
+    entry = result.expansion.matches[0].entry
+    assert entry.acronym == corpus.STYLIZED_ACRONYM
+    assert entry.display == corpus.STYLIZED_DISPLAY
+    assert entry.expansion == corpus.STYLIZED_EXPANSION
+    assert system.rank_of(result.context.passages, entry.chunk_id) == 1
+
+
+@pytest.mark.parametrize(
+    "term",
+    ["NOTE", "TODAY", "API"],
+    ids=["note", "today", "api"],
+)
+async def test_prose_on_the_glossary_page_produces_no_entry_to_promote(
+    store: SqliteDocStore, indexed: list[Chunk], term: str
+) -> None:
+    """The negatives through the real ingest path, on the real glossary page.
+
+    ``system.index`` calls the shipped ``detect_entries``, so what this asserts is that nothing
+    was ever written — not that something written was later filtered out. A term with no entry
+    cannot be expanded, cannot be promoted and cannot be classified as an explicit definition,
+    so one refusal at ingest closes all three doors at once.
+
+    See ``corpus.PROSE_ON_THE_GLOSSARY_PAGE``: this is only a test because those lines sit on a
+    page whose title supplies the evidence that carries them to exactly the threshold.
+    """
+    entries = await store.glossary_entries(indexed[0].document_id)
+
+    assert term not in {entry.acronym for entry in entries}
+
+
+async def test_the_glossary_page_still_yields_the_definitions_it_states(
+    store: SqliteDocStore, indexed: list[Chunk]
+) -> None:
+    """The other side of the refusal, so a rule that rejected everything could not pass.
+
+    ``test_prose_on_the_glossary_page_produces_no_entry_to_promote`` is satisfied by a detector
+    that writes nothing at all. This is the assertion that stops that from being a green suite.
+    """
+    entries = await store.glossary_entries(indexed[0].document_id)
+
+    found = {entry.acronym for entry in entries}
+    assert len(entries) == len(corpus.GLOSSARY_ENTRIES)
+    assert {corpus.ACRONYM, corpus.DESCRIBED_ACRONYM, corpus.STYLIZED_ACRONYM} <= found
 
 
 # --- the queries that must not change ----------------------------------------------------------
@@ -439,6 +562,105 @@ async def test_the_expanded_ranking_is_interleaved_rather_than_appended(
         "only the promoted definition is new, so the expanded search reached the context "
         "through nothing but promotion"
     )
+
+
+async def test_a_cited_definition_is_not_also_reported_as_nothing_resembling(
+    store: SqliteDocStore, indexed: list[Chunk], definition: str
+) -> None:
+    """The contradiction, gone — and **nothing numeric moved to remove it**.
+
+    The baseline reports band ``none`` with "nothing in this corpus resembles your question"
+    while the definition of the queried term is one of the passages the corpus holds. With the
+    glossary wired the definition is at rank 1 and the sentence is replaced by one that is true.
+
+    Every assertion about the *number* is an equality with the baseline, deliberately. A test
+    that allowed the score to rise would pass just as happily for an unconditional boost, which
+    is the fix this feature is forbidden to make: a detection confidence is not a cosine. What
+    changed is the classification and the sentence, and the band stays ``none`` because the
+    dense evidence really is at the corpus's noise level.
+    """
+    baseline = await _baseline(store, indexed)
+    retriever = await _with_glossary(store, indexed)
+
+    before = await baseline.retrieve(_ask(corpus.QUERY_ACRONYM))
+    after = await retriever.retrieve(_ask(corpus.QUERY_ACRONYM))
+
+    assert before.confidence is not None
+    assert after.confidence is not None
+    assert before.confidence.reason == NOTHING_RESEMBLES, (
+        "the baseline no longer reports the contradiction, so this fixture proves nothing"
+    )
+    assert not before.confidence.explicit_definition
+
+    assert system.rank_of(after.context.passages, definition) == 1
+    assert after.confidence.explicit_definition
+    assert after.confidence.reason == DEFINITION_CITED
+    assert after.confidence.reason != NOTHING_RESEMBLES
+
+    assert after.confidence.score == pytest.approx(before.confidence.score)
+    assert after.confidence.band is before.confidence.band
+    assert after.confidence.components == before.confidence.components
+    assert after.confidence.ceiling == before.confidence.ceiling
+
+
+@pytest.mark.parametrize(
+    "text",
+    [corpus.QUERY_UNRELATED, corpus.QUERY_ABSENT, corpus.QUERY_ORDINARY_USE],
+    ids=["unrelated", "nonexistent-acronym", "ordinary-use"],
+)
+async def test_a_question_with_no_definition_behind_it_still_reports_no_evidence(
+    store: SqliteDocStore, indexed: list[Chunk], text: str
+) -> None:
+    """Requirement 7, and the half of the classification that has to stay shut.
+
+    ``ordinary-use`` is the one that decides whether the rule is a rule. It names ``now``, which
+    the glossary defines, and the corpus is full of passages containing the token — so a
+    classification keyed on "a term was mentioned" or on lexical overlap would fire here. It is
+    keyed on the query asking what the term *means*, and "should I restart the daemon now" does
+    not ask that.
+    """
+    retriever = await _with_glossary(store, indexed)
+
+    result = await retriever.retrieve(_ask(text))
+
+    assert result.confidence is not None
+    assert not result.confidence.explicit_definition
+    assert result.confidence.band is ConfidenceBand.NONE
+    assert result.confidence.reason == NOTHING_RESEMBLES
+
+
+async def test_a_mention_of_the_term_is_not_enough_to_claim_a_definition(
+    store: SqliteDocStore, indexed: list[Chunk], definition: str
+) -> None:
+    """The narrowest version of the rule, with every other condition satisfied.
+
+    ``raise a ticket in NOVA today`` names a defined term, expansion fires, the defining passage
+    is fetched, and it lands at **rank 1** — the reader is looking at a glossary entry for the
+    token they typed. The classification still does not fire, because the remaining condition is
+    the one that is false: the question is an instruction, not a request for a meaning.
+
+    **It fires on ``exact_case``, which is the same ``MatchReason`` that ``What is NOVA?``
+    records.** So the reason a match was admitted cannot distinguish these two queries, and a
+    classification reading it would be true for both. That is why
+    :func:`~manicule.retrieval.retriever.cites_a_definition` asks ``definitional_frame`` directly
+    rather than inspecting the recorded reason — this assertion is what pins that down.
+
+    This is requirement 7 at its sharpest. "We are showing you a definition" and "you asked what
+    this means" are separate facts, and a classification keyed on the first alone would fire on
+    every query that merely mentions a defined term.
+    """
+    retriever = await _with_glossary(store, indexed)
+
+    result = await retriever.retrieve(_ask(f"raise a ticket in {corpus.DESCRIBED_ACRONYM} today"))
+
+    assert result.expansion is not None
+    assert result.expansion.fired, "the fixture must actually promote, or it tests nothing"
+    assert result.expansion.matches[0].reason is MatchReason.EXACT_CASE
+    assert system.rank_of(result.context.passages, definition) == 1, (
+        "the defining passage must be in front of the reader, or the rule is untested"
+    )
+    assert result.confidence is not None
+    assert not result.confidence.explicit_definition
 
 
 async def test_promotion_never_lowers_the_reported_confidence(
