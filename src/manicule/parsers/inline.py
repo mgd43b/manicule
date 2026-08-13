@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from typing import Final, override
 
 __all__ = [
+    "DEFINITION_BODY_MARKER",
     "LINE_BREAK",
     "InlinePart",
     "LineBreak",
@@ -54,6 +55,7 @@ __all__ = [
     "collapse_lines",
     "collapse_run",
     "collapse_segments",
+    "item_prefix",
 ]
 
 
@@ -68,6 +70,47 @@ class LineBreak:
 
 LINE_BREAK: Final = LineBreak()
 """What an inline break contributes to the run of text around it."""
+
+DEFINITION_BODY_MARKER: Final = ": "
+"""What a ``<dd>`` is written with, and it is what makes a definition list readable.
+
+**A definition list carries a relationship, and rendering every part with the same bullet threw
+it away.** ``<dt>NOW</dt><dd>Network Operations Workspace</dd>`` came out as two indistinguishable
+``- `` lines, so a reader could not tell which was the term and neither could
+:func:`~manicule.ingest.glossary.detect_in_chunk` — measured at 0 of 4 definitions found on a page
+whose glossary was written this way. The relationship is the *only* thing a ``<dl>`` adds over a
+``<ul>``, and it is what did not survive.
+
+``TERM`` on its own line with ``: definition`` beneath it is the convention Markdown definition
+lists already use, so it is what a reader of the chunk sees and what a citation quotes. It is also,
+not by coincidence, exactly the shape :data:`~manicule.ingest.glossary._DEFINITION_MARKER_RE` has
+always read: that form was implemented and unit-tested and could never fire, because no parser
+produced the only rendering it accepts.
+"""
+
+
+def item_prefix(tag: str, marker: str) -> str:
+    """What precedes a list item's own text: a bullet, a number, or a definition-list marker.
+
+    **Here rather than in either parser, because two copies of it would have to agree.** The
+    storage and HTML parsers keep their own list *flattening* on purpose — one of them must not
+    read an ``ac:parameter`` out of a nested macro — but the prefix is the same question with the
+    same answer for both, and storage format is XHTML. A ``<dl>`` that rendered one way through a
+    Confluence connector and another through a web crawl would reach the corpus as two glossaries
+    behaving differently depending on how the page was fetched.
+
+    A ``<dt>`` gets no marker: it is the term, and a bullet in front of it would be structure
+    competing with the ``: `` that says what the next line is. A second ``<dd>`` under one ``<dt>``
+    is rendered like the first, and detection reads only the first because the line above the
+    second is itself a ``: `` line, which is not a term — the conservative outcome, and choosing
+    between two definitions is the judgement that feature is forbidden to make.
+    """
+    if tag == "dt":
+        return ""
+    if tag == "dd":
+        return DEFINITION_BODY_MARKER
+    return f"{marker} "
+
 
 type InlinePart = str | LineBreak
 """One piece of a run: source text, or a break the source drew between two pieces of it."""

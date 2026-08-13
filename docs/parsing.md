@@ -1265,7 +1265,9 @@ of from spending a chunk's budget on whitespace.
 
 **A break becomes a space wherever a newline is already the record separator.** A table renders
 one row per line and `text == "\n".join(rows)` (§4.4); a list renders one item per line and
-glossary detection reads the marker at the start of each; a task list renders one task per line;
+glossary detection reads the marker at the start of each — `- ` or `1. ` for a bulleted or
+ordered item, and for a definition list the term bare above `: definition`, which is the one
+rendering `ingest.glossary._DEFINITION_MARKER_RE` accepts; a task list renders one task per line;
 a heading's text becomes a path element and a breadcrumb. A newline in any of those would not
 read as a line break at all — it would read as another row, another item, another heading — so
 the break is rendered as the strongest separator that rendering has, which is a space. That is

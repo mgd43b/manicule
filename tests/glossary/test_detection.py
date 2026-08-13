@@ -503,16 +503,38 @@ async def test_a_definition_list_is_detected_through_the_real_parser(media_type:
     assert {entry.form for entry in entries} == {DefinitionForm.DEFINITION_LIST}
 
 
-def test_a_second_definition_under_one_term_is_not_silently_chosen_between() -> None:
+async def test_a_second_definition_under_one_term_is_not_silently_chosen_between() -> None:
     """Two ``<dd>`` under one ``<dt>`` record the first and refuse the second.
+
+    Through the parser rather than from a hand-written string, for the reason this whole change
+    exists: a unit test fed the shape it wants proves the detector reads that shape, and says
+    nothing about whether a ``<dl>`` produces it. That gap is what let ``DEFINITION_LIST`` pass
+    its tests for as long as it did while firing on nothing.
 
     The line above the second ``: `` is itself a ``: `` line, which is not a term, so the shape
     gate refuses it. That is the conservative outcome and it is asserted rather than left to
     chance: choosing which of two definitions a term has is the judgement this feature is
     forbidden to make.
     """
-    entries = detect_in_chunk(chunk("NOW\n: Network Operations Workspace\n: Nightly Ops Watch"))
+    raw = raw_of(
+        "<dl><dt>NOW</dt><dd>Network Operations Workspace</dd>"
+        "<dd>Nightly Operations Watch</dd></dl>",
+        CONFLUENCE_MEDIA_TYPE,
+        uri="glossary",
+        title="Platform glossary",
+    )
+    parser = ConfluenceStorageParser(ConfluenceConfig())
+    blocks = [block async for block in parser.parse(raw)]
+    chunker = make_chunker()
+    await chunker.setup()
+    chunks = chunker.chunk(document_for(raw, title="Platform glossary"), blocks)
 
+    assert blocks[0].text.splitlines() == [
+        "NOW",
+        ": Network Operations Workspace",
+        ": Nightly Operations Watch",
+    ]
+    entries = detect_entries(chunks, title="Platform glossary")
     assert [(entry.acronym, entry.expansion) for entry in entries] == [
         ("NOW", "Network Operations Workspace")
     ]
