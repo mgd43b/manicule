@@ -511,7 +511,7 @@ def has_a_refused_opening(expansion: str) -> bool:
     return first.casefold() in _NEVER_OPENS_AN_EXPANSION
 
 
-def _phrase_after(captured: str, acronym: str, display: str = "") -> str:
+def _phrase_after(captured: str, acronym: str, *, display: str = "") -> str:
     """Which words of ``captured`` are the term, rather than the description following it.
 
     **The mirror image of :func:`_phrase_before`, and deliberately the same idea rather than a
@@ -576,7 +576,7 @@ def core_expansion(acronym: str, expansion: str, *, display: str = "") -> str:
     whole = _usable_expansion(expansion)
     if whole and initials_match(acronym, whole, display=display):
         return whole
-    trimmed = _phrase_after(expansion, acronym, display)
+    trimmed = _phrase_after(expansion, acronym, display=display)
     if trimmed:
         return trimmed
     if whole and not has_a_refused_opening(whole):

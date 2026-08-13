@@ -1644,8 +1644,8 @@ SORT  — SecOps Reliability Toolkit, a package that operations teams install on
 SaFeR — Service Failure Reporter, a component that groups related failures together.
 ```
 
-`SecOps` is one word and four letters of the term; `SaFeR` looks up as `SAFER` and its expansion
-supplies three initials, not five. Two comparison forms are added, and **because initials
+`SecOps` is one word and two of the term's four letters; `SaFeR` looks up as `SAFER` and its
+expansion supplies three initials, not five. Two comparison forms are added, and **because initials
 agreement is the sole authority to cut a prefix off a right-hand side, each one widens the
 authority to truncate** — which is the dangerous direction, since `when enabled` is shorter than
 the sentence it came from and therefore looks *more* like an expansion. So each is bounded:
@@ -1687,9 +1687,10 @@ built independently — the term's spellings from the term, the expansion's init
 token boundaries — and matching is set intersection over whole strings. Nothing scans an expansion
 looking for a term's letters, and nothing can, because the function that reads the expansion is
 never told what term it is about to be compared against. A test asserting that some unrelated
-string fails to match would prove none of this; `test_a_free_subsequence_scan_would_match_and_this
-_matcher_refuses` writes the scanning matcher out, shows it accepting `Storage Operations Roster`
-for `SORT` and `Service for Escalation Routing` for `SFR`, and shows this one refusing both.
+string fails to match would prove none of this, because a scanning matcher refuses those too. So
+`test_a_free_subsequence_scan_would_match_and_this_matcher_refuses` writes the scanning matcher
+out, shows it accepting `Storage Operations Roster` for `SORT` and `Service for Escalation Routing`
+for `SFR`, and shows this one refusing both.
 
 `HTTP — HyperText Transfer Protocol, used by every browser` was this section's example of the
 conservative fallback and is now cut correctly, which is why the paragraph above uses `CPU`. That

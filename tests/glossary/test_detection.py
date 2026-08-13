@@ -304,6 +304,44 @@ def test_a_stylized_spelling_supplies_a_skeleton_its_key_does_not() -> None:
 
 
 @pytest.mark.parametrize(
+    ("text", "acronym", "display", "expansion"),
+    [
+        (
+            "The Service Failure Reporter (SaFeR) groups related failures.",
+            "SAFER",
+            "SaFeR",
+            "Service Failure Reporter",
+        ),
+        (
+            "The SecOps Reliability Toolkit (SORT) is installed on every host.",
+            "SORT",
+            "SORT",
+            "SecOps Reliability Toolkit",
+        ),
+    ],
+    ids=["skeleton", "components"],
+)
+def test_a_parenthetical_resolves_its_left_boundary_by_the_same_two_forms(
+    text: str, acronym: str, display: str, expansion: str
+) -> None:
+    """``_phrase_before`` is the same rule from the other end, so it gets the same two forms.
+
+    Written because the change threads the display spelling through *both* boundary functions and
+    only one of them had a fixture. The parenthetical form is where it matters most, and not for
+    the boundary: ``_phrase_before`` drops the leading article anyway, so the phrase is the same
+    either way. What the agreement buys is :data:`INITIALS_EVIDENCE` — a parenthetical is worth
+    0.35 and a glossary page 0.15, which is 0.50 against a 0.60 threshold, so **without the
+    skeleton this line produces no entry at all**. Measured by removing it: the stylized case goes
+    from one entry to zero.
+    """
+    entries = detect_in_chunk(chunk(text))
+
+    assert [(entry.acronym, entry.display, entry.expansion) for entry in entries] == [
+        (acronym, display, expansion)
+    ]
+
+
+@pytest.mark.parametrize(
     ("display", "skeleton"),
     [
         ("SaFeR", "SFR"),

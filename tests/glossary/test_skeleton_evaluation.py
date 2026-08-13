@@ -14,6 +14,9 @@ loosely enough not to pin an arithmetic accident — and the docstrings carry th
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
@@ -417,10 +420,6 @@ def test_detection_needs_no_embedding_backend_and_repeats_exactly() -> None:
     by the document. It does not — the sets are intersected and never iterated into output — and
     this is what says so, run under the suite's random-order plugin on every seed it picks.
     """
-    import json  # noqa: PLC0415 - a subprocess check, needed nowhere else in this module
-    import subprocess  # noqa: PLC0415
-    import sys  # noqa: PLC0415
-
     probe = (
         "import json, sys; import manicule.ingest.glossary; "
         "print(json.dumps(sorted(name for name in sys.modules "
