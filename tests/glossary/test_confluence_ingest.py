@@ -243,7 +243,10 @@ async def test_the_macro_body_reaches_the_chunker_as_more_than_one_paragraph(
         "the definition opens a line of the chunk that carries it; under the defect the whole "
         "macro body was one line and only its first definition did"
     )
-    assert TERM not in body.text.split("\n")[0], "and it is not merely the first thing there"
+    assert TERM not in body.text.splitlines()[0], (
+        "and it opens a line somewhere in the middle rather than being the chunk's first line, "
+        "which is the position the defect left the first definition in and no other"
+    )
 
 
 # --- the entry the ingest produced -------------------------------------------------------------
@@ -284,11 +287,17 @@ async def test_the_adjacent_definitions_are_not_swallowed_into_the_expansion(
 async def test_the_defining_chunk_is_kept_as_the_entry_provenance(
     entry: GlossaryEntry, indexed: Sequence[Chunk]
 ) -> None:
-    """An expansion whose source cannot be opened is an assertion rather than a citation."""
+    """An expansion whose source cannot be opened is an assertion rather than a citation.
+
+    The location is asserted against the cited chunk's own breadcrumb rather than against the
+    fixture's headings written out again. A second copy would keep passing if the entry started
+    naming some *other* chunk's section, which is the failure worth catching.
+    """
     cited = next(chunk for chunk in indexed if chunk.id == entry.chunk_id)
 
     assert EXPANSION in cited.text, "the cited chunk states the definition it is cited for"
-    assert entry.location == "Signal routing > Shorthand held in a container"
+    assert entry.location == " > ".join(cited.heading_path)
+    assert entry.document_id == cited.document_id
 
 
 # --- retrieval over what the ingest produced ---------------------------------------------------

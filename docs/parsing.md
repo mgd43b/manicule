@@ -1133,14 +1133,15 @@ went 1 → 2 for it.
 **What that bump costs an existing index**, since a version is only worth having if somebody
 can price it:
 
-- **Affected**: Confluence storage documents containing a panel or an unsupported macro whose
-  rich-text body holds more than one prose block, or one prose block plus a rendered title.
-  Nothing else — a page with no macros, or whose macros carry a single paragraph, produces
-  byte-identical text and its `parse_fp` still matches.
-- **Re-parse**: every Confluence document, because `parse_fp` is per document and records the
-  parser's version rather than the document's content — the selector cannot tell in advance
-  which of them contain a multi-paragraph macro. This reads retained bytes and touches no
-  network.
+- **Text that changes**: Confluence storage documents containing a panel or an unsupported
+  macro whose rich-text body holds more than one prose block, or one prose block plus a
+  rendered title. Nothing else — a page with no macros, or whose macros carry a single
+  paragraph, re-parses to byte-identical text.
+- **Re-parse**: every Confluence document, including the ones whose text does not move. A
+  `parse_fp` records the parser's version and not the document's content, so after the bump it
+  matches for none of them — which is the point. Nothing can tell in advance which pages hold a
+  multi-paragraph macro without parsing them, and a fingerprint that could would be a hash of
+  the output rather than of the rules. This reads retained bytes and touches no network.
 - **Re-embed**: only the chunks that actually changed. Chunk ids are content-derived and
   re-parse reconciles against the stored set, so an unaffected document re-parses to the same
   ids and keeps its vectors; an affected one re-embeds the chunks whose text moved.

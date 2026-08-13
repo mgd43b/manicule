@@ -400,7 +400,7 @@ inside it are ordinary prose that needed no interpretation at all.</p>
   </ac:rich-text-body>
 </ac:structured-macro>
 """
-"""Consecutive paragraphs inside a rich-text macro, and the four things that must not follow.
+"""Consecutive paragraphs inside a rich-text macro, and what must not follow from separating them.
 
 The container is unsupported on purpose: an ``expand`` or a ``panel`` would exercise the same
 assembly, and a macro nobody has enumerated exercises it *and* the rule that such a macro's
