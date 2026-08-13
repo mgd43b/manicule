@@ -58,6 +58,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 
     from manicule.app.ports import Backend, Conversing
+    from manicule.connectors.enriched import EnrichedProfile
+    from manicule.connectors.filesystem import FilesystemConnector
     from manicule.core.content import Chunk, Document
     from manicule.core.organisation import Collection, Tag
     from manicule.embedding.artifacts import WeightsPlan
@@ -705,8 +707,14 @@ class ApplicationService:
             )
         return r.ConnectorList(count=len(summaries), connectors=tuple(summaries))
 
-    async def connector_sidecar(self, root: Path | str, *, force: bool = False) -> r.SidecarReport:
-        """Write a sidecar manifest beside every enriched HTML page under ``root``.
+    async def connector_sidecar(
+        self,
+        root: Path | str | None = None,
+        *,
+        source: str = "",
+        force: bool = False,
+    ) -> r.SidecarReport:
+        """Write a sidecar manifest beside every enriched HTML page under a root.
 
         Enriched standalone HTML — one file per page, carrying the page's own id, space, version,
         modification time and canonical address in a machine-identifiable section — is indexed
@@ -720,27 +728,67 @@ class ApplicationService:
         path derived from where the walk found the file, so nothing read out of a document can
         influence where anything is written.
 
+        **``source`` is what makes a custom exporter convertible at all.** Without it the run uses
+        the built-in default profile, which is correct for a corpus that matches the default and
+        is *predictably useless* for one that does not: every page reports ``no_profile`` and no
+        manifest is written, while the configured sync over the same directory adapts all of them.
+        Naming a configured source resolves the root and the profiles from the connector the sync
+        would run — :meth:`~manicule.app.ports.Ingesting.connector`, the same object, from the
+        same container — so the two cannot hold different readings of one profile.
+
         Args:
-            root: The directory of pages. Walked without following symlinks.
+            root: The directory of pages. Walked without following symlinks. With ``source``
+                it is optional and bounded: omitted it means the connector's whole root, and
+                supplied it must resolve **inside** that root, so a configured source cannot be
+                used as a handle for converting an unrelated directory.
+            source: A configured connector *instance* name — the key in ``[connectors.<name>]``,
+                never a connector type. It must exist, be enabled, be a filesystem source, and
+                declare at least one enriched profile.
             force: Replace manifests that already exist. Off by default, because one already
                 there was most likely written by hand or by another tool.
 
         Raises:
-            UnknownEntityError: ``root`` is not a directory.
+            UnknownEntityError: ``root`` is not a directory, or no connector is configured
+                under ``source``.
+            PolicyError: ``source`` is configured ``enabled = false``. The same refusal
+                :meth:`connector_sync` gives, for the same reason: a switch an operator set and
+                checked has to mean something on every surface that reads it, and converting a
+                disabled source's corpus is preparing an ingest that will not run.
+            ConfigError: ``source`` is not a filesystem connector, declares no enriched profile,
+                or was named alongside a root outside its own tree. Also raised when neither a
+                root nor a source is given, because there is then no directory to walk.
         """
+        from manicule.connectors.enriched import DEFAULT_PROFILE  # noqa: PLC0415
         from manicule.connectors.enriched_html import write_sidecars  # noqa: PLC0415
 
-        path = _local(root)
+        profiles: tuple[EnrichedProfile, ...] = (DEFAULT_PROFILE,)
+        if source:
+            connector = await self._filesystem_source(source)
+            profiles = connector.profiles
+            path = await asyncio.to_thread(_bounded_root, root, connector.root, source)
+        elif root is not None:
+            path = _local(root)
+        else:
+            msg = (
+                "name a directory to convert, or a configured source with `--source <name>`. "
+                "`manicule connector list` names the configured ones."
+            )
+            raise ConfigError(msg)
         if not await asyncio.to_thread(path.is_dir):
             msg = f"no such directory: {path}"
             raise UnknownEntityError(msg)
         root_path = path.resolve()
-        outcomes = await asyncio.to_thread(write_sidecars, path, force=force)
+        # `profiles` exactly as configured, in configured order, with nothing appended. Adding
+        # the default to a connector that omitted it would make this run adapt pages the sync
+        # will not, which is the disagreement the whole `--source` path exists to remove.
+        outcomes = await asyncio.to_thread(write_sidecars, path, force=force, profiles=profiles)
         counts: dict[str, int] = {}
         for outcome in outcomes:
             counts[outcome.outcome.value] = counts.get(outcome.outcome.value, 0) + 1
         return r.SidecarReport(
             root=str(root_path),
+            source=source,
+            profiles=tuple(profile.name for profile in profiles),
             considered=len(outcomes),
             written=sum(1 for outcome in outcomes if outcome.written),
             # Every considered file lands in exactly one bucket, adapted ones included, so the
@@ -760,6 +808,71 @@ class ApplicationService:
                 if not outcome.written
             ),
         )
+
+    async def _filesystem_source(self, name: str) -> FilesystemConnector:
+        """The constructed filesystem connector for a configured source, or a stated refusal.
+
+        Every check here answers "would naming this source produce a conversion that agrees with
+        the sync?", and each one fails loudly rather than degrading to the default profile —
+        which is the behaviour being removed. A silent fallback would put the operator back where
+        they started: a command that runs, reports ``no_profile`` for every page, and leaves them
+        to work out that the flag they passed did nothing.
+
+        Ordered so that the cheap configuration questions are answered before anything is built.
+        A disabled or mistyped source should not construct a connector to be told it was the
+        wrong one.
+        """
+        from manicule.connectors.config import FILESYSTEM_CONNECTOR_NAME  # noqa: PLC0415
+        from manicule.connectors.filesystem import FilesystemConnector  # noqa: PLC0415
+
+        configured = self.settings.connectors.get(name)
+        if configured is None:
+            known = ", ".join(sorted(self.settings.connectors)) or "none configured"
+            # Named as an instance rather than a type, because the commonest mistake is passing
+            # `filesystem` — the connector's *kind* — and getting an error that does not say
+            # which of the two kinds of name was wanted.
+            msg = (
+                f"no connector named {name!r}. `--source` names a configured instance — the key "
+                f"in [connectors.<name>] — rather than a connector type. Configured: {known}"
+            )
+            raise UnknownEntityError(msg)
+        if not configured.enabled:
+            msg = (
+                f"connector {name!r} is configured `enabled = false`. Set it to true in "
+                f"[connectors.{name}] to convert its corpus, or pass the directory as an "
+                f"argument for a one-off that does not consult the source's configuration."
+            )
+            raise PolicyError(msg)
+        if configured.type != FILESYSTEM_CONNECTOR_NAME:
+            msg = (
+                f"{name!r} is a {configured.type!r} source, and sidecar generation writes into a "
+                f"local directory of exported pages. Only a {FILESYSTEM_CONNECTOR_NAME!r} source "
+                f"has one."
+            )
+            raise ConfigError(msg)
+        ingestion = await self._backend.ingestion()
+        connector = await ingestion.connector(name)
+        if not isinstance(connector, FilesystemConnector):
+            # Reachable only where a plugin has registered something else under the filesystem
+            # name. Refused rather than duck-typed: the two attributes read below decide where
+            # this writes and what it recognises, and guessing that an unknown class means the
+            # same thing by them is how a conversion ends up rooted somewhere nobody named.
+            msg = (
+                f"{name!r} is configured as a {FILESYSTEM_CONNECTOR_NAME!r} source but builds a "
+                f"{type(connector).__name__}, which does not declare a root and enriched "
+                f"profiles this can convert with."
+            )
+            raise ConfigError(msg)
+        if not connector.profiles:
+            msg = (
+                f"{name!r} declares an empty `enriched_profiles`, which turns adaptation off: "
+                f"every HTML file under it is indexed as ordinary HTML and none is an enriched "
+                f"export. A conversion under that configuration would report `no_profile` for "
+                f"every page and write nothing. Configure the profile this exporter uses, or "
+                f"pass the directory as an argument to convert it with the built-in default."
+            )
+            raise ConfigError(msg)
+        return connector
 
     # --- documents ------------------------------------------------------------------------
 
@@ -1322,9 +1435,12 @@ class ApplicationService:
                 f"database migrates, taking their chunks, versions, glossary entries, collection "
                 f"membership and tags with them. These were left alone because their declared "
                 f"identity is already held by another document, and moving onto an occupied key "
-                f"would overwrite a row nothing can restore. Two pages are claiming to be one "
-                f"page, so the second will never update: every sync re-indexes it under its path "
-                f"while the first keeps the identity. Nothing is lost meanwhile — both are "
+                f"would overwrite a row nothing can restore. Two rows now stand for one page and "
+                f"the path-keyed one will never update, by whichever of two routes it got here: "
+                f"where two files declare one id, each is re-indexed under its own path on every "
+                f"sync; where a manifest applied the identity after the page had already been "
+                f"indexed, the path-keyed row stops being discovered at all, so no sync refreshes "
+                f"it and no sync removes it. Nothing is lost meanwhile — both are "
                 f"indexed, searchable and correctly cited. Compare them with "
                 f"`manicule document list --source {first.source}`, remove whichever is the "
                 f"stale copy with `manicule document delete <id>`, or correct the manifest that "
@@ -3826,6 +3942,62 @@ def _local(path: Path | str) -> Path:
     blocking I/O that has to leave the event loop.
     """
     return Path(path).expanduser()
+
+
+def _bounded_root(candidate: Path | str | None, root: Path, source: str) -> Path:
+    """Where a ``--source`` conversion may walk: the connector's root, or a directory inside it.
+
+    ``None`` is the ordinary case and means the whole root. Anything else is a **caller-supplied
+    narrowing**, and narrowing is the operation that has to be bounded — a source name that could
+    be paired with any path at all would make the configured root decorative and turn a connector
+    into a handle for writing manifests into an unrelated tree.
+
+    Two guards, and they answer different questions:
+
+    *The final component may not be a symlink.* Refused outright rather than resolved, because
+        the walk beneath does not follow symlinks either
+        (:func:`~manicule.connectors.enriched_html._walk`). Accepting one here would make the
+        entry point disagree with everything under it: a link inside the root pointing at a
+        second tree would be walked as though the operator had named that tree, which they did
+        not, and the manifests would land beside files the connector will never discover.
+
+    *The fully resolved path must be the root or inside it.* Containment is checked after
+        resolution rather than on the string, so ``..`` segments, an absolute path elsewhere, and
+        a symlinked *parent* are all one question with one answer. Comparing the text would leave
+        ``root/../../etc`` looking like a path under ``root``, which is the traversal this is for.
+
+    A relative candidate is joined to the root, because that is what "a subdirectory of this
+    source" means to somebody typing it. An absolute one is taken as given. Either way it is the
+    resolved result that is checked, so the two spellings cannot get different answers.
+
+    Raises:
+        ConfigError: The candidate is a symlink, or resolves outside ``root``.
+    """
+    if candidate is None:
+        return root
+    supplied = _local(candidate)
+    within = root / supplied if not supplied.is_absolute() else supplied
+    if within.is_symlink():
+        msg = (
+            f"{str(supplied)!r} is a symbolic link. Sidecar generation does not follow symlinks "
+            f"— neither does the walk beneath it, nor the connector that later reads the corpus "
+            f"— so a link is refused rather than resolved. Name the directory itself."
+        )
+        raise ConfigError(msg)
+    try:
+        resolved = within.resolve()
+    except OSError as exc:  # pragma: no cover - an unresolvable path is refused the same way
+        msg = f"{str(supplied)!r} cannot be resolved ({exc.strerror or exc})"
+        raise ConfigError(msg) from exc
+    if resolved != root and root not in resolved.parents:
+        msg = (
+            f"{str(supplied)!r} resolves to {resolved}, which is outside {source!r}'s configured "
+            f"root {root}. A source's root is what bounds every file this may write beside; a "
+            f"path outside it is a different corpus, so name it as an argument on its own "
+            f"instead of narrowing a source to reach it."
+        )
+        raise ConfigError(msg)
+    return resolved
 
 
 def _relative_to(path: Path, root: Path) -> str:

@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Any, override
 
 from manicule.app.ports import (
     Answering,
@@ -749,6 +749,17 @@ class FakeIngestion:
     synced: list[str] = field(default_factory=list[str])
     reindexed: list[str] = field(default_factory=list[str])
     imported: list[Path] = field(default_factory=list[Path])
+    connectors: dict[str, object] = field(default_factory=dict[str, object])
+    """Constructed connectors, by instance name, for :meth:`connector`.
+
+    Deliberately populated by the test with an object built through the **real** factory rather
+    than with a stub, because the thing under test is that sidecar generation reads a source's
+    root and profiles from the connector a sync would run. A hand-built stand-in holding two
+    attributes would make that assertion true by construction and false in the product.
+    """
+
+    asked: list[str] = field(default_factory=list[str])
+    """Which instances :meth:`connector` was asked for, so a test can show it was consulted."""
 
     async def index_path(
         self, path: Path, *, name: str, limit: int | None = None, force: bool = False
@@ -761,6 +772,22 @@ class FakeIngestion:
         del limit
         self.synced.append(connector)
         return self.report
+
+    async def connector(self, name: str) -> Any:
+        """The constructed connector for a configured source.
+
+        Raises:
+            UnknownComponentError: Nothing was registered under that name — the container's own
+                failure, raised here so a service that lets it escape untranslated is visible.
+        """
+        from manicule.core.errors import UnknownComponentError  # noqa: PLC0415
+
+        self.asked.append(name)
+        built = self.connectors.get(name)
+        if built is None:
+            msg = f"no connector named {name!r} in configuration"
+            raise UnknownComponentError(msg)
+        return built
 
     async def reindex(self, document_id: str) -> ReindexReport:
         self.reindexed.append(document_id)

@@ -280,6 +280,7 @@ class FilesystemConnector:
         include_hidden: bool = False,
         max_bytes: int | None = None,
         profiles: Sequence[EnrichedProfile] = (DEFAULT_PROFILE,),
+        configured: bool = False,
     ) -> None:
         """Point the connector at a root.
 
@@ -294,12 +295,19 @@ class FilesystemConnector:
                 configuration rather than a degenerate one: a corpus of ordinary HTML pays
                 nothing for a feature it does not use, and turning it off is how an operator
                 establishes that an unexpected parse is or is not the adapter's doing.
+            configured: Whether :attr:`name` is a configured source instance — the key in
+                ``[connectors.<name>]`` — rather than a label for a one-off walk. Set by
+                :func:`~manicule.connectors.plugin.build_filesystem` and by nothing else,
+                because it decides whether :attr:`sidecar_command` may tell an operator to run
+                ``--source <name>``, and a name no configuration holds would be an instruction
+                that fails the moment it is followed.
         """
         self.name = name
         self._root = root.expanduser().resolve()
         self._include_hidden = include_hidden
         self._max_bytes = max_bytes
         self._profiles = tuple(profiles)
+        self._configured = configured
         # Folded into the change token of every adaptable file, so that a new adapter version or
         # a changed profile set rebuilds the derived body without the source being re-read from
         # anywhere but disk. Computed once because it cannot vary between files in one run.
@@ -325,6 +333,34 @@ class FilesystemConnector:
         outside unless it can be read back.
         """
         return self._profiles
+
+    @property
+    def sidecar_command(self) -> str:
+        """The conversion command that will run with **this** connector's profiles.
+
+        The whole of requirement 6, in one place, because remediation text is the thing this
+        repository keeps getting wrong: the reason attached to an unapplied identity used to name
+        ``manicule connector sidecar <root>`` unconditionally, and for a source with a custom
+        profile that command reports ``no_profile`` for every page and writes nothing. An
+        instruction that was written and never executed.
+
+        The positional form is correct for the default profile and for nothing else, so that is
+        exactly when it is emitted. Where the profiles are this source's own, the command has to
+        be the one that resolves them from configuration — and that form needs a name
+        configuration actually holds, which is what :attr:`_configured` records. A connector built
+        for ``manicule index <path>`` has no configured name to offer and gets the root form,
+        which is right for it because it also has the default profiles.
+
+        The fallback is the root form rather than nothing. A connector with custom profiles and
+        no configured name is not reachable through the product — ``build_filesystem`` is the only
+        thing that supplies custom profiles and it always supplies the name too — but if it ever
+        became reachable, naming a command that converts the right *directory* with the wrong
+        profiles is a recoverable disappointment, and naming ``--source`` with a name nothing
+        resolves is an error the operator cannot act on at all.
+        """
+        if self._configured and self._profiles != (DEFAULT_PROFILE,):
+            return f"manicule connector sidecar --source {self.name}"
+        return f"manicule connector sidecar {self._root}"
 
     @property
     def watermark(self) -> Watermark | None:
@@ -548,7 +584,7 @@ class FilesystemConnector:
                 f"fetched and discovery does not read files. Everything else about it is "
                 f"correct — it is parsed as storage format and cited by its own title and "
                 f"address — but moving or renaming it will create a second document. Run "
-                f"`manicule connector sidecar {self._root}` to write the manifest that applies "
+                f"`{self.sidecar_command}` to write the manifest that applies "
                 f"the declared identity, then sync. The page is then indexed under its page id "
                 f"and this path-keyed copy is superseded; `manicule doctor` names it so it can "
                 f"be removed."

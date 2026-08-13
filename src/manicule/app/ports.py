@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from manicule.core.embedding import IndexFingerprints
     from manicule.core.organisation import Collection as DocumentCollection
     from manicule.core.organisation import CollectionRule, Restoration, Tag, TrashEntry
+    from manicule.core.protocols import Connector
     from manicule.core.retrieval import Filter, Query
     from manicule.generation.history import Turn
     from manicule.generation.ports import (
@@ -126,6 +127,24 @@ class Ingesting(Protocol):
 
     async def sync(self, connector: str, *, limit: int | None = None) -> RunReport:
         """Run one configured connector."""
+        ...
+
+    async def connector(self, name: str) -> Connector:
+        """The constructed connector for a configured source, without running it.
+
+        The **same object** :meth:`sync` runs, from the same container, built by the same factory
+        over the same validated configuration. That is the whole reason this is on the port
+        rather than being a settings lookup in the service: sidecar generation needs a
+        filesystem source's resolved root and its ``enriched_profiles``, and reading those out of
+        ``settings.connectors[name].options`` would be a *second* interpretation of a profile.
+        Two interpretations of one profile is precisely the defect — a conversion written under
+        one reading and a sync performed under another put manifests on disk for pages the
+        connector then declines to read, and neither report mentions the other.
+
+        Raises:
+            UnknownComponentError: Configuration has no connector by that name. Surfaces
+                translate it; the container raises it.
+        """
         ...
 
     async def reindex(self, document_id: str) -> ReindexReport:

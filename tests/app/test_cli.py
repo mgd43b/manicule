@@ -1742,3 +1742,56 @@ def test_connector_sidecar_reports_a_missing_directory_as_a_failure(
 
     assert result.exit_code != 0
     assert json.loads(result.output)["ok"] is False
+
+
+def test_connector_sidecar_accepts_a_source_and_no_root(
+    bound: ApplicationService, tmp_path: Path
+) -> None:
+    """The flag reaches the service, which is the registration a unit test never exercises.
+
+    ``--source`` made the positional argument optional, and an argument that stopped being
+    required is exactly the kind of change Typer accepts and then fails on at call time. The
+    source here is not configured, so the *refusal* is the assertion: reaching a refusal about
+    the source proves the parse succeeded and the value arrived.
+    """
+    del bound, tmp_path
+
+    result = run(["--json", "connector", "sidecar", "--source", "docs"])
+
+    assert result.exit_code != 0
+    body = json.loads(result.output)
+    assert body["ok"] is False
+    assert body["error"]["type"] == "UnknownEntityError"
+    assert "configured instance" in body["error"]["message"]
+
+
+def test_connector_sidecar_with_neither_a_root_nor_a_source_says_what_to_pass(
+    bound: ApplicationService,
+) -> None:
+    """Refused rather than defaulting to the working directory, and the message names the flag."""
+    del bound
+
+    result = run(["--json", "connector", "sidecar"])
+
+    assert result.exit_code != 0
+    body = json.loads(result.output)
+    assert body["ok"] is False
+    assert "--source" in body["error"]["message"]
+
+
+def test_connector_sidecar_reports_which_profiles_ran(
+    bound: ApplicationService, tmp_path: Path
+) -> None:
+    """The rendered line an operator reads when a run adapted nothing.
+
+    Without it "adapted no pages at all" is the same sentence whether the run used the built-in
+    default or a source's own profiles, and those send them opposite ways.
+    """
+    del bound
+    (tmp_path / "plain.html").write_text("<html><body>hi</body></html>", encoding="utf-8")
+
+    result = run(["connector", "sidecar", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "standalone-storage" in result.output
+    assert "no configured source" in result.output

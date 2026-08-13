@@ -36,6 +36,64 @@ The first command writes `1002.html.source.json` beside `1002.html`. The second 
 the filesystem connector already reads that manifest. **The pages themselves are never
 modified.**
 
+That first form converts with the **built-in default profile**. If your exporter spells its
+markers differently — the case [§1a](#1a-configuring-another-exporters-markers) exists for — use
+the named-source form instead, or the run will report `no_profile` for every page while the
+configured sync over the very same directory adapts all of them:
+
+```console
+$ manicule connector sidecar --source docs
+1 of 1 page(s) under /path/to/export
+source docs; profile(s): custom-storage-export
+```
+
+`--source` names a configured **instance** — the key in `[connectors.docs]` — and never a
+connector type. It takes both the root and the enriched profiles from the connector
+`manicule connector sync docs` would run, so the conversion and the sync cannot hold two readings
+of one profile. The source must exist, be enabled, be a filesystem source, and declare at least
+one profile; each of those is refused by name rather than quietly falling back to the default,
+because falling back is what produced the misleading `no_profile` in the first place.
+
+Every run says which profiles it used, whether or not it wrote anything:
+
+```console
+$ manicule connector sidecar /path/to/export
+0 of 1 page(s) under /path/to/export
+no configured source; profile(s): standalone-storage
+adapted no pages at all — every considered file is listed below
+skipped          why
+pages/1002.html  matches no configured enriched-document profile
+                 ('standalone-storage'), so it is an ordinary HTML file as far
+                 as this is concerned and is left to generic ingestion
+```
+
+That is the same corpus as the successful run above. The difference is the profile set, and the
+line naming it is what tells the two apart.
+
+### A bounded subdirectory
+
+A positional argument may be given *with* `--source` to convert part of a source's tree:
+
+```console
+$ manicule connector sidecar --source docs pages
+```
+
+It is resolved relative to the source's root and must stay inside it. A path that resolves
+outside — through `..`, through an absolute path elsewhere, or through a symlink — is refused,
+and so is a symlink named directly, because the walk beneath does not follow links either. A
+source name is not a licence to write manifests beside somebody else's files.
+
+The manifests a narrowed run writes are **byte-identical** to the ones a whole-root run would
+write, because no field in a manifest is relative to the conversion's root —
+[§4](#4-two-deliberate-omissions) omits `snapshot_path` for exactly this reason.
+
+**Narrowing narrows duplicate detection, and that is the one cost.** Two pages declaring one page
+id are refused as a pair, and the pair is only visible to a run that walked both. A run confined
+to `pages/` will happily write a manifest for a page whose twin sits in `other/`. Nothing breaks
+silently — the twin keeps its path identity, and once the converted page holds the id it declares,
+`doctor`'s `document-identity` check reports two rows for one page ([§5d](#5d-converting-a-corpus-that-is-already-indexed)). But the refusal arrives after a sync
+rather than during the conversion. **Convert the whole root unless you have a reason not to.**
+
 `--force` replaces manifests that already exist; without it they are left alone, because one
 already there was most likely written by hand or by another tool.
 
@@ -66,10 +124,18 @@ reason naming the page id it declares, the consequence, and the command:
   "reason": "this page declares source_id '1002' and is indexed under its path, because a
              document's identity has to be known before it is fetched and discovery does not
              read files. … moving or renaming it will create a second document. Run
-             `manicule connector sidecar /path/to/pages` to write the manifest that applies the
+             `manicule connector sidecar --source docs` to write the manifest that applies the
              declared identity, then sync."
 }
 ```
+
+**The command in that reason is the one that will work for that page's source.** A source with
+custom profiles is told `--source <name>`; a one-off `manicule index <path>` is told the root
+form, which is right for it because it also uses the default profile. This used to name the root
+form unconditionally, which for a custom-profile corpus was an instruction that reports
+`no_profile` and writes nothing — a command that had been written and never run.
+`tests/connectors/test_sidecar_source.py` now takes the command off the document, parses it, and
+executes it, so the text cannot drift away from what works.
 
 Once the manifest is there the outcome is `adapted` and the reason is gone — the notice clears
 itself rather than sitting on every page for ever.
@@ -96,7 +162,23 @@ labels = { identifier = "source_id", revision = "version" }
 Listing a profile **replaces** the default rather than adding to it; list
 `name = "standalone-storage"` alongside to keep both. An empty list turns adaptation off, which
 is a supported configuration — it is how you establish whether an unexpected parse is the
-adapter's doing.
+adapter's doing. `connector sidecar --source` refuses a source configured that way rather than
+running: with no profile there is nothing to recognise, so every page would report `no_profile`.
+
+**`labels` replaces the defaults too, and that is the easier one to get wrong.** The profile above
+understands `Identifier` and `Revision` and *stops* understanding `Page ID`, `Version`,
+`Last modified` and the rest. A page whose metadata section reads `<strong>Page ID:</strong>` under
+that profile is refused with `invalid_metadata` — "declares no page id" — rather than adapted,
+because the label it was found under maps to nothing. The keys are the spellings **in your
+documents**, normalised to lower case; the values are manicule's field names. If a field is not in
+the mapping it is not extracted, so a profile that omits an address mapping produces manifests with
+no `canonical_uri`:
+
+```toml
+labels = { identifier = "source_id", revision = "version", source = "canonical_uri" }
+```
+
+Map every field you want cited, not only the identifier.
 
 Three things are refused when the settings load, rather than at the first sync:
 
@@ -284,6 +366,61 @@ is that a later re-parse cannot reuse the vector for such a chunk — it replace
 re-embedding this change made unavoidable anyway. `tests/ingest/test_storage_integration.py`
 migrates, syncs, and asserts no chunk survives with an id that does not derive.
 
+### 5d. Converting a corpus that is already indexed
+
+The migration above re-keys documents that were in the database before the identity change. It is
+**not** what happens when you convert a corpus that this build already indexed under its paths,
+and the difference matters because the second is the ordinary workflow:
+
+```console
+$ manicule connector sidecar --source docs   # a page that was already indexed path-keyed
+$ manicule connector sync docs
+$ manicule --json document list              # two rows, one page
+```
+
+**Generating a manifest does not re-key the existing row.** The next sync discovers the page under
+its declared id and creates a *second* document; the path-keyed one is left behind. Nothing
+removes it on its own — the connector no longer discovers it under that path, and no command in
+manicule runs reconciliation — so **the old copy must be deleted by hand.**
+
+`doctor` names it rather than reporting a healthy corpus:
+
+```console
+$ manicule doctor
+ degraded  document-identity  1 document(s) are still keyed on their file's path
+while the manifest beside each one declares an identity of its own —
+'/path/to/export/pages/1003.html' declares '1003'. … Compare them with
+`manicule document list --source docs`, remove whichever is the stale copy with
+`manicule document delete <id>`, or correct the manifest that declares the wrong
+page id and sync again. There is no bulk remedy for this and none is implied.
+```
+
+Then, exactly as it says:
+
+```console
+$ manicule document list --source docs
+3d1436bf632764209fecb2467fc70e7b
+  Escalation · docs · application/xhtml+xml;profile=confluence-storage · indexed
+d70c35a339cd9893e4df4ba026efa9ef
+  Escalation · docs · application/xhtml+xml;profile=confluence-storage · indexed
+2 shown, offset 0, page size 50
+
+$ manicule document delete d70c35a339cd9893e4df4ba026efa9ef
+removed d70c35a339cd9893e4df4ba026efa9ef into the trash
+```
+
+after which `document-identity` is `ok` again. The delete is the ordinary soft delete, so a copy
+removed by mistake is restorable.
+
+The reason `doctor` sees this at all is the `claimed` rule in its identity check: a path-keyed
+enriched page is normally *excluded* from that check, because it carries its own notice naming the
+command that applies its identity. The exclusion lifts the moment another document holds the
+identity it declares — which is precisely the state following that notice produces. Without that,
+the tool would instruct an action that creates an orphan and then say nothing about it.
+
+**Convert before the first sync where you can**, and none of this arises: the manifest is read at
+the first discovery, the page is keyed by its id from the start, and there is no second row.
+
 Two files declaring one page id are **both** returned to their paths, and the conflict is reported.
 Not the second only: `documents` is `UNIQUE` on `(workspace_id, source, source_id)`, so honouring
 both would mean a silent overwrite — and keeping the *first* would make ownership depend on walk
@@ -341,4 +478,25 @@ attachments are not fetched. DOT source is preserved character for character and
 the index. Everything else manicule does to a corpus is read-only, so an unattended surface able
 to write into one is a new kind of authority rather than a new operation. It stays where a person
 is present — the rule `reset-index`, `backup`, `import` and `collection orphans` are already held
-to, and `tests/app/test_surface_parity.py` keeps it there.
+to.
+
+`--source` does not soften that. It narrows what the command may touch rather than widening who
+may run it: the root is no longer the caller's to choose, and a subdirectory given alongside it
+must resolve inside the configured root. The authority the boundary is about — writing files into
+a directory a request named — is unchanged, so the boundary is unchanged.
+
+Three tests hold the line, and they catch different things:
+
+| | |
+|---|---|
+| `tests/app/test_surface_parity.py` | `connector_sidecar` is not an MCP tool |
+| `tests/api/test_routes.py`, `ABSENT` | the HTTP paths somebody would guess are unrouted |
+| `tests/api/test_routes.py::test_no_route_generates_sidecar_manifests` | **no** route mentions sidecar, whatever it is called |
+
+The third exists because the second cannot cover a path nobody predicted — the same reason
+`plugins/install` has a test of that shape. A route added at an unguessed path passes the `ABSENT`
+table and fails the by-name walk; a route added at a guessed path under an unrelated *name* does
+the reverse. Both were confirmed by adding such a route and watching each test fail.
+
+There is no unattended scheduler to exclude it from: manicule has none, and `schedule_s` was
+removed in #98 precisely because a setting nothing reads is a promise nothing keeps.
