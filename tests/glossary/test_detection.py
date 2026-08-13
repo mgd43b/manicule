@@ -558,9 +558,8 @@ def test_a_parenthetical_survives_when_no_prefix_before_it_spells_the_term() -> 
     a bracket survives and only one of them is evidence. This is the evidence one: the boundary
     *was* offered at position 18 and the prefix was refused. The other route — the whole
     right-hand side matching because :func:`~manicule.ingest.glossary.initials_of` dropped the
-    bracketed tokens, so no boundary was ever consulted — is the accidental one, and it is
-    pinned separately by
-    ``test_whether_a_trailing_parenthetical_survives_depends_on_its_first_character``. Measured
+    bracketed tokens, so no boundary was ever consulted — is the accidental one, and it is pinned
+    separately by ``test_a_trailing_bracket_survives_only_when_the_whole_side_is_kept``. Measured
     here: ``initials_forms('central processor (the execution unit)')`` is ``{'CPEU'}`` against a
     term of ``CPU``, so no reading spells it and the filter is not what saved the bracket.
     """
@@ -573,66 +572,39 @@ def test_a_parenthetical_survives_when_no_prefix_before_it_spells_the_term() -> 
     ("line", "expected"),
     [
         ("RNE — Regional Network Edge (Type 2)", "Regional Network Edge (Type 2)"),
+        ("RNE — Regional Network Edge (Type Two)", "Regional Network Edge"),
         (
             "RNE — Regional Network Edge (Type 2), the branch hardware profile",
             "Regional Network Edge",
         ),
     ],
-    ids=["short-keeps-it", "long-drops-it"],
+    ids=["whole-spells-it", "whole-stops-spelling-it", "whole-too-long"],
 )
-def test_a_bracketed_qualifier_is_kept_whole_and_dropped_when_cutting(
+def test_a_trailing_bracket_survives_only_when_the_whole_side_is_kept(
     line: str, expected: str
 ) -> None:
-    """**The sharpest objection to the bracket rule, pinned as a decision rather than a surprise.**
+    """**Three outcomes, one rule, and the ids name the clause rather than the symptom.**
 
-    Identical brackets, opposite outcomes, and the discriminator is the length of the line. It
-    follows from the rule this module already runs everywhere: *the shortest prefix that spells
-    the term is where the term stops*. When the whole right-hand side can be taken it is taken and
-    no boundary is consulted; when it cannot, ``Regional Network Edge`` and ``Regional Network
-    Edge (Type 2)`` both spell ``RNE`` and the shorter wins — exactly as it would if the bracket
-    were a comma.
+    An earlier version of this test called these cases ``short-keeps-it`` and ``long-drops-it``,
+    which was true of the two fixtures it had and false in general — the middle case here is
+    short and is cut. Length is a *consequence* of the rule, not the rule:
 
-    **The cost is real and is the point of writing this down**: a qualifier that is genuinely part
-    of the term is dropped from a line long enough to need cutting. The alternative — preferring
-    the longest agreeing prefix at a bracket — inverts shortest-wins for one position only, and
-    would keep ``Regional Network Edge (e.g., a gateway)`` for the same reason. Nothing here tells
-    a qualifier from an example, so the choice is which way to be wrong.
-    """
-    entries = detect_in_chunk(chunk(line))
+    1. ``core_expansion`` keeps the **whole** right-hand side when it is usable and its initials
+       spell the term, consulting no boundary at all.
+    2. Otherwise the shortest prefix that spells the term wins, and a top-level bracket is one
+       more position at which that is asked.
 
-    assert [entry.expansion for entry in entries] == [expected]
+    ``(Type 2)`` is kept by clause 1: ``(Type`` and ``2)`` are dropped by
+    :func:`~manicule.ingest.glossary.initials_of`'s first-character filter, so the whole still
+    spells ``RNE``. ``(Type Two)`` falls to clause 2 because ``Two)`` begins with a letter,
+    survives the filter, and makes the whole spell ``RNET``. The third case falls to clause 2 by
+    length instead. Same rule, three routes through it.
 
-
-@pytest.mark.parametrize(
-    ("line", "expected"),
-    [
-        ("RNE — Regional Network Edge (Type 2)", "Regional Network Edge (Type 2)"),
-        ("RNE — Regional Network Edge (Type Two)", "Regional Network Edge"),
-    ],
-    ids=["digit-inside-keeps-it", "letter-inside-drops-it"],
-)
-def test_whether_a_trailing_parenthetical_survives_depends_on_its_first_character(
-    line: str, expected: str
-) -> None:
-    """**A known limitation, pinned so it is found here rather than in a corpus.**
-
-    Two lines that mean the same thing are treated differently, and what decides it is the
-    ``word[:1].isalpha()`` filter in :func:`~manicule.ingest.glossary.initials_of` — the same
-    filter whose misfiring is the defect this change exists to fix. Removing its bad consequence
-    at the boundary did not remove its influence on retention.
-
-    ``(Type 2)``: ``(Type`` starts with ``(`` and ``2)`` with a digit, so both are dropped, the
-    surviving three words spell ``RNE``, the **whole** right-hand side matches, and no boundary
-    is ever consulted — the bracket is kept by accident rather than by evidence.
-
-    ``(Type Two)``: ``Two)`` starts with ``T``, so the initials read ``RNET``, the whole no
-    longer spells the term, the boundary search runs, and the prefix before the bracket earns the
-    cut.
-
-    Recorded rather than fixed: the two cases want opposite outcomes and nothing here
-    distinguishes them. Making the filter keep bracketed tokens would change what *every*
-    expansion's initials are — a far wider change than this one, wanting its own measurement.
-    Asserted in both directions so that if somebody does make them agree, this fails and says so.
+    **The middle case is also a known limitation**, and it is asserted rather than hidden: two
+    lines that mean the same thing are treated differently, decided by the same
+    ``word[:1].isalpha()`` filter whose misfiring is the defect this change exists to fix.
+    Removing its bad consequence at the boundary did not remove its influence on retention. If
+    somebody later makes the two agree, this fails and says so.
     """
     entries = detect_in_chunk(chunk(line))
 

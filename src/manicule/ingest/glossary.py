@@ -318,56 +318,51 @@ def _description_boundaries(text: str) -> list[int]:
     expansion is reached only when the whole right-hand side already failed, and is kept whenever
     no prefix before it agrees.
 
-    **A qualifier is dropped from a long line and kept from a short one, and that is a decision
-    rather than an accident.** It is the sharpest objection to this rule, so it is written down
-    rather than left to be discovered:
+    **When a trailing bracket survives, in two clauses and no others.** An earlier draft of this
+    summarised it as "kept from a short line, dropped from a long one", which is true of the
+    fixtures it was written from and false in general — ``Regional Network Edge (Type Two)`` is
+    short and is cut. The rule as implemented is:
 
-    - ``Regional Network Edge (Type 2)``
-      is stored as ``Regional Network Edge (Type 2)`` — the bracket is kept.
-    - ``Regional Network Edge (Type 2), the branch hardware profile``
-      is stored as ``Regional Network Edge`` — the bracket is dropped.
+    1. :func:`core_expansion` keeps the **whole** right-hand side when it is usable and its
+       initials spell the term, and consults no boundary at all. This is the conservative case and
+       the one that satisfies requirement 4.
+    2. Otherwise the question "where does the term end" has to be answered, and among prefixes
+       that spell it the **shortest** wins — the rule :func:`_phrase_before` states in those words
+       and :func:`_phrase_after` inherits. A bracket is one more position at which it is asked.
 
-    Identical brackets, opposite outcomes, and the discriminator is length. The reason is the rule
-    this module already runs everywhere else: **the shortest prefix that spells the term is where
-    the term stops.** :func:`_phrase_before` says it in those words and :func:`_phrase_after`
-    inherits it. When the whole right-hand side can be taken, it is taken and no boundary is
-    consulted — the conservative case, and the one that keeps requirement 4. When it cannot, the
-    question "where does the term end" has to be answered, and among prefixes that spell it the
-    shortest is the answer. ``Regional Network Edge`` is shorter than ``Regional Network Edge
-    (Type 2)`` and both spell ``RNE``, so the shorter wins, exactly as it would if the brackets
-    were a comma.
+    Length is a *consequence* of clause 1, not a cause: a long line fails
+    :data:`MAX_EXPANSION_WORDS` and so falls to clause 2. So does a short line whose initials stop
+    agreeing. Three outcomes follow, and all three are the same two clauses:
 
-    **The cost, stated so nobody has to rediscover it:** a bracketed qualifier that really is part
-    of the term is dropped from a line long enough to need cutting. The alternative is to prefer
-    the *longest* agreeing prefix at a bracket, which would invert the shortest-wins rule for this
-    one position and would keep ``Regional Network Edge (e.g., a gateway)`` on a short line for the
-    same reason. Nothing available here tells a qualifier from an example — that is another verb
-    test — so the choice is which way to be wrong, and it is made in favour of the rule that
-    already governs every other boundary.
+    - ``Regional Network Edge (Type 2)`` → kept. Clause 1: ``(Type`` and ``2)`` are dropped by
+      :func:`initials_of`'s first-character filter, so the whole still spells ``RNE``.
+    - ``Regional Network Edge (Type Two)`` → cut to ``Regional Network Edge``. Clause 2:
+      ``Two)`` begins with a letter, survives the filter, and the whole spells ``RNET``.
+    - ``Regional Network Edge (Type 2), the branch hardware profile`` → cut. Clause 2, reached by
+      length rather than by initials.
+
+    **Known limitation, and it is the second bullet.** Whether a trailing parenthetical survives
+    depends on the first character inside it, decided by the same ``word[:1].isalpha()`` filter
+    whose misfiring is the defect this function was written to fix — removing its bad consequence
+    at the boundary did not remove its influence on retention. ``(Type 2)`` and ``(Type Two)`` mean
+    the same thing and are treated differently. Recorded rather than fixed: the two cases want
+    opposite outcomes, nothing available here distinguishes them, and making the filter keep
+    bracketed tokens would change what *every* expansion's initials are — far wider than this
+    change, and wanting its own measurement.
+
+    **The cost of clause 2, stated so nobody has to rediscover it:** a bracketed qualifier that
+    really is part of the term is dropped whenever clause 1 does not hold. The alternative is to
+    prefer the *longest* agreeing prefix at a bracket, which would invert shortest-wins for this
+    one position and would keep ``Regional Network Edge (e.g., a gateway)`` for the same reason.
+    Nothing available here tells a qualifier from an example — that is another verb test — so the
+    choice is which way to be wrong, and it is made in favour of the rule that already governs
+    every other boundary.
 
     **No list of example markers.** ``e.g.`` and ``for example`` are what the specification names,
     and a rule keyed on them would be narrower than its own justification: what disqualifies the
     parenthetical here is not the phrase inside it but that the words before it already spell the
     term. Evidence does the work, so the marker list would be decoration that fails on the first
     parenthetical nobody enumerated.
-
-    **Known limitation: whether a trailing parenthetical is kept depends on the first character
-    inside it.** Two lines that mean the same thing are treated differently, and the mechanism
-    deciding it is the ``word[:1].isalpha()`` filter in :func:`initials_of` — the same filter
-    whose misfiring is the defect this function was written to fix. Measured:
-
-    - ``RNE — Regional Network Edge (Type 2)`` keeps its bracket. ``(Type`` starts with ``(`` and
-      ``2)`` with a digit, so both are dropped by the filter, the surviving three words spell
-      ``RNE``, the *whole* right-hand side matches and no boundary is ever consulted.
-    - ``RNE — Regional Network Edge (Type Two)`` loses it. ``Two)`` starts with ``T``, which is
-      alphabetic, so the initials read ``RNET``, the whole no longer spells the term,
-      :func:`_phrase_after` runs, and the prefix before the bracket earns the cut.
-
-    Removing the bad consequence at the boundary did not remove the filter's influence on
-    retention, and this is recorded rather than fixed because the two cases want opposite
-    outcomes and nothing available here distinguishes them. Making the filter keep bracketed
-    tokens would change what every expansion's initials are, which is a far wider change than
-    this one and would want its own measurement.
 
     """
     depth = 0
