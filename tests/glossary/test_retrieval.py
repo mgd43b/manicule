@@ -809,3 +809,36 @@ async def test_a_heading_section_cannot_suppress_a_real_definition_elsewhere(
     assert system.rank_of(result.context.passages, definition) == 1
     assert result.confidence is not None
     assert result.confidence.explicit_definition
+
+
+async def test_a_truncated_expansion_still_cites_the_whole_source_line(
+    store: SqliteDocStore, indexed: list[Chunk]
+) -> None:
+    """Cutting a description off an expansion must not cut it off the citation.
+
+    The two are different strings for different jobs and this is where that stops being a
+    nicety: ``RNE`` *means* ``Regional Network Edge``, and the passage a reader is sent to has to
+    be the line the page actually holds — parenthetical, colon, trailing sentence and all. An
+    implementation that stored the truncation as the chunk text would leave the citation
+    quoting something the document does not contain, which is the failure the whole provenance
+    rule exists to prevent.
+
+    ``explicit_definition`` is asserted alongside because the public claim is what a client acts
+    on, and a definition that is right but unclaimed is a different bug from one that is wrong.
+    """
+    line = (
+        "RNE - Regional Network Edge (e.g., a gateway): Connects a private network to an "
+        "upstream network."
+    )
+    _, chunks = await system.index(store, "edge", "Edge glossary", [line])
+    retriever = await _with_glossary(store, [*indexed, *chunks])
+
+    result = await retriever.retrieve(_ask("What is RNE?"))
+
+    assert result.expansion is not None
+    match = next(m for m in result.expansion.matches if m.entry.acronym == "RNE")
+    assert match.entry.expansion == "Regional Network Edge"
+    assert match.entry.chunk_id == chunks[0].id
+    assert chunks[0].text == line, "the citation quotes the page, not the extraction"
+    assert result.confidence is not None
+    assert result.confidence.explicit_definition
