@@ -159,7 +159,10 @@ class CosineVectorStore:
             verdicts[chunk.id] = classify_stored_vector(
                 chunk,
                 recorded_identity=embedding_input_identity(
-                    stored_chunk.embed_text, embed=self._fingerprint, middleware=self._middleware
+                    stored_chunk.embed_text,
+                    document_id=stored_chunk.document_id,
+                    embed=self._fingerprint,
+                    middleware=self._middleware,
                 ),
                 stored_embed_text=stored_chunk.embed_text,
                 stored_vector=vector,

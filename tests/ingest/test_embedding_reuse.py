@@ -575,27 +575,33 @@ def a_chunk(text: str = "alpha", embed_text: str = "Doc > alpha") -> Chunk:
     )
 
 
-def test_the_identity_separates_every_input_it_takes() -> None:
-    """Three inputs, three ways to change the answer, and no way to collide them."""
+def identity(text: str = "Doc > alpha", *, document: str = "doc-1", **overrides: object) -> str:
+    """An embedding-input identity, with one input at a time varied by the caller."""
     embedder = fakes.CountingEmbedder()
-    base = embedding_input_identity("Doc > alpha", embed=embedder.fingerprint)
+    fields: dict[str, object] = {"embed": embedder.fingerprint, "document_id": document}
+    fields.update(overrides)
+    return embedding_input_identity(text, **fields)  # pyright: ignore[reportArgumentType]
 
-    assert base == embedding_input_identity("Doc > alpha", embed=embedder.fingerprint), (
-        "the same three inputs produce the same identity, or nothing is ever reused"
+
+def test_the_identity_separates_every_input_it_takes() -> None:
+    """Four inputs, four ways to change the answer, and no way to collide them."""
+    embedder = fakes.CountingEmbedder()
+
+    assert identity() == identity(), (
+        "the same four inputs produce the same identity, or nothing is ever reused"
     )
-    assert base != embedding_input_identity("Doc > beta", embed=embedder.fingerprint)
-    assert base != embedding_input_identity(
-        "Doc > alpha",
-        embed=embedder.fingerprint.model_copy(update={"model_id": "other/embedder"}),
+    assert identity() != identity("Doc > beta")
+    assert identity() != identity(
+        embed=embedder.fingerprint.model_copy(update={"model_id": "other/embedder"})
     )
-    assert base != embedding_input_identity(
-        "Doc > alpha", embed=embedder.fingerprint, middleware=("redact@1",)
+    assert identity() != identity(middleware=("redact@1",))
+    assert identity() != identity(document="doc-2"), (
+        "the same string in two documents is two identities, which is what keeps a lookup by "
+        "identity from reaching across a tenancy boundary the vector table has no column for"
     )
-    assert embedding_input_identity(
-        "Doc > alpha", embed=embedder.fingerprint, middleware=("b@1", "a@1")
-    ) == embedding_input_identity(
-        "Doc > alpha", embed=embedder.fingerprint, middleware=("a@1", "b@1")
-    ), "a declaration set that differs only in order is the same declaration"
+    assert identity(middleware=("b@1", "a@1")) == identity(middleware=("a@1", "b@1")), (
+        "a declaration set that differs only in order is the same declaration"
+    )
 
 
 @pytest.mark.parametrize(
@@ -617,11 +623,8 @@ def test_the_identity_never_conflates_two_different_embedding_inputs(left: str, 
     does not. What is normalised is the *serialisation* the digest is taken over, never the
     text.
     """
-    embedder = fakes.CountingEmbedder()
     assert left != right, "the fixture must supply two different strings"
-    assert embedding_input_identity(left, embed=embedder.fingerprint) != embedding_input_identity(
-        right, embed=embedder.fingerprint
-    )
+    assert identity(left) != identity(right)
 
 
 async def test_a_store_asked_about_a_chunk_it_has_never_held_answers_absent() -> None:
@@ -731,3 +734,37 @@ async def test_a_document_lost_at_the_store_still_reports_what_it_spent_at_the_m
     assert sweep.embedding.embedded == sum(embedder.batches), (
         "what the sweep spent is reported even though none of it was committed"
     )
+
+
+async def test_a_vector_is_never_reused_across_a_document_or_a_workspace_boundary() -> None:
+    """The identity-keyed lookup is a read no filter scopes, so the scope is in the key.
+
+    The vector table has no ``workspace_id`` column and by design never will — tenancy lives on
+    ``documents``, and a copy in a derived store is a value that can disagree. So a lookup
+    keyed on the embedding input alone would be the one vector read in the codebase that is not
+    workspace-scoped, and it would stay that way silently: nothing about a query that matches
+    too much looks wrong.
+
+    Folding the document into the identity closes it by construction, the same way
+    ``document_id(workspace_id, …)`` does one level up. A document id is derived from its
+    workspace, so a cross-tenant match cannot be *expressed* rather than merely being unlikely
+    to be written. Two chunks with byte-identical text and byte-identical breadcrumbs stand in
+    for the two tenants here, because that is the only case in which the question arises.
+    """
+    embedder = fakes.CountingEmbedder()
+    vectors = fakes.MemoryVectors()
+    await vectors.ensure_ready(embedder.fingerprint)
+    theirs = a_chunk().model_copy(update={"document_id": "their-document", "id": "their-chunk"})
+    await vectors.upsert([theirs], [[0.5] * embedder.fingerprint.dimension])
+
+    mine = a_chunk().model_copy(update={"document_id": "my-document", "id": "my-chunk"})
+    assert (mine.text, mine.embed_text) == (theirs.text, theirs.embed_text), (
+        "the fixture must be byte-identical, or the boundary is not what is being tested"
+    )
+
+    verdicts = await vectors.stored_vectors([mine])
+
+    assert verdicts[mine.id].state is VectorState.ABSENT, (
+        "the other document's vector is not reachable, by identity or by any other route"
+    )
+    assert verdicts[mine.id].vector == ()

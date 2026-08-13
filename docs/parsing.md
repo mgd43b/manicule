@@ -1178,8 +1178,8 @@ can price it:
   under current text. It can also lose its id while its embedding input stands still, because
   inserting one paragraph renumbers every chunk below it. Both are handled, and neither by the
   id: `ingest/embedding.py` compares a persisted **embedding-input identity**, derived from the
-  exact string sent to the model, the embed fingerprint, and any middleware declaring
-  `mutates_embedded_text`. Reuse needs all three of the same fingerprint, the same input, and a
+  exact string sent to the model, the document it belongs to, the embed fingerprint, and any
+  middleware declaring `mutates_embedded_text`. Reuse needs all three of the same fingerprint, the same input, and a
   readable stored vector for that identity — identity metadata claiming a vector exists is not
   a vector existing, so the row is read rather than trusted.
 

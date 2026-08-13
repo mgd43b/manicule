@@ -224,6 +224,7 @@ corpus, which is the honest price of changing what the identity means.
 def embedding_input_identity(
     embed_text: str,
     *,
+    document_id: str,
     embed: EmbedFingerprint,
     middleware: Sequence[str] = (),
 ) -> str:
@@ -235,7 +236,25 @@ def embedding_input_identity(
     and a reuse rule keyed on the id alone preserves a stale vector under current text. This
     is the value that rule has to be keyed on instead.
 
-    Three inputs, and each one is load-bearing:
+    Four inputs, and each one is load-bearing:
+
+    ``document_id``
+        **The tenancy boundary, put inside the identity rather than applied afterwards** —
+        exactly as :func:`~manicule.core.ids.document_id` puts ``workspace_id`` inside a
+        document's, and for the same reason. Reuse is answered by looking a stored identity up
+        in a vector table that has no workspace column and by design never will
+        (``docs/storage.md`` §6.2: tenancy lives on ``documents``, and a copy in a derived
+        store is a value that can disagree). A lookup keyed on the embedding input alone is
+        therefore a read no filter scopes, and "the caller will remember to scope it" is the
+        assumption this repository has already had to fix once. Because a document id is
+        derived from the workspace, folding it in makes a cross-tenant match impossible to
+        express rather than merely unlikely to be written.
+
+        Nothing measurable is lost. What it forgoes is reuse *between* two documents, and a
+        chunk's ``embed_text`` carries the document's own title in its breadcrumb (§5.1), so
+        two documents almost never produce the same embedding input in the first place. What it
+        keeps is the case reuse exists for: the same document re-parsed, where a chunk id moves
+        because it carries its position and the embedded string does not move at all.
 
     ``embed_text``
         The exact string handed to the embedder — every code point of it, in order. There is
@@ -260,6 +279,7 @@ def embedding_input_identity(
 
     Args:
         embed_text: What was, or is about to be, sent to the model.
+        document_id: The document the chunk belongs to, which carries its workspace.
         embed: The embedder's fingerprint.
         middleware: Declarations of middleware that may rewrite embedded text.
 
@@ -267,9 +287,15 @@ def embedding_input_identity(
         A hex SHA-256 digest. Opaque, fixed width, and safe to store in a text column.
     """
     payload = json.dumps(
-        [EMBEDDING_IDENTITY_VERSION, embed.canonical(), sorted(middleware), embed_text],
+        [
+            EMBEDDING_IDENTITY_VERSION,
+            document_id,
+            embed.canonical(),
+            sorted(middleware),
+            embed_text,
+        ],
         # A JSON array, so the fields cannot run into one another: no concatenation of the
-        # four values can be read as a different four. `ensure_ascii` keeps the payload pure
+        # five values can be read as a different five. `ensure_ascii` keeps the payload pure
         # ASCII, which both escapes every code point injectively and stops a lone surrogate —
         # which a parser can produce and a `str` can hold — from raising on the encode below.
         separators=(",", ":"),
@@ -400,8 +426,12 @@ def classify_stored_vector(
     if stored_embed_text is None:
         return StoredVector(state=VectorState.CORRUPT)
 
-    wanted = embedding_input_identity(chunk.embed_text, embed=embed, middleware=middleware)
-    derived = embedding_input_identity(stored_embed_text, embed=embed, middleware=middleware)
+    wanted = embedding_input_identity(
+        chunk.embed_text, document_id=chunk.document_id, embed=embed, middleware=middleware
+    )
+    derived = embedding_input_identity(
+        stored_embed_text, document_id=chunk.document_id, embed=embed, middleware=middleware
+    )
     recorded = recorded_identity or UNRECORDED_IDENTITY
     if recorded == UNRECORDED_IDENTITY:
         recorded = derived

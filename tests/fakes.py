@@ -241,12 +241,12 @@ class MemoryVectorStore:
                 raise ValueError(msg)
             # A tuple whatever the caller handed over; see `MemoryVectors` for why the
             # container type must not survive a write.
-            self._rows[chunk.id] = (chunk, tuple(vector), self._identity_of(chunk.embed_text))
+            self._rows[chunk.id] = (chunk, tuple(vector), self._identity_of(chunk))
 
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
         verdicts: dict[str, StoredVector] = {}
         for chunk in chunks:
-            wanted = self._identity_of(chunk.embed_text)
+            wanted = self._identity_of(chunk)
             elsewhere = next(
                 (row for row in self._rows.values() if row[2] == wanted != UNRECORDED_IDENTITY),
                 None,
@@ -270,7 +270,7 @@ class MemoryVectorStore:
             middleware=self._middleware,
         )
 
-    def _identity_of(self, embed_text: str) -> str:
+    def _identity_of(self, chunk: Chunk) -> str:
         """What this store records beside a vector, or nothing when it has no fingerprint yet.
 
         A store that has never been through ``ensure_ready`` cannot name the vector space it is
@@ -280,7 +280,10 @@ class MemoryVectorStore:
         if self._fingerprint is None:
             return UNRECORDED_IDENTITY
         return embedding_input_identity(
-            embed_text, embed=self._fingerprint, middleware=self._middleware
+            chunk.embed_text,
+            document_id=chunk.document_id,
+            embed=self._fingerprint,
+            middleware=self._middleware,
         )
 
     def corrupt(

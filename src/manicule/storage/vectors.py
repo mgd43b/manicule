@@ -562,7 +562,7 @@ class LanceVectorStore:
             verdicts[chunk.id] = self._verdict(chunk, record, fingerprint)
 
         wanted = {
-            chunk.id: self._identity_of(chunk.embed_text, fingerprint)
+            chunk.id: self._identity_of(chunk, fingerprint)
             for chunk in chunks
             if verdicts[chunk.id].state in {VectorState.ABSENT, VectorState.STALE}
         }
@@ -697,12 +697,21 @@ class LanceVectorStore:
             "lang": chunk.lang,
             "position": chunk.position,
             CHUNK_COLUMN: chunk.model_dump_json(),
-            IDENTITY_COLUMN: self._identity_of(chunk.embed_text, fingerprint),
+            IDENTITY_COLUMN: self._identity_of(chunk, fingerprint),
         }
 
-    def _identity_of(self, embed_text: str, fingerprint: EmbedFingerprint) -> str:
-        """This store's one rule for what a stored vector's embedding input was."""
-        return embedding_input_identity(embed_text, embed=fingerprint, middleware=self._middleware)
+    def _identity_of(self, chunk: Chunk, fingerprint: EmbedFingerprint) -> str:
+        """This store's one rule for what a stored vector's embedding input was.
+
+        Takes the chunk rather than its ``embed_text``, because the identity is scoped by the
+        document the chunk belongs to and a bare string cannot say which that is.
+        """
+        return embedding_input_identity(
+            chunk.embed_text,
+            document_id=chunk.document_id,
+            embed=fingerprint,
+            middleware=self._middleware,
+        )
 
     def _ready(self) -> tuple[AsyncTable, EmbedFingerprint]:
         """The open table and its fingerprint, or a refusal naming what was skipped."""

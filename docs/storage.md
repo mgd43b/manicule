@@ -805,14 +805,24 @@ The Lance table holds the minimum needed to find a chunk and to filter before fi
 | `embed_identity` | `string` | what this vector is an embedding *of* — see below |
 
 **`embed_identity` is what makes a re-parse cost less than a re-embed.** It is a digest over
-the exact string handed to the model, the embed fingerprint, and any middleware declaring
-`mutates_embedded_text` (`core/embedding.py`). It lives here, in the row with the vector it
-describes, rather than in SQLite — a `chunks` column asserting that a vector exists in another
+the exact string handed to the model, the **document** it belongs to, the embed fingerprint,
+and any middleware declaring `mutates_embedded_text` (`core/embedding.py`). It lives here, in
+the row with the vector it describes, rather than in SQLite — a `chunks` column asserting that a vector exists in another
 store is precisely the claim that must never be taken on trust, and a row that carries its own
 identity cannot outlive the vector it is about.
 
+**The document is in the digest for the reason `workspace_id` is in `document_id` (§3.2).** A
+stored vector is found by looking its identity up in this table, and this table has no
+`workspace_id` column — deliberately, see below. A lookup keyed on the embedding input alone
+would therefore be the one vector read that no filter scopes, and it would stay that way in
+silence, because a query matching too much looks exactly like a query matching correctly. A
+document id is derived from its workspace, so folding it in makes a cross-tenant match
+impossible to express rather than merely unlikely to be written. The cost is reuse *between*
+two documents, which is worth almost nothing: `embed_text` carries the document's own title in
+its breadcrumb, so two documents rarely produce the same embedding input at all.
+
 Three things must all hold before a stored vector is reused: the same fingerprint, the same
-embedding input, and a **readable** vector for that identity. The last is checked by reading the
+embedding input **for that document**, and a **readable** vector for that identity. The last is checked by reading the
 row, because the first two are metadata and metadata can be wrong. The identity recorded in the
 row is also cross-checked against one derived from the `chunk_json` beside it; a row that says
 two different things about what it embedded is rebuilt rather than believed.

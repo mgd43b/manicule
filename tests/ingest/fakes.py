@@ -446,7 +446,7 @@ class MemoryVectors:
                 # tuple — compare unequal to the identical vector it replaced.
                 vector=tuple(vector),
                 embed_text=chunk.embed_text,
-                identity=self._identity_of(chunk.embed_text),
+                identity=self._identity_of(chunk),
             )
 
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
@@ -457,7 +457,7 @@ class MemoryVectors:
                 continue
             verdicts[chunk.id] = choose_stored_vector(
                 self._classify(chunk, self.rows.get(chunk.id)),
-                self._classify(chunk, self._row_by_identity(self._identity_of(chunk.embed_text))),
+                self._classify(chunk, self._row_by_identity(self._identity_of(chunk))),
             )
         return verdicts
 
@@ -485,11 +485,14 @@ class MemoryVectors:
             return None
         return next((row for row in self.rows.values() if row.identity == identity), None)
 
-    def _identity_of(self, embed_text: str) -> str:
+    def _identity_of(self, chunk: Chunk) -> str:
         if self._fingerprint is None:
             return UNRECORDED_IDENTITY
         return embedding_input_identity(
-            embed_text, embed=self._fingerprint, middleware=self._middleware
+            chunk.embed_text,
+            document_id=chunk.document_id,
+            embed=self._fingerprint,
+            middleware=self._middleware,
         )
 
     async def search(
