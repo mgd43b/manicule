@@ -11,7 +11,8 @@ silently, with the assertion that protects it still passing because it only know
 
 So this file asserts three things:
 
-* the paths those operations would have are still absent, now checked under ``/ui`` as well;
+* the paths those operations would have are still absent, now checked under ``/ui`` as well
+  and checked against the **route table** rather than against a status code;
 * this package never calls ``config_get`` or ``config_set``, read from the source tree rather
   than from behaviour, because a call added later would otherwise only fail if somebody wrote a
   test for that page;
@@ -28,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from manicule.web import pages, rendering, security
+from tests.routing_support import Reach, classify, walk_routes
 from tests.web.support import backend_with_a_document, client_for
 
 NOT_FOUND = 404
@@ -35,36 +37,81 @@ METHOD_NOT_ALLOWED = 405
 
 SOURCE = Path(rendering.HERE)
 
-ABSENT: tuple[tuple[str, str, str], ...] = (
-    ("POST", "/ui/documents/upload", "an ingest path with no filesystem permission check"),
-    ("POST", "/ui/documents", "the same, under the listing's own path"),
-    ("POST", "/ui/settings", "writing configuration over the network repoints an installation"),
-    ("POST", "/ui/config", "the same operation under its own name"),
-    ("POST", "/ui/index", "indexing a path a browser named makes the server read any file"),
-    ("POST", "/ui/connectors", "declaring a connector points the index somewhere new"),
-    ("POST", "/ui/plugins", "installing a plugin fetches and executes code"),
-    ("POST", "/ui/workspaces", "switching a workspace is a command-line operation"),
+ABSENT: tuple[tuple[str, str, Reach, str], ...] = (
+    (
+        "POST",
+        "/ui/documents/upload",
+        Reach.SHADOWED,
+        "an ingest path with no filesystem permission check",
+    ),
+    ("POST", "/ui/documents", Reach.SIBLING, "the same, under the listing's own path"),
+    (
+        "POST",
+        "/ui/settings",
+        Reach.SIBLING,
+        "writing configuration over the network repoints an installation",
+    ),
+    ("POST", "/ui/config", Reach.UNROUTED, "the same operation under its own name"),
+    (
+        "POST",
+        "/ui/index",
+        Reach.UNROUTED,
+        "indexing a path a browser named makes the server read any file",
+    ),
+    (
+        "POST",
+        "/ui/connectors",
+        Reach.SIBLING,
+        "declaring a connector points the index somewhere new",
+    ),
+    ("POST", "/ui/plugins", Reach.SIBLING, "installing a plugin fetches and executes code"),
+    (
+        "POST",
+        "/ui/workspaces",
+        Reach.SIBLING,
+        "switching a workspace is a command-line operation",
+    ),
 )
 """Operations a browser UI is usually expected to have, and does not have here.
 
-Each with the reason. ``/ui/index`` is worth reading twice: it is the obvious *replacement* for
-an upload — "point the server at a path" — and it is worse, because it turns a browser into a
-reader of every file the process can open.
+Each with the reason, and with **why the request reaches no operation**, which is a fact about
+the route table rather than about a status code. ``/ui/index`` is worth reading twice: it is the
+obvious *replacement* for an upload — "point the server at a path" — and it is worse, because it
+turns a browser into a reader of every file the process can open.
+
+Most of these are :attr:`~tests.routing_support.Reach.SIBLING`, and on this surface that is the
+*expected* shape rather than a weakness: the page itself is published at that path for ``GET``,
+so a ``POST`` appearing there would be this very operation arriving, which is the change to
+fail on. The two :attr:`~tests.routing_support.Reach.UNROUTED` entries are the load-bearing
+ones, because they are what proves the 404 handler described in this module's docstring is
+still a handler and not a catch-all *route*: a catch-all would match, and they would classify
+as :attr:`~tests.routing_support.Reach.EXECUTES` instead.
+
+``POST /ui/documents/upload`` is the one to watch. It is refused only because
+``/ui/documents/{document_id}`` declares no ``POST`` today — nothing about upload is checked at
+all — so it is declared :attr:`~tests.routing_support.Reach.SHADOWED` and will fail here the day
+that route gains a write verb.
 """
 
 
-@pytest.mark.parametrize(("method", "path", "why"), ABSENT)
-def test_the_browser_surface_adds_no_write_route(method: str, path: str, why: str) -> None:
-    """404 or 405 both mean "there is no such operation here".
+@pytest.mark.parametrize(("method", "path", "expected", "why"), ABSENT)
+def test_the_browser_surface_adds_no_write_route(
+    method: str, path: str, expected: Reach, why: str
+) -> None:
+    """Asserted over the route table, not by sending the request and reading the status.
 
-    What must not happen is a 200, a 401 or a 403 — each of those says the route exists and
-    something else stopped it, which is one configuration change away from not stopping it.
+    404 and 405 are what an absent operation returns and also what several present ones return,
+    so a probe cannot distinguish "there is no such operation" from "a handler ran and did not
+    find what you named". The route table can, and it is the thing the property is about.
     """
-    backend, _ = backend_with_a_document()
-    with client_for(backend) as client:
-        response = client.request(method, path, json={})
-    assert response.status_code in {NOT_FOUND, METHOD_NOT_ALLOWED}, (
-        f"{method} {path} exists. It is deliberately absent because {why}."
+    reached = classify(method, path, walk_routes())
+    assert reached.reach is not Reach.EXECUTES, (
+        f"{method} {path} runs {reached.route}. It is deliberately absent because {why}, but "
+        f"this request reaches a handler rather than nothing."
+    )
+    assert reached.reach is expected, (
+        f"{method} {path} is {reached.reach.value} ({reached.route}), not {expected.value}. The "
+        f"operation is deliberately absent because {why}; what changed is *why*."
     )
 
 

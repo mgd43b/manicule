@@ -13,25 +13,22 @@ would then be unjoinable to one of successes, quietly.
 list of routes on every FastAPI: from 0.13x an included router appears as a wrapper object, and
 a walk that only recognised :class:`~fastapi.routing.APIRoute` therefore found **nothing at
 all** — and reported success, because "no route is misnamed" is trivially true of no routes.
-That is the failure mode this file exists to not have, so :func:`_routes` descends into
-whatever shape the framework used and :data:`MINIMUM_ROUTES` is a floor below which the walk is
-assumed to have collapsed rather than the surface to have shrunk.
+That is the failure mode this file exists to not have, so the walk lives in
+:mod:`tests.routing_support` — :func:`~tests.routing_support.walk_routes` descends into whatever
+shape the framework used, and :data:`~tests.routing_support.MINIMUM_ROUTES` is a floor below
+which it is assumed to have collapsed rather than the surface to have shrunk. It is shared
+rather than copied because the absence suites now assert over the same table, and two walks
+with one floor between them is the arrangement where the floor guards only one of them.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
-
 import pytest
-from fastapi.routing import APIRoute, APIWebSocketRoute
+from fastapi.routing import APIRoute
 
-from manicule.api.app import build_app
-from manicule.app.service import ApplicationService
 from manicule.mcp.server import TOOL_NAMES
 from tests.api.support import backend_with_a_document, client_for, envelope
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+from tests.routing_support import walk_routes
 
 UNAUTHORIZED = 401
 
@@ -115,44 +112,6 @@ NOT_OPERATIONS: frozenset[str] = frozenset(
     }
 )
 
-MINIMUM_ROUTES = 40
-"""A floor on how many routes the walk below must find.
-
-Far below the real count, and present to catch a walk that collapsed rather than to track the
-size of the surface. It has caught one: on FastAPI 0.141 an included router is a wrapper object
-rather than its routes, and the previous walk found **zero** — with every assertion in this
-file passing, because each of them is a statement about every route and there were none.
-"""
-
-
-def _descend(routes: Iterable[object]) -> Iterator[APIRoute | APIWebSocketRoute]:
-    """Every route, whichever shape this FastAPI put them in.
-
-    A router included with ``include_router`` may appear on ``app.routes`` as its routes or as
-    one object standing for them, depending on the version. Both are followed, so this file
-    keeps enumerating the surface across an upgrade instead of quietly enumerating none of it.
-    """
-    for route in routes:
-        if isinstance(route, (APIRoute, APIWebSocketRoute)):
-            yield route
-            continue
-        inner = getattr(route, "routes", None)
-        if inner is None:
-            inner = getattr(getattr(route, "original_router", None), "routes", None)
-        if inner:
-            yield from _descend(cast("Iterable[object]", inner))
-
-
-def _routes() -> list[APIRoute | APIWebSocketRoute]:
-    backend, _ = backend_with_a_document()
-    found = list(_descend(build_app(ApplicationService(backend)).routes))
-    assert len(found) >= MINIMUM_ROUTES, (
-        f"the walk found {len(found)} route(s), below the floor of {MINIMUM_ROUTES}. Every "
-        f"assertion in this file is a statement about *every* route, so a walk that found "
-        f"none passes them all. Fix the walk rather than the floor."
-    )
-    return found
-
 
 def test_every_route_is_named_for_the_operation_it_runs() -> None:
     """The vocabulary is one list across three surfaces, including on a refusal.
@@ -163,7 +122,7 @@ def test_every_route_is_named_for_the_operation_it_runs() -> None:
     """
     unknown = sorted(
         route.name
-        for route in _routes()
+        for route in walk_routes()
         if route.name not in OPERATIONS and route.name not in NOT_OPERATIONS
     )
     assert unknown == [], (
@@ -221,7 +180,7 @@ def test_every_route_describes_itself() -> None:
     """A route with no summary is an OpenAPI entry a client has to guess at."""
     undescribed = sorted(
         route.path
-        for route in _routes()
+        for route in walk_routes()
         if isinstance(route, APIRoute) and not (route.summary or route.description)
     )
     assert undescribed == [], f"routes with no summary: {undescribed}"
@@ -242,11 +201,11 @@ def test_no_route_exposes_the_orphan_cleanup() -> None:
 
     The second attempt read ``app.routes`` directly and was worse — it found no routes at all,
     for the reason this module's docstring already gives, and reported success. Hence
-    :func:`_routes`, whose floor fails a walk that collapsed.
+    :func:`~tests.routing_support.walk_routes`, whose floor fails a walk that collapsed.
     """
     offending = sorted(
         f"{route.name} {route.path}"
-        for route in _routes()
+        for route in walk_routes()
         if "orphan" in route.path.lower() or "orphan" in route.name.lower()
     )
     assert offending == [], (

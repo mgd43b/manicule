@@ -6,9 +6,12 @@ Two kinds of assertion live here.
 generated OpenAPI document rather than from a list somebody keeps in their head — a route
 registered on a router that was never included is in the file and not in the interface.
 
-**Absence.** Seven destructive operations exist on the command line and are deliberately not
+**Absence.** Destructive operations exist on the command line and are deliberately not
 reachable here. Absence is the easiest property to lose by accident and the hardest to notice,
-so each one is asserted by name: a route added later that reintroduces one fails this file.
+so each one is asserted against the **route table** — see :data:`ABSENT` — rather than by
+sending the request and accepting a 404 or a 405. Those two statuses are what an absent
+operation returns and also what several present ones return, so the probe could not tell the
+two apart, and for one entry it was not telling them apart.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import pytest
 
 from manicule.api.app import ROUTE_GROUPS
 from tests.api.support import app_for, backend_with_a_document, client_for, envelope
+from tests.routing_support import Reach, classify, walk_routes
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -197,40 +201,122 @@ def test_a_missing_required_parameter_is_also_the_ordinary_envelope() -> None:
 
 # --- the destructive boundary -----------------------------------------------------------------
 
-ABSENT: tuple[tuple[str, str, str], ...] = (
+ABSENT: tuple[tuple[str, str, Reach, str], ...] = (
     (
         "DELETE",
         "/api/v1/index",
+        Reach.UNROUTED,
         "reset-index empties the whole workspace with no restore path",
     ),
-    ("POST", "/api/v1/admin/reset-index", "the same operation under an admin path"),
-    ("POST", "/api/v1/admin/restore", "restore overwrites the live data directory"),
-    ("POST", "/api/v1/admin/backup", "a backup writes wherever the caller names"),
-    ("POST", "/api/v1/documents/upload", "an ingest path with no filesystem permission check"),
-    ("POST", "/api/v1/plugins/install", "installing a plugin fetches and executes code"),
-    ("POST", "/api/v1/admin/upgrade", "an upgrade fetches and executes code"),
-    ("POST", "/api/v1/admin/connectors", "declaring a connector points the index somewhere new"),
-    ("GET", "/api/v1/admin/benchmark", "a benchmark on request is a denial of service"),
+    (
+        "POST",
+        "/api/v1/admin/reset-index",
+        Reach.UNROUTED,
+        "the same operation under an admin path",
+    ),
+    (
+        "POST",
+        "/api/v1/admin/restore",
+        Reach.UNROUTED,
+        "restore overwrites the live data directory",
+    ),
+    ("POST", "/api/v1/admin/backup", Reach.UNROUTED, "a backup writes wherever the caller names"),
+    (
+        "POST",
+        "/api/v1/documents/upload",
+        Reach.SHADOWED,
+        "an ingest path with no filesystem permission check",
+    ),
+    ("POST", "/api/v1/admin/upgrade", Reach.UNROUTED, "an upgrade fetches and executes code"),
+    (
+        "POST",
+        "/api/v1/admin/connectors",
+        Reach.SIBLING,
+        "declaring a connector points the index somewhere new",
+    ),
+    (
+        "GET",
+        "/api/v1/admin/benchmark",
+        Reach.UNROUTED,
+        "a benchmark on request is a denial of service",
+    ),
 )
 """Operations that exist elsewhere in manicule and are deliberately not routes here.
 
-Each is named with the reason. An absence with no test is an absence that comes back.
+Each is named with the reason, and with **why the request does not reach an operation** — which
+is a fact about the route table and is what :func:`test_a_destructive_operation_has_no_route`
+checks. The three are not interchangeable, and writing the expected one down is the point:
+
+* :attr:`~tests.routing_support.Reach.UNROUTED` — nothing matches. Absence is structural.
+* :attr:`~tests.routing_support.Reach.SIBLING` — the literal path is published for another verb.
+  ``GET /api/v1/admin/connectors`` lists connectors; adding ``POST`` to it would be adding the
+  declaring operation, which is exactly the change this should fail on.
+* :attr:`~tests.routing_support.Reach.SHADOWED` — **a latent defect, recorded rather than
+  fixed.** ``POST /api/v1/documents/upload`` is refused only because ``/documents/{document_id}``
+  declares no ``POST`` *today*. Nothing about upload is being checked; the day a document-update
+  verb is added there, this path starts executing it with ``document_id='upload'``. The entry is
+  declared ``SHADOWED`` so that day turns it into ``EXECUTES`` and fails here, loudly, instead of
+  passing on in silence.
+
+``POST /api/v1/plugins/install`` is deliberately **not** in this list. It matches
+``/api/v1/plugins/{name}`` and *runs* ``plugin_add`` with ``name='install'``; its 404 comes from
+inside that handler, so probing the path never demonstrated an absence at all. What is actually
+absent is the operation, and that is asserted by name in
+:func:`test_no_route_installs_a_plugin`.
+
+An absence with no test is an absence that comes back.
 """
 
 
-@pytest.mark.parametrize(("method", "path", "why"), ABSENT)
-def test_a_destructive_operation_has_no_route(method: str, path: str, why: str) -> None:
-    """Not reachable, and the reason travels with the assertion.
+@pytest.mark.parametrize(("method", "path", "expected", "why"), ABSENT)
+def test_a_destructive_operation_has_no_route(
+    method: str, path: str, expected: Reach, why: str
+) -> None:
+    """Not reachable, asserted over the route table, and the reason travels with it.
 
-    404 or 405 both mean "there is no such operation here". What must not happen is a 200, a
-    401 or a 403 — each of those says the route exists and something else stopped it, which is
-    one configuration change away from not stopping it.
+    Deliberately **not** a request whose status code is inspected. 404 and 405 are what an
+    absent operation returns and also what several present ones return, so a probe cannot tell
+    "there is no such operation" from "a handler ran and did not find the entity you named" —
+    and this list contained one of the latter wearing the former's costume.
     """
-    backend, _ = backend_with_a_document()
-    with client_for(backend) as client:
-        response = client.request(method, path, json={})
-    assert response.status_code in {NOT_FOUND, METHOD_NOT_ALLOWED}, (
-        f"{method} {path} exists. It is deliberately absent because {why}."
+    reached = classify(method, path, walk_routes())
+    assert reached.reach is not Reach.EXECUTES, (
+        f"{method} {path} runs {reached.route}. It is deliberately absent because {why}, but "
+        f"this request reaches a handler — any 404 comes from inside it, and a request naming "
+        f"an entity that exists would not get one."
+    )
+    assert reached.reach is expected, (
+        f"{method} {path} is {reached.reach.value} ({reached.route}), not {expected.value}. The "
+        f"operation is deliberately absent because {why}; what changed is *why* it is absent, "
+        f"which is what this list records. Update the declared reach if the new reason is "
+        f"intended."
+    )
+
+
+def test_no_route_installs_a_plugin() -> None:
+    """Asserted by name over the route table, because no path probe can assert it.
+
+    ``POST /api/v1/plugins/install`` looks like the check and is not one: it matches
+    ``/api/v1/plugins/{name}`` and **executes** ``plugin_add`` with ``name='install'``, returning
+    404 only because nothing is installed under that name. Install a plugin actually called
+    ``install`` and the same request returns 200 and enables it — with a status-code assertion
+    about that path still green.
+
+    The boundary itself holds, and this is about the assertion rather than about the boundary:
+    ``plugin_add`` requires an admin principal and has no branch that fetches or executes code,
+    which :func:`test_enabling_a_plugin_never_installs_one` covers from the behavioural side.
+    What was missing was anything that would notice an *install* route being added, so that is
+    what this is.
+    """
+    offending = sorted(
+        f"{route.name} {route.path}"
+        for route in walk_routes()
+        if "install" in route.path.lower() or "install" in route.name.lower()
+    )
+    assert offending == [], (
+        f"a route installs plugins: {offending}. Installing a plugin fetches and executes code, "
+        f"so it stays on the command line; this surface only enables one that an operator has "
+        f"already put on disk."
     )
 
 
