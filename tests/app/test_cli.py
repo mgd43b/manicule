@@ -1079,6 +1079,40 @@ carries on writing escapes, because the setting was read at import and the test 
 the output.
 """
 
+SGR = re.compile(r"\x1b\[([0-9;]*)m")
+"""Every "select graphic rendition" sequence, with its parameters.
+
+The parameters are the point. ``\\x1b[1m`` is bold and ``\\x1b[32m`` is green, and the
+difference decides whether the control below can fail.
+"""
+
+COLOUR_PARAMETERS = frozenset(
+    [*(str(code) for code in range(30, 38)), *(str(code) for code in range(90, 98)), "38"]
+)
+"""SGR parameters that set a foreground colour: the 8, the bright 8, and 256/true-colour.
+
+Backgrounds are not listed because this output sets none, and a set naming codes nothing emits
+would be a guess about what to expect.
+"""
+
+
+def _colours(text: str) -> set[str]:
+    """The foreground colours actually present in some output.
+
+    Separate from "are there escapes at all", and the separation is the whole reason this
+    exists. Rich's ``no_color`` strips **colour** and keeps everything else, so a run with
+    colour genuinely turned off still emits ``\\x1b[1m`` for bold — and a control asserting
+    only that *an* escape appeared would pass while reporting on a stream that had no colour in
+    it. That is the shape of vacuous check this control was written to prevent, so it must not
+    be the shape of the control.
+    """
+    return {
+        parameter
+        for sequence in SGR.findall(text)
+        for parameter in sequence.split(";")
+        if parameter in COLOUR_PARAMETERS
+    }
+
 
 def test_a_colouring_terminal_puts_no_escape_sequences_in_the_json(
     monkeypatch: pytest.MonkeyPatch, bound: ApplicationService
@@ -1109,13 +1143,25 @@ def test_the_same_terminal_does_colour_the_human_output(
     mean anything. If it did not — a typo in the variable, a console built before the
     environment was set — the assertion above would hold on a stream that was never going to be
     coloured, and would go on holding after somebody reintroduced a banner.
+
+    **Asserted on colour rather than on escapes**, which the first version of this control got
+    wrong. Rich's ``no_color`` strips colour and leaves bold, so a console built with colour
+    genuinely disabled still writes ``\\x1b[1m`` — and "an escape appeared" passed on output
+    with no colour in it. The control could not fail for the reason it existed to detect, which
+    is the same defect it was guarding the neighbouring test against.
+
+    The colour environment is the fixture's, not the caller's. This test failed under
+    ``TERM=dumb`` before ``colour_environment`` existed, because ``TERM`` declares what the
+    stream can *render* and overrides ``FORCE_COLOR``, which only declares that it is a
+    terminal.
     """
     del bound
     monkeypatch.setenv("FORCE_COLOR", "1")
     result = run(["doctor"])
     assert result.exit_code == 0
-    assert ESCAPE in result.stdout, (
-        "FORCE_COLOR did not reach Rich, so the no-escapes assertion under --json is vacuous"
+    assert _colours(result.stdout), (
+        f"no foreground colour reached stdout, so the no-escapes assertion under --json is "
+        f"vacuous. Sequences present: {sorted(set(SGR.findall(result.stdout)))}"
     )
 
 
@@ -1480,3 +1526,87 @@ def test_recording_a_workspace_keeps_any_other_override_already_set() -> None:
     finally:
         cli.STATE.workspace = None
         cli.STATE.overrides = was
+
+
+# --- what the colour variables mean, pinned rather than assumed --------------------------------
+
+
+COLOUR_ENVIRONMENTS: tuple[tuple[str, dict[str, str], bool], ...] = (
+    ("forced", {"FORCE_COLOR": "1"}, True),
+    ("forced, and NO_COLOR set", {"FORCE_COLOR": "1", "NO_COLOR": "1"}, False),
+    ("forced, on a dumb terminal", {"FORCE_COLOR": "1", "TERM": "dumb"}, False),
+    ("forced, dumb and NO_COLOR", {"FORCE_COLOR": "1", "NO_COLOR": "1", "TERM": "dumb"}, False),
+    ("NO_COLOR alone", {"NO_COLOR": "1"}, False),
+    ("nothing set", {}, False),
+)
+"""Each colour environment, and whether manicule's human output should carry colour in it.
+
+Read from the behaviour of Rich 14 rather than from a rule manicule imposes, because manicule
+imposes none: :func:`manicule.cli.render.console` passes no colour arguments at all, so both
+conventions are honoured by the library and this table is what that delegation *means*.
+
+Two entries are the ones worth having. ``FORCE_COLOR`` with ``NO_COLOR`` is the combination
+bug3 asked about, and the answer is that ``NO_COLOR`` wins — though not by overriding, which is
+why the question is worth answering precisely: they are separate mechanisms, ``FORCE_COLOR``
+saying the stream is a terminal and ``NO_COLOR`` stripping the colour back out of what is
+written to it. ``FORCE_COLOR`` on a dumb terminal is the one that actually broke the suite, and
+it is not a colour switch at all: ``TERM=dumb`` says the stream cannot render ANSI, and Rich
+believes the capability over the request.
+"""
+
+
+@pytest.mark.parametrize(("label", "environment", "coloured"), COLOUR_ENVIRONMENTS)
+def test_the_human_output_honours_both_colour_conventions(
+    monkeypatch: pytest.MonkeyPatch,
+    bound: ApplicationService,
+    *,
+    label: str,
+    environment: dict[str, str],
+    coloured: bool,
+) -> None:
+    """The precedence, pinned by what comes out rather than documented and hoped for.
+
+    manicule delegates this entirely — it builds a console with no colour arguments — so what
+    is pinned here is a dependency's behaviour, deliberately. A Rich upgrade that changed any
+    row would change what an operator's ``NO_COLOR`` does, silently and without any manicule
+    code being touched. This is the test that would say so.
+    """
+    del bound
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    result = run(["doctor"])
+
+    assert result.exit_code == 0
+    assert bool(_colours(result.stdout)) is coloured, (
+        f"with {label}, colour was expected {'present' if coloured else 'absent'} and was not. "
+        f"Sequences present: {sorted(set(SGR.findall(result.stdout)))}"
+    )
+
+
+@pytest.mark.parametrize(("label", "environment", "coloured"), COLOUR_ENVIRONMENTS)
+def test_json_carries_no_ansi_in_any_colour_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    bound: ApplicationService,
+    *,
+    label: str,
+    environment: dict[str, str],
+    coloured: bool,
+) -> None:
+    """The property the whole section exists to protect, across every environment above.
+
+    ``--json`` is not a colour setting and must not behave like one: the envelope goes to
+    stdout through ``sys.stdout.write`` rather than through Rich, so no colour variable can put
+    a byte in it. Asserted for the coloured rows especially — those are the ones where a
+    regression would actually show, and the ones a developer on a ``TERM=dumb`` terminal would
+    never reproduce.
+    """
+    del bound, coloured
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    result = run(["doctor", "--json"])
+
+    assert result.exit_code == 0
+    assert ESCAPE not in result.stdout, f"an ANSI escape reached stdout under --json, with {label}"
+    assert json.loads(result.stdout)["op"] == "doctor"

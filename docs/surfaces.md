@@ -144,6 +144,43 @@ installation reports success at being broken.
 - **Exit status is 0 on success, 1 on a failed operation, 2 on a usage error** that Typer
   rejected before the service was reached.
 
+### Colour, and the three variables that decide it
+
+Colour applies to the **human** output only. Under `--json` the envelope is written straight to
+stdout rather than through Rich, so no colour variable can put a byte in it — that is a
+property of how it is written, not a setting, and it holds in every environment below.
+
+manicule imposes no colour policy of its own: `manicule.cli.render.console` passes no colour
+arguments, so both conventions are honoured by Rich and the behaviour is Rich's. What that
+delegation means, as of Rich 14:
+
+| Environment | Human output |
+|---|---|
+| `FORCE_COLOR` set | coloured |
+| `FORCE_COLOR` and `NO_COLOR` set | **not** coloured |
+| `FORCE_COLOR` set, `TERM=dumb` | **not** coloured |
+| `NO_COLOR` alone | not coloured |
+| nothing set | coloured only when stdout is a terminal |
+
+**`NO_COLOR` wins over `FORCE_COLOR`, but not by overriding it** — and the distinction is worth
+stating because it is what makes the pair predictable. They are separate mechanisms:
+`FORCE_COLOR` declares that the stream *is a terminal*, and `NO_COLOR` strips the colour back
+out of what gets written to it. With both set the stream is treated as a terminal and the
+output has no colour in it. Escape sequences that are not colour — bold, dim — still appear,
+which is what [no-color.org](https://no-color.org/) asks for: it governs colour, not styling.
+
+**`TERM=dumb` is not a colour switch and is the one that surprises.** It declares what the
+terminal can *render*, and Rich believes a capability over a request: `TERM=dumb` with
+`FORCE_COLOR` set produces no escape sequences at all. This is worth knowing because editors'
+integrated terminals and some CI runners set it, so output that is coloured on a developer's
+machine is plain on a colleague's with nothing having changed.
+
+The table is pinned by `tests/app/test_cli.py`, which asserts each row against captured stdout
+rather than trusting this document — so a Rich upgrade that changed what an operator's
+`NO_COLOR` does would fail the suite rather than the operator. The suite sets these variables
+explicitly for the same reason: colour is decided entirely by the environment, so a test that
+inherited the caller's shell would report on that shell rather than on manicule.
+
 ### Options `manicule` and its commands share
 
 Two options are declared on `manicule` itself and accepted by every command as well:

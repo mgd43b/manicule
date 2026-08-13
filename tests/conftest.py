@@ -21,6 +21,7 @@ from tests.corpus import build_all
 from tests.storage_helpers import data_dir, engine, store
 
 __all__ = [
+    "colour_environment",
     "corpus",
     "data_dir",
     "engine",
@@ -135,3 +136,46 @@ def corpus(tmp_path_factory: pytest.TempPathFactory) -> Path:
     structure reviewable as code, and lets the hostile cases exist without being stored.
     """
     return build_all(tmp_path_factory.mktemp("corpus"))
+
+
+COLOUR_VARIABLES: tuple[str, ...] = ("NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE")
+"""Environment variables that decide, on their own, whether anything is coloured.
+
+Rich reads ``NO_COLOR`` and ``FORCE_COLOR``; the ``CLICOLOR`` pair is the older convention that
+other tools on a developer's machine set, and clearing it costs nothing and removes a whole
+class of "works on my terminal" from the suite.
+"""
+
+BASELINE_TERM = "xterm-256color"
+"""The terminal the suite says it is running on, whatever the caller's shell says.
+
+``TERM`` is not a colour switch, which is exactly why it was missed: it is a *capability*
+declaration, and ``dumb`` tells Rich the stream cannot render ANSI at all — overriding
+``FORCE_COLOR``, which only says the stream is a terminal.
+"""
+
+
+@pytest.fixture(autouse=True)
+def colour_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every test the same colour environment, rather than the caller's.
+
+    Whether manicule colours its output is decided entirely by environment variables, so
+    without this the suite's result depends on the shell that started it. It did: a positive
+    control asserting that human output *is* coloured passed under an ordinary terminal and
+    failed under ``TERM=dumb``, which is what an editor's integrated terminal, a CI runner and
+    ``emacs`` all set.
+
+    That failure mattered more than a flaky test. The control exists so that the neighbouring
+    assertion — that ``--json`` emits no ANSI — is not vacuous, and a control that inverts with
+    the environment is the vacuum wearing a disguise: in a ``TERM=dumb`` shell it fails, the
+    obvious repair is to delete it, and the assertion it was protecting quietly stops meaning
+    anything.
+
+    The baseline is **no opinion, on a capable terminal**: the colour switches are cleared, so
+    nothing is forced either way, and ``TERM`` names a terminal that can render ANSI. A test
+    wanting colour sets ``FORCE_COLOR`` itself and now gets it deterministically; a test
+    wanting none needs nothing, because the runner's stdout is not a terminal.
+    """
+    for name in COLOUR_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TERM", BASELINE_TERM)
