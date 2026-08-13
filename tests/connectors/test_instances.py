@@ -374,6 +374,12 @@ async def test_a_connector_with_no_root_names_the_instance_to_fix(
     message = str(caught.value)
     assert "connectors.team-handbook.options" in message
     assert "plugins.config" not in message
+    # The example has to be a path somebody can copy. This assertion is here because its
+    # absence let `root = "/path/to/directory holding the page snapshots"` ship: the two
+    # checks above both passed on a message whose worked example was a sentence.
+    example = message.split('root = "')[1].split('"', maxsplit=1)[0]
+    assert " " not in example, f"the example root is prose, not a path: {example!r}"
+    assert example.startswith("/")
 
 
 async def test_two_instances_of_one_type_do_not_collide_on_document_identity(

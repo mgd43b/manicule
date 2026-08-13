@@ -58,7 +58,7 @@ def _source_name(context: BuildContext, type_name: str) -> str:
     return context.instance or type_name
 
 
-def _no_root(context: BuildContext, type_name: str, what: str) -> str:
+def _no_root(context: BuildContext, type_name: str, *, describe: str, example: str) -> str:
     """The message for a connector with nowhere to read from.
 
     Points at the instance's own ``options`` when there is an instance, because that is where
@@ -66,16 +66,22 @@ def _no_root(context: BuildContext, type_name: str, what: str) -> str:
     Getting this backwards is what the original bug report was: the error named a global
     setting the author had already written per-instance, so following it meant duplicating the
     root and giving every instance of the type the same one.
+
+    ``describe`` and ``example`` are two parameters because they sit in two grammatically
+    incompatible slots — "``.root`` to the *directory holding the page snapshots*" against
+    "``root = "/path/to/*snapshots*"``". One parameter serving both produced
+    ``root = "/path/to/directory holding the page snapshots"``, which is not a path anybody can
+    copy, in the one message this whole change exists to get right.
     """
     if context.instance:
         return (
             f"connector {context.instance!r} has no root. Set it under "
             f"[connectors.{context.instance}.options], for example "
-            f'root = "/path/to/{what}".'
+            f'root = "/path/to/{example}".'
         )
     return (
         f"connector {type_name!r} has no root. Set "
-        f'plugins.config."connector.{type_name}".root to the {what}.'
+        f'plugins.config."connector.{type_name}".root to the {describe}.'
     )
 
 
@@ -143,7 +149,12 @@ def build_filesystem(context: BuildContext) -> Connector:
         raise ConfigError(msg)
     if not settings.root:
         msg = (
-            _no_root(context, FILESYSTEM_CONNECTOR_NAME, "directory to index")
+            _no_root(
+                context,
+                FILESYSTEM_CONNECTOR_NAME,
+                describe="directory to index",
+                example="documents",
+            )
             + " Or use `manicule index <path>` for a one-off."
         )
         raise ConfigError(msg)
@@ -178,7 +189,12 @@ def build_confluence_snapshot(context: BuildContext) -> Connector:
         )
         raise ConfigError(msg)
     if not settings.root:
-        msg = _no_root(context, SNAPSHOT_CONNECTOR_NAME, "directory holding the page snapshots")
+        msg = _no_root(
+            context,
+            SNAPSHOT_CONNECTOR_NAME,
+            describe="directory holding the page snapshots",
+            example="snapshots",
+        )
         raise ConfigError(msg)
     return ConfluenceSnapshotConnector(
         Path(settings.root), name=_source_name(context, SNAPSHOT_CONNECTOR_NAME)
