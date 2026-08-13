@@ -258,12 +258,18 @@ million rows should not be loaded to produce one. ``truncated`` is reported alon
 that "no documents affected" cannot be read as "none anywhere" when it means "none in the first
 ten thousand".
 
-**Every state of both checks reports it**, which is a rule rather than a preference. The bound
-applies to the read, so it qualifies whatever the read concluded: the ok paths were the obvious
-gap, but ``document-content``'s *degraded* count was bounded too and said so nowhere, and
-"3 documents are stale" from a scan that stopped at ten thousand is the same misreading with a
-number in front of it. A count that omits its own bound is the failure this constant exists to
-prevent, and omitting it is easiest on the path that looks like good news."""
+**Every state that reports a count reports its bound**, which is a rule rather than a preference.
+The bound qualifies whatever the read concluded, so ``ok`` and ``degraded`` carry it on both
+checks: the ok paths were the obvious gap, but ``document-content``'s *degraded* count was
+bounded too and said so nowhere, and "3 documents are stale" from a scan that stopped at ten
+thousand is the same misreading with a number in front of it. A count that omits its own bound is
+the failure this constant exists to prevent, and omitting it is easiest on the path that looks
+like good news.
+
+``unknown`` is the exception and is not one: the read itself raised, so there is no page of
+documents and no count to qualify. Its ``facts`` carry the ``error_type`` and nothing else, which
+is the whole of what that state knows. Reporting ``examined: 0`` there would be a measurement
+nobody took."""
 
 _IDENTITY_SAMPLE = 25
 """How many of the affected documents are listed individually.
