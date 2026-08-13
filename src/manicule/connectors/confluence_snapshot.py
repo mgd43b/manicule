@@ -132,30 +132,31 @@ of one key are two keys and a citation would read whichever it happened to look 
 """
 
 UNINTERPRETED_MACROS: Final = "uninterpreted_macros"
-"""Metadata key recording macros present in the source that the parser will not understand.
+"""Metadata key naming the macros on a page that the parser reading it will not understand.
 
-Written on every page that contains any, and the reason this connector can ship before the
-storage-format parser does. See the module docstring: the loss is total for macro bodies held in
-CDATA, and an unreported partial parse is the failure this key exists to prevent.
+**Names only, and only the ones that are really uninterpreted.** It used to list every macro the
+page contained, which was true when nothing read any of them; the storage-format parser reads most
+of them now, so listing those would report a loss that does not happen. What remains is the set
+this parser has no reader for — the ones it emits an explicit placeholder for — and that set is
+asked of the parser rather than restated here, so the two cannot drift apart.
+
+Absent when there is nothing to say. A diagnostic on every page is a diagnostic nobody reads.
 """
 
-BODY_CONTENT_DROPPED: Final = (
-    "!body-content-dropped: a macro body is held in CDATA, which the generic HTML parser reparses "
-    "as a comment, so its content is absent from this document rather than merely flattened"
-)
-"""The entry added to :data:`UNINTERPRETED_MACROS` when content is lost rather than degraded.
+UNRECOVERABLE_MACRO_BODY: Final = "unrecoverable_macro_body"
+"""Metadata key recording a macro body that could not be recovered as text at all.
 
-Exported and asserted on, because "the semantics of this macro were flattened" and "the text of
-this macro is not in the index" are different sentences and only the second is a data-loss report.
-"""
+The narrow remainder of a warning that used to be broad and wrong. Before #90 every CDATA body was
+absent from the index, so the connector said so on every page carrying one; since #90 they are
+recovered as escaped text and that sentence became false. What is still true, and much rarer, is an
+export truncated inside a CDATA section: the section never closes, recovery leaves it exactly as it
+is rather than guessing where the author meant it to end, and its content really does not reach the
+index.
 
-_PLAIN_TEXT_BODY: Final = "ac:plain-text-body"
-"""The element whose content the generic HTML parser drops entirely.
-
-Detected as a **substring**, which is coarse on purpose and is not a parse. Its only job is to
-decide whether to warn, so the failure direction that matters is a *missed* warning — and a body
-element cannot be present without its own name being present. A spurious warning, from the literal
-appearing inside a code sample about Confluence, costs a line of diagnostics and no correctness.
+Separate from :data:`UNINTERPRETED_MACROS` because they are different claims — "we did not
+understand this macro" and "we do not have this macro's text" — and the previous design put the
+second into the *list* of the first as a sentence beginning ``!``, which made a list of names into a
+list of names-and-one-paragraph that nothing could read programmatically.
 """
 
 _DIRECTORY: Final = "snapshot_directory"
@@ -565,6 +566,9 @@ class ConfluenceSnapshotConnector:
         uninterpreted = _uninterpreted(body)
         if uninterpreted:
             metadata[UNINTERPRETED_MACROS] = uninterpreted
+        unrecoverable = _unrecoverable_body(body)
+        if unrecoverable:
+            metadata[UNRECOVERABLE_MACRO_BODY] = unrecoverable
         return metadata
 
     def _record(self, snapshot: _Snapshot, body: bytes) -> Provenance:
@@ -648,25 +652,63 @@ def _uninterpreted(body: bytes) -> list[JsonValue]:
     """The macros in ``body`` that the parser reading it will not understand.
 
     Located with :func:`~manicule.connectors.macros.storage_macros`, which parses rather than
-    matches text, so the names are the macros that are really there. The CDATA note is added
-    separately and coarsely — see :data:`_PLAIN_TEXT_BODY` — because it is the difference between
-    "this macro's semantics are flattened" and "**this macro's content is gone**", and the second
-    is what an operator has to be told.
+    matches text, so the names are the macros that are really there — then filtered against what
+    the storage-format parser declares it reads. Imported from the parser rather than restated,
+    for the reason :meth:`ConfluenceConnector._page_media_type` imports its media type: a second
+    copy of the answer goes stale the first time a macro is taught to one and not the other, and
+    the failure is a diagnostic that quietly describes a version of the code that no longer exists.
+
+    **Semantics only. This says nothing about whether the text arrived**, which is
+    :data:`UNRECOVERABLE_MACRO_BODY`'s question and a different one.
     """
+    from manicule.parsers.confluence import INTERPRETED_MACROS  # noqa: PLC0415 - see docstring
+
     try:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
         # Undecodable bytes are the parser chain's to report, not this scan's to guess at.
         return []
-    names = cast(
+    return cast(
         "list[JsonValue]",
-        sorted({macro.name for macro in storage_macros(text) if macro.name}),
+        sorted(
+            {
+                macro.name
+                for macro in storage_macros(text)
+                if macro.name and macro.name.lower() not in INTERPRETED_MACROS
+            }
+        ),
     )
-    if not names:
-        return []
-    if _PLAIN_TEXT_BODY in text.lower():
-        names.append(BODY_CONTENT_DROPPED)
-    return names
+
+
+def _unrecoverable_body(body: bytes) -> str:
+    """Why a macro body in ``body`` cannot reach the index, or ``""`` when they all can.
+
+    One case, and it is the only one left: a CDATA section that never closes.
+    :func:`~manicule.parsers.web.recover_cdata` leaves an unterminated section exactly as it found
+    it rather than guessing where the author meant it to end, so its content is not recovered and
+    genuinely is absent.
+
+    The scan mirrors that function's own loop rather than counting delimiters, because the two have
+    to agree about what "unterminated" means — a count would call ``]]>]]>`` balanced and this
+    would then contradict the parser about a document neither of them could read.
+    """
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    rest = text
+    while True:
+        _, opened, after = rest.partition("<![CDATA[")
+        if not opened:
+            return ""
+        _, closed, remainder = after.partition("]]>")
+        if not closed:
+            return (
+                "a CDATA section is never closed, so the macro body it holds is not recovered as "
+                "text and its content is absent from this document. The export is truncated or "
+                "the section was hand-edited; the retained bytes are the repair"
+            )
+        rest = remainder
 
 
 def _reasons(error: ValidationError) -> str:
@@ -708,12 +750,12 @@ def _relative(path: Path, *, root: Path) -> str:
 __all__ = [
     "ANCESTOR_IDS",
     "ATTACHMENTS",
-    "BODY_CONTENT_DROPPED",
     "CONTENT_STATUS",
     "LABELS",
     "MANIFEST_NAME",
     "MAX_MANIFEST_BYTES",
     "UNIDENTIFIED_PREFIX",
     "UNINTERPRETED_MACROS",
+    "UNRECOVERABLE_MACRO_BODY",
     "ConfluenceSnapshotConnector",
 ]

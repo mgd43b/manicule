@@ -130,7 +130,7 @@ class NoRetention:
 class Change(StrEnum):
     """What differs between a stored document and what a connector just fetched.
 
-    Three axes, kept apart because they change independently and cost different things to repair.
+    Four axes, kept apart because they change independently and cost different things to repair.
     A single "changed" boolean would answer whether to re-ingest and destroy the answer to why —
     and the second is the question somebody watching an unexpected re-ingest of a whole corpus is
     actually asking.
@@ -147,6 +147,22 @@ class Change(StrEnum):
     """The parser that produced the stored text is not the one installed now
     (``docs/storage.md`` §6.4). Neither the bytes nor the metadata moved; what we make of them
     did."""
+
+    ROUTING = "routing"
+    """The source now declares a different media type, so a **different parser** would read it.
+
+    Distinct from :attr:`LINEAGE`, and the distinction is not academic. Lineage asks whether the
+    parser that ran has since changed *version*, and it answers by looking up ``parser_used`` — so
+    when a document is re-routed to a different parser entirely, lineage compares the old parser
+    against itself, finds it unchanged, and reports the document current. Nothing else notices
+    either: the bytes are identical and the source record has not moved.
+
+    The consequence is a corpus that keeps text produced by a parser nothing routes to any more,
+    for ever, with no signal — and unlike a version bump there is no number to move that would fix
+    it, because the parser's *identity* changed rather than its version. Introducing a media type is
+    exactly the operation that does this, which is why this axis exists before the first one is
+    introduced rather than after.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -817,6 +833,12 @@ class IngestPipeline:
 
         Only a **settled** document may skip. One requeued after a crash carries a token and a
         hash from an ingest that never finished, and skipping on those would strand it forever.
+
+        **Routing is checked here and not only in :meth:`changes_since`**, for the same reason
+        lineage is. A well-behaved connector reports an unchanged token for a page nobody has
+        edited, so this level answers and the fetch never happens — and a check placed only at
+        level 2 would never run at all on exactly the corpora that are best behaved. Discovery
+        already carries the declared media type, so this costs no fetch to answer.
         """
         return (
             existing is not None
@@ -824,6 +846,7 @@ class IngestPipeline:
             and discovered.version_token is not None
             and existing.version_token == discovered.version_token
             and self._parse_lineage_is_current(existing)
+            and self._routing_is_current(existing, discovered.media_type)
         )
 
     def _unchanged_by_hash(
@@ -873,7 +896,25 @@ class IngestPipeline:
             found.add(Change.METADATA)
         if not self._parse_lineage_is_current(existing):
             found.add(Change.LINEAGE)
+        if not self._routing_is_current(existing, raw.media_type if raw is not None else None):
+            found.add(Change.ROUTING)
         return frozenset(found)
+
+    @staticmethod
+    def _routing_is_current(existing: Document, declared: str | None) -> bool:
+        """Whether what the source declares now still reaches the parser that produced the text.
+
+        One helper for both levels, so "may this be skipped" cannot come to disagree with "what
+        changed" — the same reason :meth:`_unchanged_by_hash` is expressed in terms of
+        :meth:`changes_since`. Level 1 has the declaration from discovery and level 2 from the
+        fetch; neither has to interpret it, because equality is the whole question.
+
+        **No declaration is agreement, not ignorance.** A connector that supplies no media type
+        at discovery, or a caller with no fetch in hand, has said nothing about routing — and
+        treating silence as a change would re-ingest every such corpus on every sync to learn
+        nothing, which is the failure the same rule avoids in :meth:`_source_record_is_current`.
+        """
+        return declared is None or existing.media_type == declared
 
     @staticmethod
     def _source_record_is_current(existing: Document, raw: RawDocument | None) -> bool:

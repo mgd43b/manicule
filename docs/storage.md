@@ -1026,6 +1026,23 @@ writing today's library versions into rows extracted months ago would assert som
 knows. The price is one re-parse of the corpus; the alternative is a lineage column that lies
 from the day it ships.
 
+**`parse_fp` cannot express a re-route, and this is the limit of it rather than a defect in
+it.** The query above compares each document against the current fingerprint *of the parser it
+records having used*. When a source starts declaring a different media type — because manicule
+introduced a profiled one, as it did for Confluence storage format — a different parser would
+now read those bytes, but the stored `parse_fp` still names the old parser and the old parser
+has not changed. The comparison therefore succeeds and reports the document current. Nothing
+else notices either: the bytes are identical, so the content hash agrees, and the source record
+has not moved.
+
+There is no number to bump that would fix it. A version states that one parser's output has
+changed; here the parser's *identity* changed, and the entry for the new parser is not the one
+those documents are compared against. So the axis lives in change detection rather than in
+lineage: `Change.ROUTING` compares the media type the source declares now against the one the
+document was stored under, at both levels — including level 1, which skips without fetching and
+is therefore where a well-behaved connector's corpus would otherwise go stale for ever.
+Introducing a media type is exactly the operation that needs it.
+
 ### 6.5 Creating and replacing the vector table
 
 **First ingest** creates `chunks__<fp8>` where `<fp8>` is the first eight hex characters of
