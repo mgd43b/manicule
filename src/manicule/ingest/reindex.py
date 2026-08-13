@@ -86,6 +86,17 @@ class ReindexReport:
     ``chunks`` above counts what was rebuilt; this counts what that cost. They are different
     numbers whenever a repair finds a vector it can keep, which after a narrow parser change
     is most of them.
+
+    **A document that failed contributes what it spent.** A store-stage failure happens after
+    the model has run, so the forward passes were paid for whether or not the vectors were
+    written; a report that counted only the documents it managed to rebuild would say a sweep
+    cost less precisely when things were going wrong.
+
+    **A superseded document contributes nothing, and that is a fact about the guard rather than
+    about this field.** The compare-and-swap fires on the first write a re-parse makes, which
+    is before it is chunked or embedded, so a document a sync overtakes is dropped before it
+    reaches the model. The window in which one could be superseded *after* embedding is the one
+    ``_commit`` names as unreachable while the instance lock is held.
     """
 
     def note_unrepairable(self, document: Document, reason: str) -> None:
@@ -422,6 +433,18 @@ async def re_parse(
             expected=document.revision,
         )
         for outcome in outcomes:
+            # Counted before the branching, and that is the point: the embed stage runs before
+            # anything below decides which list this document lands in, so what it cost is the
+            # same either way. The case that matters is a **store-stage failure** — the model
+            # has already run by the time an upsert fails — and counting only the documents a
+            # sweep managed to rebuild would report it as costing less the worse it went.
+            #
+            # Two things contribute zero here, for different reasons. A document superseded by a
+            # concurrent sync never reached the model: the guard fires on the re-parse's first
+            # write, which is before chunking. And a document that failed *inside* the embed
+            # stage left no accounting behind — an unknown number of batches had already gone —
+            # so zero is the honest floor rather than a guess at the figure.
+            report.note_embedding(outcome.embedding)
             if outcome.superseded:
                 # Ahead of the two failure shapes below, because a superseded document is
                 # neither of them and would be read as one: it comes back carrying the status
@@ -448,7 +471,6 @@ async def re_parse(
             else:
                 report.documents += 1
                 report.chunks += outcome.chunks
-                report.note_embedding(outcome.embedding)
     return report
 
 
@@ -663,6 +685,12 @@ async def re_parse_stale(
             left_behind += 1
             before = {chunk.id for chunk in await store.document_chunks(document.id)}
             report = await re_parse([document], pipeline=pipeline, blobs=blobs)
+            # Folded before the branching, for the reason `re_parse` folds it before its own:
+            # the embed stage runs before any of the outcomes below is decided. A document with
+            # no retained bytes contributes zero because nothing embedded it, and a superseded
+            # one contributes zero because the commit guard drops it before it is chunked — but
+            # a document that failed at the store contributes the passes it had already spent.
+            sweep.embedding = _total(sweep.embedding, report.embedding)
             if report.unrepairable:
                 sweep.unrepairable += 1
                 sweep.unrepairable_documents.extend(report.unrepairable)
@@ -683,7 +711,6 @@ async def re_parse_stale(
                     left_behind -= 1
                 continue
             sweep.reparsed += 1
-            sweep.embedding = _total(sweep.embedding, report.embedding)
             after = {chunk.id for chunk in await store.document_chunks(document.id)}
             sweep.chunks_new += len(after - before)
             sweep.chunks_kept += len(after & before)

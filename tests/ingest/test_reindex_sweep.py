@@ -693,7 +693,7 @@ async def describes_the_sync(
     ], "the glossary is replaced per document, so a reverted document reverts its definitions"
     assert all(chunk.id in vectors.rows for chunk in chunks), "every current chunk has a row"
     embedded = await fakes.CountingEmbedder().embed([chunk.embed_text for chunk in chunks])
-    assert [vectors.rows[chunk.id][1] for chunk in chunks] == embedded, (
+    assert [list(vectors.rows[chunk.id].vector) for chunk in chunks] == embedded, (
         "and the row against it is the embedding of the text it has now. A chunk id is derived "
         "from its text, so a reverted document would have reverted its chunk ids too and this "
         "would be reading rows written for the losing parse"

@@ -699,3 +699,35 @@ async def test_the_partition_adds_up_however_the_work_falls() -> None:
         "one untouched, one whose row went missing, one whose row contradicts itself, and one "
         "chunk the index has never seen"
     )
+
+
+async def test_a_document_lost_at_the_store_still_reports_what_it_spent_at_the_model() -> None:
+    """A failure after the model has run does not refund the forward passes.
+
+    The embed stage runs before the store is touched, so a document whose vectors could not be
+    written cost exactly what a document whose vectors were written cost. Counting only the
+    documents a sweep managed to rebuild would report it as costing *less* the worse the run
+    went — wrong in the one direction nobody checks, because the run being priced is the one
+    that failed.
+
+    The counting embedder is the arbiter, not the report: the assertion is that the two agree,
+    not that two of the report's own numbers do.
+    """
+    store, _, blobs, embedder = await indexed({"a": "alpha\nbeta\ngamma"})
+    refusing = fakes.RefusingVectors()
+    await refusing.ensure_ready(embedder.fingerprint)
+    embedder.batches.clear()
+
+    sweep = await re_parse_stale(
+        store=store,
+        pipeline=rebuilt(store, refusing, blobs, embedder, parser=ReversingLineParser()),
+        blobs=blobs,
+        parse_fingerprints=fingerprints("2"),
+    )
+
+    assert (sweep.failed, sweep.reparsed) == (1, 0), "the fixture must fail at the store"
+    assert sum(embedder.batches) == 3, "and it must have reached the model before failing"
+    assert sweep.embedding.forward_calls == len(embedder.batches)
+    assert sweep.embedding.embedded == sum(embedder.batches), (
+        "what the sweep spent is reported even though none of it was committed"
+    )
