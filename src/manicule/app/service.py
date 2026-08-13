@@ -47,7 +47,7 @@ from manicule.config.settings import (
     looks_secret,
 )
 from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome
-from manicule.core.content import DocumentStatus
+from manicule.core.content import PREVIOUS_IDENTITY, DocumentStatus
 from manicule.core.errors import ConfigError, ManiculeError, PolicyError, UnknownEntityError
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id
@@ -154,6 +154,21 @@ class AskAside:
     It is filled after ``message_id`` is known, so a streamed answer carries the id it was
     persisted under exactly as the non-streaming form does.
     """
+
+
+def _awaiting_reparse(document: Document) -> bool:
+    """Whether this document still serves the text it had before its identity was repaired.
+
+    The migration records the ``content_hash`` it saw, for the documents whose parse changes and
+    no others. While the column still holds that value the document has not been re-read; once it
+    differs, it has. One comparison, and it needs no clock, no watermark and nothing that has to
+    be cleaned up afterwards.
+    """
+    previous = document.metadata.get(PREVIOUS_IDENTITY)
+    if not isinstance(previous, dict):
+        return False
+    recorded = previous.get("content_hash")
+    return isinstance(recorded, str) and bool(recorded) and recorded == document.content_hash
 
 
 def _identity_deliberately_unapplied(document: Document, *, claimed: set[str]) -> bool:
@@ -935,6 +950,7 @@ class ApplicationService:
         checks.append(await self._index_check())
         checks.append(await self._connectors_check())
         checks.append(await self._document_identity_check())
+        checks.append(await self._document_content_check())
         checks.append(await self._grammar_check(fix=fix))
         checks.append(await self._vocabulary_check(fix=fix))
         # No `fix`. The other two repairs move megabytes and finish while somebody is looking
@@ -1345,6 +1361,75 @@ class ApplicationService:
                 },
             ),
             remedy=f"manicule document list --source {first.source}",
+        )
+
+    async def _document_content_check(self) -> r.Check:
+        """Documents whose identity was repaired and whose stored text has not been rebuilt yet.
+
+        **The window this exists to make visible.** Re-keying a document moves its row; it does
+        not re-read the file. So between the migration and the next sync a re-keyed enriched page
+        has its correct identity and its *old chunks* — the generic-HTML parse of the wrapper,
+        metadata banner and all. The corpus still returns exactly the content this whole change
+        exists to keep out of it.
+
+        Deleting the chunks in the migration would be worse: it removes content before its
+        replacement exists, and a page that answers nothing is a worse answer than a page that
+        answers stalely. So the intermediate state is kept and **stated**, which is the difference
+        between a design and a trap. An operator who runs a migration, sees it succeed and stops
+        would otherwise have a corpus with the original defect and nothing anywhere saying so.
+
+        **It clears itself.** The migration records the ``content_hash`` it saw, and only for
+        documents whose parse actually changes; this compares that against the live column, so the
+        moment a sync re-ingests the page with its extracted body the two differ and the finding
+        is gone. A document whose parse is unaffected — a mirrored PDF with a manifest — carries
+        no marker and is never reported, because it owes nothing.
+        """
+        try:
+            store = await self._backend.documents()
+            documents = await store.list_documents(limit=_IDENTITY_SCAN)
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            return r.Check(
+                name="document-content",
+                state="unknown",
+                detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        waiting = [document for document in documents if _awaiting_reparse(document)]
+        if not waiting:
+            return r.Check(
+                name="document-content",
+                state="ok",
+                detail="no document is serving text from before its identity was repaired",
+                facts={"awaiting_reparse": 0},
+            )
+        sources = sorted({document.source for document in waiting})
+        return r.Check(
+            name="document-content",
+            state="degraded",
+            detail=(
+                f"{len(waiting)} document(s) were re-keyed onto the identity their source "
+                f"declares and have not been re-read since. Their identity is correct and their "
+                f"stored text is not: it is the parse from before the storage body was routed to "
+                f"the storage parser, so it still carries the exporter's metadata banner and its "
+                f"macros still read as prose. Nothing is broken and nothing is missing — the "
+                f"pages are indexed, searchable and correctly cited — but they answer with text "
+                f"this build would not produce. Run "
+                f"{', '.join(f'`manicule connector sync {name}`' for name in sources)} to rebuild "
+                f"it, or `manicule index <path>` for a directory that is not a configured source. "
+                f"This clears itself once they are re-read."
+            ),
+            facts=cast(
+                "dict[str, JsonValue]",
+                {
+                    "awaiting_reparse": len(waiting),
+                    "sources": sources,
+                    "documents": [
+                        {"source": document.source, "source_id": document.source_id}
+                        for document in waiting[:_IDENTITY_SAMPLE]
+                    ],
+                },
+            ),
+            remedy=f"manicule connector sync {sources[0]}",
         )
 
     async def _index_check(self) -> r.Check:

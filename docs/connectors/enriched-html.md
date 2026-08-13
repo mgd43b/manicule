@@ -255,9 +255,34 @@ to be guessed, which is why this ships a migration and that did not.
 from `document_id`, so every chunk id moves; and the documents whose identity moves are precisely
 the documents whose *text* changes, because their body now reaches the storage parser instead of
 the HTML parser. Re-embedding is unavoidable either way, so the migration leaves the old chunks in
-place — they are stale text, and the next sync replaces them, which is a better intermediate state
-than removing content before its replacement exists. `chunks.id` does not move, so the vectors
-keyed on it stay valid throughout.
+place — removing content before its replacement exists is the worse intermediate state.
+
+That has two consequences, both stated here because neither should be discovered.
+
+**The stored text is wrong until you sync, and `doctor` says so.** A re-keyed page has its correct
+identity and its *old* chunks: the generic-HTML parse of the wrapper, metadata banner and all. So
+between the migration and the next sync the corpus still returns exactly what this change exists to
+keep out of it. The migration logs it, and `doctor`'s **`document-content`** check names the
+documents and the command:
+
+```
+N document(s) were re-keyed onto the identity their source declares and have not been
+re-read since. Their identity is correct and their stored text is not …
+Run `manicule connector sync <name>` to rebuild it.
+```
+
+It clears itself: the migration records the `content_hash` it saw — only for documents whose parse
+actually changes, so a mirrored PDF with a manifest is never reported — and the finding disappears
+the moment the page is re-ingested with its extracted body.
+
+**Chunk ids stop matching their own derivation, and nothing reads them that way.** A chunk whose
+parent moved no longer equals `chunk_id(document_id, position, text)`, and `glossary_entry_id`
+digests the chunk id so the same is true one level down. Nothing recomputes either and compares:
+`chunk_id` is called in exactly one place (`chunking/chunker.py`) and `glossary_entry_id` in one
+(`storage/glossary.py`), both at write time, to *mint* an id rather than check one. The only cost
+is that a later re-parse cannot reuse the vector for such a chunk — it replaces it, which is the
+re-embedding this change made unavoidable anyway. `tests/ingest/test_storage_integration.py`
+migrates, syncs, and asserts no chunk survives with an id that does not derive.
 
 Two files declaring one page id are **both** returned to their paths, and the conflict is reported.
 Not the second only: `documents` is `UNIQUE` on `(workspace_id, source, source_id)`, so honouring
