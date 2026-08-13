@@ -296,6 +296,50 @@ def test_an_oversized_table_splits_by_rows_and_repeats_the_header() -> None:
     )
 
 
+# A header row wide enough that the table alone exceeds the 448-token text budget, which is
+# what makes `_split_table` run at all: under the budget a table is placed whole and the
+# splitting path is never reached, so a small header-only table was never at risk.
+_WIDE_HEADER = " | ".join(" ".join(f"{name}{index}" for index in range(120)) for name in "abcde")
+
+
+@pytest.mark.parametrize(
+    ("label", "metadata"),
+    [
+        ("every row is a header row", {"rows": [_WIDE_HEADER], "header_rows": 1}),
+        ("header_rows exceeds the row count", {"rows": [_WIDE_HEADER], "header_rows": 9}),
+        ("rows is empty beside real text", {"rows": [], "header_rows": 0}),
+    ],
+)
+def test_an_oversized_table_with_no_row_to_split_at_is_still_indexed(
+    label: str, metadata: Metadata
+) -> None:
+    """A table the chunker cannot split by row must not vanish.
+
+    ``_split_table`` builds its parts from the rows *after* the header, so each of these
+    produced no parts and returned nothing — and a block that yields no unit reaches no chunk,
+    no vector and no citation. It is the quietest possible content loss: the table is simply
+    absent, and a document that was only this table looks exactly like one with no extractable
+    text. Every parser that emits ``rows`` can produce the shape, so the guard is here rather
+    than in seven parsers that must each remember it.
+
+    Prose splitting is the fallback because it is the answer this function already gives when
+    ``rows`` is absent: there is no row boundary to split at, so keep the text whole.
+    """
+    table = ParsedBlock(
+        kind=BlockKind.TABLE,
+        text=_WIDE_HEADER,
+        anchor=CellAnchor(sheet="Regional", ref="A1:E1"),
+        metadata=metadata,
+    )
+    chunks = make_chunker().chunk(document(), [table])
+    assert chunks, f"{label}: the table produced no chunks at all"
+    indexed = " ".join(chunk.text for chunk in chunks).split()
+    assert set(_WIDE_HEADER.split()) <= set(indexed), (
+        f"{label}: words from the table reached no chunk, so they are in no vector and "
+        f"quotable in no citation"
+    )
+
+
 def test_a_chunk_never_spans_a_page_boundary() -> None:
     """A chunk naming one page while half its text is on the next reads correctly and is
     wrong. Where two blocks' anchors cannot combine, the chunk closes."""
