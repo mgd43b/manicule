@@ -36,8 +36,9 @@ from manicule.core.embedding import (
 )
 from manicule.core.errors import ContextOverflowError
 from manicule.core.ids import chunk_id
-from manicule.ingest.embedding import embed_or_reuse
+from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
 from manicule.ingest.reindex import re_parse_stale, repair, select
+from tests.fakes import PassThroughMiddleware
 from tests.ingest import fakes
 from tests.ingest.test_pipeline import build, parse_versions
 from tests.ingest.test_reindex_sweep import MARKER, TrimmingLineParser, fingerprints
@@ -54,7 +55,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Sequence
 
     from manicule.core.content import RawDocument
-    from manicule.core.protocols import Chunker
+    from manicule.core.protocols import Chunker, Middleware
     from manicule.ingest.pipeline import IngestPipeline
 
 
@@ -77,6 +78,23 @@ class RebreadcrumbingChunker(fakes.BlockChunker):
             chunk.model_copy(update={"embed_text": f"{self.breadcrumb} > {chunk.text}"})
             for chunk in super().chunk(document, blocks)
         ]
+
+
+class RefusingChunkMiddleware(PassThroughMiddleware):
+    """Raises in ``after_chunk``, which is the last thing before the reuse partition runs.
+
+    A parser that explodes never enters ``_finish``; this does, and fails one line before
+    ``embed_or_reuse`` would have been called. The two reach the same outcome by different
+    routes, and only this one passes through the code that attaches the embed-stage accounting.
+    """
+
+    name = "refusing-chunk"
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        del document, chunks
+        msg = "the chunk hook is unavailable"
+        raise RuntimeError(msg)
 
 
 class ReversingLineParser(fakes.LineParser):
@@ -127,6 +145,7 @@ def rebuilt(
     *,
     parser: object | None = None,
     chunker: Chunker | None = None,
+    middleware: Sequence[Middleware] = (),
     library: str = "2",
 ) -> IngestPipeline:
     """The same corpus, read by a version the installed parse lineage no longer matches."""
@@ -136,6 +155,7 @@ def rebuilt(
         blobs=blobs,
         embedder=embedder,
         chunker=chunker,
+        middleware=middleware,
         parsers={"lines": parser or TrimmingLineParser()},
         parse_fingerprints=parse_versions(lines=library),
     )
@@ -768,3 +788,55 @@ async def test_a_vector_is_never_reused_across_a_document_or_a_workspace_boundar
         "the other document's vector is not reachable, by identity or by any other route"
     )
     assert verdicts[mine.id].vector == ()
+
+
+async def test_a_document_that_never_reached_the_model_reports_no_reuse() -> None:
+    """Failing closed is only half of it; the other half is that the number says so.
+
+    #122 makes the same argument about glossary lineage — a document whose detector could not
+    read it keeps its stale fingerprint *and* is named, because a run that failed everywhere and
+    reported green counters is a system that stopped working quietly. The embed stage's
+    accounting owes the same thing one field along: a document lost before the model ran has not
+    reused anything, and a report crediting it with reuse would be the accounting defect this
+    branch already fixed once, in a new place.
+
+    Nothing is credited here because the accounting is attached to what the commit returns, and
+    a stage that raised before the commit never gets that far. Asserted rather than left to that
+    structure, because the structure is one `replace` call away from being wrong.
+    """
+    store, vectors, blobs, embedder = await indexed({"a": "alpha\nbeta"})
+
+    for stage, pipeline in (
+        # Lost in the parser, before `_finish` is entered at all.
+        ("parse", rebuilt(store, vectors, blobs, embedder, parser=fakes.ExplodingParser())),
+        # Lost *inside* `_finish`, one line before the partition would have run. The two take
+        # different routes to the same outcome, and only the second passes through the code
+        # that attaches this accounting — so a test with only the first would report a guard it
+        # does not have.
+        (
+            "middleware",
+            rebuilt(
+                store,
+                vectors,
+                blobs,
+                embedder,
+                parser=fakes.LineParser(),
+                middleware=(RefusingChunkMiddleware(),),
+            ),
+        ),
+    ):
+        embedder.batches.clear()
+        sweep = await re_parse_stale(
+            store=store,
+            pipeline=pipeline,
+            blobs=blobs,
+            parse_fingerprints=fingerprints("2"),
+        )
+
+        assert sweep.failed == 1, f"the {stage} fixture must fail before the embed stage"
+        assert embedder.batches == [], f"and the {stage} fixture must not reach the model"
+        assert sweep.embedding == EmbeddingWork(), (
+            f"every field is zero for the {stage} failure, including `reused`: a document lost "
+            f"before the model has not had a vector reused, and crediting it would report "
+            f"avoided work that was never faced"
+        )
