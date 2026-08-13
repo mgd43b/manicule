@@ -38,12 +38,14 @@ CHUNKER_NAME = "structural"
 CHUNKER_VERSION = "2"
 """This chunker's own version, and what moving it costs.
 
-1 -> 2: an oversized table with no non-header row falls back to prose splitting instead of
-producing nothing. Under version 1 ``_split_table`` built its parts by iterating the rows
-*after* the header, so a table whose rows were all header rows returned an empty list — the
-block reached no chunk, no vector and no citation, and a document that was only that table
-produced zero chunks and was indistinguishable from one with no extractable text. Every
-parser that emits ``rows`` could produce it: reproduced through all seven.
+1 -> 2: an oversized table with no non-header row is split at its rows with no header
+repeated, instead of producing nothing. Under version 1 ``_split_table`` built its parts by
+iterating the rows *after* the header, so a table whose rows were all header rows returned an
+empty list — the block reached no chunk, no vector and no citation, and a document that was
+only that table produced zero chunks and was indistinguishable from one with no extractable
+text. Every parser that emits ``rows`` could produce it: reproduced through all seven. A
+table whose ``rows`` list is empty splits as prose, which is the answer this function already
+gives when ``rows`` is absent and there is genuinely no boundary to use.
 
 **What the bump costs an existing index**, since a version is only worth having if somebody
 can price it:
@@ -306,7 +308,33 @@ class StructuralChunker:
             # split at that is not a guess about the rendering. Prose splitting keeps the
             # text whole and is honest about having no better structure.
             return self._split_prose(block)
+        if not rows:
+            # A table whose rows the parser described as none of them. There is no boundary to
+            # split at for the same reason as above, and the block still has text: it reaches
+            # here only by exceeding the budget.
+            return self._split_prose(block)
         header_rows = _non_negative_int(block.metadata.get("header_rows"))
+        if header_rows >= len(rows):
+            # Every row is a header row, so there is no data row to repeat a header *into*.
+            #
+            # This returned nothing at all before, because the loop below starts after the
+            # header and had nowhere to start: an oversized header-only table reached no
+            # chunk, no vector and no citation, and a document that was only that table
+            # produced zero chunks and was indistinguishable from one with no extractable
+            # text. ``docs/parsing.md`` §4.2 says there is no depth at which splitting gives
+            # up, and this was one. Every parser that emits ``rows`` can produce the shape —
+            # a Markdown pipe table of a header and its delimiter, a ``<thead>`` with no
+            # ``<tbody>``, a one-row sheet under ``header_rows: 1``.
+            #
+            # Splitting by row with no header repeated, rather than falling back to prose.
+            # Prose is what this function gives when ``rows`` is *absent*, and the two are not
+            # the same situation: there the row boundaries are unknown, here they are known
+            # and merely all header. Prose splitting would discard them and cut the table
+            # mid-row and mid-cell — measured on a 60-row all-header table, three rows were
+            # left in no chunk intact — which is the defect that emitting ``rows`` exists to
+            # prevent. Splitting at the boundaries also keeps each part's ``CellAnchor``
+            # narrowed to its own rows instead of every part claiming the whole table.
+            header_rows = 0
         refs = _string_list(block.metadata.get("row_refs"))
         header = rows[:header_rows]
         header_text = "\n".join(header)
@@ -325,25 +353,10 @@ class StructuralChunker:
             running += row_tokens
         if current:
             parts.append(current)
-        if not parts:
-            # No non-header row, so the loop above ran zero times and there is nothing to
-            # repeat a header into. Returning the empty list would drop the block: an
-            # oversized table would reach no chunk, no vector and no citation, and it would do
-            # so silently — the document that was only that table produces zero chunks and is
-            # indistinguishable from one with no extractable text. §4.2 says there is no depth
-            # at which splitting gives up, and this was one.
-            #
-            # Prose splitting is the same answer this function already gives when ``rows`` is
-            # absent, for the same reason: there is no row boundary to split at, so keep the
-            # text whole and be honest about having no better structure. ``_split_lines``
-            # guards its own empty result the same way.
-            #
-            # One guard rather than a condition on each of the three ways in, because they are
-            # one fact — ``header_rows`` covers every row there is. It is reached by a table
-            # whose rows are all header rows, by an empty ``rows`` list, and by a
-            # ``header_rows`` larger than the row count, and a guard placed here cannot be
-            # forgotten by the eighth parser to emit ``rows``.
-            return self._split_prose(block)
+        # ``parts`` is never empty here: ``rows`` is non-empty and ``header_rows`` is now
+        # strictly less than its length, so the loop above ran at least once. Both facts are
+        # established directly above, which is what lets everything below index ``parts``
+        # without asking whether the table produced anything.
 
         units: list[_Unit] = []
         for part_index, indices in enumerate(parts, start=1):

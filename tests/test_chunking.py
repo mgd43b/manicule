@@ -340,6 +340,40 @@ def test_an_oversized_table_with_no_row_to_split_at_is_still_indexed(
     )
 
 
+def test_a_table_of_only_header_rows_splits_at_its_rows_rather_than_as_prose() -> None:
+    """Knowing the boundaries and not using them is the defect ``rows`` exists to prevent.
+
+    An all-header table has no data row to repeat a header into, but its row boundaries are
+    just as known as any other table's. Falling back to prose here would discard them and cut
+    the table mid-row and mid-cell — measured on this fixture, three of its sixty rows ended up
+    in no chunk intact — which is exactly what emitting ``rows`` was added to stop. It would
+    also leave every part claiming the whole table's ``CellAnchor`` while quoting a fifth of it.
+    """
+    rows = [" | ".join(f"r{index}c{column}" for column in range(12)) for index in range(60)]
+    refs = [f"A{index + 1}:L{index + 1}" for index in range(len(rows))]
+    table = ParsedBlock(
+        kind=BlockKind.TABLE,
+        text="\n".join(rows),
+        anchor=CellAnchor(sheet="Regional", ref="A1:L60"),
+        metadata={"rows": [*rows], "header_rows": len(rows), "row_refs": [*refs]},
+    )
+    chunks = make_chunker().chunk(document(), [table])
+    assert len(chunks) > 1, "the fixture is meant to exceed the budget and be split"
+
+    intact = {line for chunk in chunks for line in chunk.text.split("\n")}
+    assert set(rows) <= intact, "a row was cut across two chunks, so it is quotable in neither"
+    assert not any(chunk.metadata.get("hard_split") for chunk in chunks), (
+        "a table split at boundaries the parser supplied is not a hard split, and counting it "
+        "as one would tell `doctor` the corpus retrieves worse than it does"
+    )
+    assert all(isinstance(chunk.anchor, CellAnchor) for chunk in chunks)
+    first, last = chunks[0].anchor, chunks[-1].anchor
+    assert isinstance(first, CellAnchor)
+    assert isinstance(last, CellAnchor)
+    assert first.ref.startswith("A1:L1,"), "a part must address its own rows, not the whole table"
+    assert last.ref.endswith("A60:L60"), "the last part must reach the table's last row"
+
+
 def test_a_chunk_never_spans_a_page_boundary() -> None:
     """A chunk naming one page while half its text is on the next reads correctly and is
     wrong. Where two blocks' anchors cannot combine, the chunk closes."""
