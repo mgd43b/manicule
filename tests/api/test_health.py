@@ -41,8 +41,9 @@ class UnreachableStore(FakeStore):
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
         glossary_fp_other_than: str | None = None,
+        glossary_fp_unrecorded: bool = False,
     ) -> int:
-        del source, statuses, glossary_fp_other_than
+        del source, statuses, glossary_fp_other_than, glossary_fp_unrecorded
         msg = "database is locked"
         raise ManiculeError(msg)
 

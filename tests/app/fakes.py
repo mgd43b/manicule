@@ -171,6 +171,7 @@ class FakeStore:
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
         glossary_fp_other_than: str | None = None,
+        glossary_fp_unrecorded: bool = False,
     ) -> int:
         chosen = [
             document
@@ -183,6 +184,7 @@ class FakeStore:
                 glossary_fp_other_than is None
                 or self.glossary_lineage.get(document.id) != glossary_fp_other_than
             )
+            and (not glossary_fp_unrecorded or document.id not in self.glossary_lineage)
         ]
         return len(chosen)
 
@@ -789,7 +791,15 @@ class FakeIngestion:
 
     glossary_sweep: GlossarySweep = field(
         default_factory=lambda: GlossarySweep(
-            selected=3, redetected=3, unchanged=1, changed=2, entries_before=5, entries_after=7
+            selected=9,
+            redetected=3,
+            unchanged=1,
+            changed=2,
+            entries_before=5,
+            entries_after=7,
+            failed=4,
+            superseded=6,
+            unrepairable=8,
         )
     )
     """What the glossary sweep reports, and every number here is different for the same reason

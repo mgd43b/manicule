@@ -757,6 +757,30 @@ class StaleGlossaryReport(Payload):
     failures: tuple[str, ...] = ()
     """One line per failure, naming the document and the error. The sweep completes regardless."""
 
+    unrepairable: int = Field(default=0, ge=0)
+    """Documents whose chunks are gone, so there is nothing to recompute a glossary from.
+
+    Reported rather than stamped. Detecting over no chunks yields no entries, which is a
+    well-formed derived result — so recording it would convert a missing-chunks problem into an
+    invisible empty-glossary one and take the document out of the selection for ever. These need
+    a repair one rung up, and the line names it.
+    """
+
+    unrepairable_documents: tuple[str, ...] = ()
+    """One line per unrepairable document: which it is, why, and what would fix it."""
+
+    superseded: int = Field(default=0, ge=0)
+    """Documents a newer sync overtook mid-recompute, so the write was declined.
+
+    **Neither work done nor work to do**, and the same reading :class:`StaleReparseReport`
+    applies one rung up: a sync committed newer chunks while this was reading older ones, so the
+    corpus holds the newer state and this sweep did not touch it. Nothing needs doing — the
+    document is selected again next time, against the chunks that overtook it.
+    """
+
+    superseded_documents: tuple[str, ...] = ()
+    """One line per superseded document: which it is and what overtook it."""
+
 
 # --- conversations -------------------------------------------------------------------------
 

@@ -2361,8 +2361,46 @@ async def test_doctor_reports_a_corpus_serving_definitions_the_detector_did_not_
     assert check.state == "degraded"
     assert check.remedy == "manicule document reindex --stale-glossary"
     assert check.facts["stale"] == 1
-    assert "detector did not produce" in check.detail
+    # Which sentence it reaches for is the two tests below; what this one holds is that the
+    # corpus is reported at all, with a command attached, rather than passing green because
+    # every fingerprint that existed before this feature was current.
+    assert "reindex --stale-glossary" in check.detail
     del backend
+
+
+async def test_doctor_calls_an_unversioned_index_a_migration_rather_than_a_detector_change(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Two states, two sentences, because they send a reader to two different conclusions.
+
+    An index that predates the column has never had glossary lineage at all, and what it needs is
+    a one-time migration — a fact about the upgrade rather than about the detector. Telling
+    somebody "your detector changed" instead is wrong on the facts, and the number would look
+    alarming in proportion to how long they have been running manicule.
+    """
+    check = _check(await service.doctor(), "glossary")
+
+    assert check.state == "degraded"
+    assert check.facts["unversioned"] == check.facts["stale"] == 1
+    assert "created before glossary state was versioned" in check.detail
+    assert "one-time migration rather than a fault" in check.detail
+    assert check.remedy == "manicule document reindex --stale-glossary"
+    del backend
+
+
+async def test_doctor_distinguishes_a_moved_detector_from_an_unversioned_one(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The other half. A stamped-but-superseded document is ordinary staleness, not a migration."""
+    for known in backend.store.documents:
+        backend.store.glossary_lineage[known] = "a detector this build does not ship"
+
+    check = _check(await service.doctor(), "glossary")
+
+    assert check.facts["stale"] == 1
+    assert check.facts["unversioned"] == 0
+    assert "created before glossary state was versioned" not in check.detail
+    assert "the installed detector did not produce" in check.detail
 
 
 async def test_doctor_is_clean_once_every_document_names_the_installed_detector(

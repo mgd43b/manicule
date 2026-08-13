@@ -1128,6 +1128,10 @@ class ApplicationService:
             entries_after=sweep.entries_after,
             failed=sweep.failed,
             failures=tuple(sweep.failures),
+            unrepairable=sweep.unrepairable,
+            unrepairable_documents=tuple(sweep.unrepairable_documents),
+            superseded=sweep.superseded,
+            superseded_documents=tuple(sweep.superseded_documents),
         )
 
     # --- state ----------------------------------------------------------------------------
@@ -1834,6 +1838,7 @@ class ApplicationService:
             # that read the corpus's vocabulary to decide whether the vocabulary is current
             # would cost the thing it is asking about.
             stale = await store.count_documents(glossary_fp_other_than=detector.canonical())
+            unversioned = await store.count_documents(glossary_fp_unrecorded=True)
             documents = await store.count_documents()
         except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
             return r.Check(
@@ -1847,6 +1852,7 @@ class ApplicationService:
             "enabled": detector.detects,
             "documents": documents,
             "stale": stale,
+            "unversioned": unversioned,
         }
         if not detector.detects:
             return r.Check(
@@ -1866,19 +1872,38 @@ class ApplicationService:
                 detail=f"every document's glossary came from {detector.describe()}",
                 facts=facts,
             )
+        # Two sentences, because they send a reader to two different conclusions. An index that
+        # predates the column has never had glossary lineage at all and needs a one-time
+        # migration — a fact about the upgrade rather than about the detector. An index that has
+        # it and disagrees is ordinary staleness after a rule change. Reporting the first as the
+        # second tells somebody their detector moved when what actually happened is that they
+        # upgraded, and the number would look alarming in proportion to how long they have been
+        # running manicule.
+        if unversioned == stale:
+            detail = (
+                f"{unversioned} of {documents} document(s) carry no glossary lineage at all, "
+                f"which is what an index created before glossary state was versioned looks "
+                f"like. Their definitions are whatever detector produced them and nothing "
+                f"recorded which. This is a one-time migration rather than a fault: run "
+                f"`manicule document reindex --stale-glossary`, which recomputes them from the "
+                f"chunks already stored and runs no parser, no connector and no embedder."
+            )
+        else:
+            detail = (
+                f"{stale} of {documents} document(s) hold glossary entries the installed "
+                f"detector did not produce"
+                + (f", {unversioned} of them never versioned at all" if unversioned else "")
+                + ". Their definitions are cited and resolvable and may simply be right — but "
+                "they came out of rules this build has changed, and nothing else notices: a "
+                "detector change moves no parse, chunk or embedding fingerprint, so a sync "
+                "skips these documents and every other check here passes. Run "
+                "`manicule document reindex --stale-glossary`, which reads stored chunks and "
+                "runs no parser, no connector and no embedder."
+            )
         return r.Check(
             name="glossary",
             state="degraded",
-            detail=(
-                f"{stale} of {documents} document(s) hold glossary entries the installed "
-                f"detector did not produce, or hold entries nothing recorded a detector for. "
-                f"Their definitions are cited and resolvable and may simply be right — but "
-                f"they came out of rules this build has changed, and nothing else notices: a "
-                f"detector change moves no parse, chunk or embedding fingerprint, so a sync "
-                f"skips these documents and every other check here passes. Run "
-                f"`manicule document reindex --stale-glossary`, which reads stored chunks and "
-                f"runs no parser, no connector and no embedder."
-            ),
+            detail=detail,
             facts=facts,
             remedy="manicule document reindex --stale-glossary",
         )

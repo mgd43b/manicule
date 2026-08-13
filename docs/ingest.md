@@ -1033,7 +1033,16 @@ behind a coupling nobody could see — so parsing and detection are independentl
 |---|---|---|
 | `detector` | which detection strategy ran, or `disabled` | two strategies would otherwise be indistinguishable from one typo fix |
 | `rules` | a SHA-256 over `ingest/glossary.py` and `core/glossary.py` | the grammar, the persistence threshold, the evidence weights, the boundary model **and** the normalisation that turns a surface into a key |
+| `libraries` | `name@version` for everything outside this repository that decides a stored entry | a digest catches a rule *we* change and cannot catch one changing underneath an unchanged file |
 | `middleware` | `name@version` for every configured hook | detection reads `Chunk.text` boundaries and `heading_path`, neither of which any middleware declaration covers |
+
+**`libraries` is derived from the sources' own imports, not from a list.** Two things reach it.
+`pydantic` validates `GlossaryEntry`'s field constraints, so it decides which rows may be
+persisted at all. `unicodedata` is the sharper one: `normalise_acronym` NFKC-folds a surface into
+the stored *lookup key*, and #121 put NFKC into `initial_skeleton` as well — so the character
+database version decides what a term is filed under, and it moves with the interpreter rather
+than with any distribution. It is the one entry named by hand, because a standard-library module
+has no distribution to look up and is the case the derivation cannot see.
 
 **It is derived, not maintained.** `ParserVersions.rules` is a number somebody has to remember
 to move, and its own table records two parsers bumped for changes they did not make, by
@@ -1108,6 +1117,36 @@ of the ingest is untouched — a glossary bug does not cost a working index — 
 the document, because a detector that has stopped working behind a screen of green counters is
 the other half of failing silently.
 
+### 10.3 Four lineages, four migrations, and how to tell which one you need
+
+They are not interchangeable, and the price of each is the reason:
+
+| Lineage | Moves when | Repaired by | Costs |
+|---|---|---|---|
+| `documents.parse_fp` | a parser's rules or one of its libraries changes | `document reindex --stale` | a parse from retained bytes, then an embed of whatever moved |
+| `index_state.chunk_fingerprint` | the chunker, its budget, its tokenizer or a grammar changes | a re-index; the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything |
+| `index_state.embed_fingerprint` | the model, its dimension or its normalisation changes | `ingest.reindex.re_embed` | an embedding pass, no parsing |
+| `documents.glossary_fp` | any detection or normalisation rule changes, or a dependency of one does | `document reindex --stale-glossary` | a pass over stored text; **no GPU at all** |
+
+Two properties follow from the table that are easy to get wrong in either direction.
+
+**A parser bump is not a substitute for a detector bump.** It would migrate the media types that
+happened to get one and leave every other stale, and it charges a corpus-sized parse and re-embed
+for a change to a regular expression. It also cannot say *why* glossary rows changed, because the
+fingerprint it moved describes a parser.
+
+**A detector bump is not a reason to re-parse.** `glossary_fp` is a column on the row and
+deliberately not a field on the domain `Document`, so ingest's change detection has no way to
+consult it even by accident — which is what stops a corrected regular expression from making
+every document in a corpus look like it needs its bytes read again.
+
+**What requires a detector-version bump: nothing does, and that is the design.** The fingerprint
+is a digest of `ingest/glossary.py` and `core/glossary.py` plus the versions of what they import,
+so any edit to a rule, a threshold, an evidence weight, a written form or the normalisation moves
+it without anybody deciding to. #121 is the demonstration: it changed sentence-final punctuation
+handling and NFKC-normalised `initial_skeleton`, needed no manual bump, and every document it
+affects became selectable on the next survey.
+
 **Migration policy for the first release.** Every existing row arrives with `glossary_fp IS
 NULL`, which is selected. It is not backfilled: writing the installed fingerprint into rows
 detected before anything recorded a detector would assert that they came out of the rules
@@ -1115,6 +1154,31 @@ installed now, which is false for every corpus indexed before the column and is 
 plausible falsehood the fingerprints exist to prevent. So the first run of this command after
 upgrading sweeps the whole corpus — reading chunks, touching no network and no model — and every
 run after it selects nothing.
+
+**What the sweep reports, and why six numbers rather than three.** `selected` is the size of the
+disagreement; `redetected` splits into `unchanged` and `changed`; and the three that are not
+repairs are kept apart because they send an operator to three different places:
+
+| Count | What happened | What to do |
+|---|---|---|
+| `failed` | the detector raised on this document's text | nothing — it is a defect here, and the document stays selected until it is fixed |
+| `unrepairable` | the document's chunks are gone, so there is nothing to detect over | `document reindex --stale`, a rung up, then run this again |
+| `superseded` | a sync committed newer chunks mid-recompute, so the write was declined | nothing — the corpus holds the newer state, and the document is selected again next run |
+
+**A missing-chunks document is refused rather than stamped**, and that is the one of the three
+worth stating twice. Detecting over no chunks returns no entries, which is a *well-formed*
+derived result — so recording it would convert a missing-chunks problem into an invisible
+empty-glossary one and take the document out of the selection permanently. Chunkless *by design*
+is a different state: a document that yielded no extractable text really does state no
+definitions, and recording that is correct. `Document.expects_chunks` is the discriminator, and
+`re_embed` already uses it for the same distinction one rung up.
+
+**A supersession is neither a failure nor a repair**, on exactly the reading §8.5 gives for the
+re-parse sweep. This sweep takes no lock and shares none, because never reaching the model is the
+point of it — so an entry's `chunk_id` foreign key is what notices: the rows cite chunks a sync
+has just replaced, and the write is refused. It is told apart from a genuine failure *positively*
+— the chunk ids are read again, and ids that have moved are what a sync leaves behind — rather
+than by matching an error message, which would tie this to one store.
 
 **Ordering, when both sweeps are wanted.** Run `--stale` first. A re-parse re-runs detection on
 every document it rebuilds, so doing it second would redo work the glossary sweep had just

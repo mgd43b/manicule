@@ -84,6 +84,7 @@ class DocumentSurface(Protocol):
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
         glossary_fp_other_than: str | None = None,
+        glossary_fp_unrecorded: bool = False,
     ) -> int:
         """How many live documents match.
 
@@ -91,6 +92,10 @@ class DocumentSurface(Protocol):
         is here because ``doctor`` has to be able to say "this corpus is serving definitions the
         installed detector did not produce" without being handed the ability to repair anything.
         It is a count over an indexed column: no glossary text is read to answer it.
+
+        ``glossary_fp_unrecorded`` narrows it to the documents nothing has ever versioned, which
+        is the one-time migration an index predating the column needs and a different thing to
+        tell somebody than "your detector moved".
         """
         ...
 

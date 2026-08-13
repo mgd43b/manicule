@@ -264,14 +264,14 @@ class MemoryIngestStore:
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
         glossary_fp_other_than: str | None = None,
+        glossary_fp_unrecorded: bool = False,
     ) -> int:
-        return len(
-            await self.select_documents(
-                source=source,
-                statuses=statuses,
-                glossary_fp_other_than=glossary_fp_other_than,
-            )
+        found = await self.select_documents(
+            source=source, statuses=statuses, glossary_fp_other_than=glossary_fp_other_than
         )
+        if glossary_fp_unrecorded:
+            found = [d for d in found if d.id not in self.glossary_lineage_by_id]
+        return len(found)
 
     async def select_documents(
         self,
