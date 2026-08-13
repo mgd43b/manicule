@@ -830,12 +830,17 @@ different, and on a narrow bump the second is a small fraction of the first.
 
 **Why unchanged vectors are kept.** A chunk's id is derived from its content and position, so a
 chunk the re-parse did not move comes back with the id it already had, the vector row stored
-against that id is still its vector, and every citation that resolved to it still resolves.
+against that id is still its row, and every citation that resolved to it still resolves.
 `chunks_kept` counts those; `chunks_new` counts the chunks the sweep produced that were not
-already stored. Neither is a count of forward passes — a chunk is embedded from `embed_text`,
-which carries the heading breadcrumb, and a document whose headings moved re-embeds chunks
-whose ids did not, so the pipeline embeds every chunk of a document it re-parses and the
-embedder's cache absorbs the repeats.
+already stored.
+
+**Neither is a count of forward passes**, which is the inference this report most invites and
+the one an earlier version of this section made. Keeping an id does not skip an embedding: what
+goes to the model is `embed_text`, which carries the heading breadcrumb, so an id that held
+still does not mean the string embedded under it did. Price a sweep at one forward pass per
+chunk of every re-parsed document, with no relief from the embedding cache — what `chunks_kept`
+saves is identity, not compute. [`parsing.md`](parsing.md) §4.5 has the reasoning and the
+measured numbers, and this section is the accounting it defers to.
 
 **What a dry run guarantees.** `--dry-run` performs the selection and nothing else: no parse,
 no chunking, no embedding, no blob read, no write to the database, the vector store or the

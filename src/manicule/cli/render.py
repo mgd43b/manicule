@@ -326,7 +326,10 @@ def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
         table.add_row("  unchanged", str(payload.unchanged))
         table.add_row("  changed", str(payload.changed))
         table.add_row("chunks produced anew", str(payload.chunks_new))
-        table.add_row("chunks kept, with their vectors", str(payload.chunks_kept))
+        # "vector rows", not "vectors". A kept chunk keeps the row every citation to it resolves
+        # through; the row's contents are written again, because what is embedded carries the
+        # heading breadcrumb and that can move under an id that did not.
+        table.add_row("chunks kept, with their vector rows", str(payload.chunks_kept))
     table.add_row("unrepairable", str(payload.unrepairable))
     table.add_row("failed", str(payload.failed))
     out.print(table)
