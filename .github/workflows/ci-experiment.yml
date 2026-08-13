@@ -1,0 +1,111 @@
+# TEMPORARY. This workflow exists to measure what the test job spends its time on. It is
+# deleted before this branch merges. Nothing depends on it.
+
+name: CI experiment (temporary)
+
+on:
+  pull_request:
+
+concurrency:
+  group: ci-experiment-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  # Four arms of the same suite on the same runner class, differing only in how execution is
+  # measured. Every arm also writes a JUnit report, so the per-test duration distribution and
+  # the collected test count can both be read afterwards - a faster arm that ran fewer tests
+  # is not a faster arm.
+  measure:
+    name: measure (${{ matrix.arm }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # What CI runs today: branch coverage, C tracer.
+          - arm: a-cov-branch-ctrace
+            core: ""
+            args: "--cov --cov-report=term-missing"
+          # No measurement at all: the floor.
+          - arm: b-no-cov
+            core: ""
+            args: ""
+          # Line coverage, C tracer: what dropping `branch = true` alone buys.
+          - arm: c-cov-line-ctrace
+            core: ""
+            args: "--cov --cov-report=term-missing --cov-config=cov-line.ini"
+          # Line coverage, sys.monitoring: the fast core. It cannot measure branches before
+          # CPython 3.14, so it is only available together with the line-only config.
+          - arm: d-cov-line-sysmon
+            core: "sysmon"
+            args: "--cov --cov-report=term-missing --cov-config=cov-line.ini"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --all-extras --python 3.12
+      - name: the line-only coverage config
+        # `--cov-config` replaces the configuration wholesale, so everything that matters has
+        # to be restated here - the source root and the report exclusions from pyproject.toml.
+        # Only `branch` differs.
+        run: |
+          cat > cov-line.ini <<'INI'
+          [run]
+          source = src/manicule
+          branch = False
+
+          [report]
+          exclude_also =
+              if TYPE_CHECKING:
+              \.\.\.$
+              raise NotImplementedError
+          INI
+      - name: cache tree-sitter grammars
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: grammars-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: pre-seed grammars
+        run: >-
+          uv run --python 3.12 python -c
+          "from manicule.parsers import grammars;
+          print('fetched:', grammars.prefetch(grammars.DECLARED_LANGUAGES));
+          missing = grammars.missing_grammars(grammars.DECLARED_LANGUAGES);
+          assert not missing, f'grammars still missing after pre-seed: {missing}'"
+      - name: cache tiktoken vocabularies
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/tiktoken
+          key: vocabularies-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: pre-seed tiktoken vocabularies
+        env:
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
+        run: >-
+          uv run --python 3.12 python -c
+          "from manicule import vocabularies;
+          wanted = vocabularies.required_encodings();
+          print('seeded:', vocabularies.prefetch(wanted));
+          missing = vocabularies.missing_vocabularies(wanted);
+          assert not missing, f'vocabularies still missing after pre-seed: {missing}'"
+      - name: pytest
+        env:
+          REQUIRE_GRAMMAR_BUNDLE: "1"
+          REQUIRE_VOCABULARY_BUNDLE: "1"
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
+          COVERAGE_CORE: ${{ matrix.core }}
+        run: >-
+          uv run --python 3.12 pytest ${{ matrix.args }}
+          --durations=40 --junit-xml=junit-${{ matrix.arm }}.xml
+      - name: keep the JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.arm }}
+          path: junit-${{ matrix.arm }}.xml
