@@ -388,9 +388,30 @@ markers = [
 ]
 filterwarnings = ["error"]
 
+# **Line coverage on `sys.monitoring`, not branch coverage on the C tracer.** Measured on the
+# ubuntu runner, four arms of the same suite in one CI run, 3186 tests and 41 skips in every
+# arm: no coverage at all took 332s, branch coverage on the C tracer 639s, and *line* coverage
+# on the C tracer still took 487s. So the expense is overwhelmingly the tracer rather than the
+# branch flag — and on `sys.monitoring` the same measurement is free, at 330s, which is the
+# no-coverage arm back within the noise.
+#
+# The two settings below are one decision rather than two, and cannot be separated on any
+# CPython this project supports: `sys.monitoring` cannot measure branches before 3.14, so
+# `core = "sysmon"` with `branch = true` is not a slower configuration, it is a refused one.
+# coverage emits `CoverageWarning: Can't use core=sysmon`, and `filterwarnings = ["error"]`
+# above turns that into a hard error. That is the desirable failure: turning `branch` back on
+# stops the suite immediately rather than silently restoring the five minutes.
+#
+# What is given up is real and worth naming: which way a partially-exercised `if` went. Nothing
+# consumes it — there is no `fail_under`, nothing uploads or keeps the report, and `main` has no
+# required checks — so it was costing five minutes of every CI run to print a number that was
+# read by nobody. If a coverage gate ever arrives and wants branches back, the difference
+# between the two arms above — 639s against 330s — is what it costs, and CPython 3.14 removes
+# the conflict.
 [tool.coverage.run]
 source = ["src/manicule"]
-branch = true
+core = "sysmon"
+branch = false
 
 [tool.coverage.report]
 exclude_also = [

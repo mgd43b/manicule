@@ -119,12 +119,17 @@ jobs:
           print('seeded:', vocabularies.prefetch(wanted));
           missing = vocabularies.missing_vocabularies(wanted);
           assert not missing, f'vocabularies still missing after pre-seed: {missing}'"
+      # `--durations=25` because the last time this job's ten minutes had to be accounted for,
+      # nobody could say where they went without adding the flag and running CI again. It costs
+      # nothing and it is the first question anyone asks. The distribution is concentrated: the
+      # slowest 1% of tests is a little over half the runtime, and it is the parser corpus
+      # round-trips, which are doing real work rather than wasting time.
       - name: pytest
         env:
           REQUIRE_GRAMMAR_BUNDLE: "1"
           REQUIRE_VOCABULARY_BUNDLE: "1"
           TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
-        run: uv run --python ${{ matrix.python }} pytest --cov --cov-report=term-missing
+        run: uv run --python ${{ matrix.python }} pytest --cov --cov-report=term-missing --durations=25
 
   # A model edited without a migration and a downgrade that has never run both look exactly
   # like a healthy repository. Its own job so a drifted schema is distinguishable from a
