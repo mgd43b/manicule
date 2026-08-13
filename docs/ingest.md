@@ -585,6 +585,16 @@ rather than hoped for: **an exclusive lock on `<data_dir>/manicule.lock`, held f
 lifetime.** A second instance fails to start with the holder's PID, rather than starting and
 requeueing the first instance's in-flight documents out from under it.
 
+**That is the design, and nothing acquires it yet.** `ingest.recovery.InstanceLock` implements
+the whole of it — an exclusive `flock`, the holder's PID in the refusal, released on exit — and
+has tests of its own, and no code in `src/` constructs one. No command takes it, so the file is
+never created and two processes opened on one data directory are today stopped by nothing. It
+is stated here rather than left to be found because other guarantees are written as though it
+holds: §8.4 names it as the outermost of four exclusions, and every sentence in this document
+about "a single writer" is for now a description of how manicule is *used* rather than of what
+it refuses. The document-revision guard in §8.5 is deliberately not built on it, and holds
+whether it is taken or not.
+
 ### 6.6 Embed is in-process, and that is a deliberate asymmetry
 
 The embedder is in-process by design — that is what keeps `uv tool install manicule` a single
@@ -714,6 +724,88 @@ bug and is actually missing backpressure.
 > property.
 
 ---
+
+### 8.4 Four exclusions, and none of them is any of the others
+
+They are easy to confuse because they are all "the lock", and confusing them is how a
+lost-update bug ships: for a while this document said a concurrent sync and a corpus-wide
+re-parse were serialised *because* they shared the embed stage's lock, which is a statement
+about the model being read as a statement about the database.
+
+| What | Mechanism | Scope | Excludes |
+|---|---|---|---|
+| Model / accelerator | `asyncio.Lock` on the pipeline | one process, **all** documents | two batches inside the embedder at once |
+| Per-document mutation | keyed `asyncio.Lock`, one entry per document id | one process, **one** document | two operations writing one document's record, chunks and vectors at once |
+| Data directory | `flock` on `manicule.lock` (§6.5) | one machine, all processes | a second instance starting at all |
+| Document revision | compare-and-swap at the commit (§8.5) | durable; no process, no lock | a commit derived from a document that has since moved |
+
+**The model lock says nothing about the database.** Two operations can queue politely for the
+embedder, one after the other, and then write over each other's documents — which is exactly
+what happened. It is one lock, held around one stage, and the stages either side of it are
+where a document is read and where it is written.
+
+**The mutation lock is keyed, and that is the whole reason it is affordable.** A document is
+published by three writes in sequence — its record, its chunks and glossary rows, its
+vectors — and what must not interleave is the sequence, not all work everywhere. A
+pipeline-wide lock would make a sweep over ten thousand pages block every sync in the
+installation for the length of it, to fix a problem no two unrelated pages have. The entry is
+dropped when the last holder leaves, so a sweep does not accumulate one lock per row it has
+finished with.
+
+**The mutation lock is not durable and is not the guard.** It is an `asyncio.Lock` on a
+pipeline object: it holds inside one event loop in one process, and a second process opened on
+the same data directory takes no part in it. That is §6.5's job — and §6.5 is not wired up.
+Which is why the invariant is the one in the last row, which needs neither.
+
+### 8.5 Optimistic commit: an operation may not commit on a document that moved
+
+**The invariant.** An operation derived from document revision *R* does not commit if the
+stored document moved past *R* while it was running.
+
+The revision is not a column and needs no migration. It is derived from what is already
+stored — content hash, version token, retained-source reference, parse lineage, and the source
+record — chosen so that every one of them moves when a connector sync commits and none of them
+moves when a re-parse of the same retained bytes commits. `status` is deliberately not part of
+it: a re-parse takes a document through `parsing` and back to `indexed`, so a revision carrying
+it would fail against the re-parse's own earlier write.
+
+**Who is guarded.** Every operation that derives its content from something already stored and
+has a command to reach it: `document reindex <id>` and `document reindex --stale`, both of which
+run through `reindex.re_parse`. **A connector sync is never guarded**, and that is not an
+omission: it is holding the newest bytes the source has, so there is nothing it could be losing
+to. A sync always wins.
+
+`reindex.repair` and `reindex.re_embed` — rungs 1 and 2 of §10's ladder — are **not** guarded.
+Both would need it: each reads a document, derives from it and writes back, which is the shape
+this section is about. Neither is reachable, because neither has a caller anywhere in `src/`;
+they are library verbs with tests and no command. Stated rather than left implicit, because the
+day one of them gets a surface is the day it needs an expected revision, and the omission would
+otherwise have to be rediscovered.
+
+**Where the check is.** In the write, not before it. The comparison and the replacement are one
+statement in one transaction — a conditional `UPDATE` whose `WHERE` clause is the expected
+revision and whose row count is the answer — because a `SELECT` followed by a write has a gap
+between them exactly as wide as the one being closed. It is applied at every write the document
+receives on that path: the record write after parsing, again after the model has run and before
+the first chunk is replaced, and again at the `indexed` write that publishes. The last of those
+is the durable invariant; the middle one is what stops a superseded re-parse from producing a
+chunk, a vector or a glossary row at all, which is better than reconciling them afterwards —
+that is a second race in the same place.
+
+**What an operator does about a `superseded` result: nothing.** It is not a failure and it is
+not work left undone. It says a connector sync committed newer bytes for that document while
+the sweep was re-parsing older ones, and the sweep declined to write the older result over the
+newer one. The corpus holds the newer text. The document is either already current, in which
+case there is nothing to repair, or still stale, in which case the next run of the same command
+picks it up — re-running the sweep converges with nothing done by hand in between. A sweep
+reporting a *lot* of them is reporting that it was run during a large sync, not that anything
+is wrong.
+
+**The mode that is intentionally not supported**: two processes writing one data directory
+concurrently. The commit guard detects it and refuses, but between the second check and the
+third there is a window in which the other process's chunks can be replaced by ours before our
+commit refuses — leaving derived rows a later repair has to fix. The exclusion for that is
+§6.5, which is a lock nothing currently takes.
 
 ## 9. Storing
 
@@ -868,8 +960,9 @@ cursor is the number of documents a pass *left behind* rather than a page number
 document leaves the selection, so the set shrinks under the iteration: counting pages would
 skip the documents that shift forward into the vacated slots, and restarting at zero each time
 would re-read an unrepairable prefix for ever. Embedding batches are the pipeline's own
-(`embeddings.md`), unchanged — the sweep introduces no second consumer of the model, which is
-also what makes a concurrent sync and a sweep serialise rather than contend.
+(`embeddings.md`), unchanged — the sweep introduces no second consumer of the model, so a
+concurrent sync and a sweep queue for the accelerator rather than contending for it. That is a
+statement about the model and not about the database; §8.4 is the difference.
 
 **Idempotence, and its one exception.** A second run immediately afterwards selects nothing and
 performs no embedding work. The exception is a document produced by a parser manicule does not
@@ -879,11 +972,18 @@ the deliberate trade in `parsers/versions.py` — a plugin corpus that no repair
 be worse — and it is why the sweep tracks what it left behind rather than trusting the selection
 to empty itself.
 
-**Concurrency.** Within a process the sweep runs through the pipeline the runtime already
-built, so it shares the embed stage's lock (§6.6) with any sync running beside it and the two
-never reach the model at once. Across processes the contract is §6.5's exclusive lock on
-`<data_dir>/manicule.lock`, held for the lifetime of whichever process opened the data
-directory. The sweep takes no lock of its own; a second one would be a second answer.
+**Concurrency.** Running the sweep while a connector syncs is expected, and §8.4 is the whole
+picture. The short version: the sweep runs through the pipeline the runtime already built, so
+it shares the embed stage's lock (§6.6) with any sync beside it and the two never reach the
+model at once — **which serialises the model and nothing else**. What keeps the two from
+writing over each other on the *same* page is the per-document mutation lock within a process,
+and the compare-and-swap at the commit (§8.5) everywhere, including where no lock is held.
+
+**`superseded` is a third outcome, beside `reparsed` and `failed`.** A document a connector
+sync overtook mid-repair is reported under it, named, and left alone: the sweep declined to
+write an older parse over newer bytes, so the corpus has the newer text and the sweep did no
+work on it. Nothing needs doing about one — §8.5 has the longer answer, and re-running the
+command converges without any manual step.
 
 ---
 
@@ -1093,7 +1193,7 @@ every document that has no retained bytes, and the lock file's holder.
 | Proposed-deletion refusals awaiting confirmation | §11.1 guard 2 having fired |
 | Documents with `original_ref IS NULL`, by reason | The set for which rung 4 is the only repair |
 | Queue depth and embed throughput during a run | Where the bottleneck actually is |
-| `manicule.lock` holder | A second instance having been attempted (§6.5) |
+| `manicule.lock` holder | A second instance having been attempted (§6.5) — nothing writes this file yet |
 
 ---
 
@@ -1112,7 +1212,7 @@ Calls made in the absence of a stated position.
 | Parse in `spawn`ed worker subprocesses; embed deliberately not (chunk moved to the parent, §2) | §6 |
 | Memory bounding is platform-split: `RLIMIT_AS` on Linux, RSS polling on macOS | §6.2 |
 | Crash recovery is a startup sweep on `status` + `updated_at`, no new schema | §6.4 |
-| One instance per data directory, enforced by a lock file | §6.5 |
+| One instance per data directory, by a lock file — decided, and not yet acquired anywhere | §6.5 |
 | Every refusal runs once per run, before discovery, plus a budget/context cross-check | §7 |
 | Embed batch size derived from both fingerprints, not a constant | §8.2 |
 | Bounded queues, so backpressure reaches discovery and cursors do not expire | §8.3 |

@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 from manicule.core.content import IN_FLIGHT, DocumentStatus, Retention
 from manicule.core.embedding import IndexFingerprints
-from manicule.core.ids import document_id
+from manicule.core.ids import content_hash, document_id
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
 from manicule.ingest.recovery import requeue_interrupted
@@ -540,6 +540,188 @@ async def test_a_re_parse_reads_retained_bytes_rather_than_the_network(
     assert report.documents == 1
     assert connector.fetches == [], "a re-parse is not a re-crawl"
     await vectors.teardown()
+
+
+async def test_a_re_parse_refuses_a_snapshot_the_real_store_has_already_moved_past(
+    store: SqliteDocStore,
+    data_dir: Path,
+    engine: AsyncEngine,
+) -> None:
+    """The compare-and-swap where it has to be a SQL statement rather than a dictionary.
+
+    The in-memory double gets atomicity for nothing — there is no ``await`` between its
+    comparison and its write, so no other task can be scheduled in between — which means it can
+    satisfy the protocol while the real store does not. This drives the same refusal through a
+    migrated database.
+
+    No two tasks here, deliberately. The invariant is about *revisions*, not about timing: a
+    re-parse holding a snapshot the store has moved past must decline whether it was overtaken a
+    microsecond ago or an hour ago, and stating it serially is the same claim without a gate.
+    """
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    blobs = BlobStore(engine, data_dir)
+    pipeline = _pipeline(store, vectors, blobs)
+    connector = fakes.DictConnector({"a": "alpha\nbeta"})
+    await pipeline.run(connector)
+    stale = await store.find_document("memory", "a")
+    assert stale is not None
+
+    connector.documents["a"] = "gamma\ndelta"
+    assert (await pipeline.run(connector)).indexed == 1
+    report = await re_parse([stale], pipeline=pipeline, blobs=blobs)
+
+    assert len(report.superseded) == 1, (
+        "the snapshot is two revisions behind and its commit has to be refused"
+    )
+    assert report.documents == 0, "and refusing it is not counting it as repaired"
+    assert not report.failures, "nor as a failure of the document"
+    current = await store.get_document(stale.id)
+    assert current is not None
+    assert current.content_hash != stale.content_hash
+    stored = await store.document_chunks(stale.id)
+    assert [chunk.text for chunk in stored] == ["gamma", "delta"], (
+        "the newer sync's text is what the corpus holds, through the real store's own writes"
+    )
+    await vectors.teardown()
+
+
+async def test_the_stores_guard_reads_an_absent_field_as_absent_rather_than_as_no_match(
+    store: SqliteDocStore,
+) -> None:
+    """Three of the revision's five fields are nullable, and SQL will not compare them.
+
+    ``column = NULL`` is never true in SQL — not even of a ``NULL`` — so a guard that reached
+    the database spelled that way misses on every document with no version token, no retained
+    reference and no recorded parse lineage. That is most of a corpus, and the symptom is not a
+    crash: it is a sweep that repairs nothing and reports the whole index superseded by nobody.
+
+    The store is written with ``==`` and is nonetheless correct, because SQLAlchemy renders
+    ``column == None`` as ``column IS NULL``. That is a fact about the query builder rather than
+    about this code, which is exactly why it is pinned here rather than trusted: the guard would
+    stop holding the moment the clause became raw SQL, a parameter, or anything else that passes
+    the value through instead of inspecting it.
+
+    Checked in both directions on the same document, because the half that matters is the one
+    that has to *succeed*: a guard that refused everything would satisfy any test that only ever
+    looked for refusals.
+    """
+    from tests.storage_helpers import make_document  # noqa: PLC0415 - the storage builder
+
+    document = make_document(source="memory", source_id="null-fields")
+    stored = await store.upsert_document(document)
+    assert (stored.version_token, stored.original_ref, stored.parse_fp) == (None, None, None), (
+        "the fixture must leave all three unset, or this is a test about a different document"
+    )
+
+    hit = await store.commit_document(
+        stored.model_copy(update={"title": "renamed by the guarded write"}),
+        expected=stored.revision,
+    )
+
+    assert hit.committed is True
+    assert hit.stored is not None
+    assert hit.stored.title == "renamed by the guarded write"
+
+    moved = await store.upsert_document(
+        stored.model_copy(update={"content_hash": content_hash(b"something else")})
+    )
+    miss = await store.commit_document(
+        stored.model_copy(update={"title": "written by the stale snapshot"}),
+        expected=stored.revision,
+    )
+
+    assert miss.committed is False
+    assert miss.stored is not None
+    assert miss.stored.title == moved.title, "and the row is left exactly as the winner wrote it"
+    assert miss.stored.content_hash == moved.content_hash
+
+
+async def test_the_stores_guard_refuses_on_a_corrected_record_over_bytes_that_never_moved(
+    store: SqliteDocStore,
+) -> None:
+    """The half of the revision that cannot be a ``WHERE`` clause, on its own.
+
+    Four of the five fields are columns and go into the conditional ``UPDATE``. The source
+    record is not: it lives inside the metadata JSON, so it is compared in Python after that
+    statement has taken the write lock. Nothing else here reaches that comparison — every other
+    test moves the bytes, which moves three columns at once and refuses before it is consulted.
+
+    A mirrored page whose manifest is corrected over an unchanged body moves nothing else at
+    all: same bytes, same hash, same token, same retained reference, same parser. If the record
+    is not part of the revision, a re-parse holding the old snapshot commits and writes the
+    correction away — with a citation then naming a title the source has stopped using, and a
+    successful repair reported for it.
+    """
+    from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415 - the storage builder
+
+    stale = await store.upsert_document(make_document(source="memory", source_id="corrected"))
+    corrected = await store.upsert_document(
+        stale.model_copy(
+            update={
+                "title": "Retry policy",
+                "metadata": {
+                    PROVENANCE_KEY: Provenance(
+                        source=SourceMetadata(title="Retry policy", version="8")
+                    ).model_dump(mode="json")
+                },
+            }
+        )
+    )
+    assert (corrected.content_hash, corrected.version_token, corrected.original_ref) == (
+        stale.content_hash,
+        stale.version_token,
+        stale.original_ref,
+    ), "no column moved, so every columnar half of the guard still matches the stale snapshot"
+    assert corrected.provenance is not None
+
+    miss = await store.commit_document(
+        stale.model_copy(update={"title": "written back by the stale snapshot"}),
+        expected=stale.revision,
+    )
+
+    assert miss.committed is False
+    assert miss.stored is not None
+    assert miss.stored.title == "Retry policy", "the correction is still what the row says"
+    assert miss.stored.provenance == corrected.provenance
+
+
+async def test_the_guarded_write_refuses_another_workspaces_id_rather_than_reporting_a_miss(
+    engine: AsyncEngine,
+) -> None:
+    """A tenancy refusal, checked on the *guarded* write rather than only on the plain one.
+
+    The conditional ``UPDATE`` is workspace-scoped, so an id belonging to another tenant matches
+    nothing and comes back through the ordinary "somebody got there first" path — which is the
+    trap: that path returns the row it found so that a caller can report what overtook it, and
+    the row it found here belongs to somebody else. A caller in this workspace would be handed
+    another workspace's title, URI and metadata, in a result that looks entirely routine.
+
+    ``upsert_document`` has always refused this outright, and a guarded write that answered
+    differently would make the refusal a property of which method was called.
+    """
+    from manicule.core.errors import ManiculeError  # noqa: PLC0415
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from manicule.storage.scoped import CrossWorkspaceCollisionError  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    theirs = SqliteDocStore(engine, workspace_id="them")
+    await theirs.ensure_workspace()
+    document = await theirs.upsert_document(
+        make_document(workspace_id="them", title="their private title")
+    )
+    ours = SqliteDocStore(engine, workspace_id="us")
+    await ours.ensure_workspace()
+
+    with pytest.raises(CrossWorkspaceCollisionError) as refused:
+        await ours.commit_document(document, expected=document.revision)
+
+    assert isinstance(refused.value, ManiculeError)
+    assert "their private title" not in str(refused.value), (
+        "the refusal names the workspaces and the id, not what the other tenant's row holds"
+    )
+    assert "them" in str(refused.value)
 
 
 async def test_the_blob_store_speaks_the_retention_vocabulary(

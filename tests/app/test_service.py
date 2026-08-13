@@ -293,10 +293,47 @@ async def test_reindexing_reports_what_could_not_be_repaired(
     assert "no retained bytes" in outcome.detail
 
 
+async def test_reindexing_a_document_a_sync_overtook_says_so_rather_than_unchanged(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The single-document verb reads the same third outcome the sweep does.
+
+    ``unchanged`` is the trap, and it is the answer this used to give: the status is derived
+    from ``documents``, ``unrepairable`` and ``failures``, and a refused commit is in none of
+    them — so an operator who ran ``document reindex`` during a sync was told the re-parse had
+    produced exactly what was already stored, with no detail, which is the one reply that tells
+    them to stop looking. The re-parse did not run to a conclusion at all; something newer
+    landed and the commit was declined.
+
+    ``failed`` would be the other wrong answer, for the opposite reason: nothing failed, and the
+    corpus came out of it holding better text than this run was working from.
+    """
+    from manicule.ingest.reindex import ReindexReport  # noqa: PLC0415
+
+    overtaken = ReindexReport()
+    overtaken.superseded.append("doc-3: a newer revision was committed while this was re-parsed")
+
+    async def reindex(document_id: str) -> ReindexReport:
+        del document_id
+        return overtaken
+
+    backend.ingestion_.reindex = reindex
+    document_id = next(iter(backend.store.documents))
+
+    outcome = await service.document_reindex(document_id)
+
+    assert outcome.status == "superseded"
+    assert "a newer revision was committed" in outcome.detail, (
+        "and the reason travels with it; a status nobody can account for is the other half of "
+        "the same failure"
+    )
+    assert outcome.chunks == 0
+
+
 async def test_a_corpus_sweep_carries_every_count_the_ingest_layer_produced(
     service: ApplicationService, backend: FakeBackend
 ) -> None:
-    """Nine numbers and two lists across a layer boundary, and each is a chance to drop one.
+    """Ten numbers and three lists across a layer boundary, and each is a chance to drop one.
 
     Every count is a *different* number on purpose. With all-zeroes or all-ones, a mapping that
     wrote ``changed`` into ``unchanged`` — or dropped a field to its default — would produce a
@@ -316,6 +353,8 @@ async def test_a_corpus_sweep_carries_every_count_the_ingest_layer_produced(
         failed=1,
         unrepairable_documents=["doc-a (https://docs.example.test/a): no retained bytes"],
         failures=["doc-b: the parser gave up"],
+        superseded=4,
+        superseded_documents=["doc-c: a newer revision was committed while this was re-parsed"],
     )
 
     report = await service.document_reindex_stale(batch=4)
@@ -329,6 +368,14 @@ async def test_a_corpus_sweep_carries_every_count_the_ingest_layer_produced(
         "doc-a (https://docs.example.test/a): no retained bytes",
     )
     assert report.failures == ("doc-b: the parser gave up",)
+    assert report.superseded == 4, (
+        "concurrency is an outcome of the sweep like any other, and a payload that dropped it "
+        "would report a corpus-wide re-parse as having done less than it looked at, with "
+        "nothing anywhere accounting for the difference"
+    )
+    assert report.superseded_documents == (
+        "doc-c: a newer revision was committed while this was re-parsed",
+    )
     assert report.dry_run is False
 
 

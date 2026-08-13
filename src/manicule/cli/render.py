@@ -303,11 +303,18 @@ def render_document_deleted(out: Console, payload: r.DocumentDeleted) -> None:
 
 
 def render_document_reindexed(out: Console, payload: r.DocumentReindexed) -> None:
+    """One document's outcome, with the detail coloured by whether it is a problem.
+
+    ``superseded`` is dim rather than yellow for the same reason the sweep's list of them is:
+    it is the only one of the four statuses that needs nothing done about it, and colouring it
+    like an unrepairable document would send somebody looking for a fault that is not there.
+    """
     out.print(
         f"{escape(payload.status)} [bold]{payload.document_id}[/bold] ({payload.chunks} chunk(s))"
     )
     if payload.detail:
-        out.print(f"[yellow]{escape(payload.detail)}[/yellow]")
+        style = "dim" if payload.status == "superseded" else "yellow"
+        out.print(f"[{style}]{escape(payload.detail)}[/{style}]")
 
 
 def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
@@ -330,6 +337,10 @@ def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
         # through; the row's contents are written again, because what is embedded carries the
         # heading breadcrumb and that can move under an id that did not.
         table.add_row("chunks kept, with their vector rows", str(payload.chunks_kept))
+        # Only on a real run, like the counts above it: a plan writes nothing, so there is
+        # nothing for a concurrent sync to overtake and a zero here would be a fact about
+        # arithmetic rather than about the corpus.
+        table.add_row("superseded by a newer sync", str(payload.superseded))
     table.add_row("unrepairable", str(payload.unrepairable))
     table.add_row("failed", str(payload.failed))
     out.print(table)
@@ -339,6 +350,11 @@ def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
         out.print(f"[yellow]{escape(line)}[/yellow]")
     for line in payload.failures:
         out.print(f"[red]{escape(line)}[/red]")
+    # Dim rather than yellow, and after both: this is the one list here that is not a call to
+    # action. The document is current because something else made it current, and an operator
+    # who reads these in colour order should reach it last and stop.
+    for line in payload.superseded_documents:
+        out.print(f"[dim]{escape(line)}[/dim]")
     if payload.dry_run and payload.selected:
         out.print("\n[dim]next: [/dim]manicule document reindex --stale")
     elif payload.unrepairable:

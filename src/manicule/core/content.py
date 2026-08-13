@@ -8,6 +8,7 @@ cannot, and any attempt to recover it there is guesswork.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Final, Self
@@ -465,6 +466,70 @@ class Document(_Content):
         """
         return Provenance.from_metadata(self.metadata)
 
+    @property
+    def revision(self) -> DocumentRevision:
+        """Which state of this document's *source* it is, for a compare-and-swap.
+
+        Read off the document rather than stored in a column of its own, because every field
+        it names is already stored and a second copy is a second thing that can disagree. What
+        it costs is that the identity has to be *derived* the same way on both sides of a
+        comparison — which is why it is one property here rather than a tuple built at each
+        call site.
+        """
+        return DocumentRevision(
+            content_hash=self.content_hash,
+            version_token=self.version_token,
+            original_ref=self.original_ref,
+            parse_fp=self.parse_fp,
+            source_record=self.provenance,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentRevision:
+    """What a stored document has to still look like for an operation over it to commit.
+
+    **The problem it solves.** An operation that reads a document, spends a while deriving
+    something from it and then writes the result back has a window in the middle in which the
+    stored document can move — a connector sync fetching newer bytes for the same page is
+    exactly that. Writing the derived result afterwards restores the state the operation
+    started from, and does it *successfully*, so nothing anywhere reports a problem. Comparing
+    this before the write closes the window only if the comparison and the write are one
+    operation; see :meth:`~manicule.ingest.ports.IngestStore.commit_document`.
+
+    **These five fields and not others.** Every one of them moves when a connector sync
+    commits, and none of them moves when a re-parse of the same retained bytes commits — which
+    is the property that makes a re-parse able to write its own result and unable to write over
+    somebody else's. ``status`` is deliberately absent: a re-parse takes a document through
+    ``parsing`` and back to ``indexed``, so an identity carrying it would fail against the
+    re-parse's own earlier write.
+
+    ``source_record`` is here because "the bytes did not move" is not "the document did not
+    move": a mirrored page whose manifest is corrected keeps its content hash and changes what
+    a citation shows, and a re-parse that wrote its snapshot's metadata back would undo that
+    correction silently.
+    """
+
+    content_hash: str
+    version_token: str | None
+    original_ref: str | None
+    parse_fp: str | None
+    source_record: Provenance | None
+
+
+@dataclass(frozen=True, slots=True)
+class Commit:
+    """Whether a guarded document write happened, and what is stored either way.
+
+    ``stored`` is the row as it is now — the document just written when ``committed``, and the
+    one that superseded it when not. Returned rather than left to the caller to fetch because
+    the store read it inside the transaction that decided, and a caller reading it afterwards
+    would be reading a third state.
+    """
+
+    committed: bool
+    stored: Document | None
+
 
 __all__ = [
     "CHUNKLESS_BY_DESIGN",
@@ -474,7 +539,9 @@ __all__ = [
     "SETTLED",
     "BlockKind",
     "Chunk",
+    "Commit",
     "Document",
+    "DocumentRevision",
     "DocumentStatus",
     "Metadata",
     "ParsedBlock",
