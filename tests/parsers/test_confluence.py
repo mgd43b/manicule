@@ -386,6 +386,11 @@ async def test_invalid_dot_is_retained_with_a_warning_rather_than_dropped(corpus
         ("digraph g { a -> b; }", None),
         ("  strict digraph g { a -> b }  ", None),
         ("graph g { a -- b }", None),
+        # A record label. Braces inside a string are ordinary Graphviz, not structure, and
+        # counting them would put "the diagram body never ends" beside a diagram that compiles.
+        ('digraph g { a [shape=record, label="{left|right}"]; }', None),
+        ('digraph g { a [label="}"]; b -> c; }', None),
+        ('digraph g { a [label="\\"quoted\\""]; }', None),
         ("digraph g { a -> b;", "unclosed"),
         ("digraph g } {", "closing brace"),
         ("subgraph cluster { a }", "does not begin with"),
@@ -487,6 +492,11 @@ async def test_an_unsupported_macro_keeps_the_body_it_carries(corpus: Path) -> N
     assert "the upstream load balancer gives up at one hundred and twenty" in joined
     assert '{"lanes": ["platform", "billing"]}' in joined, (
         "a plain-text body is kept too, as inert code"
+    )
+    assert "Why the threshold is ninety seconds" in joined, (
+        "an expand macro's title is the label Confluence draws on the page, so it is content by "
+        "the same test a panel's title is. Being unsupported describes the macro's behaviour and "
+        "is never a licence to drop the words it renders"
     )
 
 

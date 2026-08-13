@@ -468,9 +468,19 @@ def dot_parse_warning(source: str) -> str | None:
     **A structural check, not a parser, and deliberately shallow.** It reads the header and
     counts braces; it does not build a graph and it never invokes Graphviz. Anything deeper would
     be a second implementation of a language this project does not otherwise care about, and the
-    cost of being wrong is asymmetric: a false warning on valid DOT is noise attached to content
-    that was kept anyway, while running a real layout engine over untrusted input to find out
-    would be the thing this parser most exists not to do.
+    cost of being wrong is asymmetric: running a real layout engine over untrusted input to find
+    out is the thing this parser most exists not to do.
+
+    **Quoted strings are skipped, and that is not shallowness being tidied up.** A record-shaped
+    node is written ``a [shape=record, label="{left|right}"]`` — braces inside a string are
+    ordinary Graphviz, not structure. Counting them attaches "the diagram body never ends" to a
+    diagram that compiles perfectly, and a confident wrong warning on valid content is the exact
+    failure this project exists to avoid. The content is kept either way; what would be wrong is
+    the sentence next to it.
+
+    Comments are *not* skipped, so a ``/* } */`` still miscounts. Left deliberately: it is rare
+    enough that carrying a comment lexer for it would be the second implementation this avoids,
+    and the cost is a warning beside content that was preserved regardless.
     """
     stripped = source.strip()
     if not stripped:
@@ -483,8 +493,18 @@ def dot_parse_warning(source: str) -> str | None:
             "reading the body"
         )
     depth = 0
+    quoted = False
+    escaped = False
     for character in stripped:
-        if character == "{":
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == '"':
+            quoted = not quoted
+        elif quoted:
+            continue
+        elif character == "{":
             depth += 1
         elif character == "}":
             depth -= 1
@@ -531,10 +551,16 @@ def _unsupported_macro(node: LexborNode, name: str, config: ConfluenceConfig) ->
     auditable — an operator can see that a ``jira`` macro was skipped and that it had a
     ``jqlQuery`` — without putting the query itself in the index, which is the defect this parser
     exists to end.
+
+    **The rendered-parameter exception applies here too, and it was missed the first time.** An
+    ``expand`` macro's ``title`` is the clickable label Confluence draws on the page: a reader
+    sees it, quotes it and searches for it, so it is content by the same test a panel's title is.
+    Emitting only the placeholder discarded it silently — the macro being unsupported is a
+    statement about its *behaviour*, never a licence to drop the words it renders.
     """
     generated = name in _TOC_MACROS
     prose, structured = ([], []) if generated else _body_blocks(node, config)
-    body_text = "\n".join(prose)
+    body_text = "\n".join(part for part in (_rendered_text(node), *prose) if part.strip())
     plain = "" if generated else _plain_text_body(node)
     if config.keep_unsupported_macros:
         metadata: Metadata = {"macro": name, "unsupported": True}
