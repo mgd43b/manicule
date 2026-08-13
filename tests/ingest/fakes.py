@@ -16,7 +16,9 @@ from manicule.core.anchors import LineAnchor
 from manicule.core.content import (
     BlockKind,
     Chunk,
+    Commit,
     Document,
+    DocumentRevision,
     DocumentStatus,
     Metadata,
     ParsedBlock,
@@ -26,6 +28,7 @@ from manicule.core.content import (
 from manicule.core.embedding import EmbedFingerprint, IndexFingerprints, Vector
 from manicule.core.errors import ParseError
 from manicule.core.fingerprints import ChunkFingerprint
+from manicule.core.glossary import GlossaryEntry
 from manicule.core.ids import chunk_id, content_hash
 from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
@@ -92,6 +95,22 @@ class MemoryIngestStore:
         self.documents[document.id] = document
         self.deleted_at.pop(document.id, None)
         return self._with_lineage(document)
+
+    async def commit_document(self, document: Document, *, expected: DocumentRevision) -> Commit:
+        """The same write, refused when the stored document is no longer ``expected``.
+
+        Atomic here for a reason the real store has to work for: nothing between the comparison
+        and the write awaits, so no other task can be scheduled in between. ``upsert_document``
+        below never suspends either, which is what makes calling it rather than repeating its
+        body safe — and what would stop being true if it grew an ``await`` that did.
+        """
+        stored = self.documents.get(document.id)
+        current = (
+            None if stored is None or document.id in self.deleted_at else self._with_lineage(stored)
+        )
+        if current is None or current.revision != expected:
+            return Commit(committed=False, stored=current)
+        return Commit(committed=True, stored=await self.upsert_document(document))
 
     async def set_status(self, document_id: str, status: DocumentStatus, detail: str = "") -> None:
         existing = self.documents.get(document_id)
@@ -305,6 +324,26 @@ class MemoryIngestStore:
         return [
             document_id for document_id, stamp in list(self.deleted_at.items()) if stamp < cutoff
         ][:limit]
+
+
+class MemoryGlossaryStore(MemoryIngestStore):
+    """An ingest store that can also hold the definitions a document states.
+
+    Kept apart from :class:`MemoryIngestStore` for the reason
+    :class:`~manicule.ingest.ports.GlossaryWriter` is kept apart from ``IngestStore``: the
+    pipeline decides whether it has somewhere to put definitions by a structural check on the
+    store it was given, so a fake that folded the method in would switch detection on for every
+    pipeline test, including the ones that are about something else entirely.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.glossary: dict[str, list[GlossaryEntry]] = {}
+
+    async def replace_glossary_entries(
+        self, document_id: str, entries: Sequence[GlossaryEntry]
+    ) -> None:
+        self.glossary[document_id] = list(entries)
 
 
 UTC_ZERO = datetime.fromtimestamp(0, tz=UTC)

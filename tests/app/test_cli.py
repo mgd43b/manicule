@@ -343,6 +343,39 @@ def test_the_sweep_reports_the_same_counts_to_a_person_and_to_a_pipe(
     assert machine["unrepairable_documents"] == ["doc-9 (https://docs.example.test/9): gone"]
 
 
+def test_a_supersession_reaches_both_surfaces_and_neither_of_them_quotes_the_document(
+    bound: ApplicationService,
+) -> None:
+    """The count and the ids, on the screen and in the envelope, and no third thing.
+
+    ``superseded`` is the one number here that is neither work done nor work to do, and the
+    surface most likely to lose it is the human one: it is a row somebody might reasonably think
+    belongs under ``failed``, or leave off a table that already has seven rows. Seven is chosen
+    for the count because no other number the fake reports is seven, so finding it on the screen
+    is finding *this* field rather than finding a coincidence.
+
+    **What this does not cover, said plainly.** That neither surface carries retained text is
+    not checkable here, because the backend is a fake and there is no document with any text in
+    it to leak. It is checked where there is one — ``tests/ingest/test_reindex_sweep.py``, over
+    the real pipeline and real content — and what holds it true here is that both renderings are
+    made from the same payload, whose every field is a count or a line the sweep composed.
+    """
+    _ingestion(bound).sweep.superseded = 7
+    _ingestion(bound).sweep.superseded_documents = [
+        "doc-4: a newer revision was committed while this was being re-parsed"
+    ]
+
+    machine = json.loads(run(["--json", "document", "reindex", "--stale"]).stdout)["data"]
+    human = _laid_bare(run(["document", "reindex", "--stale"]).stdout)
+
+    assert machine["superseded"] == 7
+    assert "7" in human, "the count is in the envelope and not on the screen"
+    assert "doc-4" in human, "and the document it happened to is named on both"
+    assert machine["superseded_documents"] == [
+        "doc-4: a newer revision was committed while this was being re-parsed"
+    ]
+
+
 def test_an_export_consents_to_nothing_unless_the_flag_is_typed(
     bound: ApplicationService,
 ) -> None:

@@ -31,6 +31,7 @@ the commit point.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError
@@ -39,6 +40,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from manicule.core.content import (
     SETTLED,
     Document,
+    DocumentRevision,
     DocumentStatus,
     PipelineStage,
     RawDocument,
@@ -68,7 +70,7 @@ from manicule.parsers.expansion import ExpandedMember, MemberFailure
 from manicule.parsers.versions import parse_fingerprint
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import AsyncGenerator, Callable, Sequence
 
     from manicule.core.content import Chunk, Metadata
     from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
@@ -92,6 +94,21 @@ class _StageError(Exception):
         super().__init__(detail)
         self.stage = stage
         self.detail = detail
+
+
+class _SupersededError(Exception):
+    """A guarded write found the document had moved on. Internal, like :class:`_StageError`.
+
+    An exception rather than a returned sentinel for the reason that one is: the guard fires at
+    two different depths — the record write and the commit — and threading an "or it moved"
+    return type up from both would put the decision in two places. There is one handler, in
+    :meth:`IngestPipeline._ingest_one`, and it is the only thing that builds a superseded
+    outcome.
+    """
+
+    def __init__(self, stored: Document | None) -> None:
+        super().__init__("the stored document moved past the revision this work was derived from")
+        self.stored = stored
 
 
 @runtime_checkable
@@ -176,6 +193,16 @@ class DocumentOutcome:
     chunks: int = 0
     skipped: str = ""
     """``version`` or ``hash`` when change detection stopped early, otherwise empty."""
+
+    superseded: bool = False
+    """Whether this document moved past the revision the work was derived from, mid-flight.
+
+    Expected concurrency rather than a failure, and kept off ``status`` for that reason: the
+    stored document is *fine*, it is simply newer than what this operation had in hand, and
+    nothing was written. Only an operation that supplied an expected revision can produce it —
+    a connector sync carries the newest bytes there are and never asks to be guarded against
+    somebody else's.
+    """
 
     members: tuple[str, ...] = ()
     """Source ids of documents found inside this one, queued rather than recursed into."""
@@ -293,6 +320,48 @@ class IngestPipeline:
         self._detect_glossary = detect_glossary and self._glossary is not None
         self._fetching = asyncio.Semaphore(max(1, fetch_concurrency))
         self._embedding = asyncio.Lock()
+        self._mutations: dict[str, tuple[asyncio.Lock, int]] = {}
+
+    # --- the two locks, and what each one is for ------------------------------------------
+
+    @asynccontextmanager
+    async def _mutating(self, document_id: str) -> AsyncGenerator[None]:
+        """Exclude other work on **this** document for the length of one document's writes.
+
+        **Keyed, because the thing that must not interleave is one document's write sequence
+        and nothing wider.** A pipeline-wide lock would serialise a sweep against a sync over
+        entirely unrelated pages, which is a throughput cost paid to fix a correctness problem
+        neither of them has. The three writes that publish a document — its record, its chunks
+        and glossary, its vectors — are not one statement and cannot be made one, so what makes
+        them indivisible is holding this from before the first to after the last.
+
+        **This is not the durable guard, and must not be mistaken for one.** It is an
+        ``asyncio.Lock``: it holds within one event loop in one process, and a second process
+        opened on the same data directory knows nothing about it. That case is the exclusive
+        lock on ``<data_dir>/manicule.lock`` (:class:`~manicule.ingest.recovery.InstanceLock`),
+        and the invariant that survives both being absent is the compare-and-swap at the commit
+        — see :meth:`~manicule.ingest.ports.IngestStore.commit_document`.
+
+        **Distinct from** ``self._embedding``, which serialises *the model* across every
+        document because there is one accelerator. Two documents may be mutated at once and
+        must not be embedded at once; one document may be neither. Sharing one lock for both
+        would make each of them wrong in the other's direction.
+
+        The entry is dropped when the last holder leaves, so a sweep over a corpus does not
+        accumulate one lock per document it has finished with. The refcount is safe without a
+        lock of its own because nothing between reading it and writing it back awaits.
+        """
+        lock, holders = self._mutations.get(document_id, (asyncio.Lock(), 0))
+        self._mutations[document_id] = (lock, holders + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock, holders = self._mutations[document_id]
+            if holders > 1:
+                self._mutations[document_id] = (lock, holders - 1)
+            else:
+                del self._mutations[document_id]
 
     # --- a run ---------------------------------------------------------------------------
 
@@ -410,6 +479,7 @@ class IngestPipeline:
         title: str = "",
         existing: Document | None = None,
         force: bool = False,
+        expected: DocumentRevision | None = None,
     ) -> list[DocumentOutcome]:
         """Everything from fetched bytes onwards, including anything found inside.
 
@@ -427,6 +497,11 @@ class IngestPipeline:
         one operation being asked for. Members are not forced: a container whose bytes are
         unchanged still expands to the same members, and re-parsing those is a decision about
         each of them rather than a consequence of touching the archive.
+
+        ``expected`` guards the *top-level* document only, and for the same reason ``force``
+        does: it is a statement about the snapshot **this caller** read, and a member found
+        inside the archive is a document the caller never saw. A caller with newer bytes than
+        anything stored — every connector sync — passes nothing and is guarded against nobody.
         """
         outcome, members = await self._ingest_one(
             raw,
@@ -435,6 +510,7 @@ class IngestPipeline:
             title=title,
             existing=existing,
             force=force,
+            expected=expected,
         )
         outcomes = [outcome]
         queue: list[MemberOutcome] = list(members)
@@ -459,6 +535,7 @@ class IngestPipeline:
         title: str = "",
         existing: Document | None = None,
         force: bool = False,
+        expected: DocumentRevision | None = None,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """One document, and whatever it turned out to contain."""
         source_bytes = raw.as_bytes()
@@ -482,6 +559,59 @@ class IngestPipeline:
             existing.id if existing else document_id(self._workspace, source, raw.source_id)
         )
 
+        # Every write this document is about to receive happens inside this, and the two guards
+        # inside it are what hold when this does not. Taken here rather than around each write,
+        # because a document is published by three of them in sequence — its record, its chunks
+        # and glossary, its vectors — and what must not interleave is the sequence.
+        async with self._mutating(identifier):
+            try:
+                return await self._ingest_guarded(
+                    raw,
+                    source=source,
+                    source_bytes=source_bytes,
+                    digest=digest,
+                    version_token=version_token,
+                    title=title,
+                    identifier=identifier,
+                    existing=existing,
+                    expected=expected,
+                )
+            except _SupersededError as moved:
+                # Nothing was written, by construction: the guard fires on the first write this
+                # document gets and again on the last, and the sequence between them is inside
+                # the lock taken above. There is no derived state to reconcile because none of
+                # it ever existed.
+                return (
+                    DocumentOutcome(
+                        source_id=raw.source_id,
+                        status=(moved.stored.status if moved.stored else DocumentStatus.PENDING),
+                        document_id=identifier,
+                        superseded=True,
+                    ),
+                    (),
+                )
+
+    async def _ingest_guarded(
+        self,
+        raw: RawDocument,
+        *,
+        source: str,
+        source_bytes: bytes,
+        digest: str,
+        version_token: str | None,
+        title: str,
+        identifier: str,
+        existing: Document | None,
+        expected: DocumentRevision | None,
+    ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
+        """The part of one document's ingest that writes, under the lock and the guard.
+
+        Split from :meth:`_ingest_one` rather than indented into it so that there is exactly one
+        ``except _SupersededError`` and it is not buried inside eighty lines of stages.
+
+        Raises:
+            _SupersededError: The stored document moved past ``expected``. Nothing was written.
+        """
         # Retention happens **before** any hook runs, and that ordering is load-bearing twice
         # over. `documents.content_hash` is the hash of what the connector returned
         # (`storage.md` §4.2), so retaining post-hook bytes would leave the reference and the
@@ -520,6 +650,7 @@ class IngestPipeline:
                 title=title,
                 identifier=identifier,
                 existing=existing,
+                expected=expected,
             )
             return skipped, ()
         raw = transformed
@@ -540,6 +671,7 @@ class IngestPipeline:
             identifier=identifier,
             existing=existing,
             retention=retention,
+            expected=expected,
         )
         if result.status is not DocumentStatus.PARSED:
             if result.status is not DocumentStatus.FAILED:
@@ -566,7 +698,10 @@ class IngestPipeline:
                 members,
             )
 
-        return await self._finish(result, document, raw=raw, existing=existing), ()
+        return (
+            await self._finish(result, document, raw=raw, existing=existing, expected=expected),
+            (),
+        )
 
     async def _record_member_failure(self, member: MemberFailure, source: str) -> DocumentOutcome:
         """Store a member that could not become a document, with the reason it could not.
@@ -652,6 +787,7 @@ class IngestPipeline:
         *,
         raw: RawDocument,
         existing: Document | None,
+        expected: DocumentRevision | None = None,
     ) -> DocumentOutcome:
         """Chunk, embed and commit a document the chain produced text for.
 
@@ -659,6 +795,12 @@ class IngestPipeline:
         than returned from six places. The shape matters more than the line count: with six
         exits it is possible to add a seventh that forgets to record the failure, and a stage
         that fails without recording is a document that quietly stops being re-tried.
+
+        Raises:
+            _SupersededError: From :meth:`_commit`, and deliberately not caught by the broad
+                ``except`` below. A document that moved on is not a document that failed to
+                embed, and demoting it would record somebody else's success as this run's
+                failure.
         """
         try:
             chunks = await self._prepare(result, document)
@@ -682,7 +824,9 @@ class IngestPipeline:
                 document, existing, PipelineStage.EMBED, f"{type(exc).__name__}: {exc}"
             )
 
-        return await self._commit(document, chunks, vectors, raw=raw, existing=existing)
+        return await self._commit(
+            document, chunks, vectors, raw=raw, existing=existing, expected=expected
+        )
 
     async def _prepare(self, result: ChainResult, document: Document) -> list[Chunk]:
         """Blocks through ``after_parse``, into chunks, through ``after_chunk``.
@@ -759,6 +903,7 @@ class IngestPipeline:
         *,
         raw: RawDocument,
         existing: Document | None,
+        expected: DocumentRevision | None = None,
     ) -> DocumentOutcome:
         """Write in the one order that survives a crash at any point.
 
@@ -769,7 +914,28 @@ class IngestPipeline:
         A crash between 1 and 2 leaves chunks with no vectors and nothing served; the repair
         re-embeds those chunk ids. A crash between 2 and 3 leaves vectors for a document that
         is not ``indexed``; the repair re-runs 2 idempotently and then 3.
+
+        **``expected`` is verified twice here, and neither one is the other's spare.** Step 3
+        is the write that publishes everything the first two staged, so a compare-and-swap
+        there is a compare-and-swap on the act of publishing: it is the durable invariant, and
+        putting it anywhere earlier would leave a window exactly as wide as the one it closes.
+        Step 0 is what makes the *derived* writes safe. Chunks and glossary rows are replaced
+        rather than added, so step 1 destroys whatever was there — and by the time step 3 could
+        refuse, that has already happened. Verifying again after the model has run and before
+        anything is replaced is what keeps a superseded re-parse from producing derived state at
+        all, which the alternative — reconciling it afterwards — turns into a second race.
+
+        Raises:
+            _SupersededError: The stored document moved past ``expected``. From step 0 that
+                means it moved while the document was being chunked and embedded; from step 3,
+                while the derived writes were in flight. Neither is reachable from inside this
+                process — :meth:`_mutating` is held across all of it — so both mean a second
+                process is writing this data directory without the instance lock.
         """
+        if expected is not None:
+            # Step 0. Written rather than read: a `SELECT` and a later write have a gap between
+            # them, and this whole class of bug is what lives in gaps like that.
+            await self._publish(document, expected=expected)
         try:
             await self._store.replace_chunks(document.id, chunks)
             # Between the chunks and the vectors, because the entries have a foreign key to the
@@ -785,14 +951,15 @@ class IngestPipeline:
                 document, existing, PipelineStage.STORE, f"{type(exc).__name__}: {exc}"
             )
 
-        indexed = await self._store.upsert_document(
+        indexed = await self._publish(
             document.model_copy(
                 update={
                     "status": DocumentStatus.INDEXED,
                     "status_detail": None,
                     "failed_stage": None,
                 }
-            )
+            ),
+            expected=expected,
         )
         await self._store.set_lineage(
             indexed.id,
@@ -807,6 +974,24 @@ class IngestPipeline:
             document_id=indexed.id,
             chunks=len(chunks),
         )
+
+    async def _publish(self, document: Document, *, expected: DocumentRevision | None) -> Document:
+        """Write a document row, guarded when the caller brought a revision to be guarded by.
+
+        The one place a document row is written on the ingest path, so that "guarded or not" is
+        decided once. A caller with no expectation — every connector sync — writes exactly as it
+        always did: it is holding the newest bytes there are, and a guard against a document
+        moving under it would be a guard against itself.
+
+        Raises:
+            _SupersededError: The stored document is no longer ``expected``, so nothing was written.
+        """
+        if expected is None:
+            return await self._store.upsert_document(document)
+        committed = await self._store.commit_document(document, expected=expected)
+        if not committed.committed or committed.stored is None:
+            raise _SupersededError(committed.stored)
+        return committed.stored
 
     async def _store_definitions(self, document: Document, chunks: Sequence[Chunk]) -> None:
         """Read this document's glossary definitions and make them its stored ones.
@@ -1030,6 +1215,7 @@ class IngestPipeline:
         identifier: str,
         existing: Document | None,
         retention: Retention,
+        expected: DocumentRevision | None = None,
     ) -> Document:
         """Write the document row for whatever the chain concluded.
 
@@ -1037,6 +1223,16 @@ class IngestPipeline:
         makes it re-queryable, skippable on the next sync, and reachable by a re-parse the day
         the missing capability arrives. An unstored failure is re-fetched on every sync, absent
         from every listing, and invisible to any repair.
+
+        **The first write a document gets, and therefore the first place ``expected`` is
+        verified.** Not because one guard here would be enough — the document can still move
+        between this and the commit, which is why :meth:`_commit` carries the same guard — but
+        because failing here is what keeps a superseded re-parse from ever *producing* a chunk,
+        a glossary row or a vector. The spec's alternative, reconciling stale derived state
+        after the fact, is where the second race lives.
+
+        Raises:
+            _SupersededError: The stored document is no longer ``expected``, so nothing was written.
         """
         keep_status = self._keeps_status(existing, result.status)
         # **The connector's own metadata reaches the document, and it is not decoration.** The
@@ -1111,7 +1307,7 @@ class IngestPipeline:
             failed_stage=settled.failed_stage if settled else result.failed_stage,
             metadata=metadata,
         )
-        stored = await self._store.upsert_document(document)
+        stored = await self._publish(document, expected=expected)
         if settled is None:
             await self._store.set_original(
                 stored.id, ref=retention.ref, omitted_reason=retention.omitted_reason
@@ -1145,6 +1341,7 @@ class IngestPipeline:
         title: str,
         identifier: str,
         existing: Document | None,
+        expected: DocumentRevision | None = None,
     ) -> DocumentOutcome:
         document = await self._store_record(
             result,
@@ -1156,6 +1353,7 @@ class IngestPipeline:
             identifier=identifier,
             existing=existing,
             retention=Retention(omitted_reason="not retained: the document was skipped"),
+            expected=expected,
         )
         await self._observe(document)
         return DocumentOutcome(

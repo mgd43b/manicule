@@ -61,6 +61,16 @@ class ReindexReport:
 
     failures: list[str] = field(default_factory=list[str])
 
+    superseded: list[str] = field(default_factory=list[str])
+    """Documents that moved on under the repair, one line each.
+
+    Kept apart from ``failures`` because it is not one. The document is in a *better* state than
+    the repair would have left it: something with newer bytes committed while this was reading
+    older ones, and the guard at the commit is what stopped the older ones being written back.
+    Counting it as a failure would put an expected outcome of ordinary concurrency into the list
+    an operator is meant to investigate.
+    """
+
     def note_unrepairable(self, document: Document, reason: str) -> None:
         self.unrepairable.append(f"{document.id} ({document.uri}): {reason}")
 
@@ -268,6 +278,15 @@ async def re_parse(
     A document whose bytes were never retained — the cap refused them, or it predates
     retention — is named with the reason rather than failing the run. Those are the only
     documents for which a re-crawl is the only repair.
+
+    **Every document here is a snapshot, and the pipeline is told so.** ``documents`` was read
+    at some earlier moment — a page of a corpus-wide selection, a single row looked up by id —
+    and between that read and the commit of the text this produces, a connector sync can fetch
+    newer bytes for the same page and commit them. The re-parse would then write the *older*
+    content back over them, successfully and silently. Passing each document's
+    :attr:`~manicule.core.content.Document.revision` as the expected one makes that commit
+    refuse instead; the document is reported ``superseded`` and nothing derived from the stale
+    snapshot is written at all.
     """
     report = ReindexReport()
     for document in documents:
@@ -296,8 +315,18 @@ async def re_parse(
             title=document.title,
             existing=document,
             force=True,
+            expected=document.revision,
         )
         for outcome in outcomes:
+            if outcome.superseded:
+                # Ahead of the two failure shapes below, because a superseded document is
+                # neither of them and would be read as one: it comes back carrying the status
+                # the *winner* left, which for a completed sync is `indexed`.
+                report.superseded.append(
+                    f"{outcome.document_id or outcome.source_id}: a newer revision was committed "
+                    f"while this was being re-parsed, so nothing from the older one was written"
+                )
+                continue
             # Two shapes of failure, because the pipeline has two. A document that was not
             # already working comes back ``failed``. A document that *was* ``indexed`` keeps its
             # status, its chunks and its vectors — the pipeline refuses to let a transient error
@@ -381,6 +410,26 @@ class StaleSweep:
     """One line per document that cannot be repaired, naming the reason and the remedy."""
 
     failures: list[str] = field(default_factory=list[str])
+
+    superseded: int = 0
+    """Documents a newer revision overtook mid-repair, so the repair declined to commit.
+
+    **Not a failure and not a repair**, which is why it is neither of the two counts either
+    side of it. A connector sync committed newer bytes for the document while this sweep was
+    parsing older ones, and the guard at the commit refused to write the older result back over
+    them — so the corpus holds the *newer* text and this sweep did not touch it. Nothing needs
+    doing about one; ``docs/ingest.md`` §8.5 says so at more length, and says what the two
+    numbers mean together.
+    """
+
+    superseded_documents: list[str] = field(default_factory=list[str])
+    """One line per superseded document: which it is and what overtook it.
+
+    Named individually rather than only counted, on the same rule as the two lists above: a
+    count nobody can attach to a document is a number nobody can check. An id and a sentence,
+    never any of the retained text — this whole command's subject is content, and its report
+    goes to a terminal and to whatever a shell pipeline points at.
+    """
 
 
 async def plan_stale(
@@ -505,6 +554,17 @@ async def re_parse_stale(
                 sweep.failed += 1
                 sweep.failures.extend(report.failures)
                 continue
+            if report.superseded:
+                sweep.superseded += 1
+                sweep.superseded_documents.extend(report.superseded)
+                # The cursor follows the *selection*, not the outcome, so a superseded document
+                # gets the same read-back a repaired one gets. A sync that overtook this
+                # document usually left it carrying a current fingerprint, so it is gone from
+                # the selection and counting it as left behind would step the offset past a
+                # document nobody has looked at.
+                if await _left_the_selection(store, document.id, current):
+                    left_behind -= 1
+                continue
             sweep.reparsed += 1
             after = {chunk.id for chunk in await store.document_chunks(document.id)}
             sweep.chunks_new += len(after - before)
@@ -513,13 +573,22 @@ async def re_parse_stale(
                 sweep.unchanged += 1
             else:
                 sweep.changed += 1
-            # Read back rather than assumed. A successful re-parse usually records a current
-            # fingerprint and leaves the selection — but not always, and the exception is the
-            # one that would hang the loop: a parser manicule does not ship records nothing, so
-            # the document is repaired, still selected, and has to keep its place in the cursor.
-            rebuilt = await store.get_document(document.id)
-            if rebuilt is not None and rebuilt.parse_fp in current:
+            if await _left_the_selection(store, document.id, current):
                 left_behind -= 1
+
+
+async def _left_the_selection(
+    store: IngestStore, document_id: str, current: Collection[str]
+) -> bool:
+    """Whether a document the sweep has finished with is out of the selection now.
+
+    Read back rather than assumed. A successful re-parse usually records a current fingerprint
+    and leaves the selection — but not always, and the exception is the one that would hang the
+    loop: a parser manicule does not ship records nothing, so the document is repaired, still
+    selected, and has to keep its place in the cursor.
+    """
+    rebuilt = await store.get_document(document_id)
+    return rebuilt is not None and rebuilt.parse_fp in current
 
 
 __all__ = [

@@ -615,6 +615,18 @@ class StaleReparseReport(Payload):
     failures: tuple[str, ...] = ()
     """One line per failure. Neither list fails the sweep — the rest of the corpus completes."""
 
+    superseded: int = Field(default=0, ge=0)
+    """Documents a newer revision overtook while this sweep was re-parsing them.
+
+    Neither ``reparsed`` nor ``failed``, and the point of a third number is that it is neither.
+    A connector sync committed newer bytes for the document mid-repair, and the guard at the
+    commit refused to write the older parse back over them — so the corpus holds the newer text
+    and this sweep left it alone. There is nothing for an operator to do about one.
+    """
+
+    superseded_documents: tuple[str, ...] = ()
+    """One line per superseded document: which it is and what overtook it. No document text."""
+
 
 # --- conversations -------------------------------------------------------------------------
 

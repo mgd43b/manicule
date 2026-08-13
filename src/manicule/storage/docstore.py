@@ -18,10 +18,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import bindparam, delete, func, select
+from sqlalchemy import bindparam, delete, func, select, update
 from sqlalchemy import text as sql
 
-from manicule.core.content import Document, DocumentStatus
+from manicule.core.content import Commit, Document, DocumentRevision, DocumentStatus
 from manicule.core.embedding import EmbedFingerprint, IndexFingerprints
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.retrieval import Candidate, Filter
@@ -44,7 +44,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Mapping, Sequence
     from datetime import datetime
 
+    from sqlalchemy import ColumnElement, CursorResult
     from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.orm import InstrumentedAttribute
 
     from manicule.core.content import Chunk
 
@@ -52,6 +54,7 @@ _WATERMARK: TypeAdapter[Watermark] = TypeAdapter(Watermark)
 
 _INDEX_STATE_ID = 1
 """``index_state`` holds one row, because a data directory holds one index."""
+
 
 LISTABLE_FILTER_FIELDS: Final = frozenset(
     {
@@ -80,6 +83,17 @@ filter inline, before ``LIMIT`` (``docs/retrieval.md`` §3.3). Only ``collection
 ``tag_ids`` remain, and those are resolved into ``document_ids`` before either store is
 reached.
 """
+
+
+def _matches(column: InstrumentedAttribute[str | None], value: str | None) -> ColumnElement[bool]:
+    """``column = value``, with ``NULL`` meaning ``NULL`` rather than meaning nothing.
+
+    Three of the revision's five fields are nullable, and in SQL ``column = NULL`` is never
+    true — not even of a ``NULL``. Written as ``==``, a compare-and-swap over a document with no
+    version token would therefore miss every single time, and a sweep would report a whole
+    corpus superseded by nobody.
+    """
+    return column.is_(None) if value is None else column == value
 
 
 class SqliteDocStore(
@@ -133,30 +147,85 @@ class SqliteDocStore(
 
     async def upsert_document(self, document: Document) -> Document:
         async with self._sessions.begin() as session:
+            return await self._write_document(session, document)
+
+    async def commit_document(self, document: Document, *, expected: DocumentRevision) -> Commit:
+        """Replace a document's row, but only while it still reads as ``expected``.
+
+        **The compare and the swap are one transaction, and the compare is itself a write.**
+        The first statement is a conditional ``UPDATE`` whose ``WHERE`` clause is the expected
+        revision; its row count is the answer. Doing it that way rather than reading the row and
+        branching on it is what makes this a compare-and-swap rather than a check followed by a
+        hopeful write: a ``SELECT`` takes no lock, so a concurrent writer can land between the
+        read and the write, and the guard would then pass on a document that had already moved.
+        The ``UPDATE`` takes SQLite's write lock at the moment it runs, so everything after it in
+        this transaction — including the source-record comparison, which lives in a JSON column
+        and cannot be a ``WHERE`` clause — is protected by that lock rather than racing it.
+
+        The touched column is ``updated_at``, which the guard would move anyway on the write it
+        is guarding. There is no separate lock column and no revision counter, so this needs no
+        migration and cannot drift out of step with the fields it compares.
+        """
+        async with self._sessions.begin() as session:
+            matched = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.Document)
+                    .where(
+                        models.Document.id == document.id,
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.deleted_at.is_(None),
+                        models.Document.content_hash == expected.content_hash,
+                        _matches(models.Document.version_token, expected.version_token),
+                        _matches(models.Document.original_ref, expected.original_ref),
+                        _matches(models.Document.parse_fp, expected.parse_fp),
+                    )
+                    .values(updated_at=utcnow()),
+                ),
+            )
             row = await session.get(models.Document, document.id)
-            if row is not None and row.workspace_id != self._workspace_id:
-                msg = (
-                    f"document id {document.id!r} belongs to workspace "
-                    f"{row.workspace_id!r}, not {self._workspace_id!r}. Ids from "
-                    f"manicule.core.ids.document_id include the workspace, so this id was "
-                    f"built some other way."
-                )
-                raise CrossWorkspaceCollisionError(msg)
-            if row is None:
-                row = models.Document(id=document.id, workspace_id=self._workspace_id)
-                session.add(row)
-            else:
-                # **History is written here or nowhere.** This is the one place both states of
-                # a document are visible at once, and it is inside the transaction that
-                # replaces one with the other — so the version and the change it explains
-                # either both land or neither does. A caller-driven "record a version" would
-                # be two transactions with a crash window between them, and the crash loses
-                # exactly the record that exists to explain the change.
-                await self._record_supersession(session, row, document)
-            apply_document(row, document)
-            row.last_seen_at = utcnow()
-            await session.flush()
-            return to_document(row)
+            stored = None if row is None else to_document(row)
+            if matched.rowcount != 1:
+                return Commit(committed=False, stored=stored)
+            if stored is not None and stored.provenance != expected.source_record:
+                # The half of the revision that is not a column. Compared here, under the write
+                # lock the `UPDATE` above just took, because a source record can be corrected
+                # over bytes that never moved — same hash, same token, same retained ref — and a
+                # guard that only looked at columns would let a stale snapshot write that
+                # correction away.
+                return Commit(committed=False, stored=stored)
+            return Commit(committed=True, stored=await self._write_document(session, document))
+
+    async def _write_document(self, session: AsyncSession, document: Document) -> Document:
+        """The write both :meth:`upsert_document` and :meth:`commit_document` perform.
+
+        One body, so that a guarded write and an unguarded one cannot come to store different
+        things — history in particular, which is written here or nowhere.
+        """
+        row = await session.get(models.Document, document.id)
+        if row is not None and row.workspace_id != self._workspace_id:
+            msg = (
+                f"document id {document.id!r} belongs to workspace "
+                f"{row.workspace_id!r}, not {self._workspace_id!r}. Ids from "
+                f"manicule.core.ids.document_id include the workspace, so this id was "
+                f"built some other way."
+            )
+            raise CrossWorkspaceCollisionError(msg)
+        if row is None:
+            row = models.Document(id=document.id, workspace_id=self._workspace_id)
+            session.add(row)
+        else:
+            # **History is written here or nowhere.** This is the one place both states of
+            # a document are visible at once, and it is inside the transaction that
+            # replaces one with the other — so the version and the change it explains
+            # either both land or neither does. A caller-driven "record a version" would
+            # be two transactions with a crash window between them, and the crash loses
+            # exactly the record that exists to explain the change.
+            await self._record_supersession(session, row, document)
+        apply_document(row, document)
+        row.last_seen_at = utcnow()
+        await session.flush()
+        return to_document(row)
 
     async def set_status(self, document_id: str, status: DocumentStatus, detail: str = "") -> None:
         """Record an outcome, keeping ``failed_stage`` consistent with ``status``.

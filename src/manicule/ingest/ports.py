@@ -21,7 +21,14 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Sequence
     from datetime import datetime
 
-    from manicule.core.content import Chunk, Document, DocumentStatus, Metadata
+    from manicule.core.content import (
+        Chunk,
+        Commit,
+        Document,
+        DocumentRevision,
+        DocumentStatus,
+        Metadata,
+    )
     from manicule.core.embedding import IndexFingerprints
     from manicule.core.glossary import GlossaryEntry
     from manicule.core.retrieval import Filter
@@ -44,6 +51,34 @@ class IngestStore(Protocol):
     async def find_document(self, source: str, source_id: SourceId) -> Document | None: ...
 
     async def upsert_document(self, document: Document) -> Document: ...
+
+    async def commit_document(self, document: Document, *, expected: DocumentRevision) -> Commit:
+        """Write a document, but only if the stored one is still ``expected``.
+
+        :meth:`upsert_document` with a compare-and-swap, and the two halves have to be one
+        operation. An operation that read the document, checked it, and then wrote would have a
+        window between the check and the write that is the same width as the window it exists to
+        close — so an implementation performs the comparison **inside the transaction that
+        writes**, and takes the write lock before it compares rather than after.
+
+        Nothing else about the write differs: the same row is replaced, the same supersession is
+        recorded, and a caller that does not need the guard should keep using
+        :meth:`upsert_document` rather than passing an expectation it invented.
+
+        **A miss is not a failure.** It means another writer got there first with something
+        newer, which is the outcome this exists to produce rather than an error to raise: the
+        caller has a stale snapshot and its job is to stop, not to retry. ``docs/ingest.md``
+        §8.5 states the invariant and what an operator does about a miss.
+
+        Args:
+            document: What to store if the guard holds.
+            expected: The revision the caller derived its work from.
+
+        Returns:
+            A :class:`~manicule.core.content.Commit` saying whether the write happened, and
+            carrying the row as it stands either way.
+        """
+        ...
 
     async def set_status(
         self, document_id: str, status: DocumentStatus, detail: str = ""

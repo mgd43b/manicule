@@ -1034,6 +1034,8 @@ class ApplicationService:
             failed=sweep.failed,
             unrepairable_documents=tuple(sweep.unrepairable_documents),
             failures=tuple(sweep.failures),
+            superseded=sweep.superseded,
+            superseded_documents=tuple(sweep.superseded_documents),
         )
 
     # --- state ----------------------------------------------------------------------------

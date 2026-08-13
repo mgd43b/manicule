@@ -296,7 +296,7 @@ async def test_reindexing_reports_what_could_not_be_repaired(
 async def test_a_corpus_sweep_carries_every_count_the_ingest_layer_produced(
     service: ApplicationService, backend: FakeBackend
 ) -> None:
-    """Nine numbers and two lists across a layer boundary, and each is a chance to drop one.
+    """Ten numbers and three lists across a layer boundary, and each is a chance to drop one.
 
     Every count is a *different* number on purpose. With all-zeroes or all-ones, a mapping that
     wrote ``changed`` into ``unchanged`` — or dropped a field to its default — would produce a
@@ -316,6 +316,8 @@ async def test_a_corpus_sweep_carries_every_count_the_ingest_layer_produced(
         failed=1,
         unrepairable_documents=["doc-a (https://docs.example.test/a): no retained bytes"],
         failures=["doc-b: the parser gave up"],
+        superseded=4,
+        superseded_documents=["doc-c: a newer revision was committed while this was re-parsed"],
     )
 
     report = await service.document_reindex_stale(batch=4)
@@ -329,6 +331,14 @@ async def test_a_corpus_sweep_carries_every_count_the_ingest_layer_produced(
         "doc-a (https://docs.example.test/a): no retained bytes",
     )
     assert report.failures == ("doc-b: the parser gave up",)
+    assert report.superseded == 4, (
+        "concurrency is an outcome of the sweep like any other, and a payload that dropped it "
+        "would report a corpus-wide re-parse as having done less than it looked at, with "
+        "nothing anywhere accounting for the difference"
+    )
+    assert report.superseded_documents == (
+        "doc-c: a newer revision was committed while this was re-parsed",
+    )
     assert report.dry_run is False
 
 
