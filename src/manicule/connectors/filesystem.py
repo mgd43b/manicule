@@ -552,6 +552,33 @@ class FilesystemConnector:
         :func:`~manicule.parsers.confluence._title` looks: a storage body is a fragment with no
         ``<title>`` in it, so a parser handed one and told nothing has no title to anchor the
         content above the first heading to.
+
+        **Outranking is not the same as overwriting, and the title is where the difference
+        showed.** A manifest outranks the page about what it *states*; a field it leaves empty is
+        not a statement, and reading it as one meant a hand-written minimal manifest — a
+        ``source_id`` and little else, which is exactly what somebody writes by hand — silently
+        cost the document its title. Nothing downstream could recover it: the extracted body is a
+        fragment with no ``<title>``, so the storage parser looks at ``metadata["title"]``, finds
+        the key absent because an empty string is dropped below, and anchors nothing. The
+        fallback is per-field for that reason rather than "use the page when there is no
+        manifest at all" — the manifest is still authoritative about every field it fills in.
+
+        **Only ``title``, and the other empty fields are deliberately left empty.**
+        :class:`~manicule.core.provenance.SourceMetadata` defaults every field to ``""``, so the
+        same reasoning appears to apply to ``canonical_uri`` and ``source_id`` — and applying it
+        there would be a different act entirely. ``title`` is what a citation displays;
+        ``source_id`` is what the corpus keys rows by, and filling a manifest's empty one in from
+        the page would move documents between identities from inside a metadata helper. The
+        narrowness is the safety, not a lack of ambition.
+
+        **The record is repaired as well as the metadata key, because they are read by different
+        things and only fixing one leaves the defect visible.**
+        :meth:`~manicule.ingest.pipeline.Pipeline._store_record` takes a document's title from the
+        provenance record first and falls back to what discovery reported, which for a local file
+        is its *filename*; the parser separately reads ``metadata["title"]`` to anchor the
+        content above the first heading. So an empty manifest title cost the citation its name
+        *and* the parse its anchor, by two different routes, and writing the fallback into only
+        one of them would have fixed the half nobody looks at.
         """
         record = provenance
         if record is None:
@@ -562,7 +589,14 @@ class FilesystemConnector:
                 ),
             )
             metadata = sidecar.with_provenance(metadata, record)
-        title = record.source.title if record.source is not None else adapted.page.source.title
+        title = (record.source.title if record.source is not None else "") or (
+            adapted.page.source.title
+        )
+        if record.source is not None and not record.source.title and title:
+            record = record.model_copy(
+                update={"source": record.source.model_copy(update={"title": title})}
+            )
+            metadata = sidecar.with_provenance(metadata, record)
         adaptation: Metadata = {
             "outcome": AdapterOutcome.ADAPTED.value,
             "profile": adapted.profile.name,
