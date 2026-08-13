@@ -15,17 +15,20 @@ from typing import TYPE_CHECKING, override
 import pytest
 
 from manicule.core.anchors import LineAnchor
-from manicule.core.content import BlockKind, DocumentStatus, ParsedBlock
+from manicule.core.content import BlockKind, DocumentStatus, ParsedBlock, RawDocument
 from manicule.core.ids import content_hash
 from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
 from manicule.ingest.reindex import plan_stale, re_parse_stale, select
+from tests.fakes import MEDIA_TYPE
 from tests.ingest import fakes
 from tests.ingest.test_pipeline import build, parse_versions
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Sequence
 
-    from manicule.core.content import Document, RawDocument
+    from pydantic import JsonValue
+
+    from manicule.core.content import Document
     from manicule.core.embedding import Vector
     from manicule.core.fingerprints import ParseFingerprint
     from manicule.core.sources import DocRef
@@ -596,6 +599,17 @@ document enough to check that a superseded re-parse reverted none of them.
 NEW = "SDR — Synced Document Record"
 """And what the connector has instead. One word apart, so the expansion is the only difference."""
 
+MARKED = f"SDR — Sta{MARKER}le Document Record"
+"""The same document, holding the character version two of the parser stops emitting.
+
+**For the tests that have to tell "the sweep wrote nothing" from "the sweep wrote something
+identical".** A re-parse of :data:`OLD` under version two produces :data:`OLD` again, so a
+document built from it comes out of a completed re-parse and an abandoned one looking exactly
+the same — and an assertion that its chunks did not move would hold whether or not the guard
+under test did anything. Built from this instead, version one stores it verbatim and a version
+two re-parse produces :data:`OLD`, so the two outcomes are two different strings.
+"""
+
 
 class GatedBlobs(fakes.MemoryBlobs):
     """Retained bytes that stop the sweep at the instant it has the old snapshot in hand.
@@ -687,15 +701,20 @@ re-parse cannot write a stale source record back would pass without ever being t
 """
 
 
+def source_record() -> dict[str, JsonValue]:
+    """The corrected manifest a sync brings back, in the shape the pipeline reads it from."""
+    return {
+        PROVENANCE_KEY: Provenance(
+            source=SourceMetadata(title=SYNCED_TITLE, version="2")
+        ).model_dump(mode="json")
+    }
+
+
 def syncing(pages: dict[str, str]) -> fakes.DictConnector:
     """A connector over the same source name, carrying an authoritative record per page."""
     connector = fakes.DictConnector(pages, name="memory")
     for source_id in pages:
-        connector.metadata[source_id] = {
-            PROVENANCE_KEY: Provenance(
-                source=SourceMetadata(title=SYNCED_TITLE, version="2")
-            ).model_dump(mode="json")
-        }
+        connector.metadata[source_id] = source_record()
     return connector
 
 
@@ -787,6 +806,77 @@ async def test_a_sync_that_starts_first_still_owns_the_document_the_sweep_was_ho
     await describes_the_sync(store, vectors, stale)
 
 
+async def test_a_correction_to_the_source_record_alone_is_enough_to_supersede_a_re_parse() -> None:
+    """The half of the revision that is not a column, isolated so that it decides on its own.
+
+    Every other test here moves the bytes, which moves the content hash, the version token and
+    the retained reference together — so all four columns disagree at once and the guard would
+    fire on any one of them. This moves **only the source record**: the sync fetches the same
+    bytes under the same token, so the hash, the token and the retained reference are all
+    identical, and it goes through the *old* parser so the recorded lineage does not move
+    either. The corrected manifest is the only difference there is.
+
+    That case is worth its own test because it is the one a column comparison silently misses. A
+    mirrored page whose title is fixed over an unchanged body is a real edit — it is what a
+    citation shows — and a re-parse that wrote its snapshot's metadata back would undo it while
+    reporting a successful repair.
+
+    The corrected fetch goes in through ``ingest_raw`` rather than through a connector run,
+    which is the same code path one document of a sync takes once its bytes are in hand. A whole
+    run would not reach it: the token has not moved and the old parser finds its own lineage
+    current, so level 1 answers "unchanged" and never fetches — which is correct behaviour, and
+    is why a real installation meets this case through the connector that *did* notice.
+    """
+    store, vectors, blobs, embedder, stale = await superseded_corpus()
+    assert stale.provenance is None, "the corpus must start with no record, or nothing moves"
+    sweeping_pipeline = upgraded(store, vectors, blobs, embedder)
+    behind, _, _ = build(
+        store=store,
+        vectors=vectors,
+        blobs=blobs,
+        embedder=embedder,
+        parse_fingerprints=parse_versions(lines="1"),
+    )
+
+    sweeping = asyncio.create_task(
+        re_parse_stale(
+            store=store,
+            pipeline=sweeping_pipeline,
+            blobs=blobs,
+            parse_fingerprints=fingerprints("2"),
+        )
+    )
+    await blobs.reached.wait()
+    outcomes = await behind.ingest_raw(
+        RawDocument(
+            source_id="a",
+            uri="memory://a",
+            media_type=MEDIA_TYPE,
+            content=OLD,
+            metadata=source_record(),
+        ),
+        source="memory",
+        version_token=stale.version_token,
+    )
+    assert [outcome.status for outcome in outcomes] == [DocumentStatus.INDEXED]
+    corrected = store.documents[stale.id]
+    assert (corrected.content_hash, corrected.version_token, corrected.original_ref) == (
+        stale.content_hash,
+        stale.version_token,
+        stale.original_ref,
+    ), "the sync moved nothing but the record, or the guard is being asked an easier question"
+    assert corrected.parse_fp == stale.parse_fp, "and not the lineage either"
+    blobs.resume.set()
+    sweep = await sweeping
+
+    assert (sweep.superseded, sweep.reparsed) == (1, 0)
+    assert store.documents[stale.id].title == SYNCED_TITLE, (
+        "the correction survives; a re-parse that committed would have written the empty title "
+        "its snapshot was carrying back over it"
+    )
+    assert store.documents[stale.id].provenance is not None
+
+
 JOINING = 2.0
 """How long one document waits inside the parser for another to join it, before giving up.
 
@@ -865,8 +955,9 @@ async def test_a_sweep_and_a_sync_over_different_documents_are_not_serialised_by
     )
     assert (sweep.reparsed, sweep.superseded, sweep.failed) == (1, 0, 0)
     assert [chunk.text for chunk in store.chunks[stale.id]] == [OLD], (
-        "the swept document is the re-parse of its own retained bytes; nothing about the other "
-        "document's sync reached it"
+        "the swept document holds version two's reading of its own retained bytes — which is "
+        "what MARKED and OLD being different strings is for, so this cannot pass on a sweep "
+        "that did nothing — and nothing about the other document's sync reached it"
     )
     fresh = await store.find_document("memory", "b")
     assert fresh is not None
@@ -910,10 +1001,14 @@ async def test_a_sweep_cancelled_before_its_commit_serves_nothing_it_half_wrote(
     embedder = CancellingEmbedder()
     blobs = GatedBlobs()
     store = fakes.MemoryGlossaryStore()
-    _, vectors, _, _, _ = await corpus({"a": OLD}, blobs=blobs, store=store, embedder=embedder)
+    _, vectors, _, _, _ = await corpus({"a": MARKED}, blobs=blobs, store=store, embedder=embedder)
     document = await store.find_document("memory", "a")
     assert document is not None
     chunks = list(store.chunks[document.id])
+    assert [chunk.text for chunk in chunks] == [MARKED], (
+        "version one stored the marker verbatim, so a completed version-two re-parse would "
+        "leave a different string here and this comparison can tell the two apart"
+    )
     rows = dict(vectors.rows)
     entries = list(store.glossary[document.id])
     pipeline = upgraded(store, vectors, blobs, embedder)
@@ -945,6 +1040,10 @@ async def test_a_sweep_cancelled_before_its_commit_serves_nothing_it_half_wrote(
     finished = await store.get_document(document.id)
     assert finished is not None
     assert finished.status is DocumentStatus.INDEXED
+    assert [chunk.text for chunk in store.chunks[document.id]] == [OLD], (
+        "and the resumed run is what produced the version-two reading, so the first run really "
+        "had written none of it"
+    )
     assert await select(store, parse_fingerprints=fingerprints("2")) == []
 
 
@@ -999,13 +1098,18 @@ async def test_a_document_overtaken_after_its_vectors_were_built_writes_no_deriv
     store = fakes.MemoryGlossaryStore()
     document_id = ""
     _, vectors, _, _, _ = await corpus(
-        {"a": OLD}, blobs=blobs, store=store, embedder=fakes.CountingEmbedder()
+        {"a": MARKED}, blobs=blobs, store=store, embedder=fakes.CountingEmbedder()
     )
     document = await store.find_document("memory", "a")
     assert document is not None
     document_id = document.id
     embedder = OvertakingEmbedder(store, document_id)
     chunks = list(store.chunks[document_id])
+    assert [chunk.text for chunk in chunks] == [MARKED], (
+        "the re-parse under way produces a different string from the one stored, so replacing "
+        "the chunk set would be visible here. Built from OLD the two would be identical and "
+        "this test would pass against an implementation that wrote all of it"
+    )
     rows = dict(vectors.rows)
     entries = list(store.glossary[document_id])
     pipeline = upgraded(store, vectors, blobs, embedder)
@@ -1074,6 +1178,52 @@ async def test_a_sweep_run_again_after_a_supersession_converges_with_no_manual_c
     await describes_the_sync(store, vectors, stale)
     assert await select(store, parse_fingerprints=fingerprints("2")) == [], (
         "converged, with nothing done to it by hand in between"
+    )
+
+
+async def test_a_supersession_does_not_step_the_cursor_past_a_document_nobody_looked_at() -> None:
+    """The paging arithmetic, for the outcome that was not in it when it was written.
+
+    The cursor is the count of documents a pass **left behind in the selection**, which is what
+    makes it right in both directions while the set shrinks underneath it. A superseded document
+    is the awkward case: the sweep did nothing to it, so the reflex is to count it as left
+    behind — but the sync that overtook it usually left it *current*, so it is gone from the
+    selection, and counting it steps the offset one place past the document that moved up into
+    its slot. With pages of one and two stale documents, that document is the entire remainder.
+
+    The symptom would be a sweep that reported doing less than it selected and stopped, with the
+    skipped page still stale and nothing anywhere naming it.
+    """
+    blobs = GatedBlobs()
+    store = fakes.MemoryGlossaryStore()
+    _, vectors, _, _, embedder = await corpus({"a": OLD, "b": "beta"}, blobs=blobs, store=store)
+    overtaken = await store.find_document("memory", "a")
+    behind = await store.find_document("memory", "b")
+    assert overtaken is not None
+    assert behind is not None
+    blobs.gate = overtaken.original_ref
+    pipeline = upgraded(store, vectors, blobs, embedder)
+
+    sweeping = asyncio.create_task(
+        re_parse_stale(
+            store=store,
+            pipeline=pipeline,
+            blobs=blobs,
+            parse_fingerprints=fingerprints("2"),
+            batch=1,
+        )
+    )
+    await blobs.reached.wait()
+    assert (await pipeline.run(syncing({"a": NEW}))).indexed == 1
+    blobs.resume.set()
+    sweep = await sweeping
+
+    assert (sweep.superseded, sweep.selected) == (1, 2), (
+        "the second document was still in the selection and the sweep has to have reached it"
+    )
+    assert sweep.reparsed == 1
+    assert await select(store, parse_fingerprints=fingerprints("2")) == [], (
+        "and repaired it; a cursor one place too far leaves it stale for ever"
     )
 
 

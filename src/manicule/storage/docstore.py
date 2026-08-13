@@ -44,9 +44,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Mapping, Sequence
     from datetime import datetime
 
-    from sqlalchemy import ColumnElement, CursorResult
+    from sqlalchemy import CursorResult
     from sqlalchemy.ext.asyncio import AsyncSession
-    from sqlalchemy.orm import InstrumentedAttribute
 
     from manicule.core.content import Chunk
 
@@ -83,17 +82,6 @@ filter inline, before ``LIMIT`` (``docs/retrieval.md`` §3.3). Only ``collection
 ``tag_ids`` remain, and those are resolved into ``document_ids`` before either store is
 reached.
 """
-
-
-def _matches(column: InstrumentedAttribute[str | None], value: str | None) -> ColumnElement[bool]:
-    """``column = value``, with ``NULL`` meaning ``NULL`` rather than meaning nothing.
-
-    Three of the revision's five fields are nullable, and in SQL ``column = NULL`` is never
-    true — not even of a ``NULL``. Written as ``==``, a compare-and-swap over a document with no
-    version token would therefore miss every single time, and a sweep would report a whole
-    corpus superseded by nobody.
-    """
-    return column.is_(None) if value is None else column == value
 
 
 class SqliteDocStore(
@@ -176,9 +164,16 @@ class SqliteDocStore(
                         models.Document.workspace_id == self._workspace_id,
                         models.Document.deleted_at.is_(None),
                         models.Document.content_hash == expected.content_hash,
-                        _matches(models.Document.version_token, expected.version_token),
-                        _matches(models.Document.original_ref, expected.original_ref),
-                        _matches(models.Document.parse_fp, expected.parse_fp),
+                        # Three of these are nullable, and in SQL `column = NULL` is never
+                        # true — not even of a `NULL`. Written out it would miss on every
+                        # document with no version token, which is most of a corpus, and the
+                        # symptom would be a sweep reporting the whole index superseded by
+                        # nobody. `==` is nonetheless right here: SQLAlchemy renders
+                        # `column == None` as `column IS NULL`, checked by compiling it and
+                        # pinned by `test_the_stores_guard_reads_an_absent_field_as_absent`.
+                        models.Document.version_token == expected.version_token,
+                        models.Document.original_ref == expected.original_ref,
+                        models.Document.parse_fp == expected.parse_fp,
                     )
                     .values(updated_at=utcnow()),
                 ),
