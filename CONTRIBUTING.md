@@ -82,6 +82,28 @@ MANICULE_VOCABULARY_BUNDLE=/path/to/vocabularies uv run python -c \
 It is not a `MANICULE_` variable, and that is deliberate — the test environment clears that
 whole namespace before each test, so a switch living inside it is deleted before it is read.
 
+### `.test_durations`, and when it needs regenerating
+
+CI runs the suite in three shards per Python version, balanced on the committed
+`.test_durations`. **You do not need it to run the tests** — `uv run pytest` ignores it
+entirely, and it is read only when `--splits` is passed.
+
+It is checked in rather than measured per run because the measurement costs a full suite, and
+it goes stale slowly and harmlessly: a test it has never heard of is given the average duration
+rather than dropped, so a stale file costs *balance* and can never cost coverage. Regenerate it
+when the shards have visibly drifted apart — each job prints its own `--durations=25`, so a
+shard that has become the slow one says so — or after a change that moves a lot of test time,
+such as adding a corpus:
+
+```bash
+uv run pytest --store-durations          # rewrites .test_durations from a full local run
+```
+
+Relative cost is what balances the shards, so a laptop's numbers are fine; they need not match
+the runner's. `tests/test_ci_test_sharding.py` holds the shard count in the workflow and its
+matrix to the same number, because a `--splits` raised without the matrix runs part of the
+suite and reports green.
+
 ## Nothing is deferred
 
 **Everything in scope happens in this change.** Adjacent bugs, dead code, stale

@@ -174,6 +174,18 @@ dev = [
   # to run, reporting an unrecognised option rather than anything about the version. The floor
   # is the release the `[tool.coverage.run]` timings below were measured on.
   "coverage>=7.15",
+  # What splits the suite across the CI matrix's shards. Chosen over the count-based splitters
+  # because this suite's cost is not distributed anything like its test count: the 25 slowest
+  # tests are roughly half the run time and nearly all of them are the parser corpus
+  # round-trips, so a split that gives each shard an equal *number* of tests gives one of them
+  # `test_word.py` and `test_every_parser.py[docx]` together and the sharding buys nothing.
+  # `--splits` partitions whatever collection produced rather than a list written down here,
+  # which is the property that matters: a test added to a new directory lands in a shard by
+  # construction, because an unmeasured test is given the average duration rather than dropped.
+  # `.test_durations` therefore only decides *which* shard a test runs in, so a stale one costs
+  # balance and cannot cost coverage. It has no configuration file of its own — every option is
+  # a flag, and the ones CI passes are in `.github/workflows/ci.yml`.
+  "pytest-split>=0.10",
   "ruff>=0.8",
   "pyright>=1.1.390",
   # Fixture generation (docs/parsing.md §3.5): fixtures are built by a checked-in script

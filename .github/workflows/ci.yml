@@ -52,13 +52,38 @@ jobs:
       - name: pyright (strict)
         run: uv run pyright
 
+  # Sharded because this job was the whole run's critical path and nothing else was close: at
+  # 6m25s a leg it decided when CI finished, while the next-longest job — `container` — was done
+  # in 1m42s. The 31s of setup ahead of `pytest` is what makes splitting across runners the
+  # cheap option rather than the expensive one: a shard re-pays half a minute, not the several
+  # minutes an install-heavy job would. Three shards take a leg to about 2m35s for about 2m40s
+  # of extra machine time across the whole matrix — a trade worth making on the one job every
+  # push and every pull request waits for, and not worth making on any of the others.
+  #
+  # Three, and not more, because two costs do not shard. Setup is 31s per shard however many
+  # there are, and `pytest` collects the *whole* suite before deselecting the other groups, so
+  # collection and the session fixtures are ~9s more that every shard pays in full. Only the
+  # ~345s of test time actually divides, which is the curve: 1 shard 6m25s, 2 shards 3m32s,
+  # 3 shards 2m35s, 4 shards 2m06s, 5 shards 1m49s. A fourth buys 29s for two more jobs, and
+  # the floor under all of it is those 40s plus the single longest test — a 25s parser corpus
+  # round-trip — which no number of shards divides.
+  #
+  # The shard count is written twice — `--splits` below and the `shard:` list — and it has to
+  # be: `strategy:` cannot read the `env` context, so there is no one place to put it. That is
+  # the dangerous kind of duplication rather than the merely untidy kind, because the two
+  # disagreeing is silent in the direction that matters: `--splits 4` against a three-entry
+  # matrix runs three quarters of the suite and every job reports green. The other direction is
+  # loud — `--group` is bounded by `--splits`, so a surplus entry is a `UsageError` rather than
+  # a quiet pass. tests/test_ci_test_sharding.py fails the build for both, because the loud one
+  # is still cheaper to find in a test than in a CI log.
   test:
-    name: test (${{ matrix.python }})
+    name: test (${{ matrix.python }}, shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python: ["3.12", "3.13"]
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -123,13 +148,35 @@ jobs:
       # nobody could say where they went without adding the flag and running CI again. It costs
       # nothing and it is the first question anyone asks. The distribution is concentrated: the
       # slowest 1% of tests is a little over half the runtime, and it is the parser corpus
-      # round-trips, which are doing real work rather than wasting time.
+      # round-trips, which are doing real work rather than wasting time. It is now also the
+      # thing to read when a shard drifts: these are per-shard durations, and a shard that has
+      # become the slow one says so here before anyone has to bisect the split.
+      #
+      # `--splitting-algorithm least_duration` rather than the default contiguous chunks. Both
+      # are duration-aware; the difference is that the default cuts the collection order at
+      # duration boundaries, so a single 25s test straddling a cut skews the shard it lands in,
+      # while `least_duration` packs largest-first into the emptiest shard and is what actually
+      # minimises the slowest one — and the slowest shard is the wall clock. It keeps each
+      # shard's tests in collection order, so module-scoped fixtures still behave; they are just
+      # set up in more than one shard now.
+      #
+      # **The coverage figure each shard prints is that shard's, not the suite's**, and it will
+      # read as a catastrophic drop to anyone who has not been told. It is left in rather than
+      # combined because `[tool.coverage.run]` in pyproject.toml already records that nothing
+      # consumes this number — no `fail_under`, no upload, no required check — and on
+      # `sys.monitoring` it costs nothing to produce. Combining across shards would mean an
+      # artifact upload and a fourth job to `coverage combine` them, which is real machinery to
+      # make an unread number correct. If it is ever read, that is the moment to build it.
       - name: pytest
         env:
           REQUIRE_GRAMMAR_BUNDLE: "1"
           REQUIRE_VOCABULARY_BUNDLE: "1"
           TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
-        run: uv run --python ${{ matrix.python }} pytest --cov --cov-report=term-missing --durations=25
+        run: >-
+          uv run --python ${{ matrix.python }} pytest
+          --splits 3 --group ${{ matrix.shard }}
+          --splitting-algorithm least_duration
+          --cov --cov-report=term-missing --durations=25
 
   # A model edited without a migration and a downgrade that has never run both look exactly
   # like a healthy repository. Its own job so a drifted schema is distinguishable from a
