@@ -43,15 +43,6 @@ from tests.storage_helpers import make_chunk, make_document
 MARKDOWN_MEDIA_TYPE = min(MARKDOWN_MEDIA_TYPES)
 """One of the Markdown types, chosen deterministically so routing is not a coin toss."""
 
-usable_expansion = ingest_glossary._usable_expansion  # pyright: ignore[reportPrivateUsage]
-"""The private cleaner, bound once here rather than reached through the module at each call.
-
-It is private because nothing outside the module should *call* it; it is tested directly because
-"refuses more than one sentence" is its own documented contract, and asserting it only through
-``core_expansion`` would leave that refusal indistinguishable from the other reasons that
-function returns ``""``.
-"""
-
 FULL_WIDTH_SAFER = "\uff33a\uff26e\uff32"
 """``SaFeR`` with its three capitals written as full-width forms.
 
@@ -1088,15 +1079,23 @@ def test_an_expansion_cut_at_a_sentence_end_keeps_none_of_its_punctuation(ending
 
 
 @pytest.mark.parametrize("ending", [".", "!", "?"])
-def test_two_sentences_are_refused_whichever_mark_ends_the_first(ending: str) -> None:
-    """Refusing "more than one sentence in it" is what ``_usable_expansion`` documents doing.
+def test_two_sentences_are_never_stored_as_one_expansion(ending: str) -> None:
+    """Refusing "more than one sentence in it" was true of ``.`` and false of the other two.
 
-    It was true of ``.`` and false of the other two, so ``Alpha Bravo! Charlie Delta`` — two
-    sentences, no initials agreement, opening with no listed word — was kept whole and stored as
-    a single phrase. The trailing-punctuation strip does not cover this: there is nothing
-    trailing to strip, the sentence ends in the middle.
+    **The term is chosen so that its initials spell the entire right-hand side**, because that is
+    the only branch on which a two-sentence string can survive whole. ``core_expansion`` keeps the
+    whole side when its initials agree, and ``ABCD`` is what ``Alpha Bravo! Charlie Delta``
+    spells — so on ``origin/main`` that string was kept entire and stored as what ``ABCD`` means.
+    ``_phrase_after`` could never have produced it: it cuts at the boundary, so a prefix is at
+    most the first sentence.
+
+    Asserted here rather than against the private cleaner that does the refusing. The value that
+    differs is the *stored expansion*, which is the thing that was wrong; a test at this edge says
+    so directly and goes on working if that helper is renamed. The trailing-punctuation strip does
+    not cover this case — nothing trails, the sentence ends in the middle — so this is a genuinely
+    separate rule from the one pinned above.
     """
-    assert usable_expansion(f"Alpha Bravo{ending} Charlie Delta") == ""
+    assert core_expansion("ABCD", f"Alpha Bravo{ending} Charlie Delta") == ""
 
 
 def test_a_stylized_terms_skeleton_is_reachable_from_a_normalised_key() -> None:
