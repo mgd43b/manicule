@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from email.message import EmailMessage
 from pathlib import Path
 from typing import override
 
@@ -48,6 +49,21 @@ def _raw(corpus: Path, name: str) -> RawDocument:
 async def _blocks(parser: MailParser, raw: RawDocument) -> list[ParsedBlock]:
     """Drained through ``read_blocks``, which closes the stream in a ``finally``."""
     return await read_blocks(parser, raw)
+
+
+def _line_start(block: ParsedBlock) -> int:
+    assert isinstance(block.anchor, LineAnchor), "a mail block is addressed by lines"
+    return block.anchor.start
+
+
+def _html_message(html: str) -> RawDocument:
+    """An HTML-only message built here, so two bodies can differ by one element."""
+    message = EmailMessage()
+    message["From"] = "sender@example.invalid"
+    message["To"] = "recipient@example.invalid"
+    message["Subject"] = "Where it went, in one message"
+    message.set_content(html, subtype="html")
+    return raw_of(message.as_bytes(), "message/rfc822", uri="built.eml")
 
 
 async def test_every_readable_fixture_round_trips_within_its_declared_location_budget(
@@ -149,6 +165,63 @@ async def test_resolving_an_html_body_anchor_applies_the_same_pinned_conversion(
     blocks = await _blocks(parser, raw)
     body = next(block for block in blocks if "reconciler" in block.text)
     assert await parser.resolve(body.anchor, raw) == body.text
+
+
+async def test_an_inline_break_in_an_html_body_moves_every_line_after_it(
+    parser: MailParser,
+) -> None:
+    """Why ``PARSERS["email"].rules`` moved for a change this parser did not make.
+
+    An HTML-only body's line numbers address the text ``_html_to_text`` builds from the web
+    parser's blocks, and a ``<br>`` now puts a newline *inside* one of those blocks. So the
+    break becomes a line of the canonical text and every anchor below it shifts by one — which
+    is a change to what every citation into that message resolves to, with nothing in this
+    module changed at all.
+
+    Run rather than reasoned about: the same message is built twice, once with the break and
+    once without, and the two anchor sequences are compared.
+    """
+    body = (
+        "<html><body><h1>Where it went</h1>"
+        "<p>first clause{divider}second clause</p>"
+        "<p>a paragraph below the break</p></body></html>"
+    )
+    without = await _blocks(parser, _html_message(body.format(divider=" ")))
+    with_break = await _blocks(parser, _html_message(body.format(divider="<br/>")))
+
+    assert without[-1].text == "a paragraph below the break"
+    assert with_break[-1].text == without[-1].text, "the same paragraph, in both messages"
+    assert without[2].text == "first clause second clause"
+    assert with_break[2].text == "first clause\nsecond clause"
+
+    moved = _line_start(with_break[-1]) - _line_start(without[-1])
+    assert moved == 1, (
+        "one line further down, because the break is now a line of the canonical text. "
+        "Asserted as the difference rather than as two absolute line numbers, so a change "
+        "to which headers this parser renders fails where it happened rather than here"
+    )
+    assert without[-1].anchor == LineAnchor(start=9, end=9), "and this is where it was"
+
+
+async def test_resolving_across_an_inline_break_returns_the_lines_it_claims(
+    parser: MailParser, corpus: Path
+) -> None:
+    """``resolve`` recomposes the canonical text by the same rules, break included.
+
+    If the two paths disagreed about what a break contributes, an anchor would resolve to the
+    line above or below the one it names — a citation that reads correctly and is wrong.
+    """
+    raw = _raw(corpus, "html-only.eml")
+    blocks = await _blocks(parser, raw)
+    # Named rather than found by "has a newline in it": the header block's lines are its
+    # fields, and the list block's are its items, so neither is what this is about.
+    broken = next(block for block in blocks if block.text.startswith("The reconciler"))
+
+    assert broken.text.splitlines() == [
+        "The reconciler now runs on its own schedule,",
+        "which removed the long tail of deletions that used to arrive a day late.",
+    ]
+    assert await parser.resolve(broken.anchor, raw) == broken.text
 
 
 async def test_a_message_with_headers_and_no_body_yields_the_header_block_alone(

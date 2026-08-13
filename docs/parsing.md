@@ -1142,9 +1142,16 @@ can price it:
   matches for none of them — which is the point. Nothing can tell in advance which pages hold a
   multi-paragraph macro without parsing them, and a fingerprint that could would be a hash of
   the output rather than of the rules. This reads retained bytes and touches no network.
-- **Re-embed**: only the chunks that actually changed. Chunk ids are content-derived and
-  re-parse reconciles against the stored set, so an unaffected document re-parses to the same
-  ids and keeps its vectors; an affected one re-embeds the chunks whose text moved.
+- **Re-embed**: every chunk of every document that re-parses. The correction is worth the space
+  because the previous version of this bullet said "only the chunks that actually changed".
+  What is content-derived is a chunk's *id*, so a chunk the re-parse did not move comes back
+  with the id it had, keeps the vector row stored against that id, and keeps every citation
+  that resolved to it — but the embedding is not skipped to get there. `re_parse` runs the
+  ordinary ingest path, and that path embeds every chunk it is handed. Measured on a four-chunk
+  document whose text did not move at all, `tests/ingest/test_reindex.py` counts four calls.
+  So a bump costs nothing in identity and one forward pass per chunk in compute.
+  [`ingest.md`](ingest.md) §10.1 owns the accounting and says why the two counts it reports are
+  not counts of forward passes.
 - **The path**: nothing, for an index that syncs. Change detection re-parses each document the
   next time its connector reports it, because `IngestPipeline` compares the stored `parse_fp`
   against what that document's own parser would produce now and a mismatch stops it counting as
@@ -1159,17 +1166,98 @@ Four things a parser must **not** promote to a paragraph boundary while obeying 
 | In the source | In `text` |
 |---|---|
 | paragraph break | blank line |
-| inline `<br>` | stays inside the paragraph |
+| inline `<br>` | one `\n`, inside the paragraph (§4.5.1) |
 | list item | one line per item, list structure kept |
 | code or plain-text body | exact source, never reflowed |
 | table | its structured representation (§4.4) |
 
-**Known gap, stated because the fixture asserts around it.** An inline `<br>` currently
-contributes *no* character in both the web and Confluence parsers: `a<br/>b` reads `ab`. It is
-therefore not a paragraph boundary, which is what this section requires of it, and it is also
-not the line break it should be. Making it one means changing the whitespace collapse that
-every heading, cell and list item goes through, which is a wider change than a paragraph rule
-and is not folded into one.
+#### 4.5.1 An inline break is one newline, and where a newline already means something it is a space
+
+This was the row above's known gap until `parsers/inline.py` closed it, and the gap was total:
+a `<br>` contributed *no* character in the web parser or the Confluence storage parser, so
+`a<br/>b` read `ab` — two source fragments glued into a word neither page contains. Every other
+inline element is understood by flattening its text into the run around it, and a `<br>` has no
+text to flatten, so the flatten returned nothing and the element was gone before any collapse
+could have kept it.
+
+The rule, which both parsers now share rather than state twice:
+
+| In the source | In `text` |
+|---|---|
+| one break | one `\n` |
+| two or more adjacent breaks | one blank line, whatever the count |
+| a break at the start or end of a container | nothing |
+| a break inside a heading, table cell, list item or task | one space |
+
+**Two adjacent breaks are a blank line because that is what they draw.** A reader sees an empty
+line and so does `paragraphs`. Beyond two there is nothing further the model can say — the
+splitter discards the empty paragraphs a longer run would produce — so the run is capped at one
+blank line rather than carried, which also stops the decorative spacer markup old pages are full
+of from spending a chunk's budget on whitespace.
+
+**A break becomes a space wherever a newline is already the record separator.** A table renders
+one row per line and `text == "\n".join(rows)` (§4.4); a list renders one item per line and
+glossary detection reads the marker at the start of each; a task list renders one task per line;
+a heading's text becomes a path element and a breadcrumb. A newline in any of those would not
+read as a line break at all — it would read as another row, another item, another heading — so
+the break is rendered as the strongest separator that rendering has, which is a space. That is
+still a repair on what was there before, because before it was nothing.
+
+**The break is an object in the parts stream, never a character in the string.** The obvious
+implementation puts a sentinel character into the text and swaps it for a newline after
+whitespace has been collapsed, and it has to answer a question it cannot answer cheaply: which
+character can no document produce? `NUL` is the usual candidate and an HTML tokenizer's error
+handling is what decides whether it survives — an argument to be re-made every time the engine
+changes, about a failure that would surface as a control character inside a citation. A
+`LINE_BREAK` object answers it by construction: a `str` is never that object however the page was
+written, and it cannot escape because the three joins in `parsers/inline.py` are its only
+consumers and each returns a string.
+
+**Deliberately unsupported.** A `<br>` inside `<pre>`, inside a `code` or `noformat` macro body,
+or inside a Graphviz body still contributes nothing: those are taken verbatim from the source and
+the rule above is not allowed to reflow them (`<pre>` in HTML draws its lines with real newlines,
+so this is a construct rather than a common one). A `<br>` inside an `ac:parameter` value is
+likewise left alone — a parameter is read as a value rather than as inline content, and
+Confluence escapes markup inside one. And an inline break inside a *single paragraph larger than
+the chunk budget* is lost to §4.2's sentence repacking, exactly as any other intra-paragraph
+structure is; the paragraph boundary either side of it survives, which is what §4.5 is about.
+
+**What the bump costs an existing index.** `PARSERS["html"].rules` and
+`PARSERS["confluence"].rules` both went 2 → 3, and `PARSERS["email"].rules` went with them for
+the reason recorded against its entry: an HTML-only mail body's `LineAnchor`s address the text
+`mail._html_to_text` builds from the web parser's blocks, so a newline inside a block moves every
+line after it. The costs are the shape §4.5 prices — text changes only for documents containing
+a break; every document of those three parsers re-parses from retained bytes, because a
+`parse_fp` records the parser's version rather than the document's content; a chunk whose text
+did not move keeps its id and its stored vector, so no citation moves; and the embedding is
+recomputed for every chunk of every re-parsed document, which is the compute the bump costs.
+Measured on the fixture corpus before the bump: of 323 blocks across 21 HTML and storage-format
+documents, exactly one changed, and it was the one holding the `<br>`.
+
+**What to type.** `manicule document reindex --stale` ([`ingest.md`](ingest.md) §10.1) is the
+sweep for it: this bump makes every `html`, `confluence` and `email` document stale at once, so
+the per-document verb is the wrong end of the tool here. `--dry-run` first prices it and names
+the documents whose bytes were never retained, which are the only ones a sweep cannot repair.
+Doing nothing is also a choice with a defined outcome — change detection re-parses each document
+the next time its connector reports it — and the sweep is what closes that window early.
+
+**Do not expect the embedding cache to absorb this.** It is a bounded LRU over
+`(embed fingerprint, text)`, and what it is good at is duplicate *text*: a batch of forty copies
+of one string costs one forward pass. A sweep in a fresh process over a corpus of distinct
+chunks has no duplicates to absorb, and a corpus larger than the cache evicts each entry before
+anything could reuse it. Measured against `EmbeddingCache` at its default capacity of 10,000:
+
+| Shape | Forward passes |
+|---|---|
+| 40 copies of one string, one batch | 1 |
+| 10,000 distinct chunks, fresh process | 10,000 |
+| the same 10,000 swept twice in one process | 10,000 then 0 |
+| 20,000 distinct chunks swept twice in one process | 20,000 then 20,000 |
+
+`html_text_version` is **not** bumped with them. `web-blocks/1` names the rule email applies to
+those blocks — join them with a blank line — and that rule is unchanged; it lives in
+`ChunkFingerprint.version`, where a bump refuses ingest against the entire corpus rather than
+re-parsing the documents that moved.
 
 ### 4.6 Block lineage — assessed, and deliberately not built yet
 

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from typing import override
 
 import pytest
 
 from manicule.core.anchors import Unlocated
-from manicule.core.content import Chunk, DocumentStatus
+from manicule.core.content import Chunk, DocumentStatus, ParsedBlock, RawDocument
+from manicule.core.embedding import Vector
 from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
 from manicule.ingest.reindex import re_embed, re_parse, repair, select
-from manicule.parsers.config import CONFLUENCE_MEDIA_TYPE, ConfluenceConfig
+from manicule.parsers.config import CONFLUENCE_MEDIA_TYPE, ConfluenceConfig, WebConfig
 from manicule.parsers.confluence import ConfluenceStorageParser
 from manicule.parsers.versions import current_parse_fingerprints, parse_fingerprint
+from manicule.parsers.web import WebParser
 from manicule.testing import assert_refuses_oversized_chunks
 from tests.fakes import HashEmbedder, make_chunks, make_document
 from tests.ingest import fakes
@@ -215,6 +218,134 @@ async def test_a_parser_rules_bump_re_parses_its_documents_without_the_connector
     assert "First paragraph.\n\nSecond paragraph." in rebuilt, (
         "and the rebuilt text is what the current parser produces, not what the stale "
         "fingerprint claimed was current"
+    )
+
+
+_BREAK_PAGE = """<html><head><title>Signal routing</title></head><body>
+<h1 id="routing">Signal routing</h1>
+<p>The first paragraph, which holds no break and must not move.</p>
+<p>primary endpoint<br/>secondary endpoint</p>
+<p>The last paragraph, which holds no break either.</p>
+</body></html>"""
+
+
+class _GluedWebParser(WebParser):
+    """The HTML parser as ``html`` rules **2** read a page: a ``<br>`` contributed nothing.
+
+    A stand-in for the previous version rather than a copy of it, and the difference it
+    reproduces is the only one there is — under version 2 the break contributed no character,
+    so the fragments either side were glued. This fixture's prose blocks carry newlines from
+    nothing else, so stripping them reproduces exactly what was stored.
+    """
+
+    @override
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        async for block in super().parse(raw):
+            yield block.model_copy(update={"text": block.text.replace("\n", "")})
+
+
+class _CountingEmbedder(HashEmbedder):
+    """Records every text it was asked to embed, so "re-embedded" can be counted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedded: list[str] = []
+
+    @override
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        self.embedded.extend(texts)
+        return await super().embed(texts)
+
+
+async def test_the_break_bump_rebuilds_from_retained_bytes_and_keeps_unmoved_chunk_identity() -> (
+    None
+):
+    """The migration a ``<br>`` becoming a newline costs, run end to end.
+
+    A document stored under the superseded fingerprint is selected; it is rebuilt from retained
+    bytes with the connector present and never asked; the one chunk whose text moved gets a new
+    id and a new vector; and the chunks that did not move keep both, because a chunk id is
+    derived from its content and re-parse reconciles against the stored set. Keeping the id is
+    what keeps every stored citation pointing where it pointed.
+
+    **What is not kept is the embedding work**, and it is asserted here because reading the code
+    suggests otherwise. ``re_parse`` runs the ordinary ingest path, which embeds every chunk it
+    is handed; the vector an unchanged chunk ends up with is identical, but it was recomputed to
+    get there. Measured on a four-chunk document whose text did not move at all: four calls.
+    ``docs/parsing.md`` §4.5 said the opposite until this case was written.
+
+    The old parser is stood in for rather than checked out, so this states what changed between
+    the two versions in one line of code instead of pinning the whole of the previous one.
+    """
+    blobs = fakes.MemoryBlobs()
+    store = fakes.MemoryIngestStore()
+    vectors = fakes.MemoryVectors()
+    embedder = _CountingEmbedder()
+    connector = fakes.DictConnector({"page": _BREAK_PAGE})
+    connector.media_types["page"] = "text/html"
+
+    stale_pipeline, _, _ = build(
+        store=store,
+        vectors=vectors,
+        blobs=blobs,
+        embedder=embedder,
+        parsers={"html": _GluedWebParser(WebConfig())},
+        chain=("html",),
+    )
+    await stale_pipeline.run(connector)
+    document = await store.find_document("memory", "page")
+    assert document is not None
+    stored = {chunk.id: chunk.text for chunk in store.chunks[document.id]}
+    assert "primary endpointsecondary endpoint" in stored.values(), (
+        "the corpus this migration repairs: two fragments glued into a word the page never had"
+    )
+    kept = {
+        chunk.id: vectors.rows[chunk.id]
+        for chunk in store.chunks[document.id]
+        if "endpoint" not in chunk.text
+    }
+    downloads = list(connector.fetches)
+
+    installed = parse_fingerprint("html")
+    assert installed is not None
+    superseded = ParseFingerprint(parser="html", version="2", libraries=dict(installed.libraries))
+    await store.set_lineage(
+        document.id, chunk_fp=None, embed_fp=None, parse_fp=superseded.canonical()
+    )
+    selected = await select(store, parse_fingerprints=current_parse_fingerprints())
+    assert [chosen.id for chosen in selected] == [document.id], (
+        "the bump selects this document: the selector is the complement of what is installed"
+    )
+
+    current_pipeline, _, _ = build(
+        store=store,
+        vectors=vectors,
+        blobs=blobs,
+        embedder=embedder,
+        parsers={"html": WebParser(WebConfig())},
+        chain=("html",),
+    )
+    embedder.embedded.clear()
+    report = await re_parse(selected, pipeline=current_pipeline, blobs=blobs)
+
+    assert report.documents == 1
+    assert report.failures == []
+    assert connector.fetches == downloads, "the source was not asked for the bytes a second time"
+    rebuilt = {chunk.id: chunk.text for chunk in store.chunks[document.id]}
+    assert "primary endpoint\nsecondary endpoint" in rebuilt.values(), (
+        "the rebuilt text is what the current parser produces, break included"
+    )
+    assert set(kept) <= set(rebuilt), "a chunk whose text did not move keeps its id"
+    assert all(vectors.rows[chunk_id] == vector for chunk_id, vector in kept.items()), (
+        "and therefore its stored vector, which is what keeps its citations pointing where "
+        "they pointed"
+    )
+    moved = set(rebuilt) - set(stored)
+    assert len(moved) == 1, "exactly one chunk's text moved, so exactly one id is new"
+    assert rebuilt[moved.pop()] == "primary endpoint\nsecondary endpoint"
+    assert len(embedder.embedded) == len(rebuilt), (
+        "and every chunk was re-embedded to get there, unchanged ones included: `re_parse` "
+        "runs the ordinary ingest path, which has no skip for a chunk whose id it already has"
     )
 
 
