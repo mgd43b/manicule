@@ -46,6 +46,7 @@ from manicule.config.settings import (
     config_file,
     looks_secret,
 )
+from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome
 from manicule.core.content import DocumentStatus
 from manicule.core.errors import ConfigError, ManiculeError, PolicyError, UnknownEntityError
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
@@ -153,6 +154,57 @@ class AskAside:
     It is filled after ``message_id`` is known, so a streamed answer carries the id it was
     persisted under exactly as the non-streaming form does.
     """
+
+
+def _identity_deliberately_unapplied(document: Document, *, claimed: set[str]) -> bool:
+    """Whether this document is path-keyed on purpose rather than being one of two for one page.
+
+    An enriched page with no manifest beside it is adapted, cited by its own page id, and keyed on
+    its path **deliberately** — identity has to be known at discovery and discovery reads the
+    manifest, not the document. It carries its own notice naming the page id and the command that
+    applies it, so reporting it here as well would be one finding twice with two remedies, and the
+    one this check gives is the wrong advice for it.
+
+    **Unless the identity it declares is already held by another document**, and that exception is
+    the whole reason this takes ``claimed``. Following the notice — generate the manifest, sync —
+    creates the page-keyed document and leaves the path-keyed one behind, because the connector
+    stops discovering it under the path it was stored by. Excluding it unconditionally meant the
+    tool instructed an action that produces an orphan and then said nothing about it. Two rows for
+    one page is exactly what this check is for, however they came to exist.
+
+    Both halves were found by running a real ingest and reading what ``doctor`` said afterwards:
+    first that "the manifest beside each one declares an identity" about a page with no manifest,
+    then nothing at all about a corpus holding the same page twice.
+    """
+    record = document.metadata.get(ENRICHED_KEY)
+    unapplied = (
+        isinstance(record, dict)
+        and record.get("outcome") == AdapterOutcome.IDENTITY_NOT_APPLIED.value
+    )
+    return unapplied and _declared(document) not in claimed
+
+
+def _declared(document: Document) -> str:
+    """The source identity this document's provenance record states, or ``""``."""
+    record = document.provenance
+    if record is None or record.source is None:
+        return ""
+    return record.source.source_id
+
+
+_IDENTITY_SCAN = 10_000
+"""How many documents the identity dry run examines before it stops and says it stopped.
+
+A bound rather than a full scan, because ``doctor`` is run to read a sentence and a corpus of a
+million rows should not be loaded to produce one. ``truncated`` is reported alongside the count so
+that "no documents affected" cannot be read as "none anywhere" when it means "none in the first
+ten thousand"."""
+
+_IDENTITY_SAMPLE = 25
+"""How many of the affected documents are listed individually.
+
+The count is the finding; the list is what makes it checkable. Twenty-five is enough to recognise
+a pattern — one directory, one exporter, one space — without turning a diagnostic into an export."""
 
 
 class ApplicationService:
@@ -669,16 +721,25 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         root_path = path.resolve()
         outcomes = await asyncio.to_thread(write_sidecars, path, force=force)
+        counts: dict[str, int] = {}
+        for outcome in outcomes:
+            counts[outcome.outcome.value] = counts.get(outcome.outcome.value, 0) + 1
         return r.SidecarReport(
             root=str(root_path),
             considered=len(outcomes),
             written=sum(1 for outcome in outcomes if outcome.written),
+            # Every considered file lands in exactly one bucket, adapted ones included, so the
+            # counts sum to `considered` and a run that adapted nothing states which kind of
+            # nothing it was rather than leaving that to be inferred from an empty `written`.
+            by_outcome=counts,
             skipped=tuple(
                 # Relative to the root, which the report has already named. Absolute paths here
                 # repeat the root on every row and push the reason — the part that says what to
                 # do next — off the side of a terminal table.
                 r.SidecarSkip(
-                    path=_relative_to(outcome.path, root_path), reason=outcome.skipped_reason
+                    path=_relative_to(outcome.path, root_path),
+                    reason=outcome.skipped_reason,
+                    outcome=outcome.outcome.value,
                 )
                 for outcome in outcomes
                 if not outcome.written
@@ -873,6 +934,7 @@ class ApplicationService:
         checks.append(await self._permissions_check())
         checks.append(await self._index_check())
         checks.append(await self._connectors_check())
+        checks.append(await self._document_identity_check())
         checks.append(await self._grammar_check(fix=fix))
         checks.append(await self._vocabulary_check(fix=fix))
         # No `fix`. The other two repairs move megabytes and finish while somebody is looking
@@ -1161,6 +1223,128 @@ class ApplicationService:
             # that wants to offer the action should not have to find it inside one. The
             # permissions check sets both and this is the other check with a command to give.
             remedy=f"manicule document list --source {first}",
+        )
+
+    async def _document_identity_check(self) -> r.Check:
+        """Documents keyed on where they sit while the file beside them declares a page id.
+
+        A local file's identity used to be its resolved path, always. It is now the ``source_id``
+        a :mod:`~manicule.connectors.sidecar` manifest declares, where one does — so that a mirror
+        reorganised from by-space to by-tree updates its pages instead of replacing every one of
+        them with a new document. Documents ingested before that keep the old identity until the
+        next sync, and the next sync moves them. This is the dry run that says so first.
+
+        **It is a stronger position than #98's and the difference is worth stating.** That change
+        had nothing in the database recording which connector instance a row came from, so a
+        migration would have had to guess and none shipped. Here the mapping is a fact already
+        stored: ``documents.source_id`` holds the old identity and the provenance record's own
+        ``source_id`` holds the new one, written by the same fetch, for exactly the rows that
+        move and no others. Every field below is read rather than estimated.
+
+        **Chunks and vectors cannot be reused, and not only because the ids move.** ``chunk_id``
+        derives from ``document_id``, so every chunk id changes — but even re-keyed they would be
+        wrong, because the documents whose identity moves are precisely the documents whose
+        *parse* changes: an enriched export stops going through the HTML parser and starts going
+        through the storage parser, which produces different blocks and therefore different text.
+        The re-embedding is unavoidable, so a migration would buy the curation rather than the
+        compute, and this check says that plainly rather than implying a cheaper option exists.
+
+        **``degraded``, not ``failing``**, on #98's reading: the documents are indexed, searchable
+        and correctly cited, and every query over them works. What is true is that their identity
+        is about to change.
+        """
+        try:
+            store = await self._backend.documents()
+            # `list_documents` rather than `select_documents`: this is the read every surface
+            # uses, so the check runs against the same scoping and the same workspace filter a
+            # listing does. The repair selector is a different surface with different predicates
+            # and none of them is the one being asked about here.
+            documents = await store.list_documents(limit=_IDENTITY_SCAN)
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            return r.Check(
+                name="document-identity",
+                state="unknown",
+                detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        # What identities are actually in use, so that a page-keyed document is recognised as the
+        # twin of the path-keyed one beside it rather than as an unrelated row.
+        claimed = {document.source_id for document in documents}
+        moving = [
+            document
+            for document in documents
+            if (declared := _declared(document))
+            and declared != document.source_id
+            and not _identity_deliberately_unapplied(document, claimed=claimed)
+        ]
+        if not moving:
+            return r.Check(
+                name="document-identity",
+                state="ok",
+                detail=(
+                    "no documents are indexed, so no identity can be about to change"
+                    if not documents
+                    # "None affected" and "none looked at past ten thousand" are different
+                    # answers, and a check that gave the first when it meant the second would be
+                    # a clean bill of health for a corpus nobody examined.
+                    else "every document is already keyed on the identity its source declares"
+                    if len(documents) < _IDENTITY_SCAN
+                    else f"the first {_IDENTITY_SCAN} documents are already keyed on the "
+                    f"identity their sources declare"
+                ),
+                facts={"affected": 0, "examined": len(documents)},
+            )
+        first = moving[0]
+        return r.Check(
+            name="document-identity",
+            state="degraded",
+            detail=(
+                f"{len(moving)} document(s) are still keyed on their file's path while the "
+                f"manifest beside each one declares an identity of its own — {first.source_id!r} "
+                f"declares {first.provenance.source.source_id!r}. "  # pyright: ignore[reportOptionalMemberAccess]
+                f"Documents ingested before the identity change are re-keyed in place when this "
+                f"database migrates, taking their chunks, versions, glossary entries, collection "
+                f"membership and tags with them. These were left alone because their declared "
+                f"identity is already held by another document, and moving onto an occupied key "
+                f"would overwrite a row nothing can restore. Two pages are claiming to be one "
+                f"page, so the second will never update: every sync re-indexes it under its path "
+                f"while the first keeps the identity. Nothing is lost meanwhile — both are "
+                f"indexed, searchable and correctly cited. Compare them with "
+                f"`manicule document list --source {first.source}`, remove whichever is the "
+                f"stale copy with `manicule document delete <id>`, or correct the manifest that "
+                f"declares the wrong page id and sync again. There is no bulk remedy for this "
+                f"and none is implied."
+            ),
+            facts=cast(
+                "dict[str, JsonValue]",
+                {
+                    "affected": len(moving),
+                    "examined": len(documents),
+                    "truncated": len(documents) >= _IDENTITY_SCAN,
+                    "chunks_reusable": False,
+                    "vectors_reusable": False,
+                    "citations_change": True,
+                    "documents": [
+                        {
+                            "source": document.source,
+                            "old_source_id": document.source_id,
+                            "old_document_id": document.id,
+                            "new_source_id": document.provenance.source.source_id,  # pyright: ignore[reportOptionalMemberAccess]
+                            "new_document_id": document_id(
+                                self.settings.workspace,
+                                document.source,
+                                document.provenance.source.source_id,  # pyright: ignore[reportOptionalMemberAccess]
+                            ),
+                            "uri": document.uri,
+                        }
+                        # Bounded, and the bound is named in `affected` rather than hidden: a
+                        # corpus of ten thousand mirrored pages would otherwise put ten thousand
+                        # rows into a diagnostic somebody runs to read a sentence.
+                        for document in moving[:_IDENTITY_SAMPLE]
+                    ],
+                },
+            ),
+            remedy=f"manicule document list --source {first.source}",
         )
 
     async def _index_check(self) -> r.Check:
@@ -3292,9 +3476,16 @@ def source_reference(document: Document | None) -> r.SourceReference | None:
 
     **Three timestamps go in under three names and none substitutes for another.**
     ``modified_at`` is the source's, ``retrieved_at`` is the snapshot's, ``indexed_at`` is this
-    installation's. ``snapshot_checksum`` is read off ``content_hash`` rather than from the record,
-    because that column is the one authority for the digest of these bytes and the record
-    deliberately keeps no second copy of it.
+    installation's.
+
+    **``snapshot_checksum`` is the local copy's digest, which is usually — and not always —
+    ``content_hash``.** For every document whose stored bytes *are* the file, the column is the
+    one authority for that digest and the record keeps no second copy. An enriched export is the
+    exception this now has to handle: its stored bytes are the storage body *extracted from* the
+    file, so ``content_hash`` digests what was indexed and the file on disk is a different,
+    larger thing. Reporting the column there labels the body's digest as the snapshot's, which is
+    an audit reading a citation, checksumming the file it names, and finding they disagree. The
+    adapter records the snapshot's own digest, and it wins where there is one.
     """
     if document is None:
         return None
@@ -3303,6 +3494,10 @@ def source_reference(document: Document | None) -> r.SourceReference | None:
         return None
     published = record.source
     snapshot = record.snapshot
+    adaptation = document.metadata.get(ENRICHED_KEY)
+    # ``dict`` rather than ``Mapping``: this is a value read back out of a JSON column, and
+    # ``Mapping`` is imported here only for type checking.
+    declared = adaptation.get("snapshot_checksum") if isinstance(adaptation, dict) else None
     return r.SourceReference(
         title=published.title if published else "",
         canonical_uri=published.canonical_uri if published else "",
@@ -3313,7 +3508,9 @@ def source_reference(document: Document | None) -> r.SourceReference | None:
         ),
         section_path=published.section_path if published else (),
         snapshot_path=snapshot.path if snapshot else "",
-        snapshot_checksum=document.content_hash,
+        snapshot_checksum=declared
+        if isinstance(declared, str) and declared
+        else document.content_hash,
         retrieved_at=(
             snapshot.retrieved_at.isoformat() if snapshot and snapshot.retrieved_at else None
         ),

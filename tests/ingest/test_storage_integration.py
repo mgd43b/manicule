@@ -8,6 +8,7 @@ exercises: lineage, tombstones, the recovery sweep, run counters, ``index_state`
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -16,6 +17,7 @@ import pytest
 
 from manicule.core.content import IN_FLIGHT, DocumentStatus, Retention
 from manicule.core.embedding import IndexFingerprints
+from manicule.core.ids import document_id
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
 from manicule.ingest.recovery import requeue_interrupted
@@ -303,8 +305,14 @@ async def test_a_mirrored_page_with_a_manifest_cites_the_page_through_the_real_s
     assert stored.title == "Retry policy"
     assert stored.uri == "https://docs.example.test/pages/123456/retry-policy"
 
+    # The identity, which is now the page's own and no longer where the file happens to sit.
+    assert stored.source_id == "123456", (
+        "a manifest that declares a source_id declares the document's identity; keying on the "
+        "path instead makes a reorganised mirror a corpus of new documents and orphans the old"
+    )
+    assert stored.id == document_id("default", "local", "123456")
+
     # The local snapshot, which must survive being superseded.
-    assert stored.source_id == str(page)
     record = stored.provenance
     assert record is not None, "the record must survive the JSON column round trip"
     assert record.snapshot is not None
@@ -621,3 +629,70 @@ async def test_a_single_document_reindex_refuses_an_id_that_is_still_in_the_tras
     assert report.documents == 0
     assert len(report.unrepairable) == 1
     assert "restored before it can be re-parsed" in report.unrepairable[0]
+
+
+async def _enriched(root: Path, *, page_id: str = "1002", name: str = "1002.html") -> Path:
+    """One enriched page with its manifest beside it, under ``root``. Synthetic throughout."""
+    from manicule.connectors.enriched_html import write_sidecars  # noqa: PLC0415
+
+    target = root / name
+    target.write_text(
+        f"<!doctype html><html><head><title>Retry Runbook</title></head><body>"
+        f"<section data-source-metadata>"
+        f"<p><strong>Page ID:</strong> {page_id}</p>"
+        f"<p><strong>Version:</strong> 7</p>"
+        f'<p><strong>Source:</strong> <a href="https://docs.example.test/pages/{page_id}">'
+        f"canonical page</a></p>"
+        f"</section>"
+        f'<main data-document-representation="storage">'
+        f"<h1>Retry Runbook</h1><p>The client retries twice.</p></main>"
+        f"</body></html>",
+        encoding="utf-8",
+    )
+    await asyncio.to_thread(write_sidecars, root, force=True)
+    return target
+
+
+async def test_a_collection_survives_the_page_being_moved(
+    store: SqliteDocStore, data_dir: Path, tmp_path: Path
+) -> None:
+    """Curation is the thing a path-keyed identity loses, so it is the thing to prove survives.
+
+    Collection membership and tags hang off ``documents.id`` with ``ON DELETE CASCADE``. Under
+    path identity a reorganised mirror is a corpus of new documents beside a corpus of orphans,
+    and every hand-curated collection quietly empties — a loss no re-sync repairs because the
+    curation is not in the corpus. Under the page's own identity the row is the same row, so the
+    membership is still there afterwards. Asserted against the real store because the cascade is
+    the schema's and only the schema can disagree with it.
+    """
+    from manicule.connectors.filesystem import FilesystemConnector  # noqa: PLC0415
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    await _enriched(corpus)
+
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    await _pipeline(store, vectors).run(FilesystemConnector(corpus, name="handbook"))
+    document = (await store.list_documents())[0]
+    assert document.source_id == "1002"
+
+    collection = await store.create_collection("runbooks", description="on-call")
+    assert await store.add_to_collection(collection.id, [document.id]) == 1
+
+    moved = corpus / "reorganised"
+    moved.mkdir()
+    for name in ("1002.html", "1002.html.source.json"):
+        (corpus / name).rename(moved / name)
+    await _pipeline(store, vectors).run(FilesystemConnector(corpus, name="handbook"))
+
+    assert len(await store.list_documents()) == 1, "the move produced a second document"
+    after = (await store.list_documents())[0]
+    assert after.id == document.id
+    assert [held.id for held in await store.collection_documents(collection.id)] == [document.id], (
+        "the collection lost its document when the page moved"
+    )
+    assert after.provenance is not None
+    assert after.provenance.snapshot is not None
+    assert after.provenance.snapshot.path == "reorganised/1002.html"
+    await vectors.teardown()

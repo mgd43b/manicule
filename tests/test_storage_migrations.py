@@ -6,6 +6,8 @@ downgrade that has never run both look exactly like a healthy repository.
 
 from __future__ import annotations
 
+import importlib
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -14,6 +16,7 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import text
 
+from manicule.core.provenance import PROVENANCE_KEY
 from manicule.storage.autogen import include_name, include_object
 from manicule.storage.engine import create_engine
 from manicule.storage.fts import FTS_SHADOW_TABLES
@@ -489,3 +492,288 @@ def _canonical_ddl(sql: str) -> str:
     columns = [clause for clause in clauses if not clause.upper().startswith("CONSTRAINT")]
     constraints = sorted(clause for clause in clauses if clause.upper().startswith("CONSTRAINT"))
     return f"{head}( {', '.join([*columns, *constraints])} )"
+
+
+_REVISION = "manicule.storage.migrations.versions.20260813_b2e6d0c94a17_page_keyed_identity"
+"""The re-key revision, addressed by its module path.
+
+Imported through :func:`importlib.import_module` rather than with an ``import`` statement,
+because a revision's module name begins with a date and is therefore not an identifier. Imported
+at all, rather than repeating its constant here, so that renaming the key in the migration breaks
+this test instead of quietly leaving it asserting a string nothing writes.
+"""
+
+
+def _previous_identity_key() -> str:
+    return str(importlib.import_module(_REVISION).PREVIOUS_IDENTITY)
+
+
+_PAGE = "1002"
+_CORPUS_PATH = "/corpus/pages/1002.html"
+_DECLARED_METADATA = json.dumps(
+    {
+        "parser_used": "web",
+        PROVENANCE_KEY: {
+            "source": {
+                "title": "Retry Runbook",
+                "canonical_uri": "https://docs.example.test/pages/1002",
+                "source_id": _PAGE,
+                "version": "7",
+                "created_at": None,
+                "modified_at": None,
+                "content_type": "",
+                "section_path": ["ENG"],
+            },
+            "snapshot": {"path": "pages/1002.html", "retrieved_at": None},
+            "unavailable_reason": "",
+        },
+    }
+)
+"""A document keyed on its path whose manifest declares a page id: the shape that moves.
+
+The record is spelled out as the stored JSON rather than built by calling the application, so
+this fixture states what is *on disk* in a corpus somebody upgraded — which is what the migration
+reads, and which a helper that happened to change shape would silently stop describing.
+"""
+
+
+async def _seed_declaring(engine: AsyncEngine) -> None:
+    """A second document, path-keyed, declaring a page id, with curation hung off it.
+
+    Curation is the point. ``collection_documents`` and ``document_tags`` are what a re-key
+    destroys if it is done by inserting the new row and deleting the old, so both are seeded and
+    both are read back on the other side.
+    """
+    statements = (
+        "INSERT INTO documents (id, workspace_id, source, source_id, uri, title, media_type, "
+        "content_hash, version_token, status, status_detail, chunk_fp, embed_fp, metadata, "
+        "created_at, updated_at, indexed_at) "
+        "VALUES ('d2', 'w', 'handbook', :source_id, 'file:///corpus/pages/1002.html', "
+        "'Retry Runbook', 'text/html', 'h2', 'v9', 'indexed', NULL, NULL, NULL, :metadata, "
+        "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', "
+        "'2026-01-02T00:00:00+00:00')",
+        "INSERT INTO chunks (id, document_id, text, embed_text, heading_text, heading_path, "
+        "kind, position, token_count, anchor, metadata, created_at) "
+        "VALUES ('c3', 'd2', 'body', 'body', '', '[]', 'prose', 0, 1, '{}', '{}', "
+        "'2026-01-01T00:00:00+00:00')",
+        "INSERT INTO document_versions (id, document_id, version, content_hash, created_at) "
+        "VALUES ('v2', 'd2', 1, 'h2', '2026-01-01T00:00:00+00:00')",
+        "INSERT INTO document_tags (document_id, tag_id) VALUES ('d2', 't1')",
+        "INSERT INTO collection_documents (collection_id, document_id) VALUES ('k1', 'd2')",
+        "INSERT INTO glossary_entries (id, document_id, chunk_id, acronym, display, expansion, "
+        "location, form, confidence, created_at) "
+        "VALUES ('g2', 'd2', 'c3', 'RPS', 'RPS', 'Retries Per Second', 'Body', 'em_dash', "
+        "0.9, '2026-01-01T00:00:00+00:00')",
+    )
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(statements[0]), {"source_id": _CORPUS_PATH, "metadata": _DECLARED_METADATA}
+        )
+        for statement in statements[1:]:
+            await connection.execute(text(statement))
+
+
+async def _children_of(engine: AsyncEngine, identifier: str) -> dict[str, list[str]]:
+    """Every child row pointing at ``identifier``, by table, as the ids they carry.
+
+    Ids rather than counts. A migration that re-pointed a child at the *wrong* document keeps the
+    count identical, and a count is what this project's worst near-miss would also have passed —
+    on an empty database, where every count was zero on both sides.
+    """
+    reads = {
+        "chunks": "SELECT id FROM chunks WHERE document_id = :id ORDER BY id",
+        "document_versions": (
+            "SELECT id FROM document_versions WHERE document_id = :id ORDER BY id"
+        ),
+        "glossary_entries": "SELECT id FROM glossary_entries WHERE document_id = :id ORDER BY id",
+        "collection_documents": (
+            "SELECT collection_id FROM collection_documents WHERE document_id = :id "
+            "ORDER BY collection_id"
+        ),
+        "document_tags": "SELECT tag_id FROM document_tags WHERE document_id = :id ORDER BY tag_id",
+    }
+    async with engine.connect() as connection:
+        return {
+            table: [row[0] for row in (await connection.execute(text(sql), {"id": identifier}))]
+            for table, sql in reads.items()
+        }
+
+
+@pytest.mark.contract
+async def test_a_declared_page_identity_is_re_keyed_and_keeps_its_curation(
+    data_dir: Path,
+) -> None:
+    """The re-key, over a populated database, up and back.
+
+    **Values, not counts**, and running the mutations showed what that is worth and what it is
+    not. Three of the ways this migration could go wrong are already caught by something else:
+    :func:`~manicule.storage.migrator.upgrade` runs ``PRAGMA foreign_key_check`` after every
+    migration, so a child left behind is a ``StorageMigrationError`` before any assertion here
+    runs; and SQLite's own UNIQUE constraints catch a child moved onto a key another row holds.
+    Claiming this test catches the cascade would have been claiming a colleague's work.
+
+    What it catches that neither does: a child re-pointed at a **valid, existing, wrong**
+    document. The foreign key resolves, no constraint is violated, the row counts are identical
+    on both sides — and a person's collection now contains a page they never put in it.
+    Confirmed by sending one child table to the other seeded document:
+
+        AssertionError: the curation did not travel with the document
+        {'glossary_entries': []} != {'glossary_entries': ['g2']}
+
+    That is why the curation is read back *by the ids it points at* rather than counted.
+    """
+    from manicule.core.ids import document_id  # noqa: PLC0415 - the derivation under test
+
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="5f1c8a34b7d9")
+        await _seed(engine)
+        await _seed_declaring(engine)
+        before = await _children_of(engine, "d2")
+        assert before["collection_documents"] == ["k1"], (
+            "the seed must actually seed the curation, or this test proves nothing"
+        )
+        assert before["document_tags"] == ["t1"]
+        assert before["chunks"] == ["c3"]
+        assert before["glossary_entries"] == ["g2"]
+        assert before["document_versions"] == ["v2"]
+        counts = await _row_counts(engine)
+
+        await upgrade(engine)
+
+        moved = document_id("w", "handbook", _PAGE)
+        assert await _row_counts(engine) == counts, "the re-key deleted rows"
+        row = await _document_row(engine, moved)
+        assert row is not None, "the document was not re-keyed onto its declared identity"
+        assert row["source_id"] == _PAGE
+        assert row["title"] == "Retry Runbook", "the re-key rewrote a column it was not asked to"
+        assert row["content_hash"] == "h2"
+        assert json.loads(str(row["metadata"]))[_previous_identity_key()] == {
+            "source_id": _CORPUS_PATH,
+            "document_id": "d2",
+        }
+        assert await _children_of(engine, moved) == before, (
+            "the curation did not travel with the document, which is the whole point"
+        )
+        assert await _children_of(engine, "d2") == {table: [] for table in before}, (
+            "children were left pointing at an identity that no longer exists"
+        )
+        # The document this revision has no business touching is untouched, including its key.
+        assert await _document_row(engine, "d1") is not None
+
+        await downgrade(engine, "5f1c8a34b7d9")
+
+        assert await _row_counts(engine) == counts, "the downgrade deleted rows"
+        back = await _document_row(engine, "d2")
+        assert back is not None, "the downgrade did not put the document back"
+        assert back["source_id"] == _CORPUS_PATH
+        assert _previous_identity_key() not in json.loads(str(back["metadata"]))
+        assert await _children_of(engine, "d2") == before
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
+async def test_a_re_key_onto_an_identity_already_taken_is_refused(data_dir: Path) -> None:
+    """Two documents cannot become one, so the second stays where it is.
+
+    Overwriting an occupied primary key would destroy a document this revision has no way to put
+    back — and it is the shape that actually arises: a page ingested under its page id from one
+    root and under its path from another, or two manifests declaring one id. Left alone and
+    logged, which is what ``doctor``'s ``document-identity`` check keeps reporting.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="5f1c8a34b7d9")
+        await _seed(engine)
+        await _seed_declaring(engine)
+        # A third document already sitting on the identity `d2` would move onto.
+        from manicule.core.ids import document_id  # noqa: PLC0415
+
+        occupied = document_id("w", "handbook", _PAGE)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO documents (id, workspace_id, source, source_id, uri, title, "
+                    "media_type, content_hash, status, metadata, created_at, updated_at) "
+                    "VALUES (:id, 'w', 'handbook', :page, 'https://docs.example.test/pages/1002', "
+                    "'Retry Runbook', 'text/html', 'h3', 'indexed', '{}', "
+                    "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+                ),
+                {"id": occupied, "page": _PAGE},
+            )
+        counts = await _row_counts(engine)
+        before = await _children_of(engine, "d2")
+
+        await upgrade(engine)
+
+        assert await _row_counts(engine) == counts, "a collision cost a document"
+        stayed = await _document_row(engine, "d2")
+        assert stayed is not None, "the colliding document was moved onto an occupied key"
+        assert stayed["source_id"] == _CORPUS_PATH
+        assert await _children_of(engine, "d2") == before
+        occupant = await _document_row(engine, occupied)
+        assert occupant is not None
+        assert occupant["content_hash"] == "h3", "the occupant was overwritten"
+    finally:
+        await engine.dispose()
+
+
+async def _document_row(engine: AsyncEngine, identifier: str) -> dict[str, object] | None:
+    async with engine.connect() as connection:
+        row = (
+            (
+                await connection.execute(
+                    text(
+                        "SELECT id, source, source_id, title, content_hash, metadata "
+                        "FROM documents WHERE id = :id"
+                    ),
+                    {"id": identifier},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        return dict(row) if row is not None else None
+
+
+@pytest.mark.contract
+async def test_a_page_keyed_on_its_path_on_purpose_is_not_re_keyed(data_dir: Path) -> None:
+    """The migration must not move a document the connector will never look up that way.
+
+    An enriched export with no manifest declares its page id in its provenance record and is
+    keyed on its path deliberately, because identity is settled at discovery and discovery reads
+    the manifest rather than the document. Re-keying it moves the row onto an identity nothing
+    queries: the next sync discovers the file under its path, finds no row, and creates a second
+    document — the exact duplication this migration exists to prevent.
+
+    Found by running an ingest and a migration over a real corpus. Nothing failed; ``doctor``
+    simply said something that was not true, and following it to the migration showed why.
+    """
+    from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome  # noqa: PLC0415
+
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="5f1c8a34b7d9")
+        await _seed(engine)
+        await _seed_declaring(engine)
+        held = json.loads(_DECLARED_METADATA)
+        held[ENRICHED_KEY] = {"outcome": AdapterOutcome.IDENTITY_NOT_APPLIED.value}
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE documents SET metadata = :metadata WHERE id = 'd2'"),
+                {"metadata": json.dumps(held)},
+            )
+        before = await _children_of(engine, "d2")
+
+        await upgrade(engine)
+
+        stayed = await _document_row(engine, "d2")
+        assert stayed is not None, "a page keyed on its path on purpose was moved"
+        assert stayed["source_id"] == _CORPUS_PATH
+        assert _previous_identity_key() not in json.loads(str(stayed["metadata"])), (
+            "the migration recorded a move it did not make"
+        )
+        assert await _children_of(engine, "d2") == before
+    finally:
+        await engine.dispose()

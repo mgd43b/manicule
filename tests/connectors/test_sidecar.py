@@ -16,7 +16,11 @@ import pytest
 
 from manicule.connectors import sidecar
 from manicule.connectors.errors import NotFoundError
-from manicule.connectors.filesystem import FilesystemConnector, version_token
+from manicule.connectors.filesystem import (
+    SNAPSHOT_PATH,
+    FilesystemConnector,
+    version_token,
+)
 from manicule.core.ids import content_hash
 from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.core.sources import DocRef
@@ -64,10 +68,13 @@ async def fetch_one(root: Path, page: Path) -> Provenance | None:
     """The record the connector attaches to ``page``'s bytes, through the real fetch path."""
     connector = FilesystemConnector(root)
     found = [doc async for doc in connector.discover(None)]
-    # Matched on the filename rather than on a resolved absolute path: the connector resolves its
-    # root once and yields paths beneath it, so the two spellings would only ever differ by a
-    # symlink the walk already refuses to follow.
-    ref = next(doc.ref for doc in found if doc.ref.source_id.endswith(page.name))
+    # Matched on the **walked path**, which is what identifies a file to this helper, and not on
+    # `source_id` — which is the page's own identity whenever a manifest declares one, and is
+    # therefore exactly what a test about manifests must not assume the shape of. Matched on the
+    # filename rather than on a resolved absolute path: the connector resolves its root once and
+    # yields paths beneath it, so the two spellings would only ever differ by a symlink the walk
+    # already refuses to follow.
+    ref = next(doc.ref for doc in found if str(doc.ref.metadata[SNAPSHOT_PATH]).endswith(page.name))
     raw = await connector.fetch(ref)
     return Provenance.from_metadata(raw.metadata)
 
@@ -198,7 +205,13 @@ async def test_the_manifest_title_wins_over_the_filename(tmp_path: Path) -> None
     assert record.source.title == "Retry policy"
     assert record.source.title != page.name
 
-    found = next(doc for doc in await discovered(tmp_path) if doc.ref.source_id == str(page))
+    found = next(
+        doc for doc in await discovered(tmp_path) if doc.ref.metadata[SNAPSHOT_PATH] == str(page)
+    )
+    assert found.ref.source_id == "123456", (
+        "the manifest's declared identity is the document's, so moving the file does not create "
+        "a second one; the path is kept beside it because fetch still has to open something"
+    )
     assert found.title == "123456.html", (
         "discovery still reports what it saw; preferring the canonical title is the pipeline's "
         "decision, made in one place, and not something the connector hides here"
@@ -470,7 +483,11 @@ async def test_the_record_reaches_the_documents_metadata_under_the_reserved_key(
     """
     page = mirror(tmp_path)
     connector = FilesystemConnector(tmp_path)
-    ref = next(doc.ref for doc in await discovered(tmp_path) if doc.ref.source_id == str(page))
+    ref = next(
+        doc.ref
+        for doc in await discovered(tmp_path)
+        if doc.ref.metadata[SNAPSHOT_PATH] == str(page)
+    )
     raw = await connector.fetch(ref)
 
     assert PROVENANCE_KEY in raw.metadata

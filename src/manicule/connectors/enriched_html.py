@@ -1,55 +1,35 @@
-"""Enriched standalone HTML: reading a mirrored page's own account of itself.
+"""Writing down what enriched HTML pages say about themselves, one manifest per page.
 
-Some offline exporters write one HTML file per page, and put the page's real identity inside
-it — a machine-identifiable metadata section carrying the page id, its space, its version, when
-it was last edited and where it is published — with the original storage-format body in a
-``<main>``. Generic filesystem ingestion indexes the text of such a file perfectly well and then
-cites ``1002.html`` and a ``file://`` URI, because the filename is the only thing it was handed.
-Everything needed to cite the page properly was in the file the whole time.
+:mod:`.enriched` knows what an enriched page *is*. This is the conversion run over a directory of
+them: for every file it considers, it either writes ``<page>.source.json`` beside it or reports
+why it did not. Nothing else here — no walking of its own invention, no second idea of what a
+page looks like, and no rewriting of anything.
 
-**This module reads that metadata out. It does not rewrite the file, and that is the design.**
+**Why a manifest at all, when the connector adapts pages at fetch anyway.** Adaptation gives a
+page its storage-format body and its citation. It cannot give it an *identity*, because identity
+has to be known at discovery — before anything is fetched — and discovery does not read
+documents. That is not a shortcut: it is what makes a re-sync of an unchanged corpus cost a
+``stat`` per file instead of a full read. The manifest is the one thing beside a page small
+enough to read on every walk, so it is where the page id has to be written down for the connector
+to key on it. A page without one is still adapted, still parsed as storage format and still cited
+by its own title and URL; what it does not get is a document identity that survives being moved.
 
-:mod:`.sidecar` already defines what a local file's authoritative metadata looks like on disk —
-``1002.html.source.json`` beside ``1002.html`` — and :class:`.filesystem.FilesystemConnector`
-already discovers it, folds it into the change token so editing either file re-ingests the page,
-and attaches the validated record to the document. So the whole job here is to turn the page's
-own metadata section into that manifest. Nothing new is added to the ingestion path, no second
-connector walks the same tree, and :class:`~manicule.core.provenance.SourceMetadata` needs no
-field it did not already have — every fact one of these pages states is one of its fields spelled
-in an exporter's vocabulary, which is exactly what that interface was shaped for.
-
-**The security consequence of not rewriting is the main argument for doing it this way.** A
+**The security consequence of not rewriting the page is the main argument for this shape.** A
 converter that emitted new files would have to decide where they go, and the page's own metadata
 is the obvious thing to name them after — at which point a page id of ``../../../etc/cron.d/x``
-is a write primitive, and the defence is a validation somebody has to keep correct forever. Here
-the output path is :func:`.sidecar.manifest_path_for` of the file that was walked to, and no
-value read out of the document reaches it. Traversal is not refused; it is unrepresentable.
-
-The rest follows the same rule the manifest reader already established:
-
-*Nothing is fetched.* A canonical URL is read out of an ``href`` attribute and written to a
-    field. It is metadata about where the page lives, and this module has no network client to
-    dereference it with even if it wanted one.
-
-*Nothing is executed.* The page is parsed, never run. Scripts and macro bodies are left in the
-    file untouched — the file is not written to at all — and no part of the metadata section is
-    interpreted as anything but text.
+is a write primitive, and the defence is a validation somebody has to keep correct for ever.
+Here the output path is :func:`.sidecar.manifest_path_for` of the file that was walked to, and no
+value read out of a document reaches it. Traversal is not refused; it is unrepresentable. It is
+also why nothing is materialised on disk for the derived body: there is no derived-artifact
+directory to place, name, exclude from discovery or garbage-collect, because the extraction is
+cheap, deterministic and done in memory at the moment it is needed.
 
 *Nothing is overwritten by accident.* An existing manifest is left alone unless the caller asks
     for it to be replaced, because the likely reason one is already there is that somebody wrote
     it by hand or with another tool.
 
-*Validation is the real model's, not a copy of it.* The extracted fields are used to construct a
-    :class:`~manicule.core.provenance.SourceMetadata`, so a ``javascript:`` canonical URI, a
-    control character in a title and a naive timestamp are refused here by exactly the code that
-    would refuse them at ingest. A second implementation of those rules would be a second thing
-    to keep in step, and the two would disagree the first time either was edited.
-
-**What the body means is deliberately not this module's problem.** The ``<main>`` holds
-storage-format XHTML, and giving that real semantics is a parser's job — the existing web parser
-indexes it as HTML today, and :func:`~manicule.parsers.web.recover_cdata` already rescues the
-macro bodies a conforming HTML parser would silently delete. This module's job is the page's
-identity and provenance; nothing here inspects the body except to hash the file it lives in.
+*Nothing is fetched or executed.* Inherited from :mod:`.enriched`, which has no network client
+    and no renderer, and reinforced by this module never writing to a page.
 """
 
 from __future__ import annotations
@@ -57,163 +37,38 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Final
-
-from selectolax.lexbor import LexborHTMLParser, LexborNode
 
 from manicule.connectors import sidecar
+from manicule.connectors.enriched import (
+    ADAPTER_VERSION,
+    DEFAULT_PROFILE,
+    MAX_HTML_BYTES,
+    METADATA_SELECTOR,
+    STORAGE_SELECTOR,
+    Adaptation,
+    AdapterOutcome,
+    EnrichedPage,
+    EnrichedProfile,
+    UnusablePageError,
+    adapt,
+    extract,
+)
 from manicule.core.ids import content_hash
-from manicule.core.provenance import SourceMetadata
 
 __all__ = [
+    "ADAPTER_VERSION",
     "MAX_HTML_BYTES",
     "METADATA_SELECTOR",
+    "STORAGE_SELECTOR",
+    "AdapterOutcome",
     "EnrichedPage",
+    "SidecarOutcome",
     "UnusablePageError",
     "extract",
     "manifest_for",
     "write_sidecars",
 ]
-
-METADATA_SELECTOR: Final = "[data-source-metadata]"
-"""How the metadata section identifies itself.
-
-An attribute rather than a class or a heading, because it is the one part of these documents
-that is addressed to a machine. A class is styling and an exporter is entitled to change it; a
-heading is prose and is translated. Requiring the marker also means this module never guesses:
-a page without one is reported as having no metadata rather than having its first table read
-hopefully.
-"""
-
-MAX_HTML_BYTES: Final = 8 * 1024 * 1024
-"""Largest page this will read.
-
-Generous for a wiki page and present for the same reason :data:`.sidecar.MAX_MANIFEST_BYTES` is:
-without it, a file in a directory somebody pointed the converter at decides how much memory the
-conversion allocates.
-"""
-
-_LABELS: Final[Mapping[str, str]] = {
-    "page id": "source_id",
-    "id": "source_id",
-    "title": "title",
-    "space": "space",
-    "space key": "space",
-    "ancestors": "ancestors",
-    "parent": "ancestors",
-    "parents": "ancestors",
-    "version": "version",
-    "last modified": "modified_at",
-    "modified": "modified_at",
-    "updated": "modified_at",
-    "created": "created_at",
-    "source": "canonical_uri",
-    "canonical url": "canonical_uri",
-    "canonical": "canonical_uri",
-    "url": "canonical_uri",
-    "retrieved": "retrieved_at",
-    "exported": "retrieved_at",
-}
-"""Labels this understands, normalised, mapped to the field each fills.
-
-Several spellings per field because these documents are written by exporters that were not
-coordinating with each other, and "Last modified", "Modified" and "Updated" are the same fact.
-Unknown labels are ignored rather than refused: an exporter adding a row of its own is not an
-error, and the failure this module actually has to catch is the *absence* of an identity, which
-is checked directly.
-"""
-
-_ANCESTOR_SEPARATORS: Final = ("\u203a", "\u00bb", ">", "/", ",")
-"""How exporters write a breadcrumb. Tried in order; the first one present splits the value.
-
-The first two are U+203A and U+00BB, written as escapes because they are confusable with an
-ASCII ``>`` on sight and that is exactly what makes them worth listing: a breadcrumb rendered
-with a typographic separator is a different byte from one rendered with the ASCII character, and
-an exporter using the pretty one would otherwise fall through to the ``/`` rule and have its page
-path split on the slashes inside a title.
-"""
-
-
-class UnusablePageError(Exception):
-    """A page was found and its metadata cannot be used. The message is what an operator reads."""
-
-
-@dataclass(frozen=True, slots=True)
-class EnrichedPage:
-    """One page's declared identity, validated.
-
-    Two fields rather than one flat record, mirroring
-    :class:`~manicule.core.provenance.Provenance`'s own split: :attr:`source` is what the
-    publication says about itself and :attr:`retrieved_at` is a statement about this copy. They
-    are kept apart here for the same reason they are kept apart there — the second is not a fact
-    about the document, and a model that could hold both would let a caller write one where the
-    other belonged.
-    """
-
-    source: SourceMetadata
-    retrieved_at: datetime | None = None
-
-
-def extract(html: str) -> EnrichedPage:
-    """The page's declared identity, or a refusal naming what was wrong.
-
-    Args:
-        html: The document's text. Parsed, never executed; see the module docstring.
-
-    Returns:
-        The validated record. :attr:`EnrichedPage.source` is a real
-        :class:`~manicule.core.provenance.SourceMetadata`, so anything it would refuse at ingest
-        is refused here instead — which is the point of building one rather than a dict.
-
-    Raises:
-        UnusablePageError: There is no metadata section, it declares no page id, it declares one
-            label twice with two different values, or a value is one the citation interface will
-            not carry. Every message names the field, because "invalid page" tells whoever runs
-            the exporter nothing about which row to look at.
-    """
-    tree = LexborHTMLParser(html)
-    sections = tree.css(METADATA_SELECTOR)
-    if not sections:
-        msg = (
-            f"no {METADATA_SELECTOR} section, so the file states no identity of its own and "
-            f"there is nothing to record that its filename does not already say"
-        )
-        raise UnusablePageError(msg)
-    if len(sections) > 1:
-        msg = (
-            f"has {len(sections)} {METADATA_SELECTOR} sections. Which one describes the page is "
-            f"exactly the ambiguity this cannot guess at"
-        )
-        raise UnusablePageError(msg)
-
-    fields = _fields(sections[0])
-    source_id = fields.get("source_id", "")
-    if not source_id:
-        msg = (
-            "declares no page id. That is the identifier an updated snapshot is recognised by, "
-            "and without it a re-export is a second document rather than a new version of one"
-        )
-        raise UnusablePageError(msg)
-
-    section_path = _section_path(fields)
-    try:
-        source = SourceMetadata(
-            title=fields.get("title") or _title(tree),
-            canonical_uri=fields.get("canonical_uri", ""),
-            source_id=source_id,
-            version=fields.get("version", ""),
-            created_at=_timestamp(fields.get("created_at"), field="created"),
-            modified_at=_timestamp(fields.get("modified_at"), field="last modified"),
-            section_path=section_path,
-        )
-    except ValueError as exc:
-        msg = f"declares metadata this index will not cite ({_reason(exc)})"
-        raise UnusablePageError(msg) from exc
-    return EnrichedPage(
-        source=source, retrieved_at=_timestamp(fields.get("retrieved_at"), field="retrieved")
-    )
 
 
 def manifest_for(page: EnrichedPage, *, html: bytes) -> dict[str, object]:
@@ -234,6 +89,17 @@ def manifest_for(page: EnrichedPage, *, html: bytes) -> dict[str, object]:
         path that disagrees with the one manicule walked to, and every manifest would be refused
         for saying something true about a different root. Omitted, so the field stays available
         to a tool that genuinely knows both.
+
+    **``content_type`` carries the representation and nothing carries the adapter's version.**
+    The first is a fact about the page — the body inside it is storage format, and that stays
+    true however this code changes — so it belongs in a manifest and reaches
+    :attr:`~manicule.core.provenance.SourceMetadata.content_type` on the way through. The second
+    is a fact about *this build of manicule*, and a manifest declaring it would go stale the day
+    the adapter was improved: either it would be believed, and the corpus would record a version
+    that never ran, or it would be checked, and every existing manifest would be refused on
+    upgrade. The version is recorded where it is true — on the document, at the fetch that
+    produced it — and it travels in the change token so that bumping it rebuilds the derived body
+    without a manifest anywhere needing to be rewritten.
     """
     manifest: dict[str, object] = {"source_id": page.source.source_id}
     if page.source.title:
@@ -246,6 +112,8 @@ def manifest_for(page: EnrichedPage, *, html: bytes) -> dict[str, object]:
         manifest["created_at"] = page.source.created_at.isoformat()
     if page.source.modified_at is not None:
         manifest["modified_at"] = page.source.modified_at.isoformat()
+    if page.source.content_type:
+        manifest["content_type"] = page.source.content_type
     if page.source.section_path:
         manifest["section_path"] = list(page.source.section_path)
     if page.retrieved_at is not None:
@@ -256,14 +124,27 @@ def manifest_for(page: EnrichedPage, *, html: bytes) -> dict[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class SidecarOutcome:
-    """What happened to one page."""
+    """What happened to one page.
+
+    :attr:`outcome` is the machine-readable half of :attr:`skipped_reason`, on the principle
+    :attr:`~manicule.app.results.Check.remedy` follows: a surface that wants to *count* refusals
+    by kind should not have to match on prose, and prose is the half that gets rewritten. They are
+    set together at every construction, so a report's counters cannot come to describe a different
+    failure than its reasons do.
+    """
 
     path: Path
+    outcome: AdapterOutcome
     written: bool = False
     skipped_reason: str = ""
 
 
-def write_sidecars(root: Path, *, force: bool = False) -> list[SidecarOutcome]:
+def write_sidecars(
+    root: Path,
+    *,
+    force: bool = False,
+    profiles: Sequence[EnrichedProfile] = (DEFAULT_PROFILE,),
+) -> list[SidecarOutcome]:
     """Write a manifest beside every enriched page under ``root``.
 
     Args:
@@ -273,45 +154,125 @@ def write_sidecars(root: Path, *, force: bool = False) -> list[SidecarOutcome]:
         force: Replace manifests that already exist. Off by default: a manifest already there
             was most likely written by hand or by another tool, and silently replacing somebody's
             metadata is not a conversion, it is a loss.
+        profiles: The exporter conventions to recognise, in precedence order. The same value the
+            connector is configured with, so a page this run adapted is a page that run will
+            adapt — a conversion written under one profile set and ingested under another would
+            put manifests on disk for pages the connector then declined to read.
 
     Returns:
         One outcome per HTML file considered, in walk order, whether or not it produced a
-        manifest. A file that was skipped carries the reason — a run that reported only its
-        successes would present "no metadata section anywhere" as a clean conversion.
+        manifest. A file that was skipped carries the reason and the outcome — a run that
+        reported only its successes would present "no metadata section anywhere" as a clean
+        conversion of nothing.
+
+    **Adapted in full before anything is written**, which is what lets two pages declaring one
+    page id be caught *here* rather than at the sync that follows. Writing as it walked would put
+    two manifests on disk claiming one identity, and the connector would then refuse both — so
+    the operator would run a conversion that reported complete success and a sync that reported
+    two documents it could not key, with nothing connecting the two reports. The cost is holding
+    one adaptation per page in memory for the length of the walk, which is the extraction that
+    was going to happen anyway.
     """
     resolved = root.expanduser().resolve()
-    return [_convert(page, root=resolved, force=force) for page in _walk(resolved, root=resolved)]
+    considered = [
+        _read(page, root=resolved, force=force, profiles=tuple(profiles))
+        for page in _walk(resolved, root=resolved)
+    ]
+    claims: dict[str, int] = {}
+    for held in considered:
+        if held.adapted is not None:
+            declared = held.adapted.page.source.source_id
+            claims[declared] = claims.get(declared, 0) + 1
+    return [_settle(held, claims) for held in considered]
 
 
-def _convert(page: Path, *, root: Path, force: bool) -> SidecarOutcome:
+@dataclass(frozen=True, slots=True)
+class _Considered:
+    """One page after the first phase: what it adapted to, and the bytes that produced it.
+
+    The bytes travel with the adaptation rather than being re-read in the second phase. Re-reading
+    would open a window in which the file changed between the digest being taken and the manifest
+    being written — a manifest whose ``snapshot_checksum`` describes bytes nobody has, refused at
+    every sync afterwards for a reason the operator cannot reproduce. It is the same gap the
+    bounded read closes at the other end, and it is closed the same way: read once, decide from
+    what was read.
+    """
+
+    page: Path
+    adapted: Adaptation | None
+    raw: bytes
+    outcome: SidecarOutcome
+
+
+def _settle(held: _Considered, claims: Mapping[str, int]) -> SidecarOutcome:
+    """Write ``held``'s manifest, or report why it was not written after all."""
+    if held.adapted is None:
+        return held.outcome
+    declared = held.adapted.page.source.source_id
+    if claims.get(declared, 0) > 1:
+        # Neither page gets a manifest. Writing one and refusing the other would make which page
+        # owns the id depend on walk order; writing both would produce two manifests the
+        # connector refuses at every sync for ever.
+        return SidecarOutcome(
+            held.page,
+            AdapterOutcome.DUPLICATE_IDENTITY,
+            skipped_reason=(
+                f"declares source_id {declared!r}, which another page under this root also "
+                f"declares. No manifest is written for either: a document is identified by "
+                f"(workspace, source, source_id), so two pages sharing one resolve to a single "
+                f"row and whichever synced second would overwrite the first"
+            ),
+        )
+    sidecar.manifest_path_for(held.page).write_text(
+        json.dumps(manifest_for(held.adapted.page, html=held.raw), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return held.outcome
+
+
+def _refused(page: Path, outcome: AdapterOutcome, reason: str) -> _Considered:
+    """A page that will produce no manifest, carrying the reason it will not."""
+    return _Considered(page, None, b"", SidecarOutcome(page, outcome, skipped_reason=reason))
+
+
+def _read(
+    page: Path, *, root: Path, force: bool, profiles: tuple[EnrichedProfile, ...]
+) -> _Considered:
+    """Adapt one page without writing anything.
+
+    Every path out carries an outcome, because the caller needs the identity of every page it
+    *could* convert before it can decide whether any of them clash — so "did this adapt" and "what
+    do we say about it" have to be answered in one pass rather than in two that could disagree.
+    """
     manifest_path = sidecar.manifest_path_for(page)
     if manifest_path.exists() and not force:
-        return SidecarOutcome(
-            page, skipped_reason="a manifest is already there; pass --force to replace it"
+        return _refused(
+            page,
+            AdapterOutcome.ALREADY_PRESENT,
+            "a manifest is already there; pass --force to replace it",
         )
     try:
         raw = _read_bounded(page)
     except OSError as exc:
-        return SidecarOutcome(page, skipped_reason=f"could not be read ({exc.strerror or exc})")
+        return _refused(page, AdapterOutcome.FAILED, f"could not be read ({exc.strerror or exc})")
     if raw is None:
         # ``stat`` for the message only, never for the decision — that was already made by a
         # bounded read. Whether the file is one byte over the limit or a thousand times it is
         # what decides between raising the limit and looking at what is in that directory.
-        return SidecarOutcome(
+        return _refused(
             page,
-            skipped_reason=f"is {page.stat().st_size} bytes, over the {MAX_HTML_BYTES}-byte limit",
+            AdapterOutcome.FAILED,
+            f"is {page.stat().st_size} bytes, over the {MAX_HTML_BYTES}-byte limit",
         )
     try:
-        extracted = extract(raw.decode("utf-8", errors="replace"))
+        adapted = adapt(raw.decode("utf-8", errors="replace"), profiles=profiles)
     except UnusablePageError as refusal:
-        return SidecarOutcome(page, skipped_reason=str(refusal))
+        return _refused(page, refusal.outcome, str(refusal))
     if not _within(manifest_path, root=root):  # pragma: no cover - `_walk` already refuses this
-        return SidecarOutcome(page, skipped_reason="resolves outside the root")
-    manifest_path.write_text(
-        json.dumps(manifest_for(extracted, html=raw), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+        return _refused(page, AdapterOutcome.FAILED, "resolves outside the root")
+    return _Considered(
+        page, adapted, raw, SidecarOutcome(page, AdapterOutcome.ADAPTED, written=True)
     )
-    return SidecarOutcome(page, written=True)
 
 
 def _read_bounded(page: Path) -> bytes | None:
@@ -361,153 +322,3 @@ def _within(path: Path, *, root: Path) -> bool:
     except OSError:  # pragma: no cover - resolution failure is itself a refusal
         return False
     return resolved == root or root in resolved.parents
-
-
-def _fields(section: LexborNode) -> dict[str, str]:
-    """The labelled values in ``section``, keyed by the field each fills.
-
-    Raises:
-        UnusablePageError: One label appeared twice with two different values. Refused rather
-            than resolved by order, because "the first one wins" is a rule nobody writing an
-            exporter knows about, and the two values are equally likely to be the right one.
-    """
-    found: dict[str, tuple[str, str]] = {}
-    for label, node, without in _rows(section):
-        field = _LABELS.get(label)
-        if field is None:
-            continue
-        value = _value(node, without=without, prefer_href=field == "canonical_uri")
-        if not value:
-            continue
-        previous = found.get(field)
-        if previous is not None and previous[1] != value:
-            # The *field* is what collides, and two different labels can fill one — "Source" and
-            # "Canonical URL" both name the address. Reporting "declares 'canonical url' twice"
-            # when the other statement was spelled "Source" sends the reader looking for a
-            # duplicate row that is not there, so both labels are named.
-            first_label, first_value = previous
-            spelling = (
-                f"{first_label!r}" if first_label == label else f"{first_label!r} and {label!r}"
-            )
-            msg = (
-                f"declares {spelling} twice, as {first_value!r} and {value!r}. Which is the "
-                f"page's is not something this can decide"
-            )
-            raise UnusablePageError(msg)
-        found[field] = (label, value)
-    return {field: value for field, (_, value) in found.items()}
-
-
-def _rows(section: LexborNode) -> Iterator[tuple[str, LexborNode, str]]:
-    """``(normalised label, the node holding the value, text to strip)`` for every labelled row.
-
-    The node rather than its text, because how a value should be read depends on which field it
-    fills and only the caller knows that — see :func:`_value`.
-    """
-    for node in section.css("dt"):
-        sibling = node.next
-        while sibling is not None and sibling.tag == "-text":
-            sibling = sibling.next
-        if sibling is not None and sibling.tag == "dd":
-            yield _label(node.text(deep=True)), sibling, ""
-    for marker in section.css("strong, b, th"):
-        parent = marker.parent
-        if parent is None:
-            continue
-        whole = _collapse(parent.text(deep=True))
-        marked = _collapse(marker.text(deep=True))
-        if not whole.startswith(marked):
-            continue
-        yield _label(marked), parent, marked
-
-
-def _value(node: LexborNode, *, without: str = "", prefer_href: bool = False) -> str:
-    """``node``'s value: its text, or an anchor's address for a field that holds one.
-
-    ``prefer_href`` is per field and not a property of the markup, which is the correction this
-    signature exists to make. A canonical link is written ``<a href="…">canonical page</a>`` at
-    least as often as it is written out, and recording the words "canonical page" as the page's
-    address would be a citation pointing at nothing — but preferring the ``href`` *everywhere*
-    turns ``<strong>Title:</strong> <a href="…">Retry policy</a>`` into a title that is a URL, and
-    a linked title is not a rare document.
-
-    **Read, never dereferenced.** Nothing in this module opens a URL.
-    """
-    if prefer_href:
-        for anchor in node.css("a"):
-            href = (anchor.attributes.get("href") or "").strip()
-            if href:
-                return href
-    text = _collapse(node.text(deep=True))
-    return text[len(without) :].strip().lstrip(":").strip() if without else text
-
-
-def _label(raw: str) -> str:
-    return _collapse(raw).rstrip(":").strip().lower()
-
-
-def _collapse(text: str) -> str:
-    return " ".join(text.split())
-
-
-def _section_path(fields: Mapping[str, str]) -> tuple[str, ...]:
-    """The page's place in its source's hierarchy, coarsest first.
-
-    The space leads because it is the outermost container, then any declared ancestors. The
-    page's own title is **not** appended: the chunker adds that itself, and a path carrying it
-    twice reaches the embedder as emphasis nobody intended
-    (:attr:`~manicule.core.provenance.SourceMetadata.section_path`).
-    """
-    path: list[str] = []
-    space = fields.get("space", "").strip()
-    if space:
-        path.append(space)
-    path.extend(_ancestors(fields.get("ancestors", "")))
-    return tuple(path)
-
-
-def _ancestors(raw: str) -> Iterator[str]:
-    value = raw.strip()
-    if not value:
-        return
-    for separator in _ANCESTOR_SEPARATORS:
-        if separator in value:
-            for part in value.split(separator):
-                if part.strip():
-                    yield part.strip()
-            return
-    yield value
-
-
-def _timestamp(raw: str | None, *, field: str) -> datetime | None:
-    """``raw`` as an aware datetime, or ``None`` when it was not declared.
-
-    Raises:
-        UnusablePageError: It is not a timestamp, or it carries no offset. A naive one is
-            refused rather than assumed to be UTC: read as UTC it is wrong by the exporting
-            host's offset, and it is used to decide which of two versions is newer.
-    """
-    if raw is None or not raw.strip():
-        return None
-    text = raw.strip()
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError as exc:
-        msg = f"declares {field} {text!r}, which is not an ISO-8601 timestamp"
-        raise UnusablePageError(msg) from exc
-    if parsed.tzinfo is None:
-        msg = (
-            f"declares {field} {text!r}, which carries no UTC offset and so does not say which "
-            f"zone it is in"
-        )
-        raise UnusablePageError(msg)
-    return parsed
-
-
-def _title(tree: LexborHTMLParser) -> str:
-    element = tree.css("title")
-    return _collapse(element[0].text(deep=True)) if element else ""
-
-
-def _reason(error: ValueError) -> str:
-    return _collapse(str(error))

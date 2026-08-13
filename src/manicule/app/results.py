@@ -1020,6 +1020,12 @@ class SidecarSkip(Payload):
 
     path: str
     reason: str
+    outcome: str = Field(
+        default="",
+        description="The machine-readable half of ``reason``: one of the adapter's outcome "
+        "names. A surface counting refusals by kind should not have to match on prose, which "
+        "is the half that gets rewritten.",
+    )
 
 
 class SidecarReport(Payload):
@@ -1036,6 +1042,19 @@ class SidecarReport(Payload):
     considered: int = Field(default=0, ge=0)
     written: int = Field(default=0, ge=0)
     skipped: tuple[SidecarSkip, ...] = ()
+    by_outcome: dict[str, int] = Field(
+        default_factory=dict[str, int],
+        description="How many files reached each outcome, adapted ones included. Every "
+        "considered file appears in exactly one bucket, so the counts sum to ``considered`` and "
+        "a run that adapted nothing says which kind of nothing it was.",
+    )
+    """The counters, keyed by outcome, and they are not a summary of :attr:`skipped`.
+
+    A caller that wanted "how many files matched no profile" would otherwise have to group the
+    skip list by parsing its reasons. That is the failure ``detail``/``facts`` exists to prevent
+    one layer up: the sentence is for a person and the bucket is for a program, and deriving the
+    second from the first makes a wording change into somebody's broken dashboard.
+    """
 
 
 class ConnectorSignedIn(Payload):

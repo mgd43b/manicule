@@ -403,6 +403,13 @@ def render_sidecar(out: Console, payload: r.SidecarReport) -> None:
         f"[bold]{payload.written}[/bold] of {payload.considered} page(s) under "
         f"{escape(payload.root)}"
     )
+    if payload.considered and not payload.written:
+        # Said outright rather than left to be read off a zero. "0 of 40" is a number somebody
+        # scans past; "adapted no pages at all" is the sentence that makes them read the reasons
+        # underneath it, which is where the answer to "why not" actually is.
+        out.print(
+            "[yellow]adapted no pages at all[/yellow] — every considered file is listed below"
+        )
     if not payload.skipped:
         return
     table = Table("skipped", "why", box=None, pad_edge=False)
