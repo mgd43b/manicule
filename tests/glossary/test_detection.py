@@ -43,7 +43,7 @@ from tests.storage_helpers import make_chunk, make_document
 MARKDOWN_MEDIA_TYPE = min(MARKDOWN_MEDIA_TYPES)
 """One of the Markdown types, chosen deterministically so routing is not a coin toss."""
 
-usable_expansion = ingest_glossary._usable_expansion
+usable_expansion = ingest_glossary._usable_expansion  # pyright: ignore[reportPrivateUsage]
 """The private cleaner, bound once here rather than reached through the module at each call.
 
 It is private because nothing outside the module should *call* it; it is tested directly because
