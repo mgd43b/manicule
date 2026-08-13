@@ -1113,6 +1113,112 @@ fail tightness.
 **A block that does not supply `rows` is split as prose.** That keeps the text whole and
 honest about having no better structure available, rather than inventing one.
 
+### 4.5 A blank line is the only paragraph boundary, and parsers owe it
+
+The prose splitter above reads `\n\n`. Nothing reads a single `\n` as a paragraph boundary,
+which makes this a **parser obligation** rather than a chunker detail: a parser that assembles
+several source paragraphs into one block's `text` must separate them with a blank line, or the
+boundaries are gone by the time anything could use them.
+
+It went wrong exactly once, and the shape is worth recording because it is not obvious from
+either side. The Confluence storage parser merges a rich-text macro's prose into the block that
+carries the macro (a panel keeps its severity; an unsupported macro keeps its body), and it
+joined those parts with `\n`. Under the budget nothing showed: the definitions in the body were
+still at the start of *lines*, and a reader of `text` saw one paragraph per line. Over the
+budget §4.2 splits the block by paragraph, finds one, splits *that* by sentence and repacks
+with spaces — so every boundary the page had became a space, and a detector that requires a
+record to begin at a line start found nothing after the first. `PARSERS["confluence"].rules`
+went 1 → 2 for it.
+
+**What that bump costs an existing index**, since a version is only worth having if somebody
+can price it:
+
+- **Text that changes**: Confluence storage documents containing a panel or an unsupported
+  macro whose rich-text body holds more than one prose block, or one prose block plus a
+  rendered title. Nothing else — a page with no macros, or whose macros carry a single
+  paragraph, re-parses to byte-identical text.
+- **Re-parse**: every Confluence document, including the ones whose text does not move. A
+  `parse_fp` records the parser's version and not the document's content, so after the bump it
+  matches for none of them — which is the point. Nothing can tell in advance which pages hold a
+  multi-paragraph macro without parsing them, and a fingerprint that could would be a hash of
+  the output rather than of the rules. This reads retained bytes and touches no network.
+- **Re-embed**: only the chunks that actually changed. Chunk ids are content-derived and
+  re-parse reconciles against the stored set, so an unaffected document re-parses to the same
+  ids and keeps its vectors; an affected one re-embeds the chunks whose text moved.
+- **The path**: nothing, for an index that syncs. Change detection re-parses each document the
+  next time its connector reports it, because `IngestPipeline` compares the stored `parse_fp`
+  against what that document's own parser would produce now and a mismatch stops it counting as
+  unchanged. To close the window sooner, `manicule document reindex <id>` re-parses one document
+  from retained bytes and touches no network. A document whose bytes were never retained is
+  named with the reason rather than failing the run, and needs a forced re-sync; it is the only
+  case that does.
+
+  **There is no corpus-wide command for it today.** `select(parse_fingerprints=…)` and
+  `re_parse` compose into exactly the sweep §3.0 describes, and nothing in `cli/` or `api/`
+  calls the pair — the only surface is the per-document verb above. §3.0's sentence about
+  `reindex --re-parse` describes the intended verb rather than a shipped one.
+
+Four things a parser must **not** promote to a paragraph boundary while obeying this:
+
+| In the source | In `text` |
+|---|---|
+| paragraph break | blank line |
+| inline `<br>` | stays inside the paragraph |
+| list item | one line per item, list structure kept |
+| code or plain-text body | exact source, never reflowed |
+| table | its structured representation (§4.4) |
+
+**Known gap, stated because the fixture asserts around it.** An inline `<br>` currently
+contributes *no* character in both the web and Confluence parsers: `a<br/>b` reads `ab`. It is
+therefore not a paragraph boundary, which is what this section requires of it, and it is also
+not the line break it should be. Making it one means changing the whitespace collapse that
+every heading, cell and list item goes through, which is a wider change than a paragraph rule
+and is not folded into one.
+
+### 4.6 Block lineage — assessed, and deliberately not built yet
+
+Glossary detection (`ingest/glossary.py`) reads *chunk* text, and the defect above is the
+argument for it reading something more stable. The durable shape is:
+
+```
+source structural block  ->  stable block identity  ->  candidate  ->  chunk containing it
+                                                                       ->  cited entry
+```
+
+**Why detection runs on chunks today**, and it is a real reason rather than an accident: a
+definition has to be *citable*, and a chunk is what a citation resolves to. An entry recorded
+against a block id would name something no citation can open, so moving detection earlier is
+not a one-line change — it is detection before packing *plus* a mapping from the block that
+stated the definition to the chunk that finally carries it.
+
+**Not done here, and the judgement is that it should not be.** The paragraph rule is a parser
+invariant: a block's `text` should say what the page says, whoever reads it afterwards. Block
+lineage is an argument about which representation a *consumer* should depend on. Doing the
+second while fixing the first would mean a fix whose diff was mostly not about the defect, and
+it would leave the parser still wrong for every other consumer.
+
+What it would need, so that the next person does not have to re-derive it:
+
+- **A stable identifier or source span per `ParsedBlock`**, derived from content and position
+  so it survives a re-parse of unchanged bytes — the property `chunks.id` already has, and the
+  reason a re-parse keeps a chunk's vector (§3.0).
+- **Block membership preserved through packing and overlap.** A chunk is built from `_Unit`s
+  that may be halves of a block and may be copied into the next chunk's overlap window (§1.5),
+  so membership is many-to-many and an overlap-borrowed sentence must not make its block look
+  like it was stated twice.
+- **Detection before packing**, over blocks, where the source's own boundaries are intact
+  whatever the budget does afterwards.
+- **A mapping from a detected definition to the citation-bearing chunk**, which is the part
+  that cannot be skipped: without it the feature loses the property that makes it usable.
+- **Fingerprint implications.** Block identity in `ChunkFingerprint` would re-chunk and
+  re-embed every document in the corpus. If it is not in the fingerprint, it has to be
+  derivable from what is, or two generations of it can coexist unnoticed — which is the defect
+  §3.0 exists to prevent, one level along.
+
+**What must not be done instead.** A source-configured alias file mapping terms to expansions
+would make the motivating corpus work and would hide the parser defect rather than fix it.
+Structural fidelity is the parser's, and it is fixed independently of anything that consumes it.
+
 ---
 
 ## 5. `text` versus `embed_text`

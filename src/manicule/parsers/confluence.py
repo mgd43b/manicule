@@ -46,7 +46,7 @@ render time from the heading text, which is a guess this parser does not make.
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from selectolax.lexbor import LexborHTMLParser, LexborNode
@@ -645,7 +645,7 @@ def _panel_macro(node: LexborNode, name: str, config: ConfluenceConfig) -> Itera
     that matters, because the inner one is usually the more urgent.
     """
     prose, structured = _body_blocks(node, config)
-    text = "\n".join(part for part in (_rendered_text(node, name), *prose) if part.strip())
+    text = _join_macro_prose((_rendered_text(node, name), *prose))
     if text.strip():
         yield _Found(
             kind=BlockKind.PANEL,
@@ -677,7 +677,7 @@ def _unsupported_macro(node: LexborNode, name: str, config: ConfluenceConfig) ->
     """
     generated = name in _TOC_MACROS
     prose, structured = ([], []) if generated else _body_blocks(node, config)
-    body_text = "\n".join(part for part in (_rendered_text(node, name), *prose) if part.strip())
+    body_text = _join_macro_prose((_rendered_text(node, name), *prose))
     plain = "" if generated else _plain_text_body(node)
     if config.keep_unsupported_macros:
         metadata: Metadata = {"macro": name, "unsupported": True}
@@ -784,6 +784,37 @@ def _body_blocks(node: LexborNode, config: ConfluenceConfig) -> tuple[list[str],
             else:
                 structured.append(found)
     return prose, structured
+
+
+def _join_macro_prose(parts: Iterable[str]) -> str:
+    """The parts of a macro's rendered text, as separate paragraphs.
+
+    **A blank line, because a single newline is not a paragraph boundary anywhere downstream.**
+    :func:`~manicule.chunking.sentences.paragraphs` splits on blank lines and the chunker splits
+    an oversized block the same way, so a body joined with ``\\n`` is one paragraph however many
+    ``<p>`` elements it came from. Past the budget that paragraph is split into sentences and
+    repacked with spaces, and every source paragraph boundary in it is gone — which is a
+    structural fact about the page being destroyed by an assembly step, and it is invisible until
+    something downstream needs a record to *begin* at a boundary.
+
+    **The rule is about paragraphs and nothing else.** A macro body carries four other kinds of
+    line break and none of them becomes a blank line here: a list keeps its one-item-per-line
+    rendering, a task list keeps its one-task-per-line rendering, a table keeps its rows, and a
+    plain-text body is source that comes back character for character. Each is assembled by its
+    own function and reaches this one — if at all — as a single already-structured part, because
+    :func:`_body_blocks` emits structured content as its own block rather than merging it.
+
+    **A rendered parameter is a part like any other**, so a panel's title is separated from the
+    body beneath it rather than glued to its first sentence. Confluence draws the title in the
+    panel's own header; a reader sees two elements, and joining them into one paragraph makes the
+    header the opening words of the body. This does *not* extend to the join inside
+    :func:`_rendered_text`, which combines two values of the same rendered element and is not a
+    paragraph boundary at all.
+
+    Parts are stripped, because a heading merged into the body arrives with the surrounding
+    element's whitespace and a blank line either side of it would be two blank lines.
+    """
+    return "\n\n".join(stripped for part in parts if (stripped := part.strip()))
 
 
 def _rendered_text(node: LexborNode, macro: str) -> str:

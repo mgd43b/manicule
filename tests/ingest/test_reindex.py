@@ -10,6 +10,9 @@ from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, DocumentStatus
 from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
 from manicule.ingest.reindex import re_embed, re_parse, repair, select
+from manicule.parsers.config import CONFLUENCE_MEDIA_TYPE, ConfluenceConfig
+from manicule.parsers.confluence import ConfluenceStorageParser
+from manicule.parsers.versions import current_parse_fingerprints, parse_fingerprint
 from manicule.testing import assert_refuses_oversized_chunks
 from tests.fakes import HashEmbedder, make_chunks, make_document
 from tests.ingest import fakes
@@ -150,6 +153,68 @@ async def test_re_parse_runs_the_current_chain_over_retained_bytes() -> None:
     assert report.documents == 1
     assert [chunk.id for chunk in store.chunks[document.id]] == before, (
         "a chunk that survives a re-parse unchanged keeps its id, and therefore its vector"
+    )
+
+
+async def test_a_parser_rules_bump_re_parses_its_documents_without_the_connector() -> None:
+    """The claim a rules bump makes, run rather than asserted.
+
+    Bumping ``PARSERS["confluence"].rules`` is only worth doing if something acts on it, and the
+    something is this: ``select`` finds the documents whose recorded lineage is not one an
+    installed parser would produce now, and ``re_parse`` rebuilds them from retained bytes. The
+    connector is present throughout and is never asked for anything — ``fetches`` is captured
+    after the sync and compared afterwards, so "no network" is a measurement rather than an
+    inference from ``re_parse``'s signature.
+
+    The stale lineage is written as ``confluence`` rules **1**, which is the version the macro
+    paragraph rule moved away from. A later bump makes that "an earlier version" rather than
+    "the previous one", which is still exactly what this case needs, so it does not have to be
+    edited every time the parser moves.
+    """
+    source = (
+        '<ac:structured-macro ac:name="expand">'
+        "<ac:rich-text-body><p>First paragraph.</p><p>Second paragraph.</p>"
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+    blobs = fakes.MemoryBlobs()
+    pipeline, store, _ = build(
+        blobs=blobs,
+        parsers={"confluence": ConfluenceStorageParser(ConfluenceConfig())},
+        chain=("confluence",),
+    )
+    connector = fakes.DictConnector({"page": source})
+    connector.media_types["page"] = CONFLUENCE_MEDIA_TYPE
+    await pipeline.run(connector)
+    document = await store.find_document("memory", "page")
+    assert document is not None
+    installed = parse_fingerprint("confluence")
+    assert installed is not None
+    assert document.parse_fp == installed.canonical(), (
+        "first ingest records what the installed parser produced"
+    )
+    downloads = list(connector.fetches)
+
+    superseded = ParseFingerprint(
+        parser="confluence", version="1", libraries=dict(installed.libraries)
+    )
+    await store.set_lineage(
+        document.id, chunk_fp=None, embed_fp=None, parse_fp=superseded.canonical()
+    )
+    stale = await select(store, parse_fingerprints=current_parse_fingerprints())
+    assert [chosen.id for chosen in stale] == [document.id], (
+        "the bump selects this document, and the selector is the complement of what is installed"
+    )
+
+    report = await re_parse(stale, pipeline=pipeline, blobs=blobs)
+
+    assert report.documents == 1
+    assert report.unrepairable == []
+    assert report.failures == []
+    assert connector.fetches == downloads, "the source was not asked for the bytes a second time"
+    rebuilt = "\n".join(chunk.text for chunk in store.chunks[document.id])
+    assert "First paragraph.\n\nSecond paragraph." in rebuilt, (
+        "and the rebuilt text is what the current parser produces, not what the stale "
+        "fingerprint claimed was current"
     )
 
 

@@ -28,6 +28,7 @@ import pytest
 from selectolax.lexbor import LexborHTMLParser
 
 from manicule.chunking import StructuralChunker
+from manicule.chunking.sentences import paragraphs
 from manicule.core.anchors import HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
@@ -46,8 +47,15 @@ from manicule.parsers.confluence import (
 )
 from manicule.parsers.plugin import PARSERS
 from manicule.parsers.web import WebParser, recover_cdata
-from manicule.testing import assert_round_trip
-from tests.corpus.confluence import ACCOUNT_ID, JQL_QUERY, SCRIPT_PAYLOAD, TOPOLOGY_DOT
+from manicule.testing import assert_round_trip, normalise
+from tests.corpus.confluence import (
+    ACCOUNT_ID,
+    CONTAINER_PRESET,
+    JQL_QUERY,
+    MACRO_DEFINITIONS,
+    SCRIPT_PAYLOAD,
+    TOPOLOGY_DOT,
+)
 from tests.parsers.support import check_corpus, check_fixture, raw_from, raw_of
 
 MEDIA_TYPE = CONFLUENCE_MEDIA_TYPE
@@ -60,6 +68,7 @@ CORPUS_FIXTURES = (
     "malformed.storage",
     "degenerate.storage",
     "astral.storage",
+    "macro-body.storage",
     "empty.storage",
     "handbook-large.storage",
 )
@@ -245,6 +254,13 @@ async def test_a_panel_title_is_the_one_parameter_that_is_content() -> None:
     A panel's title is drawn on the page in the panel's own header. A reader sees it, quotes it
     and searches for it, so it is content that happens to be carried as a parameter. The test is
     whether Confluence shows the value to a reader, not where it sits in the markup.
+
+    **The header is a paragraph of its own, which it was not before.** It used to be joined to
+    the body with a single newline, which made "Do not skip the dry run It has taken checkout
+    down twice." one paragraph to everything downstream — the header read as the opening words
+    of the body. A rendered parameter is a rendered element beside the body, not part of its
+    first sentence, so it is separated by the same blank line every other part of a macro's
+    text is.
     """
     blocks = await _blocks(
         '<ac:structured-macro ac:name="warning">'
@@ -253,7 +269,7 @@ async def test_a_panel_title_is_the_one_parameter_that_is_content() -> None:
         "</ac:structured-macro>"
     )
 
-    assert blocks[0].text == "Do not skip the dry run\nIt has taken checkout down twice."
+    assert blocks[0].text == "Do not skip the dry run\n\nIt has taken checkout down twice."
 
 
 # --- content that looks like an instruction --------------------------------------------------
@@ -624,6 +640,178 @@ async def test_placeholders_can_be_turned_off_and_the_content_still_is_not_inven
 
     assert blocks == []
     assert "quarters" not in _texts(blocks), "and the parameter is still not content"
+
+
+# --- paragraphs inside a macro body ------------------------------------------------------------
+
+
+def _macro_body(blocks: list[ParsedBlock]) -> ParsedBlock:
+    """The prose block ``macro-body.storage``'s container contributes."""
+    return next(
+        block
+        for block in blocks
+        if block.kind is BlockKind.PROSE and block.metadata.get("macro") == "custom-container"
+    )
+
+
+async def test_consecutive_paragraphs_in_a_macro_body_stay_separate_paragraphs(
+    corpus: Path,
+) -> None:
+    """The defect: three ``<p>`` elements became one paragraph on the way out of the macro.
+
+    A single newline is not a paragraph boundary to anything downstream.
+    :func:`~manicule.chunking.sentences.paragraphs` splits on blank lines, so a body joined
+    with ``\\n`` is one paragraph — and once it is past the chunk budget it is split into
+    sentences and repacked with spaces, at which point the boundaries the page had are
+    unrecoverable.
+
+    Asserted on ``paragraphs`` rather than on a substring of the text, because the substring
+    version passes on a ``\\n`` join too: the point is not that the characters are present but
+    that the same splitter the chunker uses agrees there are three of them.
+    """
+    blocks = await _corpus_blocks(corpus, "macro-body.storage")
+    body = _macro_body(blocks)
+
+    assert paragraphs(body.text)[: len(MACRO_DEFINITIONS)] == list(MACRO_DEFINITIONS), (
+        "three source paragraphs, in source order, still three after assembly"
+    )
+
+
+async def test_an_inline_br_is_not_a_paragraph_boundary(corpus: Path) -> None:
+    """The distinction the rule must not flatten: a line break inside a paragraph is one.
+
+    **``<br>`` contributes nothing at all today, and that is a separate defect left alone
+    here.** ``_inline_parts`` yields no text for it and ``_collapse`` would fold a newline into
+    a space regardless, so ``a<br/>b`` reads ``ab`` — in this parser and, identically, in the
+    web parser it shares the convention with. Making it a genuine line break means changing
+    what ``_collapse`` does to every table cell, heading and list item, which is a wider change
+    than a paragraph-boundary fix and belongs in its own.
+
+    What is asserted is the property this change is responsible for: the ``<br>`` did not
+    *become* a paragraph. The exact joined text is asserted with it so the day ``<br>`` starts
+    contributing something, this test says so rather than passing quietly.
+    """
+    blocks = await _corpus_blocks(corpus, "macro-body.storage")
+    written = next(
+        part for part in paragraphs(_macro_body(blocks).text) if "line break inside" in part
+    )
+
+    assert written == (
+        "A line break inside a paragraph is not a paragraph break.The clause after the br "
+        "element belongs to the paragraph that opened above it."
+    ), "one paragraph, and `<br>` currently contributes no character of its own"
+
+
+async def test_a_structured_block_inside_a_macro_body_is_still_its_own_block(
+    corpus: Path,
+) -> None:
+    """The paragraph rule applies to prose and must not widen to swallow structure.
+
+    A code macro nested in the container keeps its kind and its language. Merged into the
+    prose it would be four lines of YAML in the middle of a paragraph, indexed as sentences
+    and quotable as though the page had written it that way.
+    """
+    blocks = await _corpus_blocks(corpus, "macro-body.storage")
+    code = next(block for block in blocks if block.kind is BlockKind.CODE)
+
+    assert code.text == "gateways:\n  - name: primary\n    retries: 3", "verbatim, and its own"
+    assert code.lang == "yaml"
+    assert "gateways:" not in _macro_body(blocks).text, "and not also inside the prose"
+
+
+async def test_a_parameter_on_the_container_stays_out_of_the_reassembled_body(
+    corpus: Path,
+) -> None:
+    """The rendered-parameter table is keyed by macro, and the new join must not bypass it.
+
+    ``title`` is content on a ``panel`` and configuration on a macro nobody enumerated. Joining
+    the parts differently is no reason for a value to change sides.
+    """
+    blocks = await _corpus_blocks(corpus, "macro-body.storage")
+
+    assert CONTAINER_PRESET not in _texts(blocks)
+    assert "yaml" not in _texts(blocks).split(), "nor the nested macro's language"
+    placeholder = next(block for block in blocks if block.metadata.get("unsupported"))
+    assert placeholder.metadata["parameters"] == ["title"], "the name, so the omission is audible"
+    assert CONTAINER_PRESET not in str(placeholder.metadata)
+
+
+async def test_a_panel_body_gets_the_same_paragraph_rule_as_an_unsupported_one() -> None:
+    """Both assembly paths, because a fix applied to one would look complete.
+
+    A panel is the macro most likely to hold several paragraphs, and it reaches a different
+    function from the unsupported case. The severity survives the change, which is the thing a
+    panel is kept as a panel for.
+    """
+    blocks = await _blocks(
+        '<ac:structured-macro ac:name="note">'
+        "<ac:rich-text-body>"
+        "<p>The first observation.</p><p>The second observation.</p>"
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+
+    assert blocks[0].kind is BlockKind.PANEL
+    assert blocks[0].metadata["severity"] == "note"
+    assert paragraphs(blocks[0].text) == ["The first observation.", "The second observation."]
+
+
+async def test_a_heading_inside_a_macro_is_still_merged_rather_than_emitted() -> None:
+    """Which parts are merged is unchanged; only how they are joined.
+
+    Emitting the heading would open a section whose scope is the inside of the macro, and every
+    block after the macro would be filed under a heading the page does not have at that level.
+    It is still merged — now as a paragraph of its own rather than as the first line of the
+    paragraph beneath it.
+    """
+    blocks = await _blocks(
+        "<h1>Page</h1>"
+        '<ac:structured-macro ac:name="expand">'
+        "<ac:rich-text-body><h3>Inside the macro</h3><p>Under that heading.</p>"
+        "</ac:rich-text-body></ac:structured-macro>"
+        "<p>After the macro.</p>"
+    )
+    body = next(block for block in blocks if block.kind is BlockKind.PROSE)
+    after = blocks[-1]
+
+    assert paragraphs(body.text) == ["Inside the macro", "Under that heading."]
+    assert not any(block.text == "Inside the macro" for block in blocks), "merged, not emitted"
+    assert after.heading_path == ("Page",), "the page's hierarchy is untouched by it"
+
+
+async def test_reassembling_a_macro_body_is_deterministic(corpus: Path) -> None:
+    """Two parses of the same bytes are the same blocks.
+
+    Not a formality on this path: the body is assembled from a walk that appends into a list,
+    and an assembly that depended on set or dictionary ordering would produce a different
+    ``content_hash`` on the second machine and re-embed a corpus for nothing.
+    """
+    raw = raw_from(corpus / "confluence" / "macro-body.storage", MEDIA_TYPE)
+
+    first = await read_blocks(_parser(), raw)
+    second = await read_blocks(_parser(), raw)
+
+    assert first == second
+
+
+async def test_an_anchor_still_resolves_to_the_text_the_reassembled_body_claims(
+    corpus: Path,
+) -> None:
+    """Requirement three's last clause, asserted directly rather than through the harness.
+
+    The blank lines are added by the *assembly*, and the anchor addresses the source. Resolution
+    normalises whitespace, so the added boundaries do not move what the anchor covers — but that
+    is the kind of claim that should be run rather than reasoned about.
+    """
+    raw = raw_from(corpus / "confluence" / "macro-body.storage", MEDIA_TYPE)
+    parser = _parser()
+    blocks = await read_blocks(parser, raw)
+    body = _macro_body(blocks)
+
+    resolved = await parser.resolve(body.anchor, raw)
+
+    assert resolved is not None
+    for paragraph in paragraphs(body.text):
+        assert normalise(paragraph) in normalise(resolved)
 
 
 # --- anchors -------------------------------------------------------------------------------
