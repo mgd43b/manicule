@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Self
+from typing import Final, Self
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
@@ -323,6 +323,26 @@ class Retention(_Content):
         return self
 
 
+PREVIOUS_IDENTITY: Final = "previous_identity"
+"""``Document.metadata`` key recording what a re-keyed document used to be called.
+
+Written by the migration that moved a locally mirrored document off its path and onto the
+identity its source declares. It carries the old ``source_id`` and old ``document_id``, which is
+what makes that migration's downgrade exact rather than a re-derivation — the old identity was an
+absolute path, and once ``source_id`` holds the page id nothing else in the database remembers it.
+
+It also carries the ``content_hash`` seen at the moment of the move, and **only for a document
+whose stored text the move makes wrong**. Re-keying does not re-read the file, so such a document
+has its correct identity and the parse it had before; comparing the recorded digest against the
+live column is how ``doctor`` says a re-read is still owed, and how that finding clears itself the
+moment one happens.
+
+Declared here rather than in the revision that writes it because a revision's module name begins
+with a date and cannot be imported by name — and a second spelling of a stored key is a second
+key, which the reader would find empty.
+"""
+
+
 class Document(_Content):
     """The indexed record of one source document.
 
@@ -450,6 +470,7 @@ __all__ = [
     "CHUNKLESS_BY_DESIGN",
     "IN_FLIGHT",
     "NEEDS_ATTENTION",
+    "PREVIOUS_IDENTITY",
     "SETTLED",
     "BlockKind",
     "Chunk",

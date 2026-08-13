@@ -2054,3 +2054,73 @@ async def test_the_superseded_path_keyed_copy_is_reported_once_its_twin_exists(
     assert isinstance(moving[0], dict)
     assert moving[0]["old_source_id"] == "/corpus/pages/1002.html"
     assert "manicule document delete" in check.detail
+
+
+def _re_keyed(backend: FakeBackend, *, reparsed: bool) -> Document:
+    """A document the migration moved, before or after the sync that rebuilds its text."""
+    from manicule.core.content import PREVIOUS_IDENTITY  # noqa: PLC0415
+
+    document = _declaring(backend, "1002", source_id="1002")
+    return document.model_copy(
+        update={
+            "content_hash": "rebuilt" if reparsed else document.content_hash,
+            "metadata": {
+                **document.metadata,
+                PREVIOUS_IDENTITY: {
+                    "source_id": "/corpus/pages/1002.html",
+                    "document_id": "old",
+                    "content_hash": document.content_hash,
+                },
+            },
+        }
+    )
+
+
+async def test_doctor_says_the_identity_is_fixed_and_the_content_is_not(
+    backend: FakeBackend,
+) -> None:
+    """The window between re-keying a document and re-reading it, stated rather than silent.
+
+    Re-keying moves the row; it does not re-read the file. So a migrated enriched page has its
+    correct identity and its *old chunks* — the generic-HTML parse of the wrapper, metadata banner
+    and all — and the corpus still returns exactly what this change exists to keep out of it.
+    Deleting the chunks in the migration would be worse, so the intermediate state is kept; an
+    operator who runs a migration, sees it succeed and stops must be able to learn that it is half
+    the job.
+    """
+    backend.store.add(_re_keyed(backend, reparsed=False))
+
+    check = _check(await ApplicationService(backend).doctor(), "document-content")
+
+    assert check.state == "degraded"
+    assert check.facts["awaiting_reparse"] == 1
+    assert "identity is correct and their stored text is not" in check.detail
+    assert "metadata banner" in check.detail
+    assert "manicule connector sync handbook" in check.detail
+    assert check.remedy == "manicule connector sync handbook"
+
+
+async def test_the_content_check_clears_itself_once_the_document_is_re_read(
+    backend: FakeBackend,
+) -> None:
+    """It must stop firing on its own, or it is a warning nobody can satisfy.
+
+    One comparison does it: the migration recorded the digest it saw, and a re-ingest with the
+    extracted body replaces it. No clock, no watermark, and nothing to clean up afterwards.
+    """
+    backend.store.add(_re_keyed(backend, reparsed=True))
+
+    check = _check(await ApplicationService(backend).doctor(), "document-content")
+
+    assert check.state == "ok"
+    assert check.facts["awaiting_reparse"] == 0
+    assert check.remedy == ""
+
+
+async def test_a_document_that_was_never_re_keyed_is_not_reported_as_owing_a_re_read(
+    backend: FakeBackend,
+) -> None:
+    """Most of a corpus was never moved and owes nothing."""
+    backend.store.add(make_document(backend.workspace, source="handbook", source_id="notes.md"))
+
+    assert _check(await ApplicationService(backend).doctor(), "document-content").state == "ok"

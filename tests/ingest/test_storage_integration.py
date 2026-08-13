@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
+from sqlalchemy import text
 
 from manicule.core.content import IN_FLIGHT, DocumentStatus, Retention
 from manicule.core.embedding import IndexFingerprints
@@ -695,4 +696,99 @@ async def test_a_collection_survives_the_page_being_moved(
     assert after.provenance is not None
     assert after.provenance.snapshot is not None
     assert after.provenance.snapshot.path == "reorganised/1002.html"
+    await vectors.teardown()
+
+
+async def test_migrated_chunks_are_replaced_by_the_next_sync_and_none_keeps_a_stale_id(
+    store: SqliteDocStore, data_dir: Path, tmp_path: Path
+) -> None:
+    """The two consequences of leaving chunks alone, asserted end to end over the real store.
+
+    ``chunk_id`` digests the document id, so re-keying a document leaves every one of its chunks
+    with an id that no longer equals ``chunk_id(document_id, position, text)``. Nothing recomputes
+    one and compares — ``chunk_id`` is called in exactly one place and ``glossary_entry_id`` in
+    one, both to *mint* an id at write time — so the inconsistency is invisible to every read
+    path. What matters is that it does not persist, and this is where that is checked rather than
+    argued: migrate, sync, and every surviving chunk derives from the identity it now hangs off.
+
+    It also pins the other half. Before the sync the document serves its old chunks — the
+    generic-HTML parse, metadata banner and all — which is exactly what the change exists to keep
+    out of the index and exactly why ``doctor``'s ``document-content`` check reports it.
+    """
+    from manicule.connectors.filesystem import FilesystemConnector  # noqa: PLC0415
+    from manicule.core.ids import chunk_id, document_id  # noqa: PLC0415
+    from manicule.storage.migrator import downgrade, upgrade  # noqa: PLC0415
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    await _enriched(corpus)
+    engine = store.engine
+    await downgrade(engine, "5f1c8a34b7d9")
+
+    stale = "old-path-keyed-id"
+    banner = "Page ID: 1002 — exported by the wiki mirror"
+    async with engine.begin() as connection:
+        # The store fixture has already created the default workspace; the downgrade left it.
+        await connection.execute(
+            text(
+                "INSERT INTO documents (id, workspace_id, source, source_id, uri, title, "
+                "media_type, content_hash, status, metadata, created_at, updated_at) "
+                "VALUES (:id, 'default', 'handbook', :path, 'file:///x', 'Retry Runbook', "
+                "'text/html', 'stale-hash', 'indexed', :metadata, "
+                "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+            ),
+            {
+                "id": stale,
+                "path": str(corpus / "1002.html"),
+                "metadata": json.dumps(
+                    {
+                        "source_provenance": {
+                            "source": {"source_id": "1002", "title": "Retry Runbook"},
+                            "snapshot": {"path": "1002.html"},
+                            "unavailable_reason": "",
+                        }
+                    }
+                ),
+            },
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO chunks (id, document_id, text, embed_text, heading_text, "
+                "heading_path, kind, position, token_count, anchor, metadata, created_at) "
+                "VALUES (:id, :doc, :text, :text, '', '[]', 'prose', 0, 5, :anchor, '{}', "
+                "'2026-01-01T00:00:00+00:00')"
+            ),
+            {
+                "id": chunk_id(stale, 0, banner),
+                "doc": stale,
+                "text": banner,
+                "anchor": '{"kind": "unlocated", "reason": "seeded"}',
+            },
+        )
+
+    await upgrade(engine)
+
+    moved = document_id("default", "handbook", "1002")
+    assert [row.id for row in await store.list_documents()] == [moved]
+    before = await store.document_chunks(moved)
+    assert [chunk.text for chunk in before] == [banner], (
+        "the seed must actually seed the stale parse, or this test proves nothing"
+    )
+    assert before[0].id != chunk_id(moved, 0, banner), (
+        "the chunk id must be stale after the move, or the assertion below is vacuous"
+    )
+
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    await _pipeline(store, vectors).run(FilesystemConnector(corpus, name="handbook"))
+
+    after = await store.document_chunks(moved)
+    assert after, "the sync left the document with no chunks at all"
+    assert not any(chunk.text == banner for chunk in after), (
+        "the metadata banner survived the sync, which is the defect this change exists to fix"
+    )
+    for chunk in after:
+        assert chunk.id == chunk_id(moved, chunk.position, chunk.text), (
+            "a chunk survived with an id that does not derive from the identity it hangs off"
+        )
     await vectors.teardown()
