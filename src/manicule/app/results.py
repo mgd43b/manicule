@@ -657,12 +657,14 @@ class StaleReparseReport(Payload):
     """
 
     chunks_kept: int = Field(default=0, ge=0)
-    """Chunks that survived with their id, and so with every citation that resolves to them.
+    """Chunks that survived with their id, and so with the vector row already stored.
 
-    Chunk ids are content-derived, so a chunk the re-parse did not move keeps its id. **That is
-    all this says.** It is not a count of vectors kept and it is not a count of embedding work
-    avoided — a chunk in here whose heading breadcrumb moved has the id it always had and a
-    vector it can no longer use. ``embedding`` is what was avoided, measured at the model.
+    Chunk ids are content-derived, so a chunk the re-parse did not move keeps its id, keeps the
+    row every citation to it resolves through, and keeps that citation working. **That is all
+    this says.** It is a count of vector *rows* kept, not of vectors kept, and not of embedding
+    work avoided — a chunk in here whose heading breadcrumb moved has the id it always had, the
+    row it always had, and a vector inside it that can no longer be used. ``embedding`` is what
+    was avoided, measured at the model.
     """
 
     embedding: EmbeddingCost = Field(default_factory=EmbeddingCost)

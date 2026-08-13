@@ -502,12 +502,14 @@ class StaleSweep:
     """
 
     chunks_kept: int = 0
-    """Chunks that survived with their id, and therefore with their citations.
+    """Chunks that survived with their id, and therefore with the vector row already stored.
 
-    **A statement about content identity and nothing else.** It is not a count of vectors kept
-    and it is not a count of embedding work avoided: a chunk in here whose heading breadcrumb
-    moved has the id it always had and a vector it can no longer use. What was avoided is
-    :attr:`embedding`, which is measured at the model rather than inferred from row identity.
+    **A statement about content identity, and about the row rather than the vector in it.** A
+    kept chunk keeps the row every citation to it resolves through; the row's contents may
+    still be written again, because what is embedded is ``embed_text`` and the breadcrumb in it
+    can move under an id that did not. So this is not a count of vectors kept and not a count
+    of embedding work avoided. What was avoided is :attr:`embedding`, measured at the model
+    rather than inferred from row identity.
     """
 
     embedding: EmbeddingWork = field(default_factory=EmbeddingWork)

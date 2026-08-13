@@ -343,7 +343,7 @@ def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
         table.add_row("superseded by a newer sync", str(payload.superseded))
         # Under its own heading rather than beside the chunk counts, because the two answer
         # different questions and the row above used to be read as an answer to this one.
-        # Whether the vector inside a kept row survived is this block, not that line.
+        # Whether the vector inside a kept row survived is the block below, not this line.
         cost = payload.embedding
         table.add_row("", "")
         table.add_row("embedding", "")

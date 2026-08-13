@@ -927,14 +927,19 @@ them, and a fingerprint that could would be a hash of the output rather than of 
 report says so afterwards: `reparsed` is what was rebuilt, `changed` is what came out
 different, and on a narrow bump the second is a small fraction of the first.
 
-**Why unchanged vectors are kept.** A chunk's id is derived from its content and position, so a
-chunk the re-parse did not move comes back with the id it already had and every citation that
-resolved to it still resolves. `chunks_kept` counts those; `chunks_new` counts the chunks the
-sweep produced that were not already stored. **Neither is a count of forward passes**, and that
-is not a caveat about precision — they are answers to a different question. A chunk is embedded
-from `embed_text`, which carries the heading breadcrumb, so a document whose headings moved
-re-embeds chunks whose ids never changed; and a document with a paragraph inserted at the top
-renumbers every chunk below it without moving one embedded string.
+**Why unchanged vector rows are kept.** A chunk's id is derived from its content and position,
+so a chunk the re-parse did not move comes back with the id it already had, the vector row
+stored against that id is still its row, and every citation that resolved to it still resolves.
+`chunks_kept` counts those; `chunks_new` counts the chunks the sweep produced that were not
+already stored.
+
+**Neither is a count of forward passes**, and that is not a caveat about precision — they are
+answers to a different question. A row surviving is not the vector inside it surviving: a chunk
+is embedded from `embed_text`, which carries the heading breadcrumb, so a document whose
+headings moved re-embeds chunks whose ids never changed, and their rows are rewritten in place.
+The mismatch runs the other way too — a document with a paragraph inserted at the top renumbers
+every chunk below it without moving one embedded string, so those chunks are *not* in
+`chunks_kept` and their vectors are reused anyway.
 
 **What is a count of forward passes is `embedding`**, and it is measured at the model rather
 than inferred from row identity. The sweep partitions every prepared chunk three ways and

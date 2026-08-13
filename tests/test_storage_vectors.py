@@ -28,6 +28,7 @@ from manicule.core.anchors import HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, Chunk
 from manicule.core.embedding import EmbedFingerprint, Pooling, VectorState
 from manicule.core.errors import FingerprintMismatchError
+from manicule.core.protocols import VectorStore
 from manicule.core.retrieval import Filter
 from manicule.storage.vectors import (
     EXEMPT_FILTER_FIELDS,
@@ -41,6 +42,7 @@ from manicule.storage.vectors import (
     unit,
 )
 from manicule.testing import (
+    assert_protocol_signatures,
     assert_vector_store_is_dimension_agnostic,
     assert_vector_store_rejects_foreign_vectors,
     assert_vector_store_reuses_by_embedding_input,
@@ -50,7 +52,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from manicule.core.embedding import Vector
-    from manicule.core.protocols import VectorStore
 
 
 SCOPE = frozenset({"default"})
@@ -116,6 +117,26 @@ def spread(dimension: int, index: int) -> list[float]:
 
 
 # --- conformance -------------------------------------------------------------------------
+
+
+@pytest.mark.contract
+async def test_the_store_satisfies_the_vector_store_protocol(store: LanceVectorStore) -> None:
+    """Structural conformance for the backend that ships, which nothing checked until now.
+
+    ``MemoryVectorStore`` has been signature-checked against ``VectorStore`` since the protocol
+    existed and ``LanceVectorStore`` never has — so the one implementation an installation
+    actually runs was the one nothing held to the protocol's shape.
+    ``SqliteDocStore`` has had this test all along; its opposite number did not.
+
+    Both halves are needed, and the second is the one that bites. ``isinstance`` checks the
+    attributes exist; ``@runtime_checkable`` deliberately checks nothing about what they
+    accept, so a store whose ``stored_vectors`` took ``chunk_ids`` where the protocol says
+    ``chunks`` would pass every ``isinstance`` in the codebase and fail at the first keyword
+    call — which, for a method reached once per document, is somewhere in the middle of a
+    corpus sweep.
+    """
+    assert isinstance(store, VectorStore)
+    assert_protocol_signatures(store, VectorStore)
 
 
 @pytest.mark.contract
