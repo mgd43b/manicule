@@ -9,7 +9,7 @@ belonged to.
 
 **It is not backfilled, and that is the decision this revision is really making.** Every
 existing row keeps ``NULL``, which reads as "no recorded lineage" everywhere it is consulted:
-``reindex --re-parse`` selects those documents, and the next sync re-parses them. Writing
+``document reindex --stale`` selects those documents, and the next sync re-parses them. Writing
 today's versions into them instead would be one statement and would assert something nobody
 knows — that text extracted months ago came out of the libraries installed now — which is the
 class of quiet, plausible falsehood the fingerprints exist to prevent. The price is a one-time

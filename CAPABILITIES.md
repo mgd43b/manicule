@@ -88,7 +88,8 @@ of those, so the mapping is noted where it is not obvious. The output shape is a
 - `index --stats` — counts grouped by source, media type and status.
 - `index --source` — the source name documents are recorded under. It is part of their
   identity, so it is a decision rather than a constant.
-- `document reindex` — re-parse from retained bytes, with no network and no re-crawl.
+- `document reindex` — re-parse from retained bytes, with no network and no re-crawl. With
+  `--stale` instead of an id, every document an installed parser has moved past.
 - `plugin list --registry` — browse the community listing, when configuration allows it.
 - `start --transport` and `start --allow-public-bind` — the second is the only way to bind a
   non-loopback address, and no configuration file can supply it.

@@ -214,7 +214,8 @@ The three costs are not the same size, and the group name is what tells them apa
 embedding bump re-embeds everything. A chunking bump re-chunks and re-embeds what it touches.
 An extraction bump is the narrowest: `documents.parse_fp` records which parser version
 produced each document, so change detection re-parses exactly the documents that library
-produced and `reindex --re-parse` selects the same set without waiting for a sync. Adding a
+produced and `manicule document reindex --stale` selects the same set without waiting for a
+sync. Adding a
 library that decides stored text means adding it to `manicule.parsers.versions.PARSERS` *and*
 to the `index-affecting-extraction` patterns; `tests/parsers/test_versions.py` fails if the
 two disagree.

@@ -29,7 +29,13 @@ from manicule.core.errors import ConfigError
 from manicule.core.version import CORE_VERSION
 from manicule.mcp.server import TOOL_NAMES
 from manicule.storage.backup import BackupError
-from tests.app.fakes import FakeBackend, FakeMaintenance, make_chunk, make_document
+from tests.app.fakes import (
+    FakeBackend,
+    FakeIngestion,
+    FakeMaintenance,
+    make_chunk,
+    make_document,
+)
 from tests.conftest import CLEARED_TERMINAL_VARIABLES
 
 if TYPE_CHECKING:
@@ -234,6 +240,107 @@ def test_allow_insecure_target_is_refused_on_a_restore_rather_than_ignored(
     assert "--allow-insecure-target" in cli.INSECURE_TARGET_IS_A_BACKUP_OPTION
     result = run(["backup", "--restore", "/tmp/b", "--allow-insecure-target"])  # noqa: S108 - never opened
     assert result.exit_code != 0
+
+
+# --- one document or the whole corpus -----------------------------------------------------------
+
+
+def _ingestion(service: ApplicationService) -> FakeIngestion:
+    ingestion = asyncio.run(service.backend.ingestion())
+    assert isinstance(ingestion, FakeIngestion)
+    return ingestion
+
+
+def _a_real_document(service: ApplicationService) -> str:
+    """An id the fixture actually holds.
+
+    Not a plausible-looking literal. ``document_reindex`` resolves the id before it reaches the
+    ingest layer and raises for one it does not know, so a refusal test written against
+    ``"doc-1"`` exits non-zero whether the refusal fires or not — which is a test that passes
+    with the guard removed. Found exactly that way.
+    """
+    backend = service.backend
+    assert isinstance(backend, FakeBackend)
+    return next(iter(backend.store.documents))
+
+
+def test_reindex_refuses_an_id_and_a_corpus_sweep_in_one_invocation(
+    bound: ApplicationService,
+) -> None:
+    """The two readings differ by the size of the corpus, so the refusal is worth having.
+
+    Asserted at the port as well as at the exit status: a refusal that parsed, exited non-zero
+    and had already started the sweep would look identical from outside.
+    """
+    assert "--stale" in cli.REINDEX_IS_ONE_OR_ALL
+    result = run(["document", "reindex", _a_real_document(bound), "--stale"])
+    assert result.exit_code != 0
+    assert _ingestion(bound).sweeps == []
+    assert _ingestion(bound).reindexed == []
+
+
+def test_reindex_with_neither_a_target_nor_stale_says_what_is_missing(
+    bound: ApplicationService,
+) -> None:
+    """An optional argument that is sometimes required has to say so, or it reads as a crash."""
+    del bound
+    assert "--stale" in cli.REINDEX_NEEDS_A_TARGET
+    result = run(["document", "reindex"])
+    assert result.exit_code != 0
+
+
+def test_a_dry_run_of_a_single_document_reindex_is_refused_rather_than_ignored(
+    bound: ApplicationService,
+) -> None:
+    """The flag reads as "show me what this would do", and doing it is the opposite."""
+    assert "--stale" in cli.DRY_RUN_IS_A_SWEEP_OPTION
+    result = run(["document", "reindex", _a_real_document(bound), "--dry-run"])
+    assert result.exit_code != 0
+    assert _ingestion(bound).reindexed == [], "the document was re-parsed by a refused command"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["document", "reindex", "--stale"], (cli.DEFAULT_SWEEP_BATCH, False)),
+        (["document", "reindex", "--stale", "--dry-run"], (cli.DEFAULT_SWEEP_BATCH, True)),
+        (["document", "reindex", "--stale", "--batch", "5"], (5, False)),
+    ],
+)
+def test_the_sweep_options_reach_the_port_rather_than_merely_parsing(
+    bound: ApplicationService, *, argv: list[str], expected: tuple[int, bool]
+) -> None:
+    """The half a declaration cannot prove: that the flags are *wired*.
+
+    ``--dry-run`` is the one that matters. Declared and not passed, it is an option an operator
+    types to see a plan, that reports a plan-shaped result, and that has already re-parsed and
+    re-embedded the corpus by the time it prints one.
+    """
+    result = run(["--json", *argv])
+    assert result.exit_code == 0
+    assert _ingestion(bound).sweeps == [expected]
+
+
+def test_the_sweep_reports_the_same_counts_to_a_person_and_to_a_pipe(
+    bound: ApplicationService,
+) -> None:
+    """Requirement met by construction — one payload, two renderings — and checked anyway.
+
+    The numbers are read out of the JSON envelope at run time rather than written down, so a
+    renderer that started computing its own version of a count fails here rather than passing
+    against a literal somebody updated to match.
+    """
+    _ingestion(bound).sweep.unrepairable = 1
+    _ingestion(bound).sweep.unrepairable_documents = ["doc-9 (https://docs.example.test/9): gone"]
+
+    machine = json.loads(run(["--json", "document", "reindex", "--stale"]).stdout)["data"]
+    human = _laid_bare(run(["document", "reindex", "--stale"]).stdout)
+
+    assert machine["selected"] == 2
+    for field in ("selected", "reparsed", "unchanged", "changed", "chunks_new", "chunks_kept"):
+        assert str(machine[field]) in human, f"{field} is in the envelope and not on the screen"
+    assert "doc-9" in human, "the human surface names the documents somebody has to act on"
+    assert machine["unrepairable_documents"] == ["doc-9 (https://docs.example.test/9): gone"]
 
 
 def test_an_export_consents_to_nothing_unless_the_flag_is_typed(
@@ -462,6 +569,7 @@ CLI_ONLY_OPS: frozenset[str] = frozenset(
         "auth_revoke_key",
         "backup",
         "completion",
+        "document_reindex_stale",
         "export",
         "import",
         "index_changes",

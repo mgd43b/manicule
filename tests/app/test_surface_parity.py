@@ -136,6 +136,26 @@ def test_no_tool_writes_files_into_the_users_corpus() -> None:
     assert "connector_sidecar" not in TOOL_NAMES
 
 
+def test_no_tool_re_parses_the_whole_corpus() -> None:
+    """``document reindex --stale`` is command line only, by the rule above.
+
+    It is the widest mutation manicule performs short of ``reset-index``: every document a
+    parser bump touched is re-parsed, re-chunked and run through the embedder, and every vector
+    whose chunk moved is rewritten. There is no upper bound on how long that takes — it is the
+    size of the corpus — and the machine's accelerator is busy for all of it. An unattended
+    caller that could start one has a denial of service on the same terms as
+    ``/api/v1/admin/benchmark``, which ``tests/api/test_routes.py`` already refuses a route for.
+
+    The per-document verb stays on every surface. It is bounded by one document, which is the
+    difference.
+    """
+    assert "document_reindex_stale" not in TOOL_NAMES
+    assert "document_reindex" in TOOL_NAMES, (
+        "the bounded verb is the one being kept, and an absence test that passed because both "
+        "had gone would say nothing"
+    )
+
+
 def test_the_command_line_offers_exactly_twenty_commands() -> None:
     """Counted from the built command tree rather than from the source.
 

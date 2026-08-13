@@ -761,17 +761,24 @@ Storing the failure is what makes it re-queryable, skippable on the next sync, a
 `storage.md` §7's retained bytes that becomes three distinct operations, each landing on a rung
 of the blast-radius ladder (`storage.md` §1):
 
-| Command | Reads | Rung | Network |
-|---|---|---|---|
-| `reindex --repair` | `chunks` | 1–2 | none |
-| `reindex --re-embed` | `chunks.embed_text` | 2 | none |
-| `reindex --re-parse` | `blobs` | 3 | none |
-| `sync --force` | the source | 4 | yes, rate-limited, **may fail** |
+| Operation | Reads | Rung | Network | Shipped as |
+|---|---|---|---|---|
+| `repair` | `chunks` | 1–2 | none | `ingest.reindex.repair`, no command |
+| `re-embed` | `chunks.embed_text` | 2 | none | `ingest.reindex.re_embed`, no command |
+| **re-parse** | `blobs` | 3 | none | `document reindex <id>`, `document reindex --stale` |
+| a forced sync | the source | 4 | yes, rate-limited, **may fail** | `index <path> --reindex`, for a path |
 
 **Only the last one can fail for reasons outside the machine**, and it is the only one that is
 not reproducible. Everything above it is a pure function of what is already on disk. That is
-the whole return on retaining bytes, and it is why `--re-parse` is a first-class verb rather
+the whole return on retaining bytes, and it is why re-parse is a first-class verb rather
 than a flag on sync.
+
+The right-hand column is there because most of this table is **not** an operator-facing command,
+and listing them all as commands would describe an interface nobody can type. Repair runs on the
+recovery path and re-embed has no shipped surface at all, so both are reachable only from
+Python. Re-parse has both ends of its verb. And rung 4 ships for a *path* — `index <path>
+--reindex` skips change detection — while a configured connector has no `--force`, so the only
+way to make one re-fetch today is to change what the source reports.
 
 **Selection is a query, not a scan**, because of the per-document lineage in `storage.md` §6.4:
 
@@ -780,20 +787,98 @@ than a flag on sync.
 SELECT id FROM documents WHERE chunk_fp <> :current AND media_type IN (:code_types)
 ```
 
-`--re-parse` accepts the same selectors as `document list` — `--status`, `--connector`,
-`--media-type`, `--container`, `--chunk-fp` — so "re-parse everything that came out of the old
-PDF parser" is expressible without a bespoke flag. It also takes a single document id, which is
-the narrow end of the same verb and the one a restore reaches for (§11.2).
+`select()` accepts the same selectors as `document list` — status, connector, media type,
+chunk fingerprint — so "re-parse everything that came out of the old PDF parser" is expressible
+without a bespoke flag. The shipped commands expose the one selector an upgrade needs, and a
+single document id, which is the narrow end of the same verb and the one a restore reaches for
+(§11.2).
 
 **Re-parse is subject to the same identity rules as first ingest.** It runs the current parser
 chain over the retained bytes, produces chunks, and reconciles them against the stored set by
 `chunks.id`. Unchanged chunks keep their ids and their vectors (`storage.md` §3.2), so a parser
-fix that changes one table in a hundred-page document re-embeds one table.
+fix that changes one table in a hundred-page document leaves every other chunk's vector alone.
 
 **A document with no retained bytes cannot be re-parsed**, and the command says so per document
 rather than failing the run: `original_ref IS NULL` because retention was capped or the document
 predates retention. Those are listed with their `original_omitted_reason` and are the only
-documents for which `sync --force` is the only option.
+documents for which a forced re-sync is the only option.
+
+### 10.1 `document reindex --stale`, the corpus-wide end
+
+```
+manicule document reindex --stale [--dry-run] [--batch N]
+manicule document reindex <id>
+```
+
+One verb, two ends. An id repairs one document; `--stale` repairs every document an installed
+parser has moved past. Neither touches the network.
+
+**What makes a document stale.** `documents.parse_fp` records the fingerprint of the parser
+that produced its text — manicule's own rules version for that parser plus the versions of the
+libraries it reads with. A document is stale when that string is not one
+`parsers.versions.current_parse_fingerprints()` would produce now: a `pypdfium2` release, a
+`selectolax` release, or a hand-bumped `PARSERS[...].rules` after a change to what a parser
+emits. A `NULL` lineage is also selected — no recorded fingerprint is no evidence the stored
+text is current — which is how documents predating the column stay reachable.
+
+**Why every document is re-parsed when only some change.** A `parse_fp` records the parser's
+version, not the document's content, so after a bump it matches for none of that parser's
+documents. Nothing can tell in advance which pages the change actually moves without parsing
+them, and a fingerprint that could would be a hash of the output rather than of the rules. The
+report says so afterwards: `reparsed` is what was rebuilt, `changed` is what came out
+different, and on a narrow bump the second is a small fraction of the first.
+
+**Why unchanged vectors are kept.** A chunk's id is derived from its content and position, so a
+chunk the re-parse did not move comes back with the id it already had, the vector row stored
+against that id is still its vector, and every citation that resolved to it still resolves.
+`chunks_kept` counts those; `chunks_new` counts the chunks the sweep produced that were not
+already stored. Neither is a count of forward passes — a chunk is embedded from `embed_text`,
+which carries the heading breadcrumb, and a document whose headings moved re-embeds chunks
+whose ids did not, so the pipeline embeds every chunk of a document it re-parses and the
+embedder's cache absorbs the repeats.
+
+**What a dry run guarantees.** `--dry-run` performs the selection and nothing else: no parse,
+no chunking, no embedding, no blob read, no write to the database, the vector store or the
+lineage columns. It reports the same `selected` count the real run would, and it names the
+documents whose `original_ref` is unset. The one thing it cannot tell you is whether a retained
+reference still resolves to bytes on disk — that is a blob read, and it is left to the run that
+is allowed to do work.
+
+**Documents with no retained bytes.** Reported per document with the reason and the remedy,
+never as a reason to stop. There are two ways to get there: retention refused the bytes at
+ingest (`original_ref IS NULL`, with `original_omitted_reason` saying why) or the blob is gone
+from the data directory. The first needs a forced re-sync, which is rung 4 and the one rung
+that can fail; the second may only need the data directory restored. The sweep will not fetch
+on its own — leaving rung 3 is a decision an operator makes.
+
+**Stopping and resuming.** A document is the transaction boundary. Each is committed by the
+pipeline — chunks, then vectors, then `indexed`, then lineage — before the next is read, so
+interrupting the sweep leaves every document it finished internally consistent and every
+document it did not still selected. There is no resume token and nothing to clean up: run the
+command again. Documents already repaired are not selected a second time, so a restart picks up
+the remainder rather than starting the corpus over.
+
+**Batching and the cursor.** The selection is paged, `--batch` documents at a time, and the
+cursor is the number of documents a pass *left behind* rather than a page number. A repaired
+document leaves the selection, so the set shrinks under the iteration: counting pages would
+skip the documents that shift forward into the vacated slots, and restarting at zero each time
+would re-read an unrepairable prefix for ever. Embedding batches are the pipeline's own
+(`embeddings.md`), unchanged — the sweep introduces no second consumer of the model, which is
+also what makes a concurrent sync and a sweep serialise rather than contend.
+
+**Idempotence, and its one exception.** A second run immediately afterwards selects nothing and
+performs no embedding work. The exception is a document produced by a parser manicule does not
+ship: `parse_fingerprint` has no version to read for it, so it records `NULL` and is selected by
+every sweep. It is re-parsed exactly once per run and remains selectable afterwards. That is
+the deliberate trade in `parsers/versions.py` — a plugin corpus that no repair can reach would
+be worse — and it is why the sweep tracks what it left behind rather than trusting the selection
+to empty itself.
+
+**Concurrency.** Within a process the sweep runs through the pipeline the runtime already
+built, so it shares the embed stage's lock (§6.6) with any sync running beside it and the two
+never reach the model at once. Across processes the contract is §6.5's exclusive lock on
+`<data_dir>/manicule.lock`, held for the lifetime of whichever process opened the data
+directory. The sweep takes no lock of its own; a second one would be a second answer.
 
 ---
 
@@ -849,7 +934,7 @@ owns when that sweep runs:
   over-fetch factor (`storage.md` §8.2).
 
 A document that is restored inside the grace period needs no re-embed. Outside it, restore is a
-`--re-parse` from retained bytes — rung 3, still not a re-crawl.
+re-parse from retained bytes — rung 3, still not a re-crawl.
 
 `manicule.ingest.reindex.reindex_document` is that re-parse for one id, and it is what
 `TrashStore.restore_document` points at when it reports `needs_reparse`. It resolves the id
@@ -1027,7 +1112,8 @@ Calls made in the absence of a stated position.
 | Embed batch size derived from both fingerprints, not a constant | §8.2 |
 | Bounded queues, so backpressure reaches discovery and cursors do not expire | §8.3 |
 | A failed re-ingest never demotes a working document | §9 |
-| Three re-ingest verbs mapped to ladder rungs; `--re-parse` is first-class | §10 |
+| Three re-ingest verbs mapped to ladder rungs; re-parse is first-class | §10 |
+| The corpus-wide re-parse is a flag on the document verb, and command line only | §10.1 |
 | Reconcile: clean-completion-only, a deletion ceiling, soft delete only | §11.1 |
 | The sweep is scheduled and yields to backup and sync | §11.2 |
 | Watch never reconciles; debounce with a post-debounce re-`stat` | §12 |

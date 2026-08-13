@@ -310,6 +310,41 @@ def render_document_reindexed(out: Console, payload: r.DocumentReindexed) -> Non
         out.print(f"[yellow]{escape(payload.detail)}[/yellow]")
 
 
+def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
+    """The sweep's counts, and the documents somebody has to do something about.
+
+    The same numbers ``--json`` carries, off the same payload. Nothing is computed here: a
+    percentage or a "looks healthy" would be this surface's own opinion about a result the
+    other surfaces report without one.
+    """
+    if payload.dry_run:
+        out.print("[dim]dry run: nothing was parsed, embedded or written[/dim]")
+    table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_row("selected", str(payload.selected))
+    if not payload.dry_run:
+        table.add_row("re-parsed", str(payload.reparsed))
+        table.add_row("  unchanged", str(payload.unchanged))
+        table.add_row("  changed", str(payload.changed))
+        table.add_row("chunks produced anew", str(payload.chunks_new))
+        table.add_row("chunks kept, with their vectors", str(payload.chunks_kept))
+    table.add_row("unrepairable", str(payload.unrepairable))
+    table.add_row("failed", str(payload.failed))
+    out.print(table)
+    # Named individually, unlike the counts. These are the only two classes an operator can act
+    # on, and "3 unrepairable" without the ids is a number nobody can do anything with.
+    for line in payload.unrepairable_documents:
+        out.print(f"[yellow]{escape(line)}[/yellow]")
+    for line in payload.failures:
+        out.print(f"[red]{escape(line)}[/red]")
+    if payload.dry_run and payload.selected:
+        out.print("\n[dim]next: [/dim]manicule document reindex --stale")
+    elif payload.unrepairable:
+        out.print(
+            "\n[dim]a document with no retained bytes can only be repaired by fetching it "
+            "again: [/dim]manicule connector sync <name>"
+        )
+
+
 # --- ingest -----------------------------------------------------------------------------------
 
 
@@ -751,6 +786,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.DocumentDetail: lambda out, p: render_document(out, _as(r.DocumentDetail, p)),
     r.DocumentDeleted: lambda out, p: render_document_deleted(out, _as(r.DocumentDeleted, p)),
     r.DocumentReindexed: lambda out, p: render_document_reindexed(out, _as(r.DocumentReindexed, p)),
+    r.StaleReparseReport: lambda out, p: render_stale_reparse(out, _as(r.StaleReparseReport, p)),
     r.IngestReport: lambda out, p: render_ingest(out, _as(r.IngestReport, p)),
     r.IndexStatus: lambda out, p: render_index_status(out, _as(r.IndexStatus, p)),
     r.Stats: lambda out, p: render_stats(out, _as(r.Stats, p)),

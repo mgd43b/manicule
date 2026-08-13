@@ -36,7 +36,7 @@ from manicule.app import results as r
 from manicule.app.dispatch import error_info, run_op
 from manicule.app.results import Envelope, failed
 from manicule.app.runtime import Runtime
-from manicule.app.service import DEFAULT_SOURCE, ApplicationService
+from manicule.app.service import DEFAULT_SOURCE, DEFAULT_SWEEP_BATCH, ApplicationService
 from manicule.cli import render
 from manicule.core.errors import ConfigError, ManiculeError
 from manicule.core.version import CORE_VERSION
@@ -74,6 +74,39 @@ INSECURE_TARGET_IS_A_BACKUP_OPTION = (
 
 Accepting a security flag that has no effect on the operation being run is the exact shape of
 the defect this option exists to fix: an option that reads as a decision and reaches nothing.
+"""
+
+REINDEX_IS_ONE_OR_ALL = (
+    "name a document id or pass --stale, not both. --stale sweeps the whole corpus for "
+    "documents an installed parser has moved past, and an id says which single document to "
+    "re-parse; running the sweep against one id would be a much larger operation than the "
+    "argument asks for."
+)
+"""Why ``document reindex <id> --stale`` is refused rather than resolved.
+
+The same shape as :data:`BACKUP_IS_NOT_A_RESTORE` and refused for the same reason: two
+contradictory instructions in one invocation is a typo, not a plan. This one is worth refusing
+loudly because the two readings differ by the size of the corpus — a person who meant one
+document and got a sweep has committed the machine to re-parsing and re-embedding everything a
+parser bump touched, and would find out from the elapsed time.
+"""
+
+REINDEX_NEEDS_A_TARGET = (
+    "say what to re-parse: a document id, or --stale for every document whose parse "
+    "fingerprint is no longer one an installed parser produces"
+)
+
+DRY_RUN_IS_A_SWEEP_OPTION = (
+    "--dry-run applies to --stale, which selects documents before repairing them. Re-parsing "
+    "one named document has no selection to plan, so a dry run of it would report nothing and "
+    "look like a run that found nothing to do."
+)
+"""Why ``document reindex <id> --dry-run`` is refused rather than ignored.
+
+Accepting a flag that has no effect on the operation being run is the defect
+:data:`INSECURE_TARGET_IS_A_BACKUP_OPTION` exists to name, one command along. Here it is worse
+than inert: the flag reads as "show me what this would do", and silently doing it instead is
+the one outcome the person typing it was trying to avoid.
 """
 
 UNKNOWN_WORKSPACE = "unknown"
@@ -409,6 +442,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "document_get": r.DocumentDetail,
     "document_delete": r.DocumentDeleted,
     "document_reindex": r.DocumentReindexed,
+    "document_reindex_stale": r.StaleReparseReport,
     "doctor": r.Diagnosis,
     "connector_list": r.ConnectorList,
     "connector_login": r.ConnectorSignedIn,
@@ -691,10 +725,45 @@ def document_delete(
 
 @document_app.command("reindex")
 def document_reindex(
-    document_id: Annotated[str, typer.Argument(help="The document id.")],
+    document_id: Annotated[
+        str | None, typer.Argument(help="The document id. Omit it and pass --stale instead.")
+    ] = None,
+    *,
+    stale: Annotated[
+        bool,
+        typer.Option(
+            "--stale",
+            help="Re-parse every document an installed parser has moved past, instead of one.",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="With --stale: report the plan and write nothing.")
+    ] = False,
+    batch: Annotated[
+        int, typer.Option("--batch", min=1, help="With --stale: documents per page.")
+    ] = DEFAULT_SWEEP_BATCH,
 ) -> None:
-    """Re-parse one document from the bytes ingest retained. Touches no network."""
-    emit("document_reindex", lambda service: service.document_reindex(document_id))
+    """Re-parse from the bytes ingest retained: one document, or every stale one.
+
+    Touches no network either way. `--stale` rebuilds every document whose recorded parse
+    fingerprint is not one an installed parser would produce now, which is what a parser
+    upgrade leaves behind. Chunks that do not move keep their ids and their vectors, and a
+    document with no retained bytes is named rather than failing the sweep. Stopping it is
+    safe at any point; running it again resumes.
+    """
+    if stale and document_id is not None:
+        raise typer.BadParameter(REINDEX_IS_ONE_OR_ALL)
+    if not stale:
+        if document_id is None:
+            raise typer.BadParameter(REINDEX_NEEDS_A_TARGET)
+        if dry_run:
+            raise typer.BadParameter(DRY_RUN_IS_A_SWEEP_OPTION)
+        emit("document_reindex", lambda service: service.document_reindex(document_id))
+        return
+    emit(
+        "document_reindex_stale",
+        lambda service: service.document_reindex_stale(batch=batch, dry_run=dry_run),
+    )
 
 
 # --- collection -------------------------------------------------------------------------------

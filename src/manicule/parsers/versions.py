@@ -151,7 +151,8 @@ def parse_fingerprint(parser: str) -> ParseFingerprint | None:
     tokenizer id. What ``None`` means downstream is stated where it is acted on: change
     detection treats "no recorded lineage, and none obtainable" as unchanged, so a plugin
     corpus is not re-parsed on every sync, while repair selection treats a null ``parse_fp``
-    as eligible, so it is reachable by ``reindex --re-parse`` on demand. Both defaults point
+    as eligible, so it is reachable by ``document reindex --stale`` on demand. Both defaults
+    point
     away from claiming currency that cannot be proved.
 
     Cached for the life of the process. The answer is a fact about the installed environment,

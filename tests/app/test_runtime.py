@@ -121,6 +121,34 @@ async def test_the_workspace_row_exists_after_the_store_is_opened(runtime: Runti
     assert [row[0] for row in await maintenance.workspaces()] == ["default"]
 
 
+async def test_planning_a_corpus_re_parse_builds_no_pipeline_and_loads_no_model(
+    runtime: Runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--dry-run`` surveys rows, so it must not construct the machinery of a run.
+
+    Building the pipeline constructs a chunker, an embedder and a pool of parse worker
+    subprocesses, and then **refuses outright** if the index's recorded fingerprints disagree
+    with any of them. Both halves are wrong for a plan: an operator surveying an installation
+    that will not ingest is exactly the operator who needs to see what is stale, and none of it
+    is used by a pass that parses nothing.
+
+    Asserted by making ``pipeline`` fail rather than by timing it, because a construction that
+    happens to be fast today is still a construction — and this file's own premise is that no
+    embedding model is loaded anywhere in it.
+    """
+
+    async def refuse() -> object:
+        pytest.fail("a dry run built the ingest pipeline")
+
+    monkeypatch.setattr(runtime, "pipeline", refuse)
+
+    report = await ApplicationService(runtime).document_reindex_stale(dry_run=True)
+
+    assert report.dry_run is True
+    assert report.selected == 0, "an empty index has nothing stale in it"
+    assert report.reparsed == 0
+
+
 async def test_resetting_an_empty_index_is_not_an_error(runtime: Runtime) -> None:
     """A reset has to be safe to run on an installation whose state nobody is sure of."""
     reset = await ApplicationService(runtime).reset_index()

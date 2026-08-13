@@ -670,9 +670,9 @@ Three properties of what is recorded:
 unchanged when its parser has moved, so the next sync re-parses exactly the documents that
 parser produced — *at both levels*, because a source whose version token has not moved never
 reaches the byte comparison, and a check placed only there would leave every well-behaved
-connector's corpus permanently stale. And `reindex --re-parse` selects the complement of the
-currently installed fingerprints, which closes the window between an upgrade and the next
-sync without touching the network. Existing rows are **not** backfilled: `NULL` means no
+connector's corpus permanently stale. And `manicule document reindex --stale` selects the
+complement of the currently installed fingerprints, which closes the window between an upgrade
+and the next sync without touching the network. Existing rows are **not** backfilled: `NULL` means no
 recorded lineage, which selects for repair, and writing today's versions into them would
 assert something nobody knows.
 
@@ -1149,14 +1149,10 @@ can price it:
   next time its connector reports it, because `IngestPipeline` compares the stored `parse_fp`
   against what that document's own parser would produce now and a mismatch stops it counting as
   unchanged. To close the window sooner, `manicule document reindex <id>` re-parses one document
-  from retained bytes and touches no network. A document whose bytes were never retained is
-  named with the reason rather than failing the run, and needs a forced re-sync; it is the only
-  case that does.
-
-  **There is no corpus-wide command for it today.** `select(parse_fingerprints=…)` and
-  `re_parse` compose into exactly the sweep §3.0 describes, and nothing in `cli/` or `api/`
-  calls the pair — the only surface is the per-document verb above. §3.0's sentence about
-  `reindex --re-parse` describes the intended verb rather than a shipped one.
+  from retained bytes and touches no network, and `manicule document reindex --stale` does the
+  same for every document a bump left behind (`ingest.md` §10.1). A document whose bytes were
+  never retained is named with the reason rather than failing the run, and needs a forced
+  re-sync; it is the only case that does.
 
 Four things a parser must **not** promote to a paragraph boundary while obeying this:
 

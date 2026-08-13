@@ -414,7 +414,7 @@ class IngestPipeline:
         """Everything from fetched bytes onwards, including anything found inside.
 
         The path shared by a connector sync, a member of a container, and
-        ``reindex --re-parse`` reading retained bytes. One implementation, so a re-parse cannot
+        a corpus-wide re-parse reading retained bytes. One implementation, so a re-parse cannot
         drift into producing something a first ingest would not have produced.
 
         **Members are queued, never recursed into.** A parser expands one level and this drains

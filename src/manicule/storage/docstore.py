@@ -410,6 +410,7 @@ class SqliteDocStore(
         chunk_fp_other_than: str | None = None,
         parse_fp_current: Collection[str] | None = None,
         limit: int | None = None,
+        offset: int = 0,
     ) -> Sequence[Document]:
         """The selection a repair verb runs over. A query, never a scan.
 
@@ -428,6 +429,11 @@ class SqliteDocStore(
         parse lineage", while an empty set means "nothing is current", which selects every
         document. Both are reachable — the second from an installation with no parsers
         configured — so they are kept distinct rather than collapsed by a falsy test.
+
+        ``offset`` pages through the selection, and the ``ORDER BY`` above is what makes that
+        mean anything: ``created_at`` alone is not unique, so two documents written in the same
+        millisecond could swap places between pages and one of them would never be returned.
+        The id breaks the tie, so the order is total and stable across calls.
         """
         statement = (
             select(models.Document)
@@ -455,6 +461,8 @@ class SqliteDocStore(
             )
         if limit is not None:
             statement = statement.limit(limit)
+        if offset:
+            statement = statement.offset(offset)
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
             return [to_document(row) for row in rows]
