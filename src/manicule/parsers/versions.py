@@ -53,10 +53,28 @@ class ParserVersions:
     rules: str
     """The version of manicule's own extraction rules for this parser.
 
-    Bumped by hand when this repository changes which blocks a parser emits or what its
-    anchors address. It exists because a dependency map alone would leave manicule's own
-    changes — the ones a maintainer makes deliberately — as the only thing nothing records.
-    ``docs/parsing.md`` §3.2 already does this for one case under the name ``web-blocks/1``.
+    Bumped by hand when this repository changes which blocks a parser emits, what their
+    metadata says about how they are to be chunked, or what their anchors address. It exists
+    because a dependency map alone would leave manicule's own changes — the ones a maintainer
+    makes deliberately — as the only thing nothing records. ``docs/parsing.md`` §3.2 already
+    does this for one case under the name ``web-blocks/1``.
+
+    **The middle clause is not padding; it was added because leaving it out let a bump through
+    uncounted.** #109 taught four parsers to emit ``rows``, and a table block's ``rows`` is what
+    :meth:`~manicule.chunking.chunker.StructuralChunker._split_table` divides an oversized table
+    at. Measured across the built corpus, that commit moved no block's ``text``, no block's
+    anchor and no block's ``heading_path`` — so on the two clauses this sentence used to have,
+    nothing had changed and no bump was warranted. What it moved was how the same text is *cut*:
+    on a 300-row table, four to five rows had been severed mid-cell at a chunk boundary and no
+    longer were.
+
+    Neither fingerprint caught that. ``ChunkFingerprint`` did not move because the chunker's own
+    code was untouched — only its input was — and ``ParseFingerprint`` did not move because
+    nobody bumped it. The corpus was left holding two generations of *chunks* behind lineage
+    claiming to be current, which is this module's opening paragraph one stage along. A
+    ``rules`` bump is the only instrument that reaches it: blocks are not persisted, so no
+    chunk-level repair can recover a row boundary that was never recorded, and only ``re_parse``
+    reads the retained bytes again.
     """
 
     distributions: tuple[str, ...] = ()
@@ -69,7 +87,13 @@ class ParserVersions:
 
 
 PARSERS: Final[dict[str, ParserVersions]] = {
-    "adf": ParserVersions(rules="1"),
+    # 1 -> 2: table blocks carry `rows`, so an oversized table is split at its row boundaries
+    # with the header repeated into every part instead of wherever the token budget landed. The
+    # text is byte-identical — this parser already joined the same rendered rows with `\n` — and
+    # `_table`'s docstring had promised the header-repeating split since before it emitted
+    # anything `_split_table` could use. See the shared note under `markdown` below for the
+    # measurement and for why `email` does not move with these four.
+    "adf": ParserVersions(rules="2"),
     "archive": ParserVersions(rules="1"),
     # Started at 1 rather than inheriting `html`'s 2. A version is a statement about one
     # parser's own output, and these are different parsers: the documents this reads were
@@ -93,7 +117,13 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # not contain. Every storage document with a break in prose gains a newline, and every one
     # with a break in a heading, a table cell, a list item or a task body gains the space that
     # was missing between the fragments either side of it.
-    "confluence": ParserVersions(rules="3", distributions=("selectolax",)),
+    #
+    # 3 -> 4: table blocks carry `rows`. `_table_text` became `_table_rows` with the
+    # `"\n".join(...)` moved to its caller, so the text every storage document produces is
+    # byte-identical and only the metadata beside it is new — but that metadata is what
+    # `_split_table` divides an oversized table at, so a stored table stops being cut mid-row.
+    # See the shared note under `markdown` below.
+    "confluence": ParserVersions(rules="4", distributions=("selectolax",)),
     "docx": ParserVersions(rules="1", distributions=("python-docx", "lxml")),
     # 1 -> 2: an HTML-only mail body's line numbers address the text
     # `mail._html_to_text` builds from the web parser's blocks, and the web parser now
@@ -119,8 +149,39 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # with a blank line — and that rule is unchanged. It sits in `ChunkFingerprint.version`,
     # where a bump refuses ingest against the whole corpus; a change to what one parser extracts
     # is what `parse_fp` is for, which is the division the 1 -> 2 pair above already drew.
-    "html": ParserVersions(rules="3", distributions=("selectolax",)),
-    "markdown": ParserVersions(rules="1", distributions=("markdown-it-py",)),
+    #
+    # 3 -> 4: table blocks carry `rows`, by the same edit and for the same reason as
+    # `confluence`'s 3 -> 4 above — `_table_text` became `_table_rows` and the join moved to the
+    # caller. `email` is deliberately **not** bumped with it, which is the reverse of the 1 -> 2
+    # and 2 -> 3 pairs above: those moved the *text* an HTML-only body's `LineAnchor`s address,
+    # and this does not. `mail._html_to_text` joins the blocks' `text` and never reads their
+    # metadata, and an HTML-only body carrying a 300-row table parses to byte-identical blocks
+    # and byte-identical anchors across this change — run, not inferred.
+    "html": ParserVersions(rules="4", distributions=("selectolax",)),
+    # 1 -> 2: two changes from #109, and the second is the one that is easy to miss.
+    #
+    # Table blocks carry `rows`, as for the three parsers above. **And `header_rows` changed
+    # meaning**: it counts source lines rather than `tr_open` tokens, so the `| --- | --- |`
+    # delimiter travels with the header it delimits and an ordinary single-header table reports
+    # 2 where it used to report 1. That is a changed value under an unchanged key, which no
+    # reader of a diff of `PARSERS` would infer and no test outside the markdown suite would
+    # catch.
+    #
+    # **What the four bumps cost is the shape `docs/parsing.md` §4.5 prices**; what is specific
+    # to them is what moved and how it was established. Every one of the four was measured by
+    # parsing the built corpus at 41682bb^ and at 41682bb and diffing block by block: 647 blocks
+    # over 49 documents, **0 whose text moved, 0 whose anchor moved, 0 whose heading_path
+    # moved**, and 20 metadata fields that did — `rows` on 16 blocks and `header_rows` on 4
+    # markdown blocks. So the case for these bumps is not that extraction changed; it is that
+    # chunking did, and chunking is downstream of metadata nothing else records. On a 300-row
+    # glossary table the rows severed across a chunk boundary go 4 -> 0 for adf, confluence and
+    # html and 5 -> 0 for markdown, the fragments being exactly the shape #109 described:
+    # `'T063 | Term 63 '` ending one chunk and `'Expansion Words Here'` beginning the next.
+    #
+    # The corpus itself shows no difference at all — it holds no table over the chunk budget, so
+    # `_split_table` is never reached in it. That is why this was invisible, and it is not
+    # evidence that nothing changed.
+    "markdown": ParserVersions(rules="2", distributions=("markdown-it-py",)),
     "notebook": ParserVersions(rules="1", distributions=("nbformat",)),
     "pdf": ParserVersions(rules="1", distributions=("pypdfium2",)),
     "plaintext": ParserVersions(rules="1"),
