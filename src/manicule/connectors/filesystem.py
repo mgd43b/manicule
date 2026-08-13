@@ -527,17 +527,36 @@ class FilesystemConnector:
             )
             metadata = sidecar.with_provenance(metadata, record)
         title = record.source.title if record.source is not None else adapted.page.source.title
+        adaptation: Metadata = {
+            "outcome": AdapterOutcome.ADAPTED.value,
+            "profile": adapted.profile.name,
+            "adapter_version": ADAPTER_VERSION,
+            "representation": adapted.representation,
+            "snapshot_path": _relative(path, root=self._root),
+            "snapshot_checksum": adapted.snapshot_checksum,
+            "body_checksum": adapted.body_checksum,
+        }
+        if not sidecar.declared_identity(path):
+            # Adapted, cited correctly, and keyed on where it sits — because identity has to be
+            # known at discovery and discovery does not read documents. Stated on the document
+            # rather than left to be discovered when the page is moved and the corpus has two of
+            # it, and it names the step that applies the identity rather than describing the gap.
+            adaptation["outcome"] = AdapterOutcome.IDENTITY_NOT_APPLIED.value
+            adaptation["reason"] = (
+                f"this page declares source_id {adapted.page.source.source_id!r} and is indexed "
+                f"under its path, because a document's identity has to be known before it is "
+                f"fetched and discovery does not read files. Everything else about it is "
+                f"correct — it is parsed as storage format and cited by its own title and "
+                f"address — but moving or renaming it will create a second document. Run "
+                f"`manicule connector sidecar {self._root}` to write the manifest that applies "
+                f"the declared identity, then sync. The page is then indexed under its page id "
+                f"and this path-keyed copy is superseded; `manicule doctor` names it so it can "
+                f"be removed."
+            )
         return {
             **metadata,
             **({"title": title} if title else {}),
-            ENRICHED_KEY: {
-                "profile": adapted.profile.name,
-                "adapter_version": ADAPTER_VERSION,
-                "representation": adapted.representation,
-                "snapshot_path": _relative(path, root=self._root),
-                "snapshot_checksum": adapted.snapshot_checksum,
-                "body_checksum": adapted.body_checksum,
-            },
+            ENRICHED_KEY: adaptation,
         }
 
     def _adapter_for(self, path: Path) -> str:

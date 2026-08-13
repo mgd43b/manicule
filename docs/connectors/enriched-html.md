@@ -51,9 +51,28 @@ exporter's navigation, any scripts — reaches no chunk.
 What the sidecar adds is **identity**. Discovery has to know what a document is called before it
 fetches anything, and discovery does not read files: that is what makes a re-sync of an unchanged
 corpus cost a `stat` per file rather than a full read. The manifest is the one thing beside a page
-small enough to read on every walk, so it is where the page id has to be written down. A page
-without one is still adapted, still parsed as storage format and still cited by its own title and
-URL — it is simply keyed on where it sits, so moving it creates a second document.
+small enough to read on every walk, so it is where the page id has to be written down.
+
+**A page without one is adapted anyway, and it says what it is missing.** It is parsed as storage
+format and cited by its own title and URL — but it is keyed on where it sits, so
+[§3's](#5-identity-moved-off-the-path-and-that-is-a-migration) *moving the snapshot file must not
+create a second document* does **not** hold for it: move it and you get two. That is not left to
+be discovered. The document carries `enriched_adaptation.outcome = "identity_not_applied"` with a
+reason naming the page id it declares, the consequence, and the command:
+
+```json
+{
+  "outcome": "identity_not_applied",
+  "reason": "this page declares source_id '1002' and is indexed under its path, because a
+             document's identity has to be known before it is fetched and discovery does not
+             read files. … moving or renaming it will create a second document. Run
+             `manicule connector sidecar /path/to/pages` to write the manifest that applies the
+             declared identity, then sync."
+}
+```
+
+Once the manifest is there the outcome is `adapted` and the reason is gone — the notice clears
+itself rather than sitting on every page for ever.
 
 ## 1a. Configuring another exporter's markers
 
@@ -203,9 +222,21 @@ declares, where one does. The reason is that a mirror reorganised from by-space 
 created new pages — but a connector keyed on the path reports every document deleted and every
 document new, and the curated collections and tags hanging off the old rows go with them.
 
-**Documents ingested before this keep their old identity until the next sync, and the next sync
-moves them.** `manicule doctor` emits a `document-identity` check that says so first. It reports,
-per document:
+**Documents ingested before this are re-keyed in place** by revision `b2e6d0c94a17`, which runs
+when the database migrates — before the first read, so no command applies it. The re-key is an
+`UPDATE`, never an insert-and-delete: `documents.id` is the parent of five `ON DELETE CASCADE`
+foreign keys, so replacing the row would fire every one of them and destroy the chunks, versions,
+glossary entries, **collection membership and tags** the migration exists to preserve. Those
+travel with the document instead. The previous identity is recorded under
+`metadata.previous_identity`, which is what makes the downgrade exact rather than a re-derivation.
+
+Two things it deliberately does not do. It **deletes nothing**, and it **touches nothing it
+cannot re-key** — a document whose provenance yields no page id is left exactly as it was, and one
+whose declared identity is already held by another document is left alone too, because moving onto
+an occupied primary key overwrites a row nothing can restore.
+
+`manicule doctor`'s `document-identity` check reports what is left after that: the collisions.
+It clears itself once a person resolves them. It reports, per document:
 
 | | |
 |---|---|
@@ -214,14 +245,19 @@ per document:
 | old and new `document_id` | derived, so the mapping is exact rather than described |
 | chunks and vectors reusable | **no** |
 | citations change | title and URL keep, the chunk named changes |
-| recommended command | `manicule document list --source <name>` |
+| recommended command | `manicule document list --source <name>`, then `manicule document delete <id>` |
 
 The mapping is a fact already in the database — the old identity in a column, the new one in the
 record written by the same fetch — so unlike the connector-instance rename in #94 nothing here has
-to be guessed. **Chunks and vectors still cannot be carried across**, and for two reasons rather
-than one: `chunk_id` derives from `document_id`, so every chunk id moves; and the documents whose
-identity moves are precisely the documents whose *text* changes, because their body now reaches the
-storage parser instead of the HTML parser. Re-embedding is unavoidable either way.
+to be guessed, which is why this ships a migration and that did not.
+
+**Chunks and vectors are not carried across**, for two reasons rather than one: `chunk_id` derives
+from `document_id`, so every chunk id moves; and the documents whose identity moves are precisely
+the documents whose *text* changes, because their body now reaches the storage parser instead of
+the HTML parser. Re-embedding is unavoidable either way, so the migration leaves the old chunks in
+place — they are stale text, and the next sync replaces them, which is a better intermediate state
+than removing content before its replacement exists. `chunks.id` does not move, so the vectors
+keyed on it stay valid throughout.
 
 Two files declaring one page id are **both** returned to their paths, and the conflict is reported.
 Not the second only: `documents` is `UNIQUE` on `(workspace_id, source, source_id)`, so honouring

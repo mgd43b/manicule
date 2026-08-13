@@ -46,7 +46,7 @@ from manicule.config.settings import (
     config_file,
     looks_secret,
 )
-from manicule.connectors.enriched import ENRICHED_KEY
+from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome
 from manicule.core.content import DocumentStatus
 from manicule.core.errors import ConfigError, ManiculeError, PolicyError, UnknownEntityError
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
@@ -154,6 +154,42 @@ class AskAside:
     It is filled after ``message_id`` is known, so a streamed answer carries the id it was
     persisted under exactly as the non-streaming form does.
     """
+
+
+def _identity_deliberately_unapplied(document: Document, *, claimed: set[str]) -> bool:
+    """Whether this document is path-keyed on purpose rather than being one of two for one page.
+
+    An enriched page with no manifest beside it is adapted, cited by its own page id, and keyed on
+    its path **deliberately** — identity has to be known at discovery and discovery reads the
+    manifest, not the document. It carries its own notice naming the page id and the command that
+    applies it, so reporting it here as well would be one finding twice with two remedies, and the
+    one this check gives is the wrong advice for it.
+
+    **Unless the identity it declares is already held by another document**, and that exception is
+    the whole reason this takes ``claimed``. Following the notice — generate the manifest, sync —
+    creates the page-keyed document and leaves the path-keyed one behind, because the connector
+    stops discovering it under the path it was stored by. Excluding it unconditionally meant the
+    tool instructed an action that produces an orphan and then said nothing about it. Two rows for
+    one page is exactly what this check is for, however they came to exist.
+
+    Both halves were found by running a real ingest and reading what ``doctor`` said afterwards:
+    first that "the manifest beside each one declares an identity" about a page with no manifest,
+    then nothing at all about a corpus holding the same page twice.
+    """
+    record = document.metadata.get(ENRICHED_KEY)
+    unapplied = (
+        isinstance(record, dict)
+        and record.get("outcome") == AdapterOutcome.IDENTITY_NOT_APPLIED.value
+    )
+    return unapplied and _declared(document) not in claimed
+
+
+def _declared(document: Document) -> str:
+    """The source identity this document's provenance record states, or ``""``."""
+    record = document.provenance
+    if record is None or record.source is None:
+        return ""
+    return record.source.source_id
 
 
 _IDENTITY_SCAN = 10_000
@@ -1231,13 +1267,15 @@ class ApplicationService:
                 detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
                 facts={"error_type": type(exc).__name__},
             )
+        # What identities are actually in use, so that a page-keyed document is recognised as the
+        # twin of the path-keyed one beside it rather than as an unrelated row.
+        claimed = {document.source_id for document in documents}
         moving = [
             document
             for document in documents
-            if (record := document.provenance) is not None
-            and record.source is not None
-            and record.source.source_id
-            and record.source.source_id != document.source_id
+            if (declared := _declared(document))
+            and declared != document.source_id
+            and not _identity_deliberately_unapplied(document, claimed=claimed)
         ]
         if not moving:
             return r.Check(
@@ -1261,20 +1299,21 @@ class ApplicationService:
             name="document-identity",
             state="degraded",
             detail=(
-                f"{len(moving)} document(s) are keyed on their file's path while the manifest "
-                f"beside each one declares an identity of its own — {first.source_id!r} declares "
-                f"{first.provenance.source.source_id!r}. "  # pyright: ignore[reportOptionalMemberAccess]
-                f"The next sync will index them again under ids derived from the declared "
-                f"identity and leave the existing rows behind, so the corpus will appear to have "
-                f"doubled and nothing will report an error. Their chunks and vectors cannot be "
-                f"carried across: the chunk ids derive from the document id, and an enriched "
-                f"export's text changes anyway now that its body reaches the storage parser. "
-                f"Citations keep their title and URL and change the chunk they name. Inspect "
-                f"them with `manicule document list --source {first.source}`, and remove each "
-                f"old row with `manicule document delete <id>` before or after re-syncing. "
-                f"Collection membership and tags do not survive, because the new row is a "
-                f"different document. There is no bulk reconciliation for this and none is "
-                f"implied."
+                f"{len(moving)} document(s) are still keyed on their file's path while the "
+                f"manifest beside each one declares an identity of its own — {first.source_id!r} "
+                f"declares {first.provenance.source.source_id!r}. "  # pyright: ignore[reportOptionalMemberAccess]
+                f"Documents ingested before the identity change are re-keyed in place when this "
+                f"database migrates, taking their chunks, versions, glossary entries, collection "
+                f"membership and tags with them. These were left alone because their declared "
+                f"identity is already held by another document, and moving onto an occupied key "
+                f"would overwrite a row nothing can restore. Two pages are claiming to be one "
+                f"page, so the second will never update: every sync re-indexes it under its path "
+                f"while the first keeps the identity. Nothing is lost meanwhile — both are "
+                f"indexed, searchable and correctly cited. Compare them with "
+                f"`manicule document list --source {first.source}`, remove whichever is the "
+                f"stale copy with `manicule document delete <id>`, or correct the manifest that "
+                f"declares the wrong page id and sync again. There is no bulk remedy for this "
+                f"and none is implied."
             ),
             facts=cast(
                 "dict[str, JsonValue]",

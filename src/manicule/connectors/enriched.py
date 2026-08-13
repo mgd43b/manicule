@@ -285,6 +285,23 @@ class AdapterOutcome(StrEnum):
     MISSING_BODY = "missing_body"
     AMBIGUOUS = "ambiguous"
     DUPLICATE_IDENTITY = "duplicate_identity"
+    IDENTITY_NOT_APPLIED = "identity_not_applied"
+    """The page states an identity of its own and the document is keyed on its path anyway.
+
+    **A stated trade rather than a silent partial**, and it is the one outcome here that reports
+    something *working* while naming what it is not doing. The page is adapted, parsed as storage
+    format and cited by its own title and address — everything §5 asks for. What it does not have
+    is an identity that survives being moved, because identity has to be known at discovery and
+    discovery does not read documents; see
+    :class:`~manicule.connectors.filesystem.FilesystemConnector`.
+
+    So §3's "moving or reorganising the snapshot file must not create a second document" does not
+    hold for this page, and a user who drops enriched HTML in a directory, moves it later and
+    finds two documents has to be able to learn why. A generic skip reason would not tell them:
+    it would say the file was fine, which it is, and leave the second document unexplained. The
+    reason names ``manicule connector sidecar`` because that is the step that applies it.
+    """
+
     ALREADY_PRESENT = "already_present"
     """A page that adapts cleanly and whose manifest was left alone.
 

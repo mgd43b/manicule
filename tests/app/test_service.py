@@ -1846,14 +1846,14 @@ def _declaring(backend: FakeBackend, declared: str, *, source_id: str) -> Docume
     )
 
 
-async def test_doctor_reports_the_old_and_new_identity_of_every_document_about_to_move(
+async def test_doctor_reports_the_old_and_new_identity_of_every_document_in_dispute(
     backend: FakeBackend,
 ) -> None:
-    """The dry run §10 asks for: both identities, reuse, citations, and a command.
+    """Both identities, reuse, citations, and a command — the report §10 asks for.
 
     Each field is asserted rather than the presence of the check, because the check existing is
-    not the requirement — a report that named the affected count and left an operator unable to
-    tell which row becomes which would be the same warning #98 gave, one release later.
+    not the requirement: a report that named the affected count and left an operator unable to
+    tell which row is which would be the same warning #98 gave, one release later.
     """
     backend.store.add(_declaring(backend, "1002", source_id="/corpus/pages/1002.html"))
 
@@ -1878,23 +1878,42 @@ async def test_doctor_reports_the_old_and_new_identity_of_every_document_about_t
     assert check.remedy == "manicule document list --source handbook"
 
 
-async def test_the_identity_check_says_why_chunks_cannot_be_carried_across(
-    backend: FakeBackend,
-) -> None:
-    """Two reasons, and naming only the first would imply re-keying was an option.
+async def test_the_identity_check_says_why_these_were_left_alone(backend: FakeBackend) -> None:
+    """A document still keyed on its path *after* the migration is the unresolvable case.
 
-    The ids move *and* the text changes, because the documents whose identity moves are the ones
-    whose body now reaches the storage parser. An operator told only about the ids would
-    reasonably ask why a migration cannot simply recompute them.
+    Migrations run before the first read, so by the time this check has a store to query the
+    automatic re-key has happened. What is left is what the migration deliberately refused: a
+    declared identity another document already holds, where moving would overwrite a row nothing
+    can restore. Saying "the next sync will move these" would describe a product that does not
+    exist, and would leave an operator waiting for a sync to fix something no sync can.
     """
     backend.store.add(_declaring(backend, "1002", source_id="/corpus/pages/1002.html"))
 
     detail = _check(await ApplicationService(backend).doctor(), "document-identity").detail
 
-    assert "chunk ids derive from the document id" in detail
-    assert "storage parser" in detail
-    assert "Collection membership and tags do not survive" in detail
-    assert "doubled" in detail
+    assert "re-keyed in place" in detail
+    assert "already held by another document" in detail
+    assert "overwrite a row nothing can restore" in detail
+    assert "will never update" in detail
+    assert "no bulk remedy" in detail
+
+
+async def test_the_identity_check_names_only_remedies_that_exist(backend: FakeBackend) -> None:
+    """``manicule upgrade`` must not be named here, and it is the obvious wrong answer.
+
+    It backs up and reports how to install a new version; it runs no migration. Naming it would
+    send an operator to a command that does not do what the sentence implied — the failure #98's
+    own check documents avoiding, and one I nearly shipped because "upgrade" sounds like the
+    thing that applies a schema change.
+    """
+    backend.store.add(_declaring(backend, "1002", source_id="/corpus/pages/1002.html"))
+
+    check = _check(await ApplicationService(backend).doctor(), "document-identity")
+
+    assert "manicule upgrade" not in check.detail
+    assert "manicule upgrade" not in check.remedy
+    assert check.remedy == "manicule document list --source handbook"
+    assert "manicule document delete" in check.detail
 
 
 async def test_the_identity_check_clears_once_the_documents_are_keyed_on_what_they_declare(
@@ -1958,3 +1977,80 @@ async def test_the_conversion_report_carries_a_count_per_outcome(
         AdapterOutcome.ALREADY_PRESENT.value: 1,
         AdapterOutcome.NO_PROFILE.value: 1,
     }, "a converted directory reported as though none of it were enriched"
+
+
+async def test_a_page_keyed_on_its_path_on_purpose_is_not_reported_as_a_dispute(
+    backend: FakeBackend,
+) -> None:
+    """Found by running a real ingest and reading what ``doctor`` said about it.
+
+    An enriched export with no manifest is adapted, cited by its own page id, and keyed on its
+    path **deliberately** — identity has to be known at discovery and discovery reads the manifest
+    rather than the document. The check reported it, and its message said "the manifest beside
+    each one declares an identity" about a page that has no manifest at all. Worse than the wrong
+    words: the remedy it offered — decide which page owns the identity — is advice for a
+    collision, and this is not one.
+
+    It carries its own notice with its own remedy, so reporting it here as well would be one
+    finding twice with two answers, one of them wrong.
+    """
+    from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome  # noqa: PLC0415
+
+    deliberate = _declaring(backend, "1002", source_id="/corpus/pages/1002.html")
+    backend.store.add(
+        deliberate.model_copy(
+            update={
+                "metadata": {
+                    **deliberate.metadata,
+                    ENRICHED_KEY: {
+                        "outcome": AdapterOutcome.IDENTITY_NOT_APPLIED.value,
+                        "reason": "run `manicule connector sidecar /corpus`",
+                    },
+                }
+            }
+        )
+    )
+
+    check = _check(await ApplicationService(backend).doctor(), "document-identity")
+
+    assert check.state == "ok"
+    assert check.facts["affected"] == 0
+
+
+async def test_the_superseded_path_keyed_copy_is_reported_once_its_twin_exists(
+    backend: FakeBackend,
+) -> None:
+    """Following the notice creates the second row; something has to say so.
+
+    The ``identity_not_applied`` notice tells a user to generate the manifest and sync. Doing that
+    creates the page-keyed document and leaves the path-keyed one behind, because the connector
+    stops discovering it under the path it was stored by. Excluding every ``identity_not_applied``
+    row unconditionally meant the tool instructed an action that produces an orphan and then said
+    nothing about it — found by running exactly those two commands against a real index and
+    counting the documents afterwards.
+    """
+    from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome  # noqa: PLC0415
+
+    superseded = _declaring(backend, "1002", source_id="/corpus/pages/1002.html")
+    backend.store.add(
+        superseded.model_copy(
+            update={
+                "metadata": {
+                    **superseded.metadata,
+                    ENRICHED_KEY: {"outcome": AdapterOutcome.IDENTITY_NOT_APPLIED.value},
+                }
+            }
+        )
+    )
+    # The twin: the same page, now keyed on the identity it declares.
+    backend.store.add(_declaring(backend, "1002", source_id="1002"))
+
+    check = _check(await ApplicationService(backend).doctor(), "document-identity")
+
+    assert check.state == "degraded", "the corpus holds one page twice and nothing said so"
+    assert check.facts["affected"] == 1
+    moving = check.facts["documents"]
+    assert isinstance(moving, list)
+    assert isinstance(moving[0], dict)
+    assert moving[0]["old_source_id"] == "/corpus/pages/1002.html"
+    assert "manicule document delete" in check.detail

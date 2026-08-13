@@ -1402,3 +1402,50 @@ async def test_an_oversized_page_is_not_handed_to_an_html_engine_at_fetch(
     assert isinstance(refusal, dict)
     assert refusal["outcome"] == AdapterOutcome.FAILED.value
     assert "over the 256-byte limit" in str(refusal["reason"])
+
+
+async def test_a_page_whose_identity_is_available_but_not_applied_says_so(
+    tmp_path: Path,
+) -> None:
+    """The degraded state, stated on the document rather than left to be discovered.
+
+    This page is adapted, parsed as storage format and cited by its own title and address —
+    everything §5 asks for. What it does not have is an identity that survives being moved,
+    because identity has to be known at discovery and discovery does not read documents. §3's
+    "moving or reorganising the snapshot file must not create a second document" therefore does
+    *not* hold for it.
+
+    A generic skip reason would not tell anybody that: it would say the file was fine, which it
+    is, and leave the second document unexplained the day somebody reorganises the directory. The
+    outcome names the condition and the step that resolves it.
+    """
+    root = tmp_path / "corpus"
+    root.mkdir()
+    written(root)
+    store = await ingest(root)
+    stored = only(store)
+
+    assert stored.media_type == CONFLUENCE_MEDIA_TYPE, "the page was not adapted after all"
+    assert stored.uri == CANONICAL
+    record = stored.metadata[ENRICHED_KEY]
+    assert isinstance(record, dict)
+    assert record["outcome"] == AdapterOutcome.IDENTITY_NOT_APPLIED.value
+    reason = str(record["reason"])
+    assert "'1002'" in reason, "the identity the page states is not named"
+    assert "manicule connector sidecar" in reason, "the step that applies it is not named"
+    assert "second document" in reason, "the consequence of leaving it is not named"
+
+
+async def test_a_page_whose_identity_is_applied_says_that_instead(tmp_path: Path) -> None:
+    """The other half: the outcome is not a permanent label on every adapted page.
+
+    Without this the previous test passes on an implementation that never clears the notice, and
+    a converted corpus would carry a warning about a condition it no longer has — which is how a
+    diagnostic stops being read.
+    """
+    store = await ingest(await _corpus(tmp_path))
+    record = only(store).metadata[ENRICHED_KEY]
+
+    assert isinstance(record, dict)
+    assert record["outcome"] == AdapterOutcome.ADAPTED.value
+    assert "reason" not in record
