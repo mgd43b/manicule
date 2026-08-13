@@ -1374,3 +1374,31 @@ async def test_an_external_stylesheet_or_image_is_never_loaded(
 
     assert only(store).media_type == CONFLUENCE_MEDIA_TYPE
     assert not any("evil.example.test" in text for text in texts(store))
+
+
+async def test_an_oversized_page_is_not_handed_to_an_html_engine_at_fetch(
+    tmp_path: Path,
+) -> None:
+    """The bound the conversion had and the ingestion path did not.
+
+    ``write_sidecars`` reads through ``MAX_HTML_BYTES``; ``fetch`` did not, so a pathological
+    ``.html`` was handed whole to lexbor — a parse that did not happen before this feature
+    existed, on top of the one the web parser was going to do anyway. Found re-reading the diff
+    against the specification's "bound input size", not by anything failing.
+
+    Over the limit the file is what it always was: an ordinary HTML document, indexed as one.
+    """
+    root = tmp_path / "corpus"
+    root.mkdir()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("manicule.connectors.filesystem.MAX_HTML_BYTES", 256)
+        written(root)
+        assert (root / "pages" / "1002.html").stat().st_size > 256
+        store = await ingest(root)
+
+    stored = only(store)
+    assert stored.media_type == "text/html", "an oversized page was parsed as storage format"
+    refusal = stored.metadata[ENRICHED_KEY]
+    assert isinstance(refusal, dict)
+    assert refusal["outcome"] == AdapterOutcome.FAILED.value
+    assert "over the 256-byte limit" in str(refusal["reason"])

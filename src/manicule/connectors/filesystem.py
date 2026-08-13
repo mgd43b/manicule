@@ -67,6 +67,7 @@ from manicule.connectors.enriched import (
     ADAPTER_VERSION,
     DEFAULT_PROFILE,
     ENRICHED_KEY,
+    MAX_HTML_BYTES,
     Adaptation,
     AdapterOutcome,
     EnrichedProfile,
@@ -462,12 +463,30 @@ class FilesystemConnector:
         could not be read as one", which is worth recording on the document, because the
         difference between those two is the whole of whether an operator has a problem.
 
+        **The input is bounded here as well as in the conversion**, and the omission was real
+        rather than theoretical. ``write_sidecars`` reads through :data:`~.enriched.MAX_HTML_BYTES`
+        and this path did not, so a pathological ``.html`` in a corpus was handed whole to an HTML
+        engine — a parse that did not happen before this feature existed, on top of the one the
+        web parser was already going to do. ``fetch`` reading the file unbounded is older than
+        this branch and is capped downstream by ``ingest.max_fetch_bytes``; what is new is the
+        *parse*, so the parse is what this refuses. Over the limit the file falls through to
+        ordinary HTML ingestion, exactly as it did before, with the reason recorded.
+
         A refusal does not fail the document. The enriched wrapper is a perfectly good HTML file
         and is indexed as one, exactly as it was before this existed — with the reason attached
         rather than a partial success nobody can see.
         """
         if not self._profiles or not _adaptable(path):
             return None
+        if len(content) > MAX_HTML_BYTES:
+            return _Refused(
+                outcome=AdapterOutcome.FAILED.value,
+                reason=(
+                    f"is {len(content)} bytes, over the {MAX_HTML_BYTES}-byte limit for reading a "
+                    f"page as an enriched export. It is indexed as ordinary HTML instead; raise "
+                    f"the limit or split the export if it is meant to be one page"
+                ),
+            )
         try:
             return adapt(content.decode("utf-8", errors="replace"), profiles=self._profiles)
         except UnusablePageError as refusal:
