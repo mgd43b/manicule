@@ -1917,3 +1917,44 @@ async def test_the_identity_check_ignores_documents_with_nothing_to_declare(
     backend.store.add(make_document(backend.workspace, source="handbook", source_id="notes.md"))
 
     assert _check(await ApplicationService(backend).doctor(), "document-identity").state == "ok"
+
+
+async def test_the_conversion_report_carries_a_count_per_outcome(
+    backend: FakeBackend, tmp_path: Path
+) -> None:
+    """``--json`` has to answer "what kind of nothing" without parsing a sentence.
+
+    ``considered`` and ``written`` alone are equally the shape of a wrong directory, an exporter
+    this does not recognise, and a corpus already converted — and which of the three it is decides
+    the operator's next move entirely. The counters sum to ``considered``, so no file falls
+    through the report.
+    """
+    from manicule.connectors.enriched import AdapterOutcome  # noqa: PLC0415
+
+    pages = tmp_path / "pages"
+    pages.mkdir()
+    (pages / "plain.html").write_text("<html><body>hi</body></html>", encoding="utf-8")
+    (pages / "1002.html").write_text(
+        "<!doctype html><html><head><title>T</title></head><body>"
+        "<section data-source-metadata><p><strong>Page ID:</strong> 1002</p></section>"
+        '<main data-document-representation="storage"><h1>T</h1><p>Body.</p></main>'
+        "</body></html>",
+        encoding="utf-8",
+    )
+
+    report = await ApplicationService(backend).connector_sidecar(tmp_path)
+
+    assert report.considered == 2
+    assert report.written == 1
+    assert report.by_outcome == {
+        AdapterOutcome.ADAPTED.value: 1,
+        AdapterOutcome.NO_PROFILE.value: 1,
+    }
+    assert sum(report.by_outcome.values()) == report.considered
+    assert [skip.outcome for skip in report.skipped] == [AdapterOutcome.NO_PROFILE.value]
+
+    again = await ApplicationService(backend).connector_sidecar(tmp_path)
+    assert again.by_outcome == {
+        AdapterOutcome.ALREADY_PRESENT.value: 1,
+        AdapterOutcome.NO_PROFILE.value: 1,
+    }, "a converted directory reported as though none of it were enriched"

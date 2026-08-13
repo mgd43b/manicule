@@ -18,9 +18,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import socket
+from pathlib import Path
 from typing import TYPE_CHECKING, override
 
 import pytest
+from pydantic import ValidationError
 
 from manicule.connectors import sidecar
 from manicule.connectors.enriched import (
@@ -52,7 +54,6 @@ from tests.ingest import fakes
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-    from pathlib import Path
 
     from manicule.core.content import Document, ParsedBlock
 
@@ -1073,3 +1074,240 @@ async def test_an_ordinary_documents_citation_still_reports_its_content_hash(
     assert ENRICHED_KEY not in stored.metadata
     assert reference.snapshot_checksum == stored.content_hash
     assert reference.snapshot_checksum == content_hash(target.read_bytes())
+
+
+# --- what a profile may say -------------------------------------------------------------------
+#
+# Found by disabling each guard and watching what went red: these three fired nothing, because
+# they had been checked by hand at a prompt and never written down. They are the whole of "a
+# profile, never a heuristic", so a configuration that defeated any of them would defeat the
+# argument this module is built on while every test still passed.
+
+
+@pytest.mark.parametrize(
+    "selector",
+    ["main", "section", "div.storage", "", "[a=]", "main > [data-x]"],
+    ids=[
+        "an element",
+        "another element",
+        "an element and a class",
+        "empty",
+        "no value",
+        "a combinator",
+    ],
+)
+def test_a_selector_that_is_not_an_attribute_selector_is_refused(selector: str) -> None:
+    """An element name would make an ordinary ``<main>`` a storage body on every page.
+
+    The failure would be a page's navigation indexed as its body, on a corpus where it happened to
+    be the only ``<main>`` — silently, and correctly as far as any test here could tell. Refused at
+    configuration load rather than at the first sync, so the message names the setting.
+    """
+    with pytest.raises(ValidationError, match="does not select on an attribute"):
+        EnrichedProfile(name="x", body_selector=selector)
+    with pytest.raises(ValidationError, match="does not select on an attribute"):
+        EnrichedProfile(name="x", metadata_selector=selector)
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "[data-source-metadata]",
+        'main[data-document-representation="storage"]',
+        "[data-acme-page='1']",
+        "*[data-x]",
+        '[data-format~="storage"]',
+    ],
+    ids=["bare", "qualified", "single quotes", "wildcard", "a word test"],
+)
+def test_the_spellings_a_real_exporter_uses_are_accepted(selector: str) -> None:
+    """The other half, and it is not decoration.
+
+    A rule tested only on what it refuses is one nobody has shown is usable, and the failure mode
+    of a too-strict selector check is a site that cannot configure its own exporter at all.
+    """
+    assert EnrichedProfile(name="x", body_selector=selector).body_selector == selector
+
+
+def test_a_representation_outside_the_allowlist_is_refused() -> None:
+    """A profile's representation decides which parser untrusted extracted markup reaches.
+
+    ``text/html`` is the interesting refusal rather than a nonsense string: it is a real media
+    type with a real parser behind it, and accepting it would let a configuration file hand an
+    extracted body to the generic HTML parser — which is the defect this whole change removes,
+    reintroduced through a setting. A misspelling is the other half: it would route to no parser
+    at all while the configuration looked correct.
+    """
+    for representation in ("text/html", "application/xhtml+xml", "confluence-storage", ""):
+        with pytest.raises(ValidationError, match="which nothing here parses"):
+            EnrichedProfile(name="x", representation=representation)
+
+    assert EnrichedProfile(name="x", representation=CONFLUENCE_MEDIA_TYPE).representation == (
+        CONFLUENCE_MEDIA_TYPE
+    )
+
+
+def test_a_label_mapped_to_a_field_that_does_not_exist_is_refused() -> None:
+    """Ignoring it would make the alias silently do nothing, which looks like not writing one.
+
+    That is the failure ``sidecar`` refuses unknown manifest keys for, one layer along: the
+    overwhelmingly likely unknown field name is a misspelling of a known one, and an operator who
+    configures an alias and sees no change has no way to tell which of the two happened.
+    """
+    with pytest.raises(ValidationError, match="which name no field"):
+        EnrichedProfile(name="x", labels={"page id": "sourceid"})
+    with pytest.raises(ValidationError, match="which name no field"):
+        EnrichedProfile(name="x", labels={"page id": "source_id", "when": "edited_at"})
+
+    kept = EnrichedProfile(name="x", labels={"identifier": "source_id"})
+    assert kept.labels == {"identifier": "source_id"}
+
+
+def test_a_configured_profile_reaches_the_connector_that_was_built_from_it() -> None:
+    """Validation at load is worth nothing if the value never reaches the thing it configures.
+
+    ``[connectors.docs.options]`` reaching no connector is a defect this repository has had
+    before (#94), and it is invisible: the setting is accepted, the sync runs, and the corpus is
+    indexed under the default as though nothing had been written.
+    """
+    from manicule.connectors.config import FilesystemConfig  # noqa: PLC0415
+    from manicule.connectors.plugin import build_filesystem  # noqa: PLC0415
+    from manicule.plugins import BuildContext  # noqa: PLC0415
+
+    settings = FilesystemConfig(
+        root="/tmp",  # noqa: S108 - never opened; the connector resolves it and walks nothing
+        enriched_profiles=(
+            EnrichedProfile(
+                name="acme",
+                metadata_selector="[data-acme-page]",
+                body_selector='[data-acme-format="storage"]',
+            ),
+        ),
+    )
+    built = build_filesystem(
+        BuildContext(
+            settings=None,  # pyright: ignore[reportArgumentType] - unused on this path
+            config=settings,
+            data_dir=None,  # pyright: ignore[reportArgumentType] - unused on this path
+            cache_dir=None,  # pyright: ignore[reportArgumentType] - unused on this path
+            components=None,  # pyright: ignore[reportArgumentType] - unused on this path
+            instance="docs",
+        )
+    )
+
+    assert isinstance(built, FilesystemConnector)
+    assert built.name == "docs"
+    # Read through what the connector *does* rather than off an attribute, so this cannot pass on
+    # a connector that stored the profiles and consulted the default.
+    assert built.profiles == settings.enriched_profiles
+    with pytest.raises(UnusablePageError, match="matches no configured"):
+        adapt(page(), profiles=built.profiles)
+    assert (
+        adapt(
+            page(
+                metadata_attribute="data-acme-page",
+                body_attribute='data-acme-format="storage"',
+            ),
+            profiles=built.profiles,
+        ).profile.name
+        == "acme"
+    )
+
+
+async def test_an_interrupted_conversion_is_completed_by_running_it_again(
+    tmp_path: Path,
+) -> None:
+    """Resume is: run it again. There is no checkpoint file and nothing to corrupt.
+
+    The two-phase write makes this worth pinning rather than assuming. A run that dies partway
+    through the writing phase leaves some manifests on disk and some not, and the pages that got
+    one must not be re-derived or replaced — a second conversion that rewrote them would be a
+    conversion whose result depended on how many times it had been interrupted.
+    """
+    root = tmp_path / "corpus"
+    root.mkdir()
+    for name in ("1002.html", "2002.html"):
+        written(
+            root,
+            name,
+            page(rows_replacing("Page ID", name.removesuffix(".html"))),
+        )
+    survivor = sidecar.manifest_path_for(root / "pages" / "1002.html")
+
+    original = Path.write_text
+    written_paths: list[Path] = []
+
+    def die_after_the_first(self: Path, data: str, **kwargs: object) -> int:
+        if written_paths:
+            message = "the conversion was interrupted"
+            raise KeyboardInterrupt(message)
+        written_paths.append(self)
+        return original(self, data, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "write_text", die_after_the_first)
+        with pytest.raises(KeyboardInterrupt):
+            write_sidecars(root)
+
+    assert survivor.is_file(), "the manifest written before the interruption is gone"
+    before = survivor.read_text(encoding="utf-8")
+
+    outcomes = write_sidecars(root)
+
+    assert {outcome.path.name: outcome.outcome for outcome in outcomes} == {
+        "1002.html": AdapterOutcome.ALREADY_PRESENT,
+        "2002.html": AdapterOutcome.ADAPTED,
+    }
+    assert survivor.read_text(encoding="utf-8") == before, "a completed page was rewritten"
+    store = await ingest(root)
+    assert {document.source_id for document in store.documents.values()} == {"1002", "2002"}
+
+
+async def test_an_interrupted_sync_loses_nothing_and_finishes_when_it_is_run_again(
+    tmp_path: Path,
+) -> None:
+    """The other half of "run it again": an adapted page survives a sync that died mid-flight.
+
+    **This deliberately does not assert the watermark**, and the reason is worth recording. It
+    did, and the assertion held with the ``report.clean`` gate deleted — because a failure inside
+    the ingest loop stops the ``async for`` before ``discover`` reaches its own final statement,
+    so ``FilesystemConnector.watermark`` is ``None`` either way and the assertion was true for a
+    reason this test never established. That guarantee is the connector's and
+    :func:`~manicule.testing.assert_connector_contract` is where it is checked. What is checked
+    here is the part that belongs to *this* corpus: nothing is half-written, and the second run
+    completes.
+    """
+
+    class Interrupted(fakes.MemoryIngestStore):
+        """A store that fails once the run is under way, as a killed process would."""
+
+        failing = True
+
+        @override
+        async def upsert_document(self, document: Document) -> Document:
+            if self.failing:
+                message = "the store went away mid-sync"
+                raise RuntimeError(message)
+            return await super().upsert_document(document)
+
+    root = await _corpus(tmp_path)
+    # **One store across both runs**, which is the whole test. An earlier version asserted the
+    # watermark on a store the failing run had never touched, so it was checking that a fresh
+    # dictionary is empty — a test that could not have failed however the pipeline behaved.
+    store = Interrupted()
+
+    failed = await pipeline(store).run(FilesystemConnector(root, name="docs"))
+
+    assert failed.error, "the run did not fail, so this asserts nothing about an interrupted one"
+    assert failed.indexed == 0
+    assert store.documents == {}, "a half-written document survived the run that could not finish"
+
+    store.failing = False
+    resumed = await pipeline(store).run(FilesystemConnector(root, name="docs"))
+
+    assert resumed.clean
+    assert resumed.indexed == 1, "running it again is the whole of resume, and it did not resume"
+    stored = only(store)
+    assert stored.source_id == "1002"
+    assert stored.media_type == CONFLUENCE_MEDIA_TYPE
+    assert DOT in texts(store)

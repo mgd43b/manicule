@@ -314,6 +314,18 @@ class FilesystemConnector:
         return self._root
 
     @property
+    def profiles(self) -> tuple[EnrichedProfile, ...]:
+        """The enriched-document conventions this connector recognises, in precedence order.
+
+        Public for the same reason :attr:`root` is: it is part of what this source *is* rather
+        than an implementation detail, and "which profiles is this connector actually using" is
+        the first question when a page is not being adapted. A configured value that reached no
+        connector is a defect this repository has had before (#94) and one nothing observes from
+        outside unless it can be read back.
+        """
+        return self._profiles
+
+    @property
     def watermark(self) -> Watermark | None:
         """When the last **complete** walk finished.
 
