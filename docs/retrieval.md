@@ -1614,10 +1614,17 @@ likes *better* than the sentence it came from. **Truncation removes the very thi
 refusing the line.** So the cut has to be earned before it is made, never scored afterwards.
 
 Only one signal is strong enough to award it. `core_expansion` tries the whole right-hand side
-first and keeps it if its initials spell the term; otherwise it walks the description boundaries
-— comma, semicolon, end of sentence — and takes the first prefix whose initials spell the term.
-`Network Operations Visibility Assistant` spells NOVA and the description does not, and that
+first and keeps it if its initials spell the term; otherwise `_phrase_after` walks the description
+boundaries — comma, semicolon, end of sentence — and takes the first prefix whose initials spell
+it. `Network Operations Visibility Assistant` spells NOVA and the description does not, and that
 agreement between two strings is the only thing here that knows where a term ends.
+
+**This is one rule applied from both ends, not two mechanisms.** `_phrase_before` already resolves
+a parenthetical's *left* boundary the same way — `The Network Operations Workspace (NOW)` has no
+left delimiter, so it asks the acronym which suffix spells it. `_phrase_after` has no right
+delimiter and asks which prefix does. Shortest wins in both, for the same reason: the first span
+that spells the term is where the term stops, and a longer one that also spells it has swallowed
+the sentence around it. Read them together; change one and read the other.
 
 Where there is no initials evidence there is no cut. `HTTP — HyperText Transfer Protocol, used by
 every browser` keeps its description, exactly as it did before, because nothing in the text says
@@ -1641,20 +1648,52 @@ API  - when enabled, the process starts automatically.
 
 Nine words and six, so `MAX_EXPANSION_WORDS` never fired on either and nothing else looked.
 
-What refuses them is that an expansion is a **noun phrase** and neither of these begins one.
-`opens_a_clause` checks the first word against a short list of subordinators, pronouns and
-demonstratives — words that can only begin a clause, so a phrase starting with one is a statement
-*about* the term rather than the term written out. It is checked at the first word only, and it
-never overrides initials evidence: if a phrase's initials spell the term, the two strings agree
-about what the term is, which is stronger than anything one word can say.
+What refuses them is their **first word**. `has_a_refused_opening` compares it against
+`_NEVER_OPENS_AN_EXPANSION`, a short list of subordinators and of words that point rather than
+name. It never overrides initials evidence: if a phrase's initials spell the term, the two
+strings agree about what the term is, which is stronger than anything one word can say — which is
+why `ONCE — Operational Node Configuration Engine` and `WHEN — Workload Health Event Notifier`
+survive being their own counter-examples.
 
-Deliberately **not** a verb list as well. "Does this phrase contain a finite verb" is a question a
-parser answers and a word list only pretends to, and `WARNING — do not edit these records by
-hand.` is still admitted on a glossary page as a result. That is a known gap, measured and left
-rather than papered over with a list that would be wrong in the middle.
+**What the rule does not test, stated because an earlier draft of this section claimed it did.**
+It is not a test for a noun phrase, and the two lines above are not counter-examples to one:
+`this paragraph` *is* a noun phrase. What actually disqualifies both is the finite verb —
+`describes`, `starts` — and nothing here looks for a verb. Finding one is a parser's job, this
+module is deterministic by construction and has no parser to call, and a word list that pretended
+otherwise would be a rule whose justification is wider than its mechanism. The claim is therefore
+narrowed to what the list can support: these particular words do not begin expansions, one word
+at a time. Prose opening with an ordinary noun or an imperative verb — `WARNING — do not edit
+these records by hand.` — is admitted, and that is a known gap rather than an oversight.
+
+**Recall is measured as loudly as precision, because this rule fires exactly where the safety net
+is absent.** It only runs when initials evidence is missing, which is also where a large share of
+legitimate definitions live: `K8S — Kubernetes` spells nothing, nor does `CPU — central
+processor`. The measurement found the list refusing real definitions — `ITSM — IT service
+management` and `ITIL — IT infrastructure library`, because `IT` casefolds onto the pronoun `it`.
+That is why the first word is put through `acronym_shaped` before the list is consulted: the same
+gate that tells `NOW` from `Note` on the left of the dash tells `IT` from `it` on the right of it.
+Real definitions kept went from **24 of 26 to 26 of 26**, with prose refusal unchanged at 5 of 5.
 
 `Today - the system is operating normally.` never reaches any of this: one of five letters is
 upper case, so the shape gate refuses it.
+
+**Entries already written by the defect do not clear on their own.** Detection runs at ingest, and
+a re-sync of a document whose bytes have not changed is skipped before it reaches the detector —
+measured at both levels, including a source that issues a new version token for an unchanged body,
+which level 2 catches by content hash:
+
+```
+initial ingest: status=indexed entries=['NOW']
+after planting:  ['NOTE', 'NOW']
+re-sync same token:  skipped='hash' entries=['NOTE', 'NOW']
+re-sync new token:   skipped='hash' entries=['NOTE', 'NOW']
+forced (re_parse):   skipped=''     entries=['NOW']
+```
+
+A forced pass clears it, because `_store_definitions` replaces unconditionally including with an
+empty list. That is `manicule index <path> --reindex`, or `reindex.re_parse`, both of which pass
+`force=True` — an existing flag on an existing command, so there is no remediation path to build
+and none was built.
 
 ### 14.4 Scope is a correctness property
 
@@ -1798,7 +1837,8 @@ Calls made in the absence of a stated position.
 | `fast` cannot reach `high` confidence, by arithmetic and on purpose | §8.3 |
 | A degraded leg suppresses the agreement component rather than scoring it zero — confidence never blames the corpus for a pipeline fault | §8.2 |
 | A description is separated from an expansion only where initials evidence says where it begins; no evidence, no cut | §14.3.1 |
-| An expansion must be a noun phrase — a right-hand side opening a clause is refused, and a verb list is declined as a thing a word list cannot do | §14.3.2 |
+| Prose is refused on its first word against a closed list, with an abbreviation exemption; a verb list is declined as a thing a word list cannot do, and the gap it leaves is recorded | §14.3.2 |
+| Entries written by the old defect persist until a forced pass; no remediation path was built, because `--reindex` already is one | §14.3.2 |
 | An explicit definition is a named classification with no weight, not a confidence component; no weight is set until a corpus can calibrate one | §14.6.1 |
 | Router: full-match only, tuned for precision, no citations and absent confidence on a direct route | §9 |
 | L1 caches ranked ids, not content, so a hit cannot leak a deleted or foreign chunk | §10.1 |

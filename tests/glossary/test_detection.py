@@ -16,8 +16,10 @@ from manicule.ingest.glossary import (
     INITIALS_EVIDENCE,
     MIN_DEFINITION_CONFIDENCE,
     acronym_shaped,
+    core_expansion,
     detect_entries,
     detect_in_chunk,
+    has_a_refused_opening,
     initials_match,
     score_definition,
 )
@@ -269,13 +271,114 @@ def test_prose_on_a_glossary_page_is_still_refused(text: str) -> None:
     ones. Measured on ``origin/main``: ``NOTE`` produced the entry ``this paragraph describes an
     operational consideration, not a term`` (nine words) and ``API`` produced ``when enabled, the
     process starts automatically`` (six). Both sit under :data:`MAX_EXPANSION_WORDS`, so no length
-    rule ever looked at them. What refuses them now is that neither opens a noun phrase.
+    rule ever looked at them. What refuses them now is their first word — see
+    ``test_a_real_definition_is_not_refused_for_the_word_it_opens_with`` for the other direction,
+    which is the one that constrains how long the word list may get.
 
     ``Today`` is the weakest of the three and is refused by :func:`acronym_shaped` — one of five
     letters upper — as it was before. It is kept because the specification names it, and it must
     not be read as evidence for the rule the other two exercise.
     """
     assert detect_in_chunk(chunk(text)) == []
+
+
+REAL_DEFINITIONS_WITHOUT_INITIALS: list[tuple[str, str]] = [
+    ("K8S", "Kubernetes"),
+    ("CPU", "central processor"),
+    ("ID", "identifier"),
+    ("DB", "database"),
+    ("FAQ", "frequently asked questions list"),
+    ("HTTP", "HyperText Transfer Protocol"),
+    ("IOU", "I owe you"),
+    # The two that were measured being refused. `IT` casefolds to the pronoun `it`, and without
+    # the abbreviation exemption in `has_a_refused_opening` both of these were silently lost.
+    ("ITSM", "IT service management"),
+    ("ITIL", "IT infrastructure library"),
+]
+"""Ordinary definitions whose initials do **not** spell their terms.
+
+This is the population the word list can hurt, and it is the only one that can constrain how
+long the list is allowed to get. Every other fixture in this module is a false positive; a rule
+measured only against those can be made perfect by refusing everything.
+"""
+
+
+@pytest.mark.parametrize(
+    ("first_word", "refused"),
+    [
+        ("when", True),
+        ("this", True),
+        ("These", True),
+        ("there", True),
+        # An abbreviation that casefolds onto a listed pronoun. The shape gate is what tells them
+        # apart, and it is the same gate that tells ``NOW`` from ``Note`` on the other side of
+        # the dash.
+        ("IT", False),
+        ("it", True),
+        ("It", True),
+        ("Network", False),
+        ("", False),
+    ],
+)
+def test_an_abbreviation_is_never_mistaken_for_the_pronoun_it_casefolds_onto(
+    first_word: str, refused: bool
+) -> None:
+    """``IT`` and ``it`` are different words that ``casefold`` makes one.
+
+    Asserted at the level of the predicate as well as through ``core_expansion`` because this is
+    where the distinction is drawn, and because ``It`` — sentence-initial, one of two letters
+    upper — has to stay refused: a capitalised pronoun at the start of prose is still a pronoun.
+    """
+    assert has_a_refused_opening(f"{first_word} something else".strip()) is refused
+
+
+@pytest.mark.parametrize(("term", "expansion"), REAL_DEFINITIONS_WITHOUT_INITIALS)
+def test_a_real_definition_is_not_refused_for_the_word_it_opens_with(
+    term: str, expansion: str
+) -> None:
+    """Recall, measured as loudly as precision, exactly where the word list is the only judge.
+
+    None of these spells its term, so :func:`core_expansion` cannot fall back on initials and the
+    opening rule decides alone. That is the whole population at risk, and it is where a list that
+    grew by one plausible-looking word would start quietly deleting definitions.
+
+    ``ITSM`` and ``ITIL`` are here because they were **measured being refused**: ``IT`` casefolds
+    to the pronoun ``it``. They are the reason :func:`has_a_refused_opening` asks
+    :func:`acronym_shaped` before it consults the list, and they fail if that exemption is
+    removed.
+    """
+    assert not initials_match(term, expansion), (
+        f"{expansion!r} spells {term}, so this case never reaches the rule it is meant to test"
+    )
+    assert core_expansion(term, expansion) == expansion
+
+
+@pytest.mark.parametrize(
+    ("term", "expansion"),
+    [
+        ("WEN", "When Event Notifier"),
+        ("TIS", "These Index Services"),
+        ("TPD", "this platform directory"),
+    ],
+)
+def test_initials_evidence_outranks_the_word_the_expansion_opens_with(
+    term: str, expansion: str
+) -> None:
+    """The ordering inside ``core_expansion``, pinned where it can actually fail.
+
+    Each expansion **opens with a listed word** and its initials **spell the term**, which is the
+    only combination where the ordering is observable. Reversing it — consulting the list before
+    trusting the initials — refuses all three.
+
+    These are constructed rather than found, and deliberately so. An earlier version of this test
+    used terms like ``ONCE — Operational Node Configuration Engine`` on the theory that a term
+    named after a listed word was at risk. It is not: the list is checked against the
+    *expansion's* first word and never against the term, so those cases were not exercising the
+    rule at all and passed with the ordering reversed. A mutation is what showed it.
+    """
+    assert has_a_refused_opening(expansion), "this case does not reach the rule it is pinning"
+    assert initials_match(term, expansion)
+    assert core_expansion(term, expansion) == expansion
 
 
 def test_the_negatives_are_admitted_by_score_and_refused_by_shape() -> None:
