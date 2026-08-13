@@ -51,6 +51,11 @@ async def _blocks(parser: MailParser, raw: RawDocument) -> list[ParsedBlock]:
     return await read_blocks(parser, raw)
 
 
+def _line_start(block: ParsedBlock) -> int:
+    assert isinstance(block.anchor, LineAnchor), "a mail block is addressed by lines"
+    return block.anchor.start
+
+
 def _html_message(html: str) -> RawDocument:
     """An HTML-only message built here, so two bodies can differ by one element."""
     message = EmailMessage()
@@ -184,14 +189,18 @@ async def test_an_inline_break_in_an_html_body_moves_every_line_after_it(
     without = await _blocks(parser, _html_message(body.format(divider=" ")))
     with_break = await _blocks(parser, _html_message(body.format(divider="<br/>")))
 
-    assert [block.text for block in without][-1] == "a paragraph below the break"
-    assert [block.text for block in with_break][-1] == "a paragraph below the break"
-    assert without[-1].anchor == LineAnchor(start=9, end=9)
-    assert with_break[-1].anchor == LineAnchor(start=10, end=10), (
-        "one line further down, because the break is now a line of the canonical text"
-    )
+    assert without[-1].text == "a paragraph below the break"
+    assert with_break[-1].text == without[-1].text, "the same paragraph, in both messages"
     assert without[2].text == "first clause second clause"
     assert with_break[2].text == "first clause\nsecond clause"
+
+    moved = _line_start(with_break[-1]) - _line_start(without[-1])
+    assert moved == 1, (
+        "one line further down, because the break is now a line of the canonical text. "
+        "Asserted as the difference rather than as two absolute line numbers, so a change "
+        "to which headers this parser renders fails where it happened rather than here"
+    )
+    assert without[-1].anchor == LineAnchor(start=9, end=9), "and this is where it was"
 
 
 async def test_resolving_across_an_inline_break_returns_the_lines_it_claims(
@@ -204,8 +213,9 @@ async def test_resolving_across_an_inline_break_returns_the_lines_it_claims(
     """
     raw = _raw(corpus, "html-only.eml")
     blocks = await _blocks(parser, raw)
-    # Past the header block, whose own lines are the fields rather than a break.
-    broken = next(block for block in blocks[1:] if "\n" in block.text)
+    # Named rather than found by "has a newline in it": the header block's lines are its
+    # fields, and the list block's are its items, so neither is what this is about.
+    broken = next(block for block in blocks if block.text.startswith("The reconciler"))
 
     assert broken.text.splitlines() == [
         "The reconciler now runs on its own schedule,",

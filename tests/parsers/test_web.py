@@ -28,8 +28,7 @@ from manicule.core.errors import ParseError
 from manicule.core.protocols import Parser, read_blocks
 from manicule.parsers.base import slugify
 from manicule.parsers.web import WebConfig, WebParser, recover_cdata
-from manicule.testing import assert_round_trip
-from manicule.testing.normalise import contains_claimed_text
+from manicule.testing import assert_round_trip, contains_claimed_text
 from tests.parsers.support import check_corpus, check_fixture, raw_from, raw_of
 
 MEDIA_TYPE = "text/html"

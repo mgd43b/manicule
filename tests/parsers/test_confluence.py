@@ -950,6 +950,31 @@ async def test_a_verbatim_body_is_byte_faithful_whatever_the_break_rule_does() -
     assert blocks[0].lang == "yaml"
 
 
+async def test_a_parameter_value_is_read_as_a_value_and_not_as_inline_content() -> None:
+    """The second deliberate limit, asserted so it is visible rather than merely absent.
+
+    A parameter holds configuration, and the two this parser promotes to content — a panel's
+    ``title`` among them — are still read as *values*: one string, not a run of inline nodes.
+    So a ``<br>`` element inside one contributes nothing, as it did everywhere before this
+    change. It costs nothing in practice because Confluence stores a parameter's value as plain
+    text, and an author who types a tag into a panel title gets ``&lt;br/&gt;`` in the stored
+    body rather than an element — which is what the second case here shows.
+    """
+    element = await _blocks(
+        '<ac:structured-macro ac:name="panel">'
+        '<ac:parameter ac:name="title">first<br/>second</ac:parameter>'
+        "<ac:rich-text-body><p>Body.</p></ac:rich-text-body></ac:structured-macro>"
+    )
+    escaped = await _blocks(
+        '<ac:structured-macro ac:name="panel">'
+        '<ac:parameter ac:name="title">first&lt;br/&gt;second</ac:parameter>'
+        "<ac:rich-text-body><p>Body.</p></ac:rich-text-body></ac:structured-macro>"
+    )
+
+    assert element[0].text == "firstsecond\n\nBody.", "no character, as everywhere before"
+    assert escaped[0].text == "first<br/>second\n\nBody.", "which is what Confluence stores"
+
+
 async def test_an_anchor_still_resolves_to_the_section_holding_a_break() -> None:
     """Requirement eight: text surrounding a break resolves to the element that contains it."""
     parser = _parser()
