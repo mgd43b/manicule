@@ -50,13 +50,14 @@ from manicule.generation.ports import (
 )
 from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.ingest.pipeline import RunReport
-from manicule.ingest.reindex import ReindexReport, StaleSweep
+from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
 from manicule.retrieval.retriever import RetrievalResult
 from manicule.storage.organisation import normalise_name
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 
+    from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.retrieval import Filter
     from manicule.generation.answering import AnswerRequest, AnswerResult
     from manicule.plugins.registry import Discovery
@@ -123,6 +124,10 @@ class FakeStore:
     documents: dict[str, Document] = field(default_factory=dict[str, Document])
     chunks: dict[str, list[Chunk]] = field(default_factory=dict[str, list[Chunk]])
     deleted: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
+    glossary_lineage: dict[str, str] = field(default_factory=dict[str, str])
+    """``documents.glossary_fp`` per document. Empty by default, which is the honest starting
+    state for a fixture nobody has run a detector over — and the one `doctor` must report as
+    work outstanding rather than as a clean corpus."""
 
     def add(self, document: Document, *chunks: Chunk) -> Document:
         self.documents[document.id] = document
@@ -165,12 +170,19 @@ class FakeStore:
         *,
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
+        glossary_fp_other_than: str | None = None,
     ) -> int:
         chosen = [
             document
             for document in self.documents.values()
             if (source is None or document.source == source)
             and (statuses is None or document.status in statuses)
+            # Every document in this fake carries no recorded glossary lineage, which is what
+            # an unrepaired corpus looks like and therefore the state `doctor` has to report.
+            and (
+                glossary_fp_other_than is None
+                or self.glossary_lineage.get(document.id) != glossary_fp_other_than
+            )
         ]
         return len(chosen)
 
@@ -772,6 +784,18 @@ class FakeIngestion:
     """What the sweep reports. Deliberately not all-zeroes: a payload that dropped a field would
     still compare equal across surfaces if every count were the same number."""
 
+    glossary_sweeps: list[tuple[int, bool]] = field(default_factory=list[tuple[int, bool]])
+    """``(batch, dry_run)`` per glossary sweep, so a test can show what reached the port."""
+
+    glossary_sweep: GlossarySweep = field(
+        default_factory=lambda: GlossarySweep(
+            selected=3, redetected=3, unchanged=1, changed=2, entries_before=5, entries_after=7
+        )
+    )
+    """What the glossary sweep reports, and every number here is different for the same reason
+    the one above gives: a payload that dropped ``changed`` would still compare equal across
+    three surfaces if ``changed`` and ``unchanged`` happened to match."""
+
     async def index_path(
         self, path: Path, *, name: str, limit: int | None = None, force: bool = False
     ) -> RunReport:
@@ -809,6 +833,23 @@ class FakeIngestion:
         if dry_run:
             return StaleSweep(dry_run=True, selected=self.sweep.selected)
         return self.sweep
+
+    async def glossary_fingerprint(self) -> GlossaryFingerprint:
+        """The real one, deliberately, rather than a stand-in with made-up fields.
+
+        ``status`` renders it and ``doctor`` compares a stored column against it, so a fake
+        value here would let a payload carry a shape the product never produces — and this is
+        the surface where the two are asserted equal across CLI, HTTP and MCP.
+        """
+        from manicule.ingest.glossary_lineage import glossary_fingerprint  # noqa: PLC0415
+
+        return glossary_fingerprint()
+
+    async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
+        self.glossary_sweeps.append((batch, dry_run))
+        if dry_run:
+            return GlossarySweep(dry_run=True, selected=self.glossary_sweep.selected)
+        return self.glossary_sweep
 
     async def import_archive(self, path: Path, *, force: bool = False) -> RunReport:
         del force

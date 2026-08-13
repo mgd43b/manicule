@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from manicule.config.settings import Settings
     from manicule.core.content import Chunk, Document, DocumentStatus
     from manicule.core.embedding import IndexFingerprints
+    from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.organisation import Collection as DocumentCollection
     from manicule.core.organisation import CollectionRule, Restoration, Tag, TrashEntry
     from manicule.core.protocols import Connector
@@ -46,7 +47,7 @@ if TYPE_CHECKING:
     )
     from manicule.generation.sharing import ShareLink
     from manicule.ingest.pipeline import RunReport
-    from manicule.ingest.reindex import ReindexReport, StaleSweep
+    from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
 
@@ -82,7 +83,16 @@ class DocumentSurface(Protocol):
         *,
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
-    ) -> int: ...
+        glossary_fp_other_than: str | None = None,
+    ) -> int:
+        """How many live documents match.
+
+        ``glossary_fp_other_than`` is the one lineage predicate this surface can reach, and it
+        is here because ``doctor`` has to be able to say "this corpus is serving definitions the
+        installed detector did not produce" without being handed the ability to repair anything.
+        It is a count over an indexed column: no glossary text is read to answer it.
+        """
+        ...
 
     async def count_chunks(self, document_id: str | None = None) -> int: ...
 
@@ -164,6 +174,41 @@ class Ingesting(Protocol):
         Which fingerprints count as current is decided here rather than passed in. A partial
         set makes every document its parser produced look stale, which is a repair that cannot
         end, so no surface is given the chance to supply one.
+        """
+        ...
+
+    async def glossary_fingerprint(self) -> GlossaryFingerprint:
+        """What the installed detector would produce under this configuration.
+
+        On this port rather than derived by the service, and it is the one accessor that keeps
+        the whole feature coherent: ``status`` reports it, ``doctor`` counts the documents that
+        disagree with it, :meth:`redetect_stale_glossary` repairs them, and the pipeline stamps
+        it. Four readers of one fact, and any two of them computing it separately would
+        disagree the first time a middleware chain was read a second way — which would report a
+        whole corpus stale and repair it into a state ``doctor`` still called stale.
+
+        **It builds nothing.** The answer is a digest of two source files and one configuration
+        flag, so a health check can ask it without constructing an embedder — which is the whole
+        difference between a diagnostic and something that needs the system working.
+        """
+        ...
+
+    async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
+        """Recompute the glossary of every document the installed detector did not produce.
+
+        **The cheapest repair on this port, and separate from :meth:`reparse_stale` so that it
+        can be.** It reads stored chunk text and writes rows: no connector, no retained bytes,
+        no parser, no embedder, no vector. Detection is a stage of its own with rules that move
+        independently of all three of those, so a corrected detector has to be able to reach a
+        corpus without charging it a re-parse — which is what folding this into the parse sweep
+        would have done.
+
+        Which fingerprint counts as current is decided here for the same reason it is there:
+        the answer is a fact about the installed build, and a surface allowed to supply one
+        could stamp a corpus with a detector that never ran over it.
+
+        Raises:
+            PolicyError: Detection is switched off, so there is no detector to be current with.
         """
         ...
 

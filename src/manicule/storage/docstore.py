@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy import CursorResult
     from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.elements import ColumnElement
 
     from manicule.core.content import Chunk
 
@@ -66,6 +67,19 @@ def _cross_workspace(document_id: str, holder: str, asked: str) -> str:
         f"manicule.core.ids.document_id include the workspace, so this id was built some other "
         f"way."
     )
+
+
+def _glossary_is_not(fingerprint: str) -> ColumnElement[bool]:
+    """Documents whose glossary lineage is not ``fingerprint``, ``NULL`` included.
+
+    One function because :meth:`~SqliteDocStore.select_documents` finds these documents and
+    :meth:`~SqliteDocStore.count_documents` counts them, and a diagnostic that reported a number
+    the repair then did not act on would be worse than reporting nothing. ``NULL`` has to be
+    written in explicitly: SQL three-valued logic makes ``glossary_fp != 'x'`` unknown rather
+    than true for a ``NULL``, so the plain inequality silently excludes every document indexed
+    before the column existed — which is the whole population the first release has to repair.
+    """
+    return (models.Document.glossary_fp.is_(None)) | (models.Document.glossary_fp != fingerprint)
 
 
 LISTABLE_FILTER_FIELDS: Final = frozenset(
@@ -363,13 +377,17 @@ class SqliteDocStore(
         chunk_fp: str | None,
         embed_fp: str | None,
         parse_fp: str | None = None,
+        glossary_fp: str | None = None,
     ) -> None:
         """Record which fingerprints this document was last built with.
 
         ``None`` leaves a lineage unchanged rather than clearing it: re-embedding moves only the
         embedding lineage, and clearing the chunk one would make "which documents need
         re-chunking" answer "none" about documents that do. The same holds for ``parse_fp``,
-        which no path other than a re-parse is entitled to move.
+        which no path other than a re-parse is entitled to move, and for ``glossary_fp``, which
+        this path moves only when detection did not run — when it did, the fingerprint is
+        written beside the rows it describes by
+        :meth:`~manicule.storage.glossary.GlossaryMixin.replace_glossary_entries`.
         """
         async with self._sessions.begin() as session:
             row = await self._live_document(session, document_id)
@@ -381,6 +399,8 @@ class SqliteDocStore(
                 row.chunk_fp = chunk_fp
             if embed_fp is not None:
                 row.embed_fp = embed_fp
+            if glossary_fp is not None:
+                row.glossary_fp = glossary_fp
 
     async def set_original(
         self, document_id: str, *, ref: str | None, omitted_reason: str | None
@@ -435,7 +455,15 @@ class SqliteDocStore(
         *,
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
+        glossary_fp_other_than: str | None = None,
     ) -> int:
+        """How many live documents match, counted in the database.
+
+        ``glossary_fp_other_than`` answers ``doctor``'s question — how many documents hold
+        entries the installed detector did not produce — over the indexed column alone, so the
+        check costs one count rather than a walk of the corpus, and reads no glossary text to
+        do it.
+        """
         statement = (
             select(func.count())
             .select_from(models.Document)
@@ -448,6 +476,8 @@ class SqliteDocStore(
             statement = statement.where(models.Document.source == source)
         if statuses is not None:
             statement = statement.where(models.Document.status.in_(list(statuses)))
+        if glossary_fp_other_than is not None:
+            statement = statement.where(_glossary_is_not(glossary_fp_other_than))
         async with self._sessions() as session:
             return (await session.execute(statement)).scalar_one()
 
@@ -492,6 +522,7 @@ class SqliteDocStore(
         media_types: Collection[str] | None = None,
         chunk_fp_other_than: str | None = None,
         parse_fp_current: Collection[str] | None = None,
+        glossary_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> Sequence[Document]:
@@ -512,6 +543,11 @@ class SqliteDocStore(
         parse lineage", while an empty set means "nothing is current", which selects every
         document. Both are reachable — the second from an installation with no parsers
         configured — so they are kept distinct rather than collapsed by a falsy test.
+
+        ``glossary_fp_other_than`` is that idea one stage further on, and it is written as an
+        exclusion for the same reason: the documents that most need repairing are the ones with
+        ``NULL`` there, and a predicate spelled ``= current`` would leave every one of them out
+        of the selection it exists to find.
 
         ``offset`` pages through the selection, and the ``ORDER BY`` above is what makes that
         mean anything: ``created_at`` alone is not unique, so two documents written in the same
@@ -542,6 +578,8 @@ class SqliteDocStore(
                 (models.Document.parse_fp.is_(None))
                 | (models.Document.parse_fp.notin_(list(parse_fp_current)))
             )
+        if glossary_fp_other_than is not None:
+            statement = statement.where(_glossary_is_not(glossary_fp_other_than))
         if limit is not None:
             statement = statement.limit(limit)
         if offset:

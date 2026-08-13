@@ -376,6 +376,72 @@ def test_a_supersession_reaches_both_surfaces_and_neither_of_them_quotes_the_doc
     ]
 
 
+def test_reindex_refuses_both_rungs_of_the_ladder_in_one_invocation(
+    bound: ApplicationService,
+) -> None:
+    """``--stale`` and ``--stale-glossary`` differ by whether the machine spends an afternoon.
+
+    One re-parses from retained bytes and re-embeds whatever moves; the other reads the chunks
+    already stored and runs regular expressions over them. A person who meant the cheap repair
+    and got both would find out from the elapsed time, which is the one way nobody should have
+    to find out — so it is refused before either starts.
+    """
+    assert "--stale-glossary" in cli.REINDEX_IS_ONE_RUNG
+    result = run(["document", "reindex", "--stale", "--stale-glossary"])
+    assert result.exit_code != 0
+    assert _ingestion(bound).sweeps == []
+    assert _ingestion(bound).glossary_sweeps == []
+
+
+def test_a_glossary_sweep_and_a_document_id_are_refused_together(
+    bound: ApplicationService,
+) -> None:
+    """Re-parsing one document already re-runs detection on it, so the pair means nothing."""
+    assert "--stale-glossary" in cli.GLOSSARY_IS_NOT_A_DOCUMENT_SWEEP
+    result = run(["document", "reindex", _a_real_document(bound), "--stale-glossary"])
+    assert result.exit_code != 0
+    assert _ingestion(bound).glossary_sweeps == []
+    assert _ingestion(bound).reindexed == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["document", "reindex", "--stale-glossary"], (cli.DEFAULT_SWEEP_BATCH, False)),
+        (["document", "reindex", "--stale-glossary", "--dry-run"], (cli.DEFAULT_SWEEP_BATCH, True)),
+        (["document", "reindex", "--stale-glossary", "--batch", "5"], (5, False)),
+    ],
+)
+def test_the_glossary_sweep_options_reach_the_port_rather_than_merely_parsing(
+    bound: ApplicationService, *, argv: list[str], expected: tuple[int, bool]
+) -> None:
+    """Declared and not wired, ``--dry-run`` is an option that rewrites a corpus's vocabulary
+    and then prints a plan of what it was going to do."""
+    result = run(["--json", *argv])
+    assert result.exit_code == 0
+    assert _ingestion(bound).glossary_sweeps == [expected]
+    assert _ingestion(bound).sweeps == [], "the glossary sweep must not re-parse anything"
+
+
+def test_the_glossary_sweep_reports_the_same_counts_to_a_person_and_to_a_pipe(
+    bound: ApplicationService,
+) -> None:
+    """One payload, two renderings, and no definition in either.
+
+    The last clause is the one worth asserting rather than assuming: the subject of this command
+    is the corpus's own vocabulary, and a report that named the terms it had removed would print
+    the contents of the index to a terminal and to whatever a shell pipeline points at.
+    """
+    machine = json.loads(run(["--json", "document", "reindex", "--stale-glossary"]).stdout)["data"]
+    human = _laid_bare(run(["document", "reindex", "--stale-glossary"]).stdout)
+
+    for field in ("selected", "redetected", "unchanged", "changed"):
+        assert str(machine[field]) in human, f"{field} is in the envelope and not on the screen"
+    assert str(machine["entries_before"]) in human
+    assert str(machine["entries_after"]) in human
+    assert "expansion" not in machine, "a lineage report carries no definitions"
+
+
 def test_an_export_consents_to_nothing_unless_the_flag_is_typed(
     bound: ApplicationService,
 ) -> None:

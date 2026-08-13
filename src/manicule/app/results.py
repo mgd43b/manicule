@@ -637,6 +637,69 @@ class StaleReparseReport(Payload):
     """One line per superseded document: which it is and what overtook it. No document text."""
 
 
+class StaleGlossaryReport(Payload):
+    """What a corpus-wide glossary recompute did.
+
+    The counterpart to :class:`StaleReparseReport` at a rung below it, and the fields differ
+    because the costs do. That report counts chunks, because a re-parse is charged in embedding
+    passes. This one counts entries, because a recompute is charged in regular expressions over
+    text already on disk — so the number an operator wants is not what it spent but what the
+    corrected rules did to the vocabulary.
+
+    **No field carries document text, and none carries a definition.** Every string here is a
+    document id, a URI or an error, which matters more here than anywhere else on this module:
+    the subject of this operation is the corpus's own vocabulary, and a report that named the
+    terms it had removed would print the contents of the index to a terminal and to whatever a
+    shell pipeline points at.
+    """
+
+    dry_run: bool = False
+    """Whether this was a plan. A dry run reports ``selected`` and writes nothing at all."""
+
+    selected: int = Field(default=0, ge=0)
+    """Documents whose recorded glossary lineage is not what the installed detector produces.
+
+    Includes every document with no recorded lineage, which on the first release with this
+    column is the whole corpus. That is the migration policy rather than an accident: entries
+    detected before anything recorded a detector cannot be shown to have come from the rules
+    installed now, and trusting them indefinitely is what let five corrections to detection land
+    against a corpus that reported itself current.
+    """
+
+    redetected: int = Field(default=0, ge=0)
+    """Documents whose entries were recomputed from stored chunks. Zero on a dry run."""
+
+    unchanged: int = Field(default=0, ge=0)
+    """Of ``redetected``, those whose entry set came out exactly as it went in.
+
+    The expected majority after a narrow rule change, and they still advance their fingerprint:
+    the corpus now records which detector read them, and "the rules did not change this page" is
+    a result rather than an absence of one.
+    """
+
+    changed: int = Field(default=0, ge=0)
+    """Of ``redetected``, those whose entry set moved.
+
+    Compared as sets rather than counts, because the change this exists for removes false
+    entries and adds real ones on the same page.
+    """
+
+    entries_before: int = Field(default=0, ge=0)
+    entries_after: int = Field(default=0, ge=0)
+    """Entries across every document recomputed, before and after. Two totals, never a net."""
+
+    failed: int = Field(default=0, ge=0)
+    """Documents the detector could not read.
+
+    Each one keeps the entries it had and keeps its stale lineage, so it is still selected next
+    time and still reported by ``doctor``. Failing closed: a detector bug costs a repair, never
+    a working glossary.
+    """
+
+    failures: tuple[str, ...] = ()
+    """One line per failure, naming the document and the error. The sweep completes regardless."""
+
+
 # --- conversations -------------------------------------------------------------------------
 
 
@@ -1084,6 +1147,22 @@ class IndexStatus(Payload):
         "the index has committed to nothing and will accept whatever the first ingest brings.",
     )
     chunk_fingerprint: str | None = None
+    glossary: str = Field(
+        default="",
+        description="What the installed glossary detector is, in one line — or that detection "
+        "is switched off. Here beside the other two because ``status`` is where somebody looks "
+        "to find out what built this index, and until this line existed the answer named the "
+        "three stages that had fingerprints and silently omitted the fourth.",
+    )
+    stale_glossary: int = Field(
+        default=0,
+        ge=0,
+        description="Documents whose stored glossary lineage is not what the installed "
+        "detector produces, ``NULL`` lineage included. A count over an indexed column, so it "
+        "costs no glossary text to report. Non-zero is not a fault: it is what a detector fix "
+        "looks like from the corpus's side, and `manicule document reindex --stale-glossary` "
+        "is what clears it.",
+    )
     schema_revision: str | None = None
     data_dir: str = ""
 
@@ -1575,6 +1654,13 @@ __all__ = [
     "SharedConversation",
     "SharedTurnPayload",
     "SourceReference",
+    # `StaleReparseReport` is listed here for the first time, and it is not this change's.
+    # #113 added the class and not the name, so `from manicule.app.results import *` produced a
+    # module missing one of the two sweep reports — which nothing failed on, because the CLI
+    # imports the module rather than its star. Adding one name beside it and leaving the gap
+    # would make the omission look deliberate.
+    "StaleGlossaryReport",
+    "StaleReparseReport",
     "Stats",
     "TagDeleted",
     "TagList",

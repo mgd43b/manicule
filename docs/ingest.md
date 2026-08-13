@@ -855,10 +855,17 @@ of the blast-radius ladder (`storage.md` §1):
 
 | Operation | Reads | Rung | Network | Shipped as |
 |---|---|---|---|---|
+| **re-detect glossary** | `chunks.text` | 0 | none | `document reindex --stale-glossary` |
 | `repair` | `chunks` | 1–2 | none | `ingest.reindex.repair`, no command |
 | `re-embed` | `chunks.embed_text` | 2 | none | `ingest.reindex.re_embed`, no command |
 | **re-parse** | `blobs` | 3 | none | `document reindex <id>`, `document reindex --stale` |
 | a forced sync | the source | 4 | yes, rate-limited, **may fail** | `index <path> --reindex`, for a path |
+
+**Rung 0 is below repair, and it is a rung of its own rather than a wider `--stale`.** Glossary
+detection reads chunk text and writes rows: no connector, no retained bytes, no parser, no
+chunker, no embedder, no vector. Folding it into the re-parse sweep would work and would charge
+a corpus-sized parse and re-embed for a change to a regular expression, which is the cost an
+operator most needs to be able to avoid. §10.2 is the whole of it.
 
 **Only the last one can fail for reasons outside the machine**, and it is the only one that is
 not reproducible. Everything above it is a pure function of what is already on disk. That is
@@ -984,6 +991,120 @@ sync overtook mid-repair is reported under it, named, and left alone: the sweep 
 write an older parse over newer bytes, so the corpus has the newer text and the sweep did no
 work on it. Nothing needs doing about one — §8.5 has the longer answer, and re-running the
 command converges without any manual step.
+
+### 10.2 `document reindex --stale-glossary`, and why detection needs a rung of its own
+
+```
+manicule document reindex --stale-glossary [--dry-run] [--batch N]
+```
+
+**The problem this closes.** Glossary entries are derived from stored chunks by a detector whose
+grammar and evidence rules live in this repository and change independently of every other
+stage. Detection runs at ingest, downstream of parsing; a re-sync of unchanged bytes skips
+before it; and `documents.parse_fp` does not move when a detection rule does. So a corpus
+indexed before a detector fix keeps the entries the old rules produced, reports a current
+parser, chunker and embedder fingerprint, and is **correct about all three**. Five detector
+corrections landed in one day and not one of them could reach an existing index.
+
+Inferring glossary freshness from parse freshness is not the fix. It would migrate the media
+types that happened to get a parser bump, leave every other one stale, and hide the problem
+behind a coupling nobody could see — so parsing and detection are independently accountable, and
+`documents.glossary_fp` is the column that makes them so (`storage.md` §6.4).
+
+**What the fingerprint is made of.** `GlossaryFingerprint` carries three identity fields:
+
+| Field | What it covers | Why |
+|---|---|---|
+| `detector` | which detection strategy ran, or `disabled` | two strategies would otherwise be indistinguishable from one typo fix |
+| `rules` | a SHA-256 over `ingest/glossary.py` and `core/glossary.py` | the grammar, the persistence threshold, the evidence weights, the boundary model **and** the normalisation that turns a surface into a key |
+| `middleware` | `name@version` for every configured hook | detection reads `Chunk.text` boundaries and `heading_path`, neither of which any middleware declaration covers |
+
+**It is derived, not maintained.** `ParserVersions.rules` is a number somebody has to remember
+to move, and its own table records two parsers bumped for changes they did not make, by
+somebody who noticed. Detection has no dependencies at all — it is regular expressions over
+lines, by requirement (`retrieval.md` §14) — so every input to what gets stored is a byte in one
+of two files, and the honest identity is a digest of those bytes. Each of the five corrections
+would have moved it with nobody to remember anything.
+
+The trade is stated rather than hidden: a digest over bytes cannot tell a rule from the
+paragraph explaining it, so a comment-only edit makes the corpus stale. That is the direction
+worth being wrong in. Over-invalidation costs one pass over stored text with no GPU in it;
+under-invalidation costs a definition served from rules that no longer exist, silently. A
+normalised digest that skipped comments would fail the other way, and its failure would be the
+kind nobody notices.
+
+The one thing still maintained by hand is the *list* of digested files, and forgetting it is
+made as loud as it can be made: `detector_imports()` reads what those files actually import out
+of their own syntax trees — `TYPE_CHECKING` imports included, because those never execute and so
+are invisible to any runtime inspection — and the suite fails, by name, unless every `manicule`
+module they reach is either digested or listed with the reason it cannot change what gets
+stored.
+
+**`min_entry_confidence` is deliberately not in it.** That setting is applied at query time, so
+it changes which stored entries a query will act on and not which entries are stored. The
+threshold that decides persistence is `MIN_DEFINITION_CONFIDENCE`, which is a constant in the
+digested source and therefore already covered.
+
+**What the command costs.** It reads `documents` to select, reads `chunks` per document, and
+writes `glossary_entries`, `glossary_aliases` and one column. It constructs no pipeline on
+either path, so it never builds a chunker, an embedder, a vector store or a pool of parse
+workers, and it never opens the blob store. The cost boundary is the signature of
+`ingest.reindex.redetect_glossary`: there is no `pipeline`, `blobs`, `embedder` or `vectors`
+parameter for it to reach a parser or the model through, and the suite asserts that rather than
+trusting it.
+
+A consequence worth stating: the fingerprint refusals that guard a writing run are **not** run
+here. They exist because a corpus must not be written to by a different chunker or embedder, and
+this writes neither chunks nor vectors — so an index whose embedder disagrees with configuration
+can still be brought on to current detection rules.
+
+**Empty is a result.** A document the current detector reads and finds nothing in records the
+fingerprint and no entries. Without that, "no definitions on this page" and "nobody has looked"
+would be one state, every sweep would select every prose page for ever, and the feature's own
+report would be meaningless. `unchanged` counts documents whose entry set came out as it went
+in — the expected majority after a narrow rule change — and they still advance their
+fingerprint.
+
+`changed` compares entry **sets**, not counts. The change this exists for removes false
+heading-derived entries and adds newly detectable list definitions on the same page, and a count
+would report a document whose whole vocabulary was replaced as untouched.
+
+**Detection switched off has explicit semantics, and this is the choice.** With
+`rag.glossary.detect_on_ingest = false`, an ingest leaves a document's existing entries exactly
+as they are — that is what the setting is for, and clearing them would be a silent erasure
+arrived at through configuration — and records a fingerprint whose `detector` reads `disabled`.
+That is a value in the column rather than an absence: `NULL` already means "never recomputed",
+and if a disabled run wrote nothing the two states would be one. Turning detection back on
+changes the installed fingerprint, so every document stamped this way is selected by the next
+survey without anybody having to know to ask.
+
+The command itself refuses while detection is off, naming the setting. Recomputing would run
+rules the configuration says not to run; stamping the disabled state instead would erase the
+record of which detector produced the entries still being served. The plan refuses too — under
+a disabled detector the installed fingerprint *is* the disabled one, so the selection would be
+every document a detector ever read, reported as outstanding work this command would not do.
+
+**A detector failure fails closed.** `detect_entries` has no model to be unavailable, so it
+raising means a bug here. Nothing is written: the entries a working detector produced stay
+exactly where they are and stay servable, and the fingerprint is **not** advanced, so the
+document remains selected by this command and reported by `doctor` until the fix ships. The rest
+of the ingest is untouched — a glossary bug does not cost a working index — and the run names
+the document, because a detector that has stopped working behind a screen of green counters is
+the other half of failing silently.
+
+**Migration policy for the first release.** Every existing row arrives with `glossary_fp IS
+NULL`, which is selected. It is not backfilled: writing the installed fingerprint into rows
+detected before anything recorded a detector would assert that they came out of the rules
+installed now, which is false for every corpus indexed before the column and is exactly the
+plausible falsehood the fingerprints exist to prevent. So the first run of this command after
+upgrading sweeps the whole corpus — reading chunks, touching no network and no model — and every
+run after it selects nothing.
+
+**Ordering, when both sweeps are wanted.** Run `--stale` first. A re-parse re-runs detection on
+every document it rebuilds, so doing it second would redo work the glossary sweep had just
+finished. Passing both flags in one invocation is refused rather than sequenced: they differ by
+whether the machine spends an afternoon embedding, and finding that out from the elapsed time is
+the one way nobody should have to find it out.
 
 ---
 

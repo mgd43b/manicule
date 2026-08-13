@@ -1051,6 +1051,44 @@ class ApplicationService:
             superseded_documents=tuple(sweep.superseded_documents),
         )
 
+    async def document_redetect_glossary(
+        self, *, batch: int = DEFAULT_SWEEP_BATCH, dry_run: bool = False
+    ) -> r.StaleGlossaryReport:
+        """Bring every document's glossary on to the installed detector's rules.
+
+        **The repair a detector change needs, and the one no other verb performs.** Detection
+        runs at ingest, after parsing; a re-sync of unchanged bytes skips before it; and
+        ``parse_fp`` does not move when a detection rule does. So a corpus indexed before a
+        detector fix keeps the entries the old rules produced, reports current parser, chunker
+        and embedder fingerprints, and is right about all three.
+
+        Nothing here parses, fetches or embeds. It reads stored chunk text and writes rows, so
+        the cost is a pass over the corpus's text and no GPU time at all — which is why it is
+        its own command rather than a wider ``--stale`` sweep that would charge a re-parse and a
+        re-embed for a change to a regular expression.
+
+        Args:
+            batch: Documents per page of the selection.
+            dry_run: Report the selection and write nothing at all.
+
+        Raises:
+            PolicyError: ``rag.glossary.detect_on_ingest`` is off, so there is no detector for
+                the corpus to be current with.
+        """
+        ingestion = await self._backend.ingestion()
+        sweep = await ingestion.redetect_stale_glossary(batch=batch, dry_run=dry_run)
+        return r.StaleGlossaryReport(
+            dry_run=sweep.dry_run,
+            selected=sweep.selected,
+            redetected=sweep.redetected,
+            unchanged=sweep.unchanged,
+            changed=sweep.changed,
+            entries_before=sweep.entries_before,
+            entries_after=sweep.entries_after,
+            failed=sweep.failed,
+            failures=tuple(sweep.failures),
+        )
+
     # --- state ----------------------------------------------------------------------------
 
     async def index_status(self) -> r.IndexStatus:
@@ -1064,6 +1102,7 @@ class ApplicationService:
         maintenance = await self._backend.maintenance()
         statistics = await store.document_statistics()
         fingerprints = await store.index_fingerprints()
+        detector = await (await self._backend.ingestion()).glossary_fingerprint()
         return r.IndexStatus(
             documents=await store.count_documents(),
             chunks=await store.count_chunks(),
@@ -1075,6 +1114,12 @@ class ApplicationService:
             # the string a re-embed compares and must not be prettied.
             embed_fingerprint=fingerprints.embed.canonical() if fingerprints.embed else None,
             chunk_fingerprint=fingerprints.chunk.canonical() if fingerprints.chunk else None,
+            # The fourth stage, reported beside the other three. There is no corpus-wide
+            # committed value to read out of `index_state` for this one — detection is compared
+            # per document, like parsing — so what is shown is what the *installed* detector
+            # would produce, and the count beside it is how much of the corpus disagrees.
+            glossary=detector.describe(),
+            stale_glossary=await store.count_documents(glossary_fp_other_than=detector.canonical()),
             schema_revision=await maintenance.schema_revision(),
             data_dir=str(self.settings.data_dir),
         )
@@ -1141,6 +1186,7 @@ class ApplicationService:
         # "not created" on every first run, which reads as a fault and is not one.
         checks.append(await self._permissions_check())
         checks.append(await self._index_check())
+        checks.append(await self._glossary_check())
         checks.append(await self._connectors_check())
         checks.append(await self._document_identity_check())
         checks.append(await self._document_content_check())
@@ -1691,6 +1737,84 @@ class ApplicationService:
             state="ok",
             detail=f"{documents} document(s) in {fingerprints.vector_table or 'no vector table'}",
             facts={"documents": documents, "vector_table": fingerprints.vector_table or None},
+        )
+
+    async def _glossary_check(self) -> r.Check:
+        """Whether the corpus's definitions came from the detector that is installed.
+
+        **The check that makes a clean ``doctor`` mean what a reader assumes it means.** Before
+        it, every fingerprint this command reported was about parsing, chunking or embedding,
+        so an index whose glossary was three detector versions out of date passed with nothing
+        amber anywhere — and the assumption a green result invites is precisely that the index
+        is current, not that three of its four stages are.
+
+        **``degraded``, not ``failing``, and the same reading the document-content check
+        applies.** Nothing is broken: the documents are indexed, the definitions are cited to
+        passages that resolve, and every query works. What is true is that some of those
+        definitions were produced by rules this build has since corrected, which is a thing to
+        act on rather than a fault to repair. The remedy is one command, it touches no network
+        and no model, and it is named.
+
+        **Detection switched off is ``ok``, and reported as the deliberate state it is.** An
+        operator who has turned the detector off while investigating it does not need a health
+        check telling them so in amber every time they run it; what they need is for the state
+        to be visible, which is what the detail line does.
+        """
+        try:
+            ingestion = await self._backend.ingestion()
+            detector = await ingestion.glossary_fingerprint()
+            store = await self._backend.documents()
+            # A count over an indexed column. `doctor` is run to read a sentence, and a check
+            # that read the corpus's vocabulary to decide whether the vocabulary is current
+            # would cost the thing it is asking about.
+            stale = await store.count_documents(glossary_fp_other_than=detector.canonical())
+            documents = await store.count_documents()
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            return r.Check(
+                name="glossary",
+                state="unknown",
+                detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        facts: dict[str, JsonValue] = {
+            "detector": detector.describe(),
+            "enabled": detector.detects,
+            "documents": documents,
+            "stale": stale,
+        }
+        if not detector.detects:
+            return r.Check(
+                name="glossary",
+                state="ok",
+                detail=(
+                    "glossary detection is switched off "
+                    "(rag.glossary.detect_on_ingest = false), so definitions already stored "
+                    "stay queryable and no new ones are read"
+                ),
+                facts=facts,
+            )
+        if not stale:
+            return r.Check(
+                name="glossary",
+                state="ok",
+                detail=f"every document's glossary came from {detector.describe()}",
+                facts=facts,
+            )
+        return r.Check(
+            name="glossary",
+            state="degraded",
+            detail=(
+                f"{stale} of {documents} document(s) hold glossary entries the installed "
+                f"detector did not produce, or hold entries nothing recorded a detector for. "
+                f"Their definitions are cited and resolvable and may simply be right — but "
+                f"they came out of rules this build has changed, and nothing else notices: a "
+                f"detector change moves no parse, chunk or embedding fingerprint, so a sync "
+                f"skips these documents and every other check here passes. Run "
+                f"`manicule document reindex --stale-glossary`, which reads stored chunks and "
+                f"runs no parser, no connector and no embedder."
+            ),
+            facts=facts,
+            remedy="manicule document reindex --stale-glossary",
         )
 
     async def _grammar_check(self, *, fix: bool = False) -> r.Check:

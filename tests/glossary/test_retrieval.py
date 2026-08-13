@@ -22,6 +22,7 @@ from manicule.core.content import BlockKind
 from manicule.core.glossary import MatchReason
 from manicule.core.retrieval import ConfidenceBand, Query
 from manicule.ingest.glossary import detect_entries
+from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.retrieval.cache import L1QueryCache
 from manicule.retrieval.confidence import DEFINITION_CITED, NOTHING_RESEMBLES
 from manicule.retrieval.expansion import GLOSSARY_SCORE_KEY, ExpansionPolicy
@@ -794,7 +795,9 @@ async def test_a_heading_section_cannot_suppress_a_real_definition_elsewhere(
     ]
     await store.replace_chunks(appendix.id, section)
     await store.replace_glossary_entries(
-        appendix.id, detect_entries(section, title="Operations glossary appendix")
+        appendix.id,
+        detect_entries(section, title="Operations glossary appendix"),
+        fingerprint=glossary_fingerprint().canonical(),
     )
     retriever = await _with_glossary(store, [*indexed, *section])
 

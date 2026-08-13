@@ -53,10 +53,12 @@ if TYPE_CHECKING:
         Telemetry,
     )
     from manicule.config.settings import Settings
+    from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.protocols import Connector, Parser, VectorStore
+    from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport
     from manicule.ingest.ports import IngestStore
-    from manicule.ingest.reindex import ReindexReport, StaleSweep
+    from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
 
 ARCHIVE_MANIFEST = "manicule-export.json"
@@ -440,7 +442,6 @@ class Runtime:
         return await self._once("pipeline", self._build_pipeline)
 
     async def _build_pipeline(self) -> IngestPipeline:
-        from manicule.ingest.middleware import MiddlewareRunner  # noqa: PLC0415
         from manicule.ingest.pipeline import IngestPipeline  # noqa: PLC0415
         from manicule.ingest.refusals import check_before_run  # noqa: PLC0415
         from manicule.ingest.workers import WorkerPool, worker_config  # noqa: PLC0415
@@ -450,7 +451,10 @@ class Runtime:
         chunker = await self._container.aget(keys.CHUNKER)
         embedder = await self._container.aget(keys.EMBEDDER)
         vectors = await self.prepared_vectors()
-        middleware = MiddlewareRunner(await self._container.middleware())
+        # Through the accessor rather than assembled here, so that the pipeline's chain and the
+        # one glossary repair compares against are one reading of one configuration. Two
+        # readings that agreed today would part company the first time either grew a filter.
+        middleware = await self.middleware()
         fingerprint = chunker.fingerprint.with_middleware(middleware.declarations())
         # Before a single document is fetched. An index built by a different chunker or a
         # different embedder is refused here rather than discovered halfway through a run,
@@ -486,7 +490,26 @@ class Runtime:
             max_fetch_bytes=settings.ingest.max_fetch_bytes,
             target_batch_tokens=settings.ingest.target_batch_tokens,
             max_embed_batch=settings.ingest.max_embed_batch,
+            # Passed rather than defaulted, which it had been since the setting shipped. The
+            # field is documented as the switch an operator throws while investigating a
+            # detector that is producing rubbish, and nothing outside `settings.py` read it: a
+            # configuration saying `detect_on_ingest = false` detected on ingest anyway. It has
+            # to reach here now, because the glossary fingerprint records enablement, and a
+            # fingerprint that recorded a state configuration could not actually reach would be
+            # a lie told in a column rather than a setting quietly doing nothing.
+            detect_glossary=settings.rag.glossary.detect_on_ingest,
         )
+
+    async def middleware(self) -> MiddlewareRunner:
+        """The configured hook chain, as the pipeline would run it.
+
+        Public because glossary repair needs the same chain the pipeline folds in, and reading
+        it a second way is how two paths end up computing two fingerprints for one
+        configuration — which would make every document stale the moment either of them ran.
+        """
+        from manicule.ingest.middleware import MiddlewareRunner  # noqa: PLC0415
+
+        return MiddlewareRunner(await self._container.middleware())
 
     def require_engine(self) -> AsyncEngine:
         """The engine the document store opened.
@@ -671,6 +694,61 @@ class _Ingestion:
             pipeline=await self._runtime.pipeline(),
             blobs=await self._runtime.blobs(),
             parse_fingerprints=current,
+            batch=batch,
+        )
+
+    async def glossary_fingerprint(self) -> GlossaryFingerprint:
+        """What the installed detector would produce under this configuration.
+
+        The single reader of the two inputs, and the reason it is a method rather than three
+        lines repeated at four call sites: ``status``, ``doctor``, the repair and the pipeline
+        all need this string, and a second reading of the middleware chain in any one of them
+        would report a corpus stale that the others called current.
+
+        Builds nothing. The container is asked for its hooks, which are already-constructed
+        objects, and the digest is read off two source files.
+        """
+        from manicule.ingest.glossary_lineage import glossary_fingerprint  # noqa: PLC0415
+
+        middleware = await self._runtime.middleware()
+        return glossary_fingerprint(
+            enabled=self._runtime.settings.rag.glossary.detect_on_ingest,
+            middleware=middleware.chain(),
+        )
+
+    async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
+        """Bring every document's glossary up to the installed detector. Reads chunks only.
+
+        **No pipeline is built on either path, and that is the cost boundary rather than a
+        convenience.** :meth:`reparse_stale` constructs one for its real run because it parses;
+        this never does, so it never constructs a chunker, an embedder, a vector store or a
+        pool of parse workers, and it never opens the blob store. What it needs is the document
+        store, twice — once as the thing that answers the selection and reads chunks, once as
+        the thing that holds entries — and the same object is both.
+
+        The consequence worth stating: the fingerprint refusals that guard a writing run are not
+        run here, deliberately. They exist because a corpus must not be *written* to by a
+        different chunker or embedder, and this writes neither chunks nor vectors. An index
+        whose embedder disagrees with configuration is one an operator must still be able to
+        bring on to current detection rules.
+        """
+        from manicule.ingest.reindex import (  # noqa: PLC0415
+            plan_stale_glossary,
+            redetect_stale_glossary,
+        )
+
+        store = await self._runtime.documents()
+        fingerprint = await self.glossary_fingerprint()
+        if dry_run:
+            return await plan_stale_glossary(
+                store=store,  # pyright: ignore[reportArgumentType] - it satisfies IngestStore
+                fingerprint=fingerprint,
+                batch=batch,
+            )
+        return await redetect_stale_glossary(
+            store=store,  # pyright: ignore[reportArgumentType] - it satisfies IngestStore
+            glossary=store,  # pyright: ignore[reportArgumentType] - and GlossaryStore
+            fingerprint=fingerprint,
             batch=batch,
         )
 

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from manicule.core.errors import InsecureTargetError
+from manicule.core.glossary import DefinitionForm, GlossaryEntry
 from manicule.storage.backup import (
     MANIFEST_NAME,
     BackupError,
@@ -83,6 +84,54 @@ async def test_a_restored_instance_answers_a_query_identically(
             for c in await restored_store.search_lexical("authentication", k=5)
         ]
         assert after == before
+    finally:
+        await restored_engine.dispose()
+
+
+async def test_a_restore_brings_back_the_glossary_and_the_detector_that_produced_it(
+    engine: AsyncEngine, data_dir: Path, tmp_path: Path
+) -> None:
+    """Requirement 5, on the surface where getting it wrong is quietest.
+
+    A backup is a file copy, so ``documents.glossary_fp`` travels with the rows it describes and
+    nothing here had to be taught about it. That is worth an assertion rather than an
+    assumption, because the failure it rules out is the one nobody looks for: entries restored
+    without their lineage would come back looking like they had never been detected — every
+    document selected by the next sweep, a corpus-sized repair after every restore — and the
+    other direction, lineage restored without its entries, would be a corpus reporting itself
+    current with no vocabulary in it at all.
+    """
+    from manicule.ingest.glossary_lineage import glossary_fingerprint  # noqa: PLC0415
+
+    store, document_id = await _populate(engine, data_dir)
+    chunks = await store.document_chunks(document_id)
+    entries = [
+        GlossaryEntry(
+            acronym="NOW",
+            display="NOW",
+            expansion="Network Operations Workspace",
+            document_id=document_id,
+            chunk_id=chunks[0].id,
+            location="Glossary",
+            form=DefinitionForm.EM_DASH,
+            confidence=0.95,
+        )
+    ]
+    lineage = glossary_fingerprint().canonical()
+    await store.replace_glossary_entries(document_id, entries, fingerprint=lineage)
+
+    backup_dir = tmp_path / "backup"
+    await create_backup(engine, data_dir, backup_dir)
+    await engine.dispose()
+
+    restored_dir = tmp_path / "restored"
+    restore_backup(backup_dir, restored_dir)
+
+    restored_engine = create_engine(restored_dir)
+    try:
+        restored = SqliteDocStore(restored_engine)
+        assert await restored.glossary_entries(document_id) == entries
+        assert await restored.glossary_lineage(document_id) == lineage
     finally:
         await restored_engine.dispose()
 

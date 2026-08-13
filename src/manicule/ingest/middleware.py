@@ -79,6 +79,33 @@ def declarations(
     )
 
 
+def chain(
+    middleware: Sequence[Middleware], versions: Mapping[str, str] | None = None
+) -> tuple[str, ...]:
+    """``name@version`` for **every** configured middleware, declared or not.
+
+    :func:`declarations` and this differ by one predicate and answer two questions, and reading
+    them as the same question with a stricter filter is how the glossary fingerprint would have
+    been given a guard that looks right and covers nothing.
+
+    ``declarations`` names the hooks that rewrite ``embed_text``, because that is the field
+    whose mutation changes vectors — the thing :class:`~manicule.core.fingerprints.ChunkFingerprint`
+    describes. Detection never reads ``embed_text``. It reads a chunk's ``text``, which the
+    runner's digests hold immutable, and its ``heading_path``, which **no check here covers**;
+    and it reads whatever chunks the chunker produced, whose boundaries follow from block
+    metadata that :meth:`MiddlewareRunner.after_parse` permits a hook to rewrite. Both of those
+    routes are open to a hook that declares nothing at all, so the honest set for that
+    fingerprint is the whole chain.
+
+    The price is that configuring an unrelated hook makes every document's glossary lineage
+    stale. That buys a sweep over stored chunks with no parser and no embedder in it, which is
+    the cheapest repair manicule has — and it is the right direction to be wrong in, because the
+    other one is a definition served from rules that no longer exist.
+    """
+    supplied = versions or {}
+    return tuple(sorted(f"{hook.name}@{supplied.get(hook.name, '')}" for hook in middleware))
+
+
 class MiddlewareRunner:
     """Runs the configured hooks in order, and holds them to the contract.
 
@@ -97,6 +124,10 @@ class MiddlewareRunner:
     def declarations(self, versions: Mapping[str, str] | None = None) -> tuple[str, ...]:
         """The chunk-fingerprint contribution of this chain."""
         return declarations(self._middleware, versions)
+
+    def chain(self, versions: Mapping[str, str] | None = None) -> tuple[str, ...]:
+        """The glossary-fingerprint contribution of this chain: every hook, not a subset."""
+        return chain(self._middleware, versions)
 
     async def before_parse(self, raw: RawDocument) -> RawDocument | None:
         """Transform the fetched document, or return ``None`` if a hook dropped it.
@@ -209,4 +240,4 @@ class MiddlewareRunner:
             cls._require(hook, where, element, item)
 
 
-__all__ = ["MiddlewareRunner", "declarations", "text_digest"]
+__all__ = ["MiddlewareRunner", "chain", "declarations", "text_digest"]

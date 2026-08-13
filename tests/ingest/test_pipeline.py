@@ -42,6 +42,7 @@ def build(
     max_fetch_bytes: int = 256 * 1024 * 1024,
     routes: Mapping[str, Sequence[str]] | None = None,
     parse_fingerprints: Callable[[str], ParseFingerprint | None] = parse_fingerprint,
+    detect_glossary: bool = True,
 ) -> tuple[IngestPipeline, fakes.MemoryIngestStore, fakes.MemoryVectors]:
     """A pipeline over in-memory everything, plus the store and vectors to assert against.
 
@@ -67,6 +68,7 @@ def build(
         blobs=blobs,
         max_fetch_bytes=max_fetch_bytes,
         parse_fingerprints=parse_fingerprints,
+        detect_glossary=detect_glossary,
     )
     return pipeline, store, vectors
 

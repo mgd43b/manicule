@@ -63,6 +63,15 @@ class MemoryIngestStore:
         parser — so a fake that let ``upsert_document`` carry it would clear the lineage at the
         start of every run and make change detection pass for the wrong reason.
         """
+        self.glossary_lineage_by_id: dict[str, str] = {}
+        """``documents.glossary_fp``, beside the documents for the same reason ``parse_fp`` is.
+
+        The domain :class:`~manicule.core.content.Document` deliberately does not carry it —
+        change detection must not consult it, because a detector change is not a reason to
+        re-parse a document — so a fake that let ``upsert_document`` carry it would let a test
+        pass by a route the real store does not have.
+        """
+
         self.originals: dict[str, tuple[str | None, str | None]] = {}
         self.seen: dict[str, int] = {}
         self.deleted_at: dict[str, datetime] = {}
@@ -199,6 +208,7 @@ class MemoryIngestStore:
         chunk_fp: str | None,
         embed_fp: str | None,
         parse_fp: str | None = None,
+        glossary_fp: str | None = None,
     ) -> None:
         current = self.lineage.get(document_id, (None, None))
         self.lineage[document_id] = (
@@ -207,6 +217,8 @@ class MemoryIngestStore:
         )
         if parse_fp is not None:
             self.parse_lineage[document_id] = parse_fp
+        if glossary_fp is not None:
+            self.glossary_lineage_by_id[document_id] = glossary_fp
 
     async def set_original(
         self, document_id: str, *, ref: str | None, omitted_reason: str | None
@@ -240,8 +252,15 @@ class MemoryIngestStore:
         *,
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
+        glossary_fp_other_than: str | None = None,
     ) -> int:
-        return len(await self.select_documents(source=source, statuses=statuses))
+        return len(
+            await self.select_documents(
+                source=source,
+                statuses=statuses,
+                glossary_fp_other_than=glossary_fp_other_than,
+            )
+        )
 
     async def select_documents(
         self,
@@ -251,6 +270,7 @@ class MemoryIngestStore:
         media_types: Collection[str] | None = None,
         chunk_fp_other_than: str | None = None,
         parse_fp_current: Collection[str] | None = None,
+        glossary_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> Sequence[Document]:
@@ -272,6 +292,14 @@ class MemoryIngestStore:
         if parse_fp_current is not None:
             current = set(parse_fp_current)
             chosen = [d for d in chosen if d.parse_fp is None or d.parse_fp not in current]
+        if glossary_fp_other_than is not None:
+            # Unrecorded counts as different, which is the half of the predicate a fake is most
+            # likely to get wrong: `.get(id) != x` happens to be right here only because the
+            # default is `None`, and the real store has to say `IS NULL OR <> x` because SQL
+            # would otherwise drop those rows on three-valued logic.
+            chosen = [
+                d for d in chosen if self.glossary_lineage_by_id.get(d.id) != glossary_fp_other_than
+            ]
         # Sliced after every predicate, in that order, because the store applies `OFFSET` to the
         # filtered result and a fake that skipped first would page through a different set.
         chosen = chosen[offset:]
@@ -341,9 +369,22 @@ class MemoryGlossaryStore(MemoryIngestStore):
         self.glossary: dict[str, list[GlossaryEntry]] = {}
 
     async def replace_glossary_entries(
-        self, document_id: str, entries: Sequence[GlossaryEntry]
+        self, document_id: str, entries: Sequence[GlossaryEntry], *, fingerprint: str
     ) -> None:
+        """Both writes together, because the real store makes them one transaction.
+
+        A fake that stored the rows and left the fingerprint to a second call would let a
+        pipeline that forgot the second call pass — and a document holding entries with no
+        recorded detector is the state that versioning them exists to make unreachable.
+        """
         self.glossary[document_id] = list(entries)
+        self.glossary_lineage_by_id[document_id] = fingerprint
+
+    async def glossary_entries(self, document_id: str) -> Sequence[GlossaryEntry]:
+        return list(self.glossary.get(document_id, []))
+
+    async def glossary_lineage(self, document_id: str) -> str | None:
+        return self.glossary_lineage_by_id.get(document_id)
 
 
 UTC_ZERO = datetime.fromtimestamp(0, tz=UTC)

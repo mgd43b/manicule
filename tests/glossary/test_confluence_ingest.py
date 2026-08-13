@@ -66,6 +66,7 @@ from manicule.chunking.sentences import paragraphs
 from manicule.core.protocols import read_blocks
 from manicule.core.retrieval import Query
 from manicule.ingest.glossary import detect_entries
+from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.parsers.config import CONFLUENCE_MEDIA_TYPE, ConfluenceConfig
 from manicule.parsers.confluence import ConfluenceStorageParser
 from manicule.retrieval.confidence import DEFINITION_CITED
@@ -169,7 +170,11 @@ async def _ingest(
     chunks = make_chunker().chunk(document, blocks)
     await store.upsert_document(document)
     await store.replace_chunks(document.id, chunks)
-    await store.replace_glossary_entries(document.id, detect_entries(chunks, title=title))
+    await store.replace_glossary_entries(
+        document.id,
+        detect_entries(chunks, title=title),
+        fingerprint=glossary_fingerprint().canonical(),
+    )
     return document, chunks
 
 
