@@ -1767,3 +1767,55 @@ async def test_schedule_s_is_refused_rather_than_silently_doing_nothing() -> Non
 
     with pytest.raises(ValidationError, match="schedule_s"):
         ConnectorSettings.model_validate({"type": "filesystem", "schedule_s": 300})
+
+
+async def test_the_check_offers_its_command_as_a_remedy_not_only_inside_a_sentence(
+    backend: FakeBackend,
+) -> None:
+    """``remedy`` is the structured half of ``detail``, exactly as ``facts`` is.
+
+    A surface that wants to offer the action should not have to find it inside prose — that is
+    the same reasoning ``Check`` gives for carrying ``facts`` beside ``detail``, and the
+    permissions check is the precedent for setting both. Leaving it empty on the one check whose
+    entire purpose is naming a command is the omission this pins.
+    """
+    backend.store.add(make_document(backend.workspace, source="confluence-snapshot"))
+    service = _with_connectors(
+        backend, **{"team-handbook": {"type": "confluence-snapshot", "options": {"root": "/x"}}}
+    )
+
+    check = _check(await service.doctor(), "connectors")
+
+    assert check.remedy == "manicule document list --source confluence-snapshot"
+
+
+async def test_a_healthy_connector_check_offers_no_remedy(backend: FakeBackend) -> None:
+    """Empty on a healthy check, per ``Check.remedy``'s own contract."""
+    service = _with_connectors(backend, filesystem={"type": "filesystem"})
+
+    assert _check(await service.doctor(), "connectors").remedy == ""
+
+
+async def test_the_policy_hint_is_true_of_a_single_forbidding_setting(
+    backend: FakeBackend,
+) -> None:
+    """``PolicyError`` is raised for two shapes and the hint is printed under both.
+
+    ``policy_problems`` reports settings that are individually valid and jointly wrong. But a
+    connector configured ``enabled = false`` — and ``require_sharing_enabled`` before it — raise
+    the same type with a single setting as the whole cause. A hint saying only "two settings
+    disagree with each other; the message lists every one of them" sends that reader looking for
+    a second setting that does not exist.
+    """
+    from manicule.app.dispatch import run_op  # noqa: PLC0415
+
+    service = _with_connectors(backend, docs={"type": "filesystem", "enabled": False})
+
+    envelope = await run_op(
+        "connector_sync", backend.workspace, lambda: service.connector_sync("docs")
+    )
+
+    assert envelope.error is not None
+    # It must not *lead* with the two-settings claim, which is what sent the reader hunting.
+    # The conditional mention of that case later is fine and is why this checks the opening.
+    assert envelope.error.hint.startswith("Configuration forbids this")

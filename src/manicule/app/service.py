@@ -825,7 +825,7 @@ class ApplicationService:
         # "not created" on every first run, which reads as a fault and is not one.
         checks.append(await self._permissions_check())
         checks.append(await self._index_check())
-        checks.append(await self._connector_identity_check())
+        checks.append(await self._connectors_check())
         checks.append(await self._grammar_check(fix=fix))
         checks.append(await self._vocabulary_check(fix=fix))
         # No `fix`. The other two repairs move megabytes and finish while somebody is looking
@@ -1016,7 +1016,7 @@ class ApplicationService:
             remedy=f"chmod 0700 {where}",
         )
 
-    async def _connector_identity_check(self) -> r.Check:
+    async def _connectors_check(self) -> r.Check:
         """Documents filed under a connector *type* while an instance of that type is configured.
 
         Before #94, ``Connector.name`` was the component name, so ``[connectors.team-handbook]``
@@ -1110,6 +1110,10 @@ class ApplicationService:
                     "instances": sorted(renamed[name] for name in stale),
                 },
             ),
+            # Populated for the same reason `facts` is: `detail` is a sentence, and a surface
+            # that wants to offer the action should not have to find it inside one. The
+            # permissions check sets both and this is the other check with a command to give.
+            remedy=f"manicule document list --source {first}",
         )
 
     async def _index_check(self) -> r.Check:

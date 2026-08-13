@@ -31,9 +31,15 @@ if TYPE_CHECKING:
 
 _HINTS: dict[type[Exception], str] = {
     ConfigError: "Check the setting this names, then run `manicule doctor`.",
+    # Covers two shapes, and naming only the first sent readers hunting for a second setting
+    # that is not there. `policy_problems` reports settings that are individually valid and
+    # jointly wrong — those do list every one. But `require_sharing_enabled`, and a connector
+    # configured `enabled = false`, raise this too, and there the whole cause is the single
+    # setting already named. The hint has to be true of both, because it is printed under both.
     PolicyError: (
-        "Two settings that are each valid disagree with each other. The message lists every "
-        "one of them; fix them together."
+        "Configuration forbids this. Either the setting named above disallows it, or two "
+        "settings that are each valid disagree — where it is the second, the message lists "
+        "every one of them and they are fixed together."
     ),
     UnknownComponentError: (
         "Nothing installed provides that component. Install the distribution that does, or "
