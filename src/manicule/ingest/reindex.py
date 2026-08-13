@@ -715,18 +715,29 @@ async def redetect_glossary(
     entries, and the identity of what produced them. There is no ``pipeline``, no ``blobs``, no
     ``embedder`` and no ``vectors`` argument, so this function could not fetch a source, open a
     retained blob, run a parser or produce a vector if it wanted to — which is a stronger
-    statement than a comment promising it does not, and it is the one
-    ``tests/glossary/test_repair.py`` holds it to by handing it stores that raise on every other
-    method.
+    statement than a comment promising it does not, and
+    ``tests/glossary/test_repair.py::test_the_repair_reaches_no_parser_no_blob_and_no_embedder``
+    asserts it of this signature rather than of one run, because a run only shows what that run
+    did.
 
     A document with no stored chunks is not an error and not unrepairable: it states no
     definitions, that is a derived result, and it is recorded as one. The verb that repairs a
     document with no chunks is ``--re-parse``, and it is a different problem.
 
+    **The write is inside the failure handling as well as the detection**, and that is not
+    defensive breadth. There is a real race: an entry's ``chunk_id`` is a foreign key, this reads
+    the chunks and then writes rows citing them, and a sync re-ingesting the same document in
+    between replaces exactly those chunks — so the insert fails with ``FOREIGN KEY constraint
+    failed``. Unlike the parse sweep, this one takes no lock and shares none, because never
+    reaching the model is the whole point of it. Left uncaught, one concurrently-synced document
+    aborts a corpus-wide repair partway through; caught, it is one line in the report and one
+    document still selected next time.
+
     Returns:
         How many entries the document had, how many it has, and whether the set moved — or a
-        one-line reason when detection raised, in which case **nothing was written**, so the
-        previous entries are still servable and the stale lineage is still stale.
+        one-line reason when the repair did not complete, in which case **nothing was written**
+        for this document, so the previous entries are still servable and the stale lineage is
+        still stale.
     """
     # Imported here rather than at module scope, which keeps `manicule.ingest.reindex` free of
     # the detector for every caller that only re-parses or re-embeds — this module is imported
@@ -737,11 +748,11 @@ async def redetect_glossary(
     chunks = await store.document_chunks(document.id)
     try:
         entries = detect_entries(chunks, title=document.title, media_type=document.media_type)
-    except Exception as exc:  # noqa: BLE001 - a detector bug costs this document and no other
+        await glossary.replace_glossary_entries(
+            document.id, entries, fingerprint=fingerprint.canonical()
+        )
+    except Exception as exc:  # noqa: BLE001 - one document's repair, never the sweep's
         return f"{document.id} ({document.uri}): {type(exc).__name__}: {exc}"
-    await glossary.replace_glossary_entries(
-        document.id, entries, fingerprint=fingerprint.canonical()
-    )
     moved = {_entry_shape(entry) for entry in before} != {_entry_shape(entry) for entry in entries}
     return len(before), len(entries), moved
 
