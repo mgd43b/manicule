@@ -648,10 +648,13 @@ async def test_a_declared_page_identity_is_re_keyed_and_keeps_its_curation(
         assert row["source_id"] == _PAGE
         assert row["title"] == "Retry Runbook", "the re-key rewrote a column it was not asked to"
         assert row["content_hash"] == "h2"
-        assert json.loads(str(row["metadata"]))[_previous_identity_key()] == {
-            "source_id": _CORPUS_PATH,
-            "document_id": "d2",
-        }
+        recorded = json.loads(str(row["metadata"]))[_previous_identity_key()]
+        assert recorded["source_id"] == _CORPUS_PATH
+        assert recorded["document_id"] == "d2"
+        assert recorded["content_hash"] == "h2", (
+            "the seeded document is text/html, so its stored text is about to be wrong and the "
+            "record has to say so — this is what `doctor` reads to know a sync is still owed"
+        )
         assert await _children_of(engine, moved) == before, (
             "the curation did not travel with the document, which is the whole point"
         )
@@ -775,5 +778,39 @@ async def test_a_page_keyed_on_its_path_on_purpose_is_not_re_keyed(data_dir: Pat
             "the migration recorded a move it did not make"
         )
         assert await _children_of(engine, "d2") == before
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
+async def test_a_document_whose_parse_is_unaffected_records_no_staleness(data_dir: Path) -> None:
+    """A mirrored PDF with a manifest is re-keyed and its chunks stay exactly right.
+
+    Recording a staleness marker for it would make ``doctor`` report work that never needs doing
+    and never clears, because its ``content_hash`` never moves — a warning nobody can satisfy,
+    which is the shape this project keeps refusing. Only ``text/html`` is affected, because that
+    is the routing this change moves.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="5f1c8a34b7d9")
+        await _seed(engine)
+        await _seed_declaring(engine)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE documents SET media_type = 'application/pdf' WHERE id = 'd2'")
+            )
+
+        await upgrade(engine)
+
+        from manicule.core.ids import document_id  # noqa: PLC0415
+
+        row = await _document_row(engine, document_id("w", "handbook", _PAGE))
+        assert row is not None, "a manifest-bearing PDF was not re-keyed"
+        recorded = json.loads(str(row["metadata"]))[_previous_identity_key()]
+        assert recorded["document_id"] == "d2", "the move itself was not recorded"
+        assert "content_hash" not in recorded, (
+            "a document whose parse is unaffected was marked as owing a re-parse"
+        )
     finally:
         await engine.dispose()

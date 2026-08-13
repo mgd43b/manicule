@@ -26,12 +26,29 @@ key is updated and each child's reference is updated with it, inside one transac
 ``PRAGMA defer_foreign_keys`` on, so enforcement happens once at commit rather than between two
 statements that are individually inconsistent.
 
-**Chunks and vectors are deliberately left where they are.** They are the generic HTML parse of
-an enriched wrapper, so they are stale text — but the next sync replaces them, because
-``content_hash`` now digests the extracted body and the adapter version is part of the change
-token. Deleting them here would remove content before its replacement exists, which is a worse
-intermediate state than serving one more sync's worth of the old parse. ``chunks.id`` does not
-move, so the vectors keyed on it stay valid throughout.
+**Chunks and vectors are deliberately left where they are, and that has two consequences worth
+stating rather than discovering.**
+
+*The chunks are stale text until the next sync.* They are the generic HTML parse of the enriched
+    wrapper — metadata banner included — so between this migration and the next sync the corpus
+    still returns exactly what the change exists to keep out of it. Deleting them here would
+    remove content before its replacement exists, which is worse. So they stay, and the state is
+    **reported**: :data:`~manicule.core.content.PREVIOUS_IDENTITY` records the ``content_hash``
+    at migration time for every document whose parse will change, ``doctor``'s
+    ``document-content`` check names those
+    documents and the sync that fixes them, and the record clears itself the moment the document
+    is re-ingested with different bytes.
+
+*Their ids stop matching their own derivation.* ``chunk_id`` digests the document id, so a chunk
+    whose parent moved no longer equals ``chunk_id(document_id, position, text)`` — and
+    ``glossary_entry_id`` digests the chunk id, so the same is true one level down. **Nothing
+    recomputes either and compares**: ``chunk_id`` is called in exactly one place
+    (``chunking/chunker.py``) and ``glossary_entry_id`` in one (``storage/glossary.py``), both at
+    write time, to *mint* an id rather than to check one. So the inconsistency is invisible to
+    every read path. Its only cost is that a later re-parse cannot reuse the vector for such a
+    chunk — it replaces it, which is the re-embedding this change made unavoidable anyway.
+    ``tests/ingest/test_storage_integration.py`` migrates, syncs, and asserts that no chunk
+    survives with an id that does not derive.
 
 **Nothing is deleted, and nothing that cannot be re-keyed is touched.** A row whose provenance
 yields no page id is not affected and is left exactly as it was. A row whose new identity is
@@ -41,8 +58,9 @@ means overwriting a document this revision cannot restore. The ``document-identi
 ``doctor`` keeps naming those until a person resolves them.
 
 **The previous identity is recorded before it is overwritten**, under
-:data:`PREVIOUS_IDENTITY` in ``documents.metadata``. Without it the downgrade would be a
-fiction: the old identity was an absolute path, and once ``source_id`` holds the page id nothing
+:data:`~manicule.core.content.PREVIOUS_IDENTITY` in ``documents.metadata``. Without it the
+downgrade would be a fiction: the old identity was an absolute path, and once ``source_id``
+holds the page id nothing
 in the database remembers what the path was — the snapshot's location is recorded *relative to an
 ingestion root* the database does not store. A downgrade that could not restore what it undid
 would be untested code needed exactly once, under pressure.
@@ -69,6 +87,7 @@ import sqlalchemy as sa
 from alembic import op
 
 from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome
+from manicule.core.content import PREVIOUS_IDENTITY
 from manicule.core.ids import document_id
 from manicule.core.provenance import PROVENANCE_KEY
 
@@ -84,13 +103,6 @@ IDENTITY_NOT_APPLIED: Final = AdapterOutcome.IDENTITY_NOT_APPLIED.value
 
 Imported rather than spelled, so that renaming the outcome breaks this revision loudly instead of
 quietly widening what it moves."""
-
-PREVIOUS_IDENTITY: Final = "previous_identity"
-"""``documents.metadata`` key recording what a re-keyed document used to be called.
-
-Written on the way up so the way down is real, and kept afterwards because "this document used to
-be keyed on that path" is a fact an audit of a moved corpus needs and nothing else records.
-"""
 
 _CHILDREN: Final[tuple[str, ...]] = (
     "chunks",
@@ -148,6 +160,24 @@ def _recorded(held: dict[str, Any]) -> str:
     return str(recorded or "")
 
 
+def _stale_after_move(connection: sa.Connection, identifier: str) -> str:
+    """This document's ``content_hash``, when moving it leaves its stored text wrong.
+
+    ``""`` for every document whose parse is unaffected — a mirrored PDF with a manifest beside it
+    is re-keyed and its chunks remain exactly right, so recording a staleness marker for it would
+    make ``doctor`` report work that never needs doing and never clears. Only ``text/html`` is
+    affected, because that is the routing this change moves: an enriched export stops going
+    through the HTML parser and starts going through the storage parser.
+    """
+    row = connection.execute(
+        sa.text("SELECT media_type, content_hash FROM documents WHERE id = :id"),
+        {"id": identifier},
+    ).first()
+    if row is None or row[0] != "text/html":  # pragma: no cover - the caller selected this row
+        return ""
+    return str(row[1] or "")
+
+
 def _rekey(connection: sa.Connection, rows: Sequence[Any], *, direction: str) -> None:
     """Move each document onto its new key, taking its children with it.
 
@@ -162,6 +192,7 @@ def _rekey(connection: sa.Connection, rows: Sequence[Any], *, direction: str) ->
     for row in rows:
         old_id, workspace, source, old_source_id, metadata, declared = row
         held: dict[str, Any] = json.loads(metadata) if metadata else {}
+        stale = _stale_after_move(connection, old_id)
         # **Up derives the key; down reads the one that was recorded.** They are not the same
         # operation reversed. Deriving on the way down assumes the old id *was* a derivation of
         # the old source id, and a row predating some earlier change need not be — so a
@@ -183,7 +214,14 @@ def _rekey(connection: sa.Connection, rows: Sequence[Any], *, direction: str) ->
             )
             continue
         if direction == "up":
-            held[PREVIOUS_IDENTITY] = {"source_id": old_source_id, "document_id": old_id}
+            held[PREVIOUS_IDENTITY] = {
+                "source_id": old_source_id,
+                "document_id": old_id,
+                # Present only where the stored text is about to become wrong — see the module
+                # docstring. `doctor` reads it against the live `content_hash`, so it says
+                # "not re-parsed yet" while they agree and nothing once they do not.
+                **({"content_hash": stale} if stale else {}),
+            }
         else:
             held.pop(PREVIOUS_IDENTITY, None)
         for table in _CHILDREN:
@@ -213,7 +251,19 @@ def _rekey(connection: sa.Connection, rows: Sequence[Any], *, direction: str) ->
 
 def upgrade() -> None:
     connection = op.get_bind()
-    _rekey(connection, connection.execute(_selection("up")).fetchall(), direction="up")
+    rows = connection.execute(_selection("up")).fetchall()
+    _rekey(connection, rows, direction="up")
+    if rows:
+        # Said in the migration's own output as well as in `doctor`, because an operator who runs
+        # this and sees it succeed is at the moment they most need to know it is half the job.
+        _log.warning(
+            "re-keyed %d document(s) onto the identity their source declares. Their identity is "
+            "now correct and their stored text is not: it is the parse from before this change, "
+            "and it is replaced by the next sync. Run `manicule connector sync <name>` (or "
+            "`manicule index <path>`) to rebuild it; `manicule doctor` names any that are still "
+            "waiting.",
+            len(rows),
+        )
 
 
 def downgrade() -> None:
