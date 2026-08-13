@@ -61,12 +61,13 @@ for anything except genuinely new content — which is what `original_ref` in
     sha256/ab/cd/abcd…     retained original bytes
 ```
 
-`manicule.lock` is held for the process lifetime. The recovery sweep, the tombstone sweep and
-the blob GC all assume a single writer, and WAL permits several — so the assumption is to be
-enforced rather than hoped for ([`ingest.md`](ingest.md) §6.5). **Written in the future tense on
-purpose**: the lock is implemented and nothing acquires it, so the file above does not exist in
-any live data directory yet. ([`ingest.md`](ingest.md) §6.5 has the detail and §8.5 has the one
-guarantee about concurrent writers that does not depend on it.)
+`manicule.lock` is held for the process lifetime of whichever process is writing. The recovery
+sweep, the tombstone sweep and the blob GC all assume a single writer, and WAL permits several —
+so the assumption is enforced rather than hoped for ([`ingest.md`](ingest.md) §6.5). Read-only
+commands take nothing and run beside a writer; [`ingest.md`](ingest.md) §8.6 is the
+classification, and §8.5 is the guarantee about concurrent writers that does not depend on any
+of it. The file is a note carrying the holder's process id — deleting it releases nothing, and
+§6.5 says why.
 
 `<data_dir>` resolution and precedence belong to config
 ([#1](https://github.com/mgd43b/manicule/issues/1)). The only requirement storage places on

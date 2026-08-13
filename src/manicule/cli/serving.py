@@ -82,8 +82,14 @@ async def _serve(
     mcp_only: bool,
     web: bool = True,
 ) -> int:
+    # A server is a writer for its whole life, which is what `Runtime.open`'s default already
+    # says. What this has to get right is the *refusal*: the lock is taken by `__aenter__`, so
+    # a second server on the same directory raises from inside the `async with` and would
+    # otherwise reach the terminal as a traceback rather than as the one-line refusal the lock
+    # was written to produce.
     try:
         runtime = Runtime.open(**overrides)
+        runtime.acquire()
     except (ManiculeError, ValueError, OSError) as exc:
         _report(failed("start", "unknown", error_info(exc)), json_output)
         return 1
