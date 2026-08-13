@@ -40,6 +40,45 @@ __all__ = [
 ]
 
 
+def _source_name(context: BuildContext, type_name: str) -> str:
+    """What this connector calls itself: the configured instance, or the type.
+
+    ``Connector.name`` is not a label. ``ingest/pipeline.py`` reads it as ``source`` for every
+    document it stores, as the watermark key and as the run-metadata key, so it is one third of
+    ``document_id(workspace_id, source, source_id)``. Naming a connector after its
+    implementation makes every instance of a type one source — and since ``source_id`` for a
+    mirrored wiki page is the page id, two instances mirroring two deployments then collide on
+    a UNIQUE index and the second silently overwrites the first.
+
+    The fallback matters for one caller and is deliberately the old value rather than an empty
+    string: these factories are public, and one called outside the container has no configured
+    instance to be named after. A connector named ``""`` would file documents under a source
+    that identifies nothing, which is worse than the type it used to be named after.
+    """
+    return context.instance or type_name
+
+
+def _no_root(context: BuildContext, type_name: str, what: str) -> str:
+    """The message for a connector with nowhere to read from.
+
+    Points at the instance's own ``options`` when there is an instance, because that is where
+    the setting belongs and the global slot is the fallback rather than the recommendation.
+    Getting this backwards is what the original bug report was: the error named a global
+    setting the author had already written per-instance, so following it meant duplicating the
+    root and giving every instance of the type the same one.
+    """
+    if context.instance:
+        return (
+            f"connector {context.instance!r} has no root. Set it under "
+            f"[connectors.{context.instance}.options], for example "
+            f'root = "/path/to/{what}".'
+        )
+    return (
+        f"connector {type_name!r} has no root. Set "
+        f'plugins.config."connector.{type_name}".root to the {what}.'
+    )
+
+
 def build_confluence(context: BuildContext) -> Connector:
     """Construct the Confluence connector from validated configuration.
 
@@ -76,7 +115,11 @@ def build_confluence(context: BuildContext) -> Connector:
         raise ConfigError(msg)
     resolved = resolve_credentials(settings)
     credential = credential_for(resolved)
-    return ConfluenceConnector(resolved, ConfluenceClient(resolved, credential=credential))
+    return ConfluenceConnector(
+        resolved,
+        ConfluenceClient(resolved, credential=credential),
+        name=_source_name(context, CONNECTOR_NAME),
+    )
 
 
 def build_filesystem(context: BuildContext) -> Connector:
@@ -100,14 +143,13 @@ def build_filesystem(context: BuildContext) -> Connector:
         raise ConfigError(msg)
     if not settings.root:
         msg = (
-            f"connector {FILESYSTEM_CONNECTOR_NAME!r} has no root. Set "
-            f'plugins.config."connector.filesystem".root to the directory to index, or use '
-            f"`manicule index <path>` for a one-off."
+            _no_root(context, FILESYSTEM_CONNECTOR_NAME, "directory to index")
+            + " Or use `manicule index <path>` for a one-off."
         )
         raise ConfigError(msg)
     return FilesystemConnector(
         Path(settings.root),
-        name=FILESYSTEM_CONNECTOR_NAME,
+        name=_source_name(context, FILESYSTEM_CONNECTOR_NAME),
         include_hidden=settings.include_hidden,
         max_bytes=settings.max_bytes,
     )
@@ -136,13 +178,11 @@ def build_confluence_snapshot(context: BuildContext) -> Connector:
         )
         raise ConfigError(msg)
     if not settings.root:
-        msg = (
-            f"connector {SNAPSHOT_CONNECTOR_NAME!r} has no root. Set "
-            f'plugins.config."connector.confluence-snapshot".root to the directory holding the '
-            f"page snapshots."
-        )
+        msg = _no_root(context, SNAPSHOT_CONNECTOR_NAME, "directory holding the page snapshots")
         raise ConfigError(msg)
-    return ConfluenceSnapshotConnector(Path(settings.root), name=SNAPSHOT_CONNECTOR_NAME)
+    return ConfluenceSnapshotConnector(
+        Path(settings.root), name=_source_name(context, SNAPSHOT_CONNECTOR_NAME)
+    )
 
 
 class ConnectorsPlugin:

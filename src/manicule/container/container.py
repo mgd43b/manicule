@@ -195,10 +195,7 @@ class Container:
             unknown = sorted(set(raw) - set(record.config_model.model_fields))
             if unknown:
                 known = ", ".join(sorted(record.config_model.model_fields)) or "none"
-                msg = (
-                    f"invalid {where}: no such setting(s) "
-                    f"{', '.join(unknown)}. Accepted: {known}"
-                )
+                msg = f"invalid {where}: no such setting(s) {', '.join(unknown)}. Accepted: {known}"
                 raise ConfigError(msg)
         try:
             return record.config_model.model_validate(dict(raw))
@@ -334,7 +331,7 @@ class Container:
         self._order.append(slot)
         self._pending.append(slot)
         await self._setup_pending()
-        return cast("Connector", built)
+        return built
 
     def _connector_config(
         self,

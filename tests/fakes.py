@@ -360,8 +360,13 @@ class HydratingStage(RawVectorStage):
 class MemoryConnector:
     """A connector over a dictionary."""
 
-    def __init__(self, documents: dict[SourceId, str] | None = None) -> None:
-        self.name = "memory"
+    def __init__(
+        self, documents: dict[SourceId, str] | None = None, *, name: str = "memory"
+    ) -> None:
+        # Named by the caller, defaulting to the type, exactly as a real connector is. The
+        # name becomes the `source` half of every document's identity, so a fake that could
+        # only ever be called "memory" cannot exercise two instances of one type at all.
+        self.name = name
         self._documents = documents or {"a": "alpha", "b": "beta"}
         self._watermark: Watermark | None = None
 
