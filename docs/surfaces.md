@@ -302,7 +302,8 @@ Defined in `manicule.app.results` — that module is the definition, this sectio
 
 ### `ask` → `AnswerResultPayload`
 
-`text`, `citations[]`, `dropped`, `confidence`, `confidence_band`, `corpus_consulted`,
+`expansions[]`, `conflicts[]`, `explicit_definition`, `question`, `text`, `citations[]`,
+`dropped`, `confidence`, `confidence_band`, `confidence_reason`, `corpus_consulted`,
 `ungrounded`, `context_truncated`, `redacted`, `finish_reason`, `error`, `conversation_id`,
 `message_id`, `model`, `elapsed_ms`.
 
@@ -320,17 +321,50 @@ Each citation carries `slot`, `document_id`, `chunk_id`, `uri`, `title`, `headin
 
 ### `search` → `SearchResult`
 
-`query`, `profile`, `count`, `hits[]`, `confidence`, `confidence_band`, `confidence_reason`,
-`route`, `cached`, `truncated`, `elapsed_ms`.
+`expansions[]`, `conflicts[]`, `explicit_definition`, `query`, `profile`, `count`, `hits[]`,
+`confidence`, `confidence_band`, `confidence_reason`, `expanded_query`, `route`, `cached`,
+`truncated`, `elapsed_ms`, `collections[]`.
 
 Each hit carries the passage, its document, its anchor, its effective `score` **and** `scores`
 — the score every pipeline stage gave it. The per-stage history is kept because "reranking
 helped" is only checkable while the pre-rerank score survives.
 
+### `explicit_definition` → the `Glossed` contract
+
+The first three fields of both payloads above are one contract, declared once on `Glossed` and
+inherited by both — which is why they lead. `expansions[]` and `conflicts[]` are what the
+glossary had to say about the query; `explicit_definition` is whether the result *answers* it
+by showing a definition.
+
+Three things about it are contract rather than implementation detail:
+
+- **It is a classification, never a quantity.** It is copied from
+  `Confidence.explicit_definition` ([`retrieval.md`](retrieval.md) §14.6.1) and enters no
+  arithmetic, so `confidence`, `confidence_band` and the components behind them are exactly
+  what they were before this field existed. `true` beside `0.00 (none)` is a normal result and
+  not a contradiction: the similarity really is at the corpus's noise level, and somebody
+  really did write down what the term means. Presenting the number as improved because this is
+  set is the one misreading it exists to prevent.
+- **It defaults to `false`, and `false` means "no claim".** A payload stored before the field
+  existed parses and reports `false`; a client written before it existed parses one that
+  carries it. `false` covers an ordinary use of a defined token, a term two documents disagree
+  about, a defining passage that did not reach the delivered context, a directly-routed query,
+  and a corpus that was never consulted — all of which are "we are not showing you a
+  definition" rather than "there is none".
+- **`true` always resolves to a passage.** The model refuses `explicit_definition: true`
+  alongside an empty `expansions[]`, so a client can read the first expansion's `document_id`,
+  `chunk_id`, `title` and `uri` without a presence check. Each expansion also carries its own
+  `provenance` — the same `SourceReference` a hit or a citation carries, `null` for a document
+  with no authoritative record — so the source identity of a definition is on the expansion
+  rather than joined from a hit that may not be there.
+
+`confidence_reason` says the same thing in English and remains the reader-facing explanation.
+It is prose written for a person: parse the boolean, not the sentence.
+
 ### `provenance` → `SourceReference`
 
-On every search hit, every answer citation and every document summary — and `null` on all three
-unless the document carries authoritative source metadata ([`storage.md`](storage.md) §4.2.1): a
+On every search hit, every answer citation, every glossary expansion and every document summary
+— and `null` on all four unless the document carries authoritative source metadata ([`storage.md`](storage.md) §4.2.1): a
 locally mirrored page with a sidecar manifest, or any connector supplying the same record.
 
 `title`, `canonical_uri`, `source_id`, `version`, `modified_at` and `section_path` describe the

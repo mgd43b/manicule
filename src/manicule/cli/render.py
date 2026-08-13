@@ -71,6 +71,21 @@ def render_error(out: Console, op: str, error: r.ErrorInfo) -> None:
 # --- answers and search ---------------------------------------------------------------------
 
 
+EXPLICIT_DEFINITION: Final = "an explicit definition of a term you asked about is cited above"
+"""What the terminal says when ``explicit_definition`` is true.
+
+Printed **beside** the confidence figure rather than in place of it, and it names a passage
+rather than a score. That is the whole of the presentation rule: the number is unchanged — a
+run that reports ``0.00 (none)`` still reports ``0.00 (none)`` — and what the reader gains is
+the fact that one of the passages in front of them is the corpus's own statement of what the
+term means. A line that dressed this up as better evidence would be doing exactly what the
+classification exists to avoid, which is letting a lookup be read as a similarity.
+
+The reason line under it still prints, because ``none`` and ``low`` are the bands whose reason
+is worth the space and this is a case that lands squarely in ``none``.
+"""
+
+
 def render_answer(
     out: Console, payload: r.AnswerResultPayload, *, text_already_shown: bool = False
 ) -> None:
@@ -110,6 +125,8 @@ def render_answer(
     if payload.confidence is not None:
         band = f" ({payload.confidence_band})" if payload.confidence_band else ""
         facts.append(f"confidence {payload.confidence:.2f}{band}")
+    if payload.explicit_definition:
+        facts.append(EXPLICIT_DEFINITION)
     if payload.dropped:
         facts.append(f"{payload.dropped} citation(s) dropped")
     if payload.context_truncated:
@@ -189,6 +206,8 @@ def render_search(out: Console, payload: r.SearchResult) -> None:
     summary = [f"{payload.count} hit(s)", f"profile {payload.profile}"]
     if payload.confidence is not None:
         summary.append(f"confidence {payload.confidence:.2f} ({payload.confidence_band})")
+    if payload.explicit_definition:
+        summary.append(EXPLICIT_DEFINITION)
     if payload.cached:
         summary.append("served from the query cache")
     summary.append(f"{payload.elapsed_ms} ms")

@@ -1889,6 +1889,20 @@ asks how much the passages *resemble* the question, which is a property of two e
 structure, and no cosine expresses it — which is exactly why the two had to be reported side by
 side rather than added together.
 
+#### 14.6.2 It leaves retrieval as a boolean
+
+`explicit_definition` is on the public `search` and `ask` payloads, on every surface that
+publishes them, and on the streamed answer's `final` frame. It is **copied** from the
+`Confidence` above and never recomputed at the boundary: the three conditions need the query
+text, the glossary lookup and the assembled context, and a second opinion assembled from
+`confidence_reason` would be a machine contract parsing English prose written for a person.
+
+Two things can make the payload's `false` where this module's is `true`, and both are absences
+rather than disagreements. A query the router answered directly carries no `Confidence` at all,
+so there is nothing to copy. And a definition whose document became unreadable between the
+lookup and the render loses its provenance — the payload model refuses to claim a citation it
+cannot name, so the claim goes with it. [`surfaces.md`](surfaces.md) §5 is the contract.
+
 ### 14.7 The cache key
 
 `cache_key` carries the expanded query form. The generation counter catches a definition being

@@ -31,9 +31,9 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from manicule.core.version import CORE_VERSION
 
@@ -277,6 +277,11 @@ class GlossaryExpansion(Payload):
     surface cannot forget to include the document, because pydantic will not construct one
     without it.
 
+    :attr:`provenance` is the exception to that and is nullable for the reason
+    :class:`SourceReference` gives: most documents have no authoritative record, and ``null``
+    says so where an empty object would read as one that was looked for and found blank. It is
+    a *second* identity for the same document, never a substitute for the four above.
+
     Not an :class:`Anchored`. An anchor describes a *quotation*, and this is not one — nothing
     here is a passage of text, so an anchor on it would be a location for a span that is never
     shown. :attr:`chunk_id` is the citation, and it resolves through exactly the machinery every
@@ -287,6 +292,15 @@ class GlossaryExpansion(Payload):
     chunk_id: str
     uri: str
     title: str
+    provenance: SourceReference | None = Field(
+        default=None,
+        description="The defining document's authoritative source metadata, when it has any, "
+        "in the same shape a search hit and an answer citation report it. Here rather than left "
+        "to be joined from a hit, because an expansion is reportable on results that contain no "
+        "hit for it at all — a term whose definition was found and then kept out of the context "
+        "is exactly that case — and the source identity of the document a definition was read "
+        "from should not depend on whether the passage happened to survive.",
+    )
 
     acronym: str
     """The normalised key that fired — ``NOW``."""
@@ -335,7 +349,74 @@ class GlossaryConflict(Payload):
     )
 
 
-class SearchResult(Payload):
+class Glossed(Payload):
+    """A result the glossary was consulted for, and what it had to say about the query.
+
+    Carried by ``search`` and by ``ask``, and defined once rather than per payload because the
+    three fields are one contract: :attr:`explicit_definition` is a claim *about*
+    :attr:`expansions`, and a copy of the rule below in each payload is a rule that holds in
+    one of them after somebody edits the other.
+
+    **This is a stable public contract.** ``docs/surfaces.md`` §5 documents it as such: the
+    boolean is flat and defaults to ``false``, so a client written before it existed parses a
+    payload carrying it, and a client written after it parses one that does not.
+    """
+
+    expansions: tuple[GlossaryExpansion, ...] = Field(
+        default=(),
+        description="Glossary terms the query named, each with the document and passage its "
+        "definition was read out of. A result that was retrieved through an expansion has to "
+        "be able to say so: the reader is entitled to know that the search ran on words they "
+        "did not type, and which document put them there.",
+    )
+    conflicts: tuple[GlossaryConflict, ...] = ()
+    explicit_definition: bool = Field(
+        default=False,
+        description="Whether this result answers a question about a term by showing that "
+        "term's definition. **A classification, not a quantity**: it is copied from "
+        "``Confidence.explicit_definition`` and enters no arithmetic, so ``confidence``, its "
+        "band and its components are byte-for-byte what they were before this field existed. "
+        "It is machine-readable on purpose — ``confidence_reason`` says the same thing in "
+        "English, and a client that parsed prose to find it would be reading a sentence "
+        "written for a person. ``false`` for an ordinary use of a defined token, for a "
+        "contested term, when the defining passage did not survive into the delivered "
+        "context, and whenever the corpus was not consulted at all.",
+    )
+
+    @model_validator(mode="after")
+    def _a_cited_definition_is_one_the_reader_can_open(self) -> Self:
+        """Refuse the one combination that would be a claim without a citation.
+
+        Requirement 9 of the specification says an explicit definition must resolve to a
+        document, a chunk, a title and a URI. Every one of those lives on
+        :class:`GlossaryExpansion`, which cannot be built without them — so the whole of the
+        requirement reduces to *there is at least one expansion here*, and that is checkable by
+        the model rather than by whichever test remembered to look.
+
+        It has teeth because the empty case is reachable. A glossary entry whose document this
+        workspace can no longer see is **dropped** from :attr:`expansions` rather than shown
+        with a blank source, and retrieval classified the query before that drop happened. So
+        the state this refuses is one a race really can produce, and the service resolves it by
+        withdrawing the claim rather than by shipping an uncitable one.
+
+        What it does not check, said plainly: *which* expansion was the defining one. With two
+        terms named, one of them definitional, this passes on the presence of either. The
+        narrower fact is not on the payload, and inventing a second opinion about it here —
+        from the query text, or by re-reading the context — would be exactly the derived
+        classification requirement 3 forbids.
+        """
+        if self.explicit_definition and not self.expansions:
+            msg = (
+                "explicit_definition is true and no glossary expansion is reported, so the "
+                "result claims a definition was cited and names no document, chunk, title or "
+                "URI for it. A claim a reader cannot go and check is worse than no claim: "
+                "report false instead."
+            )
+            raise ValueError(msg)
+        return self
+
+
+class SearchResult(Glossed):
     """What ``search`` produced."""
 
     query: str
@@ -345,8 +426,6 @@ class SearchResult(Payload):
     confidence: float | None = None
     confidence_band: str | None = None
     confidence_reason: str = ""
-    expansions: tuple[GlossaryExpansion, ...] = ()
-    conflicts: tuple[GlossaryConflict, ...] = ()
     expanded_query: str = Field(
         default="",
         description="The second query form glossary lookup produced, or empty when none did. "
@@ -375,7 +454,7 @@ class AnswerCitation(Anchored):
     verification: str = ""
 
 
-class AnswerResultPayload(Payload):
+class AnswerResultPayload(Glossed):
     """What ``ask`` produced.
 
     ``confidence`` is absent rather than zero when the corpus was not consulted, and
@@ -390,14 +469,6 @@ class AnswerResultPayload(Payload):
     confidence: float | None = None
     confidence_band: str | None = None
     confidence_reason: str = ""
-    expansions: tuple[GlossaryExpansion, ...] = Field(
-        default=(),
-        description="Glossary terms the question named, each with the document and passage its "
-        "definition was read out of. An answer that was retrieved through an expansion has to "
-        "be able to say so: the reader is entitled to know that the search ran on words they "
-        "did not type, and which document put them there.",
-    )
-    conflicts: tuple[GlossaryConflict, ...] = ()
     corpus_consulted: bool = True
     ungrounded: bool = False
     context_truncated: bool = False
@@ -1392,6 +1463,7 @@ __all__ = [
     "FeedbackRecorded",
     "GlossaryConflict",
     "GlossaryExpansion",
+    "Glossed",
     "Identity",
     "ImportReport",
     "IndexStatus",

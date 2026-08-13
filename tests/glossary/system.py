@@ -31,12 +31,13 @@ from tests.glossary import corpus
 from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from manicule.core.content import Chunk, Document
     from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Embedder
     from manicule.retrieval.ports import GlossarySource
+    from manicule.retrieval.router import QueryRouter
     from manicule.storage.docstore import SqliteDocStore
 
 WORKSPACE = "default"
@@ -143,6 +144,8 @@ async def retriever_over(
     policy: ExpansionPolicy | None = None,
     glossary: GlossarySource | bool = True,
     cache: L1QueryCache | None = None,
+    router: QueryRouter | None = None,
+    overrides: Mapping[str, object] | None = None,
 ) -> Retriever:
     """The shipped retriever, dense + lexical + RRF, over ``chunks``.
 
@@ -154,12 +157,20 @@ async def retriever_over(
     matched with ``is True`` rather than by truthiness, and that is a fix rather than fussiness:
     the first version tested ``if glossary``, so passing a source silently selected the real
     store instead and a tenancy test passed while checking the wrong object entirely.
+
+    ``router`` wires the shipped :class:`~manicule.retrieval.router.QueryRouter`, which the
+    default deliberately leaves out: with no router every query retrieves, which is what nearly
+    every case here wants to exercise. A case about the route a query takes passes one.
+
+    ``overrides`` extends :data:`PROFILE_OVERRIDES` rather than replacing it, so a case that
+    needs one profile field — a context budget small enough to drop a passage — states that
+    field and keeps the floor of zero every other case depends on.
     """
     vectors = CosineVectorStore()
     await vectors.ensure_ready(embedder.fingerprint)
     await vectors.upsert(chunks, await embedder.embed([chunk.embed_text for chunk in chunks]))
 
-    profiles = Profiles(PROFILE_OVERRIDES)
+    profiles = Profiles({**PROFILE_OVERRIDES, **(overrides or {})})
     dense = DenseStage(embedder=embedder, vectors=vectors, docstore=store, profiles=profiles)
     lexical = LexicalStage(docstore=store, profiles=profiles)
     fusion = RRFStage()
@@ -168,6 +179,7 @@ async def retriever_over(
         docstore=store,
         assembler=ContextAssembler(counter=ContextTokenCounter(), profiles=profiles),
         profiles=profiles,
+        router=router,
         cache=cache,
         legs=fusion.legs,
         rrf_k=fusion.k,
