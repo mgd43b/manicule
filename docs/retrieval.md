@@ -1924,6 +1924,54 @@ cannot name, so the claim goes with it. [`surfaces.md`](surfaces.md) §5 is the 
 added, because that is a row; it catches neither expansion being switched off nor a second
 definition turning a term into a conflict, and both change the ranking without changing the corpus.
 
+### 14.8 Multi-word terms: a design note, not a plan
+
+A glossary is full of terms that are not abbreviations — `Change Freeze Window`, `Golden Path`,
+`Blast Radius`. None of them can be detected today, and this records **why the obvious fix is not
+the fix**, so that whoever takes it starts from the right question.
+
+**The gate that refuses them is not the one it looks like.** `acronym_shaped` is the visible
+rule and it does refuse them — `Golden Path` is 0.20 upper case against a 0.6 share — but
+deleting it would change nothing, because `normalise_acronym` in `core/glossary.py` refuses them
+independently and it is the one that decides the *key*:
+
+| Surface | Upper | Length | Charset | `normalise_acronym` |
+|---|---|---|---|---|
+| `Golden Path` | `GOLDEN PATH` | 11 ≤ 12 | space not in `isalnum() or -&/` | `''` |
+| `Blast Radius` | `BLAST RADIUS` | 12 ≤ 12 | space refused | `''` |
+| `Change Freeze Window` | `CHANGE FREEZE WINDOW` | **20 > `MAX_ACRONYM_LENGTH`** | space refused | `''` |
+
+`detect_in_chunk` then skips on `if not acronym`. So the question is not "how upper-case must a
+term look" but **what a glossary lookup key is allowed to be**, and that is a different question
+with a wider blast radius.
+
+**What widening the key would touch, all at once.** The key is not a detection detail; it is the
+string everything resolves through, at ingest and at query time alike (§14.3):
+
+- **`core/glossary.py`** — `MAX_ACRONYM_LENGTH` is 12 because "above this the token is a word,
+  not an abbreviation", which is the assumption being discarded rather than tuned. The charset
+  rule would have to admit the separator, and `GlossaryEntry.acronym` carries a `min_length`
+  constraint that decides what may be persisted at all.
+- **The query normaliser** — a query is tokenised and each token normalised before lookup
+  (§14.5). A multi-word key cannot be found by a single-token lookup however it is stored, so
+  matching would need an n-gram pass over the query, and the homograph rules that stop `now`
+  expanding every sentence would need an equivalent for phrases.
+- **Storage** — keys and aliases are indexed columns, and `glossary_entry_id` derives a row's
+  primary key from its content.
+- **Detection** — every written form's left-hand side is `_TERM`, bounded by
+  `MAX_ACRONYM_LENGTH` and admitting no spaces.
+
+**And the evidence model has nothing to offer a phrase.** `INITIALS_EVIDENCE` is the strongest
+signal detection has, and it is meaningless here: `Golden Path` has no initials to spell and
+nothing to agree with. What remains is the form weight and the page-level context — precisely
+the pairing §14.3 refuses for headings, because it admits anything shaped like the form. So
+multi-word terms do not merely need a wider key; they need **a source of evidence this feature
+does not currently have**, and choosing one is the real work.
+
+**Not started, deliberately.** This is a note about a change nobody has been asked to make. The
+measurements behind it are in the nine-shape sweep: 0 of 3 multi-word terms detected, refused by
+`normalise_acronym` rather than by `acronym_shaped`.
+
 ---
 
 ## Appendix A: decisions this document made
