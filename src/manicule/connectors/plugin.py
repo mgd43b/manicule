@@ -164,6 +164,10 @@ def build_filesystem(context: BuildContext) -> Connector:
         include_hidden=settings.include_hidden,
         max_bytes=settings.max_bytes,
         profiles=settings.enriched_profiles,
+        # Only when the name came from a configured instance rather than from the fallback in
+        # `_source_name`. It decides whether remediation text may name `--source <name>`, and
+        # that name has to be one `manicule connector sidecar --source` can actually resolve.
+        configured=bool(context.instance),
     )
 
 

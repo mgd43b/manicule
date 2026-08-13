@@ -1039,6 +1039,25 @@ class SidecarReport(Payload):
     """
 
     root: str
+    source: str = Field(
+        default="",
+        description="The configured connector instance the root and profiles came from, or "
+        "empty for a one-off conversion of a directory named directly.",
+    )
+    profiles: tuple[str, ...] = Field(
+        default=(),
+        description="The enriched-document profiles this run recognised, in the precedence "
+        "order they were applied in.",
+    )
+    """Reported because it is the answer to the question a disappointing run raises.
+
+    ``no_profile`` for every page means "none of these matched what I was looking for", and the
+    operator's next move depends entirely on *what it was looking for* — the built-in default, or
+    the two profiles their source declares. Leaving that to be inferred from whether ``--source``
+    was typed is how a conversion run under the wrong profile set looks identical to a directory
+    of ordinary HTML.
+    """
+
     considered: int = Field(default=0, ge=0)
     written: int = Field(default=0, ge=0)
     skipped: tuple[SidecarSkip, ...] = ()

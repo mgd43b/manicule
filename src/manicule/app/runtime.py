@@ -620,6 +620,16 @@ class _Ingestion:
         pipeline = await self._runtime.pipeline()
         return await pipeline.run(await self._runtime.connector(connector), limit=limit)
 
+    async def connector(self, name: str) -> Connector:
+        """The connector :meth:`sync` would run, handed back instead of run.
+
+        One line, and it is deliberately the same line :meth:`sync` opens with rather than a
+        parallel construction beside it. The container caches per instance, so a caller that
+        asks for a source's profiles and then syncs it gets one object and cannot observe two
+        readings of one configuration.
+        """
+        return await self._runtime.connector(name)
+
     async def reindex(self, document_id: str) -> ReindexReport:
         from manicule.ingest.reindex import reindex_document  # noqa: PLC0415
 

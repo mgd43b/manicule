@@ -403,6 +403,11 @@ def render_sidecar(out: Console, payload: r.SidecarReport) -> None:
         f"[bold]{payload.written}[/bold] of {payload.considered} page(s) under "
         f"{escape(payload.root)}"
     )
+    # Which profiles ran, always, and not only when something went wrong. "No pages adapted" and
+    # "no pages adapted, looking for the default profile" are the same line to a reader who has
+    # to remember whether they typed `--source`, and the second is the one that says what to fix.
+    origin = f"source {escape(payload.source)}" if payload.source else "no configured source"
+    out.print(f"[dim]{origin}; profile(s): {escape(', '.join(payload.profiles) or 'none')}[/dim]")
     if payload.considered and not payload.written:
         # Said outright rather than left to be read off a zero. "0 of 40" is a number somebody
         # scans past; "adapted no pages at all" is the sentence that makes them read the reasons

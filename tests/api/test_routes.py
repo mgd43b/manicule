@@ -239,6 +239,18 @@ ABSENT: tuple[tuple[str, str, Reach, str], ...] = (
         Reach.UNROUTED,
         "a benchmark on request is a denial of service",
     ),
+    (
+        "POST",
+        "/api/v1/connectors/sidecar",
+        Reach.UNROUTED,
+        "sidecar generation writes files into the corpus directory",
+    ),
+    (
+        "POST",
+        "/api/v1/admin/sidecar",
+        Reach.UNROUTED,
+        "the same operation under an admin path",
+    ),
 )
 """Operations that exist elsewhere in manicule and are deliberately not routes here.
 
@@ -316,6 +328,32 @@ def test_no_route_installs_a_plugin() -> None:
         f"a route installs plugins: {offending}. Installing a plugin fetches and executes code, "
         f"so it stays on the command line; this surface only enables one that an operator has "
         f"already put on disk."
+    )
+
+
+def test_no_route_generates_sidecar_manifests() -> None:
+    """Asserted by name over the route table as well as by path, and both are needed.
+
+    The two ``ABSENT`` entries above say that the paths somebody would *guess* are unrouted.
+    They say nothing about a route mounted somewhere nobody guessed, and "an operation
+    reappearing under a name nobody predicted" is exactly what ``routing_support`` says a path
+    probe cannot catch — which is why ``plugins/install`` has a test of this shape too.
+
+    Sidecar generation is the one operation that writes into the corpus *directory* rather than
+    into the index: a manifest beside every page under a root the caller names. Everything else
+    manicule does to a corpus is read-only, so an unattended surface able to write into one is a
+    new kind of authority rather than a new operation. It stays where a person is present.
+    ``tests/app/test_surface_parity.py`` holds the same line for MCP; this holds it for HTTP.
+    """
+    offending = sorted(
+        f"{route.name} {route.path}"
+        for route in walk_routes()
+        if "sidecar" in route.path.lower() or "sidecar" in route.name.lower()
+    )
+    assert offending == [], (
+        f"a route generates sidecar manifests: {offending}. That writes files into the "
+        f"operator's corpus directory at a path the request names, so it stays on the command "
+        f"line where a person is present."
     )
 
 

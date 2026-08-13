@@ -841,7 +841,21 @@ def connector_sync(
 
 @connector_app.command("sidecar")
 def connector_sidecar(
-    root: Annotated[Path, typer.Argument(help="Directory of enriched HTML pages.")],
+    root: Annotated[
+        Path | None,
+        typer.Argument(
+            help="Directory of enriched HTML pages. With --source, a subdirectory of that "
+            "source's root; omit it to convert the whole root."
+        ),
+    ] = None,
+    source: Annotated[
+        str,
+        typer.Option(
+            "--source",
+            help="A configured filesystem source. Takes its root and its enriched profiles "
+            "from the connector `connector sync` would run.",
+        ),
+    ] = "",
     force: Annotated[
         bool, typer.Option("--force", help="Replace manifests that already exist.")
     ] = False,
@@ -849,8 +863,18 @@ def connector_sidecar(
     """Record what enriched HTML pages say about themselves, for filesystem ingestion.
 
     Writes `<page>.source.json` beside each page. The pages themselves are never modified.
+
+    Pass `--source` for a corpus whose exporter spells its markers differently. Without it the
+    run uses the built-in default profile, which reports `no_profile` for every page of a
+    corpus the configured sync adapts perfectly well.
+
+    Command line only. It is the one operation that writes into the corpus *directory* rather
+    than into the index, so it stays on the surface where a person is present.
     """
-    emit("connector_sidecar", lambda service: service.connector_sidecar(root, force=force))
+    emit(
+        "connector_sidecar",
+        lambda service: service.connector_sidecar(root, source=source, force=force),
+    )
 
 
 @connector_app.command("login")
