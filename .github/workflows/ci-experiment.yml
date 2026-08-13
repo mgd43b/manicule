@@ -1,5 +1,11 @@
-# TEMPORARY. This workflow exists to measure what the test job spends its time on. It is
-# deleted before this branch merges. Nothing depends on it.
+# TEMPORARY. A single probe: does pytest-xdist work on this suite at all? This project has a
+# documented history of native crashes (`src/manicule/parsers/sourcecode.py` on tree-sitter
+# `Point` objects, `src/manicule/testing/contracts.py` on async-generator finalisation), and
+# xdist is process-parallel, so the question is whether it survives rather than whether it is
+# fast. `filterwarnings = ["error"]` and `asyncio_mode = "auto"` are both in play too.
+#
+# Deleted before this branch merges either way. A single green run would not be grounds for
+# shipping process parallelism against an intermittent crash.
 
 name: CI experiment (temporary)
 
@@ -17,56 +23,22 @@ env:
   UV_FROZEN: "1"
 
 jobs:
-  # Four arms of the same suite on the same runner class, differing only in how execution is
-  # measured. Every arm also writes a JUnit report, so the per-test duration distribution and
-  # the collected test count can both be read afterwards - a faster arm that ran fewer tests
-  # is not a faster arm.
-  measure:
-    name: measure (${{ matrix.arm }})
+  xdist:
+    name: xdist probe (${{ matrix.dist }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # What CI runs today: branch coverage, C tracer.
-          - arm: a-cov-branch-ctrace
-            core: ""
-            args: "--cov --cov-report=term-missing"
-          # No measurement at all: the floor.
-          - arm: b-no-cov
-            core: ""
-            args: ""
-          # Line coverage, C tracer: what dropping `branch = true` alone buys.
-          - arm: c-cov-line-ctrace
-            core: ""
-            args: "--cov --cov-report=term-missing --cov-config=cov-line.ini"
-          # Line coverage, sys.monitoring: the fast core. It cannot measure branches before
-          # CPython 3.14, so it is only available together with the line-only config.
-          - arm: d-cov-line-sysmon
-            core: "sysmon"
-            args: "--cov --cov-report=term-missing --cov-config=cov-line.ini"
+        # `load` hands out individual tests, `loadfile` keeps a module's tests on one worker.
+        # If module-scoped state is what breaks, the two disagree and that is worth knowing.
+        dist: ["load", "loadfile"]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: uv sync --all-groups --all-extras --python 3.12
-      - name: the line-only coverage config
-        # `--cov-config` replaces the configuration wholesale, so everything that matters has
-        # to be restated here - the source root and the report exclusions from pyproject.toml.
-        # Only `branch` differs.
-        run: |
-          cat > cov-line.ini <<'INI'
-          [run]
-          source = src/manicule
-          branch = False
-
-          [report]
-          exclude_also =
-              if TYPE_CHECKING:
-              \.\.\.$
-              raise NotImplementedError
-          INI
+      - run: nproc
       - name: cache tree-sitter grammars
         uses: actions/cache@v6
         with:
@@ -94,18 +66,18 @@ jobs:
           print('seeded:', vocabularies.prefetch(wanted));
           missing = vocabularies.missing_vocabularies(wanted);
           assert not missing, f'vocabularies still missing after pre-seed: {missing}'"
-      - name: pytest
+      - name: pytest -n auto
         env:
           REQUIRE_GRAMMAR_BUNDLE: "1"
           REQUIRE_VOCABULARY_BUNDLE: "1"
           TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
-          COVERAGE_CORE: ${{ matrix.core }}
         run: >-
-          uv run --python 3.12 pytest ${{ matrix.args }}
-          --durations=40 --junit-xml=junit-${{ matrix.arm }}.xml
+          uv run --python 3.12 pytest --cov --cov-report=term-missing
+          -n auto --dist ${{ matrix.dist }}
+          --durations=25 --junit-xml=junit-xdist-${{ matrix.dist }}.xml
       - name: keep the JUnit report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: junit-${{ matrix.arm }}
-          path: junit-${{ matrix.arm }}.xml
+          name: junit-xdist-${{ matrix.dist }}
+          path: junit-xdist-${{ matrix.dist }}.xml
