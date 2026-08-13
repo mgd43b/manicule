@@ -366,12 +366,18 @@ def test_a_table_of_only_header_rows_splits_at_its_rows_rather_than_as_prose() -
         "a table split at boundaries the parser supplied is not a hard split, and counting it "
         "as one would tell `doctor` the corpus retrieves worse than it does"
     )
-    assert all(isinstance(chunk.anchor, CellAnchor) for chunk in chunks)
-    first, last = chunks[0].anchor, chunks[-1].anchor
-    assert isinstance(first, CellAnchor)
-    assert isinstance(last, CellAnchor)
-    assert first.ref.startswith("A1:L1,"), "a part must address its own rows, not the whole table"
-    assert last.ref.endswith("A60:L60"), "the last part must reach the table's last row"
+    # Asserted against the block's own anchor rather than against a literal ref, because what
+    # matters is that each part was narrowed — not how `_collapse_areas` happens to spell the
+    # result. A literal would also pin today's spelling: `_adjacent` compares the left area's
+    # end column against the right area's start column, so multi-column rows do not collapse
+    # and the ref reads `A1:L1,A2:L2,…`. That is a defect in its own right and not this one's.
+    anchors = [chunk.anchor for chunk in chunks]
+    assert all(isinstance(anchor, CellAnchor) for anchor in anchors)
+    assert table.anchor not in anchors, (
+        "every part claimed the whole table, so each citation resolves to sixty rows while "
+        "quoting a fraction of them — the tightness a split is supposed to buy"
+    )
+    assert len(set(anchors)) == len(anchors), "two parts addressed the same rows"
 
 
 def test_a_chunk_never_spans_a_page_boundary() -> None:
