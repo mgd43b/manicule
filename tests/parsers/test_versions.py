@@ -233,3 +233,47 @@ def test_the_runtime_group_excludes_everything_a_parse_fingerprint_records() -> 
         if not any(fnmatch.fnmatch(name, pattern) for pattern in excluded)
     )
     assert leaked == [], f"{leaked} would be swept into the runtime group by its wildcard"
+
+
+# What each parser recorded in the build immediately before #109 (41682bb^), which is the
+# generation whose stored chunks cut a large table mid-row.
+BEFORE_ROWS_METADATA: tuple[tuple[str, str], ...] = (
+    ("adf", "1"),
+    ("confluence", "3"),
+    ("html", "3"),
+    ("markdown", "1"),
+)
+
+
+@pytest.mark.parametrize(("parser", "previous"), BEFORE_ROWS_METADATA)
+def test_a_parser_that_started_describing_its_table_rows_moved_its_fingerprint(
+    parser: str, previous: str
+) -> None:
+    """#109 taught four parsers to emit ``rows`` and bumped none of them.
+
+    Asserted as a fingerprint rather than a literal, for the reason
+    ``test_the_email_parser_records_a_rules_version_that_moved_with_the_conversion`` gives: a
+    literal is a tautology, and what matters is that the fingerprint an already-ingested
+    document carries differs from what this build produces — because that difference is the
+    whole of what selects it for a re-parse.
+
+    The extracted *text* did not move, which is why this was missed: measured across the built
+    corpus at 41682bb^ against 41682bb, no block's text, anchor or heading path changed. What
+    changed is that ``rows`` now describes where the rows are, and
+    :meth:`~manicule.chunking.chunker.StructuralChunker._split_table` cuts an oversized table at
+    those boundaries instead of wherever the budget lands. Blocks are not persisted, so no
+    chunk-level repair can recover a boundary that was never recorded — only a re-parse can, and
+    only a moved ``parse_fp`` selects one.
+    """
+    current = parse_fingerprint(parser)
+    assert current is not None
+    stale = ParseFingerprint(
+        parser=current.parser, version=previous, libraries=dict(current.libraries)
+    )
+
+    assert not current.matches(stale), (
+        f"{parser}'s parse fingerprint still matches the build that did not describe table "
+        f"rows, so documents ingested then keep chunks that cut a table mid-row while their "
+        f"lineage claims to be current"
+    )
+    assert "version" in current.changed_fields(stale)

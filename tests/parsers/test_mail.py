@@ -11,7 +11,7 @@ import pytest
 
 from manicule.chunking import StructuralChunker
 from manicule.core.anchors import LineAnchor
-from manicule.core.content import DocumentStatus, ParsedBlock, RawDocument
+from manicule.core.content import BlockKind, DocumentStatus, ParsedBlock, RawDocument
 from manicule.core.errors import ParseError
 from manicule.core.ids import content_hash
 from manicule.core.protocols import aclose, read_blocks
@@ -603,3 +603,47 @@ def test_the_email_parser_records_a_rules_version_that_moved_with_the_conversion
         "will never be re-parsed and their line anchors address text that is no longer produced"
     )
     assert "version" in current.changed_fields(before)
+
+
+async def test_an_html_body_is_built_from_block_text_alone() -> None:
+    """Why ``PARSERS["email"].rules`` did not move when ``PARSERS["html"].rules`` went 3 -> 4.
+
+    ``email``'s two previous bumps both followed the web parser, and a third would look like the
+    pattern. It is not the pattern, and this is the property that decides it: ``_html_to_text``
+    joins the blocks' ``text`` and reads nothing else, so a change to what the web parser says
+    *about* a block cannot move an email ``LineAnchor``. #109 was exactly such a change — it
+    added ``rows`` to table metadata and left every block's text alone — so bumping ``email``
+    with it would have re-parsed and re-embedded every email in the corpus to produce identical
+    bytes.
+
+    Asserted against the web parser's own blocks rather than against a stored expectation,
+    because the claim is about the coupling between the two parsers and not about this fixture:
+    the day the conversion starts reading metadata, ``email`` has to move with ``html`` again
+    and this is what says so. Both sides run through the parsers' public surfaces, so what is
+    compared is what a stored anchor actually addresses.
+    """
+    from manicule.parsers.config import WebConfig  # noqa: PLC0415 - the conversion's own parser
+    from manicule.parsers.web import WebParser  # noqa: PLC0415
+
+    rows = "".join(
+        f"<tr><td>T{index:03d}</td><td>Expansion {index}</td></tr>" for index in range(60)
+    )
+    body = (
+        "<html><body><p>Glossary follows.</p>"
+        f"<table><thead><tr><th>Term</th><th>Meaning</th></tr></thead><tbody>{rows}</tbody></table>"
+        "<p>Regards.</p></body></html>"
+    )
+
+    web = await read_blocks(WebParser(WebConfig()), raw_of(body, "text/html"))
+    table = next(block for block in web if block.kind is BlockKind.TABLE)
+    assert table.metadata["rows"], "the fixture must carry the metadata whose influence is denied"
+
+    mail = await read_blocks(MailParser(MailConfig()), _html_message(body))
+
+    # The first block is the rendered headers; the rest are the converted body, one per block
+    # the web parser yielded, which is what makes their line numbers a function of that text.
+    assert [block.text for block in mail[1:]] == [block.text for block in web], (
+        "an HTML-only body's blocks are no longer the web parser's blocks, so what that parser "
+        "says *about* a block can now move an email LineAnchor — and PARSERS['email'].rules has "
+        "to move with PARSERS['html'].rules again"
+    )

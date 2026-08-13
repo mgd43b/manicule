@@ -34,7 +34,46 @@ from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import chunk_id
 
 CHUNKER_NAME = "structural"
-CHUNKER_VERSION = "1"
+
+CHUNKER_VERSION = "2"
+"""This chunker's own version, and what moving it costs.
+
+1 -> 2: an oversized table with no non-header row is split at its rows with no header
+repeated, instead of producing nothing. Under version 1 ``_split_table`` built its parts by
+iterating the rows *after* the header, so a table whose rows were all header rows returned an
+empty list — the block reached no chunk, no vector and no citation, and a document that was
+only that table produced zero chunks and was indistinguishable from one with no extractable
+text. Every parser that emits ``rows`` could produce it: reproduced through all seven. A
+table whose ``rows`` list is empty splits as prose, which is the answer this function already
+gives when ``rows`` is absent and there is genuinely no boundary to use.
+
+**What the bump costs an existing index**, since a version is only worth having if somebody
+can price it:
+
+- **Chunks that change**: only documents holding a table that is over the budget *and* has no
+  non-header row. Everything else re-chunks to byte-identical chunks with byte-identical
+  boundaries — this adds chunks where there were none and moves no boundary that exists.
+  Measured rather than asserted: all 56 fixtures in the built corpus that these seven parsers
+  read were chunked under both bodies and produced identical chunk lists. None of them holds
+  the shape, which is why nothing failed while the content was being dropped.
+- **Re-chunk and re-embed**: the whole corpus, including the documents whose chunks do not
+  move. ``ChunkFingerprint`` records the chunker's version and not the document's content, so
+  after the bump it matches for none of them, and ``check_before_run`` refuses the run until
+  the operator re-chunks. Nothing can tell in advance which documents hold the shape without
+  chunking them to find out, and a fingerprint that could would be a hash of the output rather
+  than of the rules — the same reasoning ``PARSERS["confluence"]``'s 1 -> 2 records.
+- **Why not leave it**, which is the tempting option because the shape is rare and the bill is
+  corpus-wide: ``documents.chunk_fp`` is the only per-document lineage for chunking, and
+  :func:`~manicule.ingest.reindex.select` finds stale documents by asking for the ones a
+  *different* chunker built. Fixing forward without a bump would leave every already-ingested
+  document that hit this permanently invisible to ``reindex`` — the content still missing,
+  behind a fingerprint claiming to be current. That is the two-generations corpus
+  ``parsers/versions.py`` exists to prevent, one stage along.
+
+No parser ``rules`` version moves with it. What the parsers extract is unchanged: this is a
+change to what the chunker does with identical blocks, which is the division
+``PARSERS["html"]``'s 2 -> 3 comment draws from the other side.
+"""
 
 MAX_TOKENS = 512
 OVERLAP_TOKENS = 64
@@ -269,7 +308,33 @@ class StructuralChunker:
             # split at that is not a guess about the rendering. Prose splitting keeps the
             # text whole and is honest about having no better structure.
             return self._split_prose(block)
+        if not rows:
+            # A table whose rows the parser described as none of them. There is no boundary to
+            # split at for the same reason as above, and the block still has text: it reaches
+            # here only by exceeding the budget.
+            return self._split_prose(block)
         header_rows = _non_negative_int(block.metadata.get("header_rows"))
+        if header_rows >= len(rows):
+            # Every row is a header row, so there is no data row to repeat a header *into*.
+            #
+            # This returned nothing at all before, because the loop below starts after the
+            # header and had nowhere to start: an oversized header-only table reached no
+            # chunk, no vector and no citation, and a document that was only that table
+            # produced zero chunks and was indistinguishable from one with no extractable
+            # text. ``docs/parsing.md`` §4.2 says there is no depth at which splitting gives
+            # up, and this was one. Every parser that emits ``rows`` can produce the shape —
+            # a Markdown pipe table of a header and its delimiter, a ``<thead>`` with no
+            # ``<tbody>``, a one-row sheet under ``header_rows: 1``.
+            #
+            # Splitting by row with no header repeated, rather than falling back to prose.
+            # Prose is what this function gives when ``rows`` is *absent*, and the two are not
+            # the same situation: there the row boundaries are unknown, here they are known
+            # and merely all header. Prose splitting would discard them and cut the table
+            # mid-row and mid-cell — measured on a 60-row all-header table, three rows were
+            # left in no chunk intact — which is the defect that emitting ``rows`` exists to
+            # prevent. Splitting at the boundaries also keeps each part's ``CellAnchor``
+            # narrowed to its own rows instead of every part claiming the whole table.
+            header_rows = 0
         refs = _string_list(block.metadata.get("row_refs"))
         header = rows[:header_rows]
         header_text = "\n".join(header)
@@ -288,6 +353,10 @@ class StructuralChunker:
             running += row_tokens
         if current:
             parts.append(current)
+        # ``parts`` is never empty here: ``rows`` is non-empty and ``header_rows`` is now
+        # strictly less than its length, so the loop above ran at least once. Both facts are
+        # established directly above, which is what lets everything below index ``parts``
+        # without asking whether the table produced anything.
 
         units: list[_Unit] = []
         for part_index, indices in enumerate(parts, start=1):
