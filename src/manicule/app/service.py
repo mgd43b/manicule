@@ -996,8 +996,21 @@ class ApplicationService:
         require_owns(self.workspace, document)
         ingestion = await self._backend.ingestion()
         report = await ingestion.reindex(document_id)
-        detail = "; ".join([*report.unrepairable, *report.failures])
-        status = "reindexed" if report.documents else ("failed" if detail else "unchanged")
+        detail = "; ".join([*report.unrepairable, *report.failures, *report.superseded])
+        # **``superseded`` is read first, and both halves of that matter.** Ahead of
+        # ``unchanged``, because a refused re-parse is not an unchanged one: nothing was
+        # compared and the commit was declined, and ``unchanged`` with an empty detail is the
+        # one answer that tells an operator to stop looking. Ahead of ``failed``, because
+        # nothing failed — the corpus holds newer text than this run was working from, which is
+        # the outcome anybody would have wanted.
+        if report.superseded:
+            status = "superseded"
+        elif report.documents:
+            status = "reindexed"
+        elif detail:
+            status = "failed"
+        else:
+            status = "unchanged"
         return r.DocumentReindexed(
             document_id=document_id, status=status, chunks=report.chunks, detail=detail
         )

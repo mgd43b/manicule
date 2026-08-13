@@ -293,6 +293,43 @@ async def test_reindexing_reports_what_could_not_be_repaired(
     assert "no retained bytes" in outcome.detail
 
 
+async def test_reindexing_a_document_a_sync_overtook_says_so_rather_than_unchanged(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The single-document verb reads the same third outcome the sweep does.
+
+    ``unchanged`` is the trap, and it is the answer this used to give: the status is derived
+    from ``documents``, ``unrepairable`` and ``failures``, and a refused commit is in none of
+    them — so an operator who ran ``document reindex`` during a sync was told the re-parse had
+    produced exactly what was already stored, with no detail, which is the one reply that tells
+    them to stop looking. The re-parse did not run to a conclusion at all; something newer
+    landed and the commit was declined.
+
+    ``failed`` would be the other wrong answer, for the opposite reason: nothing failed, and the
+    corpus came out of it holding better text than this run was working from.
+    """
+    from manicule.ingest.reindex import ReindexReport  # noqa: PLC0415
+
+    overtaken = ReindexReport()
+    overtaken.superseded.append("doc-3: a newer revision was committed while this was re-parsed")
+
+    async def reindex(document_id: str) -> ReindexReport:
+        del document_id
+        return overtaken
+
+    backend.ingestion_.reindex = reindex
+    document_id = next(iter(backend.store.documents))
+
+    outcome = await service.document_reindex(document_id)
+
+    assert outcome.status == "superseded"
+    assert "a newer revision was committed" in outcome.detail, (
+        "and the reason travels with it; a status nobody can account for is the other half of "
+        "the same failure"
+    )
+    assert outcome.chunks == 0
+
+
 async def test_a_corpus_sweep_carries_every_count_the_ingest_layer_produced(
     service: ApplicationService, backend: FakeBackend
 ) -> None:

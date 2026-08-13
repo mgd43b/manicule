@@ -303,11 +303,18 @@ def render_document_deleted(out: Console, payload: r.DocumentDeleted) -> None:
 
 
 def render_document_reindexed(out: Console, payload: r.DocumentReindexed) -> None:
+    """One document's outcome, with the detail coloured by whether it is a problem.
+
+    ``superseded`` is dim rather than yellow for the same reason the sweep's list of them is:
+    it is the only one of the four statuses that needs nothing done about it, and colouring it
+    like an unrepairable document would send somebody looking for a fault that is not there.
+    """
     out.print(
         f"{escape(payload.status)} [bold]{payload.document_id}[/bold] ({payload.chunks} chunk(s))"
     )
     if payload.detail:
-        out.print(f"[yellow]{escape(payload.detail)}[/yellow]")
+        style = "dim" if payload.status == "superseded" else "yellow"
+        out.print(f"[{style}]{escape(payload.detail)}[/{style}]")
 
 
 def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:

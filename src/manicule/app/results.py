@@ -547,6 +547,15 @@ class DocumentReindexed(Payload):
 
     document_id: str
     status: str
+    """``reindexed``, ``superseded``, ``failed`` or ``unchanged``. Four words, and no others.
+
+    ``superseded`` is the one that is neither a success nor a problem: a connector sync
+    committed newer bytes for this document while it was being re-parsed, so the commit was
+    declined and the corpus holds the newer text. Distinct from ``unchanged``, which says the
+    re-parse ran and produced what was already stored — the opposite claim, and the one a reader
+    stops looking after.
+    """
+
     chunks: int = Field(ge=0)
     detail: str = ""
 
