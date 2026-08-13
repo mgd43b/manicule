@@ -115,6 +115,21 @@ CORPORA: dict[str, Corpus] = {
         required=("typical.json", "structure.json"),
         min_blocks=40,
     ),
+    "confluence": Corpus(
+        directory="confluence",
+        media_types={".storage": parser_config.CONFLUENCE_MEDIA_TYPE},
+        required=("typical.storage", "structure.storage", "hostile.storage"),
+        min_blocks=60,
+        ambiguous={
+            "structure.storage": (
+                "two sections share the heading path 'Capacity review > Region > "
+                "Configuration', so the anchored one's resolved span contains the other's "
+                "whole heading block, and assertion 3 cannot tell that apart from a misplaced "
+                "anchor. The repeat is the point of the fixture. Covered by test_confluence.py"
+                "::test_a_repeated_heading_path_is_unlocated_unless_an_anchor_macro_addresses_it"
+            )
+        },
+    ),
     "docx": Corpus(
         directory="word",
         media_types={".docx": _DOCX},

@@ -97,6 +97,14 @@ PARSERS: tuple[_Registration, ...] = (
         summary="Confluence Atlassian Document Format, with the source's own anchors.",
     ),
     _Registration(
+        name="confluence",
+        module="manicule.parsers.confluence",
+        factory="ConfluenceStorageParser",
+        config_model=parser_config.ConfluenceConfig,
+        media_types=parser_config.CONFLUENCE_MEDIA_TYPES,
+        summary="Confluence storage format: macros, panels and tasks read as Confluence.",
+    ),
+    _Registration(
         name="docx",
         module="manicule.parsers.word",
         factory="WordParser",

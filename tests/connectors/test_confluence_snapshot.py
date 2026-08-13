@@ -18,6 +18,7 @@ thousand pages that ingests nine thousand and reports a clean run.
 from __future__ import annotations
 
 import json
+from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -26,19 +27,20 @@ from manicule.connectors.confluence import SPACE_KEY
 from manicule.connectors.confluence_snapshot import (
     ANCESTOR_IDS,
     ATTACHMENTS,
-    BODY_CONTENT_DROPPED,
     CONTENT_STATUS,
     LABELS,
     MANIFEST_NAME,
     UNIDENTIFIED_PREFIX,
     UNINTERPRETED_MACROS,
+    UNRECOVERABLE_MACRO_BODY,
     ConfluenceSnapshotConnector,
 )
 from manicule.connectors.errors import NotFoundError
 from manicule.core.lifecycle import SupportsTeardown
-from manicule.core.protocols import Connector
+from manicule.core.protocols import Connector, read_blocks
 from manicule.core.provenance import Provenance
 from manicule.core.sources import DocRef
+from manicule.parsers.plugin import PARSERS
 from manicule.testing import assert_connector_contract
 
 if TYPE_CHECKING:
@@ -628,17 +630,16 @@ async def test_an_unchanged_snapshot_keeps_its_token(tmp_path: Path) -> None:
     assert first == second
 
 
-# --- the interim honesty this connector ships with --------------------------------------------
+# --- diagnostics that describe what actually reaches the index ---------------------------------
 
 
-async def test_a_page_with_macros_says_the_parser_will_not_understand_them(
-    tmp_path: Path,
-) -> None:
-    """The visible-degradation guard, and the reason this connector can ship before the parser.
+async def test_a_macro_the_parser_reads_is_not_reported_as_uninterpreted(tmp_path: Path) -> None:
+    """The claim this whole key used to make, and it stopped being true.
 
-    Storage format goes to the generic HTML parser for now, which is what the live connector does
-    today — so this is no worse than shipped behaviour. It is, however, lossy, and the loss is
-    recorded rather than left for somebody to discover in a search result that should have matched.
+    A ``warning`` macro was reported as beyond the parser because it *was*: nothing read `ac:*` and
+    a panel's severity was flattened to prose. The storage-format parser reads it now, so reporting
+    it would describe a version of the code that no longer exists — and a diagnostic that lists
+    every macro on the page is one an operator learns to ignore, which costs the real ones too.
     """
     snapshot(
         tmp_path,
@@ -647,16 +648,32 @@ async def test_a_page_with_macros_says_the_parser_will_not_understand_them(
     )
     metadata = await metadata_of(tmp_path)
 
-    assert metadata[UNINTERPRETED_MACROS] == ["warning"]
+    assert UNINTERPRETED_MACROS not in metadata
 
 
-async def test_a_macro_body_held_in_cdata_is_reported_as_content_lost(tmp_path: Path) -> None:
-    """Not flattened — **gone**, and the difference is the whole point of the warning.
+async def test_a_macro_with_no_reader_is_still_reported(tmp_path: Path) -> None:
+    """The other half. Narrowing the claim must not empty it.
 
-    An HTML parser has no CDATA in that context, so ``<![CDATA[...]]>`` reparses as a bogus comment
-    and every code, noformat and Graphviz macro body is absent from the document rather than merely
-    stripped of its semantics. An operator has to be told the difference between "this macro's
-    formatting was lost" and "this macro's text is not in the index".
+    A ``roadmap-planner`` has no reader, so the parser emits a placeholder and the page really does
+    reach the index missing something. That is what the key is for now.
+    """
+    snapshot(
+        tmp_path,
+        body=BODY + '<ac:structured-macro ac:name="roadmap-planner">'
+        '<ac:parameter ac:name="timeline">quarters</ac:parameter></ac:structured-macro>',
+    )
+    metadata = await metadata_of(tmp_path)
+
+    assert metadata[UNINTERPRETED_MACROS] == ["roadmap-planner"]
+
+
+async def test_a_recovered_cdata_body_is_not_reported_as_dropped(tmp_path: Path) -> None:
+    """The stale diagnostic, which contradicted the behaviour for as long as #90 has been merged.
+
+    The connector said ``!body-content-dropped: … content is absent from this document …`` whenever
+    a page held an ``ac:plain-text-body``. Since #90 the HTML parser recovers those sections as
+    escaped text and they reach stored chunks intact, so the sentence was false — and false in the
+    direction that makes somebody go looking for content that was there all along.
     """
     snapshot(
         tmp_path,
@@ -665,11 +682,80 @@ async def test_a_macro_body_held_in_cdata_is_reported_as_content_lost(tmp_path: 
         "</ac:plain-text-body></ac:structured-macro>",
     )
     metadata = await metadata_of(tmp_path)
-    reported = metadata[UNINTERPRETED_MACROS]
 
-    assert isinstance(reported, list)
-    assert "code" in reported
-    assert BODY_CONTENT_DROPPED in reported
+    assert UNRECOVERABLE_MACRO_BODY not in metadata, "the body is recovered, so nothing was lost"
+    assert UNINTERPRETED_MACROS not in metadata, "and `code` is read, so nothing is uninterpreted"
+    assert not any("dropped" in str(value) for value in metadata.values()), (
+        "no diagnostic anywhere may still say the content is gone"
+    )
+
+
+async def test_what_this_connector_declares_reaches_the_parser_that_reads_it(
+    tmp_path: Path,
+) -> None:
+    """The wiring, end to end, through the real registry rather than by inspection.
+
+    Every other test here asserts what the connector *says*. This one follows the declaration to
+    the parser it selects and reads a body with it, because the media type and the registration
+    are edited in different files and a mismatch between them is silent: the body would route to
+    the HTML parser, produce plausible prose, and nothing would raise.
+
+    It also settles bug2's last question in the direction the fix moved it. Code and DOT were not
+    to be claimed as structurally understood until a dedicated parser existed. One does now, so
+    the claim is asserted rather than withheld — the language and the engine come back as
+    properties, and the diagram is not laid out.
+    """
+    body = (
+        BODY + '<ac:structured-macro ac:name="code">'
+        '<ac:parameter ac:name="language">python</ac:parameter>'
+        "<ac:plain-text-body><![CDATA[def retry(attempts):\n    return attempts > 0]]>"
+        "</ac:plain-text-body></ac:structured-macro>"
+        '<ac:structured-macro ac:name="graphviz">'
+        '<ac:parameter ac:name="engine">neato</ac:parameter>'
+        "<ac:plain-text-body><![CDATA[digraph G { client -> server; }]]>"
+        "</ac:plain-text-body></ac:structured-macro>"
+    )
+    snapshot(tmp_path, body=body)
+    connector = ConfluenceSnapshotConnector(tmp_path)
+    raw = await connector.fetch((await discovered(tmp_path))[0].ref)
+
+    claiming = [
+        registration for registration in PARSERS if raw.media_type in registration.media_types
+    ]
+    assert [registration.name for registration in claiming] == ["confluence"], (
+        "exactly one registered parser claims what this connector declares"
+    )
+    module = import_module(claiming[0].module)
+    parser = getattr(module, claiming[0].factory)(claiming[0].config_model())
+    blocks = await read_blocks(parser, raw)
+
+    code = next(block for block in blocks if block.lang == "python")
+    assert "return attempts > 0" in code.text, "the CDATA body reaches the index"
+    assert code.text.splitlines()[0] == "def retry(attempts):", "with its lines intact"
+
+    dot = next(block for block in blocks if block.lang == "dot")
+    assert dot.text == "digraph G { client -> server; }", "character for character"
+    assert dot.metadata["engine"] == "neato"
+    assert dot.metadata["rendered"] is False, "and nothing laid it out"
+
+
+async def test_an_unterminated_cdata_body_is_reported_narrowly(tmp_path: Path) -> None:
+    """What is left of the old warning once it is made true, and it is much rarer.
+
+    Recovery leaves an unterminated section exactly as it found it rather than guessing where the
+    author meant it to end, so this body really is absent. Reported as its own fact rather than as
+    a sentence inside the list of macro names, because "we did not understand this" and "we do not
+    have this" are different claims and only the second is data loss.
+    """
+    snapshot(
+        tmp_path,
+        body=BODY + '<ac:structured-macro ac:name="code">'
+        "<ac:plain-text-body><![CDATA[def retry(): ...</ac:plain-text-body>"
+        "</ac:structured-macro>",
+    )
+    metadata = await metadata_of(tmp_path)
+
+    assert "never closed" in str(metadata[UNRECOVERABLE_MACRO_BODY])
 
 
 async def test_a_page_with_no_macros_carries_no_warning(tmp_path: Path) -> None:
