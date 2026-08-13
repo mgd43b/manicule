@@ -1002,7 +1002,6 @@ class ConnectorSummary(Payload):
     name: str
     type: str
     enabled: bool = True
-    schedule_s: int | None = None
     installed: bool = True
     last_synced_at: str | None = None
     status: str = ""

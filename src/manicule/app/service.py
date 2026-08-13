@@ -47,7 +47,7 @@ from manicule.config.settings import (
     looks_secret,
 )
 from manicule.core.content import DocumentStatus
-from manicule.core.errors import ConfigError, ManiculeError, UnknownEntityError
+from manicule.core.errors import ConfigError, ManiculeError, PolicyError, UnknownEntityError
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id
 from manicule.core.retrieval import Filter, Query, RetrievalProfile
@@ -521,12 +521,25 @@ class ApplicationService:
 
         Raises:
             UnknownEntityError: Configuration has no connector by that name.
+            PolicyError: The source is configured ``enabled = false``. Refused rather than run,
+                because the setting existed and was reported by ``connector list`` while nothing
+                consulted it — so an operator who disabled a source, and checked, was told it was
+                off by the same program that would then sync it. A disabled source that syncs is
+                worse than no switch at all: the switch is what they trusted.
         """
         started = time.monotonic()
-        if name not in self.settings.connectors:
+        configured = self.settings.connectors.get(name)
+        if configured is None:
             known = ", ".join(sorted(self.settings.connectors)) or "none configured"
             msg = f"no connector named {name!r}. Configured: {known}"
             raise UnknownEntityError(msg)
+        if not configured.enabled:
+            msg = (
+                f"connector {name!r} is configured `enabled = false`. Set it to true in "
+                f"[connectors.{name}] to sync it, or use `manicule index <path>` for a one-off "
+                f"that does not change the source's configuration."
+            )
+            raise PolicyError(msg)
         ingestion = await self._backend.ingestion()
         report = await ingestion.sync(name, limit=limit)
         return _ingest_payload(report, started)
@@ -617,7 +630,6 @@ class ApplicationService:
                     name=name,
                     type=configured.type,
                     enabled=configured.enabled,
-                    schedule_s=configured.schedule_s,
                     installed=configured.type in installed if discovery else True,
                     last_synced_at=_text_or_none(metadata.get("last_synced_at")),
                     status=_text(metadata.get("status")),
@@ -860,6 +872,7 @@ class ApplicationService:
         # "not created" on every first run, which reads as a fault and is not one.
         checks.append(await self._permissions_check())
         checks.append(await self._index_check())
+        checks.append(await self._connectors_check())
         checks.append(await self._grammar_check(fix=fix))
         checks.append(await self._vocabulary_check(fix=fix))
         # No `fix`. The other two repairs move megabytes and finish while somebody is looking
@@ -1048,6 +1061,106 @@ class ApplicationService:
             # be read as the whole mode by everyone who did not go and check.
             facts={"path": where, "exposed": True, "exposed_bits": f"{exposed:03o}"},
             remedy=f"chmod 0700 {where}",
+        )
+
+    async def _connectors_check(self) -> r.Check:
+        """Documents filed under a connector *type* while an instance of that type is configured.
+
+        Before #94, ``Connector.name`` was the component name, so ``[connectors.team-handbook]``
+        stored ``source = "confluence-snapshot"``. It is now the instance name — which changes
+        what ``document_id(workspace_id, source, source_id)`` derives from, for exactly those
+        corpora. This is the check that tells an operator before their next sync does.
+
+        **``degraded``, not ``failing``, and the distinction is deliberate.** Nothing is broken:
+        the documents are indexed, searchable and correctly cited, and every query over them
+        works. What is true is that their identity is about to change, which is a thing to act on
+        rather than a fault to repair — the same reading the vocabulary check applies to a
+        capability that is absent rather than damaged. ``failing`` would be defensible if a
+        silent overwrite had *already* happened, but that requires two instances of one type to
+        have both synced, which the pre-#94 code made impossible: they shared one global root and
+        therefore one document set. So the damage this warns about is prospective, and
+        ``degraded`` says so.
+
+        **The remedy named here is one that has been run.** There is deliberately no mention of
+        reconciliation: :func:`manicule.ingest.reconcile.reconcile` exists and is tested, but
+        nothing in the product calls it and no command invokes it, so naming it would send an
+        operator looking for a regime that is not reachable.
+        """
+        configured = self.settings.connectors
+        if not configured:
+            return r.Check(
+                name="connectors",
+                state="ok",
+                detail="no sources configured",
+                facts={"affected": []},
+            )
+        # Only an instance whose name differs from its type moves. `[connectors.filesystem]
+        # type = "filesystem"` stored `source = "filesystem"` before and stores it now, so its
+        # documents keep their ids and reporting it would be a warning about nothing.
+        renamed = {
+            settings.type: name
+            for name, settings in sorted(configured.items())
+            if name != settings.type
+        }
+        if not renamed:
+            return r.Check(
+                name="connectors",
+                state="ok",
+                detail="every configured source is named after its own type, so no document "
+                "identity depends on the change in #94",
+                facts={"affected": []},
+            )
+        try:
+            store = await self._backend.documents()
+            stale = {
+                type_name: count
+                for type_name in renamed
+                if (count := await store.count_documents(source=type_name))
+            }
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            return r.Check(
+                name="connectors",
+                state="unknown",
+                detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        if not stale:
+            return r.Check(
+                name="connectors",
+                state="ok",
+                detail="no documents are filed under a connector type name",
+                facts={"affected": []},
+            )
+        listed = ", ".join(
+            f"{name!r} ({count} document(s))" for name, count in sorted(stale.items())
+        )
+        instances = ", ".join(f"{renamed[name]!r}" for name in sorted(stale))
+        first = sorted(stale)[0]
+        return r.Check(
+            name="connectors",
+            state="degraded",
+            detail=(
+                f"{listed} are filed under a connector *type* name, while the source(s) "
+                f"configured for those types are named {instances}. manicule now records a "
+                f"document's source as the configured instance, so the next sync will index "
+                f"these pages again under new ids and leave the existing rows behind — the "
+                f"corpus will appear to have doubled, and nothing will report an error. "
+                f"Inspect them with `manicule document list --source {first}`, and remove each "
+                f"with `manicule document delete <id>` before or after re-syncing. There is no "
+                f"bulk reconciliation for this and none is implied."
+            ),
+            facts=cast(
+                "dict[str, JsonValue]",
+                {
+                    "affected": sorted(stale),
+                    "documents": sum(stale.values()),
+                    "instances": sorted(renamed[name] for name in stale),
+                },
+            ),
+            # Populated for the same reason `facts` is: `detail` is a sentence, and a surface
+            # that wants to offer the action should not have to find it inside one. The
+            # permissions check sets both and this is the other check with a command to give.
+            remedy=f"manicule document list --source {first}",
         )
 
     async def _index_check(self) -> r.Check:
