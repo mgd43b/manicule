@@ -18,6 +18,10 @@ and a code macro whose body is itself storage-format markup.
 body; a table with no rows; and a heading with nothing under it. Each breaks a different
 assumption about something being present.
 
+A fifth is not one of the four kinds but earns its own file: ``macro-body.storage`` holds
+consecutive paragraphs inside a rich-text macro, which were being assembled into one. See
+:data:`MACRO_BODY`.
+
 **Hostile** — the load-bearing one, and it is not about malformed markup. A storage-format body
 is authored by anyone with write access to the page, so it carries content that *looks like
 instructions*: a CDATA body holding a ``<script>`` element, a parameter value holding one, DOT
@@ -309,6 +313,105 @@ MOJIBAKE = (
     b"sentence continues past it.</p>\n"
 )
 
+CONTAINER_PRESET = "Container styling preset seven"
+"""A ``title`` on a macro nobody enumerated, which is therefore configuration.
+
+The rendered-parameter table is keyed by macro, so ``title`` is content on a ``panel`` and a
+setting on this one. Exported so the suite asserts its absence by the constant the fixture is
+written with."""
+
+MACRO_DEFINITIONS = (
+    "OLD - Older Delivery Layer.",
+    "SaFeR - Signal Fault Router, a service that routes operational signals between the "
+    "regional gateways. See the routing overview for the order they are tried in.",
+    "NEXT - Network Event Exchange Toolkit.",
+)
+"""The three consecutive paragraphs, as the parser must render them: three, not one.
+
+Exported in source order, so a suite can assert both the boundaries between them and the order
+they arrive in without restating either."""
+
+CONTAINER_NOTES = 20
+"""How many paragraphs of ordinary prose follow the definitions inside the container.
+
+**The fixture is the size the defect needs, rather than the test being run at a smaller
+budget.** A macro body only reaches the chunker's paragraph splitter when it exceeds the text
+budget — 448 tokens of the 512, the other 64 being the breadcrumb reserve — and under it a body
+joined with single newlines still has its definitions at the start of a *line*, which is enough
+for detection to find them. Below the budget the defect is invisible; above it every source
+boundary is replaced by a space. Twenty notes of about forty words put this body comfortably
+past 448, so the end-to-end regression runs at the shipped chunk settings and demonstrates the
+failure that actually reaches a corpus.
+"""
+
+
+def _container_notes() -> str:
+    """Prose after the definitions, distinct by construction rather than by inspection.
+
+    Zero-padded so note one is not a prefix of note eleven, and each names its own number twice,
+    which is what keeps the round-trip contract's discrimination assertion meaningful rather
+    than accidentally satisfied.
+    """
+    return "\n".join(
+        f"    <p>Note {number:02d} records what the on-call engineer saw in window "
+        f"{number:02d}: which of the regional gateways was draining at the time, how far "
+        f"behind the buffer had fallen before anybody noticed, and how long the queue took "
+        f"to clear once the drain finished.</p>"
+        for number in range(1, CONTAINER_NOTES + 1)
+    )
+
+
+MACRO_TITLE = "Signal routing"
+"""The page title, chosen for what it does *not* say.
+
+**Nothing on this page announces itself as a glossary**, and that is load-bearing rather than
+incidental. :data:`~manicule.ingest.glossary.GLOSSARY_CONTEXT_EVIDENCE` is worth 0.15, which is
+exactly enough to carry a spaced hyphen — 0.45 — over
+:data:`~manicule.ingest.glossary.MIN_DEFINITION_CONFIDENCE`. A page called "Routing terms"
+therefore records every ``TERM - phrase`` line on it whatever its initials say, and a fixture
+titled that way would pass this suite's end-to-end case with the initials machinery entirely
+broken. The first draft was titled exactly that, by accident, and did.
+
+``GLOSSARY_WORDS`` matches whole lower-cased words, so "terms" supplies the evidence and "term"
+does not. Neither appears here, in the title or in either heading."""
+
+MACRO_BODY = f"""<h1 id="signal-routing">{MACRO_TITLE}</h1>
+<p>A template puts the shorthand below inside a container macro, which draws a box around it.
+This parser has no reader for that macro, so the box is a placeholder and the paragraphs
+inside it are ordinary prose that needed no interpretation at all.</p>
+<h2 id="held-in-a-container">Shorthand held in a container</h2>
+<ac:structured-macro ac:name="custom-container">
+  <ac:parameter ac:name="title">{CONTAINER_PRESET}</ac:parameter>
+  <ac:rich-text-body>
+    <p><strong>OLD</strong> - Older Delivery Layer.</p>
+    <p><strong>SaFeR</strong> - Signal Fault Router, a service that routes operational signals
+    between the regional gateways. See <a href="https://docs.example.test/routing">the routing
+    overview</a> for the order they are tried in.</p>
+    <p><strong>NEXT</strong> - Network Event Exchange Toolkit.</p>
+    <p>A line break inside a paragraph is not a paragraph break.<br/>The clause after the br
+    element belongs to the paragraph that opened above it.</p>
+{_container_notes()}
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">yaml</ac:parameter>
+      <ac:plain-text-body><![CDATA[gateways:
+  - name: primary
+    retries: 3]]></ac:plain-text-body>
+    </ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+"""
+"""Consecutive paragraphs inside a rich-text macro, and the four things that must not follow.
+
+The container is unsupported on purpose: an ``expand`` or a ``panel`` would exercise the same
+assembly, and a macro nobody has enumerated exercises it *and* the rule that such a macro's
+``title`` stays configuration. Everything else here is a boundary that must survive the
+paragraph rule without being widened by it — an inline ``<br>``, a nested code macro, a link
+and inline emphasis inside one definition, and a heading path the anchors address.
+
+The definitions are first and :func:`_container_notes` follows them, so a reader of the fixture
+meets what it is about before the bulk that makes it big enough to matter. See
+:data:`CONTAINER_NOTES` for why the bulk is there at all."""
+
 _LARGE_TOPICS = (
     "shard rebalancing",
     "cold tier promotion",
@@ -331,6 +434,7 @@ def build(dest: Path) -> None:
     _write(dest / "malformed.storage", MALFORMED)
     _write(dest / "degenerate.storage", DEGENERATE)
     _write(dest / "astral.storage", ASTRAL)
+    _write(dest / "macro-body.storage", MACRO_BODY)
     _write(dest / "empty.storage", "")
     (dest / "mojibake.storage").write_bytes(MOJIBAKE)
     _write(dest / "handbook-large.storage", _large())

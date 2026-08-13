@@ -71,13 +71,23 @@ class ParserVersions:
 PARSERS: Final[dict[str, ParserVersions]] = {
     "adf": ParserVersions(rules="1"),
     "archive": ParserVersions(rules="1"),
-    # Starts at 1 rather than inheriting `html`'s 2. A version is a statement about one
+    # Started at 1 rather than inheriting `html`'s 2. A version is a statement about one
     # parser's own output, and these are different parsers: the documents this reads were
     # previously read by `html`, and what re-parses them is `Change.ROUTING` noticing that the
     # media type they arrive under has changed. A bump here could not have done it — the stored
     # documents name `html` as the parser they used, so this entry is not the one their lineage
-    # is compared against.
-    "confluence": ParserVersions(rules="1", distributions=("selectolax",)),
+    # is compared against. That remains true of every document ingested before this parser
+    # existed; the bump below is about the ones ingested since.
+    #
+    # 1 -> 2: consecutive paragraphs inside a rich-text macro body are joined with a blank line
+    # rather than a single newline. A blank line is what `chunking.sentences.paragraphs` reads as
+    # a paragraph boundary, so under version 1 a macro body was one paragraph however many `<p>`
+    # elements it held — and past the chunk budget it was split into sentences and repacked with
+    # spaces, losing every boundary the page had. Every panel and every unsupported macro with
+    # more than one prose block now produces different text and different chunk boundaries, so
+    # the bump is what re-parses them from retained bytes instead of leaving a corpus that
+    # disagrees with the parser behind a fingerprint claiming it is current.
+    "confluence": ParserVersions(rules="2", distributions=("selectolax",)),
     "docx": ParserVersions(rules="1", distributions=("python-docx", "lxml")),
     # 1 -> 2: an HTML-only mail body's line numbers address the text
     # `mail._html_to_text` builds from the web parser's blocks, and the web parser now
