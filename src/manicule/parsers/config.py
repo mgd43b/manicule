@@ -122,7 +122,13 @@ already uses for the other Confluence body format, for the same reason.
 
 Deliberately **not** a bare ``application/xhtml+xml``, which :data:`WEB_MEDIA_TYPES` already
 claims: resolution is by exact media type, so a bare one would route to the HTML parser and the
-distinction this exists to draw would silently not happen."""
+distinction this exists to draw would silently not happen.
+
+**A convention of this project, not a registered type.** Atlassian publishes no IANA media type
+for storage format, so this string was coined here, exactly as :data:`ADF_MEDIA_TYPE` was for the
+other body format. It is stable within manicule and meaningless outside it — recorded because a
+convention that reads like a standard is one somebody later cites as though it were, and
+``docs/parsing.md`` §2.4 says the same thing where the type is registered."""
 
 CONFLUENCE_MEDIA_TYPES = frozenset({CONFLUENCE_MEDIA_TYPE})
 

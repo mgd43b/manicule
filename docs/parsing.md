@@ -460,6 +460,17 @@ an extension because neither is ever a file the way a `.docx` is.
   `ac:parameter` as prose and put a code macro's language, a diagram's engine and a Jira
   macro's JQL query into the index as text the page did not contain.
 
+**Both of these media types are manicule's conventions, not registered ones.** Atlassian
+publishes no IANA type for either body format, so `application/json;profile=atlas-doc-format` and
+`application/xhtml+xml;profile=confluence-storage` were coined here — the first by the ADF parser,
+the second by following it. They are stable identifiers *within this project* and nothing outside
+it will recognise them. Written down because a convention that reads like a standard gets cited as
+one: a future reader deciding what a third-party tool should emit, or what to send in an `Accept`
+header, would be reasoning from a string this repository invented. The profile syntax itself is
+ordinary RFC 9110 — a parameter on a real base type — so the shape is standard even where the
+value is ours. The fixture extension `.storage` is a convention of the same kind, and exists only
+so the test corpus can route a file to this parser.
+
 Both obey the same anchor rules as everything else. Storage format's fragments are `Partial` for
 the HTML parser's reason and one of its own: Confluence synthesises heading ids at *render* time,
 so a stored body usually publishes none, and synthesising one here would produce a citation that
