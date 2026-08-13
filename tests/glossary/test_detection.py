@@ -111,7 +111,7 @@ def test_a_heading_lifted_into_the_breadcrumb_is_still_a_heading_definition() ->
     ids=["bullet", "asterisk", "plus", "ordered", "nested", "em-dash", "colon"],
 )
 def test_a_definition_written_as_a_list_item_is_detected(text: str) -> None:
-    """A bulleted glossary is the second commonest layout there is, and none of it worked.
+    """A glossary written as a bulleted list produced nothing at all.
 
     Every form anchors its term at the first non-space character, so the marker defeated all
     three line rules at once rather than one of them: measured on ``origin/main``,
@@ -892,10 +892,11 @@ def test_a_candidate_line_cannot_supply_the_glossary_evidence_that_admits_it() -
     below are the same two lines in both orders, and nothing about the page differs.
     """
     lines = ["TODO - add the storage terms next quarter.", "XXX - some other note here."]
-    plain = {"document": PLAIN, "heading_path": ("Handbook",)}
 
-    first = detect_in_chunk(chunk("\n".join(lines), **plain))
-    reversed_order = detect_in_chunk(chunk("\n".join(reversed(lines)), **plain))
+    first = detect_in_chunk(chunk("\n".join(lines), document=PLAIN, heading_path=("Handbook",)))
+    reversed_order = detect_in_chunk(
+        chunk("\n".join(reversed(lines)), document=PLAIN, heading_path=("Handbook",))
+    )
 
     assert first == [], "a line naming 'terms' is not evidence that its own page is a glossary"
     assert reversed_order == []
