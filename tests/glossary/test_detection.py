@@ -441,6 +441,205 @@ def test_a_right_hand_side_with_no_initials_evidence_is_kept_whole() -> None:
     ]
 
 
+# --- brackets ------------------------------------------------------------------------------------
+
+PARENTHETICAL_DESCRIPTION = (
+    "Regional Network Edge (e.g., a gateway): Connects a private network to an upstream network."
+)
+"""Fourteen words, of which three are the term, and a comma buried inside a parenthetical.
+
+The comma is the whole case. It is the *only* boundary the line offered before brackets were
+read: ``:`` is not one, and the final ``.`` has no whitespace after it so the sentence
+alternative never fires either.
+"""
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"RNE - {PARENTHETICAL_DESCRIPTION}",
+        f"RNE — {PARENTHETICAL_DESCRIPTION}",
+        f"RNE: {PARENTHETICAL_DESCRIPTION}",
+    ],
+    ids=["spaced-hyphen", "em-dash", "colon"],
+)
+def test_a_comma_inside_a_parenthetical_does_not_end_the_expansion(line: str) -> None:
+    """**The regression, and it stored a phrase no source ever wrote.**
+
+    Measured on ``origin/main``: ``RNE`` was recorded as meaning ``'Regional Network Edge (e.g'``.
+    The path is worth restating because the last step is the surprising one.
+
+    1. The whole right-hand side is fourteen words, so :data:`MAX_EXPANSION_WORDS` refuses it and
+       ``core_expansion`` falls through to the boundary search.
+    2. The only boundary found is the comma **inside** ``(e.g., a gateway)``.
+    3. The prefix is ``Regional Network Edge (e.g``, which is four words and survives.
+    4. ``initials_match('RNE', 'Regional Network Edge (e.g')`` returns **True** — because
+       ``initials_of`` keeps only words whose first character is alphabetic, ``(e.g`` begins with
+       a bracket and contributes nothing, and the three surviving words spell ``RNE`` exactly.
+
+    So the cut was awarded by an artefact of the initials filter rather than by evidence about
+    where the expansion ends. Parametrised over three separators because the fault is in
+    ``core_expansion``, which every written form shares — a fix proved on one of them would say
+    nothing about the other two.
+    """
+    entries = detect_in_chunk(chunk(line))
+
+    assert [entry.expansion for entry in entries] == ["Regional Network Edge"]
+
+
+def test_a_parenthetical_that_is_part_of_the_expansion_is_kept() -> None:
+    """The conservative direction: a bracket only *offers* a cut, and offering is not awarding.
+
+    Nothing here is a rule about parentheses. ``core_expansion`` tries the whole right-hand side
+    first, and this one is short enough and spells its term, so it is returned entire and no
+    boundary is ever consulted. That ordering is what keeps requirement 4 without a second rule
+    to balance against requirement 2.
+    """
+    entries = detect_in_chunk(chunk("RNE - Regional Network Edge (Gateway)"))
+
+    assert [entry.expansion for entry in entries] == ["Regional Network Edge (Gateway)"]
+
+
+def test_an_unclosed_parenthetical_cannot_produce_an_invented_expansion() -> None:
+    """A phrase assembled by cutting inside a bracket is not a phrase the source contains.
+
+    Two independent things stop it, which is why this asserts on both lines. The prefix
+    ``Alpha (Beta`` is refused by :func:`brackets_balance` however plausible it reads, and no
+    other prefix spells ``XYZ`` — so nothing is stored at all rather than something tidy-looking
+    being stored on no evidence.
+
+    The second line is the counterpart that must still work: an unclosed bracket does not
+    poison a prefix that was already earned before it, because ``Regional Network Edge`` is
+    contiguous in the source and spells the term.
+    """
+    assert detect_in_chunk(chunk("XYZ - Alpha (Beta, Gamma and several further clauses here")) == []
+
+    kept = detect_in_chunk(chunk("RNE - Regional Network Edge (e.g. a gateway of some kind"))
+    assert [entry.expansion for entry in kept] == ["Regional Network Edge"]
+
+
+def test_a_stored_expansion_never_holds_an_unmatched_bracket() -> None:
+    """The invariant, asserted directly rather than through the case that motivated it.
+
+    Worth having on its own terms: an unmatched bracket is the *signature* of truncation inside a
+    parenthetical, so this would have caught the defect above without anybody having to work out
+    which boundary rule went wrong. It is cheap, it is a property of the stored string, and it
+    does not depend on the boundary model staying as it is.
+    """
+    lines = [
+        f"RNE - {PARENTHETICAL_DESCRIPTION}",
+        "RNE - Regional Network Edge (Gateway)",
+        "RNE - Regional Network Edge (e.g. a gateway of some kind",
+        "XYZ - Alpha [Beta, Gamma and several further clauses go here",
+        "ATLAS — Automated Transfer Ledger And Scheduler (v2), the nightly export runner",
+    ]
+    stored = [entry.expansion for line in lines for entry in detect_in_chunk(chunk(line))]
+
+    assert stored, "the fixture must produce entries, or it asserts nothing"
+    for expansion in stored:
+        assert ingest_glossary.brackets_balance(expansion), (
+            f"{expansion!r} holds a bracket it never closes"
+        )
+
+
+def test_a_parenthetical_survives_when_no_prefix_before_it_spells_the_term() -> None:
+    """**Requirement 4, and the fixture is chosen so that it can fail.**
+
+    A naive "cut at the first parenthesis" rule stores ``central processor`` here. This one
+    stores the whole thing, because nothing authorises the cut: ``central processor`` spells
+    ``CP`` and not ``CPU``, so the bracket is offered and refused, and with no boundary earned
+    the right-hand side is taken whole exactly as it was before brackets were read at all.
+
+    That is the difference between offering a position and awarding a cut, tested on a line where
+    the two rules disagree rather than on one where the candidate is rejected outright and any
+    implementation would look correct.
+
+    **Retained for the right reason, which was checked rather than assumed.** There are two ways
+    a bracket survives and only one of them is evidence. This is the evidence one: the boundary
+    *was* offered at position 18 and the prefix was refused. The other route — the whole
+    right-hand side matching because :func:`~manicule.ingest.glossary.initials_of` dropped the
+    bracketed tokens, so no boundary was ever consulted — is the accidental one, and it is pinned
+    separately by ``test_a_trailing_bracket_survives_only_when_the_whole_side_is_kept``. Measured
+    here: ``initials_forms('central processor (the execution unit)')`` is ``{'CPEU'}`` against a
+    term of ``CPU``, so no reading spells it and the filter is not what saved the bracket.
+    """
+    entries = detect_in_chunk(chunk("CPU — central processor (the execution unit)"))
+
+    assert [entry.expansion for entry in entries] == ["central processor (the execution unit)"]
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("RNE — Regional Network Edge (Type 2)", "Regional Network Edge (Type 2)"),
+        ("RNE — Regional Network Edge (Type Two)", "Regional Network Edge"),
+        (
+            "RNE — Regional Network Edge (Type 2), the branch hardware profile",
+            "Regional Network Edge",
+        ),
+    ],
+    ids=["whole-spells-it", "whole-stops-spelling-it", "whole-too-long"],
+)
+def test_a_trailing_bracket_survives_only_when_the_whole_side_is_kept(
+    line: str, expected: str
+) -> None:
+    """**Three outcomes, one rule, and the ids name the clause rather than the symptom.**
+
+    An earlier version of this test called these cases ``short-keeps-it`` and ``long-drops-it``,
+    which was true of the two fixtures it had and false in general — the middle case here is
+    short and is cut. Length is a *consequence* of the rule, not the rule:
+
+    1. ``core_expansion`` keeps the **whole** right-hand side when it is usable and its initials
+       spell the term, consulting no boundary at all.
+    2. Otherwise the shortest prefix that spells the term wins, and a top-level bracket is one
+       more position at which that is asked.
+
+    ``(Type 2)`` is kept by clause 1: ``(Type`` and ``2)`` are dropped by
+    :func:`~manicule.ingest.glossary.initials_of`'s first-character filter, so the whole still
+    spells ``RNE``. ``(Type Two)`` falls to clause 2 because ``Two)`` begins with a letter,
+    survives the filter, and makes the whole spell ``RNET``. The third case falls to clause 2 by
+    length instead. Same rule, three routes through it.
+
+    **The middle case is also a known limitation**, and it is asserted rather than hidden: two
+    lines that mean the same thing are treated differently, decided by the same
+    ``word[:1].isalpha()`` filter whose misfiring is the defect this change exists to fix.
+    Removing its bad consequence at the boundary did not remove its influence on retention. If
+    somebody later makes the two agree, this fails and says so.
+    """
+    entries = detect_in_chunk(chunk(line))
+
+    assert [entry.expansion for entry in entries] == [expected]
+
+
+def test_a_quoted_example_marker_yields_no_definition_rather_than_a_truncated_one() -> None:
+    """The limitation, pinned as a test so it is a known edge rather than a surprise.
+
+    The same defect with a different delimiter: ``_description_boundaries`` reads brackets and
+    not quotes, so the cut is still *offered* at the comma inside ``"e.g., a gateway"``. What
+    stops ``'Regional Network Edge "e.g'`` reaching the index is
+    :func:`~manicule.ingest.glossary.brackets_balance` refusing an odd number of double quotes,
+    and the line then yields nothing at all.
+
+    Nothing is stored, which is the safe direction, and the definition that could have been read
+    is lost, which is the cost. Asserted rather than left implicit because a silent limitation is
+    the kind that gets rediscovered as a bug.
+
+    The apostrophe cannot join that rule — ``it's`` and ``don't`` would make ordinary English
+    unbalanced — so a single-quoted example marker is unsupported for a reason no amount of care
+    removes.
+    """
+    quoted = 'RNE - Regional Network Edge "e.g., a gateway": Connects a private network upstream'
+
+    assert detect_in_chunk(chunk(quoted)) == []
+
+
+def test_an_apostrophe_does_not_make_an_ordinary_expansion_unbalanced() -> None:
+    """The counterpart that keeps the quote rule from costing more than it buys."""
+    assert ingest_glossary.brackets_balance("the ops desk's rota")
+    assert ingest_glossary.brackets_balance('a "quoted" aside')
+    assert not ingest_glossary.brackets_balance('a "quoted aside')
+
+
 # --- compound words and stylized spellings ------------------------------------------------------
 
 

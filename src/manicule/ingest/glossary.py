@@ -48,7 +48,7 @@ from manicule.core.glossary import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from manicule.core.content import Chunk
 
@@ -231,7 +231,158 @@ unconditionally is the obvious version of this and it is wrong in both direction
 ``Retention And Vault Index Node Export, Cold`` in half, and it would hand
 ``when enabled, the process starts automatically`` a two-word prefix that looks far more like an
 expansion than the sentence it came from. :func:`core_expansion` still has to be convinced.
+
+**Matched positions are filtered by :func:`_description_boundaries` and this pattern is never
+scanned directly**, because punctuation inside a bracket belongs to the bracket. See there.
 """
+
+_BRACKETS: Final[Mapping[str, str]] = {"(": ")", "[": "]", "{": "}"}
+"""Bracket pairs tracked when reading a right-hand side, opener to closer."""
+
+_CLOSERS: Final[frozenset[str]] = frozenset(_BRACKETS.values())
+
+
+_PAIRED_QUOTES: Final[frozenset[str]] = frozenset({'"', "“", "”"})
+"""Double quotes an expansion must not be cut in half of.
+
+**Counted for evenness rather than matched as a pair**, because the straight ``"`` is the same
+character at both ends and the typographic pair is not reliably present on the same line. Evenness
+is the property that actually matters here: an odd count means the phrase opens a quotation it
+never closes, which is the same signature :func:`brackets_balance` looks for.
+
+**The apostrophe is deliberately absent, and that is the whole reason this is a separate set.**
+``'`` is a quote in ``the 'ops desk' rota`` and a letter in ``it's`` and ``don't``, and nothing
+here can tell those apart — a rule including it would refuse ordinary English. That is a real gap
+rather than an oversight: a single-quoted example marker is an intentionally unsupported form,
+recorded in :func:`_description_boundaries`.
+"""
+
+
+def brackets_balance(text: str) -> bool:
+    """Whether ``text`` closes every bracket and quotation it opens.
+
+    **A stored expansion with an unmatched bracket is not untidy, it is a signature.** It is what
+    truncation inside a parenthetical leaves behind, and it cannot arise from a source phrase that
+    was cut at a place its author would recognise. Checking it costs one pass and catches the
+    whole family without anybody having to understand which boundary rule went wrong — which is
+    the argument for keeping it even though :func:`_description_boundaries` now prevents the case
+    that motivated it. Measured: with the boundary model correct and this check removed,
+    ``XYZ - Alpha [Beta, Gamma and several further clauses go here`` is still stored as
+    ``'Alpha [Beta'``, so the two rules are independent rather than one being the other's
+    leftovers.
+
+    **Double quotes are counted here and are not boundary-aware**, which is a deliberate
+    asymmetry. ``RNE - Regional Network Edge "e.g., a gateway": …`` is the same defect with a
+    different delimiter, and :func:`_description_boundaries` does not read quotes — so the cut is
+    still offered at the comma inside them, and what stops ``'Regional Network Edge "e.g'`` being
+    stored is this check refusing it. The line yields no definition rather than a wrong one. That
+    is the conservative half of the trade and it is named as a limitation rather than presented as
+    support; see :data:`_PAIRED_QUOTES` for why the apostrophe cannot join it.
+    """
+    expected: list[str] = []
+    for character in text:
+        if character in _BRACKETS:
+            expected.append(_BRACKETS[character])
+        elif character in _CLOSERS and (not expected or expected.pop() != character):
+            return False
+    if expected:
+        return False
+    return sum(text.count(quote) for quote in _PAIRED_QUOTES) % 2 == 0
+
+
+def _description_boundaries(text: str) -> list[int]:
+    """Every position at which a description may begin, brackets respected.
+
+    Two corrections to reading :data:`_DESCRIPTION_BOUNDARY_RE` directly, and the first is what
+    this exists for.
+
+    **Punctuation inside a bracket belongs to the bracket.** ``RNE - Regional Network Edge
+    (e.g., a gateway): Connects a private network to an upstream network`` offered exactly one
+    boundary before this function existed, and it was the comma inside ``e.g.,``. The prefix
+    ``Regional Network Edge (e.g`` then *passed* :func:`initials_match`, because
+    :func:`initials_of` keeps only words whose first character is alphabetic — ``(e.g`` begins
+    with a bracket, contributed nothing, and the three surviving words spelled ``RNE`` exactly.
+    So the cut was awarded by an artefact of that filter rather than by evidence, and ``RNE`` was
+    stored as meaning ``Regional Network Edge (e.g``.
+
+    **A top-level opening bracket is itself a candidate.** Skipping the nested punctuation alone
+    is not enough: it leaves that line with no boundary at all — ``:`` is not one and the final
+    ``.`` has no whitespace after it — so the fourteen-word right-hand side stays refused by
+    :data:`MAX_EXPANSION_WORDS` and the definition disappears. Failing closed is better than
+    storing a fragment, but the phrase before the bracket is the expansion and the source says so.
+
+    **Offering a position is not awarding a cut**, which is the whole of requirement 5 and the
+    reason this is not "cut at the first parenthesis". :func:`_phrase_after` still asks the
+    acronym whether the prefix spells it, exactly as it does for a comma. ``Regional Network
+    Edge`` spells ``RNE`` and earns the cut; a parenthetical that is genuinely part of an
+    expansion is reached only when the whole right-hand side already failed, and is kept whenever
+    no prefix before it agrees.
+
+    **When a trailing bracket survives, in two clauses and no others.** An earlier draft of this
+    summarised it as "kept from a short line, dropped from a long one", which is true of the
+    fixtures it was written from and false in general — ``Regional Network Edge (Type Two)`` is
+    short and is cut. The rule as implemented is:
+
+    1. :func:`core_expansion` keeps the **whole** right-hand side when it is usable and its
+       initials spell the term, and consults no boundary at all. This is the conservative case and
+       the one that satisfies requirement 4.
+    2. Otherwise the question "where does the term end" has to be answered, and among prefixes
+       that spell it the **shortest** wins — the rule :func:`_phrase_before` states in those words
+       and :func:`_phrase_after` inherits. A bracket is one more position at which it is asked.
+
+    Length is a *consequence* of clause 1, not a cause: a long line fails
+    :data:`MAX_EXPANSION_WORDS` and so falls to clause 2. So does a short line whose initials stop
+    agreeing. Three outcomes follow, and all three are the same two clauses:
+
+    - ``Regional Network Edge (Type 2)`` → kept. Clause 1: ``(Type`` and ``2)`` are dropped by
+      :func:`initials_of`'s first-character filter, so the whole still spells ``RNE``.
+    - ``Regional Network Edge (Type Two)`` → cut to ``Regional Network Edge``. Clause 2:
+      ``Two)`` begins with a letter, survives the filter, and the whole spells ``RNET``.
+    - ``Regional Network Edge (Type 2), the branch hardware profile`` → cut. Clause 2, reached by
+      length rather than by initials.
+
+    **Known limitation, and it is the second bullet.** Whether a trailing parenthetical survives
+    depends on the first character inside it, decided by the same ``word[:1].isalpha()`` filter
+    whose misfiring is the defect this function was written to fix — removing its bad consequence
+    at the boundary did not remove its influence on retention. ``(Type 2)`` and ``(Type Two)`` mean
+    the same thing and are treated differently. Recorded rather than fixed: the two cases want
+    opposite outcomes, nothing available here distinguishes them, and making the filter keep
+    bracketed tokens would change what *every* expansion's initials are — far wider than this
+    change, and wanting its own measurement.
+
+    **The cost of clause 2, stated so nobody has to rediscover it:** a bracketed qualifier that
+    really is part of the term is dropped whenever clause 1 does not hold. The alternative is to
+    prefer the *longest* agreeing prefix at a bracket, which would invert shortest-wins for this
+    one position and would keep ``Regional Network Edge (e.g., a gateway)`` for the same reason.
+    Nothing available here tells a qualifier from an example — that is another verb test — so the
+    choice is which way to be wrong, and it is made in favour of the rule that already governs
+    every other boundary.
+
+    **No list of example markers.** ``e.g.`` and ``for example`` are what the specification names,
+    and a rule keyed on them would be narrower than its own justification: what disqualifies the
+    parenthetical here is not the phrase inside it but that the words before it already spell the
+    term. Evidence does the work, so the marker list would be decoration that fails on the first
+    parenthetical nobody enumerated.
+
+    """
+    depth = 0
+    depths: list[int] = []
+    openings: list[int] = []
+    for index, character in enumerate(text):
+        depths.append(depth)
+        if character in _BRACKETS:
+            if depth == 0:
+                openings.append(index)
+            depth += 1
+        elif character in _CLOSERS:
+            depth = max(0, depth - 1)
+    nested_free = {
+        match.start()
+        for match in _DESCRIPTION_BOUNDARY_RE.finditer(text)
+        if depths[match.start()] == 0
+    }
+    return sorted(nested_free | set(openings))
+
 
 _UPPERCASE_SHARE: Final = 0.6
 """How much of a term's alphabetic content must be upper case.
@@ -555,9 +706,11 @@ def _mentions_glossary(*texts: Iterable[str]) -> bool:
 def _usable_expansion(expansion: str) -> str:
     """``expansion`` cleaned up, or the empty string if it is not one.
 
-    Rejects the two shapes that look like definitions and are not: something with more than one
-    sentence in it, and something long enough to be a description. Both are prose that happens
-    to sit after a separator.
+    Rejects the three shapes that look like definitions and are not: something with more than one
+    sentence in it, something long enough to be a description, and something holding a bracket it
+    never closes. The first two are prose that happens to sit after a separator; the third is a
+    phrase no source wrote, assembled by cutting inside a parenthetical — see
+    :func:`brackets_balance`.
     """
     trimmed = expansion.strip().strip("|").strip()
     trimmed = re.sub(r"\s+", " ", trimmed).rstrip(".").strip()
@@ -567,6 +720,8 @@ def _usable_expansion(expansion: str) -> str:
     if not (1 <= len(words) <= MAX_EXPANSION_WORDS):
         return ""
     if not any(character.isalpha() for character in trimmed):
+        return ""
+    if not brackets_balance(trimmed):
         return ""
     return trimmed
 
@@ -603,8 +758,8 @@ def _phrase_after(captured: str, acronym: str, *, display: str = "") -> str:
     Returns the empty string when no prefix spells the acronym, which the caller reads as "no
     evidence about where this ends" rather than as "no expansion here".
     """
-    for boundary in _DESCRIPTION_BOUNDARY_RE.finditer(captured):
-        prefix = _usable_expansion(captured[: boundary.start()])
+    for boundary in _description_boundaries(captured):
+        prefix = _usable_expansion(captured[:boundary])
         if prefix and initials_match(acronym, prefix, display=display):
             return prefix
     return ""
@@ -965,6 +1120,7 @@ __all__ = [
     "MIN_SKELETON_LENGTH",
     "a_heading_may_define",
     "acronym_shaped",
+    "brackets_balance",
     "core_expansion",
     "detect_entries",
     "detect_in_chunk",
