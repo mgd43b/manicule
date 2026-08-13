@@ -1170,10 +1170,12 @@ can price it:
   why the two counts it reports are not counts of forward passes.
 
   **Do not expect the embedding cache to absorb it.** `EmbeddingCache` is a bounded LRU over
-  `(embed fingerprint, text)`, and what it is good at is duplicate *text*: a batch of forty
-  copies of one string costs one forward pass. A sweep in a fresh process over a corpus of
-  distinct chunks has no duplicates to absorb, and a corpus larger than the cache evicts each
-  entry before anything could reuse it. Measured at its default capacity of 10,000:
+  `(embed fingerprint, embed_text)` — the post-middleware string handed to the model, not the
+  chunk's `text`, and the distinction is this bullet's own so it has to hold here too. What it
+  is good at is duplicates of that string: a batch of forty copies of one costs one forward
+  pass. A sweep in a fresh process over a corpus of distinct chunks has none to absorb, and a
+  corpus larger than the cache evicts each entry before anything could reuse it. Measured at
+  its default capacity of 10,000:
 
   | Shape | Forward passes |
   |---|---|

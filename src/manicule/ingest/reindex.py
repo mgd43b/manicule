@@ -357,13 +357,23 @@ class StaleSweep:
     reading is wrong. A chunk's id is derived from its ``text``; what reaches the model is
     ``embed_text``, which carries the heading breadcrumb. An id that survived therefore does
     *not* prove the embedded string did — a document whose headings moved re-embeds chunks
-    whose ids never changed — so the pipeline embeds every chunk of a document it re-parses,
-    and the embedder's own cache is what absorbs the repeats. What this counts is the honest
-    thing: how much of the corpus the re-parse actually produced anew.
+    whose ids never changed — so the pipeline embeds every chunk of a document it re-parses.
+
+    **Over a corpus of distinct chunks nothing absorbs that**, and this docstring claimed the
+    embedding cache did until somebody measured it rather than repeating the claim. The cache
+    de-duplicates identical ``embed_text`` within one run, which is not the shape of a
+    corpus-wide sweep; ``docs/parsing.md`` §4.5 carries the numbers. What this field counts is
+    the honest thing, and the only thing it can count without instrumenting the model: how much
+    of the corpus the re-parse produced anew.
     """
 
     chunks_kept: int = 0
-    """Chunks that survived with their id, and therefore with the vector row already stored."""
+    """Chunks that survived with their id, and therefore with the vector row already stored.
+
+    A saving in identity rather than in compute: a kept chunk was produced again and went to the
+    model again like every other one, and what it kept is the row every citation to it resolves
+    through.
+    """
 
     unrepairable: int = 0
     failed: int = 0
