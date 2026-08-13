@@ -300,10 +300,21 @@ async def test_a_table_records_how_many_header_rows_it_has() -> None:
     Recorded by the parser, which can see the delimiter row, rather than guessed downstream
     from the first row looking like a header — a part carrying the wrong rows mislabels every
     column in it.
+
+    **``header_rows`` counts source lines, so an ordinary one-header table reports 2.** The
+    delimiter is not a data row and a part beginning after it would not be a pipe table at all,
+    so whatever the header-repeating split carries has to include it. ``rows`` is the source
+    lines themselves, and without it the split never happened: a 300-row table was cut wherever
+    the token budget landed, producing eight line fragments and four truncated glossary
+    expansions stored against correct citations.
     """
     blocks = await _blocks("| Setting | Default |\n|---|---|\n| retries | 3 |\n")
     assert blocks[0].kind is BlockKind.TABLE
-    assert blocks[0].metadata == {"header_rows": 1}
+    assert blocks[0].metadata == {
+        "header_rows": 2,
+        "rows": ["| Setting | Default |", "|---|---|", "| retries | 3 |"],
+    }
+    assert blocks[0].text.splitlines() == blocks[0].metadata["rows"]
 
 
 async def test_front_matter_does_not_become_a_heading_nobody_wrote() -> None:

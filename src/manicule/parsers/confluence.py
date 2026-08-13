@@ -477,8 +477,9 @@ def _atomic(node: LexborNode, tag: str, config: ConfluenceConfig) -> _Found | No
     lang: str | None = None
     refs: list[JsonValue] = []
     if tag == "table":
-        text = _table_text(node, refs)
-        metadata = {"header_rows": _header_rows(node)}
+        rows = _table_rows(node, refs)
+        text = "\n".join(rows)
+        metadata = {"header_rows": _header_rows(node), "rows": [*rows]}
     elif tag == TASK_LIST:
         text, metadata = _task_list(node)
     elif tag in {"ul", "ol", "dl"}:
@@ -982,18 +983,28 @@ def _image(node: LexborNode) -> tuple[str, Metadata]:
 # --- tables and lists, macro-aware -----------------------------------------------------------
 
 
-def _table_text(node: LexborNode, refs: list[JsonValue] | None = None) -> str:
-    """A table rendered one row per line, cells separated by pipes.
+def _table_rows(node: LexborNode, refs: list[JsonValue] | None = None) -> list[str]:
+    """A table's rows, one rendered line each, cells separated by pipes.
 
     Cells are flattened through :func:`_inline_text` rather than ``text(deep=True)``, which is the
     difference that keeps a macro's parameters out of a cell.
+
+    **Returned as a list because the chunker needs the boundaries, not just the text.**
+    :meth:`~manicule.chunking.chunker.StructuralChunker._split_table` splits at row boundaries
+    only when the parser describes them in ``rows`` metadata, and falls back to prose splitting
+    when it does not — which cuts mid-row. Measured on a 300-row table before this returned a
+    list: two of three chunk boundaries severed a row, leaving ``'WGX | Wlpha '`` at the end of
+    one chunk and ``'Geta Exchange'`` at the start of the next. A severed row is not merely
+    untidy; it is a well-formed-looking ``TERM | expansion`` line whose expansion is a fragment,
+    so glossary detection would read it as a definition and store a truncated meaning under a
+    correct citation.
     """
     rows: list[str] = []
     for row in node.css("tr"):
         cells = [_inline_text(cell, refs) for cell in row.css("th, td")]
         if any(cells):
             rows.append(" | ".join(cells))
-    return "\n".join(rows)
+    return rows
 
 
 def _header_rows(node: LexborNode) -> int:

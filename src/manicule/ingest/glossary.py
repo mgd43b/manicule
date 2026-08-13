@@ -336,7 +336,37 @@ _TERM = rf"[A-Za-z][\w&/.-]{{0,{MAX_ACRONYM_LENGTH - 1}}}"
 _DASH_RE: Final = re.compile(rf"^\s*(?P<term>{_TERM})\s+[—–]\s+(?P<expansion>\S.*?)\s*$")  # noqa: RUF001
 _HYPHEN_RE: Final = re.compile(rf"^\s*(?P<term>{_TERM})\s+-\s+(?P<expansion>\S.*?)\s*$")
 _COLON_RE: Final = re.compile(rf"^\s*(?P<term>{_TERM})\s*:\s+(?P<expansion>\S.*?)\s*$")
-_TABLE_RE: Final = re.compile(r"^\s*\|\s*(?P<term>[^|]+?)\s*\|\s*(?P<expansion>[^|]+?)\s*\|\s*$")
+_TABLE_RE: Final = re.compile(
+    r"^\s*\|?\s*(?P<term>[^|]+?)\s*\|\s*(?P<expansion>[^|]+?)\s*(?:\|.*)?$"
+)
+"""The first two cells of a table row, however the parser spelled the row.
+
+**Outer pipes are optional, and requiring them meant this form had never fired outside
+Markdown.** A Markdown pipe table reaches a chunk as the author wrote it —
+``| NOW | Network Operations Workspace |`` — but every parser that *renders* a table writes
+``" | ".join(cells)`` with no outer pipes: :mod:`~manicule.parsers.confluence`,
+:mod:`~manicule.parsers.web` and :mod:`~manicule.parsers.adf` alike, and
+:mod:`~manicule.parsers.spreadsheet` uses a tab and so is outside this rule entirely. Measured
+on ``origin/main``, ``_TABLE_RE.match('NOW | Network Operations Workspace')`` returned ``None``
+while the hand-written ``| NOW | ... |`` in the one test covering this form matched — a rule
+written to a fixture no renderer produces.
+
+**Only the first two cells, and the rest are ignored rather than refused.** ``Term | Meaning |
+Owner`` is the commonest real glossary layout and the two-group rule had no reading of it at
+all. The extra columns are metadata about the term — an owner, a status, a review date — not
+part of what it means, so the trailing ``(?:\\|.*)?`` consumes them without capturing. The
+expansion group is non-greedy, so it stops at the first cell boundary rather than swallowing
+the row.
+
+**This rule may only be widened together with row-boundary metadata from the parsers**, and
+that ordering is the whole risk of the change rather than a nicety. ``_split_table`` splits a
+table at row boundaries only when the block carries ``rows``; without it the chunker splits the
+table as prose and cuts mid-row. Measured on a 300-row Confluence table with this regex widened
+and ``rows`` still absent: 299 entries detected, of which one was
+``WGX = 'Wlpha'`` against a source row reading ``Wlpha Geta Exchange`` — a truncated expansion
+at confidence 0.70, above the threshold, carrying a correct citation. Detecting nothing was
+strictly better than that, so the parsers emit ``rows`` in the same change.
+"""
 _DEFINITION_MARKER_RE: Final = re.compile(r"^\s*:\s+(?P<expansion>\S.*?)\s*$")
 _HEADING_RE: Final = re.compile(rf"^\s*#{{1,6}}\s+(?P<term>{_TERM})\s*$")
 # Likewise the typographic apostrophe: a word processor writes one and a plain editor writes

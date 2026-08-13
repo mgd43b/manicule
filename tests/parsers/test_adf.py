@@ -288,13 +288,28 @@ async def test_a_table_keeps_its_rows_and_counts_its_header(corpus: Path) -> Non
 
     ``header_rows`` comes from the ``tableHeader`` cells, because a table too large for one
     chunk repeats those rows into every part and the wrong ones mislabel every column.
+
+    ``rows`` is what makes that split happen. The chunker splits at row boundaries only when
+    the block describes them and otherwise falls back to prose splitting, which cuts mid-row —
+    so a docstring promising the header-repeating split while emitting only ``header_rows``
+    described something that never ran. The two are asserted together for that reason.
     """
     raw = raw_from(corpus / "adf" / "typical.json", ADF_MEDIA_TYPE)
     table = next(
         block for block in await read_blocks(_parser(), raw) if block.kind is BlockKind.TABLE
     )
-    assert table.metadata == {"header_rows": 1}
-    assert table.text.splitlines()[0] == "Signal | Alarm above"
+    assert table.metadata == {
+        "header_rows": 1,
+        "rows": [
+            "Signal | Alarm above",
+            "lease age | 90 seconds",
+            "journal depth | 4096 records",
+        ],
+    }
+    assert table.text.splitlines() == table.metadata["rows"], (
+        "the rendered text and the declared rows must be the same lines, or the chunker "
+        "reassembles a table the parser never produced"
+    )
 
 
 async def test_a_nested_list_keeps_its_nesting(corpus: Path) -> None:
