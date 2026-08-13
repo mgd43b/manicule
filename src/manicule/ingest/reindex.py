@@ -684,20 +684,37 @@ class GlossarySweep:
     """
 
 
-def _entry_shape(entry: GlossaryEntry) -> tuple[str, str, str, str, float, tuple[str, ...]]:
-    """One entry reduced to everything about it a reader can observe.
+def _entry_shape(
+    entry: GlossaryEntry,
+) -> tuple[str, str, str, str, str, str, str, tuple[str, ...]]:
+    """One entry reduced to every stored field of it.
 
-    Aliases are sorted because the store returns them sorted and the detector returns them in
-    the order the source wrote them, and two comparisons that disagreed about that would report
-    a change nobody made. The confidence is in here on purpose: a change to an evidence weight
-    moves it without moving a single term, and that is still a change to what is stored.
+    **Every field, rather than the ones that decide a lookup**, and the difference was a real
+    defect: an earlier version of this omitted ``display`` and ``location`` on the reasoning that
+    nothing resolves through them. Both are *stored* and both are *shown* — ``display`` is the
+    source's own spelling of the term, which a citation quotes instead of the normalised key, and
+    ``location`` is where in the document it was found. A detector change that moved either would
+    have rewritten what a reader is served while this reported the document unchanged, which is a
+    quieter version of exactly the defect the fingerprint exists to remove.
+
+    So the rule is the whole row, and the three adjustments to it are all about comparing like
+    with like. Aliases are sorted, because the store returns them sorted and the detector returns
+    them in the order the source wrote them, and a comparison that disagreed about that would
+    report a change nobody made. They stay nested rather than being flattened into the tuple, on
+    the reasoning :func:`~manicule.ingest.middleware.text_digest` gives about NUL separation:
+    flattened, a term whose location is ``A`` and whose alias is ``B`` would compare equal to one
+    with no location and aliases ``A``, ``B``. And confidence is formatted to a string, because it
+    round-trips through SQLite as a float and pinning the comparison to six places is cheaper to
+    reason about than trusting two paths to produce bit-identical doubles.
     """
     return (
         entry.acronym,
+        entry.display,
         entry.expansion,
         entry.chunk_id,
+        entry.location,
         entry.form.value,
-        entry.confidence,
+        f"{entry.confidence:.6f}",
         tuple(sorted(entry.aliases)),
     )
 

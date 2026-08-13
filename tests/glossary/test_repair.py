@@ -303,6 +303,49 @@ async def test_a_newly_supported_list_definition_is_added(
     ] == [("HDR", "Hot Draining Router")]
 
 
+async def test_a_change_to_a_field_nothing_resolves_through_still_counts_as_changed(
+    store: SqliteDocStore,
+) -> None:
+    """Every stored field is compared, not the ones a lookup goes through.
+
+    Found by Copilot on this pull request, and it was right: an earlier ``_entry_shape`` omitted
+    ``display`` and ``location`` because nothing resolves through them. Both are stored and both
+    are shown — ``display`` is the source's own spelling, which a citation quotes *instead of*
+    the normalised key, and ``location`` is where in the document the definition was found. A
+    detector change that moved either would have rewritten what a reader is served while the
+    sweep reported the document unchanged.
+
+    ``SaFeR`` is the case that makes it concrete rather than theoretical: #103 exists so that a
+    deliberately mixed-case spelling is readable, the key is ``SAFER`` either way, and the two
+    are a different thing on the screen.
+    """
+    line = "SaFeR — Service Failure Reporter"
+    document, chunks = await system.index(store, "glossary", "Glossary of terms", [line])
+    detected = await store.glossary_entries(document.id)
+    assert [found.display for found in detected] == ["SaFeR"], "the fixture must store a spelling"
+
+    # The same term, the same key, the same expansion, the same everything a lookup reads — and
+    # a display and a location the previous detector wrote differently.
+    await store.replace_glossary_entries(
+        document.id,
+        [
+            detected[0].model_copy(update={"display": "SAFER", "location": "somewhere else"}),
+        ],
+        fingerprint=SUPERSEDED,
+    )
+
+    report = await sweep(store)
+
+    assert report.changed == 1, (
+        "a rewritten display or location is a rewritten row, and reporting it as unchanged "
+        "would hide the repair from the operator who ran it"
+    )
+    assert report.unchanged == 0
+    repaired = await store.glossary_entries(document.id)
+    assert (repaired[0].display, repaired[0].location) == ("SaFeR", "Glossary of terms")
+    del chunks
+
+
 async def test_a_document_producing_nothing_records_current_lineage(
     store: SqliteDocStore,
 ) -> None:
