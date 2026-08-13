@@ -1311,3 +1311,66 @@ async def test_an_interrupted_sync_loses_nothing_and_finishes_when_it_is_run_aga
     assert stored.source_id == "1002"
     assert stored.media_type == CONFLUENCE_MEDIA_TYPE
     assert DOT in texts(store)
+
+
+async def test_a_declared_external_entity_is_never_resolved(tmp_path: Path) -> None:
+    """XXE, asserted rather than argued from the choice of engine.
+
+    The extraction reads with an HTML5 tokenizer, which has no DTD subset and no entity resolver,
+    so this is structurally impossible rather than defended against — and that is exactly why it
+    needs a test. "The library we use does not do that" is a claim about a dependency, and the day
+    somebody swaps the engine for an XML one to be more correct about XHTML, nothing else here
+    would notice. The secret file is real and its content is checked for by name.
+    """
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SHOULD-NEVER-BE-INDEXED", encoding="utf-8")
+    root = tmp_path / "corpus"
+    root.mkdir()
+    written(
+        root,
+        body=(
+            f'<!doctype html [<!ENTITY xxe SYSTEM "file://{secret}">]>\n'
+            + page(body="<h1>T</h1><p>The value is &xxe; here.</p>")
+        ),
+    )
+
+    store = await ingest(root)
+
+    assert not any("SHOULD-NEVER-BE-INDEXED" in text for text in texts(store))
+    assert not any(str(secret) in text for text in texts(store))
+
+
+async def test_an_external_stylesheet_or_image_is_never_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing in the wrapper causes a resource to be fetched, and the socket says so.
+
+    A page can reference a stylesheet, a script and an image, and every one of them is a URL a
+    renderer would go and get. Nothing here renders — but "nothing renders" is a property of the
+    whole path from fetch to chunk, so it is asserted over the whole path rather than at the one
+    function that obviously does not.
+    """
+    root = tmp_path / "corpus"
+    root.mkdir()
+    written(
+        root,
+        body=page(
+            wrapper=(
+                '<link rel="stylesheet" href="https://evil.example.test/x.css">\n'
+                '<script src="https://evil.example.test/x.js"></script>\n'
+                '<img src="https://evil.example.test/x.png">\n'
+            )
+        ),
+    )
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        message = "ingestion opened a socket"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(socket, "socket", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
+
+    store = await ingest(root)
+
+    assert only(store).media_type == CONFLUENCE_MEDIA_TYPE
+    assert not any("evil.example.test" in text for text in texts(store))
