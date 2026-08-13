@@ -309,8 +309,9 @@ def _block(node: LexborNode, tag: str) -> _Found | None:
     metadata: Metadata = {}
     lang: str | None = None
     if kind is BlockKind.TABLE:
-        text = _table_text(node)
-        metadata = {"header_rows": _header_rows(node)}
+        rows = _table_rows(node)
+        text = "\n".join(rows)
+        metadata = {"header_rows": _header_rows(node), "rows": [*rows]}
     elif kind is BlockKind.LIST:
         text = "\n".join(_list_lines(node, 0))
     elif kind is BlockKind.CODE:
@@ -371,18 +372,23 @@ def _header_rows(node: LexborNode) -> int:
     return 1 if rows and rows[0].css("th") else 0
 
 
-def _table_text(node: LexborNode) -> str:
-    """A table rendered one row per line, cells separated by pipes.
+def _table_rows(node: LexborNode) -> list[str]:
+    """A table's rows, one rendered line each, cells separated by pipes.
 
     Keeping the row structure is the point of parsing the table at all: a table flattened to
     a run of words loses which value belongs to which column.
+
+    Returned as a list so the row boundaries reach the chunker in ``rows`` metadata. Without
+    them :meth:`~manicule.chunking.chunker.StructuralChunker._split_table` falls back to prose
+    splitting and cuts mid-row, which produces a line that still looks like ``TERM | expansion``
+    while its expansion is a fragment.
     """
     rows: list[str] = []
     for row in node.css("tr"):
         cells = [_collapse(cell.text(deep=True)) for cell in row.css("th, td")]
         if any(cells):
             rows.append(" | ".join(cells))
-    return "\n".join(rows)
+    return rows
 
 
 def _list_lines(node: LexborNode, depth: int) -> Iterator[str]:

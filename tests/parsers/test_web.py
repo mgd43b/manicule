@@ -319,7 +319,12 @@ async def test_a_table_keeps_its_rows_and_counts_its_header(corpus: Path) -> Non
     table = next(
         block for block in await read_blocks(_parser(), raw) if block.kind is BlockKind.TABLE
     )
-    assert table.metadata == {"header_rows": 1}
+    rows = ["Signal | Alarm above", "lease age | 90 seconds", "journal depth | 4096 records"]
+    assert table.metadata == {"header_rows": 1, "rows": rows}
+    assert table.text.splitlines() == rows, (
+        "``rows`` is what the chunker splits on; lines that disagree with the text would "
+        "reassemble a table the parser never produced"
+    )
     assert table.text.splitlines()[0] == "Signal | Alarm above"
 
 

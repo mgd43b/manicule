@@ -27,18 +27,56 @@ from manicule.ingest.glossary import (
     initials_match,
     score_definition,
 )
+from manicule.parsers.config import (
+    CONFLUENCE_MEDIA_TYPE,
+    MARKDOWN_MEDIA_TYPES,
+    ConfluenceConfig,
+    MarkdownConfig,
+)
+from manicule.parsers.confluence import ConfluenceStorageParser
+from manicule.parsers.markdown import MarkdownParser
 from tests.glossary.corpus import PROSE_ON_THE_GLOSSARY_PAGE
+from tests.parsers.support import document_for, make_chunker, raw_of
 from tests.storage_helpers import make_chunk, make_document
+
+MARKDOWN_MEDIA_TYPE = min(MARKDOWN_MEDIA_TYPES)
+"""One of the Markdown types, chosen deterministically so routing is not a coin toss."""
 
 DOCUMENT = make_document(source_id="glossary", title="Glossary of terms")
 PLAIN = make_document(source_id="handbook", title="Operations handbook")
 EXPANSION = "Network Operations Workspace"
+
+LONG_TABLE: list[tuple[str, str]] = [
+    (
+        f"{chr(ord('A') + index % 26)}{chr(ord('A') + index // 26 % 26)}X",
+        f"{chr(ord('A') + index % 26)}lpha {chr(ord('A') + index // 26 % 26)}eta Exchange",
+    )
+    for index in range(300)
+]
+"""Three hundred rows, which is enough to split under any tokenizer this suite uses.
+
+Generated rather than written out because the content is irrelevant and the *length* is the
+whole fixture: what matters is that the table cannot fit in one chunk, so the chunker has to
+choose a boundary. Every expansion is three words, so a truncation is visible as a shorter one
+rather than as a plausible alternative.
+"""
 
 
 def chunk(
     text: str, *, document: Document = DOCUMENT, heading_path: tuple[str, ...] = ("Glossary",)
 ) -> Chunk:
     return make_chunk(document, 0, text, heading_path=heading_path)
+
+
+def _rendered_rows(media_type: str) -> list[str]:
+    """Every line :data:`LONG_TABLE` legitimately produces, header and delimiter included.
+
+    A chunk may only contain lines from this set. Anything else is a fragment the chunker made
+    by cutting somewhere that was not a row boundary.
+    """
+    if media_type == CONFLUENCE_MEDIA_TYPE:
+        return ["Term | Meaning", *(f"{term} | {text}" for term, text in LONG_TABLE)]
+    return ["| Term | Meaning |", "|---|---|", *(f"| {t} | {x} |" for t, x in LONG_TABLE)]
 
 
 # --- the forms the spec lists ---------------------------------------------------------------
@@ -163,6 +201,116 @@ def test_a_bare_list_item_is_not_a_definition() -> None:
     """
     assert detect_in_chunk(chunk(f"- {EXPANSION}")) == []
     assert detect_in_chunk(chunk("- Note - this is an ordinary remark")) == []
+
+
+# --- table rows --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"NOW | {EXPANSION}",
+        f"| NOW | {EXPANSION} |",
+        f"NOW | {EXPANSION} | Platform",
+        f"| NOW | {EXPANSION} | Platform |",
+        f"NOW | {EXPANSION} | Platform | 2026-01-01",
+    ],
+    ids=["rendered", "markdown", "three-columns", "markdown-three", "four-columns"],
+)
+def test_a_table_row_is_detected_however_the_parser_spelled_it(text: str) -> None:
+    """Outer pipes are optional and the columns after the second are ignored.
+
+    Requiring outer pipes meant this form fired for Markdown and for nothing else: every parser
+    that *renders* a table writes ``" | ".join(cells)`` without them, so
+    ``_TABLE_RE.match('NOW | Network Operations Workspace')`` was ``None`` on ``origin/main``
+    while the hand-written fixture in the one test covering the form matched.
+
+    A third column is metadata about the term — an owner, a status, a review date — and
+    ``Term | Meaning | Owner`` is the commonest real glossary layout, which the two-group rule
+    had no reading of at all.
+    """
+    entries = detect_in_chunk(chunk(text))
+
+    assert [entry.acronym for entry in entries] == ["NOW"]
+    assert entries[0].expansion == EXPANSION, "the expansion is the second cell, not the row"
+    assert entries[0].form is DefinitionForm.TABLE_ROW
+
+
+@pytest.mark.parametrize(
+    ("media_type", "body"),
+    [
+        (
+            CONFLUENCE_MEDIA_TYPE,
+            "<table><thead><tr><th>Term</th><th>Meaning</th></tr></thead><tbody>"
+            + "".join(f"<tr><td>{t}</td><td>{x}</td></tr>" for t, x in LONG_TABLE)
+            + "</tbody></table>",
+        ),
+        (
+            MARKDOWN_MEDIA_TYPE,
+            "| Term | Meaning |\n|---|---|\n" + "".join(f"| {t} | {x} |\n" for t, x in LONG_TABLE),
+        ),
+    ],
+    ids=["confluence", "markdown"],
+)
+async def test_a_table_too_long_for_one_chunk_stores_no_truncated_expansion(
+    media_type: str, body: str
+) -> None:
+    """**The coupling, and the reason the table rule may not ship on its own.**
+
+    ``_split_table`` divides a table at row boundaries only when the parser describes them in
+    ``rows``; without that it splits the table as prose and cuts wherever the token budget
+    lands — mid-row, and sometimes mid-cell. A severed row is worse than a lost one, because
+    ``WGX | Wlpha `` is still a well-formed ``TERM | expansion`` line whose expansion is a
+    fragment, so it is stored as a confident definition carrying a correct citation.
+
+    Measured with the regex widened and ``rows`` absent: 299 entries from 300 rows, one of them
+    ``WGX = 'Wlpha'`` against a source row reading ``Wlpha Geta Exchange``, at 0.70. On Markdown
+    — where this form already fired before any of this — the same defect was live on
+    ``origin/main``: eight line fragments and four truncated expansions.
+
+    Asserted against the source rows rather than by counting, because the count was never the
+    problem. Every stored expansion has to be what its row actually said.
+
+    **Row integrity is asserted separately from expansion correctness, and that is not
+    belt-and-braces.** Measured while writing this: with ``rows`` removed the Markdown case still
+    produced perfect expansions, because Markdown severs at the leading ``|`` and this rule now
+    treats outer pipes as optional — so the regex silently repaired the damage and the expansion
+    assertion alone guarded nothing on that parser. What is actually broken there is the chunk,
+    which no longer holds whole rows, so that is what gets asserted.
+    """
+    parser = (
+        ConfluenceStorageParser(ConfluenceConfig())
+        if media_type == CONFLUENCE_MEDIA_TYPE
+        else MarkdownParser(MarkdownConfig())
+    )
+    raw = raw_of(body, media_type, uri="glossary", title="Platform glossary")
+    blocks = [block async for block in parser.parse(raw)]
+    chunker = make_chunker()
+    await chunker.setup()
+    chunks = chunker.chunk(document_for(raw, title="Platform glossary"), blocks)
+
+    assert len(chunks) > 1, "the fixture must be long enough to split, or it tests nothing"
+    entries = detect_entries(chunks, title="Platform glossary")
+
+    whole = {row for chunk_ in chunks for row in chunk_.text.splitlines() if row.strip()}
+    severed = [row for row in whole if row not in set(_rendered_rows(media_type))]
+    assert severed == [], "the chunker split the table somewhere other than a row boundary"
+
+    source = dict(LONG_TABLE)
+    stored = {entry.acronym: entry.expansion for entry in entries}
+    assert {term: stored.get(term) for term in source} == source
+
+
+def test_a_tables_header_and_rule_rows_are_not_definitions() -> None:
+    """What stops a table's own furniture becoming entries.
+
+    The header is refused by the shape gate — ``Term`` is one letter in four upper case — and
+    the delimiter by ``_TABLE_RULE_RE``. Both matter now that outer pipes are optional, because
+    a rendered header row is exactly the shape of a rendered data row.
+    """
+    text = f"Term | Meaning\n| --- | --- |\nNOW | {EXPANSION}"
+
+    assert [entry.acronym for entry in detect_in_chunk(chunk(text))] == ["NOW"]
 
 
 def test_a_term_written_with_dots_normalises_to_the_same_key() -> None:

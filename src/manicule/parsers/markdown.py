@@ -259,20 +259,38 @@ def _fence_language(token: Token) -> str | None:
     return info.split(maxsplit=1)[0]
 
 
-def _header_rows(tokens: Sequence[Token], index: int) -> Metadata:
-    """Header-row count for the pipe table opening at ``index``.
+def _table_metadata(tokens: Sequence[Token], index: int, lines: Sequence[str]) -> Metadata:
+    """Row boundaries and header-row count for the pipe table opening at ``index``.
 
     Recorded rather than inferred downstream: a table too large for one chunk is split by
     rows with its header repeated into every part (``docs/parsing.md`` §4.2), and a part
     without its header is a grid of numbers.
+
+    **``rows`` is what makes that split happen at all, and without it this table was cut
+    wherever the token budget landed.** ``_split_table`` reads ``rows`` first and falls back to
+    prose splitting when it is absent, so a Markdown table longer than one chunk was divided
+    mid-row and sometimes mid-cell. Measured on a 300-row pipe table before this emitted
+    ``rows``: eight lines were fragments rather than complete rows, and glossary detection —
+    which reads this form and only this form on Markdown — stored four truncated expansions
+    against correct citations, ``KCX = 'Klpha'`` where the source row read ``Klpha Ceta
+    Exchange``, at confidence 0.70.
+
+    **The delimiter line counts as header**, which is why this returns both values together.
+    A GFM table's ``| --- | --- |`` is not a data row and a part that began after it would not
+    be a table any more — so a part carrying the header must carry the delimiter with it.
+    ``header_rows`` therefore counts source lines, not ``tr_open`` tokens: for the ordinary
+    single-header table it is 2 where the token count is 1.
     """
-    rows = 0
+    header = 0
     for token in tokens[index + 1 :]:
         if token.type in {"thead_close", "table_close"}:
             break
         if token.type == "tr_open":
-            rows += 1
-    return {"header_rows": rows}
+            header += 1
+    token = tokens[index]
+    rows = list(lines[token.map[0] : token.map[1]]) if token.map is not None else []
+    # One delimiter line follows the header rows, and only when there is a header to delimit.
+    return {"header_rows": header + 1 if header and rows else header, "rows": [*rows]}
 
 
 def _drafts(tokens: Sequence[Token], lines: Sequence[str]) -> list[_Draft]:
@@ -302,7 +320,7 @@ def _drafts(tokens: Sequence[Token], lines: Sequence[str]) -> list[_Draft]:
                 kind=kind,
                 title=title,
                 lang=_fence_language(token) if token.type == "fence" else None,
-                metadata=_header_rows(tokens, index) if kind is BlockKind.TABLE else {},
+                metadata=(_table_metadata(tokens, index, lines) if kind is BlockKind.TABLE else {}),
             )
         )
     return drafts

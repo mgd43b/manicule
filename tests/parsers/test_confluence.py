@@ -502,16 +502,22 @@ async def test_a_panel_nested_in_a_panel_keeps_its_own_severity(corpus: Path) ->
 
 
 async def test_a_table_keeps_its_cell_boundaries_and_counts_its_header(corpus: Path) -> None:
-    """A table flattened to a run of words loses which value belongs to which column."""
+    """A table flattened to a run of words loses which value belongs to which column.
+
+    ``rows`` carries the same lines as the text, and it is what lets the chunker split a long
+    table at a row boundary instead of as prose — a prose split cuts mid-row, and a severed row
+    still looks like ``TERM | expansion`` while its expansion is a fragment.
+    """
     blocks = await _corpus_blocks(corpus, "typical.storage")
     table = next(block for block in blocks if block.kind is BlockKind.TABLE)
 
-    assert table.metadata == {"header_rows": 1}
-    assert table.text.splitlines() == [
+    rows = [
         "Environment | Key age limit | Owner",
         "Staging | 30 days | Platform",
         "Production | 90 days | Security",
     ]
+    assert table.metadata == {"header_rows": 1, "rows": rows}
+    assert table.text.splitlines() == rows
 
 
 async def test_a_page_link_reads_as_its_title_and_an_external_link_as_its_words(

@@ -293,6 +293,12 @@ def _table(node: Mapping[str, object], config: ADFConfig) -> Iterator[_Found]:
     ``header_rows`` is counted from the markup rather than guessed, because a table too large
     for one chunk is split by rows with its header repeated into every part
     (``docs/parsing.md`` §4.2), and a part carrying the wrong rows mislabels every column.
+
+    **``rows`` is emitted beside it, and until it was this docstring described something that
+    did not happen.** ``header_rows`` alone is not enough: ``_split_table`` reads ``rows`` first
+    and falls back to prose splitting when it is absent, so the header-repeating split above was
+    never reached and a long table was cut wherever the token budget landed — mid-row, and
+    sometimes mid-cell.
     """
     rows: list[str] = []
     header_rows = 0
@@ -312,7 +318,9 @@ def _table(node: Mapping[str, object], config: ADFConfig) -> Iterator[_Found]:
         rows.append(" | ".join(rendered))
     if rows:
         yield _Found(
-            kind=BlockKind.TABLE, text="\n".join(rows), metadata={"header_rows": header_rows}
+            kind=BlockKind.TABLE,
+            text="\n".join(rows),
+            metadata={"header_rows": header_rows, "rows": [*rows]},
         )
 
 
