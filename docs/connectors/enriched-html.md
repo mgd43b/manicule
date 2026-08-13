@@ -91,7 +91,7 @@ write, because no field in a manifest is relative to the conversion's root —
 id are refused as a pair, and the pair is only visible to a run that walked both. A run confined
 to `pages/` will happily write a manifest for a page whose twin sits in `other/`. Nothing breaks
 silently — the twin keeps its path identity, and once the converted page holds the id it declares,
-`doctor`'s `document-identity` check reports two rows for one page ([§5d](#5d-converting-a-corpus-that-is-already-indexed)). But the refusal arrives after a sync
+`doctor`'s `document-identity` check reports two rows for one page ([§5d](#5e-clearing-the-leftovers-when-you-did-arrive-that-way)). But the refusal arrives after a sync
 rather than during the conversion. **Convert the whole root unless you have a reason not to.**
 
 `--force` replaces manifests that already exist; without it they are left alone, because one
@@ -366,66 +366,6 @@ is that a later re-parse cannot reuse the vector for such a chunk — it replace
 re-embedding this change made unavoidable anyway. `tests/ingest/test_storage_integration.py`
 migrates, syncs, and asserts no chunk survives with an id that does not derive.
 
-### 5d. Converting a corpus that is already indexed
-
-The migration above re-keys documents that were in the database before the identity change. It is
-**not** what happens when you convert a corpus that this build already indexed under its paths,
-and the difference matters because the second is the ordinary workflow:
-
-```console
-$ manicule connector sidecar --source docs   # a page that was already indexed path-keyed
-$ manicule connector sync docs
-$ manicule --json document list              # two rows, one page
-```
-
-**Generating a manifest does not re-key the existing row.** The next sync discovers the page under
-its declared id and creates a *second* document; the path-keyed one is left behind. Nothing
-removes it on its own — the connector no longer discovers it under that path, and no command in
-manicule runs reconciliation — so **the old copy must be deleted by hand.**
-
-`doctor` names it rather than reporting a healthy corpus:
-
-```console
-$ manicule doctor
- degraded  document-identity  1 document(s) are still keyed on their file's path
-while the manifest beside each one declares an identity of its own —
-'/path/to/export/pages/1003.html' declares '1003'. … Compare them with
-`manicule document list --source docs`, remove whichever is the stale copy with
-`manicule document delete <id>`, or correct the manifest that declares the wrong
-page id and sync again. There is no bulk remedy for this and none is implied.
-```
-
-Then, exactly as it says:
-
-```console
-$ manicule document list --source docs
-3d1436bf632764209fecb2467fc70e7b
-  Escalation · docs · application/xhtml+xml;profile=confluence-storage · indexed
-d70c35a339cd9893e4df4ba026efa9ef
-  Escalation · docs · application/xhtml+xml;profile=confluence-storage · indexed
-2 shown, offset 0, page size 50
-
-$ manicule document delete d70c35a339cd9893e4df4ba026efa9ef
-removed d70c35a339cd9893e4df4ba026efa9ef into the trash
-```
-
-after which `document-identity` is `ok` again. The delete is the ordinary soft delete, so a copy
-removed by mistake is restorable.
-
-The reason `doctor` sees this at all is the `claimed` rule in its identity check: a path-keyed
-enriched page is normally *excluded* from that check, because it carries its own notice naming the
-command that applies its identity. The exclusion lifts the moment another document holds the
-identity it declares — which is precisely the state following that notice produces. Without that,
-the tool would instruct an action that creates an orphan and then say nothing about it.
-
-**Convert before the first sync where you can**, and none of this arises: the manifest is read at
-the first discovery, the page is keyed by its id from the start, and there is no second row.
-
-Two files declaring one page id are **both** returned to their paths, and the conflict is reported.
-Not the second only: `documents` is `UNIQUE` on `(workspace_id, source, source_id)`, so honouring
-both would mean a silent overwrite — and keeping the *first* would make ownership depend on walk
-order, so renaming a directory would move one page's content onto another page's identity.
-
 ## 5a. What a `.html` file's media type is, and when
 
 Discovery declares **no** media type for `.html` and `.htm`, because whether a file is an enriched
@@ -471,6 +411,110 @@ because there is no output for it to find.
 
 Graphviz is not rendered, macros are not expanded, page references are not followed and
 attachments are not fetched. DOT source is preserved character for character and stays inert.
+
+### 5d. Convert before the first sync
+
+**This is ordering guidance, not remediation, and it is the most useful sentence in this
+document.** Generate the sidecars *before* the export is first synced:
+
+```console
+$ manicule connector sidecar --source docs
+40 of 40 page(s) under /path/to/export
+source docs; profile(s): custom-storage-export
+
+$ manicule connector sync docs
+discovered  40
+indexed     40
+```
+
+40 documents, no leftovers, `document-identity` `ok`. The manifest is read at the first discovery,
+so the page is keyed by its id from the start and no path-keyed row is ever created.
+
+The reason to say this loudly is that **the natural ordering is the other one.** An operator
+exports, syncs, sees every page reported as ordinary HTML, and *that failure is what tells them
+the generator exists*. Converting then and re-syncing leaves one stranded row per page:
+
+```console
+$ manicule connector sync docs        # before converting: 40 path-keyed documents
+$ manicule connector sidecar --source docs
+$ manicule connector sync docs
+  total=80  page-keyed=40  path-keyed leftovers=40
+```
+
+**Generating a manifest does not re-key the existing row.** The sync discovers the page under its
+declared id and creates a *second* document; the path-keyed one is left behind at
+`status = indexed`. Nothing removes it on its own — the connector no longer discovers it under
+that path, and no command in manicule runs reconciliation.
+
+### 5e. Clearing the leftovers, when you did arrive that way
+
+`doctor` names them and does not report a healthy corpus. At forty:
+
+```console
+$ manicule --json doctor
+affected=40  listed=25  truncated=False
+… Listed below: 25 of 40. This diagnostic is a sample; `manicule document list
+--source docs --limit 160 --json` lists the corpus itself, and the affected rows
+are the ones whose provenance source_id differs from their source_id. Raise
+--limit past your corpus size — it defaults to 50. Converting an export *before*
+its first sync avoids this entirely …
+```
+
+Two things about that output are worth reading carefully:
+
+- **`documents` in the facts is a sample, capped at 25.** `affected` is the real count. A script
+  that iterated the array believing it complete would clear 25 of 40 and report success. The
+  message now states the cap; `truncated` does **not** — that field describes the 10,000-document
+  *scan* bound, not this one.
+- **The listing defaults to `--limit 50`.** On a corpus of 80 rows, `manicule document list
+  --source docs --json` returns 50 and shows 10 of the 40 affected. The `--limit` in the emitted
+  command is not decoration.
+
+There is **no bulk delete**, by design. The removal is per document, and at this scale that means
+a loop over the listing:
+
+```console
+$ manicule document list --source docs --limit 160 --json \
+    | python -c 'import json,sys
+d = json.load(sys.stdin)["data"]
+for x in d["documents"]:
+    p = x.get("provenance") or {}
+    if p.get("source_id") and p["source_id"] != x["source_id"]:
+        print(x["id"])' > leftovers.txt
+
+$ while read -r id; do manicule document delete "$id"; done < leftovers.txt
+removed 675afe61665b316c2ab5372de1daa885 into the trash
+…
+```
+
+40 deletions took 16-20s across two runs. The predicate — provenance `source_id` differing from the stored
+`source_id` — is the same one `doctor` uses, so the loop clears exactly what it reports. The id in
+`doctor`'s `facts.documents[].old_document_id` is the id `document delete` takes, directly.
+
+Use `read -r` and make sure the file ends in a newline. `while read` silently drops a final line
+without one, which will leave you one leftover and a `doctor` that still says `degraded` — that
+happened while writing this.
+
+The delete is the ordinary soft delete: removed copies go to the trash and are restorable. Pass
+`--hard` only if you mean it.
+
+> **Do not reach for `manicule collection orphans`.** It means "documents in no collection", which
+> in a corpus with no collections defined is *every document*. Run against the 40-page corpus above
+> it reports all 40 — with `--confirm` it would trash the whole index. The word "orphan" means
+> something entirely different there.
+
+After the loop, `document-identity` and `document-content` are both `ok` and 40 documents remain.
+
+The reason `doctor` sees any of this is the `claimed` rule in its identity check: a path-keyed
+enriched page is normally *excluded* from that check, because it carries its own notice naming the
+command that applies its identity. The exclusion lifts the moment another document holds the
+identity it declares — which is precisely the state the sync after conversion produces. Without
+that, the tool would instruct an action that strands a row and then say nothing about it.
+
+Two files declaring one page id are **both** returned to their paths, and the conflict is reported.
+Not the second only: `documents` is `UNIQUE` on `(workspace_id, source, source_id)`, so honouring
+both would mean a silent overwrite — and keeping the *first* would make ownership depend on walk
+order, so renaming a directory would move one page's content onto another page's identity.
 
 ## 6. Why it is command line only
 

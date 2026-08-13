@@ -183,6 +183,21 @@ def _awaiting_reparse(document: Document) -> bool:
     return isinstance(recorded, str) and bool(recorded) and recorded == document.content_hash
 
 
+def _sidecar_ordering_would_have_helped(moving: Sequence[Document]) -> bool:
+    """Whether these rows are enriched pages that a conversion before the first sync would avoid.
+
+    Narrow on purpose. The ordering advice is true for a corpus of enriched exports converted
+    after it was indexed, and is *not* true for two files that genuinely declare one page id —
+    converting those earlier changes nothing, because the conflict is in the documents rather
+    than in when the manifests were written. Attaching it to both would be advice that does not
+    apply to half the cases it appears in, which is how a diagnostic stops being read.
+
+    The signal is the adaptation record: a path-keyed enriched page carries one, and a document
+    that merely has a manifest does not.
+    """
+    return any(isinstance(document.metadata.get(ENRICHED_KEY), dict) for document in moving)
+
+
 def _identity_deliberately_unapplied(document: Document, *, claimed: set[str]) -> bool:
     """Whether this document is path-keyed on purpose rather than being one of two for one page.
 
@@ -1460,12 +1475,44 @@ class ApplicationService:
                 f"`manicule document list --source {first.source}`, remove whichever is the "
                 f"stale copy with `manicule document delete <id>`, or correct the manifest that "
                 f"declares the wrong page id and sync again. There is no bulk remedy for this "
-                f"and none is implied."
+                f"and none is implied"
+                # The list below is capped, and the cap is stated *here* rather than left to be
+                # inferred from a length. `affected` and `len(documents)` disagreeing is how a
+                # script that iterated the sample deletes some of the corpus and reports success
+                # — the `documents` array is the only machine-readable enumeration this check
+                # offers, so a caller has to be told when it is not the whole of it.
+                + (
+                    # `--limit` is named because it is not optional in practice: the listing
+                    # defaults to 50, and a corpus with this many affected rows has more than
+                    # that. Emitting the command without it was this message's own first draft,
+                    # and running it returned 50 of 80 rows and 10 of 40 affected — the same
+                    # class of untrue instruction the sidecar remediation was fixed for.
+                    f". Listed below: {min(len(moving), _IDENTITY_SAMPLE)} of {len(moving)}. This "
+                    f"diagnostic is a sample; `manicule document list --source {first.source} "
+                    f"--limit {max(len(documents) * 2, 100)} --json` lists the corpus itself, and "
+                    f"the affected rows are the ones whose provenance source_id differs from "
+                    f"their source_id. Raise --limit past your corpus size — it defaults to 50"
+                    if len(moving) > _IDENTITY_SAMPLE
+                    else ""
+                )
+                + (
+                    # Ordering, not remediation. At export scale this state is reached one row
+                    # per page, and per-document removal is what there is; the cheap fix is to
+                    # not arrive here, which is a thing to say before the next corpus rather than
+                    # after this one.
+                    ". Converting an export *before* its first sync avoids this entirely: the "
+                    "manifest is read at the first discovery and no path-keyed row is ever "
+                    "created"
+                    if _sidecar_ordering_would_have_helped(moving)
+                    else ""
+                )
+                + "."
             ),
             facts=cast(
                 "dict[str, JsonValue]",
                 {
                     "affected": len(moving),
+                    "listed": min(len(moving), _IDENTITY_SAMPLE),
                     "examined": len(documents),
                     "truncated": len(documents) >= _IDENTITY_SCAN,
                     "chunks_reusable": False,

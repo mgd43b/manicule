@@ -19,8 +19,14 @@ import pytest
 from manicule import vocabularies
 from manicule.app import results as r
 from manicule.app.results import CheckState
-from manicule.app.service import ApplicationService, hardware
+from manicule.app.service import (
+    _IDENTITY_SAMPLE,  # pyright: ignore[reportPrivateUsage]
+    ApplicationService,
+    hardware,
+)
 from manicule.config.settings import Settings, config_file
+from manicule.connectors.enriched import AdapterOutcome
+from manicule.connectors.filesystem import ENRICHED_KEY
 from manicule.core.content import Document, DocumentStatus
 from manicule.core.errors import ConfigError, UnknownEntityError
 from manicule.core.ids import document_id
@@ -1914,6 +1920,82 @@ async def test_the_identity_check_names_only_remedies_that_exist(backend: FakeBa
     assert "manicule upgrade" not in check.remedy
     assert check.remedy == "manicule document list --source handbook"
     assert "manicule document delete" in check.detail
+
+
+async def test_the_identity_check_says_when_its_list_is_only_a_sample(
+    backend: FakeBackend,
+) -> None:
+    """``affected`` and the length of ``documents`` disagree past the sample bound, and it says so.
+
+    The ``documents`` array is the only machine-readable enumeration this check offers. A caller
+    that iterated it believing it complete would repair twenty-five rows of a corpus with more
+    than that and report success — and nothing in the payload contradicted them, because
+    ``truncated`` describes the *scan* bound and not this one. Found by running the workflow on a
+    forty-page export.
+    """
+    for index in range(_IDENTITY_SAMPLE + 5):
+        backend.store.add(_declaring(backend, f"{index}", source_id=f"/corpus/pages/{index}.html"))
+
+    check = _check(await ApplicationService(backend).doctor(), "document-identity")
+
+    affected = check.facts["affected"]
+    listed = check.facts["listed"]
+    documents = check.facts["documents"]
+    assert isinstance(documents, list)
+    assert affected == _IDENTITY_SAMPLE + 5
+    assert listed == _IDENTITY_SAMPLE
+    assert len(documents) == listed, "`listed` does not describe the array it is about"
+    assert f"{_IDENTITY_SAMPLE} of {affected}" in check.detail
+    assert "--limit" in check.detail, (
+        "the listing command is named without the flag that makes it complete; it defaults to 50"
+    )
+
+
+async def test_the_identity_check_does_not_claim_to_be_a_sample_when_it_is_not(
+    backend: FakeBackend,
+) -> None:
+    """The other side, so the sentence above is not simply always present."""
+    backend.store.add(_declaring(backend, "1002", source_id="/corpus/pages/1002.html"))
+
+    check = _check(await ApplicationService(backend).doctor(), "document-identity")
+
+    assert check.facts["listed"] == 1
+    assert "Listed below" not in check.detail
+    assert "--limit" not in check.detail
+
+
+async def test_the_identity_check_gives_ordering_advice_only_where_it_applies(
+    backend: FakeBackend,
+) -> None:
+    """Converting before the first sync avoids this — for an enriched page, and not otherwise.
+
+    Two files that genuinely declare one page id are not helped by converting earlier: the
+    conflict is in the documents rather than in when the manifests were written. Advice that
+    appeared in both cases would be wrong in one of them, which is how a diagnostic stops being
+    read.
+    """
+    # Both rows, because that is the state being described: the page-keyed document created by
+    # the sync after conversion, and the path-keyed one it left behind. One alone is *excluded*
+    # from this check by design — it carries its own notice — so a fixture with one row would
+    # assert about a code path the workflow never reaches.
+    stranded = _declaring(backend, "1002", source_id="/corpus/pages/1002.html")
+    stranded.metadata[ENRICHED_KEY] = {"outcome": AdapterOutcome.IDENTITY_NOT_APPLIED.value}
+    backend.store.add(stranded)
+    backend.store.add(_declaring(backend, "1002", source_id="1002"))
+
+    with_record = _check(await ApplicationService(backend).doctor(), "document-identity")
+
+    assert with_record.state == "degraded"
+    assert "before* its first sync" in with_record.detail
+
+    plain = FakeBackend(settings=backend.settings)
+    plain.store.add(_declaring(plain, "1002", source_id="/corpus/pages/1002.html"))
+    plain.store.add(_declaring(plain, "1002", source_id="1002"))
+
+    without_record = _check(await ApplicationService(plain).doctor(), "document-identity")
+
+    assert without_record.state == "degraded", "the two are not comparable states"
+    assert "first sync" not in without_record.detail
 
 
 async def test_the_identity_check_clears_once_the_documents_are_keyed_on_what_they_declare(
