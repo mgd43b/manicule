@@ -94,6 +94,77 @@ def test_a_heading_lifted_into_the_breadcrumb_is_still_a_heading_definition() ->
     assert [(entry.acronym, entry.form) for entry in entries] == [("NOW", DefinitionForm.HEADING)]
 
 
+# --- list markers ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"- NOW - {EXPANSION}",
+        f"* NOW - {EXPANSION}",
+        f"+ NOW - {EXPANSION}",
+        f"1. NOW - {EXPANSION}",
+        f"  - NOW - {EXPANSION}",
+        f"- NOW — {EXPANSION}",
+        f"- NOW: {EXPANSION}",
+    ],
+    ids=["bullet", "asterisk", "plus", "ordered", "nested", "em-dash", "colon"],
+)
+def test_a_definition_written_as_a_list_item_is_detected(text: str) -> None:
+    """A glossary written as a bulleted list produced nothing at all.
+
+    Every form anchors its term at the first non-space character, so the marker defeated all
+    three line rules at once rather than one of them: measured on ``origin/main``,
+    ``'- HDR - Hot Draining Router'`` produced ``[]`` while the identical line without its
+    marker produced an entry at 0.95.
+
+    Parametrised over the spellings the parsers actually emit — :mod:`~manicule.parsers.
+    confluence`, :mod:`~manicule.parsers.web` and :mod:`~manicule.parsers.adf` write ``- `` and
+    ``1. `` with two spaces of indent per level, and Markdown passes through whichever of
+    ``-``, ``*`` and ``+`` the author typed.
+    """
+    entries = detect_in_chunk(chunk(text))
+
+    assert [entry.acronym for entry in entries] == ["NOW"]
+    assert entries[0].expansion == EXPANSION, "the marker is not part of what the term means"
+
+
+def test_a_list_marker_is_not_part_of_a_heading_definitions_expansion() -> None:
+    """The other half of the marker rule, and it is a *stored value* rather than a miss.
+
+    A heading section whose body is a bulleted list took the body verbatim, so ``PFC`` was
+    recorded as meaning ``'- Partition Failover Coordinator'`` — dash included, in the string a
+    reader is shown and a query matches against. Detecting nothing would have been the safer
+    failure; this one published a malformed expansion under a correct citation.
+    """
+    entries = detect_in_chunk(
+        make_chunk(
+            DOCUMENT, 0, "- Partition Failover Coordinator", heading_path=("Glossary", "PFC")
+        )
+    )
+
+    assert [entry.expansion for entry in entries] == ["Partition Failover Coordinator"]
+
+
+def test_a_bare_list_item_is_not_a_definition() -> None:
+    """Removing the marker must not turn every list into a glossary.
+
+    The marker rule deletes structure and loosens nothing else, so what refused a bulleted line
+    before still refuses it: an item with no separator offers no expansion to find, and
+    ``- Note - ...`` is turned away by the two gates the module docstring calls independent.
+
+    **They really are independent here, which is why this asserts absence rather than naming one
+    of them.** Measured by removing each in turn: with only :data:`_UPPERCASE_SHARE` dropped to
+    0.2 this still passes, because ``this`` is in ``_NEVER_OPENS_AN_EXPANSION``; with only the
+    word list emptied it still passes, because ``Note`` is 0.25 upper case. Remove both and the
+    line is stored as ``NOTE = 'this is an ordinary remark'`` at exactly 0.60 — which is the
+    failure this case exists to produce, and the reason it is worth keeping despite passing
+    whether or not the marker rule is present.
+    """
+    assert detect_in_chunk(chunk(f"- {EXPANSION}")) == []
+    assert detect_in_chunk(chunk("- Note - this is an ordinary remark")) == []
+
+
 def test_a_term_written_with_dots_normalises_to_the_same_key() -> None:
     entries = detect_in_chunk(chunk(f"N.O.W. — {EXPANSION}"))
 
@@ -806,6 +877,42 @@ def test_a_document_titled_glossary_lifts_a_form_that_carries_nothing_else() -> 
 
     assert [entry.acronym for entry in on_a_glossary] == ["FATHOM"]
     assert elsewhere == [], "the same line in a runbook has neither piece of evidence"
+
+
+def test_a_candidate_line_cannot_supply_the_glossary_evidence_that_admits_it() -> None:
+    """Context is read from the page, never from the text being judged.
+
+    ``detect_in_chunk`` used to pass the chunk's own first line to ``_mentions_glossary``, so a
+    line containing any of :data:`GLOSSARY_WORDS` certified itself. ``terms`` is one of them, and
+    0.45 + 0.15 is exactly :data:`MIN_DEFINITION_CONFIDENCE`, so it decided every case it touched:
+    on a document titled "Operations handbook" this chunk recorded **two** entries, and moving the
+    same line to second position recorded none.
+
+    The position dependence is what makes it a bug rather than a loose threshold — the two lines
+    below are the same two lines in both orders, and nothing about the page differs.
+    """
+    lines = ["TODO - add the storage terms next quarter.", "XXX - some other note here."]
+
+    first = detect_in_chunk(chunk("\n".join(lines), document=PLAIN, heading_path=("Handbook",)))
+    reversed_order = detect_in_chunk(
+        chunk("\n".join(reversed(lines)), document=PLAIN, heading_path=("Handbook",))
+    )
+
+    assert first == [], "a line naming 'terms' is not evidence that its own page is a glossary"
+    assert reversed_order == []
+
+
+def test_a_heading_path_naming_a_glossary_is_still_evidence() -> None:
+    """What the page *may* say about itself, kept: the breadcrumb is not the candidate's text.
+
+    Narrowing context to the title alone would lose a glossary that is one section of a longer
+    page, which is an ordinary way to write one.
+    """
+    entries = detect_in_chunk(
+        chunk("FATHOM — Failure Analysis Tooling Home", document=PLAIN, heading_path=("Glossary",))
+    )
+
+    assert [entry.acronym for entry in entries] == ["FATHOM"]
 
 
 # --- normalisation ----------------------------------------------------------------------------

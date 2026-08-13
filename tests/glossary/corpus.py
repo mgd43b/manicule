@@ -163,6 +163,33 @@ line added here changes the chunk's vector and silently retires all three: the c
 still cite measurements, and the corpus they name would no longer be the corpus that produced
 them. New material goes on :data:`SUPPLEMENT_ENTRIES`, which is a second document and leaves
 this one byte-identical.
+
+**Six of these are near-miss backronyms, and that is coverage rather than sloppiness.** They read
+as though their expansions spell them and they do not:
+
+========  ===========================================  =============
+Term      Expansion                                    Spells
+========  ===========================================  =============
+ISOTOPE   Index Storage Optimisation Tooling Endpoint  ISOTE
+JUNIPER   Job Under Node Inspection Pipeline Runner    JUNIPR
+KRYPTON   Key Rotation Yield Protocol Token Notary     KRYPTN
+MISTRAL   Metrics Ingest Stream Transfer And Load      MISTAL, MISTL
+OBSIDIAN  Observation Buffer Storage Index And Node    OBSIAN, OBSIN
+XENON     Export Node Observation Notary               ENON
+========  ===========================================  =============
+
+So they earn no :data:`~manicule.ingest.glossary.INITIALS_EVIDENCE` and are detected at exactly
+0.60 — ``_FORM_WEIGHT[EM_DASH]`` 0.45 plus
+:data:`~manicule.ingest.glossary.GLOSSARY_CONTEXT_EVIDENCE` 0.15 — while the other nineteen sit
+at 0.95. They are the only entries in this suite that exercise a definition admitted by **form
+and page alone**, with no agreement between the two strings.
+
+**Do not "correct" their spellings.** Making them spell out would move all six to 0.95, leave the
+0.60 path with no witness anywhere in the suite, and fail nothing while doing it — the class would
+simply stop being tested. That path is currently under review precisely because it also admits
+things that are not definitions, so a fixture that stops covering it would hide the review's
+subject. If a true backronym is wanted, add one to :data:`SUPPLEMENT_ENTRIES`; these six stay as
+they are.
 """
 
 ORDINARY: Final[tuple[str, ...]] = (

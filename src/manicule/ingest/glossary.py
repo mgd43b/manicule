@@ -90,6 +90,24 @@ GLOSSARY_CONTEXT_EVIDENCE: Final = 0.15
 Deliberately the smallest of the three. It is evidence about the *page*, and a page can be a
 glossary and still contain a sentence with a colon in it — so it must never be enough on its
 own to admit a form that carries nothing else.
+
+**Read from the page and from nothing nearer**, which used not to be true and is the whole of why
+this is stated twice. :func:`detect_in_chunk` also passed the chunk's own first line to
+:func:`_mentions_glossary`, so a candidate could supply the evidence that carried it: on a
+document titled "Operations handbook", the chunk
+
+    TODO - add the storage terms next quarter.
+    XXX - some other note here.
+
+recorded **two** entries, because ``terms`` is in :data:`GLOSSARY_WORDS` and the first line is
+where it was looked for. Moving that same line to second position recorded none. Evidence a
+candidate can write for itself is not evidence, and 0.45 + 0.15 is exactly
+:data:`MIN_DEFINITION_CONFIDENCE`, so it was decisive every time it fired.
+
+The title and the heading path are the two things a chunk cannot edit about itself. Dropping the
+first line lost nothing measurable: over every fixture in ``tests/glossary`` — both glossary
+pages, the forty-five ordinary passages, ``PROSE_ON_THE_GLOSSARY_PAGE``, and the whole labelled
+skeleton corpus — the detected set is identical before and after.
 """
 
 GLOSSARY_WORDS: Final[frozenset[str]] = frozenset(
@@ -328,6 +346,35 @@ _PARENTHETICAL_RE: Final = re.compile(
     r"\s*\(\s*(?P<terms>[^()]{2,64}?)\s*\)"
 )
 _TABLE_RULE_RE: Final = re.compile(r"^[\s|:-]+$")
+
+_LIST_MARKER_RE: Final = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
+"""A list item's bullet or number: structure a parser wrote, not text an author did.
+
+Every parser that renders a list supplies the marker itself — ``- `` for a bullet, ``1. `` for an
+ordered item, two spaces of indent per level in :mod:`~manicule.parsers.confluence`,
+:mod:`~manicule.parsers.web` and :mod:`~manicule.parsers.adf` alike. The author typed
+``NOW - Network Operations Workspace``; the ``- `` in front of it is the parser saying "this was
+a list".
+
+**Removing it is what makes a bulleted glossary detectable at all**, and the gap was total rather
+than partial. Every form anchors its term at the first non-space character — ``_HYPHEN_RE`` and
+its two neighbours all begin ``^\\s*(?P<term>...)`` — and a marker occupies exactly that position,
+so a bullet defeated all three at once. Measured on ``origin/main``:
+
+- ``detect_in_chunk('- HDR - Hot Draining Router')`` → ``[]``
+- ``detect_in_chunk('HDR - Hot Draining Router')`` → one entry, confidence 0.95
+
+The same held for the colon and em-dash spellings, for ordered lists, and for nested items, which
+is why this is one rule applied to the line rather than an alternation added to three patterns.
+
+**Applied to every line, including a code chunk's.** A unified diff's ``- import os`` therefore
+reads as ``import os`` here. That is deliberate and bounded: nothing downstream is loosened, so
+such a line still has to be written like an abbreviation, still has to survive
+:func:`core_expansion`, and still has to clear :data:`MIN_DEFINITION_CONFIDENCE`. Keying this off
+:attr:`~manicule.core.content.Chunk.kind` was the alternative and is worse — a chunk holding a
+list and the prose around it is not kind ``LIST``, so the fix would silently not apply to the
+commonest real layout while looking like it did.
+"""
 
 
 def acronym_shaped(surface: str) -> bool:
@@ -750,8 +797,8 @@ def detect_in_chunk(chunk: Chunk, *, glossary_context: bool = False) -> list[Glo
             Passed in rather than inferred here, because the evidence lives in the title, and a
             chunk does not carry one.
     """
-    lines = chunk.text.splitlines()
-    context = glossary_context or _mentions_glossary(chunk.heading_path, lines[:1])
+    lines = [_LIST_MARKER_RE.sub("", line) for line in chunk.text.splitlines()]
+    context = glossary_context or _mentions_glossary(chunk.heading_path)
     location = " > ".join(chunk.heading_path)
 
     candidates = _heading_definitions(lines, chunk.heading_path)
