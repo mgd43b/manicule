@@ -171,9 +171,12 @@ which is what [no-color.org](https://no-color.org/) asks for: it governs colour,
 
 **`TERM=dumb` is not a colour switch and is the one that surprises.** It declares what the
 terminal can *render*, and Rich believes a capability over a request: `TERM=dumb` with
-`FORCE_COLOR` set produces no escape sequences at all. This is worth knowing because editors'
-integrated terminals and some CI runners set it, so output that is coloured on a developer's
-machine is plain on a colleague's with nothing having changed.
+`FORCE_COLOR` set produces no escape sequences at all. Any environment whose terminal cannot
+render ANSI reports it, so the same command is coloured in one shell and plain in another with
+nothing about manicule having changed.
+
+`TTY_COMPATIBLE` is the same shape and is checked **before** `FORCE_COLOR`: `TTY_COMPATIBLE=0`
+means "not a terminal" whatever else is set.
 
 The table is pinned by `tests/app/test_cli.py`, which asserts each row against captured stdout
 rather than trusting this document — so a Rich upgrade that changed what an operator's

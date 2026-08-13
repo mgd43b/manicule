@@ -30,6 +30,7 @@ from manicule.core.version import CORE_VERSION
 from manicule.mcp.server import TOOL_NAMES
 from manicule.storage.backup import BackupError
 from tests.app.fakes import FakeBackend, FakeMaintenance, make_chunk, make_document
+from tests.conftest import CLEARED_TERMINAL_VARIABLES
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -1610,3 +1611,81 @@ def test_json_carries_no_ansi_in_any_colour_environment(
     assert result.exit_code == 0
     assert ESCAPE not in result.stdout, f"an ANSI escape reached stdout under --json, with {label}"
     assert json.loads(result.stdout)["op"] == "doctor"
+
+
+# --- the colour isolation, checked against what Rich actually reads ---------------------------
+
+
+SIZE_AND_JUPYTER: dict[str, str] = {
+    "COLUMNS": "terminal width, not colour. Pinned per case by the tests that assert layout; a "
+    "width chosen here would quietly become the one every such assertion was written against.",
+    "LINES": "terminal height, and nothing this surface prints depends on it.",
+    "JUPYTER_COLUMNS": "size, and only consulted when Rich believes it is inside Jupyter.",
+    "JUPYTER_LINES": "size, and only consulted when Rich believes it is inside Jupyter.",
+}
+"""Variables Rich reads that the colour fixture deliberately leaves alone, and why for each.
+
+A reason apiece rather than a bare list, because "this one does not matter" is a claim. The
+alternative — clearing everything Rich reads — would make this fixture decide the terminal
+*size* as well, which is a different subject with its own tests already pinning it.
+"""
+
+RICH_ENVIRONMENT_FLOOR = 8
+"""How many variables the scan below must find in Rich's console module.
+
+Rich reads ten there today. The floor is under that and far above zero, because the failure
+this guards against is a scan that matches nothing and reports a fixture as complete.
+"""
+
+
+def _variables_rich_reads() -> set[str]:
+    """Every environment variable Rich's console module consults, read from its source.
+
+    A third-party library's source, deliberately. What decides whether this suite's output is
+    coloured is not manicule's code — ``render.console`` passes no colour arguments — so the
+    only honest place to derive the list is the library that does decide.
+    """
+    import rich.console  # noqa: PLC0415 - only this derivation reads Rich's source
+
+    source = Path(rich.console.__file__).read_text(encoding="utf-8")
+    return set(re.findall(r"environ(?:\.get)?\(\s*[\"']([A-Z_0-9]+)[\"']", source))
+
+
+def test_the_colour_isolation_accounts_for_every_variable_rich_reads() -> None:
+    """The guard that would have caught both misses, instead of a person catching one of them.
+
+    The fixture's list has been wrong twice. ``TERM`` was absent, which is the bug that started
+    this — and it is not a colour switch, so no amount of thinking about colour would have
+    surfaced it. Then the first version of the fix added ``TERM`` and still missed
+    ``TTY_COMPATIBLE``, which Rich checks *before* ``FORCE_COLOR``: ``TTY_COMPATIBLE=0``
+    reproduced the original failure exactly, through a fixture written to prevent it.
+
+    Twice is a pattern, and the pattern is that a hand-written list of somebody else's
+    environment variables goes stale silently. So the list is checked against Rich's source:
+    every variable it consults is either cleared, pinned, or carries a written reason for being
+    left alone. A Rich upgrade that starts reading an eleventh fails here until somebody says
+    which it is.
+    """
+    read = _variables_rich_reads()
+
+    assert len(read) >= RICH_ENVIRONMENT_FLOOR, (
+        f"the scan found {len(read)} environment variable(s) in Rich's console module, below "
+        f"the floor of {RICH_ENVIRONMENT_FLOOR}. It is reading the wrong file, or Rich has "
+        f"restructured and this derivation no longer sees what decides colour."
+    )
+    for landmark in ("FORCE_COLOR", "NO_COLOR", "TERM", "TTY_COMPATIBLE"):
+        assert landmark in read, (
+            f"the scan did not find {landmark}, which Rich certainly reads. Whatever it "
+            f"parsed, it was not the module that decides whether output is coloured."
+        )
+
+    classified = CLEARED_TERMINAL_VARIABLES | {"TERM"} | set(SIZE_AND_JUPYTER)
+    unaccounted = sorted(read - classified)
+    assert unaccounted == [], (
+        f"Rich reads {unaccounted}, which the colour fixture neither controls nor excuses. If "
+        f"it can change whether output is a terminal or is coloured, add it to "
+        f"CLEARED_TERMINAL_VARIABLES in tests/conftest.py; if it cannot, add it to "
+        f"SIZE_AND_JUPYTER here with the reason. Leaving it unclassified is how this suite "
+        f"went back to depending on the caller's shell twice already."
+    )
+    assert all(SIZE_AND_JUPYTER.values()), "a variable left alone without a reason is an oversight"

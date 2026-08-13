@@ -138,20 +138,29 @@ def corpus(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return build_all(tmp_path_factory.mktemp("corpus"))
 
 
-COLOUR_VARIABLES: tuple[str, ...] = ("NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE")
-"""Environment variables that decide, on their own, whether anything is coloured.
+CLEARED_TERMINAL_VARIABLES: frozenset[str] = frozenset(
+    {"NO_COLOR", "FORCE_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE", "COLORTERM"}
+)
+"""Variables that decide whether output is a terminal, and whether it is coloured.
 
-Rich reads ``NO_COLOR`` and ``FORCE_COLOR``; the ``CLICOLOR`` pair is the older convention that
-other tools on a developer's machine set, and clearing it costs nothing and removes a whole
-class of "works on my terminal" from the suite.
+Every one is cleared, so the suite states its own answer instead of inheriting the caller's.
+
+The list is **not** trusted to be complete on its own —
+``tests/app/test_cli.py::test_the_colour_isolation_accounts_for_every_variable_rich_reads``
+checks it against what Rich's source actually consults. That check exists because a
+hand-written list here has already been wrong twice: ``TERM`` was missing, which is the bug
+this fixture was written for, and ``TTY_COMPATIBLE`` was missing from the first version of the
+fix — Rich reads it *before* ``FORCE_COLOR``, so ``TTY_COMPATIBLE=0`` reintroduced the original
+failure exactly.
 """
 
 BASELINE_TERM = "xterm-256color"
 """The terminal the suite says it is running on, whatever the caller's shell says.
 
-``TERM`` is not a colour switch, which is exactly why it was missed: it is a *capability*
-declaration, and ``dumb`` tells Rich the stream cannot render ANSI at all — overriding
-``FORCE_COLOR``, which only says the stream is a terminal.
+Set rather than cleared, because an absent ``TERM`` is not a neutral answer — it is a terminal
+that declares no capability. ``TERM`` is not a colour switch, which is why it was missed: it is
+a *capability*, and ``dumb`` tells Rich the stream cannot render ANSI at all, which beats
+``FORCE_COLOR`` saying the stream is a terminal.
 """
 
 
@@ -161,9 +170,8 @@ def colour_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
     Whether manicule colours its output is decided entirely by environment variables, so
     without this the suite's result depends on the shell that started it. It did: a positive
-    control asserting that human output *is* coloured passed under an ordinary terminal and
-    failed under ``TERM=dumb``, which is what an editor's integrated terminal, a CI runner and
-    ``emacs`` all set.
+    control asserting that human output *is* coloured passed in an ordinary terminal and failed
+    under ``TERM=dumb``, which is what a shell buffer that cannot render ANSI reports.
 
     That failure mattered more than a flaky test. The control exists so that the neighbouring
     assertion — that ``--json`` emits no ANSI — is not vacuous, and a control that inverts with
@@ -171,11 +179,15 @@ def colour_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     obvious repair is to delete it, and the assertion it was protecting quietly stops meaning
     anything.
 
-    The baseline is **no opinion, on a capable terminal**: the colour switches are cleared, so
-    nothing is forced either way, and ``TERM`` names a terminal that can render ANSI. A test
-    wanting colour sets ``FORCE_COLOR`` itself and now gets it deterministically; a test
-    wanting none needs nothing, because the runner's stdout is not a terminal.
+    The baseline is **no opinion, on a capable terminal**: the switches are cleared, so nothing
+    is forced either way, and ``TERM`` names a terminal that can render ANSI. A test wanting
+    colour sets ``FORCE_COLOR`` itself and now gets it deterministically; a test wanting none
+    needs nothing, because the runner's stdout is not a terminal.
+
+    Size is deliberately left alone. ``COLUMNS`` and ``LINES`` are inherited, and the tests that
+    care pin them per case — a width this fixture chose would silently become the width every
+    layout assertion was written against.
     """
-    for name in COLOUR_VARIABLES:
+    for name in CLEARED_TERMINAL_VARIABLES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("TERM", BASELINE_TERM)
