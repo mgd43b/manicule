@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -476,3 +477,88 @@ async def test_a_runtime_gives_the_directory_back_when_it_closes(data_dir: Path)
 
     with InstanceLock(data_dir):
         pass
+
+
+NO_RUNTIME_COMMANDS: frozenset[str] = frozenset(
+    {
+        # Prints a shell script from a table in this process. Opens nothing.
+        "completion",
+        # Reads the loaded configuration and prints it. No data directory is touched.
+        "config show",
+        # Signals a server whose pid is in a file and waits for it to go. It must **not** take
+        # the directory: the process it is stopping is holding it, so a `stop` that wanted the
+        # lock could never stop anything.
+        "stop",
+        # Opens its own runtime in `cli/serving.py` and takes the directory there, which
+        # `test_every_long_lived_writer_takes_the_directory_before_it_starts_serving` checks.
+        # It is here rather than in WRITERS because it emits no operation for `_cli_ops` to
+        # find — it is the runtime, not a call through one.
+        "start",
+    }
+)
+"""Commands that never reach ``_execute``, and what each one does instead.
+
+Every other command opens a runtime through that one function, which is what makes the
+classification a property of the surface rather than of a convention. These four are the
+exceptions, and an exception that is not written down is indistinguishable from an oversight —
+which is the entire failure mode this file exists to prevent.
+"""
+
+
+def _normalised(name: str) -> str:
+    """One spelling for a command path and for an operation name.
+
+    ``document reindex`` and ``document_reindex`` are the same thing said by two surfaces, and
+    the comparison below is only meaningful once they look the same.
+    """
+    return re.sub(r"[ _-]+", "-", name.strip())
+
+
+def _cli_commands() -> set[str]:
+    """Every command the surface offers, from the Typer app rather than from the source."""
+    import typer  # noqa: PLC0415 - only this test walks the app
+
+    import manicule.cli.main as cli  # noqa: PLC0415 - only this test needs the module
+
+    def walk(app: typer.Typer, prefix: str = "") -> list[str]:
+        found: list[str] = []
+        for command in app.registered_commands:
+            name = command.name or (command.callback.__name__ if command.callback else "")
+            found.append(_normalised(f"{prefix}{name}"))
+        for group in app.registered_groups:
+            inner = group.typer_instance
+            if inner is not None:
+                found.extend(walk(inner, f"{group.name} "))
+        return found
+
+    return set(walk(cli.app))
+
+
+def test_every_command_is_accounted_for_by_the_classification_or_named_as_an_exception() -> None:
+    """The hole the operation list alone leaves, closed.
+
+    ``_cli_ops`` finds operations, and an operation is what a command *emits*. Three commands
+    emit none — ``completion`` and ``config show`` because they open nothing, ``start`` and
+    ``stop`` because one opens its own runtime and the other signals somebody else's — so a
+    check built only on operations would report a complete enumeration while saying nothing
+    about four of the forty-two things an operator can type.
+
+    Comparing command names against operation names needs the mapping to be regular, and it is:
+    ``document reindex`` emits ``document_reindex``. Where it is not, the command has to be
+    named above with the reason, which is the point.
+    """
+    commands = _cli_commands()
+    assert len(commands) > 30, "the walk must find the real surface, or this proves nothing"
+
+    classified = {_normalised(op) for op in WRITERS | READ_ONLY_OPS}
+    # `index` emits `index_path` when given a path and `index_status` when not; `backup` emits
+    # `restore` for `--restore`. Each is one command over two operations, so its own name
+    # matches neither — and both operations are classified individually above.
+    aliases = {"index", "backup"}
+    exceptions = {_normalised(name) for name in NO_RUNTIME_COMMANDS}
+    unaccounted = commands - classified - exceptions - aliases
+    assert not unaccounted, (
+        f"these commands are neither classified nor named as exceptions: {sorted(unaccounted)}. "
+        f"Each one either emits an operation that belongs in WRITERS or READ_ONLY_OPS, or opens "
+        f"no runtime and belongs in NO_RUNTIME_COMMANDS with the reason."
+    )
