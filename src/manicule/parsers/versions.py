@@ -135,6 +135,16 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # newline *inside* a block, and `_html_to_text` hands the result to `lines_of` — so the
     # break becomes a line of the canonical text and every `LineAnchor` after it moves by one.
     # This parser's own rules are again unchanged; what it extracts is not.
+    #
+    # **Deliberately not moved to 4 when `html` did**, which breaks the run of two above and is
+    # therefore the entry most at risk of being tidied into symmetry later. Both bumps above
+    # moved the *text* an HTML-only body's `LineAnchor`s address. #109 did not: it added `rows`
+    # to what the web parser says *about* a table block, and `_html_to_text` joins the blocks'
+    # `text` and never reads their metadata — a body carrying a 300-row table parses to
+    # byte-identical blocks and byte-identical anchors across it, run rather than inferred.
+    # `test_an_html_body_is_built_from_block_text_alone` in `tests/parsers/test_mail.py` is what
+    # keeps that true; a bump here would be symmetry rather than a fact, and it would re-parse
+    # and re-embed every email in the corpus to produce identical text.
     "email": ParserVersions(rules="3", distributions=("selectolax",)),
     # 1 -> 2: CDATA sections are recovered as text rather than deleted by the HTML parser's
     # bogus-comment reparse. Every document containing one produces different text now, and

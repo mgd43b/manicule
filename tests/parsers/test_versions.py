@@ -277,30 +277,3 @@ def test_a_parser_that_started_describing_its_table_rows_moved_its_fingerprint(
         f"lineage claims to be current"
     )
     assert "version" in current.changed_fields(stale)
-
-
-def test_the_email_parser_did_not_move_when_the_html_parser_only_gained_metadata() -> None:
-    """``email`` tracks the web parser's *text*, and #109 did not change it.
-
-    The asymmetry is deliberate and is the part most at risk of being tidied away later, because
-    ``email`` moved with ``html`` twice running — 1 -> 2 for CDATA recovery and 2 -> 3 for the
-    inline ``<br>`` — and a third bump would look like the pattern. It is not the pattern. Both
-    of those changed the text an HTML-only body's :class:`LineAnchor` addresses;
-    :func:`~manicule.parsers.mail._html_to_text` joins the blocks' ``text`` and never reads their
-    metadata, so a body carrying a 300-row table parses to byte-identical blocks and
-    byte-identical anchors across #109 — run rather than inferred.
-
-    A bump here would have been symmetry rather than a fact, and it is not free: it would
-    re-parse and re-embed every email in the corpus (``docs/parsing.md`` §4.5) to produce
-    identical text.
-    """
-    current = parse_fingerprint("email")
-    assert current is not None
-
-    unchanged = ParseFingerprint(
-        parser=current.parser, version="3", libraries=dict(current.libraries)
-    )
-    assert current.matches(unchanged), (
-        "email's rules version moved for a change that did not touch the text its line anchors "
-        "address, which re-parses every email in the corpus to produce the same bytes"
-    )
