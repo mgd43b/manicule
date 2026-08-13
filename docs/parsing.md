@@ -1199,6 +1199,10 @@ can price it:
   | re-parse, before this was implemented | 20,000 | 320 |
   | re-parse, now | 0 | 0 |
 
+  Reproduce it with `.venv/bin/python -m tests.benchmarks.embedding_reuse`, and the row above it
+  with `--no-reuse`. A bump that moves only *some* documents costs in proportion:
+  `--changed-fraction 0.1` embeds 2,000 of the 20,000 in 32 calls of the 320.
+
   §3.3's assertion 6 is the same distinction one level down, and [`ingest.md`](ingest.md) §10.1
   owns the accounting and says which of its counts are counts of forward passes.
 

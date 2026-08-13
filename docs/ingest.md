@@ -926,6 +926,15 @@ chunker, no embedder, no vector. Folding it into the re-parse sweep would work a
 a corpus-sized parse and re-embed for a change to a regular expression, which is the cost an
 operator most needs to be able to avoid. §10.2 is the whole of it.
 
+**`re-embed` is the one verb that deliberately does not reuse a stored vector**, and it is
+worth stating here rather than only in its docstring, because a specification for durable reuse
+would naturally list it among the paths that should. It is the verb an operator reaches for when
+the *vectors themselves* are suspect — a reconfigured model, a restored `vectors/` directory,
+a rebuild that stopped half way. Reuse would find every embedding input unchanged and skip every
+forward pass, so the one command that means "I do not trust these vectors" would succeed, report
+success, and change nothing. Every other path reuses; this one is the escape hatch, and an
+escape hatch that quietly does nothing is worse than none.
+
 **Only the last one can fail for reasons outside the machine**, and it is the only one that is
 not reproducible. Everything above it is a pure function of what is already on disk. That is
 the whole return on retaining bytes, and it is why re-parse is a first-class verb rather
@@ -1010,11 +1019,37 @@ reports the parts separately, because the remedy differs:
 | `embedding.input_changed` | chunks sent to the model | the input is new or has moved — including a chunk whose id survived |
 | `embedding.repaired` | chunks sent to the model | the input was unchanged and the stored vector was missing or unusable |
 | `embedding.forward_calls` | batches the model was asked for | the number accelerator time is proportional to |
+| `embedding.first_seen` | chunks sent to the model | the document held nothing to reuse — growth, not change |
+| `embedding.cache_hits` | chunks the embedder's warm cache served | the process-local layer, reported apart from durable reuse |
 | `embedding.vectors_backfilled` | rows whose identity was reconstructed | a `vectors/` directory predating the identity column, converting itself as it is swept |
 
 A rising `repaired` on a corpus nobody edited is the one line here that asks for attention: it
 says vector rows are going missing or arriving damaged, which is a question about the data
 directory rather than about a parser.
+
+**There is deliberately no counter for reuse missed because the embedding fingerprint
+changed.** A changed fingerprint does not produce misses. It refuses the run before discovery
+(§7) and prints what a rebuild would cost, and the vectors live in a table named after the
+fingerprint (`storage.md` §6.5) so a new one never meets the old rows at all. A counter for it
+could only ever read zero, and a number that cannot move is a worse artefact than a sentence
+saying why — this repository has shipped a byte cap that bounded nothing and an interval that
+scheduled nothing, and both read as working features.
+
+**Reproducing the numbers.** `tests/benchmarks/embedding_reuse.py` is the program the figures
+in this section and in `parsing.md` §4.5 come from. It is in the repository rather than in
+somebody's notes because a figure cited as an argument, reproducible only by whoever took it,
+is a claim whose check is not where its reader is:
+
+```bash
+.venv/bin/python -m tests.benchmarks.embedding_reuse                      # the current cost
+.venv/bin/python -m tests.benchmarks.embedding_reuse --no-reuse           # the cost before
+.venv/bin/python -m tests.benchmarks.embedding_reuse --changed-fraction 0.1
+```
+
+`--changed-fraction` is what prices a *partial* migration: a bump whose parser moves that
+fraction of documents embeds that fraction of chunks. It counts forward passes, not seconds at
+a real model — the embedder is a counting stand-in, and the constant factor against a real one
+is unmeasured.
 
 **What a dry run guarantees.** `--dry-run` performs the selection and nothing else: no parse,
 no chunking, no embedding, no blob read, no write to the database, the vector store or the
