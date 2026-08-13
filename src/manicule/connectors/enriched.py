@@ -80,6 +80,7 @@ __all__ = [
     "ADAPTER_VERSION",
     "DEFAULT_LABELS",
     "DEFAULT_PROFILE",
+    "ENRICHED_KEY",
     "MAX_BODY_BYTES",
     "MAX_HTML_BYTES",
     "METADATA_SELECTOR",
@@ -105,6 +106,25 @@ lineage as the bytes themselves, and a corpus holding two generations of extract
 nothing to tell them apart is the failure that field exists to end. It travels in the change
 token, so bumping it re-adapts and re-parses every enriched page without anything being
 re-downloaded — the snapshot is a local file and was never thrown away.
+"""
+
+ENRICHED_KEY: Final = "enriched_adaptation"
+"""Document-metadata key recording what the adapter did to this page.
+
+**Here rather than on** :class:`~manicule.core.provenance.LocalSnapshot`, and the choice is the
+one ``docs/storage.md`` §4.2.1 already settled for ``space_key``: the provenance record carries
+what *every* source has, and anything one situation means and others do not stays in the
+connector's own keys. A snapshot checksum distinct from the document's content hash is exactly
+that — it exists only where a document's bytes are *derived from* a local file rather than being
+it, which is true of an enriched export and of nothing else manicule ingests. Adding a field to
+``LocalSnapshot`` would have put a checksum on every document that has no second set of bytes to
+be a checksum of, and its docstring's argument against one — that ``documents.content_hash``
+already holds the digest of exactly these bytes — remains true for all of them.
+
+The record holds the six facts §1 of the specification asks be distinguishable, minus the two the
+core already stores: the local snapshot path is :attr:`LocalSnapshot.path` and the extracted
+body's digest is ``documents.content_hash``. Both are repeated here anyway, because a diagnostic
+that had to join three places to answer "what was extracted from what" would not be run.
 """
 
 MAX_HTML_BYTES: Final = 8 * 1024 * 1024
@@ -207,7 +227,7 @@ differ because one is somebody else's document and the other is this installatio
 configuration.
 """
 
-_ANCESTOR_SEPARATORS: Final = ("›", "»", ">", "/", ",")
+_ANCESTOR_SEPARATORS: Final = ("\u203a", "\u00bb", ">", "/", ",")
 """How exporters write a breadcrumb. Tried in order; the first one present splits the value.
 
 The first two are U+203A and U+00BB, written as escapes because they are confusable with an ASCII
@@ -265,6 +285,17 @@ class AdapterOutcome(StrEnum):
     MISSING_BODY = "missing_body"
     AMBIGUOUS = "ambiguous"
     DUPLICATE_IDENTITY = "duplicate_identity"
+    ALREADY_PRESENT = "already_present"
+    """A page that adapts cleanly and whose manifest was left alone.
+
+    Its own value rather than folded into :attr:`NO_PROFILE`, which is where it was and which was
+    a plain untruth: a second conversion run over a converted directory reported
+    ``no_profile: 2`` — "neither of these is an enriched page" — about a directory in which one of
+    them demonstrably was. The two answers lead opposite ways. ``no_profile`` says *point this at
+    a different directory*; this says *pass ``--force`` if you meant to replace what is there*.
+    Found by running the command twice and reading what it said.
+    """
+
     FAILED = "failed"
 
 
@@ -591,8 +622,8 @@ def _refusal(
     apart precisely by the number that was *not* complained about.
     """
     msg = (
-        f"{_COMPLAINTS[outcome]} (profile {profile.name!r}: {sections} × "
-        f"{profile.metadata_selector}, {bodies} × {profile.body_selector})"
+        f"{_COMPLAINTS[outcome]} (profile {profile.name!r}: {sections} x "
+        f"{profile.metadata_selector}, {bodies} x {profile.body_selector})"
     )
     return UnusablePageError(msg, outcome)
 

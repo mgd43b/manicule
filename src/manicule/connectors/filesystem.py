@@ -66,6 +66,7 @@ from manicule.connectors import sidecar
 from manicule.connectors.enriched import (
     ADAPTER_VERSION,
     DEFAULT_PROFILE,
+    ENRICHED_KEY,
     Adaptation,
     AdapterOutcome,
     EnrichedProfile,
@@ -103,25 +104,6 @@ Needed because ``source_id`` stops being a path the moment a manifest declares a
 ``fetch`` still has to open something. The same shape
 :data:`~manicule.connectors.confluence_snapshot._DIRECTORY` uses, for the same reason: the
 location is what a fetch needs and is nothing an identity should carry.
-"""
-
-ENRICHED_KEY: Final = "enriched_adaptation"
-"""Document-metadata key recording what the adapter did to this page.
-
-**Here rather than on** :class:`~manicule.core.provenance.LocalSnapshot`, and the choice is the
-one ``docs/storage.md`` §4.2.1 already settled for ``space_key``: the provenance record carries
-what *every* source has, and anything one situation means and others do not stays in the
-connector's own keys. A snapshot checksum distinct from the document's content hash is exactly
-that — it exists only where a document's bytes are *derived from* a local file rather than being
-it, which is true of an enriched export and of nothing else manicule ingests. Adding a field to
-``LocalSnapshot`` would have put a checksum on every document that has no second set of bytes to
-be a checksum of, and its docstring's argument against one — that ``documents.content_hash``
-already holds the digest of exactly these bytes — remains true for all of them.
-
-The record holds the six facts §1 of the specification asks be distinguishable, minus the two the
-core already stores: the local snapshot path is :attr:`LocalSnapshot.path` and the extracted
-body's digest is ``documents.content_hash``. Both are repeated here anyway, because a diagnostic
-that had to join three places to answer "what was extracted from what" would not be run.
 """
 
 DUPLICATE_IDENTITY: Final = "duplicate_source_identity"
@@ -400,8 +382,7 @@ class FilesystemConnector:
         path = Path(str(ref.metadata.get(SNAPSHOT_PATH) or ref.source_id))
         if not self._within_root(path):
             msg = (
-                f"{str(path)!r} is outside {self._root}, which is the only tree this "
-                f"source serves"
+                f"{str(path)!r} is outside {self._root}, which is the only tree this source serves"
             )
             raise NotFoundError(msg)
         try:
@@ -428,7 +409,9 @@ class FilesystemConnector:
                 uri=ref.uri,
                 media_type=media_type_for(path),
                 content=content,
-                metadata=metadata if adapted is None else {**metadata, ENRICHED_KEY: adapted.stated},
+                metadata=metadata
+                if adapted is None
+                else {**metadata, ENRICHED_KEY: adapted.stated},
             )
         return RawDocument(
             source_id=ref.source_id,
@@ -669,7 +652,6 @@ def _relative(path: Path, *, root: Path) -> str:
 __all__ = [
     "ADAPTABLE_SUFFIXES",
     "DUPLICATE_IDENTITY",
-    "ENRICHED_KEY",
     "IGNORED_DIRECTORIES",
     "OCTET_STREAM",
     "SNAPSHOT_PATH",

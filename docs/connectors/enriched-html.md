@@ -19,9 +19,11 @@ Some offline exporters write one HTML file per page and put the page's real iden
 </html>
 ```
 
-Ordinary filesystem ingestion indexes the text of that file perfectly well and then cites
-`1002.html` and a `file://` URI, because the filename is all the connector was given. Everything
-needed to cite the page properly was in the file the whole time.
+Ordinary filesystem ingestion indexed the text of that file perfectly well and then cited
+`1002.html` and a `file://` URI, because the filename was all the connector was given — and it
+read the `<main>` as generic HTML, so a code macro's language, a panel's severity, a task's state
+and a Graphviz engine were flattened into prose. Everything needed to cite the page properly, and
+to read its body as what it is, was in the file the whole time.
 
 ## 1. Using it
 
@@ -37,8 +39,76 @@ modified.**
 `--force` replaces manifests that already exist; without it they are left alone, because one
 already there was most likely written by hand or by another tool.
 
-Every page that produced nothing is reported with the reason. A run that found no metadata
-anywhere says so, rather than reporting a clean conversion of nothing.
+Every page that produced nothing is reported with the reason, and `--json` carries a count per
+outcome beside it. A run that adapted nothing says so outright rather than printing `0 of 40`.
+
+**The second command does the interesting half, and it does it with or without the first.** At
+fetch the connector reads each `.html` file, and where a profile matches it extracts the storage
+body and hands *that* to the dedicated storage parser under
+`application/xhtml+xml;profile=confluence-storage`. The wrapper — the metadata banner, the
+exporter's navigation, any scripts — reaches no chunk.
+
+What the sidecar adds is **identity**. Discovery has to know what a document is called before it
+fetches anything, and discovery does not read files: that is what makes a re-sync of an unchanged
+corpus cost a `stat` per file rather than a full read. The manifest is the one thing beside a page
+small enough to read on every walk, so it is where the page id has to be written down. A page
+without one is still adapted, still parsed as storage format and still cited by its own title and
+URL — it is simply keyed on where it sits, so moving it creates a second document.
+
+## 1a. Configuring another exporter's markers
+
+Nothing is hard-coded to one exporter's attribute spelling. A profile states four things:
+
+```toml
+[connectors.docs]
+type = "filesystem"
+
+[connectors.docs.options]
+root = "/path/to/pages"
+
+[[connectors.docs.options.enriched_profiles]]
+name = "acme-export"
+metadata_selector = '[data-acme-page]'
+body_selector = '[data-acme-format="storage"]'
+representation = "application/xhtml+xml;profile=confluence-storage"
+labels = { identifier = "source_id", revision = "version" }
+```
+
+Listing a profile **replaces** the default rather than adding to it; list
+`name = "standalone-storage"` alongside to keep both. An empty list turns adaptation off, which
+is a supported configuration — it is how you establish whether an unexpected parse is the
+adapter's doing.
+
+Three things are refused when the settings load, rather than at the first sync:
+
+- **A selector that is not an attribute selector.** `main` would make every `<main>` on every page
+  a storage body, which is the guess this whole mechanism exists instead of. An attribute is a
+  statement an exporter made on purpose; an element name is a fact about HTML.
+- **A representation outside the allowlist.** A profile's representation decides which parser
+  untrusted extracted markup reaches, and a misspelling would route to nothing at all while the
+  configuration looked right.
+- **A label mapped to a field that does not exist.** An alias that silently does nothing is
+  indistinguishable from not having written it — the same reason the manifest reader refuses
+  unknown keys.
+
+## 1b. Exactly one of each, or a refusal
+
+There are nine combinations of "how many metadata sections" and "how many storage bodies", and
+all nine are enumerated rather than left to a chain of conditions:
+
+| sections \ bodies | 0 | 1 | many |
+|---|---|---|---|
+| **0** | not an enriched page — ordinary HTML ingestion | no identity of its own | ambiguous |
+| **1** | no storage body | **adapted** | ambiguous |
+| **many** | ambiguous | ambiguous | ambiguous |
+
+A file that engages a profile and is then ambiguous is **refused**, not offered to the next
+profile — falling through is how a document carrying two vocabularies would get to choose which
+of its bodies was indexed.
+
+A refusal never costs the document. The wrapper is a perfectly good HTML file and is indexed as
+one, with the reason recorded on the document under `enriched_adaptation` so `doctor` and the
+conversion report can name it.
 
 ## 2. Why a sidecar, and not the other two
 
@@ -49,7 +119,7 @@ worth keeping because it is mostly about what *already exists*.
 |---|---|---|---|---|
 | **A dedicated enriched-HTML connector** | a whole connector: walk, identity, watermark, reconcile | no | — | none |
 | **Convert to manifest-plus-body** | none | yes — a directory per page | the page's own metadata | none |
-| **Sidecar generation** (this) | **none** | **no** | **the file that was walked to** | **none** |
+| **Sidecar generation plus an adapter** (this) | **none** | **no** | **the file that was walked to** | **none** |
 
 **A dedicated connector** would duplicate what `confluence-snapshot` and `filesystem` already do
 — walking a tree in a stable order, deriving identity, reconciling deletions — for a corpus that
@@ -126,13 +196,83 @@ and modification time now stale in the manifest beside it — is refused with a 
 quietly citing metadata that describes an older revision. Re-running the conversion is the fix,
 and it is idempotent.
 
-## 5. What this does not do
+## 5. Identity moved off the path, and that is a migration
 
-It does not interpret the body. `<main data-document-representation="storage">` holds
-storage-format XHTML, which the web parser indexes as HTML today — including the macro bodies
-[`recover_cdata`](../../src/manicule/parsers/web.py) rescues from being silently deleted. Giving
-that markup real semantics is a parser's job and is tracked separately. This command's job is the
-page's identity and provenance.
+A local file's identity used to be its resolved path, always. It is now the `source_id` a manifest
+declares, where one does. The reason is that a mirror reorganised from by-space to by-tree has not
+created new pages — but a connector keyed on the path reports every document deleted and every
+document new, and the curated collections and tags hanging off the old rows go with them.
+
+**Documents ingested before this keep their old identity until the next sync, and the next sync
+moves them.** `manicule doctor` emits a `document-identity` check that says so first. It reports,
+per document:
+
+| | |
+|---|---|
+| old identity | `documents.source_id` — the path |
+| new identity | the `source_id` in the stored provenance record |
+| old and new `document_id` | derived, so the mapping is exact rather than described |
+| chunks and vectors reusable | **no** |
+| citations change | title and URL keep, the chunk named changes |
+| recommended command | `manicule document list --source <name>` |
+
+The mapping is a fact already in the database — the old identity in a column, the new one in the
+record written by the same fetch — so unlike the connector-instance rename in #94 nothing here has
+to be guessed. **Chunks and vectors still cannot be carried across**, and for two reasons rather
+than one: `chunk_id` derives from `document_id`, so every chunk id moves; and the documents whose
+identity moves are precisely the documents whose *text* changes, because their body now reaches the
+storage parser instead of the HTML parser. Re-embedding is unavoidable either way.
+
+Two files declaring one page id are **both** returned to their paths, and the conflict is reported.
+Not the second only: `documents` is `UNIQUE` on `(workspace_id, source, source_id)`, so honouring
+both would mean a silent overwrite — and keeping the *first* would make ownership depend on walk
+order, so renaming a directory would move one page's content onto another page's identity.
+
+## 5a. What a `.html` file's media type is, and when
+
+Discovery declares **no** media type for `.html` and `.htm`, because whether a file is an enriched
+export is a fact about its contents and discovery does not read contents.
+`DiscoveredDoc.media_type` is `None`, which the pipeline already reads as "this connector has not
+made a claim" rather than as a change. Every other suffix keeps its declaration and the routing
+check that goes with it.
+
+Guessing instead is wrong in both directions: declare `text/html` and every adapted page
+re-ingests on every sync because the stored type disagrees with the declared one; declare the
+storage type and every ordinary page does.
+
+## 5b. What is recorded, and where
+
+| Fact | Where |
+|---|---|
+| extracted-body checksum | `documents.content_hash` — the index is built from the body |
+| full-snapshot checksum | `enriched_adaptation.snapshot_checksum` |
+| local snapshot path | `LocalSnapshot.path`, and repeated in the record |
+| adapter profile | `enriched_adaptation.profile` |
+| representation | `documents.media_type`, and `SourceMetadata.content_type` |
+| adapter version | `enriched_adaptation.adapter_version` |
+
+`enriched_adaptation` is a connector key rather than a field on `LocalSnapshot`, on the rule
+`storage.md` §4.2.1 already set for `space_key`: the provenance record carries what *every* source
+has. A snapshot checksum distinct from the content hash exists only where a document's bytes are
+*derived from* a local file rather than being it, which is true of an enriched export and of
+nothing else manicule ingests.
+
+The manifest records the **representation** and deliberately not the adapter version. The first is
+a fact about the page and stays true however this code changes; the second is a fact about this
+build, and a manifest declaring it would either be believed — recording a version that never ran —
+or checked, refusing every existing manifest the day the adapter improved. The version travels in
+the change token instead, so bumping it rebuilds the derived body with no manifest rewritten and
+nothing re-downloaded.
+
+## 5c. What this still does not do
+
+Nothing is materialised on disk. There is no derived-artifact directory, so there is nothing to
+place, name, exclude from discovery, or garbage-collect — the extraction is deterministic and
+happens in memory at the moment it is needed. The same walk therefore cannot index its own output,
+because there is no output for it to find.
+
+Graphviz is not rendered, macros are not expanded, page references are not followed and
+attachments are not fetched. DOT source is preserved character for character and stays inert.
 
 ## 6. Why it is command line only
 

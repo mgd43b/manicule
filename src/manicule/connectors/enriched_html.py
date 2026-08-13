@@ -35,7 +35,7 @@ cheap, deterministic and done in memory at the moment it is needed.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -164,52 +164,115 @@ def write_sidecars(
         manifest. A file that was skipped carries the reason and the outcome — a run that
         reported only its successes would present "no metadata section anywhere" as a clean
         conversion of nothing.
+
+    **Adapted in full before anything is written**, which is what lets two pages declaring one
+    page id be caught *here* rather than at the sync that follows. Writing as it walked would put
+    two manifests on disk claiming one identity, and the connector would then refuse both — so
+    the operator would run a conversion that reported complete success and a sync that reported
+    two documents it could not key, with nothing connecting the two reports. The cost is holding
+    one adaptation per page in memory for the length of the walk, which is the extraction that
+    was going to happen anyway.
     """
     resolved = root.expanduser().resolve()
-    return [
-        _convert(page, root=resolved, force=force, profiles=tuple(profiles))
+    considered = [
+        _read(page, root=resolved, force=force, profiles=tuple(profiles))
         for page in _walk(resolved, root=resolved)
     ]
+    claims: dict[str, int] = {}
+    for held in considered:
+        if held.adapted is not None:
+            declared = held.adapted.page.source.source_id
+            claims[declared] = claims.get(declared, 0) + 1
+    return [_settle(held, claims) for held in considered]
 
 
-def _convert(
+@dataclass(frozen=True, slots=True)
+class _Considered:
+    """One page after the first phase: what it adapted to, and the bytes that produced it.
+
+    The bytes travel with the adaptation rather than being re-read in the second phase. Re-reading
+    would open a window in which the file changed between the digest being taken and the manifest
+    being written — a manifest whose ``snapshot_checksum`` describes bytes nobody has, refused at
+    every sync afterwards for a reason the operator cannot reproduce. It is the same gap the
+    bounded read closes at the other end, and it is closed the same way: read once, decide from
+    what was read.
+    """
+
+    page: Path
+    adapted: Adaptation | None
+    raw: bytes
+    outcome: SidecarOutcome
+
+
+def _settle(held: _Considered, claims: Mapping[str, int]) -> SidecarOutcome:
+    """Write ``held``'s manifest, or report why it was not written after all."""
+    if held.adapted is None:
+        return held.outcome
+    declared = held.adapted.page.source.source_id
+    if claims.get(declared, 0) > 1:
+        # Neither page gets a manifest. Writing one and refusing the other would make which page
+        # owns the id depend on walk order; writing both would produce two manifests the
+        # connector refuses at every sync for ever.
+        return SidecarOutcome(
+            held.page,
+            AdapterOutcome.DUPLICATE_IDENTITY,
+            skipped_reason=(
+                f"declares source_id {declared!r}, which another page under this root also "
+                f"declares. No manifest is written for either: a document is identified by "
+                f"(workspace, source, source_id), so two pages sharing one resolve to a single "
+                f"row and whichever synced second would overwrite the first"
+            ),
+        )
+    sidecar.manifest_path_for(held.page).write_text(
+        json.dumps(manifest_for(held.adapted.page, html=held.raw), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return held.outcome
+
+
+def _refused(page: Path, outcome: AdapterOutcome, reason: str) -> _Considered:
+    """A page that will produce no manifest, carrying the reason it will not."""
+    return _Considered(page, None, b"", SidecarOutcome(page, outcome, skipped_reason=reason))
+
+
+def _read(
     page: Path, *, root: Path, force: bool, profiles: tuple[EnrichedProfile, ...]
-) -> SidecarOutcome:
+) -> _Considered:
+    """Adapt one page without writing anything.
+
+    Every path out carries an outcome, because the caller needs the identity of every page it
+    *could* convert before it can decide whether any of them clash — so "did this adapt" and "what
+    do we say about it" have to be answered in one pass rather than in two that could disagree.
+    """
     manifest_path = sidecar.manifest_path_for(page)
     if manifest_path.exists() and not force:
-        return SidecarOutcome(
+        return _refused(
             page,
-            AdapterOutcome.NO_PROFILE,
-            skipped_reason="a manifest is already there; pass --force to replace it",
+            AdapterOutcome.ALREADY_PRESENT,
+            "a manifest is already there; pass --force to replace it",
         )
     try:
         raw = _read_bounded(page)
     except OSError as exc:
-        return SidecarOutcome(
-            page, AdapterOutcome.FAILED, skipped_reason=f"could not be read ({exc.strerror or exc})"
-        )
+        return _refused(page, AdapterOutcome.FAILED, f"could not be read ({exc.strerror or exc})")
     if raw is None:
         # ``stat`` for the message only, never for the decision — that was already made by a
         # bounded read. Whether the file is one byte over the limit or a thousand times it is
         # what decides between raising the limit and looking at what is in that directory.
-        return SidecarOutcome(
+        return _refused(
             page,
             AdapterOutcome.FAILED,
-            skipped_reason=f"is {page.stat().st_size} bytes, over the {MAX_HTML_BYTES}-byte limit",
+            f"is {page.stat().st_size} bytes, over the {MAX_HTML_BYTES}-byte limit",
         )
     try:
-        adapted: Adaptation = adapt(raw.decode("utf-8", errors="replace"), profiles=profiles)
+        adapted = adapt(raw.decode("utf-8", errors="replace"), profiles=profiles)
     except UnusablePageError as refusal:
-        return SidecarOutcome(page, refusal.outcome, skipped_reason=str(refusal))
+        return _refused(page, refusal.outcome, str(refusal))
     if not _within(manifest_path, root=root):  # pragma: no cover - `_walk` already refuses this
-        return SidecarOutcome(
-            page, AdapterOutcome.FAILED, skipped_reason="resolves outside the root"
-        )
-    manifest_path.write_text(
-        json.dumps(manifest_for(adapted.page, html=raw), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+        return _refused(page, AdapterOutcome.FAILED, "resolves outside the root")
+    return _Considered(
+        page, adapted, raw, SidecarOutcome(page, AdapterOutcome.ADAPTED, written=True)
     )
-    return SidecarOutcome(page, AdapterOutcome.ADAPTED, written=True)
 
 
 def _read_bounded(page: Path) -> bytes | None:

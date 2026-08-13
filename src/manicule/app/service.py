@@ -46,6 +46,7 @@ from manicule.config.settings import (
     config_file,
     looks_secret,
 )
+from manicule.connectors.enriched import ENRICHED_KEY
 from manicule.core.content import DocumentStatus
 from manicule.core.errors import ConfigError, ManiculeError, PolicyError, UnknownEntityError
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
@@ -153,6 +154,21 @@ class AskAside:
     It is filled after ``message_id`` is known, so a streamed answer carries the id it was
     persisted under exactly as the non-streaming form does.
     """
+
+
+_IDENTITY_SCAN = 10_000
+"""How many documents the identity dry run examines before it stops and says it stopped.
+
+A bound rather than a full scan, because ``doctor`` is run to read a sentence and a corpus of a
+million rows should not be loaded to produce one. ``truncated`` is reported alongside the count so
+that "no documents affected" cannot be read as "none anywhere" when it means "none in the first
+ten thousand"."""
+
+_IDENTITY_SAMPLE = 25
+"""How many of the affected documents are listed individually.
+
+The count is the finding; the list is what makes it checkable. Twenty-five is enough to recognise
+a pattern — one directory, one exporter, one space — without turning a diagnostic into an export."""
 
 
 class ApplicationService:
@@ -669,16 +685,25 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         root_path = path.resolve()
         outcomes = await asyncio.to_thread(write_sidecars, path, force=force)
+        counts: dict[str, int] = {}
+        for outcome in outcomes:
+            counts[outcome.outcome.value] = counts.get(outcome.outcome.value, 0) + 1
         return r.SidecarReport(
             root=str(root_path),
             considered=len(outcomes),
             written=sum(1 for outcome in outcomes if outcome.written),
+            # Every considered file lands in exactly one bucket, adapted ones included, so the
+            # counts sum to `considered` and a run that adapted nothing states which kind of
+            # nothing it was rather than leaving that to be inferred from an empty `written`.
+            by_outcome=counts,
             skipped=tuple(
                 # Relative to the root, which the report has already named. Absolute paths here
                 # repeat the root on every row and push the reason — the part that says what to
                 # do next — off the side of a terminal table.
                 r.SidecarSkip(
-                    path=_relative_to(outcome.path, root_path), reason=outcome.skipped_reason
+                    path=_relative_to(outcome.path, root_path),
+                    reason=outcome.skipped_reason,
+                    outcome=outcome.outcome.value,
                 )
                 for outcome in outcomes
                 if not outcome.written
@@ -873,6 +898,7 @@ class ApplicationService:
         checks.append(await self._permissions_check())
         checks.append(await self._index_check())
         checks.append(await self._connectors_check())
+        checks.append(await self._document_identity_check())
         checks.append(await self._grammar_check(fix=fix))
         checks.append(await self._vocabulary_check(fix=fix))
         # No `fix`. The other two repairs move megabytes and finish while somebody is looking
@@ -1161,6 +1187,125 @@ class ApplicationService:
             # that wants to offer the action should not have to find it inside one. The
             # permissions check sets both and this is the other check with a command to give.
             remedy=f"manicule document list --source {first}",
+        )
+
+    async def _document_identity_check(self) -> r.Check:
+        """Documents keyed on where they sit while the file beside them declares a page id.
+
+        A local file's identity used to be its resolved path, always. It is now the ``source_id``
+        a :mod:`~manicule.connectors.sidecar` manifest declares, where one does — so that a mirror
+        reorganised from by-space to by-tree updates its pages instead of replacing every one of
+        them with a new document. Documents ingested before that keep the old identity until the
+        next sync, and the next sync moves them. This is the dry run that says so first.
+
+        **It is a stronger position than #98's and the difference is worth stating.** That change
+        had nothing in the database recording which connector instance a row came from, so a
+        migration would have had to guess and none shipped. Here the mapping is a fact already
+        stored: ``documents.source_id`` holds the old identity and the provenance record's own
+        ``source_id`` holds the new one, written by the same fetch, for exactly the rows that
+        move and no others. Every field below is read rather than estimated.
+
+        **Chunks and vectors cannot be reused, and not only because the ids move.** ``chunk_id``
+        derives from ``document_id``, so every chunk id changes — but even re-keyed they would be
+        wrong, because the documents whose identity moves are precisely the documents whose
+        *parse* changes: an enriched export stops going through the HTML parser and starts going
+        through the storage parser, which produces different blocks and therefore different text.
+        The re-embedding is unavoidable, so a migration would buy the curation rather than the
+        compute, and this check says that plainly rather than implying a cheaper option exists.
+
+        **``degraded``, not ``failing``**, on #98's reading: the documents are indexed, searchable
+        and correctly cited, and every query over them works. What is true is that their identity
+        is about to change.
+        """
+        try:
+            store = await self._backend.documents()
+            # `list_documents` rather than `select_documents`: this is the read every surface
+            # uses, so the check runs against the same scoping and the same workspace filter a
+            # listing does. The repair selector is a different surface with different predicates
+            # and none of them is the one being asked about here.
+            documents = await store.list_documents(limit=_IDENTITY_SCAN)
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            return r.Check(
+                name="document-identity",
+                state="unknown",
+                detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        moving = [
+            document
+            for document in documents
+            if (record := document.provenance) is not None
+            and record.source is not None
+            and record.source.source_id
+            and record.source.source_id != document.source_id
+        ]
+        if not moving:
+            return r.Check(
+                name="document-identity",
+                state="ok",
+                detail=(
+                    "no documents are indexed, so no identity can be about to change"
+                    if not documents
+                    # "None affected" and "none looked at past ten thousand" are different
+                    # answers, and a check that gave the first when it meant the second would be
+                    # a clean bill of health for a corpus nobody examined.
+                    else "every document is already keyed on the identity its source declares"
+                    if len(documents) < _IDENTITY_SCAN
+                    else f"the first {_IDENTITY_SCAN} documents are already keyed on the "
+                    f"identity their sources declare"
+                ),
+                facts={"affected": 0, "examined": len(documents)},
+            )
+        first = moving[0]
+        return r.Check(
+            name="document-identity",
+            state="degraded",
+            detail=(
+                f"{len(moving)} document(s) are keyed on their file's path while the manifest "
+                f"beside each one declares an identity of its own — {first.source_id!r} declares "
+                f"{first.provenance.source.source_id!r}. "  # pyright: ignore[reportOptionalMemberAccess]
+                f"The next sync will index them again under ids derived from the declared "
+                f"identity and leave the existing rows behind, so the corpus will appear to have "
+                f"doubled and nothing will report an error. Their chunks and vectors cannot be "
+                f"carried across: the chunk ids derive from the document id, and an enriched "
+                f"export's text changes anyway now that its body reaches the storage parser. "
+                f"Citations keep their title and URL and change the chunk they name. Inspect "
+                f"them with `manicule document list --source {first.source}`, and remove each "
+                f"old row with `manicule document delete <id>` before or after re-syncing. "
+                f"Collection membership and tags do not survive, because the new row is a "
+                f"different document. There is no bulk reconciliation for this and none is "
+                f"implied."
+            ),
+            facts=cast(
+                "dict[str, JsonValue]",
+                {
+                    "affected": len(moving),
+                    "examined": len(documents),
+                    "truncated": len(documents) >= _IDENTITY_SCAN,
+                    "chunks_reusable": False,
+                    "vectors_reusable": False,
+                    "citations_change": True,
+                    "documents": [
+                        {
+                            "source": document.source,
+                            "old_source_id": document.source_id,
+                            "old_document_id": document.id,
+                            "new_source_id": document.provenance.source.source_id,  # pyright: ignore[reportOptionalMemberAccess]
+                            "new_document_id": document_id(
+                                self.settings.workspace,
+                                document.source,
+                                document.provenance.source.source_id,  # pyright: ignore[reportOptionalMemberAccess]
+                            ),
+                            "uri": document.uri,
+                        }
+                        # Bounded, and the bound is named in `affected` rather than hidden: a
+                        # corpus of ten thousand mirrored pages would otherwise put ten thousand
+                        # rows into a diagnostic somebody runs to read a sentence.
+                        for document in moving[:_IDENTITY_SAMPLE]
+                    ],
+                },
+            ),
+            remedy=f"manicule document list --source {first.source}",
         )
 
     async def _index_check(self) -> r.Check:
@@ -3292,9 +3437,16 @@ def source_reference(document: Document | None) -> r.SourceReference | None:
 
     **Three timestamps go in under three names and none substitutes for another.**
     ``modified_at`` is the source's, ``retrieved_at`` is the snapshot's, ``indexed_at`` is this
-    installation's. ``snapshot_checksum`` is read off ``content_hash`` rather than from the record,
-    because that column is the one authority for the digest of these bytes and the record
-    deliberately keeps no second copy of it.
+    installation's.
+
+    **``snapshot_checksum`` is the local copy's digest, which is usually — and not always —
+    ``content_hash``.** For every document whose stored bytes *are* the file, the column is the
+    one authority for that digest and the record keeps no second copy. An enriched export is the
+    exception this now has to handle: its stored bytes are the storage body *extracted from* the
+    file, so ``content_hash`` digests what was indexed and the file on disk is a different,
+    larger thing. Reporting the column there labels the body's digest as the snapshot's, which is
+    an audit reading a citation, checksumming the file it names, and finding they disagree. The
+    adapter records the snapshot's own digest, and it wins where there is one.
     """
     if document is None:
         return None
@@ -3303,6 +3455,10 @@ def source_reference(document: Document | None) -> r.SourceReference | None:
         return None
     published = record.source
     snapshot = record.snapshot
+    adaptation = document.metadata.get(ENRICHED_KEY)
+    # ``dict`` rather than ``Mapping``: this is a value read back out of a JSON column, and
+    # ``Mapping`` is imported here only for type checking.
+    declared = adaptation.get("snapshot_checksum") if isinstance(adaptation, dict) else None
     return r.SourceReference(
         title=published.title if published else "",
         canonical_uri=published.canonical_uri if published else "",
@@ -3313,7 +3469,9 @@ def source_reference(document: Document | None) -> r.SourceReference | None:
         ),
         section_path=published.section_path if published else (),
         snapshot_path=snapshot.path if snapshot else "",
-        snapshot_checksum=document.content_hash,
+        snapshot_checksum=declared
+        if isinstance(declared, str) and declared
+        else document.content_hash,
         retrieved_at=(
             snapshot.retrieved_at.isoformat() if snapshot and snapshot.retrieved_at else None
         ),

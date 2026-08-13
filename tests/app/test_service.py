@@ -21,8 +21,10 @@ from manicule.app import results as r
 from manicule.app.results import CheckState
 from manicule.app.service import ApplicationService, hardware
 from manicule.config.settings import Settings, config_file
-from manicule.core.content import DocumentStatus
+from manicule.core.content import Document, DocumentStatus
 from manicule.core.errors import ConfigError, UnknownEntityError
+from manicule.core.ids import document_id
+from manicule.core.provenance import Provenance
 from manicule.core.retrieval import Candidate, RetrievalProfile
 from manicule.embedding.runtimes import hub
 from manicule.embedding.runtimes.hub import OFFLINE_ENV
@@ -1819,3 +1821,99 @@ async def test_the_policy_hint_is_true_of_a_single_forbidding_setting(
     # It must not *lead* with the two-settings claim, which is what sent the reader hunting.
     # The conditional mention of that case later is fine and is why this checks the opening.
     assert envelope.error.hint.startswith("Configuration forbids this")
+
+
+# --- the document-identity dry run ---------------------------------------------------------------
+
+
+def _declaring(backend: FakeBackend, declared: str, *, source_id: str) -> Document:
+    """A document keyed on its path while its record declares an identity of its own."""
+    from manicule.core.provenance import LocalSnapshot, SourceMetadata  # noqa: PLC0415
+
+    return make_document(
+        backend.workspace,
+        source="handbook",
+        source_id=source_id,
+        provenance=Provenance(
+            source=SourceMetadata(
+                title="Retry Runbook",
+                canonical_uri="https://docs.example.test/pages/1002",
+                source_id=declared,
+                version="7",
+            ),
+            snapshot=LocalSnapshot(path="pages/1002.html"),
+        ),
+    )
+
+
+async def test_doctor_reports_the_old_and_new_identity_of_every_document_about_to_move(
+    backend: FakeBackend,
+) -> None:
+    """The dry run §10 asks for: both identities, reuse, citations, and a command.
+
+    Each field is asserted rather than the presence of the check, because the check existing is
+    not the requirement — a report that named the affected count and left an operator unable to
+    tell which row becomes which would be the same warning #98 gave, one release later.
+    """
+    backend.store.add(_declaring(backend, "1002", source_id="/corpus/pages/1002.html"))
+
+    check = _check(await ApplicationService(backend).doctor(), "document-identity")
+
+    assert check.state == "degraded"
+    assert check.facts["affected"] == 1
+    assert check.facts["chunks_reusable"] is False
+    assert check.facts["vectors_reusable"] is False
+    assert check.facts["citations_change"] is True
+    moving = check.facts["documents"]
+    assert isinstance(moving, list)
+    row = moving[0]
+    assert isinstance(row, dict)
+    assert row["old_source_id"] == "/corpus/pages/1002.html"
+    assert row["new_source_id"] == "1002"
+    assert row["old_document_id"] == document_id(
+        backend.workspace, "handbook", "/corpus/pages/1002.html"
+    )
+    assert row["new_document_id"] == document_id(backend.workspace, "handbook", "1002")
+    assert row["old_document_id"] != row["new_document_id"]
+    assert check.remedy == "manicule document list --source handbook"
+
+
+async def test_the_identity_check_says_why_chunks_cannot_be_carried_across(
+    backend: FakeBackend,
+) -> None:
+    """Two reasons, and naming only the first would imply re-keying was an option.
+
+    The ids move *and* the text changes, because the documents whose identity moves are the ones
+    whose body now reaches the storage parser. An operator told only about the ids would
+    reasonably ask why a migration cannot simply recompute them.
+    """
+    backend.store.add(_declaring(backend, "1002", source_id="/corpus/pages/1002.html"))
+
+    detail = _check(await ApplicationService(backend).doctor(), "document-identity").detail
+
+    assert "chunk ids derive from the document id" in detail
+    assert "storage parser" in detail
+    assert "Collection membership and tags do not survive" in detail
+    assert "doubled" in detail
+
+
+async def test_the_identity_check_clears_once_the_documents_are_keyed_on_what_they_declare(
+    backend: FakeBackend,
+) -> None:
+    """It has to stop firing on its own, or it is a warning nobody can ever satisfy."""
+    backend.store.add(_declaring(backend, "1002", source_id="1002"))
+
+    check = _check(await ApplicationService(backend).doctor(), "document-identity")
+
+    assert check.state == "ok"
+    assert check.facts["affected"] == 0
+    assert check.remedy == ""
+
+
+async def test_the_identity_check_ignores_documents_with_nothing_to_declare(
+    backend: FakeBackend,
+) -> None:
+    """An ordinary local file is keyed on its path because that is all it has said."""
+    backend.store.add(make_document(backend.workspace, source="handbook", source_id="notes.md"))
+
+    assert _check(await ApplicationService(backend).doctor(), "document-identity").state == "ok"

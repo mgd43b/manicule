@@ -74,9 +74,7 @@ async def fetch_one(root: Path, page: Path) -> Provenance | None:
     # filename rather than on a resolved absolute path: the connector resolves its root once and
     # yields paths beneath it, so the two spellings would only ever differ by a symlink the walk
     # already refuses to follow.
-    ref = next(
-        doc.ref for doc in found if str(doc.ref.metadata[SNAPSHOT_PATH]).endswith(page.name)
-    )
+    ref = next(doc.ref for doc in found if str(doc.ref.metadata[SNAPSHOT_PATH]).endswith(page.name))
     raw = await connector.fetch(ref)
     return Provenance.from_metadata(raw.metadata)
 
@@ -208,9 +206,7 @@ async def test_the_manifest_title_wins_over_the_filename(tmp_path: Path) -> None
     assert record.source.title != page.name
 
     found = next(
-        doc
-        for doc in await discovered(tmp_path)
-        if doc.ref.metadata[SNAPSHOT_PATH] == str(page)
+        doc for doc in await discovered(tmp_path) if doc.ref.metadata[SNAPSHOT_PATH] == str(page)
     )
     assert found.ref.source_id == "123456", (
         "the manifest's declared identity is the document's, so moving the file does not create "

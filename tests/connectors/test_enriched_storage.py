@@ -18,10 +18,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import socket
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import pytest
 
+from manicule.connectors import sidecar
 from manicule.connectors.enriched import (
     ADAPTER_VERSION,
     DEFAULT_PROFILE,
@@ -36,11 +37,10 @@ from manicule.connectors.enriched_html import write_sidecars
 from manicule.connectors.filesystem import (
     DUPLICATE_IDENTITY,
     ENRICHED_KEY,
-    SNAPSHOT_PATH,
     FilesystemConnector,
 )
 from manicule.core.content import BlockKind, Chunk, DocumentStatus
-from manicule.core.ids import chunk_id, document_id
+from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
 from manicule.ingest.workers import InProcessRunner
@@ -174,6 +174,7 @@ class _Chunker(fakes.BlockChunker):
     second. A test that could not fail on the first would be asserting half a requirement.
     """
 
+    @override
     def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
         return [
             Chunk(
@@ -211,15 +212,15 @@ def pipeline(store: fakes.MemoryIngestStore) -> IngestPipeline:
                 "web": WebParser(WebConfig()),
             }
         ),
-        resolve_chain=lambda media: (
-            ["confluence"] if media == CONFLUENCE_MEDIA_TYPE else ["web"]
-        ),
+        resolve_chain=lambda media: ["confluence"] if media == CONFLUENCE_MEDIA_TYPE else ["web"],
         middleware=MiddlewareRunner([]),
         chunk_fingerprint=chunker.fingerprint,
     )
 
 
-async def ingest(root: Path, *, store: fakes.MemoryIngestStore | None = None, name: str = "docs"):
+async def ingest(
+    root: Path, *, store: fakes.MemoryIngestStore | None = None, name: str = "docs"
+) -> fakes.MemoryIngestStore:
     """Sync ``root`` through the pipeline and hand back the store it wrote to."""
     held = store if store is not None else fakes.MemoryIngestStore()
     await pipeline(held).run(FilesystemConnector(root, name=name))
@@ -290,9 +291,7 @@ async def test_a_configuration_parameter_is_never_indexed_as_prose(tmp_path: Pat
 async def test_code_and_diagram_chunks_are_code(tmp_path: Path) -> None:
     """Clause 4. A diagram's source is text in a language, and is retrievable as such."""
     store = await ingest(await _corpus(tmp_path))
-    kinds = {
-        chunk.text: chunk.kind for chunks in store.chunks.values() for chunk in chunks
-    }
+    kinds = {chunk.text: chunk.kind for chunks in store.chunks.values() for chunk in chunks}
 
     assert kinds[CODE] is BlockKind.CODE
     assert kinds[DOT] is BlockKind.CODE
@@ -393,10 +392,10 @@ def test_every_combination_of_marker_counts_has_an_outcome() -> None:
     [
         (page(), AdapterOutcome.ADAPTED, ""),
         ("<html><body><p>An ordinary page.</p></body></html>", AdapterOutcome.NO_PROFILE, ""),
-        (page(sections=2), AdapterOutcome.AMBIGUOUS, "2 ×"),
-        (page(bodies=2), AdapterOutcome.AMBIGUOUS, "2 ×"),
-        (page(body_attribute="data-something-else"), AdapterOutcome.MISSING_BODY, "0 ×"),
-        (page(metadata_attribute="data-something-else"), AdapterOutcome.INVALID_METADATA, "0 ×"),
+        (page(sections=2), AdapterOutcome.AMBIGUOUS, "2 x"),
+        (page(bodies=2), AdapterOutcome.AMBIGUOUS, "2 x"),
+        (page(body_attribute="data-something-else"), AdapterOutcome.MISSING_BODY, "0 x"),
+        (page(metadata_attribute="data-something-else"), AdapterOutcome.INVALID_METADATA, "0 x"),
     ],
     ids=[
         "the supported default profile",
@@ -542,8 +541,10 @@ async def test_a_page_the_adapter_refuses_is_indexed_as_html_with_the_reason_rec
 
     assert stored.media_type == "text/html"
     assert stored.status is DocumentStatus.INDEXED
-    assert stored.metadata[ENRICHED_KEY]["outcome"] == AdapterOutcome.AMBIGUOUS.value  # pyright: ignore[reportIndexIssue]
-    assert "ambiguity" in str(stored.metadata[ENRICHED_KEY]["reason"])  # pyright: ignore[reportIndexIssue]
+    refusal = stored.metadata[ENRICHED_KEY]
+    assert isinstance(refusal, dict)
+    assert refusal["outcome"] == AdapterOutcome.AMBIGUOUS.value
+    assert "ambiguity" in str(refusal["reason"])
 
 
 async def test_the_record_names_what_was_extracted_from_what(tmp_path: Path) -> None:
@@ -574,9 +575,14 @@ async def test_two_files_claiming_one_page_id_are_both_refused_it(tmp_path: Path
     """
     root = tmp_path / "corpus"
     root.mkdir()
-    written(root, "a.html")
-    written(root, "b.html")
-    write_sidecars(root, force=True)
+    for name in ("a.html", "b.html"):
+        target = written(root, name)
+        # Written by hand rather than by `write_sidecars`, which refuses to create this
+        # situation at all — see the test below. The connector still has to survive it, because a
+        # manifest is a file in the corpus and anybody can put one there.
+        sidecar.manifest_path_for(target).write_text(
+            json.dumps({"source_id": "1002", "title": "Retry Runbook"}), encoding="utf-8"
+        )
 
     found = [doc async for doc in FilesystemConnector(root, name="docs").discover(None)]
 
@@ -736,7 +742,7 @@ async def test_hostile_markup_inside_cdata_stays_text(tmp_path: Path) -> None:
     written(
         root,
         body=page(
-            body=f"<h1>T</h1><ac:structured-macro ac:name=\"code\">"
+            body=f'<h1>T</h1><ac:structured-macro ac:name="code">'
             f"<ac:plain-text-body><![CDATA[{hostile}]]></ac:plain-text-body>"
             f"</ac:structured-macro>"
         ),
@@ -857,3 +863,213 @@ def test_the_conversion_and_the_connector_are_configured_with_one_profile_set(
         AdapterOutcome.INVALID_METADATA
     )
     assert write_sidecars(tmp_path, force=True, profiles=(profile,))[0].written
+
+
+# --- storage-format semantics, through the enriched path ---------------------------------------
+#
+# The parser's own suite covers these against a bare storage body. They are repeated here against
+# a body that arrived *inside an enriched wrapper*, because that is the path this change adds and
+# the failure it could introduce is a body that reaches the parser subtly altered by extraction.
+
+
+async def test_the_page_keeps_its_structure_through_the_wrapper(tmp_path: Path) -> None:
+    """Every semantic §5 lists, asserted on what the index actually holds."""
+    store = await ingest(await _corpus(tmp_path))
+    chunks = [chunk for held in store.chunks.values() for chunk in held]
+    by_kind = {chunk.kind for chunk in chunks}
+
+    panels = [chunk for chunk in chunks if chunk.kind is BlockKind.PANEL]
+    assert panels, "the warning panel was flattened into prose"
+    assert panels[0].metadata["severity"] == "warning"
+    assert "Never retry a write." in panels[0].text
+
+    tasks = next(chunk for chunk in chunks if chunk.text.startswith("- ["))
+    assert "- [x] Raise the ceiling" in tasks.text
+    assert "- [ ] Alert on exhaustion" in tasks.text
+    assert tasks.metadata["complete"] == 1
+    assert not any(chunk.text == "incomplete" for chunk in chunks), (
+        "a task's state reached the index as a one-word block of its own"
+    )
+
+    table = next(chunk for chunk in chunks if chunk.kind is BlockKind.TABLE)
+    assert "Setting | Value" in table.text
+    assert "ceiling | retries=2" in table.text, "the macro inside the cell lost its body"
+    assert "bash" not in table.text, "the macro's language leaked out of a table cell"
+
+    placeholder = next(chunk for chunk in chunks if "unsupported macro" in chunk.text)
+    assert placeholder.text == "[unsupported macro: jira]"
+    assert placeholder.metadata["parameters"] == ["jqlQuery"], (
+        "the parameter name makes the omission auditable; its value must not be in the index"
+    )
+
+    # A page reference and an external link are structured, and each is recorded beside the text
+    # of the block it appears in rather than inside it. The two are separate blocks here because
+    # the author wrote them in separate paragraphs, which is the point: the reference travels with
+    # the sentence it belongs to.
+    references: list[object] = []
+    for chunk in chunks:
+        held = chunk.metadata.get("links")
+        if isinstance(held, list):
+            references.extend(held)
+    assert {"kind": "page", "title": "Backoff"} in references
+    assert {"kind": "external", "href": "https://docs.example.test/pages/1003"} in references
+    assert "backoff" in {chunk.text for chunk in chunks}, (
+        "a page link reads as the words the author wrote, never as an identifier"
+    )
+
+    assert BlockKind.HEADING in by_kind
+    assert "Retry policy" in {chunk.text for chunk in chunks}
+
+
+async def test_invalid_dot_is_kept_with_the_warning_beside_it(tmp_path: Path) -> None:
+    """A diagram that does not compile is still what the author wrote, and still searchable.
+
+    Dropping it would remove the version somebody debugging the page most needs to find.
+    """
+    broken = "digraph G { a -> b;"
+    root = tmp_path / "corpus"
+    root.mkdir()
+    converted(
+        root,
+        body=page(
+            body=f'<h1>T</h1><ac:structured-macro ac:name="graphviz">'
+            f"<ac:plain-text-body><![CDATA[{broken}]]></ac:plain-text-body>"
+            f"</ac:structured-macro>"
+        ),
+    )
+    store = await ingest(root)
+
+    diagram = next(
+        chunk
+        for held in store.chunks.values()
+        for chunk in held
+        if chunk.text.startswith("digraph")
+    )
+    assert diagram.text == broken
+    assert "unclosed" in str(diagram.metadata["parse_warning"])
+    assert diagram.metadata["rendered"] is False
+
+
+async def test_the_index_is_filterable_by_source_and_media_type(tmp_path: Path) -> None:
+    """An adapted page is reachable by the two filters an operator actually reaches for.
+
+    The media type is the interesting one: it is what routing set, so filtering on it is how
+    somebody asks "which of my documents were read as storage format" — a question that had no
+    answer before, because every one of them was ``text/html``.
+    """
+    root = tmp_path / "corpus"
+    root.mkdir()
+    converted(root)
+    (root / "guide.html").write_text("<html><body><p>Ordinary.</p></body></html>", encoding="utf-8")
+    store = await ingest(root, name="handbook")
+
+    assert {document.source for document in store.documents.values()} == {"handbook"}
+    adapted = [
+        document
+        for document in store.documents.values()
+        if document.media_type == CONFLUENCE_MEDIA_TYPE
+    ]
+    assert [document.source_id for document in adapted] == ["1002"]
+
+
+async def test_the_conversion_refuses_to_write_two_manifests_claiming_one_page(
+    tmp_path: Path,
+) -> None:
+    """Caught at the conversion rather than left for the sync to find.
+
+    Writing as the walk went would put two manifests on disk claiming one identity and report
+    complete success, and the sync afterwards would refuse two documents it could not key — two
+    reports with nothing connecting them. Neither page gets a manifest, because writing one and
+    refusing the other would make ownership depend on walk order.
+    """
+    root = tmp_path / "corpus"
+    root.mkdir()
+    written(root, "a.html")
+    written(root, "b.html")
+
+    outcomes = write_sidecars(root)
+
+    assert [outcome.outcome for outcome in outcomes] == [AdapterOutcome.DUPLICATE_IDENTITY] * 2
+    assert not any(outcome.written for outcome in outcomes)
+    assert not list(root.glob("**/*.source.json")), "a manifest was written for a clashing page"
+    for outcome in outcomes:
+        assert "'1002'" in outcome.skipped_reason
+        assert "overwrite" in outcome.skipped_reason
+
+
+def test_a_page_that_already_has_a_manifest_is_not_reported_as_unrecognised(
+    tmp_path: Path,
+) -> None:
+    """The defect running the command twice exposed.
+
+    A converted directory reported ``no_profile`` for every page in it — "none of these is an
+    enriched page" about a directory of nothing but enriched pages. The two answers send an
+    operator opposite ways: one says point this somewhere else, the other says pass ``--force``.
+    """
+    written(tmp_path)
+    assert write_sidecars(tmp_path)[0].outcome is AdapterOutcome.ADAPTED
+
+    again = write_sidecars(tmp_path)
+
+    assert again[0].outcome is AdapterOutcome.ALREADY_PRESENT
+    assert "--force" in again[0].skipped_reason
+
+
+async def test_a_citation_reports_the_snapshots_own_digest_not_the_extracted_bodys(
+    tmp_path: Path,
+) -> None:
+    """The defect running a real ingest exposed, and the reason it was not visible before.
+
+    ``SourceReference.snapshot_checksum`` was read off ``documents.content_hash``, on the entirely
+    correct premise that the stored bytes *are* the local copy. This change makes that false for
+    exactly one kind of document: an enriched export's stored bytes are the storage body extracted
+    from the file, so the column digests what was indexed while the file on disk is a different,
+    larger thing. Reporting the column labels the body's digest as the snapshot's — an audit
+    checksums the file the citation names and finds they disagree.
+    """
+    from manicule.app.service import source_reference  # noqa: PLC0415
+
+    root = await _corpus(tmp_path)
+    store = await ingest(root)
+    stored = only(store)
+    record = stored.metadata[ENRICHED_KEY]
+    assert isinstance(record, dict)
+
+    reference = source_reference(stored)
+
+    assert reference is not None
+    assert reference.snapshot_checksum == record["snapshot_checksum"]
+    assert reference.snapshot_checksum != stored.content_hash, (
+        "the citation reported the extracted body's digest as the local file's"
+    )
+    assert reference.snapshot_checksum == content_hash(
+        (root / "pages" / "1002.html").read_bytes()
+    ), "and the digest it reports is not the file's either"
+
+
+async def test_an_ordinary_documents_citation_still_reports_its_content_hash(
+    tmp_path: Path,
+) -> None:
+    """The other side of the same rule, which is the majority of every corpus.
+
+    Where the stored bytes *are* the local copy there is one digest and the column is its one
+    authority. A fix that made every citation read a connector key would have broken that.
+    """
+    from manicule.app.service import source_reference  # noqa: PLC0415
+
+    root = tmp_path / "corpus"
+    root.mkdir()
+    target = root / "123456.html"
+    target.write_text("<html><body><p>Ordinary.</p></body></html>", encoding="utf-8")
+    sidecar.manifest_path_for(target).write_text(
+        json.dumps({"source_id": "123456", "title": "Ordinary"}), encoding="utf-8"
+    )
+    store = await ingest(root)
+    stored = only(store)
+
+    reference = source_reference(stored)
+
+    assert reference is not None
+    assert ENRICHED_KEY not in stored.metadata
+    assert reference.snapshot_checksum == stored.content_hash
+    assert reference.snapshot_checksum == content_hash(target.read_bytes())
