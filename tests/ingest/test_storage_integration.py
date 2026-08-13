@@ -87,6 +87,49 @@ def _confluence_snapshot(
     return directory
 
 
+async def test_annotated_state_survives_a_re_ingest_through_the_real_store(
+    store: SqliteDocStore, data_dir: Path, tmp_path: Path
+) -> None:
+    """The claim that would have sunk the metadata-precedence reorder, against the real store.
+
+    Fresh connector metadata now beats the stored copy, and the property that has to survive is the
+    other one: per-document state written by :meth:`IngestStore.annotate` — which no connector
+    supplies — must not be erased by a re-ingest. It survives because a key absent from
+    ``raw.metadata`` overrides nothing, which needs no special case.
+
+    **Asserted here rather than only against the in-memory double**, because the double got this
+    wrong: its ``annotate`` wrote to a side dictionary nothing read, so an annotation vanished and
+    the assertion passed for the wrong reason. Fixed there too, but the real store is the authority
+    and this is where the claim belongs.
+    """
+    from manicule.connectors.confluence_snapshot import (  # noqa: PLC0415
+        ConfluenceSnapshotConnector,
+    )
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    _confluence_snapshot(corpus, version=7)
+
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(store, vectors)
+    await pipeline.run(ConfluenceSnapshotConnector(corpus))
+    document = (await store.list_documents())[0]
+    await store.annotate(document.id, {"last_ingest_error": {"stage": "parse", "detail": "old"}})
+
+    _confluence_snapshot(corpus, version=8, body="<h2>Retry policy</h2>\n<p>Three times.</p>\n")
+    await pipeline.run(ConfluenceSnapshotConnector(corpus))
+
+    after = (await store.list_documents())[0]
+    assert after.metadata["last_ingest_error"] == {"stage": "parse", "detail": "old"}, (
+        "state a connector never supplies was erased by the metadata reorder"
+    )
+    assert after.provenance is not None
+    assert after.provenance.source is not None
+    assert after.provenance.source.version == "8", "and the connector's own facts still refreshed"
+    await vectors.teardown()
+
+
 async def test_a_confluence_snapshot_cites_the_page_through_the_real_stores(
     store: SqliteDocStore, data_dir: Path, tmp_path: Path
 ) -> None:
