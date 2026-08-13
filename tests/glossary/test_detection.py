@@ -452,10 +452,34 @@ def test_initials_are_matched_with_and_without_the_small_words() -> None:
         ("Note", False),
         ("Warning", False),
         ("A", False),
+        # Lower-case-initial abbreviations, which this gate refuses and no value of
+        # `_UPPERCASE_SHARE` could admit: all three are above the share and fail on the first
+        # character. Asserted because the constant's docstring cited `mDNS` as a *reason* for its
+        # value while the function rejected it, and a justification citing a case it refuses is
+        # the same defect as a test named wider than its assertion.
+        ("mDNS", False),
+        ("eSIM", False),
+        ("gRPC", False),
     ],
 )
 def test_only_abbreviation_shaped_terms_pass_the_shape_gate(surface: str, shaped: bool) -> None:
     assert acronym_shaped(surface) is shaped
+
+
+def test_a_lower_case_initial_abbreviation_is_refused_on_its_first_character() -> None:
+    """The half of the shape gate that tuning ``_UPPERCASE_SHARE`` cannot reach.
+
+    ``mDNS`` is 0.75 upper case — comfortably over the 0.6 share — and still refused, because the
+    gate also requires an initial capital. Stated as its own case so the *reason* is pinned and
+    not just the outcome: a future reader lowering the share to admit these would find this test
+    still red, which is the correct answer, since the initial-capital rule is what refuses them.
+    """
+    letters = [character for character in "mDNS" if character.isalpha()]
+    share = sum(1 for character in letters if character.isupper()) / len(letters)
+
+    assert share > 0.6, "the share is not what refuses it"
+    assert not acronym_shaped("mDNS")
+    assert acronym_shaped("MDNS"), "the same letters with an initial capital are admitted"
 
 
 def test_the_dash_form_clears_the_threshold_on_its_initials_alone() -> None:

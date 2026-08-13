@@ -164,8 +164,21 @@ deterministic by construction and has no parser to call, and a word list that pr
 would be a rule whose justification is wider than its mechanism. So the claim is narrowed to what
 the list can actually support: these particular words do not begin expansions, one word at a
 time, for the two reasons given beside them. Prose opening with an ordinary noun or an imperative
-verb — ``WARNING — do not edit these records by hand`` — is admitted, and that is a known gap
-rather than an oversight.
+verb — ``WARNING — do not edit these records by hand`` — is admitted, and that is a known gap.
+
+**Do not close it by adding ``note``, ``warning`` and ``caution`` as refused *terms*.** The
+objection is not that such a list would overclaim — it would not; admonition labels are document
+furniture and a list of them tests exactly what it names. The objection is the trade. ``WARNING —
+a log level indicating a recoverable condition`` is an ordinary definition in operations and
+logging documentation, which is the corpus this project exists for: the gate buys one false
+positive and sells a false negative in the domain most likely to be indexed. That stays a bad
+trade however carefully the list is drawn, so drawing it more carefully is not the fix.
+
+The fix, if a real corpus ever needs one, is **structural and lives in the parser rather than
+here**. An admonition in Confluence storage format is ``<ac:structured-macro ac:name="warning">``
+and not a ``TERM — text`` line at all; :mod:`manicule.connectors.macros` already reads those
+elements by name. A parser knows what a word list can only guess at, and by the time text reaches
+this module the distinction has been flattened away.
 
 **A first word written like an abbreviation is the abbreviation, not the pronoun**, so
 :func:`acronym_shaped` is consulted before the list. This is not a nicety: it was measured.
@@ -194,9 +207,18 @@ expansion than the sentence it came from. :func:`core_expansion` still has to be
 _UPPERCASE_SHARE: Final = 0.6
 """How much of a term's alphabetic content must be upper case.
 
-Not 1.0, because ``IPv6`` and ``mDNS`` are abbreviations and a rule that refused them would be
-wrong about real corpora. Not lower, because at 0.5 a two-letter capitalised word — ``It``,
-``Of`` — becomes an abbreviation and every sentence beginning becomes a candidate.
+Not 1.0, because ``IPv6`` is an abbreviation — two of its three letters are upper case, so it
+clears 0.6 and would fail a stricter rule. Not lower, because at 0.5 a two-letter capitalised
+word — ``It``, ``Of`` — becomes an abbreviation and every sentence beginning becomes a candidate.
+
+**This share is only half of the gate, and the other half is not negotiable by tuning it.**
+:func:`acronym_shaped` also requires an initial capital, so a term beginning lower case is refused
+at the first character whatever its share. ``mDNS`` is 0.75 upper and still refused; so are
+``eSIM`` and ``gRPC``. This docstring used to cite ``mDNS`` as a reason for the value of this
+constant, which was wrong twice over: the constant does not admit it, and no value of the constant
+could. Lower-case-initial abbreviations are outside what this module detects. Widening it is a
+behaviour change across all six written forms — every sentence that begins ``it``, ``the`` or
+``and`` becomes a candidate term — and it wants its own measurement, not an edit here.
 """
 
 _FUNCTION_WORDS: Final[frozenset[str]] = frozenset(

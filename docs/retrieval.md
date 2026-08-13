@@ -1663,7 +1663,21 @@ module is deterministic by construction and has no parser to call, and a word li
 otherwise would be a rule whose justification is wider than its mechanism. The claim is therefore
 narrowed to what the list can support: these particular words do not begin expansions, one word
 at a time. Prose opening with an ordinary noun or an imperative verb — `WARNING — do not edit
-these records by hand.` — is admitted, and that is a known gap rather than an oversight.
+these records by hand.` — is admitted, and that is a known gap.
+
+**Do not close it by adding `note`, `warning` and `caution` as refused terms.** The objection is
+not that such a list would overclaim — it would not; admonition labels are document furniture and
+a list of them tests exactly what it names. The objection is the trade. `WARNING — a log level
+indicating a recoverable condition` is an ordinary definition in operations and logging
+documentation, which is the corpus this project exists for: the gate buys one false positive and
+sells a false negative in the domain most likely to be indexed. That stays a bad trade however
+carefully the list is drawn.
+
+The fix, if a real corpus ever needs one, is **structural and belongs in the parser**. An
+admonition in Confluence storage format is `<ac:structured-macro ac:name="warning">` and not a
+`TERM — text` line at all, and `manicule.connectors.macros` already reads those elements by name.
+By the time text reaches the detector the distinction has been flattened away, which is why no
+word list can recover it.
 
 **Recall is measured as loudly as precision, because this rule fires exactly where the safety net
 is absent.** It only runs when initials evidence is missing, which is also where a large share of
