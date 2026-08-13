@@ -542,6 +542,57 @@ def test_a_stored_expansion_never_holds_an_unmatched_bracket() -> None:
         )
 
 
+def test_a_parenthetical_survives_when_no_prefix_before_it_spells_the_term() -> None:
+    """**Requirement 4, and the fixture is chosen so that it can fail.**
+
+    A naive "cut at the first parenthesis" rule stores ``central processor`` here. This one
+    stores the whole thing, because nothing authorises the cut: ``central processor`` spells
+    ``CP`` and not ``CPU``, so the bracket is offered and refused, and with no boundary earned
+    the right-hand side is taken whole exactly as it was before brackets were read at all.
+
+    That is the difference between offering a position and awarding a cut, tested on a line where
+    the two rules disagree rather than on one where the candidate is rejected outright and any
+    implementation would look correct.
+    """
+    entries = detect_in_chunk(chunk("CPU — central processor (the execution unit)"))
+
+    assert [entry.expansion for entry in entries] == ["central processor (the execution unit)"]
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("RNE — Regional Network Edge (Type 2)", "Regional Network Edge (Type 2)"),
+        (
+            "RNE — Regional Network Edge (Type 2), the branch hardware profile",
+            "Regional Network Edge",
+        ),
+    ],
+    ids=["short-keeps-it", "long-drops-it"],
+)
+def test_a_bracketed_qualifier_is_kept_whole_and_dropped_when_cutting(
+    line: str, expected: str
+) -> None:
+    """**The sharpest objection to the bracket rule, pinned as a decision rather than a surprise.**
+
+    Identical brackets, opposite outcomes, and the discriminator is the length of the line. It
+    follows from the rule this module already runs everywhere: *the shortest prefix that spells
+    the term is where the term stops*. When the whole right-hand side can be taken it is taken and
+    no boundary is consulted; when it cannot, ``Regional Network Edge`` and ``Regional Network
+    Edge (Type 2)`` both spell ``RNE`` and the shorter wins — exactly as it would if the bracket
+    were a comma.
+
+    **The cost is real and is the point of writing this down**: a qualifier that is genuinely part
+    of the term is dropped from a line long enough to need cutting. The alternative — preferring
+    the longest agreeing prefix at a bracket — inverts shortest-wins for one position only, and
+    would keep ``Regional Network Edge (e.g., a gateway)`` for the same reason. Nothing here tells
+    a qualifier from an example, so the choice is which way to be wrong.
+    """
+    entries = detect_in_chunk(chunk(line))
+
+    assert [entry.expansion for entry in entries] == [expected]
+
+
 def test_a_quoted_example_marker_yields_no_definition_rather_than_a_truncated_one() -> None:
     """The limitation, pinned as a test so it is a known edge rather than a surprise.
 

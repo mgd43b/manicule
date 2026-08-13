@@ -318,11 +318,39 @@ def _description_boundaries(text: str) -> list[int]:
     expansion is reached only when the whole right-hand side already failed, and is kept whenever
     no prefix before it agrees.
 
+    **A qualifier is dropped from a long line and kept from a short one, and that is a decision
+    rather than an accident.** It is the sharpest objection to this rule, so it is written down
+    rather than left to be discovered:
+
+    - ``Regional Network Edge (Type 2)``
+      is stored as ``Regional Network Edge (Type 2)`` — the bracket is kept.
+    - ``Regional Network Edge (Type 2), the branch hardware profile``
+      is stored as ``Regional Network Edge`` — the bracket is dropped.
+
+    Identical brackets, opposite outcomes, and the discriminator is length. The reason is the rule
+    this module already runs everywhere else: **the shortest prefix that spells the term is where
+    the term stops.** :func:`_phrase_before` says it in those words and :func:`_phrase_after`
+    inherits it. When the whole right-hand side can be taken, it is taken and no boundary is
+    consulted — the conservative case, and the one that keeps requirement 4. When it cannot, the
+    question "where does the term end" has to be answered, and among prefixes that spell it the
+    shortest is the answer. ``Regional Network Edge`` is shorter than ``Regional Network Edge
+    (Type 2)`` and both spell ``RNE``, so the shorter wins, exactly as it would if the brackets
+    were a comma.
+
+    **The cost, stated so nobody has to rediscover it:** a bracketed qualifier that really is part
+    of the term is dropped from a line long enough to need cutting. The alternative is to prefer
+    the *longest* agreeing prefix at a bracket, which would invert the shortest-wins rule for this
+    one position and would keep ``Regional Network Edge (e.g., a gateway)`` on a short line for the
+    same reason. Nothing available here tells a qualifier from an example — that is another verb
+    test — so the choice is which way to be wrong, and it is made in favour of the rule that
+    already governs every other boundary.
+
     **No list of example markers.** ``e.g.`` and ``for example`` are what the specification names,
     and a rule keyed on them would be narrower than its own justification: what disqualifies the
     parenthetical here is not the phrase inside it but that the words before it already spell the
     term. Evidence does the work, so the marker list would be decoration that fails on the first
     parenthetical nobody enumerated.
+
     """
     depth = 0
     depths: list[int] = []
