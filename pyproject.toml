@@ -291,6 +291,26 @@ ban-relative-imports = "parents"
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
+[tool.ruff.format]
+# What the formatter owns, stated **here** rather than in the argument list CI happens to pass.
+#
+# CI used to check `src tests packages` while the obvious developer command, `ruff format .`,
+# also rewrote `tools/` and the Python inside markdown documents. Nothing verified those two, so
+# a developer running the natural command introduced changes CI could never fail on — and they
+# drifted, which is how this exclusion got written down twice with the second one silently
+# undoing the first. With the scope in configuration, `ruff format .` and CI's check are the
+# same command over the same set, and cannot disagree.
+#
+# These are *format-only* exclusions. Both are still linted by `ruff check .`:
+#
+# * `tools/` is generator scripts owned by the documentation they produce, not by the
+#   application's style policy. `[tool.ruff.lint.per-file-ignores]` already treats it that way.
+# * The design documents are prose. Their Python is illustrative sketches, hand-aligned into
+#   columns — a schema laid out so the types read down the page — and a formatter collapsing
+#   that alignment removes the thing the author put there on purpose. They are not code that
+#   runs, and no test imports them.
+exclude = ["tools/**", "**/*.md"]
+
 [tool.pyright]
 include = ["src", "tests", "packages"]
 pythonVersion = "3.12"
