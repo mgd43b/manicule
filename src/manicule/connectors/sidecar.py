@@ -203,9 +203,10 @@ def declared_identity(document: Path) -> str:
         which is what a local file with nothing to say about itself has always been.
     """
     try:
-        if not manifest_path_for(document).is_file():
+        manifest = manifest_path_for(document)
+        if not manifest.is_file():
             return ""
-        return _parse(manifest_path_for(document)).source().source_id
+        return _parse(manifest).source().source_id
     except (OSError, _UnusableManifestError):
         # Soft, as everywhere else here: a manifest that cannot be read never fails the document
         # beside it. The reason reaches the operator through `provenance_for` at fetch, which is

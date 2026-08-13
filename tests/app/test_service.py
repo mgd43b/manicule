@@ -18,6 +18,7 @@ import pytest
 
 from manicule import vocabularies
 from manicule.app import results as r
+from manicule.app import service as service_module
 from manicule.app.results import CheckState
 from manicule.app.service import (
     _IDENTITY_SAMPLE,  # pyright: ignore[reportPrivateUsage]
@@ -2099,6 +2100,34 @@ async def test_the_identity_check_gives_ordering_advice_only_where_it_applies(
     assert "first sync" not in without_record.detail
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    [AdapterOutcome.INVALID_METADATA, AdapterOutcome.AMBIGUOUS, AdapterOutcome.DUPLICATE_IDENTITY],
+)
+async def test_ordering_advice_is_refused_for_outcomes_that_converting_earlier_would_not_fix(
+    backend: FakeBackend, outcome: AdapterOutcome
+) -> None:
+    """An adaptation record is not the signal; ``identity_not_applied`` is.
+
+    Every adapted page carries a record whatever happened to it, so testing for the record
+    offered "convert before the first sync" to pages whose problem was an unreadable manifest or
+    an identity two files claim. Converting those earlier reproduces both — the advice is not
+    merely unhelpful there, it is about a different thing.
+
+    Parametrised over the outcomes that are *not* the one this keys on, because the case that
+    passes either way is the one that is. The counterpart above pins the positive.
+    """
+    stranded = _declaring(backend, "1002", source_id="/corpus/pages/1002.html")
+    stranded.metadata[ENRICHED_KEY] = {"outcome": outcome.value}
+    backend.store.add(stranded)
+    backend.store.add(_declaring(backend, "1002", source_id="1002"))
+
+    check = _check(await ApplicationService(backend).doctor(), "document-identity")
+
+    assert check.state == "degraded", "the two are not comparable states"
+    assert "first sync" not in check.detail
+
+
 async def test_the_identity_check_clears_once_the_documents_are_keyed_on_what_they_declare(
     backend: FakeBackend,
 ) -> None:
@@ -2392,3 +2421,75 @@ async def test_a_real_glossary_sweep_carries_every_count_back(
         sweep.entries_before,
         sweep.entries_after,
     )
+
+
+@pytest.mark.parametrize("name", ["document-identity", "document-content"])
+async def test_a_bounded_scan_says_it_was_bounded_on_every_path_it_reports(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """``affected: 0`` from a scan that stopped early is not "none anywhere".
+
+    Both checks read a bounded page of documents, and a count is only interpretable next to the
+    bound that produced it. The ok paths are the ones that read as good news and so are the ones
+    where the omission costs most — a corpus of a million rows reported clean having been asked
+    about ten thousand of them.
+
+    The bound is patched down rather than fed ten thousand fixtures: what is being asserted is
+    that the checks report the bound they used, and a test that had to build the real one would
+    be pinning ``_IDENTITY_SCAN``'s value instead of the reporting rule.
+    """
+    for index in range(3):
+        backend.store.add(
+            make_document(backend.workspace, source="handbook", source_id=f"notes{index}.md")
+        )
+    bound = len(backend.store.documents) - 1
+    monkeypatch.setattr(service_module, "_IDENTITY_SCAN", bound)
+
+    check = _check(await ApplicationService(backend).doctor(), name)
+
+    assert check.state == "ok", "the fixture must reach the ok path, or this asserts nothing"
+    assert check.facts["examined"] == bound, "the scan did not stop where it was told to"
+    assert check.facts["truncated"] is True
+
+
+@pytest.mark.parametrize("name", ["document-identity", "document-content"])
+async def test_an_unbounded_scan_says_so_rather_than_omitting_the_fact(
+    backend: FakeBackend, name: str
+) -> None:
+    """The other half: ``truncated`` has to be present and ``False``, not absent.
+
+    An absent key and a false one are the same to a reader who does not know the key exists,
+    which is exactly the caller this reports for. Asserting the value rather than the key's
+    presence is what makes the two states distinguishable.
+    """
+    backend.store.add(make_document(backend.workspace, source="handbook", source_id="notes.md"))
+
+    check = _check(await ApplicationService(backend).doctor(), name)
+
+    assert check.state == "ok"
+    assert check.facts["examined"] == len(backend.store.documents)
+    assert check.facts["truncated"] is False
+
+
+async def test_the_content_checks_degraded_count_carries_the_bound_as_well(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finding from a bounded scan is bounded too, and this one said so nowhere.
+
+    ``3 documents are stale`` out of a scan that stopped at its limit is the same misreading as
+    ``0 are`` — the number is a floor, not a total. The identity check reported this on its
+    degraded path already; this one reported it on neither.
+    """
+    backend.store.add(_re_keyed(backend, reparsed=False))
+    # Exactly the number held, so the stale document is inside the page *and* the read came back
+    # full. A scan that returns its whole limit cannot tell whether more exist, which is the
+    # state `truncated` is about.
+    bound = len(backend.store.documents)
+    monkeypatch.setattr(service_module, "_IDENTITY_SCAN", bound)
+
+    check = _check(await ApplicationService(backend).doctor(), "document-content")
+
+    assert check.state == "degraded"
+    assert check.facts["truncated"] is True
+    assert check.facts["examined"] == bound
+    assert f"among the first {bound} documents examined" in check.detail

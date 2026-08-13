@@ -526,6 +526,13 @@ async def test_a_filesystem_name_that_builds_something_else_is_refused(tmp_path:
     Reachable only where something has taken over the ``filesystem`` component name. Refused
     rather than duck-typed: the root and the profiles read off that object decide where this
     writes and what it recognises.
+
+    **What this asserts is that the message names the class, not that it is spelled a particular
+    way.** It used to read ``"builds a object" in ...``, pinning an article that was wrong for
+    the one type it fires on most — and pinning it in the direction that makes the defect cost
+    something to fix, because correcting the message turned the test red. A substring assertion
+    is a specification of the part it quotes; quoting the ungrammatical part specified the
+    ungrammaticality.
     """
     root = corpus(tmp_path)
     settings = settings_for(root, profiles=[PROFILE])
@@ -535,7 +542,9 @@ async def test_a_filesystem_name_that_builds_something_else_is_refused(tmp_path:
     with pytest.raises(ConfigError) as refusal:
         await service.connector_sidecar(None, source="docs")
 
-    assert "builds a object" in str(refusal.value)
+    assert "builds an instance of object" in str(refusal.value), (
+        "the refusal did not name the class that was built instead"
+    )
     assert not list(root.glob("**/*.source.json"))
 
 

@@ -662,6 +662,39 @@ async def test_a_corrected_manifest_updates_the_citation_over_an_unchanged_body(
     assert stored.provenance.source.version == "8"
 
 
+async def test_a_hand_written_manifest_with_no_title_does_not_cost_the_page_its_own(
+    tmp_path: Path,
+) -> None:
+    """A field a manifest leaves empty is not a statement, and was being read as one.
+
+    A manifest outranks the page about what it *states* — that is what
+    ``test_a_corrected_manifest_updates_the_citation_over_an_unchanged_body`` above pins, and it
+    still holds. What it must not do is outrank the page with an *absence*: a minimal manifest
+    carrying a ``source_id`` and little else is exactly what somebody writes by hand, and the
+    empty title was winning.
+
+    Both routes are asserted because the empty title cost the document its name twice over, and
+    fixing either alone looks like a fix. The stored title comes from the *provenance record*,
+    falling back to what discovery reported — a local file's filename, so the citation read
+    ``1002.html``. The parser separately reads ``metadata["title"]`` to anchor the content above
+    the first heading, and a storage body is a fragment with no ``<title>`` to fall back to.
+    """
+    root = await _corpus(tmp_path)
+    manifest = root / "pages" / "1002.html.source.json"
+    held = json.loads(manifest.read_text(encoding="utf-8"))
+    assert held["title"] == "Retry Runbook", "the generated manifest must start with a title"
+    held["title"] = ""
+    manifest.write_text(json.dumps(held), encoding="utf-8")
+
+    stored = only(await ingest(root))
+
+    assert stored.title == "Retry Runbook", "the citation fell back to the filename"
+    assert stored.provenance is not None
+    assert stored.provenance.source is not None
+    assert stored.provenance.source.title == "Retry Runbook", "the record kept the empty title"
+    assert stored.provenance.source.source_id == "1002", "identity must not move with the title"
+
+
 async def test_a_new_adapter_version_rebuilds_the_derived_body(tmp_path: Path) -> None:
     """The change token covers the adapter, so a changed extraction is not invisible.
 

@@ -193,10 +193,25 @@ def _sidecar_ordering_would_have_helped(moving: Sequence[Document]) -> bool:
     than in when the manifests were written. Attaching it to both would be advice that does not
     apply to half the cases it appears in, which is how a diagnostic stops being read.
 
-    The signal is the adaptation record: a path-keyed enriched page carries one, and a document
-    that merely has a manifest does not.
+    **The signal is the outcome, not the presence of a record**, and reading the record alone was
+    narrow in the docstring and wide in the code. Every adapted page carries one, whatever
+    happened to it: ``invalid_metadata`` and ``ambiguous`` are recorded the same way, and for
+    those "convert before the first sync" is advice about ordering offered for a problem that is
+    not about ordering — the manifest was unreadable or the page declared an identity two files
+    claim, and converting earlier reproduces both. Only ``identity_not_applied`` names a document
+    that is path-keyed *because of when the conversion ran*, which is the one thing arriving
+    earlier would have changed.
+
+    Keyed off :attr:`~manicule.connectors.enriched.AdapterOutcome.IDENTITY_NOT_APPLIED` so that
+    this and :func:`_identity_deliberately_unapplied` read the same field for the same reason. They
+    are two halves of one judgement about that outcome, and having one test it while the other
+    tested the record's mere existence is how they came to disagree.
     """
-    return any(isinstance(document.metadata.get(ENRICHED_KEY), dict) for document in moving)
+    return any(
+        isinstance(record := document.metadata.get(ENRICHED_KEY), dict)
+        and record.get("outcome") == AdapterOutcome.IDENTITY_NOT_APPLIED.value
+        for document in moving
+    )
 
 
 def _identity_deliberately_unapplied(document: Document, *, claimed: set[str]) -> bool:
@@ -241,7 +256,20 @@ _IDENTITY_SCAN = 10_000
 A bound rather than a full scan, because ``doctor`` is run to read a sentence and a corpus of a
 million rows should not be loaded to produce one. ``truncated`` is reported alongside the count so
 that "no documents affected" cannot be read as "none anywhere" when it means "none in the first
-ten thousand"."""
+ten thousand".
+
+**Every state that reports a count reports its bound**, which is a rule rather than a preference.
+The bound qualifies whatever the read concluded, so ``ok`` and ``degraded`` carry it on both
+checks: the ok paths were the obvious gap, but ``document-content``'s *degraded* count was
+bounded too and said so nowhere, and "3 documents are stale" from a scan that stopped at ten
+thousand is the same misreading with a number in front of it. A count that omits its own bound is
+the failure this constant exists to prevent, and omitting it is easiest on the path that looks
+like good news.
+
+``unknown`` is the exception and is not one: the read itself raised, so there is no page of
+documents and no count to qualify. Its ``facts`` carry the ``error_type`` and nothing else, which
+is the whole of what that state knows. Reporting ``examined: 0`` there would be a measurement
+nobody took."""
 
 _IDENTITY_SAMPLE = 25
 """How many of the affected documents are listed individually.
@@ -888,10 +916,13 @@ class ApplicationService:
             # name. Refused rather than duck-typed: the two attributes read below decide where
             # this writes and what it recognises, and guessing that an unknown class means the
             # same thing by them is how a conversion ends up rooted somewhere nobody named.
+            # "builds an instance of X" rather than "builds a X": the type name is interpolated,
+            # so no fixed article is right for all of them — the class this actually fires on
+            # most often is `object`, and the message read "builds a object".
             msg = (
-                f"{name!r} is configured as a {FILESYSTEM_CONNECTOR_NAME!r} source but builds a "
-                f"{type(connector).__name__}, which does not declare a root and enriched "
-                f"profiles this can convert with."
+                f"{name!r} is configured as a {FILESYSTEM_CONNECTOR_NAME!r} source but builds an "
+                f"instance of {type(connector).__name__}, which does not declare a root and "
+                f"enriched profiles this can convert with."
             )
             raise ConfigError(msg)
         if not connector.profiles:
@@ -1547,7 +1578,14 @@ class ApplicationService:
                     else f"the first {_IDENTITY_SCAN} documents are already keyed on the "
                     f"identity their sources declare"
                 ),
-                facts={"affected": 0, "examined": len(documents)},
+                # `truncated` on the ok path as well as the degraded one. The prose above already
+                # distinguishes "none" from "none in the first ten thousand"; a caller reading
+                # `facts` got `affected: 0` and no way to tell which sentence produced it.
+                facts={
+                    "affected": 0,
+                    "examined": len(documents),
+                    "truncated": len(documents) >= _IDENTITY_SCAN,
+                },
             )
         first = moving[0]
         return r.Check(
@@ -1668,20 +1706,36 @@ class ApplicationService:
                 detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
                 facts={"error_type": type(exc).__name__},
             )
+        # The same bound the identity check reads, reported the same way. This check is the one
+        # that had it nowhere: neither its prose nor its facts said the scan stopped, so a corpus
+        # of a million rows reported "no document is serving stale text" having looked at one per
+        # cent of it. Both states report it, because a bounded count is bounded whether it came
+        # back zero or not.
+        truncated = len(documents) >= _IDENTITY_SCAN
+        bound = f" among the first {_IDENTITY_SCAN} documents examined" if truncated else ""
         waiting = [document for document in documents if _awaiting_reparse(document)]
         if not waiting:
             return r.Check(
                 name="document-content",
                 state="ok",
-                detail="no document is serving text from before its identity was repaired",
-                facts={"awaiting_reparse": 0},
+                detail=(
+                    "no documents are indexed, so none can be serving text from before their "
+                    "identity was repaired"
+                    if not documents
+                    else f"no document is serving text from before its identity was repaired{bound}"
+                ),
+                facts={
+                    "awaiting_reparse": 0,
+                    "examined": len(documents),
+                    "truncated": truncated,
+                },
             )
         sources = sorted({document.source for document in waiting})
         return r.Check(
             name="document-content",
             state="degraded",
             detail=(
-                f"{len(waiting)} document(s) were re-keyed onto the identity their source "
+                f"{len(waiting)} document(s){bound} were re-keyed onto the identity their source "
                 f"declares and have not been re-read since. Their identity is correct and their "
                 f"stored text is not: it is the parse from before the storage body was routed to "
                 f"the storage parser, so it still carries the exporter's metadata banner and its "
@@ -1696,6 +1750,8 @@ class ApplicationService:
                 "dict[str, JsonValue]",
                 {
                     "awaiting_reparse": len(waiting),
+                    "examined": len(documents),
+                    "truncated": truncated,
                     "sources": sources,
                     "documents": [
                         {"source": document.source, "source_id": document.source_id}

@@ -38,6 +38,7 @@ stored copy is how a comparison form becomes a second key by accident.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import TYPE_CHECKING, Final
 
 from manicule.core.glossary import (
@@ -223,7 +224,19 @@ is why ``ONCE — Operational Node Configuration Engine`` and ``WHEN — Workloa
 Notifier`` survive being their own counter-examples.
 """
 
-_DESCRIPTION_BOUNDARY_RE: Final = re.compile(r"[,;]|(?<=[.!?])\s")
+_SENTENCE_FINAL: Final = ".!?"
+"""What ends a sentence, for every rule in this module that has to know.
+
+**One constant because there were two answers, and the disagreement was the defect.**
+:data:`_DESCRIPTION_BOUNDARY_RE` has always treated all three as sentence ends, so a boundary
+could be offered after ``!`` or ``?``; :func:`_usable_expansion` stripped and rejected on ``.``
+alone. The two together stored ``Network Operations Visibility Assistant!`` as an expansion —
+punctuation and all, from a prefix cut at a boundary the cleaner did not know was one — and
+accepted ``Alpha Bravo! Charlie Delta`` whole, two sentences, which that function's own docstring
+says it refuses. Naming the set once is what stops a fourth rule inheriting half of it.
+"""
+
+_DESCRIPTION_BOUNDARY_RE: Final = re.compile(rf"[,;]|(?<=[{re.escape(_SENTENCE_FINAL)}])\s")
 """Where a description may begin: a comma, a semicolon, or the end of a sentence.
 
 Each match yields a *candidate* prefix and nothing more. Truncating at the first comma
@@ -234,6 +247,15 @@ expansion than the sentence it came from. :func:`core_expansion` still has to be
 
 **Matched positions are filtered by :func:`_description_boundaries` and this pattern is never
 scanned directly**, because punctuation inside a bracket belongs to the bracket. See there.
+"""
+
+_SENTENCE_BREAK_RE: Final = re.compile(rf"[{re.escape(_SENTENCE_FINAL)}]\s")
+"""A sentence ending somewhere other than at the end of the string.
+
+The test :func:`_usable_expansion` uses for "more than one sentence in it". Read against
+:data:`_DESCRIPTION_BOUNDARY_RE`, which finds the same positions in order to *offer* them: what
+one function treats as a place a description may begin, the other treats as proof that a phrase
+kept whole is prose. Both readings need the same list of what ends a sentence.
 """
 
 _BRACKETS: Final[Mapping[str, str]] = {"(": ")", "[": "]", "{": "}"}
@@ -607,7 +629,18 @@ def initial_skeleton(display: str) -> str:
     alphabetic, so ``IPv6`` skeletons to ``IP6`` and no expansion's initials can ever spell it.
     Retaining the digit makes such a skeleton unmatchable, which is the conservative outcome —
     dropping it would leave ``IP``, two characters, and the bound would refuse that anyway.
+
+    **NFKC first, because a comparison form in the wrong normal form compares against nothing.**
+    :func:`~manicule.core.glossary.normalise_acronym` normalises deliberately, so a ``SaFeR``
+    whose capitals are written full-width still keys under an ASCII ``SAFER``. Reading the display
+    raw skeletoned it to a full-width ``SFR``, and :func:`term_forms` then held one member of each
+    kind. No expansion's initials can spell a full-width string, so that skeleton was not merely
+    wrong, it was unreachable — a stylized term with any compatibility character in it silently
+    lost the second form this function exists to give it. Normalising here repairs a full-width
+    digit the same way, so an ``IPv6`` written with one skeletons to ``IP6`` rather than to
+    something no expansion and no bound can read.
     """
+    display = unicodedata.normalize("NFKC", display)
     if not display[:1].isupper():
         return ""
     if not any(character.islower() for character in display):
@@ -629,8 +662,19 @@ def term_forms(acronym: str, display: str = "") -> frozenset[str]:
     **Nothing here reads the expansion**, and that is half of why requirement 3 holds. The set of
     strings a phrase is permitted to spell is fixed before any phrase is looked at, so no phrase
     can widen it by containing the right letters.
+
+    **Both members are NFKC-normalised here rather than assumed to be**, because the two callers
+    disagree about what they pass. :func:`detect_in_chunk` passes a
+    :func:`~manicule.core.glossary.normalise_acronym` key, already normalised.
+    :func:`_phrase_before` passes the raw surface the parentheses held, deliberately, and there
+    that surface *is* the display
+    spelling. Normalising only in :func:`initial_skeleton` would leave that second caller building
+    a set whose two members were in different normal forms from each other, which is the same
+    unreachable-comparison-form defect one call site along. A set intersection is only meaningful
+    over one normal form, so this is the place that owns it.
     """
-    forms = {"".join(character for character in acronym if character.isalnum()).upper()}
+    key = unicodedata.normalize("NFKC", acronym)
+    forms = {"".join(character for character in key if character.isalnum()).upper()}
     if display:
         forms.add(initial_skeleton(display))
     return frozenset(forms) - {""}
@@ -646,6 +690,24 @@ def initials_of(
     than ``SRT``. Function words are dropped before the split rather than after it: a writer
     skips a small word, not half of a compound, and dropping ``And`` from ``AndOps`` would be a
     rule about letters rather than about words.
+
+    **The expansion is read raw, and unlike the term side that is a decision rather than an
+    oversight.** :func:`term_forms` NFKC-normalises both of its members because a key that has
+    been normalised and a skeleton that has not cannot be compared; the expansion has no such
+    disagreement to repair, since nothing normalises it anywhere —
+    :func:`~manicule.core.glossary.normalise_expansion` is case and whitespace only, on purpose.
+    Adding NFKC *here* would not align two forms, it would change what a word boundary is, and
+    measured on this function it changes four readings. A full-width ``Secure Automated
+    Framework`` stops giving a full-width ``SAF`` and starts giving an ASCII one, which is the
+    wanted case; but a ``first Line Encoder`` opening with the ``fi`` ligature goes ``FILE`` →
+    ``FLE``, a line opening with the Roman-numeral character for four goes ``LE`` → ``ILE``, and
+    an ``Alpha-Beta Gamma`` written with a full-width hyphen goes ``AG`` → ``ABG``, because NFKC
+    maps that hyphen onto a token separator this splits on. Those last three are new answers to
+    "what are this phrase's initials", which is a wider change than the one being made and wants
+    its own measurement. **Consequence, stated rather than left to be found:** a
+    full-width *expansion* against an ASCII term is still a missed detection. The term side is
+    the half that had two normal forms in one set; this half has one, consistently, and being
+    wrong consistently is a different bug.
     """
     words = [word for word in re.split(r"[\s/-]+", expansion) if word]
     if skip_function_words:
@@ -711,10 +773,19 @@ def _usable_expansion(expansion: str) -> str:
     never closes. The first two are prose that happens to sit after a separator; the third is a
     phrase no source wrote, assembled by cutting inside a parenthetical — see
     :func:`brackets_balance`.
+
+    **Both sentence rules read :data:`_SENTENCE_FINAL` rather than naming ``.``**, and this is
+    where the two answers used to disagree. Stripping only a period left the trailing punctuation
+    on every expansion cut at a ``!`` or ``?`` boundary — ``core_expansion`` stored
+    ``Network Operations Visibility Assistant!``, which then went into a query rewrite. Rejecting
+    only on ``". "`` meant "more than one sentence in it", written directly above, was false of
+    the two sentences ``Alpha Bravo! Charlie Delta``: they were kept whole and stored as one
+    phrase. The order matters and is the order below — trailing punctuation goes first, so a
+    phrase that *ends* at a sentence end is cleaned rather than mistaken for two of them.
     """
     trimmed = expansion.strip().strip("|").strip()
-    trimmed = re.sub(r"\s+", " ", trimmed).rstrip(".").strip()
-    if not trimmed or ". " in trimmed:
+    trimmed = re.sub(r"\s+", " ", trimmed).rstrip(_SENTENCE_FINAL).strip()
+    if not trimmed or _SENTENCE_BREAK_RE.search(trimmed):
         return ""
     words = trimmed.split()
     if not (1 <= len(words) <= MAX_EXPANSION_WORDS):

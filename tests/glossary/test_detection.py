@@ -26,6 +26,7 @@ from manicule.ingest.glossary import (
     initial_skeleton,
     initials_match,
     score_definition,
+    term_forms,
 )
 from manicule.parsers.config import (
     CONFLUENCE_MEDIA_TYPE,
@@ -41,6 +42,15 @@ from tests.storage_helpers import make_chunk, make_document
 
 MARKDOWN_MEDIA_TYPE = min(MARKDOWN_MEDIA_TYPES)
 """One of the Markdown types, chosen deterministically so routing is not a coin toss."""
+
+FULL_WIDTH_SAFER = "\uff33a\uff26e\uff32"
+"""``SaFeR`` with its three capitals written as full-width forms.
+
+The shape a CJK-locale exporter emits, and the input ``normalise_acronym`` has always collapsed
+on purpose. Written as escapes rather than pasted so the codepoints are legible in a diff and the
+linter's ambiguous-character rule can stay on for every other string in this file — a ``noqa``
+here would suppress it for the one line where a confusable character is the entire point.
+"""
 
 DOCUMENT = make_document(source_id="glossary", title="Glossary of terms")
 PLAIN = make_document(source_id="handbook", title="Operations handbook")
@@ -1050,6 +1060,74 @@ def test_a_real_definition_is_not_refused_for_the_word_it_opens_with(
         f"{expansion!r} spells {term}, so this case never reaches the rule it is meant to test"
     )
     assert core_expansion(term, expansion) == expansion
+
+
+@pytest.mark.parametrize("ending", [".", "!", "?"])
+def test_an_expansion_cut_at_a_sentence_end_keeps_none_of_its_punctuation(ending: str) -> None:
+    """All three sentence endings, because the module used to know two lists of them.
+
+    ``_DESCRIPTION_BOUNDARY_RE`` offers a boundary after ``.``, ``!`` and ``?`` alike, so a cut
+    can land after any of the three; ``_usable_expansion`` stripped ``.`` alone. The surviving
+    ``!`` or ``?`` was then stored as part of the term's meaning and went into query rewrites.
+
+    Parametrised rather than written once with a period, because a period passed before this
+    change and would have gone on passing: the case that fails is the ending nobody stripped.
+    """
+    right = f"Network Operations Visibility Assistant{ending} It correlates operational signals"
+
+    assert core_expansion("NOVA", right) == "Network Operations Visibility Assistant"
+
+
+@pytest.mark.parametrize("ending", [".", "!", "?"])
+def test_two_sentences_are_never_stored_as_one_expansion(ending: str) -> None:
+    """Refusing "more than one sentence in it" was true of ``.`` and false of the other two.
+
+    **The term is chosen so that its initials spell the entire right-hand side**, because that is
+    the only branch on which a two-sentence string can survive whole. ``core_expansion`` keeps the
+    whole side when its initials agree, and ``ABCD`` is what ``Alpha Bravo! Charlie Delta``
+    spells — so on ``origin/main`` that string was kept entire and stored as what ``ABCD`` means.
+    ``_phrase_after`` could never have produced it: it cuts at the boundary, so a prefix is at
+    most the first sentence.
+
+    Asserted here rather than against the private cleaner that does the refusing. The value that
+    differs is the *stored expansion*, which is the thing that was wrong; a test at this edge says
+    so directly and goes on working if that helper is renamed. The trailing-punctuation strip does
+    not cover this case — nothing trails, the sentence ends in the middle — so this is a genuinely
+    separate rule from the one pinned above.
+    """
+    assert core_expansion("ABCD", f"Alpha Bravo{ending} Charlie Delta") == ""
+
+
+def test_a_stylized_terms_skeleton_is_reachable_from_a_normalised_key() -> None:
+    """The skeleton and the key have to be in one normal form, or the pair compares against none.
+
+    ``normalise_acronym`` NFKC-normalises deliberately, so :data:`FULL_WIDTH_SAFER` keys under an
+    ASCII ``SAFER``. Reading the display raw skeletoned it to a full-width ``SFR``, which no
+    expansion's initials can ever spell — the second comparison form was not wrong so much as
+    unreachable, and the detection was lost silently.
+
+    The ASCII spelling is asserted alongside as the control: it passed before this change, and a
+    test that only used it would pin nothing.
+    """
+    assert initial_skeleton("SaFeR") == "SFR", "the ASCII control moved"
+    assert initial_skeleton(FULL_WIDTH_SAFER) == "SFR"
+    assert initials_match(
+        normalise_acronym(FULL_WIDTH_SAFER),
+        "Secure Automated Framework Estimating Risk",
+        display=FULL_WIDTH_SAFER,
+    )
+
+
+def test_both_comparison_forms_are_normalised_even_when_the_caller_normalised_neither() -> None:
+    """``_phrase_before`` passes the raw surface as the key, so ``term_forms`` cannot assume one.
+
+    Two callers disagree about what they hand this: ``detect`` passes a ``normalise_acronym``
+    key, ``_phrase_before`` passes the parenthesised surface unchanged. Normalising only inside
+    ``initial_skeleton`` would leave the second building a set with one full-width member and one
+    ASCII one — the same defect, one call site along. Asserted on the set itself because that is
+    where two normal forms can coexist.
+    """
+    assert set(term_forms(FULL_WIDTH_SAFER, FULL_WIDTH_SAFER)) == {"SAFER", "SFR"}
 
 
 @pytest.mark.parametrize(
