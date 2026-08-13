@@ -1626,13 +1626,92 @@ delimiter and asks which prefix does. Shortest wins in both, for the same reason
 that spells the term is where the term stops, and a longer one that also spells it has swallowed
 the sentence around it. Read them together; change one and read the other.
 
-Where there is no initials evidence there is no cut. `HTTP — HyperText Transfer Protocol, used by
-every browser` keeps its description, exactly as it did before, because nothing in the text says
-where the expansion stops and guessing would store a phrase the source never wrote. This is a
-known limit, not a claim of completeness.
+Where there is no initials evidence there is no cut. `CPU — central processor, the part that
+executes instructions` keeps its description, because nothing in the text says where the expansion
+stops and guessing would store a phrase the source never wrote. This is a known limit, not a claim
+of completeness.
 
 The **passage is never trimmed**. Only the stored expansion is; the chunk the entry cites still
 contains the whole line, so a citation resolves to text the document actually holds.
+
+### 14.3.1.1 What counts as initials, and the bound on each widening
+
+Ordinary word initials miss two conventions technical writing is full of, and both were failing
+the same way — the whole right-hand side kept and then refused as too long, so no entry at all:
+
+```
+SORT  — SecOps Reliability Toolkit, a package that operations teams install on a host.
+SaFeR — Service Failure Reporter, a component that groups related failures together.
+```
+
+`SecOps` is one word and two of the term's four letters; `SaFeR` looks up as `SAFER` and its
+expansion supplies three initials, not five. Two comparison forms are added, and **because initials
+agreement is the sole authority to cut a prefix off a right-hand side, each one widens the
+authority to truncate** — which is the dangerous direction, since `when enabled` is shorter than
+the sentence it came from and therefore looks *more* like an expansion. So each is bounded:
+
+| Form | Read from | Bound on it |
+|---|---|---|
+| Word initials | Whitespace, `/`, `-` | Unchanged |
+| Component initials | One camel boundary: lower-case or digit followed by upper case | That boundary only. `HTTPServer` is **not** split — a second rule is more authority to cut |
+| Initial skeleton | The upper-case and numeric characters of a deliberately mixed-case display | Initial capital, at least one lower-case letter, and `MIN_SKELETON_LENGTH` = 3 characters |
+
+The two run in opposite directions and only one needed a floor. Splitting a compound can only
+*lengthen* a phrase's initials, and a longer string is satisfied by fewer terms — so it demands
+more agreement, not less. A skeleton is *shorter* than the key it stands beside, which is a weaker
+constraint: fewer words have to agree before a prefix may call itself the expansion. Swept over
+the labelled corpus in `tests/glossary/skeleton_corpus.py`, 18 positives and 17 negatives:
+
+| Bound | Precision | Recall | Boundary precision | What moved |
+|---|---|---|---|---|
+| 2 | 0.947 | 1.000 | 1.000 | `WEB = 'when enabled'`, a false positive |
+| **3** | **1.000** | **1.000** | **1.000** | — |
+| 4 | 1.000 | 0.944 | 0.941 | `AuDiT` lost |
+
+Three is pinned on both sides by one case each, and `SaFeR` skeletons to exactly three characters
+— zero margin, the same margin `_UPPERCASE_SHARE` has on the same term's shape.
+
+**The intuitive argument for the floor is not the one that holds.** Short forms ought to cut prose
+more often, so the prose ought to show it — and it does not: across the forty-five ordinary
+passages in `tests/glossary/corpus.py` there is not one two-word description-boundary prefix, and
+the distribution of prefix-initial lengths peaks at six. What condemns a bound of two is a
+constructed line, `WEb - when enabled, the process starts automatically`, which is the §14.3.2
+`API` negative under a term whose skeleton is `WE`. Related and **not** fixed here: a two-letter
+*key* has always had this authority — `core_expansion('WE', 'when enabled, …')` returns `when
+enabled` on `origin/main` — because `MIN_ACRONYM_LENGTH` is 2. Narrowing that would refuse `IO`,
+`ID` and `DB`, and it is not what this change is about; it is recorded because it is the reason
+the floor belongs on the skeleton specifically, which is authority granted *in addition* to a key.
+
+**Arbitrary subsequences are refused structurally rather than by a rule.** Two closed sets are
+built independently — the term's spellings from the term, the expansion's initials from its own
+token boundaries — and matching is set intersection over whole strings. Nothing scans an expansion
+looking for a term's letters, and nothing can, because the function that reads the expansion is
+never told what term it is about to be compared against. A test asserting that some unrelated
+string fails to match would prove none of this, because a scanning matcher refuses those too. So
+`test_a_free_subsequence_scan_would_match_and_this_matcher_refuses` writes the scanning matcher
+out, shows it accepting `Storage Operations Roster` for `SORT` and `Service for Escalation Routing`
+for `SFR`, and shows this one refusing both.
+
+`HTTP — HyperText Transfer Protocol, used by every browser` was this section's example of the
+conservative fallback and is now cut correctly, which is why the paragraph above uses `CPU`. That
+is a documented limitation closing, not a behaviour drifting: `HyperText` is a compound and its
+components spell the term exactly.
+
+**A term is three strings and the third resolves nothing.** The *display* is what the source
+wrote, stored verbatim; the *lookup key* is `normalise_acronym` of it and is the only one anything
+resolves through, at ingest and at query time alike; the *initial skeleton* is a comparison form,
+computed where it is compared and stored nowhere. `SaFeR` is found by `safer` and not by `SFR`,
+and two definitions of `SAFER` remain a conflict whatever their capitalisation says — §14.5's rule
+that nothing picks a winner is not weakened by there being a new way to spell the loser.
+
+Measured end to end over that corpus: detection precision and recall **1.000/1.000** against
+`origin/main`'s 1.000/0.833, expansion-boundary precision **1.000** against 0.933, zero false
+positive entries, hit rate **13/14** at k=1 and k=3 and **14/14** at k=10, unsupported-query
+rejection **6/6**, and **no confidence band or score moved on any of the 24 queries**. The one
+question that does not reach rank 1 is `What does SecOps Reliability Toolkit stand for?`: it names
+the expansion and never writes the term, so no alias fires and the glossary does nothing for it.
+That is a real limit of a lookup keyed by term, and the query is kept in the corpus rather than
+dropped for a rounder number.
 
 ### 14.3.2 Why exact lexical matching is not enough to call something a definition
 

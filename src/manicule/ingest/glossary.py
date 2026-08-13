@@ -22,6 +22,17 @@ and they are independent on purpose:
 2. **Confidence.** Everything else is evidence, combined and compared against a threshold: the
    written form, whether the expansion's initials actually spell the term, and whether the
    surrounding document says it is a glossary.
+
+**A term is three strings, and keeping them apart is a correctness property.** The *display* is
+what the source wrote — ``SaFeR`` — and it is stored verbatim, because a citation should quote
+the document rather than our normalisation. The *lookup key* is
+:func:`~manicule.core.glossary.normalise_acronym` of it — ``SAFER`` — and it is the only one of
+the three that anything resolves through, at ingest and at query time alike. The *initial
+skeleton* is :func:`initial_skeleton` of it — ``SFR`` — and it is a **comparison form**: it exists
+so that ``Service Failure Reporter`` can be recognised as the expansion, and it is stored nowhere,
+resolves nothing, and breaks no tie. Two definitions of ``SAFER`` disagree whatever their
+capitalisation says. The skeleton is computed where it is compared for exactly that reason — a
+stored copy is how a comparison form becomes a second key by accident.
 """
 
 from __future__ import annotations
@@ -227,6 +238,78 @@ _FUNCTION_WORDS: Final[frozenset[str]] = frozenset(
 """Words an acronym is free to skip. ``ATLAS`` spells out with ``And``; ``RAM`` skips ``of``.
 Both spellings are checked, because which one a writer used is not knowable from the string."""
 
+_CAMEL_COMPONENT_RE: Final = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+"""Where a compound word's components meet: a lower-case character followed by an upper-case one.
+
+``SORT — SecOps Reliability Toolkit`` is a definition whose ordinary word initials spell ``SRT``
+and whose *component* initials spell the term. The boundary is a property of the writer's own
+capitalisation, so this is one decomposition rather than a search — ``SecOps`` yields ``Sec`` and
+``Ops`` and nothing else can be read out of it.
+
+**Only this boundary, and the omission is the limit of the rule.** ``HTTPServer`` is not split;
+that would need a second boundary — upper case followed by upper-then-lower — and every extra
+boundary is extra authority to cut a right-hand side in half. One boundary, spelled by the writer
+in the plainest way available, is the narrowest rule that reads ``SecOps``.
+
+**Splitting can only lengthen a phrase's initials, which makes it the safer of the two widenings
+in this module.** A longer initials string is satisfied by fewer terms, so a phrase that spells a
+term by its components spells it on *more* agreement than one that spells it by its words.
+:func:`initial_skeleton` runs the other way and needs a bound; this does not.
+"""
+
+MIN_SKELETON_LENGTH: Final = 3
+"""How many significant characters an :func:`initial_skeleton` needs before it may award a cut.
+
+**The bound on the one widening in this module that runs in the dangerous direction.** A skeleton
+is shorter than the key it stands beside — that is what it is for — and a shorter comparison form
+is a weaker constraint, because fewer words have to agree before a prefix may call itself the
+expansion. Swept over the labelled corpus in ``tests/glossary/skeleton_corpus.py``, 18 positives
+and 17 negatives:
+
+=====  ==========  =======  ===================  ==========================================
+Bound  Precision   Recall   Boundary precision   What moved
+=====  ==========  =======  ===================  ==========================================
+2      0.947       1.000    1.000                ``WEB = 'when enabled'``, a false positive
+3      1.000       1.000    1.000                —
+4      1.000       0.944    0.941                ``AuDiT`` lost, skeleton ``ADT``
+=====  ==========  =======  ===================  ==========================================
+
+Three is the only value that scores perfectly, and it is pinned on both sides by one case each.
+Below it, ``WEb - when enabled, the process starts automatically`` — the ticket's own ``API``
+negative under a stylized term whose skeleton is ``WE`` — has ``when enabled`` cut out of it and
+stored as the meaning of ``WEB``. Above it, ``AuDiT — Automated Data Trail`` is lost. The
+motivating example sits exactly on the bound as well: ``SaFeR`` skeletons to ``SFR``, three
+characters, **zero margin** — the same margin :data:`_UPPERCASE_SHARE` has on the same term's
+shape.
+
+**What the corpus does *not* say, recorded because the obvious argument for this constant turns
+out to be unsupported.** The intuition is that short comparison forms cut prose more often, so the
+prose should show it. Measured over the forty-five ordinary passages in
+``tests/glossary/corpus.py`` — every description-boundary prefix, under all four readings of its
+initials, counted by length:
+
+===  ====  ====  ====  ====  ====  ====  ====  =====  =====  =====
+k    1     3     4     5     6     7     8     9      10     11
+===  ====  ====  ====  ====  ====  ====  ====  =====  =====  =====
+n    1     1     7     13    18    12    4     5      3      2
+===  ====  ====  ====  ====  ====  ====  ====  =====  =====  =====
+
+There is **no k=2 column**: not one of those passages offers a two-word boundary prefix, and the
+distribution peaks at six. So ordinary prose is not what condemns a bound of two, and a docstring
+claiming it did — an earlier draft of this one did, with numbers nobody had run — would have been
+citing a measurement that says the opposite. What condemns it is the constructed line above, which
+is in the corpus precisely because the natural population does not contain its own worst case.
+
+**A two-character comparison form is dangerous, and the key can already be one.** ``core_expansion
+('WE', 'when enabled, the process starts automatically')`` returns ``when enabled`` on
+``origin/main``, before any of this: :data:`~manicule.core.glossary.MIN_ACRONYM_LENGTH` is 2, so a
+two-letter *key* has always had this authority. That is not fixed here — it is the merged
+design's, it is out of this change's scope, and narrowing it would refuse ``IO``, ``ID`` and
+``DB``. It is recorded because it is the reason the bound belongs on the skeleton specifically:
+the skeleton is authority a term is granted **in addition** to its key, and additional authority
+is the kind worth being strict about.
+"""
+
 _TERM = rf"[A-Za-z][\w&/.-]{{0,{MAX_ACRONYM_LENGTH - 1}}}"
 
 # RUF001 on the next line is the whole point of it: an em dash and an en dash are the two
@@ -262,28 +345,126 @@ def acronym_shaped(surface: str) -> bool:
     return surface[:1].isupper() and upper / len(letters) >= _UPPERCASE_SHARE
 
 
-def initials_of(expansion: str, *, skip_function_words: bool) -> str:
-    """The letters an expansion's words begin with, upper case."""
+def initial_skeleton(display: str) -> str:
+    """The significant skeleton of a deliberately mixed-case spelling. Empty when there is none.
+
+    ``SaFeR`` is written with lower-case letters that belong to its *spelling* and not to its
+    initials: the writer capitalised ``S``, ``F`` and ``R`` because those are the letters the
+    expansion's words begin with, and left ``a`` and ``e`` in lower case because they are
+    connective. The skeleton is the upper-case and numeric characters in order — ``SFR``.
+
+    **A comparison form, never a key.** :func:`~manicule.core.glossary.normalise_acronym` owns
+    the lookup and keeps it: ``SaFeR`` stores under ``SAFER``, a reader who types ``safer`` finds
+    it, and a reader who types ``SFR`` does not, because ``SFR`` is never written anywhere. It is
+    also never a tie-breaker — two definitions of ``SAFER`` are two definitions of ``SAFER``
+    whatever their internal capitalisation says, which is the ticket's requirement 7 and the
+    reason this is a function rather than a field. A stored skeleton is a second copy that can
+    disagree with the spelling it came from, and a second copy is how a comparison form becomes a
+    key by accident.
+
+    Three conditions, and each refuses a case the others do not:
+
+    1. **An initial capital.** ``mDNS`` skeletons to nothing here, as it is refused by
+       :func:`acronym_shaped` there. The rule is the same one twice on purpose: a term whose own
+       first letter is lower case is outside what this module detects, and a skeleton that
+       silently began at the second character would be reading a term the source did not write.
+    2. **At least one lower-case letter.** Without one there is no deliberate mixing to read, and
+       the skeleton would simply restate the key — ``NOW`` skeletons to ``NOW``. That is not
+       wrong, it is nothing, and returning it would put a second copy of the key into every
+       comparison for no gain.
+    3. **At least :data:`MIN_SKELETON_LENGTH` characters.** The whole of the bound; see there.
+
+    Numeric characters are kept because the ticket names them, and the consequence is stated
+    rather than papered over: :func:`initials_of` takes a word's first character only when it is
+    alphabetic, so ``IPv6`` skeletons to ``IP6`` and no expansion's initials can ever spell it.
+    Retaining the digit makes such a skeleton unmatchable, which is the conservative outcome —
+    dropping it would leave ``IP``, two characters, and the bound would refuse that anyway.
+    """
+    if not display[:1].isupper():
+        return ""
+    if not any(character.islower() for character in display):
+        return ""
+    skeleton = "".join(
+        character for character in display if character.isupper() or character.isdigit()
+    )
+    if len(skeleton) < MIN_SKELETON_LENGTH:
+        return ""
+    return skeleton
+
+
+def term_forms(acronym: str, display: str = "") -> frozenset[str]:
+    """Every spelling of a term that an expansion's initials are allowed to spell.
+
+    At most two: the normalised key, and the :func:`initial_skeleton` of the source's own
+    spelling when there is one. Both are computed from the term alone.
+
+    **Nothing here reads the expansion**, and that is half of why requirement 3 holds. The set of
+    strings a phrase is permitted to spell is fixed before any phrase is looked at, so no phrase
+    can widen it by containing the right letters.
+    """
+    forms = {"".join(character for character in acronym if character.isalnum()).upper()}
+    if display:
+        forms.add(initial_skeleton(display))
+    return frozenset(forms) - {""}
+
+
+def initials_of(
+    expansion: str, *, skip_function_words: bool, split_components: bool = False
+) -> str:
+    """The letters an expansion's words begin with, upper case.
+
+    ``split_components`` reads a compound word's parts instead of the whole word, at the
+    :data:`_CAMEL_COMPONENT_RE` boundary — ``SecOps Reliability Toolkit`` gives ``SORT`` rather
+    than ``SRT``. Function words are dropped before the split rather than after it: a writer
+    skips a small word, not half of a compound, and dropping ``And`` from ``AndOps`` would be a
+    rule about letters rather than about words.
+    """
     words = [word for word in re.split(r"[\s/-]+", expansion) if word]
     if skip_function_words:
         words = [word for word in words if word.casefold() not in _FUNCTION_WORDS]
+    if split_components:
+        words = [part for word in words for part in _CAMEL_COMPONENT_RE.split(word) if part]
     return "".join(word[0] for word in words if word[:1].isalpha()).upper()
 
 
-def initials_match(acronym: str, expansion: str) -> bool:
+def initials_forms(expansion: str) -> frozenset[str]:
+    """Every reading of an expansion's significant initials. Four at most.
+
+    Two independent choices, neither knowable from the string: whether the writer spelled the
+    function words out — ``ATLAS`` includes its ``And``, ``RAM`` skips its ``of`` — and whether a
+    compound word contributes one initial or one per component.
+
+    **Every reading is produced from token boundaries, before any term is consulted.** The
+    boundaries are whitespace, ``/``, ``-`` and the camel-case boundary, all of them written into
+    the text by whoever wrote it. This function cannot be steered by the term it is about to be
+    compared against, because it is never told what that term is.
+    """
+    return frozenset(
+        initials_of(expansion, skip_function_words=skip, split_components=split)
+        for skip in (False, True)
+        for split in (False, True)
+    ) - {""}
+
+
+def initials_match(acronym: str, expansion: str, *, display: str = "") -> bool:
     """Whether ``expansion``'s initials spell ``acronym``.
 
-    Both spellings are accepted — every word, and every word that is not a function word —
-    because ``ATLAS`` includes its ``And`` and ``RAM`` skips its ``of``, and nothing in the
-    strings says which convention the writer followed.
+    ``display`` is the source's own spelling of the term, which admits its
+    :func:`initial_skeleton` as a second form the initials may spell. Omitting it is the narrow
+    reading — the key alone — and every caller that has a display spelling to hand passes it.
+
+    **Set intersection over whole strings, and that is requirement 3's guarantee in one line.**
+    Two closed sets are built independently — :func:`term_forms` from the term,
+    :func:`initials_forms` from the expansion's token boundaries — and the test is whether they
+    share a member. There is no containment test, no scan, and no position at which the
+    comparison could stop early having found the letters it wanted: a phrase either spells the
+    term exactly, under one of four readings of its own boundaries, or it does not. An
+    implementation that walked the expansion looking for the term's letters would pass every
+    positive fixture in this suite, which is why
+    ``test_a_free_subsequence_scan_would_match_and_this_matcher_refuses`` builds the counterpart
+    that separates them rather than asserting that some unrelated string fails to match.
     """
-    letters = "".join(character for character in acronym if character.isalnum()).upper()
-    if not letters:
-        return False
-    return letters in {
-        initials_of(expansion, skip_function_words=False),
-        initials_of(expansion, skip_function_words=True),
-    }
+    return bool(term_forms(acronym, display) & initials_forms(expansion))
 
 
 def _mentions_glossary(*texts: Iterable[str]) -> bool:
@@ -330,7 +511,7 @@ def has_a_refused_opening(expansion: str) -> bool:
     return first.casefold() in _NEVER_OPENS_AN_EXPANSION
 
 
-def _phrase_after(captured: str, acronym: str) -> str:
+def _phrase_after(captured: str, acronym: str, *, display: str = "") -> str:
     """Which words of ``captured`` are the term, rather than the description following it.
 
     **The mirror image of :func:`_phrase_before`, and deliberately the same idea rather than a
@@ -347,12 +528,12 @@ def _phrase_after(captured: str, acronym: str) -> str:
     """
     for boundary in _DESCRIPTION_BOUNDARY_RE.finditer(captured):
         prefix = _usable_expansion(captured[: boundary.start()])
-        if prefix and initials_match(acronym, prefix):
+        if prefix and initials_match(acronym, prefix, display=display):
             return prefix
     return ""
 
 
-def core_expansion(acronym: str, expansion: str) -> str:
+def core_expansion(acronym: str, expansion: str, *, display: str = "") -> str:
     """The term written out, with any trailing description removed. Empty if there is none.
 
     **The boundary decision is conditional on evidence, never applied first and scored
@@ -384,11 +565,18 @@ def core_expansion(acronym: str, expansion: str) -> str:
     harm — measured at 24 of 26 real definitions kept before the abbreviation exemption and 26 of
     26 after. Initials agreement is a property of two strings and outranks a judgement made from
     one word of one of them.
+
+    **``display`` widens what counts as initials agreement, and therefore widens the authority to
+    cut.** That is the whole risk of passing it, and it is why the two forms it admits are bounded
+    where they are: :data:`_CAMEL_COMPONENT_RE` reads one boundary and can only lengthen a
+    phrase's initials, and :func:`initial_skeleton` is refused below
+    :data:`MIN_SKELETON_LENGTH`. Neither adds a way to *find* letters in a phrase; both add a way
+    for a phrase's existing token boundaries to spell a term the source wrote down.
     """
     whole = _usable_expansion(expansion)
-    if whole and initials_match(acronym, whole):
+    if whole and initials_match(acronym, whole, display=display):
         return whole
-    trimmed = _phrase_after(expansion, acronym)
+    trimmed = _phrase_after(expansion, acronym, display=display)
     if trimmed:
         return trimmed
     if whole and not has_a_refused_opening(whole):
@@ -397,15 +585,26 @@ def core_expansion(acronym: str, expansion: str) -> str:
 
 
 def score_definition(
-    acronym: str, expansion: str, form: DefinitionForm, *, glossary_context: bool
+    acronym: str,
+    expansion: str,
+    form: DefinitionForm,
+    *,
+    glossary_context: bool,
+    display: str = "",
 ) -> float:
     """How strongly this reads as a definition rather than as prose.
 
     Additive and capped, with each term's justification on its own constant. Not a probability
     of anything: it answers "is this text a definition", never "is this definition right".
+
+    ``display`` is passed for the same reason :func:`core_expansion` takes it, and passing it in
+    one place and not the other would be the incoherent version: the boundary decision would cut
+    ``SecOps Reliability Toolkit`` out of a longer line on the strength of initials agreement and
+    the score would then report that no initials agreement was found. One notion of agreement,
+    read once, used by both.
     """
     score = _FORM_WEIGHT[form]
-    if initials_match(acronym, expansion):
+    if initials_match(acronym, expansion, display=display):
         score += INITIALS_EVIDENCE
     if glossary_context:
         score += GLOSSARY_CONTEXT_EVIDENCE
@@ -432,7 +631,7 @@ kept the article would store an expansion no document ever writes and no query e
 """
 
 
-def _phrase_before(captured: str, acronym: str) -> str:
+def _phrase_before(captured: str, term: str) -> str:
     """Which words of ``captured`` are the term, rather than the sentence around it.
 
     A parenthetical has no left-hand delimiter — the regular expression has to guess where the
@@ -451,11 +650,16 @@ def _phrase_before(captured: str, acronym: str) -> str:
     :func:`_phrase_after` is this same question asked from the other end — where a term *stops*
     when a description follows it — and answers it the same way, by asking the acronym. Change
     one and read the other.
+
+    ``term`` is the surface the parentheses held rather than a normalised key, and it is used as
+    both spellings :func:`initials_match` accepts. Renamed from ``acronym`` when the second
+    spelling arrived: it had always been the display form, and calling it the key made the call
+    below look like a mistake.
     """
     words = captured.split()
     for length in range(1, len(words) + 1):
         candidate = " ".join(words[len(words) - length :])
-        if initials_match(acronym, candidate):
+        if initials_match(term, candidate, display=term):
             return candidate
     while words and words[0].casefold() in _LEADING_ARTICLES:
         words = words[1:]
@@ -561,10 +765,16 @@ def detect_in_chunk(chunk: Chunk, *, glossary_context: bool = False) -> list[Glo
         if not acronym_shaped(candidate.display):
             continue
         acronym = normalise_acronym(candidate.display)
-        expansion = core_expansion(acronym, candidate.expansion)
+        expansion = core_expansion(acronym, candidate.expansion, display=candidate.display)
         if not acronym or not expansion or normalise_acronym(expansion) == acronym:
             continue
-        confidence = score_definition(acronym, expansion, candidate.form, glossary_context=context)
+        confidence = score_definition(
+            acronym,
+            expansion,
+            candidate.form,
+            glossary_context=context,
+            display=candidate.display,
+        )
         if confidence < MIN_DEFINITION_CONFIDENCE:
             continue
         aliases = tuple(
@@ -620,12 +830,16 @@ __all__ = [
     "INITIALS_EVIDENCE",
     "MAX_EXPANSION_WORDS",
     "MIN_DEFINITION_CONFIDENCE",
+    "MIN_SKELETON_LENGTH",
     "acronym_shaped",
     "core_expansion",
     "detect_entries",
     "detect_in_chunk",
     "has_a_refused_opening",
+    "initial_skeleton",
+    "initials_forms",
     "initials_match",
     "initials_of",
     "score_definition",
+    "term_forms",
 ]
