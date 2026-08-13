@@ -502,6 +502,12 @@ async def test_a_fetched_definition_still_obeys_a_chunk_level_restriction(
     A query restricted to code passages must not be handed a prose glossary page, however
     certain we are that it defines a term the query named. This is where that restriction is
     applied, and removing the check here is the way the feature would become a filter bypass.
+
+    It is also the one query shape that separates "a definition exists" from "a definition is in
+    front of the reader": the alias resolves, the entry is found, and the passage is then refused
+    by the chunk-level filter. Written after a mutation showed that dropping the in-context
+    condition from ``cites_a_definition`` broke nothing — a result claiming an explicit definition
+    while showing a context that does not contain one is the failure this half now catches.
     """
     retriever = await _with_glossary(store, indexed)
 
@@ -510,6 +516,11 @@ async def test_a_fetched_definition_still_obeys_a_chunk_level_restriction(
     assert result.expansion is not None
     assert result.expansion.fired, "the term still resolved — the restriction is not on vocabulary"
     assert system.rank_of(result.context.passages, definition) is None
+    assert result.confidence is not None
+    assert not result.confidence.explicit_definition, (
+        "the definition was found and then refused, so the result may not claim it was cited"
+    )
+    assert result.confidence.reason != DEFINITION_CITED
 
 
 async def test_a_definition_from_a_document_this_query_cannot_see_is_never_promoted(

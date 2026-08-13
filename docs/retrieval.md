@@ -1595,6 +1595,67 @@ real definition, and two independent gates apply:
    (0.80), a dash form on a glossary page clears it alone (0.60), and a colon form with neither
    does not (0.40).
 
+### 14.3.1 Where the term ends and the description begins
+
+A glossary line is often a definition followed by prose about it:
+
+```
+NOVA — Network Operations Visibility Assistant, a service used to correlate operational signals.
+```
+
+Thirteen words on the right of the dash. `MAX_EXPANSION_WORDS` is 10, so this was refused whole
+and **no entry was written at all** — which is upstream of retrieval entirely: nothing to expand
+with, nothing to promote, nothing to cite. No amount of ranking work reaches it.
+
+The obvious fix is to cut at the first comma and score what is left. That is wrong in the one
+direction that matters, and the arithmetic says so. `API - when enabled, the process starts
+automatically.` truncates to `when enabled` — two words, which every length rule in the module
+likes *better* than the sentence it came from. **Truncation removes the very thing that was
+refusing the line.** So the cut has to be earned before it is made, never scored afterwards.
+
+Only one signal is strong enough to award it. `core_expansion` tries the whole right-hand side
+first and keeps it if its initials spell the term; otherwise it walks the description boundaries
+— comma, semicolon, end of sentence — and takes the first prefix whose initials spell the term.
+`Network Operations Visibility Assistant` spells NOVA and the description does not, and that
+agreement between two strings is the only thing here that knows where a term ends.
+
+Where there is no initials evidence there is no cut. `HTTP — HyperText Transfer Protocol, used by
+every browser` keeps its description, exactly as it did before, because nothing in the text says
+where the expansion stops and guessing would store a phrase the source never wrote. This is a
+known limit, not a claim of completeness.
+
+The **passage is never trimmed**. Only the stored expansion is; the chunk the entry cites still
+contains the whole line, so a citation resolves to text the document actually holds.
+
+### 14.3.2 Why exact lexical matching is not enough to call something a definition
+
+A line's shape is not evidence that it defines anything. On a page titled "Glossary" a spaced
+hyphen scores 0.45 from its form plus 0.15 from the page — exactly the 0.60 threshold — so
+*every* upper-case token followed by a dash is admitted there on the strength of the page alone.
+Measured before this rule existed, both of these were recorded as real glossary entries:
+
+```
+NOTE - this paragraph describes an operational consideration, not a term.
+API  - when enabled, the process starts automatically.
+```
+
+Nine words and six, so `MAX_EXPANSION_WORDS` never fired on either and nothing else looked.
+
+What refuses them is that an expansion is a **noun phrase** and neither of these begins one.
+`opens_a_clause` checks the first word against a short list of subordinators, pronouns and
+demonstratives — words that can only begin a clause, so a phrase starting with one is a statement
+*about* the term rather than the term written out. It is checked at the first word only, and it
+never overrides initials evidence: if a phrase's initials spell the term, the two strings agree
+about what the term is, which is stronger than anything one word can say.
+
+Deliberately **not** a verb list as well. "Does this phrase contain a finite verb" is a question a
+parser answers and a word list only pretends to, and `WARNING — do not edit these records by
+hand.` is still admitted on a glossary page as a result. That is a known gap, measured and left
+rather than papered over with a list that would be wrong in the middle.
+
+`Today - the system is operating normally.` never reaches any of this: one of five letters is
+upper case, so the shape gate refuses it.
+
 ### 14.4 Scope is a correctness property
 
 Entries are stored in `glossary_entries` and `glossary_aliases`, scoped through `document_id` and
@@ -1644,7 +1705,7 @@ for *should I restart the daemon now* — a question that was never about the te
 appears on questions it does not concern is one readers learn to skip, which costs exactly the case
 it exists for.
 
-### 14.6 What it does to confidence: nothing, by construction
+### 14.6 What it does to confidence: nothing numeric, by construction
 
 A promoted definition carries **no leg score**. `evidence_per_passage` (§8.2) skips a passage the
 dense leg never ranked, so promotion contributes nothing in either direction — it cannot
@@ -1652,10 +1713,49 @@ manufacture evidence, and it cannot be mistaken for a cosine nobody measured. Wh
 found by both the original and the expanded search, the better of the two opinions is kept per leg,
 which is the only combination that cannot let the feature quietly *lower* a reported confidence.
 
-Measured on the fixture above, `What is NOW?` reports **0.1121 `low`** before and after. That is
+Measured on the fixture above, `What is NOW?` reports **0.2117 `low`** before and after. That is
 non-zero, which is `bugs/bug2.md`'s second acceptance criterion, and it is low because a chunk that
 is mostly about twenty-four other terms genuinely is weak evidence. Making the number larger would
 mean letting a detection confidence stand in for a cosine, which §8 refuses everywhere else.
+
+### 14.6.1 An explicit definition is a classification, not a quantity
+
+The number staying still left a sentence that was simply false. A run could report band `none`
+with "*nothing in this corpus resembles your question*" while showing, at rank 1, the glossary
+entry defining the exact term the question named. That is not a threshold set too high; it is two
+paths that never spoke, one reading a cosine and the other reading a lookup.
+
+`Confidence.explicit_definition` is what they say to each other. It is a **boolean
+classification**: it enters no weighted sum, moves no band, and leaves `components` and `ceiling`
+untouched. Its whole effect is that `NOTHING_RESEMBLES` is replaced by `DEFINITION_CITED`, which
+says what was found instead of asserting the corpus is empty of it.
+
+It is set only when all three of these hold, and dropping any one turns it into a boost:
+
+| Condition | Why it is necessary |
+|---|---|
+| A glossary entry fired for the term | Already means the entry cleared the confidence floor and was not contested — a disagreeing pair is reported as a conflict and fires nothing, so a contested term never reaches this |
+| The query asked what the term **means** | Tested with `definitional_frame`, not by reading the recorded `MatchReason`. `raise a ticket in NOVA today` records `exact_case`, the same reason `What is NOVA?` records, so the reason cannot tell them apart |
+| The defining passage is **in the context** | "We found a definition" and "we are showing you one" are different claims, and only the second may contradict "nothing here resembles your question" |
+
+The second condition is what keeps exact lexical overlap from establishing support: a query that
+merely *mentions* a defined term gets the definition promoted and still reports no evidence,
+because it did not ask.
+
+**No numeric glossary component ships**, and that is a measured result rather than caution. On the
+evaluation corpus the classification separates the two populations perfectly — seven definitional
+queries true, five non-definitional false, zero false positives — but that is twelve queries over
+three defined terms on one synthetic corpus, which is nowhere near enough to set a weight. Setting
+one from it would be adjusting a constant to fit the motivating example, which §8.4 forbids by
+name. So there is no zero-weight component and no unused configuration key to find later and
+wonder about; when there is a corpus big enough to calibrate against, the classification is
+already there to weigh.
+
+This is also why an explicit definition is not the same thing as a high similarity. Similarity
+asks how much the passages *resemble* the question, which is a property of two embeddings.
+"Someone wrote down what this term means, and here is the line" is a property of the corpus's
+structure, and no cosine expresses it — which is exactly why the two had to be reported side by
+side rather than added together.
 
 ### 14.7 The cache key
 
@@ -1697,6 +1797,9 @@ Calls made in the absence of a stated position.
 | Confidence is a retrieval-support score with named components, no fallback term | §8.2, §8.3 |
 | `fast` cannot reach `high` confidence, by arithmetic and on purpose | §8.3 |
 | A degraded leg suppresses the agreement component rather than scoring it zero — confidence never blames the corpus for a pipeline fault | §8.2 |
+| A description is separated from an expansion only where initials evidence says where it begins; no evidence, no cut | §14.3.1 |
+| An expansion must be a noun phrase — a right-hand side opening a clause is refused, and a verb list is declined as a thing a word list cannot do | §14.3.2 |
+| An explicit definition is a named classification with no weight, not a confidence component; no weight is set until a corpus can calibrate one | §14.6.1 |
 | Router: full-match only, tuned for precision, no citations and absent confidence on a direct route | §9 |
 | L1 caches ranked ids, not content, so a hit cannot leak a deleted or foreign chunk | §10.1 |
 | L1 key excludes conversation history and includes the generation counter, `Query.limit` and the pipeline identity | §10.2 |

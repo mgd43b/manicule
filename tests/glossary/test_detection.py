@@ -156,12 +156,15 @@ def test_a_description_after_a_sentence_boundary_is_dropped() -> None:
     assert [entry.expansion for entry in entries] == [EXPANSION]
 
 
-def test_the_whole_passage_survives_for_citation_after_the_expansion_is_trimmed() -> None:
-    """Trimming the expansion must not trim the evidence.
+def test_the_trimmed_entry_still_cites_the_chunk_that_states_the_whole_line() -> None:
+    """Trimming the expansion must not cost the citation.
 
-    The stored expansion is four words; the passage the entry cites is the whole line including
-    the description. An entry whose citation resolved to the trimmed phrase would be pointing at
-    text no document contains — which is the one thing a citation may never do.
+    The stored expansion is four words and the chunk it cites states all thirteen. What is
+    asserted is the *link* — that the entry points at the passage the description is in — because
+    that is the part a change here could break. Asserting that the chunk still contains its own
+    text would be asserting the fixture; the claim that the reader is shown the whole line is
+    made where it can fail, against a passage that has been through storage and retrieval, by
+    ``test_the_promoted_passage_still_carries_the_description_it_was_trimmed_of``.
     """
     passage = chunk(DESCRIBED)
 
@@ -169,8 +172,8 @@ def test_the_whole_passage_survives_for_citation_after_the_expansion_is_trimmed(
 
     assert entry.expansion == "Network Operations Visibility Assistant"
     assert entry.chunk_id == passage.id
-    assert passage.text == DESCRIBED, "the chunk itself is untouched"
-    assert "a service used to correlate operational signals" in passage.text
+    assert entry.expansion in passage.text
+    assert entry.expansion != passage.text, "the entry is the term, not the line it came from"
 
 
 def test_a_stylized_spelling_is_displayed_and_a_normalised_key_is_stored() -> None:

@@ -69,10 +69,24 @@ async def test_the_real_embedder_buries_the_definition_and_the_glossary_recovers
     measurement this test does not perform, they did not reproduce when it was attempted, and a
     number nobody can re-derive is worse than no number.
 
-    The definition's own cosine to ``What is NOW?`` is 0.4655 — below the 0.54 noise floor —
+    The definition's own cosine to ``What is NOW?`` is **0.4368** — below the 0.54 noise floor —
     because it is one line of a twenty-five entry page. That is why the recovery comes from the
-    *lookup* rather than from the expanded embedding: the expansion alone ranks the glossary 8
-    of 61, which would not have reached a ten-passage context either.
+    *lookup* rather than from the expanded embedding.
+
+    This line read 0.4655 and that figure is **not** something the supplement moved: re-measuring
+    the 61-chunk corpus, with the glossary page byte-identical to what it has always been, also
+    produces 0.4368. The two were measured differently and the older method is not recorded. The
+    claim that rests on it is unaffected either way — both values sit below the noise floor, which
+    is the whole of what the sentence is for. ``docs/retrieval.md`` §14.1 and the historical table
+    in ``corpus.py`` still quote 0.4655 and are left alone: they describe how the fixture was
+    arrived at, not what it measures today.
+
+    A sentence claiming the expansion alone ranks the glossary "8 of 61, which would not have
+    reached a ten-passage context either" has been removed rather than updated. Asked through this
+    retriever, the bare expansion ranks the glossary page **1** — so either the claim is wrong or
+    it was measured dense-only, and nothing records which. It was load-bearing for nothing: the
+    recovery comes from the lookup, and ``test_switching_the_feature_off_restores_the_measured
+    _baseline`` is what actually holds that down.
     """
     embedder = await _embedder()
     chunks = await system.build_corpus(store)
