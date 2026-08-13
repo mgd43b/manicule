@@ -1016,6 +1016,29 @@ class ConnectorList(Payload):
     connectors: tuple[ConnectorSummary, ...] = ()
 
 
+class SidecarSkip(Payload):
+    """One page that produced no manifest, and why."""
+
+    path: str
+    reason: str
+
+
+class SidecarReport(Payload):
+    """What one sidecar-generation run did.
+
+    :attr:`skipped` carries every page that produced nothing, with its reason, rather than a
+    count. A run over a directory whose files all lack a metadata section would otherwise report
+    ``written: 0`` and look like a clean conversion of nothing — and the operator's next move
+    depends entirely on whether the answer is "wrong directory", "wrong exporter" or "already
+    done".
+    """
+
+    root: str
+    considered: int = Field(default=0, ge=0)
+    written: int = Field(default=0, ge=0)
+    skipped: tuple[SidecarSkip, ...] = ()
+
+
 class ConnectorSignedIn(Payload):
     """A browser session captured for a source, proved against it, and stored.
 

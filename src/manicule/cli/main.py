@@ -412,6 +412,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "doctor": r.Diagnosis,
     "connector_list": r.ConnectorList,
     "connector_login": r.ConnectorSignedIn,
+    "connector_sidecar": r.SidecarReport,
     "connector_sync": r.IngestReport,
     "config_get": r.ConfigValue,
     "config_set": r.ConfigChange,
@@ -836,6 +837,20 @@ def connector_sync(
 ) -> None:
     """Run one configured connector."""
     emit("connector_sync", lambda service: service.connector_sync(name, limit=limit))
+
+
+@connector_app.command("sidecar")
+def connector_sidecar(
+    root: Annotated[Path, typer.Argument(help="Directory of enriched HTML pages.")],
+    force: Annotated[
+        bool, typer.Option("--force", help="Replace manifests that already exist.")
+    ] = False,
+) -> None:
+    """Record what enriched HTML pages say about themselves, for filesystem ingestion.
+
+    Writes `<page>.source.json` beside each page. The pages themselves are never modified.
+    """
+    emit("connector_sidecar", lambda service: service.connector_sidecar(root, force=force))
 
 
 @connector_app.command("login")

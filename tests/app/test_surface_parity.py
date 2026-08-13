@@ -125,6 +125,17 @@ def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:
     assert "collection_orphans" not in TOOL_NAMES
 
 
+def test_no_tool_writes_files_into_the_users_corpus() -> None:
+    """``connector_sidecar`` is command line only, by the same rule.
+
+    It is the one operation that writes to the corpus *directory* rather than to the index — a
+    manifest beside every page under a root the caller names. Everything else manicule does to a
+    corpus is read-only, so an unattended surface that could write into one is a new kind of
+    authority rather than a new operation, and it stays where a person is present.
+    """
+    assert "connector_sidecar" not in TOOL_NAMES
+
+
 def test_the_command_line_offers_exactly_twenty_commands() -> None:
     """Counted from the built command tree rather than from the source.
 

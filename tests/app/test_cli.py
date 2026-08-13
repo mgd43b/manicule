@@ -1689,3 +1689,56 @@ def test_the_colour_isolation_accounts_for_every_variable_rich_reads() -> None:
         f"went back to depending on the caller's shell twice already."
     )
     assert all(SIZE_AND_JUPYTER.values()), "a variable left alone without a reason is an oversight"
+
+
+# --- connector sidecar ---------------------------------------------------------------------------
+
+
+ENRICHED = """<!doctype html><html><head><title>Retry Runbook</title></head><body>
+<section data-source-metadata>
+<p><strong>Page ID:</strong> 1002</p>
+<p><strong>Source:</strong> <a href="https://docs.example.test/pages/1002">canonical page</a></p>
+</section><main data-document-representation="storage"><p>Retry with backoff.</p></main>
+</body></html>"""
+
+
+def test_connector_sidecar_runs_end_to_end_and_renders(
+    bound: ApplicationService, tmp_path: Path
+) -> None:
+    """The success path, exercised.
+
+    Every other test of this feature calls the module directly, and two registrations sit between
+    a working module and a working command — ``PAYLOADS`` and ``RENDERERS``. Both were missing on
+    the first attempt, and both raise ``KeyError`` only when the operation *succeeds*, which is
+    the path a unit test of the extractor never reaches.
+    """
+    del bound
+    (tmp_path / "1002.html").write_text(ENRICHED, encoding="utf-8")
+
+    result = run(["connector", "sidecar", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "1002.html.source.json").is_file()
+
+
+def test_connector_sidecar_names_a_skipped_page_relative_to_the_root(
+    bound: ApplicationService, tmp_path: Path
+) -> None:
+    """Absolute paths repeat the root on every row and push the reason off the table."""
+    del bound
+    (tmp_path / "plain.html").write_text("<html><body>hi</body></html>", encoding="utf-8")
+
+    result = run(["--json", "connector", "sidecar", str(tmp_path)])
+
+    payload = json.loads(result.output)["data"]
+    assert payload["skipped"][0]["path"] == "plain.html"
+
+
+def test_connector_sidecar_reports_a_missing_directory_as_a_failure(
+    bound: ApplicationService, tmp_path: Path
+) -> None:
+    del bound
+    result = run(["--json", "connector", "sidecar", str(tmp_path / "nowhere")])
+
+    assert result.exit_code != 0
+    assert json.loads(result.output)["ok"] is False
