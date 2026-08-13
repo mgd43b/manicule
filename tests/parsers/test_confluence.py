@@ -508,6 +508,53 @@ async def test_a_page_link_reads_as_its_title_and_an_external_link_as_its_words(
     assert "the published runbook" in joined
 
 
+async def test_a_link_keeps_its_target_beside_the_text_rather_than_inside_it() -> None:
+    """A title is what the sentence says; it is not an address.
+
+    Two spaces can hold pages with the same name, so a reader following a citation needs to know
+    which was meant — and a URL spliced into the prose is noise in the vector and nonsense read
+    aloud. The reference is kept as data next to the text that mentions it.
+    """
+    blocks = await _blocks(
+        '<p>See <ac:link><ri:page ri:content-title="Maintenance calendar" '
+        'ri:space-key="ENG"/></ac:link>, '
+        '<a href="https://example.test/runbooks/signing">the runbook</a> and '
+        '<ac:link><ri:attachment ri:filename="plan.pdf"/></ac:link>.</p>'
+    )
+
+    assert blocks[0].text == "See Maintenance calendar, the runbook and plan.pdf."
+    assert blocks[0].metadata["links"] == [
+        {"kind": "page", "title": "Maintenance calendar", "space": "ENG"},
+        {"kind": "external", "href": "https://example.test/runbooks/signing"},
+        {"kind": "attachment", "filename": "plan.pdf"},
+    ]
+
+
+async def test_a_mention_records_that_a_person_was_linked_and_nothing_more() -> None:
+    """Redaction that moves an identifier from text to metadata is not redaction.
+
+    The account id is absent from both, which is the only version of this claim worth making.
+    """
+    blocks = await _blocks(
+        f'<p>Asked by <ac:link><ri:user ri:account-id="{ACCOUNT_ID}"/></ac:link>.</p>'
+    )
+
+    assert blocks[0].metadata["links"] == [{"kind": "user"}]
+    assert ACCOUNT_ID not in str(blocks[0].metadata)
+    assert ACCOUNT_ID not in blocks[0].text
+
+
+async def test_a_link_inside_a_table_cell_is_recorded_too() -> None:
+    """The same plumbing, so a reference in a cell is not quietly a lesser reference."""
+    blocks = await _blocks(
+        "<table><tr><td>Owner</td>"
+        '<td><ac:link><ri:page ri:content-title="Platform team"/></ac:link></td></tr></table>'
+    )
+
+    assert blocks[0].kind is BlockKind.TABLE
+    assert blocks[0].metadata["links"] == [{"kind": "page", "title": "Platform team"}]
+
+
 async def test_a_link_body_wins_over_the_title_of_what_it_points_at() -> None:
     """The body is what the sentence reads as, so it is what the sentence keeps."""
     blocks = await _blocks(

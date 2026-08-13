@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from selectolax.lexbor import LexborHTMLParser, LexborNode
 
 from manicule.core.anchors import Anchor, HeadingAnchor, Unlocated
-from manicule.core.content import BlockKind, Metadata, ParsedBlock, RawDocument
+from manicule.core.content import BlockKind, JsonValue, Metadata, ParsedBlock, RawDocument
 from manicule.parsers.base import HeadingStack, ParserProfile, decode
 from manicule.parsers.config import CONFLUENCE_MEDIA_TYPES, ConfluenceConfig
 from manicule.parsers.web import recover_cdata
@@ -341,14 +341,16 @@ def _walk(node: LexborNode, config: ConfluenceConfig) -> Iterator[_Found]:
     Confluence's own block constructs, and that configuration elements never enter it at all.
     """
     pending: list[str] = []
+    refs: list[JsonValue] = []
     fragment: str | None = None
     for child in node.iter(include_text=True):
         tag = child.tag or ""
-        inline = _run_text(child, tag)
+        _record(child, refs)
+        inline = _run_text(child, tag, refs)
         if inline is not None:
             pending.append(inline)
             continue
-        yield from _flush(pending)
+        yield from _flush(pending, refs)
         if tag in _HEADING_LEVELS:
             heading = _heading(child, tag, fragment)
             fragment = None
@@ -367,10 +369,66 @@ def _walk(node: LexborNode, config: ConfluenceConfig) -> Iterator[_Found]:
                 yield found
         else:
             yield from _walk(child, config)
-    yield from _flush(pending)
+    yield from _flush(pending, refs)
 
 
-def _run_text(child: LexborNode, tag: str) -> str | None:
+def _record(node: LexborNode, refs: list[JsonValue] | None) -> None:
+    """Note the thing ``node`` points at, if it points at anything.
+
+    **The target, kept beside the text rather than inside it.** A page link reads as its title and
+    that is what the sentence should say, but a title is not an address: two spaces can hold pages
+    with the same name, and a reader following a citation needs to know which was meant. Recording
+    the reference structurally keeps the cross-reference graph without putting a URL in the middle
+    of a sentence, where it is noise in the vector and nonsense read aloud.
+
+    **An attachment is referenced and never fetched**, which is the whole of what this does for
+    one: parsing reaches no network, and attachment ingestion stays a separate feature that can be
+    added without changing this parser.
+
+    A user reference records only that a person was linked. The account id is deliberately absent
+    here as it is from the text — recording it in metadata rather than in text would move a
+    directory identifier from one part of the index to another and call it redaction.
+    """
+    if refs is None:
+        return
+    reference = _reference(node)
+    if reference is not None and reference not in refs:
+        refs.append(reference)
+
+
+_REFERENCE_ATTRIBUTES: Mapping[str, tuple[str, str, str]] = {
+    "a": ("external", "href", "href"),
+    "ri:page": ("page", "ri:content-title", "title"),
+    "ri:attachment": ("attachment", "ri:filename", "filename"),
+    "ri:url": ("external", "ri:value", "href"),
+}
+"""Element to (kind, the attribute holding the target, the field it is recorded under).
+
+A table rather than a chain of conditions, so adding a resource type is one row and the shape of
+every reference stays visibly the same. ``ri:user`` is absent on purpose: its identifying attribute
+is the one thing that must never be recorded, so it cannot be expressed as "copy this attribute"."""
+
+
+def _reference(node: LexborNode) -> Metadata | None:
+    """One link target, as data. ``None`` for anything that is not a reference."""
+    tag = node.tag or ""
+    if tag == "ri:user":
+        return {"kind": "user"}
+    entry = _REFERENCE_ATTRIBUTES.get(tag)
+    if entry is None:
+        return None
+    kind, attribute, field = entry
+    value = _collapse(node.attributes.get(attribute) or "")
+    if not value:
+        return None
+    reference: Metadata = {"kind": kind, field: value}
+    space = _collapse(node.attributes.get("ri:space-key") or "") if tag == "ri:page" else ""
+    if space:
+        reference["space"] = space
+    return reference
+
+
+def _run_text(child: LexborNode, tag: str, refs: list[JsonValue] | None = None) -> str | None:
     """What ``child`` adds to the run of text around it, or ``None`` if it starts a block.
 
     ``""`` and ``None`` mean different things and the difference is the parameter rule: a
@@ -386,18 +444,22 @@ def _run_text(child: LexborNode, tag: str) -> str | None:
         # so the rule holds however malformed the document is.
         return ""
     if tag == LINK:
-        return _link_text(child)
+        return _link_text(child, refs)
     if tag in _INLINE_TAGS:
-        return _inline_text(child)
+        return _inline_text(child, refs)
     return None
 
 
-def _flush(pending: list[str]) -> Iterator[_Found]:
+def _flush(pending: list[str], refs: list[JsonValue] | None = None) -> Iterator[_Found]:
     """Emit the loose inline run collected so far, if it holds anything, and clear it."""
     text = _collapse("".join(pending))
+    collected = list(refs) if refs else []
     pending.clear()
+    if refs is not None:
+        refs.clear()
     if text:
-        yield _Found(kind=BlockKind.PROSE, text=text)
+        metadata: Metadata = {"links": collected} if collected else {}
+        yield _Found(kind=BlockKind.PROSE, text=text, metadata=metadata)
 
 
 def _heading(node: LexborNode, tag: str, pending_fragment: str | None) -> _Found:
@@ -413,13 +475,14 @@ def _atomic(node: LexborNode, tag: str, config: ConfluenceConfig) -> _Found | No
     """One element that is a block on its own, or ``None`` when it carries nothing to index."""
     metadata: Metadata = {}
     lang: str | None = None
+    refs: list[JsonValue] = []
     if tag == "table":
-        text = _table_text(node)
+        text = _table_text(node, refs)
         metadata = {"header_rows": _header_rows(node)}
     elif tag == TASK_LIST:
         text, metadata = _task_list(node)
     elif tag in {"ul", "ol", "dl"}:
-        text = "\n".join(_list_lines(node, 0))
+        text = "\n".join(_list_lines(node, 0, refs))
     elif tag == "pre":
         # Not collapsed: indentation is part of what the code says.
         text = node.text(deep=True).strip("\n")
@@ -428,6 +491,8 @@ def _atomic(node: LexborNode, tag: str, config: ConfluenceConfig) -> _Found | No
         text, metadata = _image(node)
     if not text.strip():
         return None
+    if refs:
+        metadata = {**metadata, "links": refs}
     kind = _ATOMIC_KINDS[tag]
     return _Found(kind=kind, text=text, lang=lang, metadata=metadata)
 
@@ -761,18 +826,19 @@ def _task_list(node: LexborNode) -> tuple[str, Metadata]:
     return "\n".join(lines), {"tasks": len(lines), "complete": complete}
 
 
-def _inline_text(node: LexborNode) -> str:
+def _inline_text(node: LexborNode, refs: list[JsonValue] | None = None) -> str:
     """The text of an element's inline content, with Confluence's vocabulary understood.
 
     The single place the parameter rule is enforced for nested content: everything that flattens
     an element to a string goes through here rather than through ``text(deep=True)``, so a macro
     inside a table cell, a list item or a heading cannot leak its configuration into the text.
     """
-    return _collapse("".join(_inline_parts(node)))
+    return _collapse("".join(_inline_parts(node, refs)))
 
 
-def _inline_parts(node: LexborNode) -> Iterator[str]:
+def _inline_parts(node: LexborNode, refs: list[JsonValue] | None = None) -> Iterator[str]:
     for child in node.iter(include_text=True):
+        _record(child, refs)
         if child.is_text_node:
             yield child.text_content or ""
             continue
@@ -782,7 +848,7 @@ def _inline_parts(node: LexborNode) -> Iterator[str]:
         if tag in _CONFIGURATION_ONLY:
             continue
         if tag == LINK:
-            yield _link_text(child)
+            yield _link_text(child, refs)
         elif tag == IMAGE:
             yield _image(child)[0]
         elif tag == MACRO:
@@ -790,7 +856,7 @@ def _inline_parts(node: LexborNode) -> Iterator[str]:
         elif tag.startswith("ri:"):
             yield _resource_text(child)
         else:
-            yield from _inline_parts(child)
+            yield from _inline_parts(child, refs)
 
 
 def _inline_macro_text(node: LexborNode) -> str:
@@ -817,7 +883,7 @@ def _plain_or_rich(node: LexborNode) -> str:
     return ""
 
 
-def _link_text(node: LexborNode) -> str:
+def _link_text(node: LexborNode, refs: list[JsonValue] | None = None) -> str:
     """What an ``ac:link`` contributes: what a reader would see, never an identifier.
 
     The body the author wrote wins, because it is what the sentence reads as. Failing that the
@@ -825,6 +891,7 @@ def _link_text(node: LexborNode) -> str:
     by a display reference.
     """
     for child in _descendants(node, frozenset({LINK})):
+        _record(child, refs)
         if child.tag in {LINK_BODY, PLAIN_TEXT_LINK_BODY}:
             body = _inline_text(child)
             if body:
@@ -884,7 +951,7 @@ def _image(node: LexborNode) -> tuple[str, Metadata]:
 # --- tables and lists, macro-aware -----------------------------------------------------------
 
 
-def _table_text(node: LexborNode) -> str:
+def _table_text(node: LexborNode, refs: list[JsonValue] | None = None) -> str:
     """A table rendered one row per line, cells separated by pipes.
 
     Cells are flattened through :func:`_inline_text` rather than ``text(deep=True)``, which is the
@@ -892,7 +959,7 @@ def _table_text(node: LexborNode) -> str:
     """
     rows: list[str] = []
     for row in node.css("tr"):
-        cells = [_inline_text(cell) for cell in row.css("th, td")]
+        cells = [_inline_text(cell, refs) for cell in row.css("th, td")]
         if any(cells):
             rows.append(" | ".join(cells))
     return "\n".join(rows)
@@ -907,7 +974,7 @@ def _header_rows(node: LexborNode) -> int:
     return 1 if rows and rows[0].css("th") else 0
 
 
-def _list_lines(node: LexborNode, depth: int) -> Iterator[str]:
+def _list_lines(node: LexborNode, depth: int, refs: list[JsonValue] | None = None) -> Iterator[str]:
     """A list rendered with its nesting preserved as indentation."""
     marker = "1." if node.tag == "ol" else "-"
     for item in node.iter():
@@ -917,7 +984,7 @@ def _list_lines(node: LexborNode, depth: int) -> Iterator[str]:
             "".join(
                 part.text_content or ""
                 if part.is_text_node
-                else ("" if part.tag in {"ul", "ol"} else _inline_text(part))
+                else ("" if part.tag in {"ul", "ol"} else _inline_text(part, refs))
                 for part in item.iter(include_text=True)
             )
         )
@@ -925,7 +992,7 @@ def _list_lines(node: LexborNode, depth: int) -> Iterator[str]:
             yield f"{_INDENT * depth}{marker} {own}"
         for nested in item.iter():
             if nested.tag in {"ul", "ol"}:
-                yield from _list_lines(nested, depth + 1)
+                yield from _list_lines(nested, depth + 1, refs)
 
 
 def _code_language(node: LexborNode) -> str | None:
