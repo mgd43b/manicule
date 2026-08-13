@@ -560,6 +560,59 @@ class DocumentReindexed(Payload):
     detail: str = ""
 
 
+class EmbeddingCost(Payload):
+    """What an operation cost at the embedder, in facts that are not each other.
+
+    Reported separately from the chunk counts beside it because the two are routinely
+    confused, and the confusion is expensive in exactly one direction: a chunk keeping its
+    content-derived id is not a vector surviving, and a vector surviving is not a forward pass
+    avoided. What an accelerator spends its time on is ``forward_calls``, and nothing above it
+    in a sweep report is a measurement of that.
+    """
+
+    reused: int = Field(default=0, ge=0)
+    """Vectors taken from the store without a model call, because the embedding input matched."""
+
+    embedded: int = Field(default=0, ge=0)
+    """Chunks handed to the embedder."""
+
+    input_changed: int = Field(default=0, ge=0)
+    """Of ``embedded``, those whose embedding input was new or had changed.
+
+    Includes a chunk whose ``text`` did not move — and which therefore kept its id and its
+    citations — while the heading breadcrumb in its ``embed_text`` did.
+    """
+
+    repaired: int = Field(default=0, ge=0)
+    """Of ``embedded``, those whose input was unchanged and whose stored vector was unusable.
+
+    Missing, of the wrong dimension, or described by metadata that contradicts the chunk beside
+    it. Found by reading the row rather than by trusting what it claims.
+    """
+
+    forward_calls: int = Field(default=0, ge=0)
+    """Batches the embedder was asked for. The number an accelerator's time is proportional to."""
+
+    vectors_new: int = Field(default=0, ge=0)
+    """Of ``embedded``, those the store held no row for.
+
+    Not every row the operation wrote: a reused vector re-filed under a new chunk id also lands
+    in a row that did not exist, and is counted under ``reused``. This pair says where the
+    *embedder's* output went.
+    """
+
+    vectors_replaced: int = Field(default=0, ge=0)
+    """Of ``embedded``, those that overwrote a row the store already had."""
+
+    vectors_backfilled: int = Field(default=0, ge=0)
+    """Reused rows that carried no recorded embedding-input identity and had one reconstructed.
+
+    The one-time migration of a ``vectors/`` directory that predates the identity column,
+    counted as it happens. It costs no forward pass, and it reaches zero once every row a sweep
+    touches has been written since.
+    """
+
+
 class StaleReparseReport(Payload):
     """What a corpus-wide re-parse of stale documents did.
 
@@ -597,20 +650,25 @@ class StaleReparseReport(Payload):
     chunks_new: int = Field(default=0, ge=0)
     """Chunks produced that were not already stored, and so new rows in the vector store.
 
-    Not the sweep's embedding cost. Every chunk of every re-parsed document goes to the model,
-    kept ones included, and a corpus of distinct chunks gives the embedding cache no repeats to
-    absorb — ``docs/ingest.md`` §10.1 prices it.
+    Not the sweep's embedding cost either, and the two are no longer even close: a chunk reaches
+    the model only when its *embedding input* is new, changed or has no readable vector, which
+    is a different set from the chunks that are new. ``embedding`` is the cost, and
+    ``docs/ingest.md`` §10.1 prices both.
     """
 
     chunks_kept: int = Field(default=0, ge=0)
     """Chunks that survived with their id, and so with the vector row already stored.
 
     Chunk ids are content-derived, so a chunk the re-parse did not move keeps its id, keeps the
-    row every citation to it resolves through, and keeps that citation working. The row's
-    *contents* are written again — what is embedded is ``embed_text``, which carries the
-    heading breadcrumb, so a chunk whose id held still can nevertheless have had its vector
-    move.
+    row every citation to it resolves through, and keeps that citation working. **That is all
+    this says.** It is a count of vector *rows* kept, not of vectors kept, and not of embedding
+    work avoided — a chunk in here whose heading breadcrumb moved has the id it always had, the
+    row it always had, and a vector inside it that can no longer be used. ``embedding`` is what
+    was avoided, measured at the model.
     """
+
+    embedding: EmbeddingCost = Field(default_factory=EmbeddingCost)
+    """What the sweep cost at the embedder, summed over the documents it rebuilt."""
 
     unrepairable: int = Field(default=0, ge=0)
     """Documents that cannot be re-parsed, because there are no retained bytes to read."""

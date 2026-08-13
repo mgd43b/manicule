@@ -802,6 +802,39 @@ The Lance table holds the minimum needed to find a chunk and to filter before fi
 | `lang` | `string` | pushdown filter |
 | `position` | `int64` | pushdown filter |
 | `chunk_json` | `string` | the chunk itself — see below |
+| `embed_identity` | `string` | what this vector is an embedding *of* — see below |
+
+**`embed_identity` is what makes a re-parse cost less than a re-embed.** It is a digest over
+the exact string handed to the model, the **document** it belongs to, the embed fingerprint,
+and any middleware declaring `mutates_embedded_text` (`core/embedding.py`). It lives here, in
+the row with the vector it describes, rather than in SQLite — a `chunks` column asserting that a vector exists in another
+store is precisely the claim that must never be taken on trust, and a row that carries its own
+identity cannot outlive the vector it is about.
+
+**The document is in the digest for the reason `workspace_id` is in `document_id` (§3.2).** A
+stored vector is found by looking its identity up in this table, and this table has no
+`workspace_id` column — deliberately, see below. A lookup keyed on the embedding input alone
+would therefore be the one vector read that no filter scopes, and it would stay that way in
+silence, because a query matching too much looks exactly like a query matching correctly. A
+document id is derived from its workspace, so folding it in makes a cross-tenant match
+impossible to express rather than merely unlikely to be written. The cost is reuse *between*
+two documents, which is worth almost nothing: `embed_text` carries the document's own title in
+its breadcrumb, so two documents rarely produce the same embedding input at all.
+
+Three things must all hold before a stored vector is reused: the same fingerprint, the same
+embedding input **for that document**, and a **readable** vector for that identity. The last is checked by reading the
+row, because the first two are metadata and metadata can be wrong. The identity recorded in the
+row is also cross-checked against one derived from the `chunk_json` beside it; a row that says
+two different things about what it embedded is rebuilt rather than believed.
+
+**Migration is one `add_columns` and no re-embedding.** An existing table gains the column in
+`ensure_ready`, filled with the empty string, and every row then reads as *identity not
+recorded*. Such a row is reconstructed rather than distrusted: `upsert` wrote its `chunk_json`
+from the same object, in the same call, as the vector beside it, so `chunk_json.embed_text` is
+the exact prior embedding input rather than a guess at one. An existing corpus therefore keeps
+every vector it has, the reconstruction is reported as `embedding.vectors_backfilled`
+([`ingest.md`](ingest.md) §10.1), and the first write of each row records its identity for good.
+Backup, restore and export are unaffected: the column travels with the table like every other.
 
 **`chunk_json` is a departure from the original design, forced by the protocol.** An earlier
 draft of this section said the Lance row holds no text: a search would return `(id, distance)`
@@ -1716,6 +1749,7 @@ one.
 | Column renames to match `docs/contracts.md` §2: `source_type`→`source`, `source_path`→`uri`, `file_type`→`media_type`, `source_version`→`version_token`, `parser_used`→`parser` | §4.2 |
 | FTS5 is external-content over `chunks` and trigger-maintained | §6.1 |
 | The vector row carries the chunk as `chunk_json`, because the protocol requires a self-sufficient store | §6.2 |
+| The vector row carries its own `embed_identity`, so nothing outside it asserts that it is current | §6.2 |
 | The lexical query is one joined statement so `LIMIT` applies after filtering | §6.1 |
 | The sweep collects soft-deleted documents after a grace period, trading free restore against vector top-`k` dilution | §8.2 |
 | Two FTS columns with BM25 weights `1.0 / 0.4` | §6.1 |

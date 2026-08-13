@@ -18,6 +18,7 @@ made.
 
 from __future__ import annotations
 
+import random
 from typing import TYPE_CHECKING
 
 import lancedb
@@ -25,11 +26,13 @@ import pytest
 
 from manicule.core.anchors import HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, Chunk
-from manicule.core.embedding import EmbedFingerprint, Pooling
+from manicule.core.embedding import EmbedFingerprint, Pooling, VectorState
 from manicule.core.errors import FingerprintMismatchError
+from manicule.core.protocols import VectorStore
 from manicule.core.retrieval import Filter
 from manicule.storage.vectors import (
     EXEMPT_FILTER_FIELDS,
+    IDENTITY_COLUMN,
     META_TABLE,
     LanceVectorStore,
     VectorStoreStateError,
@@ -39,15 +42,16 @@ from manicule.storage.vectors import (
     unit,
 )
 from manicule.testing import (
+    assert_protocol_signatures,
     assert_vector_store_is_dimension_agnostic,
     assert_vector_store_rejects_foreign_vectors,
+    assert_vector_store_reuses_by_embedding_input,
 )
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from manicule.core.embedding import Vector
-    from manicule.core.protocols import VectorStore
 
 
 SCOPE = frozenset({"default"})
@@ -113,6 +117,26 @@ def spread(dimension: int, index: int) -> list[float]:
 
 
 # --- conformance -------------------------------------------------------------------------
+
+
+@pytest.mark.contract
+async def test_the_store_satisfies_the_vector_store_protocol(store: LanceVectorStore) -> None:
+    """Structural conformance for the backend that ships, which nothing checked until now.
+
+    ``MemoryVectorStore`` has been signature-checked against ``VectorStore`` since the protocol
+    existed and ``LanceVectorStore`` never has — so the one implementation an installation
+    actually runs was the one nothing held to the protocol's shape.
+    ``SqliteDocStore`` has had this test all along; its opposite number did not.
+
+    Both halves are needed, and the second is the one that bites. ``isinstance`` checks the
+    attributes exist; ``@runtime_checkable`` deliberately checks nothing about what they
+    accept, so a store whose ``stored_vectors`` took ``chunk_ids`` where the protocol says
+    ``chunks`` would pass every ``isinstance`` in the codebase and fail at the first keyword
+    call — which, for a method reached once per document, is somewhere in the middle of a
+    corpus sweep.
+    """
+    assert isinstance(store, VectorStore)
+    assert_protocol_signatures(store, VectorStore)
 
 
 @pytest.mark.contract
@@ -627,3 +651,180 @@ async def test_a_chunk_without_a_location_round_trips_as_unlocated(
     found = await store.search(spread(4, 0), k=1)
 
     assert found[0].chunk.anchor == unplaced.anchor
+
+
+# --- embedding-input identity ------------------------------------------------------------
+
+
+@pytest.mark.contract
+async def test_the_store_answers_reuse_on_the_embedding_input(tmp_path: Path) -> None:
+    """The reuse contract, against the backend that ships rather than against a double.
+
+    A store answering on chunk id alone passes every other check in this file: its writes
+    succeed, its searches return, and its answers are drawn from the right space. What it gets
+    wrong is a chunk whose ``embed_text`` moved while its ``text`` did not — silently, for as
+    long as the corpus lives.
+    """
+    made: list[LanceVectorStore] = []
+
+    def make_store() -> VectorStore:
+        store = LanceVectorStore(tmp_path / f"vectors-{len(made)}")
+        made.append(store)
+        return store
+
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
+    await assert_vector_store_reuses_by_embedding_input(make_store, chunks)
+
+
+async def test_a_reused_vector_is_the_stored_vector_to_the_last_bit(
+    store: LanceVectorStore,
+) -> None:
+    """Reading a row back and writing it again leaves the row exactly as it was.
+
+    The claim "an unchanged chunk's vector was not recomputed" is only checkable if this is
+    exactly true, and it is not free: a stored ``float32`` vector reads back with a length a
+    few parts in 10^8 from one, and re-normalising it perturbs the odd row by an ulp.
+    :data:`~manicule.storage.vectors.FLOAT32_EPSILON` is what stops that.
+
+    **A fixed seed and 256 rows**, because the guard must fail deterministically when it is
+    removed and the defect it catches is rare. This exact fixture holds four rows that drift
+    without it — measured against real Lance by removing the guard and counting. Two earlier
+    fixtures, one of 200 rows built from tidy arithmetic and one of 64 from this seed, both
+    passed with the guard gone and would have certified nothing.
+    """
+    await store.ensure_ready(fingerprint(8))
+    rng = random.Random(0)  # noqa: S311 - a fixture, seeded so the guard fails deterministically
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(256)]
+    # Deliberately neither one-hot nor normalised, so the store does the scaling and the round
+    # trip has something to lose.
+    vectors: list[Vector] = [[rng.uniform(-1.0, 1.0) for _ in range(8)] for _ in chunks]
+    await store.upsert(chunks, vectors)
+
+    first = await store.stored_vectors(chunks)
+    assert all(verdict.state is VectorState.READABLE for verdict in first.values())
+    await store.upsert(chunks, [first[chunk_.id].vector for chunk_ in chunks])
+    again = await store.stored_vectors(chunks)
+
+    assert {key: verdict.vector for key, verdict in again.items()} == {
+        key: verdict.vector for key, verdict in first.items()
+    }, "a row written back with the vector it already held is the row it already was"
+
+
+async def test_a_table_written_before_the_identity_column_keeps_every_vector_it_has(
+    tmp_path: Path,
+) -> None:
+    """The migration of an existing ``vectors/`` directory, against real Lance.
+
+    The column is added in ``ensure_ready`` and every existing row reads as unrecorded. The
+    conservative reading of an unrecorded identity — distrust it — would re-embed a whole
+    corpus to learn what each row already says; the embedding input is instead reconstructed
+    from the chunk the row was written with, which is what makes the upgrade free.
+    """
+    directory = tmp_path / "vectors"
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
+    vectors: list[Vector] = [spread(4, index) for index in range(3)]
+
+    legacy = LanceVectorStore(directory)
+    await legacy.ensure_ready(fingerprint())
+    await legacy.upsert(chunks, vectors)
+    await legacy.teardown()
+    await _drop_identity_column(directory, fingerprint())
+
+    reopened = LanceVectorStore(directory)
+    verdicts = await reopened.stored_vectors(chunks)
+    assert all(verdict.state is VectorState.READABLE for verdict in verdicts.values()), (
+        "every row from before the column is still this chunk's vector, and reconstructing "
+        "that from the chunk beside it costs no forward pass"
+    )
+    assert not any(verdict.identity_recorded for verdict in verdicts.values()), (
+        "and each is reported as reconstructed, so the one-time backfill is a number rather "
+        "than something that happened quietly"
+    )
+
+    await reopened.ensure_ready(fingerprint())
+    await reopened.upsert(chunks, [verdicts[chunk_.id].vector for chunk_ in chunks])
+    settled = await reopened.stored_vectors(chunks)
+    assert all(verdict.identity_recorded for verdict in settled.values()), (
+        "writing the rows records their identities, so the backfill happens once"
+    )
+
+
+async def test_a_chunk_refiled_under_a_new_id_still_finds_its_vector(
+    store: LanceVectorStore,
+) -> None:
+    """A chunk id carries its position, so an insertion renames everything below it.
+
+    Nothing here changes an embedding input. Without the identity-keyed lookup, inserting one
+    paragraph at the top of a document would re-embed every chunk under it — the same waste
+    this path exists to remove, arriving through the other door.
+    """
+    await store.ensure_ready(fingerprint())
+    original = chunk("chunk-a", position=0)
+    await store.upsert([original], [spread(4, 1)])
+
+    shifted = original.model_copy(update={"id": "chunk-a-moved", "position": 5})
+    verdicts = await store.stored_vectors([shifted])
+
+    assert verdicts[shifted.id].state is VectorState.READABLE
+    assert list(verdicts[shifted.id].vector) == spread(4, 1)
+
+
+async def test_a_row_whose_metadata_contradicts_the_chunk_beside_it_is_repaired(
+    tmp_path: Path,
+) -> None:
+    """Identity metadata claiming a vector exists is not the same as a usable vector existing.
+
+    Reached by writing the row through lancedb directly, because nothing in manicule can
+    produce it — which is the point: what this guards against is a half-written directory, a
+    restored backup, or an edited table, none of which asks permission. Two rows, one damaged
+    each way, and the undamaged row beside them stays readable so the check cannot pass by
+    condemning everything.
+
+    **A row of the wrong dimension is deliberately not a case here.** The vector column is
+    ``fixed_size_list<float32, dimension>``, so Lance cannot hold one; the classification
+    exists for a backend whose column is not fixed-width, and
+    :func:`~manicule.core.embedding.classify_stored_vector` is where it is tested.
+    """
+    directory = tmp_path / "vectors"
+    store = LanceVectorStore(directory)
+    await store.ensure_ready(fingerprint())
+    intact, lying, unreadable = (chunk(f"chunk-{name}") for name in ("a", "b", "c"))
+    await store.upsert([intact, lying, unreadable], [spread(4, index) for index in range(3)])
+    await store.teardown()
+
+    # `lying` keeps the identity that says it embeds its own current text, beside a chunk that
+    # says it embeds something else. `unreadable` keeps everything except a decodable chunk.
+    await _rewrite_chunk_json(directory, lying.id, lying.model_copy(update={"embed_text": "?"}))
+    await _rewrite_chunk_json(directory, unreadable.id, None)
+
+    reopened = LanceVectorStore(directory)
+    verdicts = await reopened.stored_vectors([intact, lying, unreadable])
+
+    assert verdicts[intact.id].state is VectorState.READABLE
+    assert verdicts[lying.id].state is VectorState.CORRUPT, (
+        "a row that says two different things about what it embedded is not evidence that a "
+        "vector is current, and it is the one thing it must not be taken as"
+    )
+    assert verdicts[unreadable.id].state is VectorState.CORRUPT
+    assert verdicts[lying.id].vector == ()
+    assert verdicts[unreadable.id].vector == ()
+
+
+async def _rewrite_chunk_json(directory: Path, chunk_id: str, replacement: Chunk | None) -> None:
+    """Overwrite one row's chunk column, leaving its vector and identity alone.
+
+    ``None`` writes something that is not a chunk at all.
+    """
+    connection = await lancedb.connect_async(directory)
+    table = await connection.open_table(table_name(fingerprint()))
+    encoded = "not json at all" if replacement is None else replacement.model_dump_json()
+    await table.update(where=f"id = {quote(chunk_id)}", updates={"chunk_json": encoded})
+    connection.close()
+
+
+async def _drop_identity_column(directory: Path, embed: EmbedFingerprint) -> None:
+    """Make a table look like one written before the identity column existed."""
+    connection = await lancedb.connect_async(directory)
+    table = await connection.open_table(table_name(embed))
+    await table.drop_columns([IDENTITY_COLUMN])
+    connection.close()

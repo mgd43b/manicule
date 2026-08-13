@@ -341,6 +341,21 @@ def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
         # nothing for a concurrent sync to overtake and a zero here would be a fact about
         # arithmetic rather than about the corpus.
         table.add_row("superseded by a newer sync", str(payload.superseded))
+        # Under its own heading rather than beside the chunk counts, because the two answer
+        # different questions and the row above used to be read as an answer to this one.
+        # Whether the vector inside a kept row survived is the block below, not this line.
+        cost = payload.embedding
+        table.add_row("", "")
+        table.add_row("embedding", "")
+        table.add_row("  vectors reused", str(cost.reused))
+        table.add_row("  chunks embedded", str(cost.embedded))
+        table.add_row("    input new or changed", str(cost.input_changed))
+        table.add_row("    vector missing or corrupt", str(cost.repaired))
+        table.add_row("    into a new row", str(cost.vectors_new))
+        table.add_row("    over an existing row", str(cost.vectors_replaced))
+        table.add_row("  forward calls", str(cost.forward_calls))
+        if cost.vectors_backfilled:
+            table.add_row("  identities backfilled", str(cost.vectors_backfilled))
     table.add_row("unrepairable", str(payload.unrepairable))
     table.add_row("failed", str(payload.failed))
     out.print(table)

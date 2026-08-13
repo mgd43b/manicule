@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -53,7 +53,7 @@ from manicule.core.errors import (
 )
 from manicule.core.ids import content_hash, document_id
 from manicule.core.provenance import Provenance
-from manicule.ingest.embedding import embed_chunks
+from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.ports import GlossaryWriter
@@ -220,6 +220,15 @@ class DocumentOutcome:
 
     members: tuple[str, ...] = ()
     """Source ids of documents found inside this one, queued rather than recursed into."""
+
+    embedding: EmbeddingWork = field(default_factory=EmbeddingWork)
+    """What the embed stage cost: what was reused, what was embedded, and how many batches.
+
+    Zero everywhere for a document change detection skipped, because a document that was not
+    re-indexed did not reach the embedder — which is a different statement from a document
+    whose vectors were all reusable, and the reason this is a whole record rather than a
+    number.
+    """
 
 
 @dataclass
@@ -869,14 +878,22 @@ class IngestPipeline:
             if not chunks:
                 return await self._nothing_to_index(result, document, raw=raw)
             await self._advance(existing, DocumentStatus.EMBEDDING)
-            async with self._embedding:
-                vectors = await embed_chunks(
-                    self._embedder,
-                    chunks,
-                    chunk_fingerprint=self._chunk_fingerprint,
-                    target_batch_tokens=self._target_batch_tokens,
-                    maximum=self._max_embed_batch,
-                )
+            # The lock goes to `embed_or_reuse`, which holds it around the model call and
+            # nothing else. Both reads here — this one and the vector store's — are about what
+            # the index already holds, and taking the one lock every embedder in the process
+            # shares while they run would serialise a sweep against a concurrent sync on work
+            # neither of them needs the model for.
+            previous = await self._previous_inputs(document, existing)
+            vectors, work = await embed_or_reuse(
+                self._embedder,
+                chunks,
+                vectors=self._vectors,
+                chunk_fingerprint=self._chunk_fingerprint,
+                previous=previous,
+                target_batch_tokens=self._target_batch_tokens,
+                maximum=self._max_embed_batch,
+                lock=self._embedding,
+            )
         except _StageError as failure:
             return await self._demote(document, existing, failure.stage, failure.detail)
         except ContextOverflowError as exc:
@@ -886,9 +903,32 @@ class IngestPipeline:
                 document, existing, PipelineStage.EMBED, f"{type(exc).__name__}: {exc}"
             )
 
-        return await self._commit(
+        # The embed stage's accounting is attached to what the commit returns rather than
+        # passed into it. What it cost to produce these vectors is not one of the things the
+        # commit has to get right, and threading it through would put another argument in the
+        # one function whose ordering is the crash contract — which now also carries
+        # `expected`, and has earned the right to be left alone.
+        outcome = await self._commit(
             document, chunks, vectors, raw=raw, existing=existing, expected=expected
         )
+        return replace(outcome, embedding=work)
+
+    async def _previous_inputs(
+        self, document: Document, existing: Document | None
+    ) -> dict[str, str]:
+        """What the index already recorded as each stored chunk's embedding input.
+
+        Only used to tell two chunks apart that both have no vector row: one that never had
+        one, and one whose row went missing while its embedding input did not change. Both are
+        embedded; this decides which the report calls a repair.
+
+        Skipped entirely for a document being ingested for the first time, where there is
+        nothing stored and the query would be a round trip to learn that.
+        """
+        if existing is None:
+            return {}
+        stored = await self._store.document_chunks(document.id)
+        return {chunk.id: chunk.embed_text for chunk in stored}
 
     async def _prepare(self, result: ChainResult, document: Document) -> list[Chunk]:
         """Blocks through ``after_parse``, into chunks, through ``after_chunk``.

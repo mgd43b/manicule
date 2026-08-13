@@ -19,6 +19,7 @@ from manicule.testing.contracts import (
     assert_trash_store_contract,
     assert_vector_store_is_dimension_agnostic,
     assert_vector_store_rejects_foreign_vectors,
+    assert_vector_store_reuses_by_embedding_input,
     assert_version_store_contract,
     closing,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "assert_trash_store_contract",
     "assert_vector_store_is_dimension_agnostic",
     "assert_vector_store_rejects_foreign_vectors",
+    "assert_vector_store_reuses_by_embedding_input",
     "assert_version_store_contract",
     "closing",
     "contains_claimed_text",

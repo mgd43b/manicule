@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, override
 
+from manicule.core.embedding import StoredVector, VectorState
 from manicule.core.retrieval import Candidate, Filter, Query
 from manicule.retrieval.profile import Profiles
 
@@ -48,14 +49,22 @@ class ListVectorStore:
         self.requested: list[int] = []
         self.filters: list[Filter | None] = []
 
-    async def ensure_ready(self, fingerprint: object) -> None:
-        del fingerprint
+    async def ensure_ready(
+        self, fingerprint: object, *, embed_text_middleware: Sequence[str] = ()
+    ) -> None:
+        del fingerprint, embed_text_middleware
 
     async def fingerprint(self) -> None:
         return None
 
     async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
         del chunks, vectors
+
+    async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
+        # A store that never writes holds nothing to reuse. Answered rather than omitted,
+        # because the protocol's answer is total: an entry per chunk, so the caller is never
+        # left deciding what a missing key meant.
+        return {chunk.id: StoredVector(state=VectorState.ABSENT) for chunk in chunks}
 
     async def search(
         self,

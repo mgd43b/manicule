@@ -23,17 +23,20 @@ exists to keep it fed.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from manicule.core.embedding import require_within_context
+from manicule.core.embedding import VectorState, require_within_context
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Mapping, Sequence
+    from contextlib import AbstractAsyncContextManager
 
     from manicule.core.content import Chunk
     from manicule.core.embedding import Vector
     from manicule.core.fingerprints import ChunkFingerprint
-    from manicule.core.protocols import Embedder
+    from manicule.core.protocols import Embedder, VectorStore
 
 MAX_BATCH = 64
 """Upper clamp on a derived batch size, so a tiny budget cannot ask for a huge batch."""
@@ -60,6 +63,7 @@ async def embed_chunks(
     chunk_fingerprint: ChunkFingerprint | None = None,
     target_batch_tokens: int = 16_384,
     maximum: int = MAX_BATCH,
+    on_batch: Callable[[Sequence[Chunk]], None] | None = None,
 ) -> list[Vector]:
     """Embed ``chunks`` in order, refusing any the model would truncate.
 
@@ -73,6 +77,10 @@ async def embed_chunks(
             a measurement of anything relevant to this model's limit.
         target_batch_tokens: Tokens per batch, from which the batch size is derived.
         maximum: Clamp on the derived size.
+        on_batch: Called with each batch immediately before the model sees it. This is the
+            only place in the process that knows how many forward passes an operation cost,
+            and a count derived afterwards from ``len(chunks) // size`` would be a restatement
+            of the arithmetic above rather than a measurement of what happened.
 
     Returns:
         One vector per chunk, in the order the chunks were given.
@@ -96,6 +104,8 @@ async def embed_chunks(
     vectors: list[Vector] = []
     for start in range(0, len(chunks), size):
         batch = chunks[start : start + size]
+        if on_batch is not None:
+            on_batch(batch)
         produced = await embedder.embed([chunk.embed_text for chunk in batch])
         if len(produced) != len(batch):
             msg = (
@@ -109,4 +119,204 @@ async def embed_chunks(
     return vectors
 
 
-__all__ = ["MAX_BATCH", "batch_size", "embed_chunks"]
+@dataclass(frozen=True)
+class EmbeddingWork:
+    """What one call to :func:`embed_or_reuse` cost, in the terms that are not each other.
+
+    Every field here exists because collapsing it into another one produces a report that
+    claims something it did not check. A chunk keeping its id is not a vector surviving; a
+    vector surviving is not a forward pass avoided; a forward pass avoided by this partition
+    is not one absorbed by the embedder's in-memory cache. Those are four different facts and
+    an operator pricing a corpus-wide re-parse needs them apart.
+
+    Two invariants hold of **what :func:`embed_or_reuse` returns**, and
+    ``test_the_partition_adds_up_however_the_work_falls`` asserts them rather than trusting
+    them:
+
+    - ``reused + embedded == chunks``
+    - ``input_changed + repaired == embedded == vectors_new + vectors_replaced``
+
+    They are scoped to that function on purpose. A caller may build one of these by hand from
+    what it knows — :func:`~manicule.ingest.reindex.re_embed` does, because it embeds
+    unconditionally and never reads the rows it overwrites — and such a record leaves at zero
+    every field it did not measure. Zero here always means *not counted*, never *checked and
+    found to be none*.
+    """
+
+    chunks: int = 0
+    """Chunks the operation was given."""
+
+    reused: int = 0
+    """Vectors taken from the store without a model call, because the embedding input matched."""
+
+    embedded: int = 0
+    """Chunks handed to the embedder. The honest count of embedding work done."""
+
+    input_changed: int = 0
+    """Of ``embedded``, those whose embedding input is new or has changed.
+
+    Includes the chunk whose ``text`` — and therefore whose id — did not move at all while the
+    heading breadcrumb in its ``embed_text`` did. That chunk is why reuse is not keyed on the
+    chunk id, and it is counted here rather than under ``reused``.
+    """
+
+    repaired: int = 0
+    """Of ``embedded``, those whose embedding input was unchanged and whose vector was not usable.
+
+    A row that went missing, or one whose stored vector cannot be read at the index's
+    dimension, or one whose recorded identity contradicts the chunk stored beside it. Identity
+    metadata asserting that a vector exists is not the same as the vector existing, so this
+    group is found by looking rather than by trusting.
+    """
+
+    forward_calls: int = 0
+    """Batches the embedder was actually asked for. Counted at the call, not derived from it."""
+
+    vectors_new: int = 0
+    """Of ``embedded``, those the store held no row for. A row that did not exist before.
+
+    **Not every row the commit writes**, and the narrower reading is the checked one. A reused
+    vector re-filed under a new chunk id also lands in a row that did not exist — that is what
+    happens to every chunk below an inserted paragraph — and it is counted under ``reused``,
+    because what this pair is about is where the *embedder's* output went.
+    """
+
+    vectors_replaced: int = 0
+    """Of ``embedded``, those that overwrote a row the store already had.
+
+    A reused vector written back is not counted here: the row's chunk may have moved position
+    and an unrecorded identity is recorded by the write, but the vector is the one that was
+    already there. "Replaced" means the vector changed.
+    """
+
+    vectors_backfilled: int = 0
+    """Reused rows that carried no recorded identity and had it reconstructed.
+
+    The one-time migration, counted as it happens. It falls to zero once every row a sweep
+    touches has been written since the identity column arrived; it is not a cost, because a
+    reconstructed identity avoids the same forward pass a recorded one does.
+    """
+
+
+async def embed_or_reuse(
+    embedder: Embedder,
+    chunks: Sequence[Chunk],
+    *,
+    vectors: VectorStore,
+    chunk_fingerprint: ChunkFingerprint | None = None,
+    previous: Mapping[str, str] | None = None,
+    target_batch_tokens: int = 16_384,
+    maximum: int = MAX_BATCH,
+    lock: AbstractAsyncContextManager[object] | None = None,
+) -> tuple[list[Vector], EmbeddingWork]:
+    """Embed only the chunks whose embedding input the index does not already hold a vector for.
+
+    **The reuse condition is three-part and every part is load-bearing**: the same embedding
+    fingerprint, the same embedding input, *and* a readable stored vector for that identity.
+    The first two are answered by
+    :func:`~manicule.core.embedding.embedding_input_identity`; the third is answered by
+    reading the row, because identity metadata claiming a vector exists is not a vector
+    existing. Anything weaker keeps a stale vector under current chunk text — in particular
+    reuse keyed on the chunk id, which survives a re-parse whenever ``text`` does while the
+    breadcrumb in ``embed_text`` may not have.
+
+    **The oversize refusal runs over every chunk before anything is reused.** A document all of
+    whose vectors are reusable would otherwise never reach
+    :func:`~manicule.core.embedding.require_within_context`, and a corpus-wide sweep would
+    then pass in silence under a model whose sequence length had *fallen* — the failure the
+    module docstring is about, which changes no fingerprint and fires no comparison.
+
+    Args:
+        embedder: The configured embedder, called only for what is not reusable.
+        chunks: The complete, ordered chunk set about to be committed.
+        vectors: The store to ask, and the store the answer is about. It is asked about chunks
+            rather than ids, so that its answer can be about the embedding input.
+        chunk_fingerprint: The chunker that produced ``chunks``, when it is known.
+        previous: Chunk id to the ``embed_text`` the index already held for it, when the caller
+            knows. It separates two chunks that both have no vector row: one that never had one
+            because it is new, and one whose row went missing while its input did not change.
+            Both are embedded either way — this only decides which of them the report calls a
+            repair. An absent mapping is not a claim that nothing was stored; it is a caller
+            that did not look, and every chunk with no row is then counted as new.
+        target_batch_tokens: Tokens per batch, from which the batch size is derived.
+        maximum: Clamp on the derived size.
+        lock: Held around the model call and nothing else, when the caller has one.
+
+            **The scope is the point.** What the pipeline's lock exists for is that two batches
+            never reach the model at once (``docs/ingest.md`` §6.6); it is not a lock on the
+            vector store. Taken around this whole function it would hold the single
+            process-wide embedding lock across a vector-store read for every document — so a
+            sweep and a sync running beside each other would serialise on a read they could
+            have done concurrently, which is contention rather than the thing the lock is for.
+
+    Returns:
+        One vector per chunk, in the order the chunks were given, and what it cost.
+
+    Raises:
+        ContextOverflowError: Any chunk exceeds what the model will read.
+    """
+    require_within_context(chunks, embedder.fingerprint, chunk_fingerprint)
+    if not chunks:
+        return [], EmbeddingWork()
+
+    verdicts = await vectors.stored_vectors(chunks)
+    held = previous or {}
+
+    reused: dict[int, Vector] = {}
+    pending: list[Chunk] = []
+    positions: list[int] = []
+    counts = dict.fromkeys(VectorState, 0)
+    backfilled = 0
+    repaired = 0
+
+    for position, chunk in enumerate(chunks):
+        verdict = verdicts[chunk.id]
+        counts[verdict.state] += 1
+        if verdict.is_reusable:
+            reused[position] = verdict.vector
+            backfilled += 0 if verdict.identity_recorded else 1
+            continue
+        if verdict.state is VectorState.CORRUPT or (
+            verdict.state is VectorState.ABSENT and held.get(chunk.id) == chunk.embed_text
+        ):
+            repaired += 1
+        pending.append(chunk)
+        positions.append(position)
+
+    forward_calls = 0
+
+    def count_batch(batch: Sequence[Chunk]) -> None:
+        nonlocal forward_calls
+        del batch
+        forward_calls += 1
+
+    async with lock if lock is not None else nullcontext():
+        produced = await embed_chunks(
+            embedder,
+            pending,
+            chunk_fingerprint=chunk_fingerprint,
+            target_batch_tokens=target_batch_tokens,
+            maximum=maximum,
+            on_batch=count_batch,
+        )
+
+    ordered: list[Vector] = [()] * len(chunks)
+    for position, vector in reused.items():
+        ordered[position] = vector
+    for position, vector in zip(positions, produced, strict=True):
+        ordered[position] = vector
+
+    return ordered, EmbeddingWork(
+        chunks=len(chunks),
+        reused=len(reused),
+        embedded=len(pending),
+        input_changed=len(pending) - repaired,
+        repaired=repaired,
+        forward_calls=forward_calls,
+        vectors_new=counts[VectorState.ABSENT],
+        vectors_replaced=counts[VectorState.STALE] + counts[VectorState.CORRUPT],
+        vectors_backfilled=backfilled,
+    )
+
+
+__all__ = ["MAX_BATCH", "EmbeddingWork", "batch_size", "embed_chunks", "embed_or_reuse"]

@@ -36,12 +36,12 @@ from typing import TYPE_CHECKING
 
 from manicule.core.content import DocumentStatus, RawDocument
 from manicule.core.errors import ContextOverflowError, PolicyError
-from manicule.ingest.embedding import embed_chunks
+from manicule.ingest.embedding import EmbeddingWork, embed_chunks, embed_or_reuse
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
 
-    from manicule.core.content import Document
+    from manicule.core.content import Chunk, Document
     from manicule.core.fingerprints import ChunkFingerprint, GlossaryFingerprint, ParseFingerprint
     from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Embedder, VectorStore
@@ -80,8 +80,56 @@ class ReindexReport:
     an operator is meant to investigate.
     """
 
+    embedding: EmbeddingWork = field(default_factory=EmbeddingWork)
+    """What the embedder was actually asked for across the pass.
+
+    ``chunks`` above counts what was rebuilt; this counts what that cost. They are different
+    numbers whenever a repair finds a vector it can keep, which after a narrow parser change
+    is most of them.
+
+    **A document that failed contributes what it spent.** A store-stage failure happens after
+    the model has run, so the forward passes were paid for whether or not the vectors were
+    written; a report that counted only the documents it managed to rebuild would say a sweep
+    cost less precisely when things were going wrong.
+
+    **A superseded document contributes nothing, and that is a fact about the guard rather than
+    about this field.** The compare-and-swap fires on the first write a re-parse makes, which
+    is before it is chunked or embedded, so a document a sync overtakes is dropped before it
+    reaches the model. The window in which one could be superseded *after* embedding is the one
+    ``_commit`` names as unreachable while the instance lock is held.
+    """
+
     def note_unrepairable(self, document: Document, reason: str) -> None:
         self.unrepairable.append(f"{document.id} ({document.uri}): {reason}")
+
+    def note_embedding(self, work: EmbeddingWork) -> None:
+        """Fold one document's embed-stage accounting into the pass total."""
+        self.embedding = _total(self.embedding, work)
+
+
+def _total(left: EmbeddingWork, right: EmbeddingWork) -> EmbeddingWork:
+    """Two embed-stage accountings added field by field.
+
+    Written once rather than at each of the three places that aggregate, because a sum that
+    forgets a field reports a smaller cost than was paid and nothing fails when it does.
+
+    Reflective over the fields, which is what makes it maintenance-free and also what makes the
+    refusal below necessary: ``+`` is defined on strings and on lists too, so a field that was
+    not a count would be *concatenated* here rather than rejected, and the report would go
+    quietly wrong instead of loudly.
+    """
+    totals: dict[str, int] = {}
+    for name in EmbeddingWork.__dataclass_fields__:
+        values = (getattr(left, name), getattr(right, name))
+        if not all(isinstance(value, int) for value in values):
+            msg = (
+                f"EmbeddingWork.{name} is not a count, so two of them cannot be added. Every "
+                f"field of an embed-stage accounting is summed across documents; a field that "
+                f"is not a number needs its own rule rather than this one."
+            )
+            raise TypeError(msg)
+        totals[name] = values[0] + values[1]
+    return EmbeddingWork(**totals)
 
 
 async def select(
@@ -160,6 +208,13 @@ async def re_embed(
     here; and a model reconfigured to a shorter sequence length leaves the embedding
     fingerprint identical, so no comparison fires either. Without the check, one command would
     truncate a whole corpus in silence.
+
+    **This verb deliberately does not reuse stored vectors**, and it is the only one that does
+    not. :func:`~manicule.ingest.embedding.embed_or_reuse` would find every embedding input
+    unchanged and skip every forward pass, which is precisely wrong here: this is what an
+    operator runs when the vectors themselves are suspect — a reconfigured model, a restored
+    directory, a half-finished rebuild — and a rebuild that reuses what it was asked to replace
+    is not a rebuild. What it costs is stated up front by every refusal that recommends it.
     """
     report = ReindexReport()
     for document in documents:
@@ -168,12 +223,20 @@ async def re_embed(
             if document.expects_chunks:
                 report.note_unrepairable(document, "no stored chunks to re-embed")
             continue
+        batches = 0
+
+        def count_batch(batch: Sequence[Chunk], /) -> None:
+            nonlocal batches
+            del batch
+            batches += 1
+
         try:
             produced = await embed_chunks(
                 embedder,
                 chunks,
                 chunk_fingerprint=chunk_fingerprint,
                 target_batch_tokens=target_batch_tokens,
+                on_batch=count_batch,
             )
         except ContextOverflowError as exc:
             # Fatal to this document and to nothing else. There is no partial-credit answer:
@@ -181,6 +244,18 @@ async def re_embed(
             # passage, it is an embedding of something else.
             report.failures.append(f"{document.id}: {exc}")
             continue
+        # `vectors_new` and `vectors_replaced` are deliberately left at zero. This verb does
+        # not read the rows it is about to overwrite, so it does not know which of them existed
+        # — and a report that guessed "all replaced" would be asserting something it never
+        # checked, in a module whose whole subject is not doing that.
+        report.note_embedding(
+            EmbeddingWork(
+                chunks=len(chunks),
+                embedded=len(chunks),
+                input_changed=len(chunks),
+                forward_calls=batches,
+            )
+        )
         await vectors.upsert(chunks, produced)
         # Only the embedding lineage moves. Re-embedding does not re-chunk, so claiming a new
         # chunk fingerprint here would make a later "which documents need re-chunking" query
@@ -209,6 +284,13 @@ async def repair(
     the upsert is idempotent by chunk id, so re-running it costs nothing and the document is
     then marked. A document with no chunks and a non-terminal status has nothing to finish and
     is named instead, because the repair it needs is a re-parse.
+
+    **Only the chunks with no usable vector reach the model.** This is the verb for a run that
+    stopped part-way, so the interesting case is a document most of whose vectors were written
+    before the crash: embedding all of them again to finish the few that were not is the whole
+    cost of the repair and none of its value. The chunks are the stored ones, so their
+    embedding inputs are exactly what the index recorded — which is what makes the vectors that
+    survived the crash reusable and the rest a repair.
     """
     report = ReindexReport()
     for document in documents:
@@ -219,15 +301,21 @@ async def repair(
             )
             continue
         try:
-            produced = await embed_chunks(
+            produced, work = await embed_or_reuse(
                 embedder,
                 chunks,
+                vectors=vectors,
                 chunk_fingerprint=chunk_fingerprint,
+                # The stored chunks *are* the previous ones — this verb re-embeds what is in
+                # the index rather than re-deriving it — so a chunk with no vector row is
+                # always a missing vector rather than a new chunk.
+                previous={chunk.id: chunk.embed_text for chunk in chunks},
                 target_batch_tokens=target_batch_tokens,
             )
         except ContextOverflowError as exc:
             report.failures.append(f"{document.id}: {exc}")
             continue
+        report.note_embedding(work)
         await vectors.upsert(chunks, produced)
         await store.upsert_document(
             document.model_copy(
@@ -292,8 +380,15 @@ async def re_parse(
 
     Identity rules are the same as first ingest, because it is the same code path: chunks are
     reconciled against the stored set by ``chunks.id``, and an id is derived from its content,
-    so a chunk that survives a re-parse unchanged keeps its id and therefore its vector. A
-    parser fix that changes one table in a hundred-page document re-embeds one table.
+    so a chunk that survives a re-parse unchanged keeps its id and therefore its vector.
+
+    **What is embedded is a separate question from what keeps its id**, and the pipeline
+    answers it separately: a chunk reaches the model only when its *embedding input* is new,
+    changed, or has no readable vector stored against it
+    (:func:`~manicule.ingest.embedding.embed_or_reuse`). So a parser fix that changes one table
+    in a hundred-page document embeds that table and the chunks whose heading breadcrumbs moved
+    with it — which is a larger set than the ids that changed and a far smaller one than the
+    document.
 
     A document whose bytes were never retained — the cap refused them, or it predates
     retention — is named with the reason rather than failing the run. Those are the only
@@ -338,6 +433,18 @@ async def re_parse(
             expected=document.revision,
         )
         for outcome in outcomes:
+            # Counted before the branching, and that is the point: the embed stage runs before
+            # anything below decides which list this document lands in, so what it cost is the
+            # same either way. The case that matters is a **store-stage failure** — the model
+            # has already run by the time an upsert fails — and counting only the documents a
+            # sweep managed to rebuild would report it as costing less the worse it went.
+            #
+            # Two things contribute zero here, for different reasons. A document superseded by a
+            # concurrent sync never reached the model: the guard fires on the re-parse's first
+            # write, which is before chunking. And a document that failed *inside* the embed
+            # stage left no accounting behind — an unknown number of batches had already gone —
+            # so zero is the honest floor rather than a guess at the figure.
+            report.note_embedding(outcome.embedding)
             if outcome.superseded:
                 # Ahead of the two failure shapes below, because a superseded document is
                 # neither of them and would be read as one: it comes back carrying the status
@@ -406,22 +513,34 @@ class StaleSweep:
     reading is wrong. A chunk's id is derived from its ``text``; what reaches the model is
     ``embed_text``, which carries the heading breadcrumb. An id that survived therefore does
     *not* prove the embedded string did — a document whose headings moved re-embeds chunks
-    whose ids never changed — so the pipeline embeds every chunk of a document it re-parses.
+    whose ids never changed. What this counts is how much of the corpus the re-parse produced
+    anew; :attr:`embedding` is what it cost.
 
-    **Over a corpus of distinct chunks nothing absorbs that**, and this docstring claimed the
-    embedding cache did until somebody measured it rather than repeating the claim. The cache
-    de-duplicates identical ``embed_text`` within one run, which is not the shape of a
-    corpus-wide sweep; ``docs/parsing.md`` §4.5 carries the numbers. What this field counts is
-    the honest thing, and the only thing it can count without instrumenting the model: how much
-    of the corpus the re-parse produced anew.
+    **Nor is it the embedding cache's doing**, which this docstring claimed until somebody
+    measured it. The cache de-duplicates identical ``embed_text`` within one run, which is not
+    the shape of a corpus-wide sweep over distinct chunks; what avoids the forward passes is the
+    persisted embedding-input identity, and ``docs/parsing.md`` §4.5 carries both sets of
+    numbers.
     """
 
     chunks_kept: int = 0
     """Chunks that survived with their id, and therefore with the vector row already stored.
 
-    A saving in identity rather than in compute: a kept chunk was produced again and went to the
-    model again like every other one, and what it kept is the row every citation to it resolves
-    through.
+    **A statement about content identity, and about the row rather than the vector in it.** A
+    kept chunk keeps the row every citation to it resolves through; the row's contents may
+    still be written again, because what is embedded is ``embed_text`` and the breadcrumb in it
+    can move under an id that did not. So this is not a count of vectors kept and not a count
+    of embedding work avoided. What was avoided is :attr:`embedding`, measured at the model
+    rather than inferred from row identity.
+    """
+
+    embedding: EmbeddingWork = field(default_factory=EmbeddingWork)
+    """What the sweep cost at the embedder, summed over every document it rebuilt.
+
+    The three-way partition — reused, re-embedded because the input changed, re-embedded
+    because the vector was missing or corrupt — plus the number of batches the model was
+    actually asked for. This is the field to read when pricing a parser bump; everything above
+    it counts documents and chunks, which are not what an accelerator spends its time on.
     """
 
     unrepairable: int = 0
@@ -566,6 +685,12 @@ async def re_parse_stale(
             left_behind += 1
             before = {chunk.id for chunk in await store.document_chunks(document.id)}
             report = await re_parse([document], pipeline=pipeline, blobs=blobs)
+            # Folded before the branching, for the reason `re_parse` folds it before its own:
+            # the embed stage runs before any of the outcomes below is decided. A document with
+            # no retained bytes contributes zero because nothing embedded it, and a superseded
+            # one contributes zero because the commit guard drops it before it is chunked — but
+            # a document that failed at the store contributes the passes it had already spent.
+            sweep.embedding = _total(sweep.embedding, report.embedding)
             if report.unrepairable:
                 sweep.unrepairable += 1
                 sweep.unrepairable_documents.extend(report.unrepairable)

@@ -927,19 +927,35 @@ them, and a fingerprint that could would be a hash of the output rather than of 
 report says so afterwards: `reparsed` is what was rebuilt, `changed` is what came out
 different, and on a narrow bump the second is a small fraction of the first.
 
-**Why unchanged vectors are kept.** A chunk's id is derived from its content and position, so a
-chunk the re-parse did not move comes back with the id it already had, the vector row stored
-against that id is still its row, and every citation that resolved to it still resolves.
+**Why unchanged vector rows are kept.** A chunk's id is derived from its content and position,
+so a chunk the re-parse did not move comes back with the id it already had, the vector row
+stored against that id is still its row, and every citation that resolved to it still resolves.
 `chunks_kept` counts those; `chunks_new` counts the chunks the sweep produced that were not
 already stored.
 
-**Neither is a count of forward passes**, which is the inference this report most invites and
-the one an earlier version of this section made. Keeping an id does not skip an embedding: what
-goes to the model is `embed_text`, which carries the heading breadcrumb, so an id that held
-still does not mean the string embedded under it did. Price a sweep at one forward pass per
-chunk of every re-parsed document, with no relief from the embedding cache — what `chunks_kept`
-saves is identity, not compute. [`parsing.md`](parsing.md) §4.5 has the reasoning and the
-measured numbers, and this section is the accounting it defers to.
+**Neither is a count of forward passes**, and that is not a caveat about precision — they are
+answers to a different question. A row surviving is not the vector inside it surviving: a chunk
+is embedded from `embed_text`, which carries the heading breadcrumb, so a document whose
+headings moved re-embeds chunks whose ids never changed, and their rows are rewritten in place.
+The mismatch runs the other way too — a document with a paragraph inserted at the top renumbers
+every chunk below it without moving one embedded string, so those chunks are *not* in
+`chunks_kept` and their vectors are reused anyway.
+
+**What is a count of forward passes is `embedding`**, and it is measured at the model rather
+than inferred from row identity. The sweep partitions every prepared chunk three ways and
+reports the parts separately, because the remedy differs:
+
+| Field | What it is | What it means |
+|---|---|---|
+| `embedding.reused` | vectors taken from the store | the embedding input was unchanged and a readable vector was found |
+| `embedding.input_changed` | chunks sent to the model | the input is new or has moved — including a chunk whose id survived |
+| `embedding.repaired` | chunks sent to the model | the input was unchanged and the stored vector was missing or unusable |
+| `embedding.forward_calls` | batches the model was asked for | the number accelerator time is proportional to |
+| `embedding.vectors_backfilled` | rows whose identity was reconstructed | a `vectors/` directory predating the identity column, converting itself as it is swept |
+
+A rising `repaired` on a corpus nobody edited is the one line here that asks for attention: it
+says vector rows are going missing or arriving damaged, which is a question about the data
+directory rather than about a parser.
 
 **What a dry run guarantees.** `--dry-run` performs the selection and nothing else: no parse,
 no chunking, no embedding, no blob read, no write to the database, the vector store or the

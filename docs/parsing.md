@@ -818,21 +818,25 @@ numbers address its output.)
 6. **Idempotence across a re-ingest.** Re-parsing an unchanged document produces the same
    chunk sequence, so an unchanged document costs no *new* vectors.
 
-   **"Costs zero re-embedding" is what this used to say, and it is true of only one of the two
-   paths that re-visit a document.** On a sync, change detection compares the stored hash and
-   never parses the document at all, so nothing is embedded. On a *forced* re-parse — which is
-   what a fingerprint bump triggers, and the only path where this assertion is doing work —
-   the pipeline parses, chunks and embeds everything it is handed. Measured on a four-chunk
-   document whose bytes and text did not move:
+   **"Costs zero re-embedding" is what this used to say. It stopped being true, and then it
+   became true again for a reason worth keeping written down**, because the reason is not the
+   one the sentence suggests. On a sync, change detection compares the stored hash and never
+   parses the document at all, so nothing is embedded. On a *forced* re-parse — which is what a
+   fingerprint bump triggers, and the only path where this assertion is doing work — the
+   pipeline parses and chunks everything it is handed, and for a time it embedded all of it
+   too. Measured on a four-chunk document whose bytes and text did not move:
 
    | Path | Embed calls |
    |---|---|
    | re-sync, document unchanged | 0 |
-   | forced re-parse, document unchanged | 4 |
+   | forced re-parse, before persisted embedding-input identity | 4 |
+   | forced re-parse, now | 0 |
 
-   What idempotence buys is therefore identity rather than compute: the ids are the ones
-   already stored, so the vector rows keyed on them are still the right vectors and every
-   citation still resolves. §4.5 prices the compute.
+   **The last row is not this assertion's doing, and reading it as such is the mistake.** What
+   idempotence buys is identity: the ids are the ones already stored, so every citation still
+   resolves. Whether a *vector* survives is decided one field along, by `embed_text` and the
+   breadcrumb in it — a document whose headings moved satisfies this assertion in full and
+   re-embeds every chunk. §4.5 prices the compute and §5 owns the distinction.
 
    The parser's obligation is the *sequence* — same texts, same order, same anchors. The
    **chunk ID scheme is storage's** ([`storage.md`](storage.md) §3.2), derived from content
@@ -1158,24 +1162,47 @@ can price it:
   matches for none of them — which is the point. Nothing can tell in advance which pages hold a
   multi-paragraph macro without parsing them, and a fingerprint that could would be a hash of
   the output rather than of the rules. This reads retained bytes and touches no network.
-- **Re-embed**: every chunk of every document that re-parses, and **not** only the chunks whose
-  text changed. That is the inference to resist, because everything around it invites the
-  opposite one: a chunk's *id* is content-derived, so a chunk the re-parse did not move comes
-  back with the id it had, keeps the vector row stored against that id, and keeps every citation
-  that resolved to it. None of that skips the embedding. `re_parse` runs the ordinary ingest
-  path, and that path embeds every chunk it is handed — measured on a four-chunk document whose
-  text did not move at all, `tests/ingest/test_reindex.py` counts four calls. So a bump costs
-  nothing in identity and one forward pass per chunk in compute. §3.3's assertion 6 is the same
-  distinction one level down, and [`ingest.md`](ingest.md) §10.1 owns the accounting and says
-  why the two counts it reports are not counts of forward passes.
+- **Re-embed**: only the chunks whose **embedding input** changed, plus the ones with no usable
+  vector stored against that input. Four facts sit close together here and three of them are
+  routinely read as the fourth, so they are worth naming apart:
 
-  **Do not expect the embedding cache to absorb it.** `EmbeddingCache` is a bounded LRU over
-  `(embed fingerprint, embed_text)` — the post-middleware string handed to the model, not the
-  chunk's `text`, and the distinction is this bullet's own so it has to hold here too. What it
-  is good at is duplicates of that string: a batch of forty copies of one costs one forward
-  pass. A sweep in a fresh process over a corpus of distinct chunks has none to absorb, and a
-  corpus larger than the cache evicts each entry before anything could reuse it. Measured at
-  its default capacity of 10,000:
+  | Fact | What decides it |
+  |---|---|
+  | a chunk **id** survives | `text` and position — `chunks.id` is derived from both |
+  | a **citation** still resolves | the id surviving |
+  | a **vector** is still correct | `embed_text`, which carries the heading breadcrumb |
+  | a **forward pass** is avoided | the vector being correct *and* readable *and* found |
+
+  A chunk can keep its id while the string that produced its vector changes — a document whose
+  headings moved is exactly that — so an optimisation keyed on the id preserves a stale vector
+  under current text. It can also lose its id while its embedding input stands still, because
+  inserting one paragraph renumbers every chunk below it. Both are handled, and neither by the
+  id: `ingest/embedding.py` compares a persisted **embedding-input identity**, derived from the
+  exact string sent to the model, the document it belongs to, the embed fingerprint, and any
+  middleware declaring `mutates_embedded_text`. Reuse needs all three of the same fingerprint, the same input, and a
+  readable stored vector for that identity — identity metadata claiming a vector exists is not
+  a vector existing, so the row is read rather than trusted.
+
+  **Measured, in a fresh process, over a corpus twice the embedding cache's capacity** — 20
+  documents holding 20,000 distinct chunks, re-parsed after a library bump that moved no text:
+
+  | | Chunks embedded | Forward calls |
+  |---|---|---|
+  | first ingest | 20,000 | 320 |
+  | re-parse, before this was implemented | 20,000 | 320 |
+  | re-parse, now | 0 | 0 |
+
+  §3.3's assertion 6 is the same distinction one level down, and [`ingest.md`](ingest.md) §10.1
+  owns the accounting and says which of its counts are counts of forward passes.
+
+  **This is not the embedding cache, and the cache could not have done it.** `EmbeddingCache` is
+  a bounded LRU over `(embed fingerprint, embed_text)` — the post-middleware string handed to
+  the model, not the chunk's `text`, and the distinction is this bullet's own so it has to hold
+  here too. What it is good at is duplicates of that string: a batch of forty copies of one
+  costs one forward pass. A sweep in a fresh process over a corpus of distinct chunks has none
+  to absorb, and a corpus larger than the cache evicts each entry before anything could reuse
+  it. Measured at its default capacity of 10,000, with the persisted identity out of the
+  picture:
 
   | Shape | Forward passes |
   |---|---|
@@ -1183,6 +1210,9 @@ can price it:
   | 10,000 distinct chunks, fresh process | 10,000 |
   | the same 10,000 swept twice in one process | 10,000 then 0 |
   | 20,000 distinct chunks swept twice in one process | 20,000 then 20,000 |
+
+  Which is why the reuse is persisted beside the vector rather than held in memory: the row in
+  the last line of that table is the shape a corpus migration actually has.
 - **The path**: nothing, for an index that syncs. Change detection re-parses each document the
   next time its connector reports it, because `IngestPipeline` compares the stored `parse_fp`
   against what that document's own parser would produce now and a mismatch stops it counting as
@@ -1386,6 +1416,29 @@ still exceed 64 tokens, truncate the last element on a word boundary and append 
 requires the whole document's heading tree, which is not available when reading a single
 chunk back; and a change to the breadcrumb rules must show up as an explicit re-embed with a
 `chunker_version` bump, not as silent drift between chunks written before and after.
+
+### 5.4 It is `embed_text`, not `text`, that decides whether a vector survives
+
+The most expensive confusion in the codebase, and it is a confusion between two things that
+are *both* content-derived, which is what makes it easy to make and hard to see.
+
+| | Derived from | So it changes when |
+|---|---|---|
+| `chunks.id` | `text` and position | the quoted text moves, or the chunk moves within its document |
+| the vector | `embed_text` | the quoted text moves, **or the breadcrumb above it does** |
+
+Both directions of the mismatch are real and both are common:
+
+- **Rename a heading.** Every `text` is untouched, so every id survives and every citation
+  still resolves — and every `embed_text` moved, so every stored vector is now an embedding of
+  a string the corpus no longer contains. Reuse keyed on the surviving id keeps all of them.
+- **Insert a paragraph at the top.** Every `embed_text` below it is untouched — position is not
+  part of the breadcrumb, §5.1 — while every id changes, because an id carries its position.
+  Reuse keyed on the id re-embeds a document that moved nothing the model would see.
+
+So the thing worth persisting is neither: it is the identity of the *embedding input*, which is
+what `embed_identity` in the vector row records ([`storage.md`](storage.md) §6.2) and what
+[`ingest.md`](ingest.md) §10.1 reports the arithmetic of.
 
 ---
 
