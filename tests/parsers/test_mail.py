@@ -23,9 +23,9 @@ from manicule.parsers.expansion import (
     read_members,
 )
 from manicule.parsers.mail import MailConfig, MailParser
-from manicule.testing import assert_round_trip
+from manicule.testing import assert_parser_contract, assert_round_trip
 from tests.corpus.mail import ATTACHMENT_TEXT
-from tests.parsers.support import check_corpus, document_for, raw_from
+from tests.parsers.support import check_corpus, document_for, raw_from, raw_of
 
 READABLE = (
     "typical.eml",
@@ -465,3 +465,68 @@ async def _is_closed(stream: AsyncIterator[object]) -> bool:
     except StopAsyncIteration:
         return True
     return False
+
+
+async def test_a_cdata_body_in_an_html_email_is_recovered_and_moves_the_lines_after_it() -> None:
+    """Recovering CDATA moves an HTML mail body's line numbers, because they address its blocks.
+
+    **This is the coupling that nearly shipped a defect.** ``_html_to_text`` builds the canonical
+    text an email ``LineAnchor`` addresses by joining the blocks :class:`WebParser` yields. The web
+    parser now recovers CDATA sections rather than deleting them, so a recovered body becomes a
+    block of its own and **every line after it shifts**.
+
+    The HTML parser itself anchors structurally — a heading path and a published fragment — so the
+    change is invisible there. Email is the parser that reuses it and anchors by *line*, and the
+    only reason this is safe is that ``ParserVersions.rules["email"]`` was bumped alongside the
+    html one: without it, a corpus would hold email anchors under the old numbering while newly
+    ingested identical messages got the new, and nothing would say so.
+
+    Asserted here rather than in the web parser's suite because the failure is the email parser's
+    to have, and a test living beside the change would not have found it.
+    """
+    body = (
+        "<h2>Retry policy</h2>"
+        "<ac:plain-text-body><![CDATA[def retry(): ...]]></ac:plain-text-body>"
+        "<p>Trailing paragraph.</p>"
+    )
+    message = (
+        "From: a@example.test\r\nTo: b@example.test\r\nSubject: Retry\r\n"
+        f"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{body}"
+    )
+    parser = MailParser(MailConfig())
+    raw = raw_of(message, "message/rfc822")
+    blocks = await assert_parser_contract(parser, raw)
+    texts = [block.text for block in blocks]
+
+    assert "def retry(): ..." in texts, (
+        "the recovered macro body is missing from the mail body, so an HTML-only email loses the "
+        "same content the HTML parser used to lose"
+    )
+    # The recovered body occupies its own line, so the paragraph after it is no longer where it
+    # would have been. `assert_parser_contract` above is what proves the anchors still resolve to
+    # the text their blocks claim — which is the property that would break if the recovery moved
+    # the lines without the numbering following.
+    assert texts.index("Trailing paragraph.") > texts.index("def retry(): ...")
+
+
+def test_the_email_parser_records_a_rules_version_that_moved_with_the_conversion() -> None:
+    """The bump that re-parses existing emails, asserted as a fingerprint rather than a literal.
+
+    Not ``rules == "2"``, which is a tautology. What matters is that the *fingerprint* an email
+    document carries differs from the one a build before this change produced — because that
+    difference is what selects those documents for a re-parse from retained bytes. Without it the
+    corpus keeps line anchors that address text the parser no longer produces, behind a lineage
+    claiming to be current.
+    """
+    from manicule.core.fingerprints import ParseFingerprint  # noqa: PLC0415
+    from manicule.parsers.versions import parse_fingerprint  # noqa: PLC0415
+
+    current = parse_fingerprint("email")
+    assert current is not None
+    before = ParseFingerprint(parser=current.parser, version="1", libraries=dict(current.libraries))
+
+    assert not current.matches(before), (
+        "the email parse fingerprint did not move, so documents parsed before the CDATA recovery "
+        "will never be re-parsed and their line anchors address text that is no longer produced"
+    )
+    assert "version" in current.changed_fields(before)

@@ -68,9 +68,28 @@ STORAGE_BODY = "storage"
 STORAGE_MEDIA_TYPE = "text/html"
 """What a storage-format body is routed as.
 
-Storage format is XHTML with Confluence's own ``ac:`` and ``ri:`` elements mixed in. The HTML
-parser reads it with a real HTML engine and keeps the structure that survives; calling it
-something else would only mean writing a second parser for a dialect of the same thing.
+Storage format is XHTML with Confluence's own ``ac:`` and ``ri:`` elements mixed in, and the HTML
+parser reads it with a real HTML engine rather than by stripping angle brackets. What it recovers
+is the structure HTML and storage format share: headings, paragraphs, lists, tables, ``<pre>``.
+
+**This docstring used to claim more, and the claim was false.** It said the parser "keeps the
+structure that survives" and that calling storage format something else "would only mean writing a
+second parser for a dialect of the same thing". It is not the same thing, and the difference
+destroyed content: storage format wraps the body of every ``code``, ``noformat`` and ``graphviz``
+macro in ``<![CDATA[…]]>``, which HTML does not have outside foreign content — so a conforming
+parser reparsed each one as a bogus comment and **deleted the body**. Every code block on every
+Server or Data Center page was absent from the index, with a fragment of it indexed as prose, for
+as long as this connector has existed.
+
+``manicule.parsers.web`` now recovers those sections as escaped text, so the routing above is
+honest about the structure it claims. What it still does *not* do is read ``ac:*`` and ``ri:*`` as
+Confluence: a code macro's language, a warning panel's severity, a task list's state and a Graphviz
+macro's engine are all flattened to prose. That is a missing feature rather than lost content, and
+it is what a storage-format parser is for.
+
+The lesson worth keeping is about the sentence rather than the bug. It was written from intent,
+never executed, and it read as a settled argument against doing the work — while being wrong. A
+claim about what a parser keeps is checkable in four lines.
 """
 
 _SEARCH_PATH = "/rest/api/content/search"
