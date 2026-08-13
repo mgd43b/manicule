@@ -279,6 +279,10 @@ def build_server(service: ApplicationService) -> FastMCP:
             An envelope whose ``data`` carries the answer text, its citations, the retrieval
             confidence and whether the corpus was consulted at all. ``ungrounded`` means
             passages were found and none survived verification — a materially weaker answer.
+            ``explicit_definition`` is ``true`` when the question asked what a term means and
+            the corpus's own definition of it is in ``expansions`` and was in the context; read
+            that boolean rather than parsing ``confidence_reason``, and read it *beside*
+            ``confidence`` rather than as a larger one — it moves no number.
         """
         return await dispatch(
             "ask",
@@ -321,7 +325,11 @@ def build_server(service: ApplicationService) -> FastMCP:
         Returns:
             An envelope whose ``data.hits`` are ranked passages, each with its document, its
             anchor and the score every pipeline stage gave it. ``data.collections`` repeats
-            the scope the search ran under.
+            the scope the search ran under. ``data.explicit_definition`` is ``true`` when the
+            query asked what a term means and the corpus's own definition of it is in
+            ``data.expansions`` and reached the results; read that boolean rather than parsing
+            ``confidence_reason``, and read it *beside* ``confidence`` rather than as a larger
+            one — it moves no number.
         """
         return await dispatch(
             "search",

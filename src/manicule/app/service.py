@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from manicule.connectors.filesystem import FilesystemConnector
     from manicule.core.content import Chunk, Document
     from manicule.core.organisation import Collection, Tag
+    from manicule.core.retrieval import Confidence
     from manicule.embedding.artifacts import WeightsPlan
     from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
     from manicule.generation.ports import ConversationRecord
@@ -146,6 +147,15 @@ class AskAside:
 
     conflicts: tuple[r.GlossaryConflict, ...] = ()
     """Terms with more than one definition in scope, so none was expanded."""
+
+    explicit_definition: bool = False
+    """Whether the retrieval answered a question about a term by showing its definition.
+
+    Here for the same reason the band is, and it is the *only* route it has: the generator's
+    envelope carries the score and nothing else about the retrieval, so a classification left
+    off this record would reach the non-streaming ``ask`` and the streamed ``final`` frame
+    through no path at all. Both read it from here, which is what makes them the same answer.
+    """
 
     payload: r.AnswerResultPayload | None = None
     """The settled result, built by :meth:`ApplicationService.ask_stream` when the run ends.
@@ -350,6 +360,9 @@ class ApplicationService:
             record.confidence_band = confidence.band.value
             record.confidence_reason = confidence.reason
         record.expansions, record.conflicts = await self._glossary_payloads(retrieved.expansion)
+        # After the expansions, because the classification is only reportable alongside the
+        # provenance it names and `_glossary_payloads` is what decides whether that survived.
+        record.explicit_definition = cited_definition(confidence, record.expansions)
         envelope: AnswerEnvelope | None = None
         try:
             async with answering(answerer, request, result) as events:
@@ -426,6 +439,7 @@ class ApplicationService:
             confidence=confidence.score if confidence else None,
             confidence_band=confidence.band.value if confidence else None,
             confidence_reason=confidence.reason if confidence else "",
+            explicit_definition=cited_definition(confidence, expansions),
             expansions=expansions,
             conflicts=conflicts,
             expanded_query=retrieved.expansion.expanded if retrieved.expansion else "",
@@ -468,6 +482,7 @@ class ApplicationService:
                 chunk_id=entry.chunk_id,
                 uri=document.uri,
                 title=document.title,
+                provenance=source_reference(document),
                 acronym=entry.acronym,
                 display=entry.display,
                 expansion=entry.expansion,
@@ -3463,6 +3478,7 @@ class ApplicationService:
             conflicts=aside.conflicts,
             confidence_band=aside.confidence_band,
             confidence_reason=aside.confidence_reason,
+            explicit_definition=aside.explicit_definition,
             corpus_consulted=envelope.corpus_consulted,
             ungrounded=envelope.ungrounded,
             context_truncated=envelope.context_truncated,
@@ -3477,6 +3493,47 @@ class ApplicationService:
 
 
 # --- module helpers --------------------------------------------------------------------------
+
+
+def cited_definition(
+    confidence: Confidence | None, expansions: Sequence[r.GlossaryExpansion]
+) -> bool:
+    """Whether a result may report that it is showing the definition of a term it was asked about.
+
+    **The classification is retrieval's and is copied, never recomputed.** It is read straight
+    off :attr:`~manicule.core.retrieval.Confidence.explicit_definition`, which is where the
+    three conditions behind it are decided and the only place they can be decided: the question's
+    shape, the entry that fired, and whether the defining passage reached the context. Deriving
+    it here — from ``confidence_reason``, from the presence of an expansion, from anything at
+    all — would be a second opinion, and the one that disagrees is always the one nobody reads.
+
+    Two things can make it ``false`` that retrieval's own answer cannot.
+
+    ``confidence is None`` is a query the router answered without consulting the corpus, and
+    ``Confidence`` is *absent* on those rather than zero. There is no classification to copy
+    because nothing was classified, and ``false`` is the only honest reading of a lookup that
+    never happened.
+
+    An empty ``expansions`` is the race :meth:`ApplicationService._glossary_payloads` documents:
+    the entry's document became unreadable between the lookup and the render, so the provenance
+    was dropped rather than shown blank. The claim goes with it. That is not a policy choice
+    made here — :class:`~manicule.app.results.Glossed` refuses the combination outright, so the
+    alternative is not "report it anyway" but "raise", and turning a soft delete into a failed
+    search is the outcome that helper exists to avoid.
+
+    **Withdrawing the claim does not rewrite the sentence beside it, and that is deliberate.** On
+    that path ``confidence_reason`` is left saying a definition was cited, which by then is
+    stale: :data:`~manicule.retrieval.confidence.DEFINITION_CITED` ends "*and the citation
+    resolves to it*" and the citation has stopped resolving. The repair that suggests itself is
+    to substitute :data:`~manicule.retrieval.confidence.NOTHING_RESEMBLES` here. **Do not.** It
+    is false in the same state, and demonstrably so — the defining passage is still rank 1, so
+    that sentence would be printed directly above the corpus's own definition of the term the
+    question named. Both available sentences are wrong here, a third would be a permanent concept
+    describing a window between two reads of one request, and prose this application invents is
+    worse than prose it merely relays. The argument in full, with the state constructed and the
+    counter-example asserted, is in ``tests/glossary/test_surfaces.py``.
+    """
+    return bool(confidence and confidence.explicit_definition and expansions)
 
 
 def hardware() -> dict[str, JsonValue]:
