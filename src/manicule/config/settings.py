@@ -928,12 +928,24 @@ class RagSettings(Section):
 
 
 class ConnectorSettings(Section):
-    """One configured source."""
+    """One configured source.
+
+    **There is no ``schedule_s``, and its absence is deliberate.** The field existed, was
+    reported by ``connector list``, and was read by nothing: there is no scheduler in manicule
+    and no code path that polled on an interval. A setting that does nothing is a promise the
+    software does not keep, and this one would have been cited as evidence that scheduling
+    existed. It is removed rather than documented as unimplemented, so a configuration that sets
+    it is refused loudly by ``extra="forbid"`` instead of silently doing nothing — which is the
+    same choice :class:`Section` makes about every other misspelled key. Sync is what an operator
+    or their own cron runs.
+    """
 
     type: str = Field(min_length=1, description="Registered connector implementation.")
-    enabled: bool = True
-    schedule_s: int | None = Field(
-        default=None, ge=60, description="Poll interval. ``None`` means manual sync only."
+    enabled: bool = Field(
+        default=True,
+        description="Whether `manicule connector sync` will run this source. False refuses the "
+        "sync rather than skipping it quietly, so a disabled source that somebody tries to run "
+        "says so.",
     )
     options: dict[str, JsonValue] = Field(
         default_factory=dict, description="Validated against the connector's own config model."

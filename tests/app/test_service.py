@@ -17,6 +17,7 @@ import huggingface_hub
 import pytest
 
 from manicule import vocabularies
+from manicule.app import results as r
 from manicule.app.results import CheckState
 from manicule.app.service import ApplicationService, hardware
 from manicule.config.settings import Settings, config_file
@@ -1610,3 +1611,159 @@ async def test_updating_a_description_cannot_erase_one_by_omission(
         "an empty string neither cleared the description nor was rejected; 'no description' "
         "now has two spellings on the wire"
     )
+
+
+# --- the connector-identity check, and the two settings around it --------------------------------
+
+
+def _with_connectors(backend: FakeBackend, **connectors: object) -> ApplicationService:
+    """A service whose settings carry the given sources."""
+    from manicule.config.settings import ConnectorSettings  # noqa: PLC0415
+
+    settings = backend.settings.model_copy(
+        update={
+            "connectors": {
+                name: ConnectorSettings.model_validate(spec) for name, spec in connectors.items()
+            }
+        }
+    )
+    backend.settings = settings
+    return ApplicationService(backend)
+
+
+def _check(diagnosis: r.Diagnosis, name: str) -> r.Check:
+    """The named check, or a failure saying which names were there.
+
+    ``next`` with no default raises ``StopIteration``, which pytest reports as an error with no
+    indication that the check simply was not emitted — so the names are listed instead.
+    """
+    for check in diagnosis.checks:
+        if check.name == name:
+            return check
+    offered = ", ".join(sorted(c.name for c in diagnosis.checks))
+    message = f"no check named {name!r}; the diagnosis carried: {offered}"
+    raise AssertionError(message)
+
+
+async def test_doctor_names_the_sources_whose_document_identity_is_about_to_change(
+    backend: FakeBackend,
+) -> None:
+    """The whole point of the check: which values, what happens, what to run.
+
+    A warning that says "some documents are affected" sends an operator to read every row in
+    their corpus, so the affected ``source`` values are named the way the permissions check names
+    the offending path.
+    """
+    backend.store.add(make_document(backend.workspace, source="confluence-snapshot"))
+    service = _with_connectors(
+        backend, **{"team-handbook": {"type": "confluence-snapshot", "options": {"root": "/x"}}}
+    )
+
+    check = _check(await service.doctor(), "connectors")
+
+    assert check.state == "degraded"
+    # The enumeration specifically, with its count -- not merely the string appearing somewhere.
+    # A bare `"confluence-snapshot" in detail` passed on a message that named no source at all,
+    # because the remedy command below happens to contain the same word. That assertion was
+    # weaker than the name of this test, which is the defect it exists to catch elsewhere.
+    assert "'confluence-snapshot' (1 document(s))" in check.detail
+    assert "'team-handbook'" in check.detail
+    assert check.facts["affected"] == ["confluence-snapshot"]
+    assert check.facts["documents"] == 1
+    assert check.facts["instances"] == ["team-handbook"]
+
+
+async def test_the_check_states_the_consequence_rather_than_only_the_condition(
+    backend: FakeBackend,
+) -> None:
+    """Somebody who syncs without being told will conclude the corpus doubled."""
+    backend.store.add(make_document(backend.workspace, source="confluence-snapshot"))
+    service = _with_connectors(
+        backend, **{"team-handbook": {"type": "confluence-snapshot", "options": {"root": "/x"}}}
+    )
+
+    detail = _check(await service.doctor(), "connectors").detail
+
+    assert "new ids" in detail
+    assert "doubled" in detail
+
+
+async def test_the_check_names_only_remedies_that_exist(backend: FakeBackend) -> None:
+    """It must not point at a regime that cannot be invoked.
+
+    ``manicule.ingest.reconcile.reconcile`` exists and is tested, and **nothing in the product
+    calls it** — there is no command, no service method and no sweep that runs it. Naming it here
+    would read as though there were a way to bulk-reconcile and the operator had missed it. The
+    two commands named instead were run against a real index before this was written.
+    """
+    backend.store.add(make_document(backend.workspace, source="confluence-snapshot"))
+    service = _with_connectors(
+        backend, **{"team-handbook": {"type": "confluence-snapshot", "options": {"root": "/x"}}}
+    )
+
+    detail = _check(await service.doctor(), "connectors").detail
+
+    assert "manicule document list --source confluence-snapshot" in detail
+    assert "manicule document delete" in detail
+    assert "reconcile" not in detail.replace("bulk reconciliation", "")
+
+
+async def test_an_instance_named_after_its_own_type_is_not_reported(
+    backend: FakeBackend,
+) -> None:
+    """Its documents keep their ids, so warning about it would be a warning about nothing."""
+    backend.store.add(make_document(backend.workspace, source="filesystem"))
+    service = _with_connectors(backend, filesystem={"type": "filesystem"})
+
+    check = _check(await service.doctor(), "connectors")
+
+    assert check.state == "ok"
+    assert check.facts["affected"] == []
+
+
+async def test_a_renamed_instance_with_no_documents_under_its_type_is_not_reported(
+    backend: FakeBackend,
+) -> None:
+    """A fresh install configured the new way has nothing to migrate and should hear nothing."""
+    service = _with_connectors(
+        backend, **{"team-handbook": {"type": "confluence-snapshot", "options": {"root": "/x"}}}
+    )
+
+    assert _check(await service.doctor(), "connectors").state == "ok"
+
+
+async def test_syncing_a_disabled_connector_is_refused(backend: FakeBackend) -> None:
+    """The switch is what the operator trusted.
+
+    ``enabled`` was reported by ``connector list`` and read by nothing, so somebody who turned a
+    source off and checked was told it was off by the same program that would then sync it.
+    """
+    from manicule.core.errors import PolicyError  # noqa: PLC0415
+
+    service = _with_connectors(backend, docs={"type": "filesystem", "enabled": False})
+
+    with pytest.raises(PolicyError, match="enabled = false"):
+        await service.connector_sync("docs")
+
+
+async def test_an_enabled_connector_is_not_refused(backend: FakeBackend) -> None:
+    """The guard above must reject the disabled case and nothing else."""
+    service = _with_connectors(backend, docs={"type": "filesystem", "enabled": True})
+
+    report = await service.connector_sync("docs")
+
+    assert report.connector
+
+
+async def test_schedule_s_is_refused_rather_than_silently_doing_nothing() -> None:
+    """There is no scheduler. A setting that does nothing is a promise the software breaks.
+
+    Loud rejection is the point: a config carrying it was already being ignored, and an operator
+    who believed it was polling needs to find out from manicule rather than from a stale index.
+    """
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from manicule.config.settings import ConnectorSettings  # noqa: PLC0415
+
+    with pytest.raises(ValidationError, match="schedule_s"):
+        ConnectorSettings.model_validate({"type": "filesystem", "schedule_s": 300})
