@@ -21,6 +21,7 @@ import pytest
 from manicule.connectors import sidecar
 from manicule.connectors.enriched_html import (
     MAX_HTML_BYTES,
+    AdapterOutcome,
     UnusablePageError,
     extract,
     manifest_for,
@@ -142,14 +143,24 @@ def test_a_manifest_claims_only_what_the_page_actually_said() -> None:
 # --- refusals name what was wrong ----------------------------------------------------------------
 
 
-def test_a_file_with_no_metadata_section_is_refused_by_name() -> None:
-    with pytest.raises(UnusablePageError, match="no \\[data-source-metadata\\] section"):
+def test_an_ordinary_html_file_matches_no_profile_rather_than_being_a_broken_page() -> None:
+    """The outcome a directory of ordinary HTML produces, and it is not a complaint.
+
+    It used to be reported as "no [data-source-metadata] section", which reads as a defect in a
+    file that has none because it is not an export and was never meant to be one. Every page in a
+    documentation site would have carried that reason.
+    """
+    with pytest.raises(UnusablePageError, match="matches no configured") as refused:
         extract("<html><body><p>Just a page.</p></body></html>")
+
+    assert refused.value.outcome is AdapterOutcome.NO_PROFILE
 
 
 def test_two_metadata_sections_are_refused_rather_than_guessed_between() -> None:
-    with pytest.raises(UnusablePageError, match="2 \\[data-source-metadata\\] sections"):
+    with pytest.raises(UnusablePageError, match=r"2 . \[data-source-metadata\]") as refused:
         extract(page(sections=2))
+
+    assert refused.value.outcome is AdapterOutcome.AMBIGUOUS
 
 
 def test_one_label_stated_twice_with_two_values_is_refused() -> None:
@@ -425,10 +436,14 @@ def test_every_page_that_produced_nothing_is_reported_with_its_reason(tmp_path: 
     outcomes = write_sidecars(tmp_path)
 
     skipped = {
-        outcome.path.name: outcome.skipped_reason for outcome in outcomes if not outcome.written
+        outcome.path.name: (outcome.outcome, outcome.skipped_reason)
+        for outcome in outcomes
+        if not outcome.written
     }
     assert "plain.html" in skipped
-    assert "data-source-metadata" in skipped["plain.html"]
+    outcome, reason = skipped["plain.html"]
+    assert outcome is AdapterOutcome.NO_PROFILE
+    assert "matches no configured" in reason
 
 
 # --- found by self-review ------------------------------------------------------------------------

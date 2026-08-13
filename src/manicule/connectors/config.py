@@ -25,6 +25,7 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from manicule.connectors.enriched import DEFAULT_PROFILE, EnrichedProfile
 from manicule.core.errors import ConfigError
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "ConfluenceConfig",
     "ConfluenceSnapshotConfig",
     "Deployment",
+    "EnrichedProfile",
     "FilesystemConfig",
     "resolve_credentials",
 ]
@@ -104,6 +106,27 @@ class FilesystemConfig(BaseModel):
         ge=1,
         description="Refuse a file larger than this at discovery, before it is read.",
     )
+    enriched_profiles: tuple[EnrichedProfile, ...] = Field(
+        default=(DEFAULT_PROFILE,),
+        description="Enriched-export conventions to recognise inside HTML files, in precedence "
+        "order. An empty tuple turns adaptation off and indexes every HTML file as HTML.",
+    )
+    """How a site whose exporter spells the markers differently teaches this connector to read it.
+
+    **Configuration rather than code, and validated rather than trusted.** Every field of a
+    profile is checked when the settings are loaded
+    (:class:`~manicule.connectors.enriched.EnrichedProfile`): a selector that is not an attribute
+    selector is refused, because an element name would make an ordinary ``<main>`` a storage body
+    and that is the guess this whole mechanism exists instead of; a representation outside the
+    allowlist is refused, because a profile's representation decides which parser untrusted
+    extracted markup reaches; and a label mapped to a field that does not exist is refused rather
+    than ignored, because an alias that silently does nothing is indistinguishable from not having
+    written it.
+
+    Replacing the default rather than adding to it is the caller's choice to make. Listing
+    :data:`~manicule.connectors.enriched.DEFAULT_PROFILE` alongside a new one keeps both; omitting
+    it means this corpus is not the default form and should not be searched for it.
+    """
 
 
 class Deployment(StrEnum):

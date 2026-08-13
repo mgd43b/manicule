@@ -174,6 +174,45 @@ def is_manifest(path: Path) -> bool:
     return path.name.endswith(MANIFEST_SUFFIX)
 
 
+def declared_identity(document: Path) -> str:
+    """The source identity ``document``'s manifest declares, or ``""`` when it declares none.
+
+    **What discovery needs and all it needs.** A connector has to know a document's identity
+    before it fetches anything, because identity is what the stored row is looked up by and the
+    lookup is what makes a sync incremental. A manifest is small, bounded and beside the file that
+    was walked to, so reading one is affordable where reading the *document* would not be —
+    :class:`~manicule.connectors.filesystem.FilesystemConnector` already stats it on every walk to
+    build the change token, and this reads what it stats.
+
+    **Identity is deliberately not conditioned on the snapshot checksum.** A manifest whose
+    declared digest disagrees with the file beside it is refused *as a record* by
+    :func:`provenance_for`, and rightly — it describes a revision that is no longer there. But
+    identity is not a description of a revision. If it moved when a page was edited and moved back
+    when the conversion was re-run, a corpus would acquire a second document on every edit and
+    lose it again on every repair, and reconciliation would report deletions that were nothing of
+    the sort. The page is the same page whether or not its metadata has caught up.
+
+    Everything else is one rule: a manifest that cannot be used supplies **nothing**, identity
+    included. A field this reads out of a manifest that :func:`provenance_for` would then refuse
+    would be a document keyed on a record the corpus does not hold.
+
+    Returns:
+        The declared identity, validated by the same model that validates it at fetch. ``""``
+        where there is no manifest, it cannot be read, it is not usable, or it declares no
+        ``source_id`` — every one of which means "this document is identified by where it sits",
+        which is what a local file with nothing to say about itself has always been.
+    """
+    try:
+        if not manifest_path_for(document).is_file():
+            return ""
+        return _parse(manifest_path_for(document)).source().source_id
+    except (OSError, _UnusableManifestError):
+        # Soft, as everywhere else here: a manifest that cannot be read never fails the document
+        # beside it. The reason reaches the operator through `provenance_for` at fetch, which is
+        # where there is a record to hang it on.
+        return ""
+
+
 def provenance_for(
     document: Path,
     *,
@@ -344,6 +383,7 @@ __all__ = [
     "MANIFEST_SUFFIX",
     "MAX_MANIFEST_BYTES",
     "SNAPSHOT_PATH",
+    "declared_identity",
     "is_manifest",
     "manifest_path_for",
     "provenance_for",

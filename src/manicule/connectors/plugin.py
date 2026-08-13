@@ -163,6 +163,7 @@ def build_filesystem(context: BuildContext) -> Connector:
         name=_source_name(context, FILESYSTEM_CONNECTOR_NAME),
         include_hidden=settings.include_hidden,
         max_bytes=settings.max_bytes,
+        profiles=settings.enriched_profiles,
     )
 
 

@@ -16,6 +16,7 @@ import pytest
 
 from manicule.core.content import IN_FLIGHT, DocumentStatus, Retention
 from manicule.core.embedding import IndexFingerprints
+from manicule.core.ids import document_id
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
 from manicule.ingest.recovery import requeue_interrupted
@@ -303,8 +304,14 @@ async def test_a_mirrored_page_with_a_manifest_cites_the_page_through_the_real_s
     assert stored.title == "Retry policy"
     assert stored.uri == "https://docs.example.test/pages/123456/retry-policy"
 
+    # The identity, which is now the page's own and no longer where the file happens to sit.
+    assert stored.source_id == "123456", (
+        "a manifest that declares a source_id declares the document's identity; keying on the "
+        "path instead makes a reorganised mirror a corpus of new documents and orphans the old"
+    )
+    assert stored.id == document_id("default", "local", "123456")
+
     # The local snapshot, which must survive being superseded.
-    assert stored.source_id == str(page)
     record = stored.provenance
     assert record is not None, "the record must survive the JSON column round trip"
     assert record.snapshot is not None
