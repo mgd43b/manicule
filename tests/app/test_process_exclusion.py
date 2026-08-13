@@ -32,10 +32,16 @@ from manicule.ingest.recovery import LOCK_FILENAME, InstanceLock
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-pytestmark = pytest.mark.skipif(
-    not hasattr(__import__("fcntl", fromlist=["flock"]), "flock"),
-    reason="this platform has no flock, so there is no lock to test",
-)
+pytest.importorskip("fcntl", reason="this platform has no flock, so there is no lock to test")
+"""Skip the module where the primitive genuinely is not there, rather than fail collecting it.
+
+``importorskip`` rather than a ``skipif`` over ``__import__``. The obvious spelling —
+``skipif(not hasattr(__import__("fcntl"), "flock"))`` — evaluates the import *while deciding
+whether to skip*, so on a platform with no ``fcntl`` it raises ``ModuleNotFoundError`` before
+the skip can apply and takes collection of the whole file down with it. A guard that crashes on
+exactly the platform it exists to spare is worse than no guard, because the failure looks like a
+broken test suite rather than an unsupported primitive.
+"""
 
 HELD = "held"
 """What the holder prints once it owns the directory. A gate, so no test waits on a clock."""
