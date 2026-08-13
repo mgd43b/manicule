@@ -32,9 +32,6 @@ from manicule.web import pages, rendering, security
 from tests.routing_support import Reach, classify, walk_routes
 from tests.web.support import backend_with_a_document, client_for
 
-NOT_FOUND = 404
-METHOD_NOT_ALLOWED = 405
-
 SOURCE = Path(rendering.HERE)
 
 ABSENT: tuple[tuple[str, str, Reach, str], ...] = (

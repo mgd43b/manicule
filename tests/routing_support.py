@@ -25,6 +25,20 @@ none. :func:`walk_routes` descends into whatever shape the framework used, and
 :data:`MINIMUM_ROUTES` is a floor below which the walk is assumed to have collapsed rather than
 the surface to have shrunk. That has caught a real regression once already; it is not
 hypothetical.
+
+**What this does not catch, said plainly, because a check whose name outruns what it verifies is
+the thing being defended against.** :func:`classify` asks the question for one method and one
+path, so it answers about *that request* and not about the operation in general:
+
+* **A websocket is invisible to it.** ``matches`` is asked with an ``http`` scope, and an
+  :class:`~fastapi.routing.APIWebSocketRoute` returns no match for one even at its own path —
+  ``GET /api/v1/chat/ws`` classifies as :attr:`Reach.UNROUTED` today. So an operation
+  reintroduced as a websocket at a path declared absent passes. That is *consistent* — no HTTP
+  verb reaches it — and it is still a way back in, and the defence against it is a reviewer
+  reading the diff.
+* **A path nobody wrote down is not checked.** These are declared lists, so an operation
+  reappearing under a name nobody predicted is caught by the vocabulary assertions in
+  :mod:`tests.api.test_contract`, not here.
 """
 
 from __future__ import annotations

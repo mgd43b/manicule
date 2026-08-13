@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 NOT_FOUND = 404
-METHOD_NOT_ALLOWED = 405
 UNPROCESSABLE = 422
 
 
