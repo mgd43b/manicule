@@ -3520,6 +3520,18 @@ def cited_definition(
     made here — :class:`~manicule.app.results.Glossed` refuses the combination outright, so the
     alternative is not "report it anyway" but "raise", and turning a soft delete into a failed
     search is the outcome that helper exists to avoid.
+
+    **Withdrawing the claim does not rewrite the sentence beside it, and that is deliberate.** On
+    that path ``confidence_reason`` is left saying a definition was cited, which by then is
+    stale: :data:`~manicule.retrieval.confidence.DEFINITION_CITED` ends "*and the citation
+    resolves to it*" and the citation has stopped resolving. The repair that suggests itself is
+    to substitute :data:`~manicule.retrieval.confidence.NOTHING_RESEMBLES` here. **Do not.** It
+    is false in the same state, and demonstrably so — the defining passage is still rank 1, so
+    that sentence would be printed directly above the corpus's own definition of the term the
+    question named. Both available sentences are wrong here, a third would be a permanent concept
+    describing a window between two reads of one request, and prose this application invents is
+    worse than prose it merely relays. The argument in full, with the state constructed and the
+    counter-example asserted, is in ``tests/glossary/test_surfaces.py``.
     """
     return bool(confidence and confidence.explicit_definition and expansions)
 

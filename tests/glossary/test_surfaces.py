@@ -703,6 +703,29 @@ async def test_a_definition_whose_document_vanished_withdraws_the_claim_rather_t
     entirely — the definition is never promoted, retrieval classifies ``false`` itself, and the
     payload has nothing to withdraw. The race being simulated happens after retrieval returns.
 
+    **The prose left standing is false, and so is every alternative.** The last assertions pin
+    ``confidence_reason`` at :data:`DEFINITION_CITED` in a state where that sentence ends "*and
+    the citation resolves to it*" and the citation does not resolve — which is the premise of
+    this whole case. So the machine field says no definition was cited while the English says one
+    was: the same contradiction this feature was built to remove, pointing the other way. Anybody
+    who notices will reach for the obvious repair, and the obvious repair is to substitute
+    :data:`NOTHING_RESEMBLES` at the boundary.
+
+    **That repair is worse, and the fixture can show it rather than argue it.** The defining
+    passage is still hit 1 — only the *expansion's* provenance lookup lost its document — so
+    "nothing in this corpus resembles your question" would be printed directly above the
+    corpus's own definition of the term the question named. That is asserted below, because a
+    reason nobody can construct the counter-example to is a reason that gets edited.
+
+    There is no true constant here and a third would be worse than either: it would put a
+    permanent concept in the retrieval vocabulary to describe a window that opens and closes
+    between two reads inside one request, and every reader of ``confidence.py`` would afterwards
+    have to learn a state they will never see. Keeping retrieval's own sentence is therefore not
+    tidy layering; it is the least-wrong option where every option is wrong, and the only one the
+    application does not have to manufacture. The field a client branches on is correct, the
+    prose is stale by one microsecond, and prose is the half this contract tells consumers not
+    to parse.
+
     Without this case the clause that withdraws the claim is unreachable code, and deleting it
     would break nothing that anybody runs.
     """
@@ -737,8 +760,19 @@ async def test_a_definition_whose_document_vanished_withdraws_the_claim_rather_t
     assert found.hits, "the search still answers; a soft delete is not an outage"
     assert found.expansions == (), "an expansion with no readable document is dropped"
     assert _json(found)["explicit_definition"] is False
+
+    assert found.hits[0].chunk_id == entries[corpus.ACRONYM].chunk_id, (
+        "the definition is still the first thing the reader sees — only the expansion's own "
+        "document lookup lost it — which is what makes NOTHING_RESEMBLES a false sentence here "
+        "rather than merely a layering violation"
+    )
     assert found.confidence_reason == DEFINITION_CITED, (
-        "retrieval's own reason is untouched — this withdraws a claim, it does not rescore"
+        "retrieval's own reason is kept, and it is stale: it says the citation resolves to the "
+        "definition and the citation no longer resolves. Do not substitute NOTHING_RESEMBLES to "
+        "repair that — it is false too, as the assertion above shows, and both available "
+        "sentences are wrong in this state. A third would be a permanent concept in the "
+        "retrieval vocabulary describing a window between two reads of one request. The boolean "
+        "beside it is correct, and the boolean is the half this contract is for"
     )
 
 
