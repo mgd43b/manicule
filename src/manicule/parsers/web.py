@@ -452,7 +452,7 @@ def _list_lines(node: LexborNode, depth: int) -> Iterator[str]:
         if own:
             yield f"{_INDENT * depth}{item_prefix(item.tag or '', marker)}{own}"
         for nested in item.iter():
-            if nested.tag in {"ul", "ol"}:
+            if nested.tag in _NESTED_LISTS:
                 yield from _list_lines(nested, depth + 1)
 
 
