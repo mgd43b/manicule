@@ -83,6 +83,17 @@ outside — through `..`, through an absolute path elsewhere, or through a symli
 and so is a symlink named directly, because the walk beneath does not follow links either. A
 source name is not a licence to write manifests beside somebody else's files.
 
+The manifests a narrowed run writes are **byte-identical** to the ones a whole-root run would
+write, because no field in a manifest is relative to the conversion's root —
+[§4](#4-two-deliberate-omissions) omits `snapshot_path` for exactly this reason.
+
+**Narrowing narrows duplicate detection, and that is the one cost.** Two pages declaring one page
+id are refused as a pair, and the pair is only visible to a run that walked both. A run confined
+to `pages/` will happily write a manifest for a page whose twin sits in `other/`. Nothing breaks
+silently — the twin keeps its path identity, and once the converted page holds the id it declares,
+`doctor`'s `document-identity` check reports two rows for one page ([§5d](#5d-converting-a-corpus-that-is-already-indexed)). But the refusal arrives after a sync
+rather than during the conversion. **Convert the whole root unless you have a reason not to.**
+
 `--force` replaces manifests that already exist; without it they are left alone, because one
 already there was most likely written by hand or by another tool.
 

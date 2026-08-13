@@ -356,7 +356,8 @@ async def test_moving_the_page_updates_one_document_rather_than_creating_a_secon
     )
     assert only(store).id == first.id, "same page, different document id"
     record = only(store).provenance
-    assert record is not None and record.snapshot is not None
+    assert record is not None
+    assert record.snapshot is not None
     assert record.snapshot.path == "by-tree/eng/1002.html", (
         "the document did not learn where the page went"
     )
@@ -580,6 +581,75 @@ async def test_a_subdirectory_inside_the_root_is_allowed(tmp_path: Path) -> None
     assert report.written == 1
     assert (root / "pages" / "1002.html.source.json").is_file()
     assert not (root / "other" / "1003.html.source.json").exists(), "the narrowing did nothing"
+
+
+async def test_narrowing_to_a_subdirectory_narrows_duplicate_detection_too(
+    tmp_path: Path,
+) -> None:
+    """The cost of the bounded subdirectory, stated rather than discovered.
+
+    Two pages declaring one id are refused *as a pair* — and the pair is only visible to a run
+    that walked both. Narrowing to one of their directories writes a manifest for the one it saw,
+    because as far as that run is concerned nothing clashes. Converting the whole root refuses
+    both, which is why the whole root is the default.
+
+    **The corpus does not silently break, and that is what makes this a trade rather than a
+    hole.** The unconverted twin keeps its path identity, and the moment the converted one holds
+    the id it declares, ``doctor``'s ``document-identity`` check stops excluding it and reports
+    two rows for one page. Pinned here so that a change which lost the later detection would fail
+    something, rather than leaving the earlier detection's absence uncovered at both ends.
+    """
+    root = corpus(tmp_path)
+    (root / "other").mkdir()
+    (root / "other" / "dup.html").write_text(page(), encoding="utf-8")
+    settings = settings_for(root, profiles=[PROFILE])
+
+    narrowed = await convert(settings, root=Path("pages"))
+
+    assert narrowed.by_outcome == {AdapterOutcome.ADAPTED.value: 1}, (
+        "the narrowed run saw the clash it could not have seen"
+    )
+    store = await _synced(settings)
+    service, backend = await service_for(settings)
+    for document in store.documents.values():
+        backend.store.add(document)
+    check = {c.name: c for c in (await service.doctor()).checks}["document-identity"]
+
+    assert check.state == "degraded", "the corpus holds two rows for one page and doctor is quiet"
+    assert "dup.html" in check.detail
+
+
+async def test_the_whole_root_refuses_the_pair_the_narrowed_run_could_not_see(
+    tmp_path: Path,
+) -> None:
+    """The other half, so the test above is a statement about narrowing and not about the pair."""
+    root = corpus(tmp_path)
+    (root / "other").mkdir()
+    (root / "other" / "dup.html").write_text(page(), encoding="utf-8")
+
+    report = await convert(settings_for(root, profiles=[PROFILE]))
+
+    assert report.by_outcome == {AdapterOutcome.DUPLICATE_IDENTITY.value: 2}
+    assert not list(root.glob("**/*.source.json"))
+
+
+async def test_a_narrowed_conversion_writes_the_same_manifest_as_a_whole_root_one(
+    tmp_path: Path,
+) -> None:
+    """Why narrowing is safe at all: a manifest says nothing about which root produced it.
+
+    ``snapshot_path`` is deliberately never written (§4), so no field in a manifest is relative
+    to the conversion's root. If one were, a narrowed run would emit paths that disagreed with
+    the ones the connector walks to and every manifest it wrote would be refused at ingest.
+    """
+    whole = corpus(tmp_path / "a")
+    narrow = corpus(tmp_path / "b")
+    await convert(settings_for(whole, profiles=[PROFILE]))
+    await convert(settings_for(narrow, profiles=[PROFILE]), root=Path("pages"))
+
+    assert (whole / "pages" / "1002.html.source.json").read_text(encoding="utf-8") == (
+        narrow / "pages" / "1002.html.source.json"
+    ).read_text(encoding="utf-8")
 
 
 async def test_a_root_outside_the_configured_root_is_refused(tmp_path: Path) -> None:
