@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from manicule.core.content import Chunk, Document
+    from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Embedder
     from manicule.retrieval.ports import GlossarySource
     from manicule.storage.docstore import SqliteDocStore
@@ -84,7 +85,12 @@ async def index(
 
 
 async def build_corpus(store: SqliteDocStore, *, workspace_id: str = WORKSPACE) -> list[Chunk]:
-    """The whole fixture: one glossary page, forty-five ordinary uses, fifteen usages."""
+    """The whole fixture: two glossary pages, forty-five ordinary uses, fifteen usages.
+
+    The first glossary page is the twenty-five entry chunk every recorded cosine describes and
+    it must stay exactly as it is; the supplement is where later material goes. See
+    ``corpus.SUPPLEMENT_ENTRIES`` for why they are two documents rather than one longer page.
+    """
     chunks: list[Chunk] = []
     _, glossary = await index(
         store,
@@ -94,6 +100,14 @@ async def build_corpus(store: SqliteDocStore, *, workspace_id: str = WORKSPACE) 
         workspace_id=workspace_id,
     )
     chunks.extend(glossary)
+    _, supplement = await index(
+        store,
+        "supplement",
+        corpus.SUPPLEMENT_TITLE,
+        [corpus.supplement_page()],
+        workspace_id=workspace_id,
+    )
+    chunks.extend(supplement)
     _, handbook = await index(
         store,
         "handbook",
@@ -103,6 +117,22 @@ async def build_corpus(store: SqliteDocStore, *, workspace_id: str = WORKSPACE) 
     )
     chunks.extend(handbook)
     return chunks
+
+
+async def entries_by_acronym(
+    store: SqliteDocStore, chunks: Sequence[Chunk]
+) -> dict[str, GlossaryEntry]:
+    """Every definition detected anywhere in ``chunks``, keyed by normalised acronym.
+
+    Looked up across every document the fixture produced rather than off one id, so a test does
+    not have to know which page a term was defined on — and does not quietly start asserting
+    against the wrong document when one moves.
+    """
+    found: dict[str, GlossaryEntry] = {}
+    for document_id in dict.fromkeys(chunk.document_id for chunk in chunks):
+        for entry in await store.glossary_entries(document_id):
+            found[entry.acronym] = entry
+    return found
 
 
 async def retriever_over(
@@ -172,6 +202,7 @@ __all__ = [
     "SCOPE",
     "WORKSPACE",
     "build_corpus",
+    "entries_by_acronym",
     "index",
     "query_filter",
     "rank_of",

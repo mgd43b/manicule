@@ -293,37 +293,38 @@ async def test_a_stylized_term_resolves_through_its_normalised_key(
     ["NOTE", "TODAY", "API"],
     ids=["note", "today", "api"],
 )
-async def test_prose_on_the_glossary_page_produces_no_entry_to_promote(
+async def test_prose_on_a_glossary_page_produces_no_entry_to_promote(
     store: SqliteDocStore, indexed: list[Chunk], term: str
 ) -> None:
-    """The negatives through the real ingest path, on the real glossary page.
+    """The negatives through the real ingest path, on a real glossary page.
 
     ``system.index`` calls the shipped ``detect_entries``, so what this asserts is that nothing
     was ever written — not that something written was later filtered out. A term with no entry
     cannot be expanded, cannot be promoted and cannot be classified as an explicit definition,
     so one refusal at ingest closes all three doors at once.
 
-    See ``corpus.PROSE_ON_THE_GLOSSARY_PAGE``: this is only a test because those lines sit on a
-    page whose title supplies the evidence that carries them to exactly the threshold.
+    See ``corpus.PROSE_ON_THE_GLOSSARY_PAGE``: this is only a test because those lines sit under
+    a title that supplies the evidence carrying them to exactly the threshold.
     """
-    entries = await store.glossary_entries(indexed[0].document_id)
+    entries = await system.entries_by_acronym(store, indexed)
 
-    assert term not in {entry.acronym for entry in entries}
+    assert term not in entries
 
 
-async def test_the_glossary_page_still_yields_the_definitions_it_states(
+async def test_the_glossary_pages_still_yield_the_definitions_they_state(
     store: SqliteDocStore, indexed: list[Chunk]
 ) -> None:
     """The other side of the refusal, so a rule that rejected everything could not pass.
 
-    ``test_prose_on_the_glossary_page_produces_no_entry_to_promote`` is satisfied by a detector
-    that writes nothing at all. This is the assertion that stops that from being a green suite.
+    ``test_prose_on_a_glossary_page_produces_no_entry_to_promote`` is satisfied by a detector
+    that writes nothing at all. This is the assertion that stops that from being a green suite:
+    every line that *is* a definition is still one, across both pages.
     """
-    entries = await store.glossary_entries(indexed[0].document_id)
+    entries = await system.entries_by_acronym(store, indexed)
 
-    found = {entry.acronym for entry in entries}
-    assert len(entries) == len(corpus.GLOSSARY_ENTRIES)
-    assert {corpus.ACRONYM, corpus.DESCRIBED_ACRONYM, corpus.STYLIZED_ACRONYM} <= found
+    expected = len(corpus.GLOSSARY_ENTRIES) + len(corpus.SUPPLEMENT_ENTRIES)
+    assert len(entries) == expected, "a definition was lost, or a line of prose was admitted"
+    assert {corpus.ACRONYM, corpus.DESCRIBED_ACRONYM, corpus.STYLIZED_ACRONYM} <= set(entries)
 
 
 # --- the queries that must not change ----------------------------------------------------------
@@ -630,7 +631,7 @@ async def test_a_question_with_no_definition_behind_it_still_reports_no_evidence
 
 
 async def test_a_mention_of_the_term_is_not_enough_to_claim_a_definition(
-    store: SqliteDocStore, indexed: list[Chunk], definition: str
+    store: SqliteDocStore, indexed: list[Chunk]
 ) -> None:
     """The narrowest version of the rule, with every other condition satisfied.
 
@@ -650,13 +651,14 @@ async def test_a_mention_of_the_term_is_not_enough_to_claim_a_definition(
     every query that merely mentions a defined term.
     """
     retriever = await _with_glossary(store, indexed)
+    defining = (await system.entries_by_acronym(store, indexed))[corpus.DESCRIBED_ACRONYM].chunk_id
 
     result = await retriever.retrieve(_ask(f"raise a ticket in {corpus.DESCRIBED_ACRONYM} today"))
 
     assert result.expansion is not None
     assert result.expansion.fired, "the fixture must actually promote, or it tests nothing"
     assert result.expansion.matches[0].reason is MatchReason.EXACT_CASE
-    assert system.rank_of(result.context.passages, definition) == 1, (
+    assert system.rank_of(result.context.passages, defining) == 1, (
         "the defining passage must be in front of the reader, or the rule is untested"
     )
     assert result.confidence is not None

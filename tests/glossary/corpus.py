@@ -12,12 +12,18 @@ Fixture                                              Rank of the definition
 ===================================================  ===============================
 The glossary line as its own short passage, thirty   **1 of 33** — no failure
 ordinary uses of "now" around it
-The glossary as one chunk holding 27 entries         **1 of 31**, cosine 0.4655 —
+The glossary as one chunk holding 25 entries         **1 of 31**, cosine 0.4655 —
                                                      ranked fine, but below the noise
                                                      floor, so confidence said ``none``
 The above, plus fifteen passages that *use* the      **15 of 61** — the failure
 acronym in running text
 ===================================================  ===============================
+
+Those ranks are the historical record of how the fixture was arrived at, measured by a method
+this suite no longer performs — attempting to re-derive them produced different figures, so they
+are left as the account they are rather than restated as current fact. What *is* current is
+:mod:`tests.glossary.test_measured`, which measures the shipped retriever and states the numbers
+it produced. The corpus is 62 chunks since the supplement was added, not 61.
 
 So reproducing it needed two ingredients, and a fixture missing either one proves nothing:
 
@@ -36,16 +42,19 @@ every passage the phrase "network operations workspace", which made the expanded
 glossary *last* — a fixture that would have proved expansion harmful, for a reason no corpus
 has.
 
-**What the page carries beyond bare definitions**, added for the description-boundary work and
-each earning its place by being a category the extraction rules can get wrong:
+**A second glossary page carries the description-boundary material**, and it is separate from
+the first for a reason that outlives this change: the twenty-five entry chunk is what every
+cosine in this suite and in ``docs/retrieval.md`` §8 was measured against, so adding a line to
+it would retire those measurements without failing anything. See :data:`SUPPLEMENT_ENTRIES`.
+What the supplement holds, each a category the extraction rules can get wrong:
 
 * :data:`DESCRIBED_ENTRY` — a definition trailed by nine words of prose, which the detector
   refused wholesale before it could tell an expansion from a description.
 * :data:`STYLIZED_ENTRY` — the same shape with a stylized spelling, so display preservation and
   description-trimming are proved *together* rather than on two fixtures each built for one.
-* :data:`PROSE_ON_THE_GLOSSARY_PAGE` — three lines that look like definitions and are not, on
-  the page where the confidence arithmetic admits them. Two of the three were recorded as real
-  entries before this fixture existed.
+* :data:`PROSE_ON_THE_GLOSSARY_PAGE` — three lines that look like definitions and are not, on a
+  page whose title supplies the evidence that carries them to exactly the threshold. Two of the
+  three were recorded as real entries before this fixture existed.
 """
 
 from __future__ import annotations
@@ -87,14 +96,35 @@ PROSE_ON_THE_GLOSSARY_PAGE: Final[tuple[str, ...]] = (
     "Today - the system is operating normally.",
     "API - when enabled, the process starts automatically.",
 )
-"""Prose that looks like a definition, **sitting on the glossary page itself**.
+"""Prose that looks like a definition, on a page that says it is a glossary.
 
-Placed here rather than in a separate document because that placement is the whole test. On an
-ordinary page a spaced hyphen scores 0.45 against a 0.60 threshold and every line here is
-refused by arithmetic that has nothing to do with this feature. On a page titled "Glossary of
-terms" the context evidence adds the missing 0.15, the total is exactly the threshold, and the
-scoring gate admits all three — so this is the only placement where refusing them proves
-anything. Do not move them.
+**The placement is the whole test.** On an ordinary page a spaced hyphen scores 0.45 against a
+0.60 threshold, so every line here is refused by arithmetic that has nothing to do with this
+feature and a fixture placed there passes whether the detector is right or wrong. Under
+:data:`SUPPLEMENT_TITLE` the context evidence adds the missing 0.15, the total is exactly the
+threshold, and the scoring gate admits all three — so this is the only placement where refusing
+them proves anything. Do not move them off a glossary page.
+
+Two of the three were recorded as real entries before ``core_expansion`` existed: ``NOTE`` at
+nine words and ``API`` at six, both under :data:`~manicule.ingest.glossary.MAX_EXPANSION_WORDS`.
+"""
+
+SUPPLEMENT_TITLE: Final = "Glossary supplement: newer terminology"
+
+SUPPLEMENT_ENTRIES: Final[tuple[str, ...]] = (DESCRIBED_ENTRY, STYLIZED_ENTRY)
+"""The definitions that carry descriptions, on a page of their own.
+
+**A second document rather than two more lines on the first**, and that is a constraint this
+suite has to keep. Every cosine recorded against :data:`GLOSSARY_ENTRIES` is a property of that
+exact chunk; growing it would leave ``STRONG_SIMILARITY`` and the §8 tables citing a corpus that
+no longer exists, which is the quietest way a measured constant goes wrong. Measured directly:
+adding these two lines and the prose to the twenty-five entry page moved its cosine to ``What is
+NOW?`` from 0.4432 to 0.4984. Both are still below the 0.54 noise floor, so no claim would have
+*broken* — the numbers would just no longer have been the numbers.
+
+A separate page is also the better fixture. A term defined on one page while a question is asked
+against a corpus of several is what a real deployment looks like, and it means promotion has to
+find the right document rather than the only one.
 """
 
 GLOSSARY_ENTRIES: Final[tuple[str, ...]] = (
@@ -111,12 +141,10 @@ GLOSSARY_ENTRIES: Final[tuple[str, ...]] = (
     "MISTRAL — Metrics Ingest Stream Transfer And Load",
     "NIMBUS — Node Inventory Metrics Bucket Update Service",
     f"{ACRONYM} — {EXPANSION}",
-    DESCRIBED_ENTRY,
     "OBSIDIAN — Observation Buffer Storage Index And Node",
     "PUMICE — Pipeline Update Metrics Index Collection Engine",
     "QUARTZ — Query Uptime And Retention Tracking Zone",
     "RAVINE — Retention And Vault Index Node Export",
-    STYLIZED_ENTRY,
     "SIERRA — Storage Index Export Retention Relay Agent",
     "TUNDRA — Tooling Under Node Data Retention Agent",
     "UMBER — Update Metrics Buffer And Export Relay",
@@ -126,11 +154,15 @@ GLOSSARY_ENTRIES: Final[tuple[str, ...]] = (
     "YARROW — Yield And Retention Reporting Observation Window",
     "ZEPHYR — Zone Export Pipeline Health Yield Runner",
 )
-"""Twenty-seven terms on one page. The count is the dilution, and the dilution is the point.
+"""Twenty-five terms on one page. The count is the dilution, and the dilution is the point.
 
-Twenty-five of them are bare ``TERM — Expansion`` lines. The other two carry descriptions, and
-they are interleaved among the rest rather than appended, so nothing downstream can be right by
-position.
+**Do not add entries here.** This tuple is the chunk every cosine recorded in this suite and in
+``docs/retrieval.md`` §8 was measured against — 0.4655 for ``What is NOW?``, 0.702 and 0.747 for
+the two phrasings :data:`~manicule.retrieval.confidence.STRONG_SIMILARITY` is justified from. A
+line added here changes the chunk's vector and silently retires all three: the constants would
+still cite measurements, and the corpus they name would no longer be the corpus that produced
+them. New material goes on :data:`SUPPLEMENT_ENTRIES`, which is a second document and leaves
+this one byte-identical.
 """
 
 ORDINARY: Final[tuple[str, ...]] = (
@@ -290,12 +322,21 @@ the corpus never mentions."""
 def glossary_page() -> str:
     """The glossary as one chunk, which is how 512/64 chunking delivers it.
 
-    The prose lines sit inside it, which is what makes them a real test of detection rather than
-    of arithmetic — see :data:`PROSE_ON_THE_GLOSSARY_PAGE`.
+    Unchanged since the measurements in ``docs/retrieval.md`` §8 were taken, and it has to stay
+    that way — see :data:`GLOSSARY_ENTRIES`.
+    """
+    return f"{GLOSSARY_TITLE}\n\n" + "\n".join(GLOSSARY_ENTRIES)
+
+
+def supplement_page() -> str:
+    """The second glossary: two described definitions and three lines of prose, one chunk.
+
+    The prose sits *inside* it rather than on a page of its own, because a definition-shaped
+    sentence is only hard to refuse where the page vouches for it.
     """
     return (
-        f"{GLOSSARY_TITLE}\n\n"
-        + "\n".join(GLOSSARY_ENTRIES)
+        f"{SUPPLEMENT_TITLE}\n\n"
+        + "\n".join(SUPPLEMENT_ENTRIES)
         + "\n"
         + "\n".join(PROSE_ON_THE_GLOSSARY_PAGE)
     )
@@ -332,6 +373,9 @@ __all__ = [
     "STYLIZED_DISPLAY",
     "STYLIZED_ENTRY",
     "STYLIZED_EXPANSION",
+    "SUPPLEMENT_ENTRIES",
+    "SUPPLEMENT_TITLE",
     "glossary_page",
     "passages",
+    "supplement_page",
 ]
