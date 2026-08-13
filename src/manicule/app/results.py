@@ -594,10 +594,15 @@ class EmbeddingCost(Payload):
     """Batches the embedder was asked for. The number an accelerator's time is proportional to."""
 
     vectors_new: int = Field(default=0, ge=0)
-    """Rows written where the store held none."""
+    """Of ``embedded``, those the store held no row for.
+
+    Not every row the operation wrote: a reused vector re-filed under a new chunk id also lands
+    in a row that did not exist, and is counted under ``reused``. This pair says where the
+    *embedder's* output went.
+    """
 
     vectors_replaced: int = Field(default=0, ge=0)
-    """Rows whose stored vector was overwritten with a different one."""
+    """Of ``embedded``, those that overwrote a row the store already had."""
 
     vectors_backfilled: int = Field(default=0, ge=0)
     """Reused rows that carried no recorded embedding-input identity and had one reconstructed.

@@ -878,20 +878,22 @@ class IngestPipeline:
             if not chunks:
                 return await self._nothing_to_index(result, document, raw=raw)
             await self._advance(existing, DocumentStatus.EMBEDDING)
-            # Read before the lock is taken. It is a database query about what this document
-            # already holds, and holding the one lock every embedder in the process shares
-            # while it runs would serialise a read behind the model for no reason.
+            # The lock goes to `embed_or_reuse`, which holds it around the model call and
+            # nothing else. Both reads here — this one and the vector store's — are about what
+            # the index already holds, and taking the one lock every embedder in the process
+            # shares while they run would serialise a sweep against a concurrent sync on work
+            # neither of them needs the model for.
             previous = await self._previous_inputs(document, existing)
-            async with self._embedding:
-                vectors, work = await embed_or_reuse(
-                    self._embedder,
-                    chunks,
-                    vectors=self._vectors,
-                    chunk_fingerprint=self._chunk_fingerprint,
-                    previous=previous,
-                    target_batch_tokens=self._target_batch_tokens,
-                    maximum=self._max_embed_batch,
-                )
+            vectors, work = await embed_or_reuse(
+                self._embedder,
+                chunks,
+                vectors=self._vectors,
+                chunk_fingerprint=self._chunk_fingerprint,
+                previous=previous,
+                target_batch_tokens=self._target_batch_tokens,
+                maximum=self._max_embed_batch,
+                lock=self._embedding,
+            )
         except _StageError as failure:
             return await self._demote(document, existing, failure.stage, failure.detail)
         except ContextOverflowError as exc:

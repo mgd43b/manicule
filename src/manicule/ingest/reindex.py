@@ -101,13 +101,24 @@ def _total(left: EmbeddingWork, right: EmbeddingWork) -> EmbeddingWork:
 
     Written once rather than at each of the three places that aggregate, because a sum that
     forgets a field reports a smaller cost than was paid and nothing fails when it does.
+
+    Reflective over the fields, which is what makes it maintenance-free and also what makes the
+    refusal below necessary: ``+`` is defined on strings and on lists too, so a field that was
+    not a count would be *concatenated* here rather than rejected, and the report would go
+    quietly wrong instead of loudly.
     """
-    return EmbeddingWork(
-        **{
-            name: getattr(left, name) + getattr(right, name)
-            for name in EmbeddingWork.__dataclass_fields__
-        }
-    )
+    totals: dict[str, int] = {}
+    for name in EmbeddingWork.__dataclass_fields__:
+        values = (getattr(left, name), getattr(right, name))
+        if not all(isinstance(value, int) for value in values):
+            msg = (
+                f"EmbeddingWork.{name} is not a count, so two of them cannot be added. Every "
+                f"field of an embed-stage accounting is summed across documents; a field that "
+                f"is not a number needs its own rule rather than this one."
+            )
+            raise TypeError(msg)
+        totals[name] = values[0] + values[1]
+    return EmbeddingWork(**totals)
 
 
 async def select(
@@ -222,13 +233,16 @@ async def re_embed(
             # passage, it is an embedding of something else.
             report.failures.append(f"{document.id}: {exc}")
             continue
+        # `vectors_new` and `vectors_replaced` are deliberately left at zero. This verb does
+        # not read the rows it is about to overwrite, so it does not know which of them existed
+        # — and a report that guessed "all replaced" would be asserting something it never
+        # checked, in a module whose whole subject is not doing that.
         report.note_embedding(
             EmbeddingWork(
                 chunks=len(chunks),
                 embedded=len(chunks),
                 input_changed=len(chunks),
                 forward_calls=batches,
-                vectors_replaced=len(chunks),
             )
         )
         await vectors.upsert(chunks, produced)

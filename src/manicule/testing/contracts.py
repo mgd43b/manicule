@@ -415,7 +415,7 @@ async def assert_vector_store_reuses_by_embedding_input(
     invisibly, because every write succeeds and every search returns.
 
     So this is run against every store manicule ships, and against any store a plugin
-    contributes. Five cases, each of which a plausible wrong implementation gets wrong:
+    contributes. Six cases, each of which a plausible wrong implementation gets wrong:
 
     1. **An unchanged chunk is readable**, and comes back with the vector that was stored.
     2. **A chunk whose ``embed_text`` changed while its id did not is stale.** The case an
@@ -423,9 +423,13 @@ async def assert_vector_store_reuses_by_embedding_input(
        rather than about ids.
     3. **A chunk that moved position, with neither text nor embedding input changed, is
        readable.** Position is not part of the embedding input and must not invalidate.
-    4. **A chunk with no row at all is absent**, rather than missing from the answer. The
+    4. **A chunk refiled under a new id, with the same embedding input, is readable.** The
+       other direction of the same mistake, and the one a store passes case 3 without having:
+       a chunk id carries its position, so inserting one paragraph renames every chunk below
+       it. A store that only ever looks a row up by id re-embeds all of them.
+    5. **A chunk with no row at all is absent**, rather than missing from the answer. The
        answer is total: one verdict per chunk asked about.
-    5. **Every verdict that is not readable carries no vector.** A caller that reads
+    6. **Every verdict that is not readable carries no vector.** A caller that reads
        ``verdict.vector`` without checking the state must get nothing rather than something.
     """
     fingerprint = _fingerprint(8)
@@ -447,6 +451,7 @@ async def assert_vector_store_reuses_by_embedding_input(
     unchanged, rewritten, moved = original
     rewritten = rewritten.model_copy(update={"embed_text": f"Somewhere else > {rewritten.text}"})
     moved = moved.model_copy(update={"position": moved.position + 100})
+    refiled = moved.model_copy(update={"id": f"{moved.id}-refiled"})
     never_stored = unchanged.model_copy(
         update={
             "id": f"{unchanged.id}-absent",
@@ -455,9 +460,10 @@ async def assert_vector_store_reuses_by_embedding_input(
         }
     )
 
-    verdicts = await store.stored_vectors([unchanged, rewritten, moved, never_stored])
+    asked = [unchanged, rewritten, moved, refiled, never_stored]
+    verdicts = await store.stored_vectors(asked)
     _require(
-        set(verdicts) == {unchanged.id, rewritten.id, moved.id, never_stored.id},
+        set(verdicts) == {chunk.id for chunk in asked},
         "the store answered about a different set of chunks than it was asked about. The "
         "answer is total — one verdict per chunk — so a caller never has to guess what a "
         "missing key meant",
@@ -485,6 +491,14 @@ async def assert_vector_store_reuses_by_embedding_input(
         "the store refused to reuse the vector of a chunk that only moved position. Position "
         "is not part of the embedding input, so a document whose sections were reordered "
         "would re-embed in full for no change to any embedded string",
+    )
+    _require(
+        verdicts[refiled.id].state is VectorState.READABLE,
+        "the store found nothing for a chunk whose embedding input it holds a vector for, "
+        "because that vector is filed under the id the chunk used to have. A chunk id carries "
+        "its position, so one inserted paragraph renames every chunk below it — and a store "
+        "that only looks a row up by id re-embeds a document that moved nothing the model "
+        "would see",
     )
     _require(
         verdicts[never_stored.id].state is VectorState.ABSENT,

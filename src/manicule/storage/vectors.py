@@ -512,22 +512,19 @@ class LanceVectorStore:
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> Mapping[str, StoredVector]:
         """What this store holds for each of ``chunks``, and whether it can still be used.
 
-        The rule, in the order it is applied, because each step rejects something the step
-        after it would have accepted:
+        **What a verdict means is decided by
+        :func:`~manicule.core.embedding.classify_stored_vector`**, which every backend shares
+        and which is the only place the rule is written down. This method's job is to produce
+        the three things a Lance row knows — its recorded identity, the ``embed_text`` of the
+        chunk stored beside it, and the vector — and to look in the two places a row can be.
 
-        1. **A row that cannot be read as a chunk is corrupt.** Nothing about it can be
-           checked, and an unreadable row is not a vector to reuse.
-        2. **A row that contradicts itself is corrupt.** The recorded identity is compared
-           against one derived from the chunk stored beside it, and a disagreement means the
-           metadata does not describe the vector. Identity metadata asserting that a usable
-           vector exists is exactly the thing that must not be taken on trust — so a row
-           claiming to be about the input being asked for, while saying two different things
-           about what that input was, is repaired rather than believed.
-        3. **A row about a different embedding input is stale.** This is the case chunk-id
-           reuse gets wrong: the id survived a re-parse, the breadcrumb in ``embed_text`` did
-           not, and the stored vector describes a string this chunk no longer contains.
-        4. **A row of the wrong dimension is corrupt**, however current its identity.
-        5. Everything left is readable, and its vector is returned exactly as stored.
+        **Two lookups, because a chunk id is not the only way a row can belong to a chunk.**
+        The first is by id. The second is by embedding-input identity, for the chunks the first
+        did not answer: a chunk id carries its position, so inserting one paragraph renames
+        every chunk below it while moving no embedding input at all, and keyed on the id alone
+        that edit re-embeds the whole document.
+        :func:`~manicule.core.embedding.choose_stored_vector` decides which verdicts the second
+        lookup is allowed to override.
 
         **A row written before the identity column is reconstructed, not distrusted.** Its
         embedding input is read from the chunk in :data:`CHUNK_COLUMN`, which
@@ -542,7 +539,10 @@ class LanceVectorStore:
         :meth:`delete_document` and unlike :meth:`upsert` and :meth:`search`. The fingerprint
         it compares against is the one the directory records, which is the one the stored
         vectors were made with — the only fingerprint the question is about. A directory that
-        holds nothing answers that it holds nothing for every chunk, which is true.
+        holds nothing answers that it holds nothing for every chunk, which is true. The one
+        thing an unprepared instance does not know is the middleware declaration, which it
+        takes as empty; that can only make an identity fail to match, so the cost is a
+        re-embed rather than a wrong vector.
         """
         verdicts = {chunk.id: StoredVector(state=VectorState.ABSENT) for chunk in chunks}
         if not chunks:
@@ -551,37 +551,36 @@ class LanceVectorStore:
         fingerprint = await self.fingerprint()
         if table is None or fingerprint is None:
             return verdicts
+        schema = await table.schema()
+        has_identity = IDENTITY_COLUMN in {str(field.name) for field in schema}
 
         by_id = {chunk.id: chunk for chunk in chunks}
-        for record in await self._rows_for(table, sorted(by_id)):
+        for record in await self._rows_for(table, sorted(by_id), has_identity=has_identity):
             chunk = by_id.get(str(record[ID_COLUMN]))
             if chunk is None:  # pragma: no cover - the predicate asked for these ids only
                 continue
             verdicts[chunk.id] = self._verdict(chunk, record, fingerprint)
 
-        # A second lookup, keyed on the embedding input rather than on the chunk id, for the
-        # chunks the first one did not answer. A chunk id carries its position, so inserting a
-        # paragraph renames every chunk below it while moving no embedding input at all — and
-        # keyed on the id alone that edit re-embeds the whole document. See
-        # `choose_stored_vector` for which verdicts this is allowed to override.
         wanted = {
             chunk.id: self._identity_of(chunk.embed_text, fingerprint)
             for chunk in chunks
             if verdicts[chunk.id].state in {VectorState.ABSENT, VectorState.STALE}
         }
-        if not wanted:
+        if not (wanted and has_identity):
             return verdicts
         found = await self._rows_by_identity(table, sorted(set(wanted.values())))
-        for chunk in chunks:
-            identity = wanted.get(chunk.id)
-            record = None if identity is None else found.get(identity)
-            verdicts[chunk.id] = choose_stored_vector(
-                verdicts[chunk.id],
-                None if record is None else self._verdict(chunk, record, fingerprint),
+        for chunk_id, identity in wanted.items():
+            record = found.get(identity)
+            if record is None:
+                continue
+            verdicts[chunk_id] = choose_stored_vector(
+                verdicts[chunk_id], self._verdict(by_id[chunk_id], record, fingerprint)
             )
         return verdicts
 
-    async def _rows_for(self, table: AsyncTable, chunk_ids: Sequence[str]) -> list[dict[str, Any]]:
+    async def _rows_for(
+        self, table: AsyncTable, chunk_ids: Sequence[str], *, has_identity: bool
+    ) -> list[dict[str, Any]]:
         """Every stored row among ``chunk_ids``, read in bounded pages.
 
         Paged because the predicate is an ``IN`` list and the caller's set is not bounded by
@@ -589,13 +588,13 @@ class LanceVectorStore:
         is a SQL string megabytes long. The page size is a property of the query, not of the
         work, so it needs no tuning knob.
 
-        The identity column is selected only when the table has one. A table that predates it
-        gains it in :meth:`ensure_ready`, but this method does not require that to have run —
-        so it asks the schema rather than assuming, and a row from a table without the column
-        reads as :data:`~manicule.core.embedding.UNRECORDED_IDENTITY`, which is what it is.
+        ``limit(len(page))`` is exact here rather than defensive: a chunk id is the merge key,
+        so the table holds at most one row per id and a page of *n* ids can match at most *n*
+        rows. :meth:`_rows_by_identity` does not have that property and does not have the limit.
+
+        A row from a table without the identity column reads as
+        :data:`~manicule.core.embedding.UNRECORDED_IDENTITY`, which is what it is.
         """
-        schema = await table.schema()
-        has_identity = IDENTITY_COLUMN in {str(field.name) for field in schema}
         columns = [ID_COLUMN, VECTOR_COLUMN, CHUNK_COLUMN]
         if has_identity:
             columns.append(IDENTITY_COLUMN)
@@ -625,14 +624,14 @@ class LanceVectorStore:
         a vector is a pure function of that input under a fixed fingerprint, so every row
         recorded against it holds the same vector and any of them answers the question.
 
-        A table without the identity column has nothing to search — every row in it reads as
-        :data:`~manicule.core.embedding.UNRECORDED_IDENTITY` — so this returns nothing and the
-        id-keyed answer stands. Those rows are still reusable under their own ids, and the
-        first write of each records its identity, after which it is findable here too.
+        **No ``limit``, deliberately, and this is where one would be a bug rather than a
+        safeguard.** An identity is not a key: two chunks with the same text under the same
+        breadcrumb record the same one, so a page of *n* identities can match many more than
+        *n* rows. A limit of *n* would then return every row of one popular identity and none
+        of the others — losing reuse for the rest, silently, in an order decided by however the
+        rows happen to be laid out. The ``IN`` predicate is the bound, and what it bounds is
+        the duplicate density of the corpus.
         """
-        schema = await table.schema()
-        if IDENTITY_COLUMN not in {str(field.name) for field in schema}:
-            return {}
         rows: dict[str, dict[str, Any]] = {}
         for start in range(0, len(identities), IDENTITY_QUERY_PAGE):
             page = identities[start : start + IDENTITY_QUERY_PAGE]
@@ -641,7 +640,6 @@ class LanceVectorStore:
                 await table.query()
                 .where(f"{IDENTITY_COLUMN} IN ({listed})")
                 .select([ID_COLUMN, VECTOR_COLUMN, CHUNK_COLUMN, IDENTITY_COLUMN])
-                .limit(len(page))
                 .to_list()
             )
             for record in found:
@@ -781,7 +779,7 @@ class LanceVectorStore:
         schema = await table.schema()
         if IDENTITY_COLUMN in {str(field.name) for field in schema}:
             return
-        await table.add_columns({IDENTITY_COLUMN: f"'{UNRECORDED_IDENTITY}'"})
+        await table.add_columns({IDENTITY_COLUMN: quote(UNRECORDED_IDENTITY)})
 
     async def _existing_table(self) -> AsyncTable | None:
         """The vector table if the directory has one, without requiring :meth:`ensure_ready`.
@@ -813,7 +811,6 @@ __all__ = [
     "META_TABLE",
     "PUSHED_DOWN_FILTER_FIELDS",
     "TABLE_PREFIX",
-    "UNRECORDED_IDENTITY",
     "LanceVectorStore",
     "VectorStoreStateError",
     "fingerprint_hash",

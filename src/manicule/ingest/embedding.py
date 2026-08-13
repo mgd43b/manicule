@@ -23,6 +23,7 @@ exists to keep it fed.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,7 @@ from manicule.core.embedding import VectorState, require_within_context
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from contextlib import AbstractAsyncContextManager
 
     from manicule.core.content import Chunk
     from manicule.core.embedding import Vector
@@ -127,10 +129,18 @@ class EmbeddingWork:
     is not one absorbed by the embedder's in-memory cache. Those are four different facts and
     an operator pricing a corpus-wide re-parse needs them apart.
 
-    Two invariants hold by construction, and the tests assert them rather than trusting them:
+    Two invariants hold of **what :func:`embed_or_reuse` returns**, and
+    ``test_the_partition_adds_up_however_the_work_falls`` asserts them rather than trusting
+    them:
 
     - ``reused + embedded == chunks``
     - ``input_changed + repaired == embedded == vectors_new + vectors_replaced``
+
+    They are scoped to that function on purpose. A caller may build one of these by hand from
+    what it knows — :func:`~manicule.ingest.reindex.re_embed` does, because it embeds
+    unconditionally and never reads the rows it overwrites — and such a record leaves at zero
+    every field it did not measure. Zero here always means *not counted*, never *checked and
+    found to be none*.
     """
 
     chunks: int = 0
@@ -163,14 +173,20 @@ class EmbeddingWork:
     """Batches the embedder was actually asked for. Counted at the call, not derived from it."""
 
     vectors_new: int = 0
-    """Rows written where the store held none."""
+    """Of ``embedded``, those the store held no row for. A row that did not exist before.
+
+    **Not every row the commit writes**, and the narrower reading is the checked one. A reused
+    vector re-filed under a new chunk id also lands in a row that did not exist — that is what
+    happens to every chunk below an inserted paragraph — and it is counted under ``reused``,
+    because what this pair is about is where the *embedder's* output went.
+    """
 
     vectors_replaced: int = 0
-    """Rows whose stored vector was overwritten with a different one.
+    """Of ``embedded``, those that overwrote a row the store already had.
 
-    A reused vector is written back unchanged — the row's chunk may have moved position, and
-    an unrecorded identity is recorded by the write — so it is not counted here. "Replaced"
-    means the vector changed.
+    A reused vector written back is not counted here: the row's chunk may have moved position
+    and an unrecorded identity is recorded by the write, but the vector is the one that was
+    already there. "Replaced" means the vector changed.
     """
 
     vectors_backfilled: int = 0
@@ -191,6 +207,7 @@ async def embed_or_reuse(
     previous: Mapping[str, str] | None = None,
     target_batch_tokens: int = 16_384,
     maximum: int = MAX_BATCH,
+    lock: AbstractAsyncContextManager[object] | None = None,
 ) -> tuple[list[Vector], EmbeddingWork]:
     """Embed only the chunks whose embedding input the index does not already hold a vector for.
 
@@ -223,6 +240,14 @@ async def embed_or_reuse(
             that did not look, and every chunk with no row is then counted as new.
         target_batch_tokens: Tokens per batch, from which the batch size is derived.
         maximum: Clamp on the derived size.
+        lock: Held around the model call and nothing else, when the caller has one.
+
+            **The scope is the point.** What the pipeline's lock exists for is that two batches
+            never reach the model at once (``docs/ingest.md`` §6.6); it is not a lock on the
+            vector store. Taken around this whole function it would hold the single
+            process-wide embedding lock across a vector-store read for every document — so a
+            sweep and a sync running beside each other would serialise on a read they could
+            have done concurrently, which is contention rather than the thing the lock is for.
 
     Returns:
         One vector per chunk, in the order the chunks were given, and what it cost.
@@ -265,14 +290,15 @@ async def embed_or_reuse(
         del batch
         forward_calls += 1
 
-    produced = await embed_chunks(
-        embedder,
-        pending,
-        chunk_fingerprint=chunk_fingerprint,
-        target_batch_tokens=target_batch_tokens,
-        maximum=maximum,
-        on_batch=count_batch,
-    )
+    async with lock if lock is not None else nullcontext():
+        produced = await embed_chunks(
+            embedder,
+            pending,
+            chunk_fingerprint=chunk_fingerprint,
+            target_batch_tokens=target_batch_tokens,
+            maximum=maximum,
+            on_batch=count_batch,
+        )
 
     ordered: list[Vector] = [()] * len(chunks)
     for position, vector in reused.items():

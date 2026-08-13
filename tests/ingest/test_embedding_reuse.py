@@ -367,8 +367,9 @@ async def test_a_chunk_that_only_moved_position_reuses_its_vector() -> None:
     assert embedder.batches == [], "and not one of them cost a forward pass"
     assert (sweep.embedding.reused, sweep.embedding.embedded) == (3, 0)
     assert sweep.embedding.vectors_new == 0, (
-        "the rows are written under the ids the chunks now have, and every vector in them came "
-        "out of the store"
+        "`vectors_new` counts where the *embedder's* output went, and the embedder produced "
+        "none. The rows written under the ids the chunks now have are new rows, and they are "
+        "counted under `reused` because the vectors in them came out of the store"
     )
 
 
@@ -662,3 +663,39 @@ async def test_a_document_with_nothing_to_embed_still_refuses_an_oversized_chunk
         await embed_or_reuse(embedder, [oversized], vectors=vectors)
 
     assert embedder.batches == [], "and it refused before asking the model for anything"
+
+
+async def test_the_partition_adds_up_however_the_work_falls() -> None:
+    """The arithmetic `EmbeddingWork` claims, over a corpus holding all four verdicts at once.
+
+    A report whose parts do not sum to its whole is one an operator cannot reason from, and the
+    failure is quiet: every number looks plausible on its own. Asserted here rather than left to
+    the class docstring, over one document arranged to contain a reused chunk, a chunk whose
+    input moved, a chunk whose row went missing and a chunk that never had one.
+    """
+    store, vectors, _, embedder = await indexed({"a": "alpha\nbeta\ngamma"})
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    stored = list(store.chunks[document.id])
+    vectors.rows.pop(stored[1].id)
+    vectors.rows[stored[2].id].embed_text = "no longer what this chunk says"
+    fresh = stored[0].model_copy(
+        update={"id": "brand-new", "text": "delta", "embed_text": "Doc > delta", "position": 3}
+    )
+    chunks = [*stored, fresh]
+
+    _, work = await embed_or_reuse(
+        embedder,
+        chunks,
+        vectors=vectors,
+        previous={chunk.id: chunk.embed_text for chunk in stored},
+    )
+
+    assert work.chunks == len(chunks)
+    assert work.reused + work.embedded == work.chunks
+    assert work.input_changed + work.repaired == work.embedded
+    assert work.vectors_new + work.vectors_replaced == work.embedded
+    assert (work.reused, work.repaired, work.input_changed) == (1, 2, 1), (
+        "one untouched, one whose row went missing, one whose row contradicts itself, and one "
+        "chunk the index has never seen"
+    )
