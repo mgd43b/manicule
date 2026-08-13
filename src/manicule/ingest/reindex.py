@@ -359,10 +359,12 @@ class StaleSweep:
     *not* prove the embedded string did — a document whose headings moved re-embeds chunks
     whose ids never changed — so the pipeline embeds every chunk of a document it re-parses.
 
-    **Nothing absorbs that**, and this docstring claimed the embedding cache did until somebody
-    measured it rather than repeating the claim — ``docs/parsing.md`` §4.5 carries the numbers.
-    What this field counts is the honest thing, and the only thing it can count without
-    instrumenting the model: how much of the corpus the re-parse produced anew.
+    **Over a corpus of distinct chunks nothing absorbs that**, and this docstring claimed the
+    embedding cache did until somebody measured it rather than repeating the claim. The cache
+    de-duplicates identical ``embed_text`` within one run, which is not the shape of a
+    corpus-wide sweep; ``docs/parsing.md`` §4.5 carries the numbers. What this field counts is
+    the honest thing, and the only thing it can count without instrumenting the model: how much
+    of the corpus the re-parse produced anew.
     """
 
     chunks_kept: int = 0

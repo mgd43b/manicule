@@ -589,7 +589,8 @@ class StaleReparseReport(Payload):
     """Chunks produced that were not already stored, and so new rows in the vector store.
 
     Not the sweep's embedding cost. Every chunk of every re-parsed document goes to the model,
-    kept ones included, and nothing absorbs the repeat — ``docs/ingest.md`` §10.1 prices it.
+    kept ones included, and a corpus of distinct chunks gives the embedding cache no repeats to
+    absorb — ``docs/ingest.md`` §10.1 prices it.
     """
 
     chunks_kept: int = Field(default=0, ge=0)
@@ -598,7 +599,8 @@ class StaleReparseReport(Payload):
     Chunk ids are content-derived, so a chunk the re-parse did not move keeps its id, keeps the
     row every citation to it resolves through, and keeps that citation working. The row's
     *contents* are written again — what is embedded is ``embed_text``, which carries the
-    heading breadcrumb, so a chunk whose id held still can still have had its vector move.
+    heading breadcrumb, so a chunk whose id held still can nevertheless have had its vector
+    move.
     """
 
     unrepairable: int = Field(default=0, ge=0)
