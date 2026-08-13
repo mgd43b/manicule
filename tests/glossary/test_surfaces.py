@@ -39,7 +39,9 @@ from manicule.app.service import ApplicationService
 from manicule.cli.render import EXPLICIT_DEFINITION, console, render_answer, render_search
 from manicule.config.settings import RouterSettings
 from manicule.core.content import BlockKind
+from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
 from manicule.core.retrieval import Filter, Query
+from manicule.ingest.glossary import detect_entries
 from manicule.retrieval.cache import L1QueryCache
 from manicule.retrieval.confidence import DEFINITION_CITED, NOTHING_RESEMBLES
 from manicule.retrieval.router import QueryRouter
@@ -48,6 +50,7 @@ from manicule.retrieval.utility import handlers_for
 from tests.app.fakes import FakeBackend
 from tests.evaluation.fakes import BagOfWordsEmbedder
 from tests.glossary import corpus, system
+from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -100,6 +103,54 @@ without it. With two, the passage for the term the query merely *uses* leads, an
 for the term it *asks about* is the one a budget can push out. That is the state requirement 5
 names, and it is not reachable with a single term.
 """
+
+
+MIRRORED_ACRONYM = "ZEBU"
+MIRRORED_EXPANSION = "Zonal Event Buffer Unit"
+MIRRORED_ENTRY = f"{MIRRORED_ACRONYM} — {MIRRORED_EXPANSION}, a queue for deferred events."
+MIRRORED_QUERY = f"What is {MIRRORED_ACRONYM}?"
+MIRRORED_TITLE = "Deferred event handling"
+MIRRORED_URI = "https://docs.example.test/handbook/deferred-events"
+MIRRORED_SOURCE_ID = "page-84213"
+MIRRORED_VERSION = "7"
+"""A term defined on a page that carries an authoritative source record.
+
+Invented here rather than added to ``corpus.py``: every cosine that file documents is measured
+against its two glossary pages, and a third term on a third page would change what those
+numbers describe. It is a whole extra document, so it changes nothing about them.
+"""
+
+
+async def _with_a_published_source(store: SqliteDocStore) -> list[Chunk]:
+    """Index one glossary page that came from somewhere with a canonical address.
+
+    Written out rather than routed through :func:`tests.glossary.system.index`, because the
+    difference *is* the metadata: that helper builds a plain synthetic file, which is the
+    correct fixture for every other case here and the one thing this case cannot use.
+    """
+    record = Provenance(
+        source=SourceMetadata(
+            title=MIRRORED_TITLE,
+            canonical_uri=MIRRORED_URI,
+            source_id=MIRRORED_SOURCE_ID,
+            version=MIRRORED_VERSION,
+        )
+    )
+    document = make_document(
+        source="fixture",
+        source_id="mirrored",
+        workspace_id=system.WORKSPACE,
+        title="Glossary supplement: mirrored page",
+        uri=MIRRORED_URI,
+        body=MIRRORED_ENTRY.encode(),
+    ).model_copy(update={"metadata": {PROVENANCE_KEY: record.as_metadata_value()}})
+    await store.upsert_document(document)
+    chunks = [make_chunk(document, 0, MIRRORED_ENTRY, heading_path=(document.title,))]
+    await store.replace_chunks(document.id, chunks)
+    entries = detect_entries(chunks, title=document.title)
+    assert entries, "the fixture must actually detect a definition, or it tests nothing"
+    await store.replace_glossary_entries(document.id, entries)
+    return chunks
 
 
 @dataclass
@@ -293,19 +344,31 @@ async def test_an_expansion_carries_its_own_source_reference(
 ) -> None:
     """Requirement 9's fifth field: source identity, on the expansion rather than joined to it.
 
-    ``null`` here, because the fixture's documents are synthetic files with no authoritative
-    record and ``null`` is the honest answer for one — an empty object would read as a record
-    that was looked for and came back blank. The field being *present and null* is the claim:
-    a consumer reads one shape whether or not the definition came from a mirrored page, and the
-    four location fields beside it are populated either way.
-    """
-    recorded = await _run(store, indexed, corpus.QUERY_ACRONYM)
-    cited = _json(recorded.search)["expansions"][0]
+    Two definitions, and the difference between them is the point. One is defined on a mirrored
+    page carrying an authoritative record, and its expansion reports the publisher's own
+    ``source_id``, ``canonical_uri``, ``title`` and ``version``. The other is defined on an
+    ordinary synthetic file, and reports ``null`` — the honest answer for a document with no
+    such record, where an empty object would read as one that was looked for and came back
+    blank.
 
-    assert "provenance" in cited, "the expansion has to report the field, populated or not"
-    assert cited["provenance"] is None
-    for located in LOCATES_A_DEFINITION:
-        assert cited[located], f"the four location fields are populated either way: {located}"
+    Both halves are needed. Without the populated one the field could be hard-wired to ``null``
+    and nothing would notice; without the ``null`` one, a consumer would have no evidence that
+    the ordinary case is a stated absence rather than a missing key.
+    """
+    mirrored = await _with_a_published_source(store)
+    service = await _service(store, [*indexed, *mirrored])
+
+    published = _json(await service.search(MIRRORED_QUERY, limit=LIMIT))["expansions"][0]
+    local = _json(await service.search(corpus.QUERY_ACRONYM, limit=LIMIT))["expansions"][0]
+
+    assert published["provenance"] is not None
+    assert published["provenance"]["source_id"] == MIRRORED_SOURCE_ID
+    assert published["provenance"]["canonical_uri"] == MIRRORED_URI
+    assert published["provenance"]["title"] == MIRRORED_TITLE
+    assert local["provenance"] is None, "an ordinary file has no record, and says so"
+    for cited in (published, local):
+        for located in LOCATES_A_DEFINITION:
+            assert cited[located], f"the four location fields are populated either way: {located}"
 
 
 async def test_answer_json_reports_the_same_classification_as_the_search(
