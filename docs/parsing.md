@@ -826,7 +826,7 @@ numbers address its output.)
    pipeline parses and chunks everything it is handed, and for a time it embedded all of it
    too. Measured on a four-chunk document whose bytes and text did not move:
 
-   | Path | Embed calls |
+   | Path | Chunks embedded |
    |---|---|
    | re-sync, document unchanged | 0 |
    | forced re-parse, before persisted embedding-input identity | 4 |
@@ -837,6 +837,13 @@ numbers address its output.)
    resolves. Whether a *vector* survives is decided one field along, by `embed_text` and the
    breadcrumb in it — a document whose headings moved satisfies this assertion in full and
    re-embeds every chunk. §4.5 prices the compute and §5 owns the distinction.
+
+   **Chunks, not calls**, which is the same distinction §5's table draws one level down. The
+   embedder takes a batch, so the four in the middle row went to the model in a single
+   `embed()` — measured, not assumed. Four is still the number worth reporting, because a
+   forward pass per chunk is what the compute actually is; but the column was headed
+   "Embed calls", and a reader pricing a fingerprint bump against an API's per-request cost
+   would have been out by the batch size.
 
    The parser's obligation is the *sequence* — same texts, same order, same anchors. The
    **chunk ID scheme is storage's** ([`storage.md`](storage.md) §3.2), derived from content

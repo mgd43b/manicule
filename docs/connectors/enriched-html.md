@@ -91,7 +91,7 @@ write, because no field in a manifest is relative to the conversion's root —
 id are refused as a pair, and the pair is only visible to a run that walked both. A run confined
 to `pages/` will happily write a manifest for a page whose twin sits in `other/`. Nothing breaks
 silently — the twin keeps its path identity, and once the converted page holds the id it declares,
-`doctor`'s `document-identity` check reports two rows for one page ([§5d](#5e-clearing-the-leftovers-when-you-did-arrive-that-way)). But the refusal arrives after a sync
+`doctor`'s `document-identity` check reports two rows for one page ([§5e](#5e-clearing-the-leftovers-when-you-did-arrive-that-way)). But the refusal arrives after a sync
 rather than during the conversion. **Convert the whole root unless you have a reason not to.**
 
 `--force` replaces manifests that already exist; without it they are left alone, because one

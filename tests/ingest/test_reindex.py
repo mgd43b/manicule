@@ -271,8 +271,14 @@ async def test_the_break_bump_rebuilds_from_retained_bytes_and_keeps_unmoved_chu
     **What is not kept is the embedding work**, and it is asserted here because reading the code
     suggests otherwise. ``re_parse`` runs the ordinary ingest path, which embeds every chunk it
     is handed; the vector an unchanged chunk ends up with is identical, but it was recomputed to
-    get there. Measured on a four-chunk document whose text did not move at all: four calls.
-    ``docs/parsing.md`` §4.5 said the opposite until this case was written.
+    get there. Measured on a four-chunk document whose text did not move at all: four chunks
+    embedded. ``docs/parsing.md`` §4.5 said the opposite until this case was written.
+
+    **Four chunks, one ``embed()`` call.** The assertion below counts texts, because
+    :class:`_CountingEmbedder` extends by ``texts`` — which is the number that matters, since a
+    forward pass per chunk is what a re-embed costs. It is not a count of calls: the embedder
+    batches, and this document's four chunks go in one. Written down because the docstring said
+    "four calls" and the number it named was the other one.
 
     The old parser is stood in for rather than checked out, so this states what changed between
     the two versions in one line of code instead of pinning the whole of the previous one.
