@@ -31,6 +31,7 @@ from manicule.core.embedding import (
     StoredVector,
     Vector,
     VectorState,
+    choose_stored_vector,
     classify_stored_vector,
     embedding_input_identity,
 )
@@ -238,25 +239,36 @@ class MemoryVectorStore:
             if expected is not None and len(vector) != expected:
                 msg = f"vector for {chunk.id} has {len(vector)} dimensions, expected {expected}"
                 raise ValueError(msg)
-            self._rows[chunk.id] = (chunk, vector, self._identity_of(chunk.embed_text))
+            # A tuple whatever the caller handed over; see `MemoryVectors` for why the
+            # container type must not survive a write.
+            self._rows[chunk.id] = (chunk, tuple(vector), self._identity_of(chunk.embed_text))
 
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
         verdicts: dict[str, StoredVector] = {}
         for chunk in chunks:
-            row = self._rows.get(chunk.id)
-            if row is None or self._fingerprint is None:
-                verdicts[chunk.id] = StoredVector(state=VectorState.ABSENT)
-                continue
-            stored_chunk, vector, identity = row
-            verdicts[chunk.id] = classify_stored_vector(
-                chunk,
-                recorded_identity=identity,
-                stored_embed_text=stored_chunk.embed_text,
-                stored_vector=list(vector),
-                embed=self._fingerprint,
-                middleware=self._middleware,
+            wanted = self._identity_of(chunk.embed_text)
+            elsewhere = next(
+                (row for row in self._rows.values() if row[2] == wanted != UNRECORDED_IDENTITY),
+                None,
+            )
+            verdicts[chunk.id] = choose_stored_vector(
+                self._classify(chunk, self._rows.get(chunk.id)),
+                self._classify(chunk, elsewhere),
             )
         return verdicts
+
+    def _classify(self, chunk: Chunk, row: tuple[Chunk, Vector, str] | None) -> StoredVector:
+        if row is None or self._fingerprint is None:
+            return StoredVector(state=VectorState.ABSENT)
+        stored_chunk, vector, identity = row
+        return classify_stored_vector(
+            chunk,
+            recorded_identity=identity,
+            stored_embed_text=stored_chunk.embed_text,
+            stored_vector=list(vector),
+            embed=self._fingerprint,
+            middleware=self._middleware,
+        )
 
     def _identity_of(self, embed_text: str) -> str:
         """What this store records beside a vector, or nothing when it has no fingerprint yet.
@@ -334,6 +346,27 @@ class FixedDimensionVectorStore(MemoryVectorStore):
             msg = f"table is {self._ASSUMED}-dimensional"
             raise ValueError(msg)
         await super().ensure_ready(fingerprint, embed_text_middleware=embed_text_middleware)
+
+
+class IdKeyedVectorStore(MemoryVectorStore):
+    """A store that answers reuse on the chunk id, which is the plausible wrong answer.
+
+    Every write succeeds, every search returns, and every other conformance check passes. What
+    it gets wrong is a chunk whose ``embed_text`` moved while its ``text`` did not: the id is
+    content-derived from ``text``, so it survives, and this store hands back a vector for a
+    string the corpus no longer contains — silently, for as long as the index lives.
+    """
+
+    @override
+    async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
+        return {
+            chunk.id: (
+                StoredVector(state=VectorState.READABLE, vector=tuple(row[1]))
+                if (row := self._rows.get(chunk.id)) is not None
+                else StoredVector(state=VectorState.ABSENT)
+            )
+            for chunk in chunks
+        }
 
 
 class ForgetfulVectorStore(MemoryVectorStore):

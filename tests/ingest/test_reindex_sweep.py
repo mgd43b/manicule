@@ -140,6 +140,11 @@ async def corpus(
     vectors = fakes.MemoryVectors()
     blobs = blobs or fakes.MemoryBlobs()
     embedder = embedder or fakes.CountingEmbedder()
+    # What ``app.runtime`` does before it builds a pipeline, done here for the same reason: a
+    # store that has not been told which vector space it holds cannot say whether a stored
+    # vector is still a chunk's, so a sweep over an unprepared store would measure no reuse and
+    # prove nothing about the sweep.
+    await vectors.ensure_ready(embedder.fingerprint)
     pipeline, _, _ = build(
         store=store,
         vectors=vectors,

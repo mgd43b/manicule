@@ -71,6 +71,7 @@ from manicule.core.embedding import (
     EmbedFingerprint,
     StoredVector,
     VectorState,
+    choose_stored_vector,
     classify_stored_vector,
     embedding_input_identity,
 )
@@ -536,17 +537,48 @@ class LanceVectorStore:
         reported through
         :attr:`~manicule.core.embedding.StoredVector.identity_recorded` rather than hidden,
         and writing the row again records the identity for good.
+
+        **Answers without requiring :meth:`ensure_ready`**, like :meth:`count` and
+        :meth:`delete_document` and unlike :meth:`upsert` and :meth:`search`. The fingerprint
+        it compares against is the one the directory records, which is the one the stored
+        vectors were made with — the only fingerprint the question is about. A directory that
+        holds nothing answers that it holds nothing for every chunk, which is true.
         """
-        table, fingerprint = self._ready()
         verdicts = {chunk.id: StoredVector(state=VectorState.ABSENT) for chunk in chunks}
         if not chunks:
             return verdicts
+        table = await self._existing_table()
+        fingerprint = await self.fingerprint()
+        if table is None or fingerprint is None:
+            return verdicts
+
         by_id = {chunk.id: chunk for chunk in chunks}
         for record in await self._rows_for(table, sorted(by_id)):
             chunk = by_id.get(str(record[ID_COLUMN]))
             if chunk is None:  # pragma: no cover - the predicate asked for these ids only
                 continue
             verdicts[chunk.id] = self._verdict(chunk, record, fingerprint)
+
+        # A second lookup, keyed on the embedding input rather than on the chunk id, for the
+        # chunks the first one did not answer. A chunk id carries its position, so inserting a
+        # paragraph renames every chunk below it while moving no embedding input at all — and
+        # keyed on the id alone that edit re-embeds the whole document. See
+        # `choose_stored_vector` for which verdicts this is allowed to override.
+        wanted = {
+            chunk.id: self._identity_of(chunk.embed_text, fingerprint)
+            for chunk in chunks
+            if verdicts[chunk.id].state in {VectorState.ABSENT, VectorState.STALE}
+        }
+        if not wanted:
+            return verdicts
+        found = await self._rows_by_identity(table, sorted(set(wanted.values())))
+        for chunk in chunks:
+            identity = wanted.get(chunk.id)
+            record = None if identity is None else found.get(identity)
+            verdicts[chunk.id] = choose_stored_vector(
+                verdicts[chunk.id],
+                None if record is None else self._verdict(chunk, record, fingerprint),
+            )
         return verdicts
 
     async def _rows_for(self, table: AsyncTable, chunk_ids: Sequence[str]) -> list[dict[str, Any]]:
@@ -556,18 +588,64 @@ class LanceVectorStore:
         anything this method controls: one query per document is small, one query per corpus
         is a SQL string megabytes long. The page size is a property of the query, not of the
         work, so it needs no tuning knob.
+
+        The identity column is selected only when the table has one. A table that predates it
+        gains it in :meth:`ensure_ready`, but this method does not require that to have run —
+        so it asks the schema rather than assuming, and a row from a table without the column
+        reads as :data:`~manicule.core.embedding.UNRECORDED_IDENTITY`, which is what it is.
         """
+        schema = await table.schema()
+        has_identity = IDENTITY_COLUMN in {str(field.name) for field in schema}
+        columns = [ID_COLUMN, VECTOR_COLUMN, CHUNK_COLUMN]
+        if has_identity:
+            columns.append(IDENTITY_COLUMN)
+
         rows: list[dict[str, Any]] = []
         for start in range(0, len(chunk_ids), IDENTITY_QUERY_PAGE):
             page = chunk_ids[start : start + IDENTITY_QUERY_PAGE]
             listed = ", ".join(quote(chunk_id) for chunk_id in page)
-            rows.extend(
+            found = (
                 await table.query()
                 .where(f"{ID_COLUMN} IN ({listed})")
+                .select(columns)
+                .limit(len(page))
+                .to_list()
+            )
+            for record in found:
+                record.setdefault(IDENTITY_COLUMN, UNRECORDED_IDENTITY)
+            rows.extend(found)
+        return rows
+
+    async def _rows_by_identity(
+        self, table: AsyncTable, identities: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """One row per embedding-input identity, for the identities that have one.
+
+        Which row, when several chunks share an embedding input, is not a choice worth making:
+        a vector is a pure function of that input under a fixed fingerprint, so every row
+        recorded against it holds the same vector and any of them answers the question.
+
+        A table without the identity column has nothing to search — every row in it reads as
+        :data:`~manicule.core.embedding.UNRECORDED_IDENTITY` — so this returns nothing and the
+        id-keyed answer stands. Those rows are still reusable under their own ids, and the
+        first write of each records its identity, after which it is findable here too.
+        """
+        schema = await table.schema()
+        if IDENTITY_COLUMN not in {str(field.name) for field in schema}:
+            return {}
+        rows: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(identities), IDENTITY_QUERY_PAGE):
+            page = identities[start : start + IDENTITY_QUERY_PAGE]
+            listed = ", ".join(quote(identity) for identity in page)
+            found = (
+                await table.query()
+                .where(f"{IDENTITY_COLUMN} IN ({listed})")
                 .select([ID_COLUMN, VECTOR_COLUMN, CHUNK_COLUMN, IDENTITY_COLUMN])
                 .limit(len(page))
                 .to_list()
             )
+            for record in found:
+                rows.setdefault(str(record[IDENTITY_COLUMN]), record)
         return rows
 
     def _verdict(

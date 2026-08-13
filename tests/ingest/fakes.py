@@ -33,6 +33,7 @@ from manicule.core.embedding import (
     StoredVector,
     Vector,
     VectorState,
+    choose_stored_vector,
     classify_stored_vector,
     embedding_input_identity,
 )
@@ -439,7 +440,11 @@ class MemoryVectors:
         for chunk, vector in zip(chunks, vectors, strict=True):
             self.rows[chunk.id] = VectorRow(
                 document_id=chunk.document_id,
-                vector=vector,
+                # Stored as a tuple whatever the caller handed over. A real row is a typed
+                # column and reads back the same shape however it was written, so a fake that
+                # kept the caller's container would make a reused vector — which arrives as a
+                # tuple — compare unequal to the identical vector it replaced.
+                vector=tuple(vector),
                 embed_text=chunk.embed_text,
                 identity=self._identity_of(chunk.embed_text),
             )
@@ -447,19 +452,38 @@ class MemoryVectors:
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
         verdicts: dict[str, StoredVector] = {}
         for chunk in chunks:
-            row = self.rows.get(chunk.id)
-            if row is None or self._fingerprint is None:
+            if self._fingerprint is None:
                 verdicts[chunk.id] = StoredVector(state=VectorState.ABSENT)
                 continue
-            verdicts[chunk.id] = classify_stored_vector(
-                chunk,
-                recorded_identity=row.identity,
-                stored_embed_text=row.embed_text,
-                stored_vector=list(row.vector),
-                embed=self._fingerprint,
-                middleware=self._middleware,
+            verdicts[chunk.id] = choose_stored_vector(
+                self._classify(chunk, self.rows.get(chunk.id)),
+                self._classify(chunk, self._row_by_identity(self._identity_of(chunk.embed_text))),
             )
         return verdicts
+
+    def _classify(self, chunk: Chunk, row: VectorRow | None) -> StoredVector:
+        if row is None or self._fingerprint is None:
+            return StoredVector(state=VectorState.ABSENT)
+        return classify_stored_vector(
+            chunk,
+            recorded_identity=row.identity,
+            stored_embed_text=row.embed_text,
+            stored_vector=list(row.vector),
+            embed=self._fingerprint,
+            middleware=self._middleware,
+        )
+
+    def _row_by_identity(self, identity: str) -> VectorRow | None:
+        """Any row recorded against ``identity``, whichever chunk id it is filed under.
+
+        A scan, because this is a fake and the set is small; the real store has a column to
+        query. What matters is that both answer the same question — a chunk id carries its
+        position, so a document with a paragraph inserted at the top renames every chunk below
+        it without moving one embedding input.
+        """
+        if identity == UNRECORDED_IDENTITY:
+            return None
+        return next((row for row in self.rows.values() if row.identity == identity), None)
 
     def _identity_of(self, embed_text: str) -> str:
         if self._fingerprint is None:

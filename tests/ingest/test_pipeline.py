@@ -27,7 +27,7 @@ from tests.ingest import fakes
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
-    from manicule.core.protocols import Embedder, Middleware
+    from manicule.core.protocols import Chunker, Embedder, Middleware
 
 
 def build(
@@ -43,15 +43,17 @@ def build(
     routes: Mapping[str, Sequence[str]] | None = None,
     parse_fingerprints: Callable[[str], ParseFingerprint | None] = parse_fingerprint,
     detect_glossary: bool = True,
+    chunker: Chunker | None = None,
 ) -> tuple[IngestPipeline, fakes.MemoryIngestStore, fakes.MemoryVectors]:
     """A pipeline over in-memory everything, plus the store and vectors to assert against.
 
     ``routes`` resolves a chain per media type, for the tests that need two parsers to own two
-    documents. ``chain`` is the single-chain shorthand every other test uses.
+    documents. ``chain`` is the single-chain shorthand every other test uses. ``chunker`` is for
+    the tests that need the breadcrumb to move without the text moving, which no parser can do.
     """
     store = store or fakes.MemoryIngestStore()
     vectors = vectors or fakes.MemoryVectors()
-    chunker = fakes.BlockChunker()
+    chunker = chunker or fakes.BlockChunker()
 
     def resolve(media_type: str) -> Sequence[str]:
         return list(chain if routes is None else routes[media_type])

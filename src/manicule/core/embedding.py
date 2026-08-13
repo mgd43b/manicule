@@ -369,12 +369,14 @@ def classify_stored_vector(
 
     1. **A row whose chunk cannot be read is corrupt.** Nothing about it can be checked, and a
        row that cannot be checked is not a vector to reuse.
-    2. **A row that contradicts itself is corrupt** *when it is claiming to be about the input
-       being asked for*. The recorded identity is compared against one derived from the chunk
-       beside it; a disagreement means the metadata does not describe the vector, and metadata
-       asserting that a usable vector exists is the one thing that must never be taken on
-       trust. A self-contradictory row claiming some *other* input is merely stale — it was
-       never going to be reused either way, and calling it a repair would overstate the damage.
+    2. **A row whose recorded identity claims the input being asked for, while the chunk
+       stored beside it says otherwise, is corrupt.** Metadata asserting that a usable vector
+       exists is the one thing that must never be taken on trust, and here the row's two halves
+       disagree about the very input the caller wants. A row whose recorded identity claims
+       something *else* is merely stale, whatever its chunk says: a change of embedding
+       fingerprint or of middleware declaration puts every row in that position at once, and
+       calling a whole corpus corrupt would say the directory was damaged when the model
+       simply changed.
     3. **A row about a different embedding input is stale.** The case chunk-id reuse gets
        wrong: the id survived a re-parse because ``text`` did, while the heading breadcrumb in
        ``embed_text`` did not.
@@ -404,7 +406,7 @@ def classify_stored_vector(
     if recorded == UNRECORDED_IDENTITY:
         recorded = derived
     elif recorded != derived:
-        claims_current = wanted in {recorded, derived}
+        claims_current = recorded == wanted
         return StoredVector(state=VectorState.CORRUPT if claims_current else VectorState.STALE)
 
     if recorded != wanted:
@@ -416,6 +418,42 @@ def classify_stored_vector(
         vector=tuple(float(value) for value in stored_vector),
         identity_recorded=bool(recorded_identity),
     )
+
+
+def choose_stored_vector(
+    by_id: StoredVector, by_identity: StoredVector | None = None
+) -> StoredVector:
+    """Pick between the row under a chunk's own id and any row holding the same input.
+
+    **Why a second lookup exists at all.** A chunk id is derived from position as well as text
+    (:func:`~manicule.core.ids.chunk_id`), so inserting one paragraph at the top of a document
+    changes the id of every chunk below it while changing not one embedding input. Keyed on the
+    id alone, that edit re-embeds the whole document to store vectors it already holds — the
+    same waste this path exists to remove, arriving through the other door. A vector is a pure
+    function of the embedding input under a fixed fingerprint, so a row recorded against that
+    input *is* this chunk's vector, whichever id it happens to be filed under.
+
+    **The row under the chunk's own id wins when it is usable**, because it is the row that
+    would be overwritten and the one whose identity may need recording.
+
+    **A corrupt row is never shopped around.** A present-and-damaged row is evidence about this
+    chunk's stored vector, and the honest response to damage in a directory is to rebuild the
+    row rather than to find another copy and leave the question of what damaged it unasked.
+    Absent and stale carry no such evidence, so those are the two the fallback answers.
+
+    Args:
+        by_id: The verdict on the row stored under the chunk's id.
+        by_identity: The verdict on a row found by embedding-input identity instead, when the
+            store looked and found one.
+
+    Returns:
+        The verdict the caller should act on.
+    """
+    if by_id.state is not VectorState.ABSENT and by_id.state is not VectorState.STALE:
+        return by_id
+    if by_identity is not None and by_identity.is_reusable:
+        return by_identity
+    return by_id
 
 
 def require_within_context(
@@ -498,6 +536,7 @@ __all__ = [
     "TokenStates",
     "Vector",
     "VectorState",
+    "choose_stored_vector",
     "classify_stored_vector",
     "embedding_input_identity",
     "require_within_context",
