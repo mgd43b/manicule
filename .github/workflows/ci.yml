@@ -53,20 +53,25 @@ jobs:
         run: uv run pyright
 
   # Sharded because this job was the whole run's critical path and nothing else was close: at
-  # 6m25s a leg it decided when CI finished, while the next-longest job — `container` — was done
-  # in 1m42s. The 31s of setup ahead of `pytest` is what makes splitting across runners the
-  # cheap option rather than the expensive one: a shard re-pays half a minute, not the several
-  # minutes an install-heavy job would. Three shards take a leg to about 2m35s for about 2m40s
-  # of extra machine time across the whole matrix — a trade worth making on the one job every
-  # push and every pull request waits for, and not worth making on any of the others.
+  # 6m30s a leg it decided when CI finished, while the next-longest job — `container` — was done
+  # in 1m42s. It now finishes in 2m54s, for about 3m45s of extra machine time across the whole
+  # matrix — a trade worth making on the one job every push and every pull request waits for,
+  # and not worth making on any of the others. The 33s of setup ahead of `pytest` is what makes
+  # splitting across runners the cheap option rather than the expensive one: a shard re-pays
+  # half a minute, not the several minutes an install-heavy job would.
   #
-  # Three, and not more, because two costs do not shard. Setup is 31s per shard however many
+  # Three, and not more, because two costs do not shard. Setup is 33s per shard however many
   # there are, and `pytest` collects the *whole* suite before deselecting the other groups, so
-  # collection and the session fixtures are ~9s more that every shard pays in full. Only the
-  # ~345s of test time actually divides, which is the curve: 1 shard 6m25s, 2 shards 3m32s,
-  # 3 shards 2m35s, 4 shards 2m06s, 5 shards 1m49s. A fourth buys 29s for two more jobs, and
-  # the floor under all of it is those 40s plus the single longest test — a 25s parser corpus
+  # collection and the session fixtures are another 34s that every shard pays in full. Only the
+  # ~320s of test time actually divides, which is the curve: 1 shard 6m27s, 2 shards 3m47s,
+  # 3 shards 2m54s, 4 shards 2m27s, 5 shards 2m11s. A fourth buys 27s for two more jobs, and
+  # the floor under all of it is those 67s plus the single longest test — a 25s parser corpus
   # round-trip — which no number of shards divides.
+  #
+  # Those are measured on this runner rather than modelled: the two ends are the real 390s
+  # unsharded leg and the real 174s three-shard one, and the curve is fitted to them. Worth
+  # saying because a laptop does not predict them — collection there costs a few seconds rather
+  # than 34, which makes local timings far too optimistic about what another shard would buy.
   #
   # The shard count is written twice — `--splits` below and the `shard:` list — and it has to
   # be: `strategy:` cannot read the `env` context, so there is no one place to put it. That is
