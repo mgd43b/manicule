@@ -392,6 +392,25 @@ def render_connectors(out: Console, payload: r.ConnectorList) -> None:
         out.print("[dim]no sources configured[/dim]")
 
 
+def render_sidecar(out: Console, payload: r.SidecarReport) -> None:
+    """What a conversion did, and every page it did nothing for.
+
+    Skipped pages are printed rather than counted. "Considered 40, wrote 0" is equally the shape
+    of a wrong directory, a page format this does not recognise, and a corpus already converted —
+    and which of the three it is decides the operator's next move entirely.
+    """
+    out.print(
+        f"[bold]{payload.written}[/bold] of {payload.considered} page(s) under "
+        f"{escape(payload.root)}"
+    )
+    if not payload.skipped:
+        return
+    table = Table("skipped", "why", box=None, pad_edge=False)
+    for skip in payload.skipped:
+        table.add_row(escape(skip.path), escape(skip.reason))
+    out.print(table)
+
+
 def render_config_value(out: Console, payload: r.ConfigValue) -> None:
     out.print_json(data=payload.value)
     out.print(f"[dim]from {escape(payload.source)}[/dim]")
@@ -709,6 +728,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.ConnectorSignedIn: lambda out, p: render_connector_signed_in(
         out, _as(r.ConnectorSignedIn, p)
     ),
+    r.SidecarReport: lambda out, p: render_sidecar(out, _as(r.SidecarReport, p)),
     r.ConfigValue: lambda out, p: render_config_value(out, _as(r.ConfigValue, p)),
     r.ConfigChange: lambda out, p: render_config_change(out, _as(r.ConfigChange, p)),
     r.WorkspaceList: lambda out, p: render_workspaces(out, _as(r.WorkspaceList, p)),

@@ -626,6 +626,53 @@ class ApplicationService:
             )
         return r.ConnectorList(count=len(summaries), connectors=tuple(summaries))
 
+    async def connector_sidecar(self, root: Path | str, *, force: bool = False) -> r.SidecarReport:
+        """Write a sidecar manifest beside every enriched HTML page under ``root``.
+
+        Enriched standalone HTML — one file per page, carrying the page's own id, space, version,
+        modification time and canonical address in a machine-identifiable section — is indexed
+        perfectly well by ordinary filesystem ingestion today, and cited by its filename and a
+        ``file://`` URI, because that is all the connector was given. This reads the identity out
+        of each page and records it in the manifest format the filesystem connector *already*
+        reads, so the pages become properly citable without a new connector, a new ingestion path
+        or a change to the provenance interface.
+
+        **The source files are never modified.** The manifest is written beside each page, at a
+        path derived from where the walk found the file, so nothing read out of a document can
+        influence where anything is written.
+
+        Args:
+            root: The directory of pages. Walked without following symlinks.
+            force: Replace manifests that already exist. Off by default, because one already
+                there was most likely written by hand or by another tool.
+
+        Raises:
+            UnknownEntityError: ``root`` is not a directory.
+        """
+        from manicule.connectors.enriched_html import write_sidecars  # noqa: PLC0415
+
+        path = _local(root)
+        if not await asyncio.to_thread(path.is_dir):
+            msg = f"no such directory: {path}"
+            raise UnknownEntityError(msg)
+        root_path = path.resolve()
+        outcomes = await asyncio.to_thread(write_sidecars, path, force=force)
+        return r.SidecarReport(
+            root=str(root_path),
+            considered=len(outcomes),
+            written=sum(1 for outcome in outcomes if outcome.written),
+            skipped=tuple(
+                # Relative to the root, which the report has already named. Absolute paths here
+                # repeat the root on every row and push the reason — the part that says what to
+                # do next — off the side of a terminal table.
+                r.SidecarSkip(
+                    path=_relative_to(outcome.path, root_path), reason=outcome.skipped_reason
+                )
+                for outcome in outcomes
+                if not outcome.written
+            ),
+        )
+
     # --- documents ------------------------------------------------------------------------
 
     async def document_list(
@@ -3384,6 +3431,19 @@ def _local(path: Path | str) -> Path:
     blocking I/O that has to leave the event loop.
     """
     return Path(path).expanduser()
+
+
+def _relative_to(path: Path, root: Path) -> str:
+    """``path`` under ``root``, or its own string when it is somehow not under one.
+
+    The fallback is not expected — the walk refuses anything outside the root — but a report is
+    not worth raising over, and a full path is a true statement where a wrong relative one would
+    be a misleading short answer.
+    """
+    try:
+        return str(path.resolve().relative_to(root))
+    except ValueError:  # pragma: no cover - the walk already refuses this
+        return str(path)
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
