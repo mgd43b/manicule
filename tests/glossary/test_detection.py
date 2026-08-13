@@ -7,10 +7,13 @@ same expression fills a glossary with every sentence containing a colon.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from manicule.core.content import Chunk, Document
 from manicule.core.glossary import DefinitionForm, normalise_acronym, normalise_expansion
+from manicule.ingest import glossary as ingest_glossary
 from manicule.ingest.glossary import (
     GLOSSARY_CONTEXT_EVIDENCE,
     INITIALS_EVIDENCE,
@@ -20,9 +23,11 @@ from manicule.ingest.glossary import (
     detect_entries,
     detect_in_chunk,
     has_a_refused_opening,
+    initial_skeleton,
     initials_match,
     score_definition,
 )
+from tests.glossary.corpus import PROSE_ON_THE_GLOSSARY_PAGE
 from tests.storage_helpers import make_chunk, make_document
 
 DOCUMENT = make_document(source_id="glossary", title="Glossary of terms")
@@ -198,16 +203,246 @@ def test_a_stylized_spelling_is_displayed_and_a_normalised_key_is_stored() -> No
 def test_a_right_hand_side_with_no_initials_evidence_is_kept_whole() -> None:
     """The conservative half of the boundary rule, stated as a test rather than left implicit.
 
-    ``HyperText Transfer Protocol`` does not spell ``HTTP``, so nothing here knows where the
-    expansion ends, and guessing at the comma would store a phrase on no evidence at all. The
-    whole right-hand side is kept — exactly what happened before this change — and the length
-    rule still bounds it. This is a limitation being pinned down, not a behaviour being praised.
+    ``central processor`` does not spell ``CPU`` under any reading this module has, so nothing
+    here knows where the expansion ends, and guessing at the comma would store a phrase on no
+    evidence at all. The whole right-hand side is kept and the length rule still bounds it. This
+    is a limitation being pinned down, not a behaviour being praised.
+
+    **This case used to be ``HTTP — HyperText Transfer Protocol, used by every browser``, and it
+    was moved rather than deleted.** That line is now cut correctly, because ``HyperText`` is a
+    compound whose components spell the two ``T``s — see
+    ``test_a_compound_word_supplies_initials_its_whole_word_does_not``, which asserts the new
+    behaviour by name. The limitation this test is about is real and still has cases; it just no
+    longer has that one.
     """
-    entries = detect_in_chunk(chunk("HTTP — HyperText Transfer Protocol, used by every browser"))
+    entries = detect_in_chunk(chunk("CPU — central processor, the part that executes instructions"))
 
     assert [entry.expansion for entry in entries] == [
-        "HyperText Transfer Protocol, used by every browser"
+        "central processor, the part that executes instructions"
     ]
+
+
+# --- compound words and stylized spellings ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("term", "line", "expansion"),
+    [
+        (
+            "SORT",
+            "SORT — SecOps Reliability Toolkit, a package that operations teams install on a host.",
+            "SecOps Reliability Toolkit",
+        ),
+        (
+            "HTTP",
+            "HTTP — HyperText Transfer Protocol, used by every browser",
+            "HyperText Transfer Protocol",
+        ),
+    ],
+    ids=["secops", "hypertext"],
+)
+def test_a_compound_word_supplies_initials_its_whole_word_does_not(
+    term: str, line: str, expansion: str
+) -> None:
+    """A camel-cased word contributes one initial per component, which is what awards the cut.
+
+    ``SecOps Reliability Toolkit`` spells ``SRT`` by its words and ``SORT`` by its components, so
+    the whole right-hand side is thirteen words with no agreement — no entry at all — until the
+    split is read. The boundary is the writer's own capital letter and nothing else: see
+    ``test_a_compound_written_without_the_internal_capital_earns_no_cut`` for the same letters
+    written flat.
+
+    ``HyperText Transfer Protocol`` is here because it **moved**. It used to be this module's
+    example of the conservative fallback — no initials evidence, so keep the whole right-hand side
+    including ``used by every browser`` — and under component initials it spells ``HTTP`` exactly
+    and the description is trimmed. That is the correct expansion of the term, so this is a
+    documented limitation being closed rather than a behaviour changing by accident, and the test
+    that pinned the old reading now says so and uses a different term.
+    """
+    entries = detect_in_chunk(chunk(line))
+
+    assert [(entry.acronym, entry.expansion) for entry in entries] == [(term, expansion)]
+
+
+def test_a_compound_written_without_the_internal_capital_earns_no_cut() -> None:
+    """The negative case that limits the compound rule, and the whole reason it is about capitals.
+
+    ``Secops`` is ``SecOps`` with one letter changed. It is one component, its initials spell
+    ``SRT``, and no prefix of this line agrees with ``SORT`` — so nothing awards a cut, the whole
+    right-hand side is over the length bound, and there is no entry. A rule that split compounds
+    by consulting a list of prefixes would take both spellings and could not tell a reader which
+    property of the text it was reading.
+    """
+    line = "SORT — Secops Reliability Toolkit, a package that operations teams install on a host."
+    right = line.partition(" — ")[2]
+
+    assert not initials_match("SORT", "Secops Reliability Toolkit", display="SORT")
+    assert core_expansion("SORT", right, display="SORT") == "", "a cut was awarded"
+    assert detect_in_chunk(chunk(line)) == []
+
+
+def test_a_stylized_spelling_supplies_a_skeleton_its_key_does_not() -> None:
+    """The second convention, on the ticket's own example.
+
+    ``SaFeR`` looks up as ``SAFER`` — five characters, which ``Service Failure Reporter`` does not
+    spell. Its deliberate capitals spell ``SFR``, which the expansion does. Both representations
+    survive: the entry is keyed by ``SAFER``, displayed as ``SaFeR``, and the skeleton appears
+    nowhere on it.
+    """
+    line = "SaFeR — Service Failure Reporter, a component that groups related failures together."
+
+    assert initial_skeleton("SaFeR") == "SFR"
+    assert not initials_match("SAFER", "Service Failure Reporter")
+    assert initials_match("SAFER", "Service Failure Reporter", display="SaFeR")
+
+    entries = detect_in_chunk(chunk(line))
+
+    assert [(entry.acronym, entry.display, entry.expansion) for entry in entries] == [
+        ("SAFER", "SaFeR", "Service Failure Reporter")
+    ]
+    assert entries[0].keys == ("SAFER",), "the skeleton is a comparison form, never a second key"
+
+
+@pytest.mark.parametrize(
+    ("display", "skeleton"),
+    [
+        ("SaFeR", "SFR"),
+        ("ReCAP", "RCAP"),
+        ("AuDiT", "ADT"),
+        # All upper case: there is no deliberate mixing to read, and a skeleton equal to the key
+        # is not evidence, it is the key written twice.
+        ("NOW", ""),
+        ("N.O.W.", ""),
+        # Below the bound. `MoJo` skeletons to `MJ`, which any two-word phrase satisfies.
+        ("MoJo", ""),
+        ("WEb", ""),
+        # A lower-case initial, refused here as well as by `acronym_shaped`, so that a caller
+        # reaching this function directly is not told that `mDNS` is a term spelled `DNS`.
+        ("mDNS", ""),
+        ("gRPC", ""),
+        ("", ""),
+    ],
+)
+def test_a_skeleton_needs_deliberate_mixed_case_above_the_bound(
+    display: str, skeleton: str
+) -> None:
+    """Each condition on :func:`initial_skeleton`, with a case that only that condition refuses."""
+    assert initial_skeleton(display) == skeleton
+
+
+def test_the_bound_is_what_stops_a_short_skeleton_cutting_prose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """:data:`MIN_SKELETON_LENGTH` watched failing, the only way to know it is load-bearing.
+
+    ``WEb`` skeletons to ``WE`` and the ticket's own ``API`` negative has the boundary prefix
+    ``when enabled``, whose initials are ``WE``. Lower the bound to two and the cut is awarded and
+    ``when enabled`` becomes the recorded meaning of ``WEB`` — the exact failure ``core_expansion``
+    warns about, arriving through the new evidence rather than through truncation. At three there
+    is no skeleton, no cut, and the opening-word rule refuses the whole right-hand side.
+
+    The mutation is applied to the constant rather than to the function so that what is
+    demonstrated is the *bound* doing the work, not an implementation detail of how it is applied.
+    """
+    line = "WEb - when enabled, the process starts automatically."
+
+    assert detect_in_chunk(chunk(line)) == []
+
+    monkeypatch.setattr(ingest_glossary, "MIN_SKELETON_LENGTH", 2)
+
+    admitted = detect_in_chunk(chunk(line))
+
+    assert [(entry.acronym, entry.expansion) for entry in admitted] == [("WEB", "when enabled")], (
+        "the bound is not what refuses this line, so it is not the guard it is named for"
+    )
+
+
+def _free_subsequence_scan(form: str, phrase: str) -> bool:
+    """A **deliberately wrong** matcher: does ``form`` appear in ``phrase`` as any subsequence.
+
+    Written out here because requirement 3 cannot be tested the obvious way round. "Arbitrary
+    subsequence matching is impossible" asserted as *some unrelated string does not match* proves
+    nothing at all — it passes on an implementation that scans freely, because a freely scanning
+    matcher also refuses strings whose letters are not there. The assertion has to be built the
+    other way: a phrase a free scan **accepts** and the shipped matcher must refuse. This function
+    is the free scan, so the fixtures below can be shown to be adversarial rather than asserted to
+    be.
+    """
+    wanted = iter(form.upper())
+    letter = next(wanted, None)
+    for character in phrase.upper():
+        if character == letter:
+            letter = next(wanted, None)
+    return letter is None
+
+
+@pytest.mark.parametrize(
+    ("term", "form", "phrase", "line"),
+    [
+        (
+            "SORT",
+            "SORT",
+            "Storage Operations Roster",
+            "SORT — Storage Operations Roster, the rota that names who is on call each week.",
+        ),
+        (
+            "SaFeR",
+            "SFR",
+            "Service for Escalation Routing",
+            "SaFeR — Service for Escalation Routing, a queue that pages the duty manager.",
+        ),
+    ],
+    ids=["key-scan", "skeleton-scan"],
+)
+def test_a_free_subsequence_scan_would_match_and_this_matcher_refuses(
+    term: str, form: str, phrase: str, line: str
+) -> None:
+    """Requirement 3, as a case that separates the two implementations rather than as a claim.
+
+    One fixture per comparison form, because the two would fail differently. ``SORT``'s letters
+    appear in order inside ``Storage Operations Roster`` — ``S``, then ``O`` and ``t`` inside
+    ``Operations``, then ``R`` — so a scan for the *key* takes it. ``SFR`` appears in order inside
+    ``Service for Escalation Routing``, so a scan for the *skeleton* takes that one; its key
+    ``SAFER`` does not appear at all, which is why the skeleton needed its own fixture.
+
+    What the shipped matcher does instead is compare complete strings: the phrase's initials under
+    four readings of its own token boundaries, against the two spellings of the term, by set
+    intersection. There is no position at which it could stop early having found the letters it
+    wanted. Both lines run past the length bound, so refusing the cut refuses the entry outright
+    and the two outcomes are told apart by more than a difference in stored text.
+    """
+    assert _free_subsequence_scan(form, phrase), (
+        f"{phrase!r} does not contain {form} as a subsequence, so this fixture cannot tell a "
+        f"scanning matcher from a boundary-respecting one"
+    )
+
+    assert not initials_match(normalise_acronym(term), phrase, display=term)
+    assert core_expansion(normalise_acronym(term), phrase, display=term) == phrase, (
+        "the phrase alone is short enough to keep whole; the refusal under test is of the cut"
+    )
+    assert detect_in_chunk(chunk(line)) == []
+
+
+@pytest.mark.parametrize("text", PROSE_ON_THE_GLOSSARY_PAGE, ids=["note", "today", "api"])
+def test_the_widened_matcher_awards_no_cut_inside_the_protected_prose(text: str) -> None:
+    """The negatives measured against the **wider** net, which is the claim that needed proving.
+
+    ``test_prose_on_a_glossary_page_is_still_refused`` asserts that no entry is written. This
+    asserts the step before it and the one the widening could actually have broken: that no
+    *prefix* of these lines is ever selected. Truncation is the dangerous direction — ``when
+    enabled`` is shorter than the sentence it came from and therefore more expansion-shaped by
+    every length rule in the module — so a widening that admitted a cut here would produce a
+    better-looking false positive than the one the module started with.
+
+    Whichever way each line is refused, ``core_expansion`` returns the whole right-hand side or
+    nothing. Never a proper prefix of it.
+    """
+    term, _, right = text.partition(" - ")
+    whole = re.sub(r"\s+", " ", right.strip()).rstrip(".").strip()
+
+    core = core_expansion(normalise_acronym(term), right, display=term)
+
+    assert core in {"", whole}, f"a prefix of {right!r} was selected as the expansion of {term}"
 
 
 # --- refusing prose -------------------------------------------------------------------------
@@ -288,8 +523,9 @@ REAL_DEFINITIONS_WITHOUT_INITIALS: list[tuple[str, str]] = [
     ("ID", "identifier"),
     ("DB", "database"),
     ("FAQ", "frequently asked questions list"),
-    ("HTTP", "HyperText Transfer Protocol"),
     ("IOU", "I owe you"),
+    ("NIC", "network card"),
+    ("PSU", "power supply"),
     # The two that were measured being refused. `IT` casefolds to the pronoun `it`, and without
     # the abbreviation exemption in `has_a_refused_opening` both of these were silently lost.
     ("ITSM", "IT service management"),
@@ -300,6 +536,13 @@ REAL_DEFINITIONS_WITHOUT_INITIALS: list[tuple[str, str]] = [
 This is the population the word list can hurt, and it is the only one that can constrain how
 long the list is allowed to get. Every other fixture in this module is a false positive; a rule
 measured only against those can be made perfect by refusing everything.
+
+``HTTP — HyperText Transfer Protocol`` was a member and is not one any more, and the reason is
+worth recording rather than editing away. Component initials read ``HyperText`` as two words, so
+that pair now *does* spell its term and the case no longer reaches the rule this population
+exists to constrain — the parametrised assertion below caught it, which is what that assertion is
+for. It moved to ``test_a_compound_word_supplies_initials_its_whole_word_does_not``. ``NIC`` and
+``PSU`` replace it so the population does not quietly shrink by one every time a case graduates.
 """
 
 
