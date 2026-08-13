@@ -367,14 +367,104 @@ async def test_content_and_metadata_changes_are_detected_independently() -> None
     }
 
 
-def _raw(metadata: Metadata) -> RawDocument:
+def _raw(metadata: Metadata, *, media_type: str = MEDIA_TYPE) -> RawDocument:
     """A fetched document carrying ``metadata``, for asking the classifier a question."""
     return RawDocument(
         source_id=MIRRORED,
         uri=f"memory://{MIRRORED}",
-        media_type=MEDIA_TYPE,
+        media_type=media_type,
         content="The client retries twice.\n",
         metadata=metadata,
+    )
+
+
+# --- re-routing ------------------------------------------------------------------------------
+
+RE_ROUTED = "text/x-fake-storage"
+"""A second media type for the same bytes, standing in for a source that has learned to
+declare what it was serving all along."""
+
+
+async def test_a_source_that_declares_a_new_media_type_reports_it_as_its_own_axis() -> None:
+    """A re-route is not a lineage change, and reporting it as one would be a lie.
+
+    Lineage asks whether the parser that ran has since changed *version*, and it answers by
+    looking up ``parser_used`` — so on a re-route it compares the old parser against itself,
+    finds it unchanged, and says the document is current. Nothing else notices either: the bytes
+    are identical and the source record has not moved.
+    """
+    connector = a_connector(metadata=a_record(version="7"))
+    pipeline, store, _ = build()
+    await pipeline.run(connector)
+    stored = next(iter(store.documents.values()))
+    digest = stored.content_hash
+
+    # The same bytes, the same record, declared as something else.
+    assert pipeline.changes_since(stored, digest, _raw(a_record(version="7"), media_type=RE_ROUTED)) == {
+        Change.ROUTING
+    }
+
+    # And it is reported *beside* the others rather than instead of them.
+    assert pipeline.changes_since(
+        stored, "another-digest", _raw(a_record(version="8"), media_type=RE_ROUTED)
+    ) == {Change.CONTENT, Change.METADATA, Change.ROUTING}
+
+
+async def test_a_fetch_that_declares_nothing_is_not_treated_as_a_re_route() -> None:
+    """Silence is agreement, not ignorance.
+
+    A caller with no fetch in hand has said nothing about routing. Treating that as a change
+    would re-ingest every such corpus on every sync to learn nothing — the same rule the source
+    record follows one field along.
+    """
+    connector = a_connector(metadata=a_record(version="7"))
+    pipeline, store, _ = build()
+    await pipeline.run(connector)
+    stored = next(iter(store.documents.values()))
+
+    assert pipeline.changes_since(stored, stored.content_hash, None) == frozenset()
+
+
+async def test_a_re_routed_document_is_not_skipped_on_an_unchanged_version_token() -> None:
+    """The level-1 half, which is the half that would actually have bitten.
+
+    A page nobody has edited reports the version token it reported last time, so level 1 answers
+    and **the fetch never happens** — meaning a routing check placed only in ``changes_since``
+    never runs at all on precisely the connectors that are best behaved. It is the same trap
+    ``_parse_lineage_is_current`` exists for, one axis along, and the consequence is a corpus
+    holding text from a parser nothing routes to any more, for ever, with nothing reported.
+
+    Asserted on the fetch rather than on the classifier: whether the pipeline *went and looked*
+    is the observable behaviour, and a test of the private predicate would pass while the
+    document was still being skipped.
+    """
+    connector = a_connector(metadata=a_record(version="7"))
+    connector.tokens[MIRRORED] = "unmoved"
+    pipeline, store, _ = build(
+        parsers={"lines": fakes.LineParser(), "storage": fakes.LineParser()},
+        routes={MEDIA_TYPE: ("lines",), RE_ROUTED: ("storage",)},
+    )
+    await pipeline.run(connector)
+    assert connector.fetches == [MIRRORED]
+    first = next(iter(store.documents.values()))
+    assert first.metadata.get("parser_used") == "lines"
+
+    # Nothing about the page has moved, so a second run must skip it.
+    await pipeline.run(connector)
+    assert connector.fetches == [MIRRORED], "an unchanged page must not be re-fetched"
+
+    # Now the source declares the type it was serving all along. The token is still 'unmoved'.
+    connector.media_types[MIRRORED] = RE_ROUTED
+    await pipeline.run(connector)
+
+    assert connector.fetches == [MIRRORED, MIRRORED], (
+        "a re-routed document was skipped without being fetched, so its text stays whatever the "
+        "old parser made of it for ever"
+    )
+    after = next(iter(store.documents.values()))
+    assert after.media_type == RE_ROUTED
+    assert after.metadata.get("parser_used") == "storage", (
+        "the point of noticing is that the new parser actually gets to read it"
     )
 
 
