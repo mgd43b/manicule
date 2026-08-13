@@ -152,8 +152,14 @@ class _Body:
 class ConfluenceConnector:
     """Discovers, fetches and reconciles Confluence pages and their attachments."""
 
-    def __init__(self, config: ConfluenceConfig, client: ConfluenceClient) -> None:
-        self.name = CONNECTOR_NAME
+    def __init__(
+        self, config: ConfluenceConfig, client: ConfluenceClient, *, name: str = CONNECTOR_NAME
+    ) -> None:
+        # The configured source's name, defaulting to the type for a caller outside the
+        # container. Two Confluence sites, or two space subsets of one site, are two sources;
+        # naming both after the implementation files their documents under one `source`, where
+        # a shared page id makes one silently overwrite the other.
+        self.name = name
         self._config = config
         self._client = client
         self._observed: dict[str, datetime] = {}

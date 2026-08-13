@@ -81,6 +81,19 @@ class BuildContext:
     data_dir: Path
     cache_dir: Path
     components: ComponentResolver
+    instance: str = ""
+    """The configured instance this build is for, when the kind has instances.
+
+    Connectors are the kind that does: configuration names sources, so ``[connectors.handbook]``
+    and ``[connectors.runbooks]`` are two sources that happen to share an implementation. The
+    factory needs the name because it is not decoration — it becomes ``Connector.name``, and
+    from there the ``source`` half of ``document_id(workspace_id, source, source_id)``, the
+    watermark key and the run-metadata key. A factory that named its connector after the
+    implementation instead would make every instance of a type one source.
+
+    Empty for kinds configuration selects exactly one of — an embedder is not an instance of
+    anything, and there is no second one for a name to distinguish it from.
+    """
 
 
 type Factory[T] = Callable[[BuildContext], T]

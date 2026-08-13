@@ -389,14 +389,23 @@ async def test_a_parser_disagreeing_with_its_own_declaration_is_caught(settings:
 async def test_a_connector_is_named_by_the_user_and_typed_by_configuration(
     settings: Settings,
 ) -> None:
+    """The source is ``docs``; ``memory`` is only the implementation it asked for.
+
+    This assertion used to read ``.name == "memory"`` — the *type* — under this same name,
+    so the test asserted the defect while its title described the fix. That is worse than no
+    test: it reported a property nobody had checked, and it is why the collapse of "connector
+    type" into "configured source" survived as long as it did.
+    """
     from tests.fakes import MemoryConnector  # noqa: PLC0415
 
     registry = ComponentRegistry().bind("test")
-    registry.add(keys.CONNECTOR.named("memory"), lambda _: MemoryConnector())
+    registry.add(
+        keys.CONNECTOR.named("memory"), lambda context: MemoryConnector(name=context.instance)
+    )
     configured = settings.model_copy(update={"connectors": {"docs": _connector_settings("memory")}})
     container = Container(configured, registry)
 
-    assert (await container.connector("docs")).name == "memory"
+    assert (await container.connector("docs")).name == "docs"
     with pytest.raises(UnknownComponentError, match="no connector named 'absent'"):
         await container.connector("absent")
 
