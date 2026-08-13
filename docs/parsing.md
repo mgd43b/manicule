@@ -816,7 +816,23 @@ numbers address its output.)
    carrying one.
 
 6. **Idempotence across a re-ingest.** Re-parsing an unchanged document produces the same
-   chunk sequence, so an unchanged document costs zero re-embedding.
+   chunk sequence, so an unchanged document costs no *new* vectors.
+
+   **"Costs zero re-embedding" is what this used to say, and it is true of only one of the two
+   paths that re-visit a document.** On a sync, change detection compares the stored hash and
+   never parses the document at all, so nothing is embedded. On a *forced* re-parse — which is
+   what a fingerprint bump triggers, and the only path where this assertion is doing work —
+   the pipeline parses, chunks and embeds everything it is handed. Measured on a four-chunk
+   document whose bytes and text did not move:
+
+   | Path | Embed calls |
+   |---|---|
+   | re-sync, document unchanged | 0 |
+   | forced re-parse, document unchanged | 4 |
+
+   What idempotence buys is therefore identity rather than compute: the ids are the ones
+   already stored, so the vector rows keyed on them are still the right vectors and every
+   citation still resolves. §4.5 prices the compute.
 
    The parser's obligation is the *sequence* — same texts, same order, same anchors. The
    **chunk ID scheme is storage's** ([`storage.md`](storage.md) §3.2), derived from content
@@ -1142,16 +1158,29 @@ can price it:
   matches for none of them — which is the point. Nothing can tell in advance which pages hold a
   multi-paragraph macro without parsing them, and a fingerprint that could would be a hash of
   the output rather than of the rules. This reads retained bytes and touches no network.
-- **Re-embed**: every chunk of every document that re-parses. The correction is worth the space
-  because the previous version of this bullet said "only the chunks that actually changed".
-  What is content-derived is a chunk's *id*, so a chunk the re-parse did not move comes back
-  with the id it had, keeps the vector row stored against that id, and keeps every citation
-  that resolved to it — but the embedding is not skipped to get there. `re_parse` runs the
-  ordinary ingest path, and that path embeds every chunk it is handed. Measured on a four-chunk
-  document whose text did not move at all, `tests/ingest/test_reindex.py` counts four calls.
-  So a bump costs nothing in identity and one forward pass per chunk in compute.
-  [`ingest.md`](ingest.md) §10.1 owns the accounting and says why the two counts it reports are
-  not counts of forward passes.
+- **Re-embed**: every chunk of every document that re-parses, and **not** only the chunks whose
+  text changed. That is the inference to resist, because everything around it invites the
+  opposite one: a chunk's *id* is content-derived, so a chunk the re-parse did not move comes
+  back with the id it had, keeps the vector row stored against that id, and keeps every citation
+  that resolved to it. None of that skips the embedding. `re_parse` runs the ordinary ingest
+  path, and that path embeds every chunk it is handed — measured on a four-chunk document whose
+  text did not move at all, `tests/ingest/test_reindex.py` counts four calls. So a bump costs
+  nothing in identity and one forward pass per chunk in compute. §3.3's assertion 6 is the same
+  distinction one level down, and [`ingest.md`](ingest.md) §10.1 owns the accounting and says
+  why the two counts it reports are not counts of forward passes.
+
+  **Do not expect the embedding cache to absorb it.** `EmbeddingCache` is a bounded LRU over
+  `(embed fingerprint, text)`, and what it is good at is duplicate *text*: a batch of forty
+  copies of one string costs one forward pass. A sweep in a fresh process over a corpus of
+  distinct chunks has no duplicates to absorb, and a corpus larger than the cache evicts each
+  entry before anything could reuse it. Measured at its default capacity of 10,000:
+
+  | Shape | Forward passes |
+  |---|---|
+  | 40 copies of one string, one batch | 1 |
+  | 10,000 distinct chunks, fresh process | 10,000 |
+  | the same 10,000 swept twice in one process | 10,000 then 0 |
+  | 20,000 distinct chunks swept twice in one process | 20,000 then 20,000 |
 - **The path**: nothing, for an index that syncs. Change detection re-parses each document the
   next time its connector reports it, because `IngestPipeline` compares the stored `parse_fp`
   against what that document's own parser would produce now and a mismatch stops it counting as
@@ -1222,17 +1251,23 @@ Confluence escapes markup inside one. And an inline break inside a *single parag
 the chunk budget* is lost to §4.2's sentence repacking, exactly as any other intra-paragraph
 structure is; the paragraph boundary either side of it survives, which is what §4.5 is about.
 
-**What the bump costs an existing index.** `PARSERS["html"].rules` and
-`PARSERS["confluence"].rules` both went 2 → 3, and `PARSERS["email"].rules` went with them for
-the reason recorded against its entry: an HTML-only mail body's `LineAnchor`s address the text
-`mail._html_to_text` builds from the web parser's blocks, so a newline inside a block moves every
-line after it. The costs are the shape §4.5 prices — text changes only for documents containing
-a break; every document of those three parsers re-parses from retained bytes, because a
-`parse_fp` records the parser's version rather than the document's content; a chunk whose text
-did not move keeps its id and its stored vector, so no citation moves; and the embedding is
-recomputed for every chunk of every re-parsed document, which is the compute the bump costs.
-Measured on the fixture corpus before the bump: of 323 blocks across 21 HTML and storage-format
-documents, exactly one changed, and it was the one holding the `<br>`.
+**Which parsers moved, and why one of them did not have to.** `PARSERS["html"].rules` and
+`PARSERS["confluence"].rules` both went 2 → 3, because their own rules changed.
+`PARSERS["email"].rules` went with them although its rules did not: an HTML-only mail body's
+`LineAnchor`s address the text `mail._html_to_text` builds from the web parser's blocks, so a
+newline inside a block makes the break a line of that text and every anchor after it moves.
+That is the second time this entry has been bumped for a change it did not make, and the first
+is recorded beside it.
+
+`html_text_version` is **not** bumped with them. `web-blocks/1` names the rule email applies to
+those blocks — join them with a blank line — and that rule is unchanged; it lives in
+`ChunkFingerprint.version`, where a bump refuses ingest against the entire corpus rather than
+re-parsing the documents that moved.
+
+**What it costs is the shape §4.5 prices**, with one number worth having: text moves only in
+documents that contain a break, and on the fixture corpus that was 1 block of 323, across 21
+HTML and storage-format documents. Every document of those three parsers re-parses regardless,
+because a `parse_fp` records the parser's version and not the document's content.
 
 **What to type.** `manicule document reindex --stale` ([`ingest.md`](ingest.md) §10.1) is the
 sweep for it: this bump makes every `html`, `confluence` and `email` document stale at once, so
@@ -1240,24 +1275,6 @@ the per-document verb is the wrong end of the tool here. `--dry-run` first price
 the documents whose bytes were never retained, which are the only ones a sweep cannot repair.
 Doing nothing is also a choice with a defined outcome — change detection re-parses each document
 the next time its connector reports it — and the sweep is what closes that window early.
-
-**Do not expect the embedding cache to absorb this.** It is a bounded LRU over
-`(embed fingerprint, text)`, and what it is good at is duplicate *text*: a batch of forty copies
-of one string costs one forward pass. A sweep in a fresh process over a corpus of distinct
-chunks has no duplicates to absorb, and a corpus larger than the cache evicts each entry before
-anything could reuse it. Measured against `EmbeddingCache` at its default capacity of 10,000:
-
-| Shape | Forward passes |
-|---|---|
-| 40 copies of one string, one batch | 1 |
-| 10,000 distinct chunks, fresh process | 10,000 |
-| the same 10,000 swept twice in one process | 10,000 then 0 |
-| 20,000 distinct chunks swept twice in one process | 20,000 then 20,000 |
-
-`html_text_version` is **not** bumped with them. `web-blocks/1` names the rule email applies to
-those blocks — join them with a blank line — and that rule is unchanged; it lives in
-`ChunkFingerprint.version`, where a bump refuses ingest against the entire corpus rather than
-re-parsing the documents that moved.
 
 ### 4.6 Block lineage — assessed, and deliberately not built yet
 
