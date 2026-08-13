@@ -71,6 +71,13 @@ class ParserVersions:
 PARSERS: Final[dict[str, ParserVersions]] = {
     "adf": ParserVersions(rules="1"),
     "archive": ParserVersions(rules="1"),
+    # Starts at 1 rather than inheriting `html`'s 2. A version is a statement about one
+    # parser's own output, and these are different parsers: the documents this reads were
+    # previously read by `html`, and what re-parses them is `Change.ROUTING` noticing that the
+    # media type they arrive under has changed. A bump here could not have done it — the stored
+    # documents name `html` as the parser they used, so this entry is not the one their lineage
+    # is compared against.
+    "confluence": ParserVersions(rules="1", distributions=("selectolax",)),
     "docx": ParserVersions(rules="1", distributions=("python-docx", "lxml")),
     # 1 -> 2: an HTML-only mail body's line numbers address the text
     # `mail._html_to_text` builds from the web parser's blocks, and the web parser now

@@ -102,12 +102,30 @@ The breadcrumb elides anything past its token budget anyway
 costs a row that is mostly one field.
 """
 
-_MEDIA_TYPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$")
-"""``type/subtype``, and nothing else.
+_TYPE_PART = "[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*"
+"""One RFC 9110 token: a type, a subtype, a parameter name, or an unquoted value."""
 
-Deliberately not a full RFC 6838 parse with parameters. What this field is for is routing and
-display; a declared value with a ``;charset=`` on it is a value somebody expected to be
-interpreted, and interpreting half of it is worse than refusing all of it.
+_MEDIA_TYPE = re.compile(
+    rf'^{_TYPE_PART}/{_TYPE_PART}(?:;\s*{_TYPE_PART}=(?:{_TYPE_PART}|"[^"]*"))*$'
+)
+"""``type/subtype``, and any parameters it carries, all of them well-formed.
+
+**This used to refuse parameters outright, and the reasoning was sound but reached the wrong
+rule.** It said a declared value with a ``;charset=`` on it "is a value somebody expected to be
+interpreted, and interpreting half of it is worse than refusing all of it". The first half of
+that is right. The conclusion does not follow: the alternative to interpreting half of a value
+is accepting the whole of it, not refusing the whole of it.
+
+What settled it is that the old rule refused **manicule's own media types**. Both Confluence
+body formats are identified by a profile parameter — ``application/json;profile=atlas-doc-format``
+and ``application/xhtml+xml;profile=confluence-storage`` — and the parameter is not decoration
+there, it is the whole of what distinguishes the format from the generic type underneath it.
+A record that cannot state the type this system routed a document by is not a conservative
+record; it is one that has to lie or say nothing.
+
+Still not a full RFC 9110 parse: the value is stored and compared, never split, so a parameter's
+*meaning* is nothing this model claims to know. What it checks is that the whole string is
+well-formed, so ``text/html;charset`` and ``text/html;;`` are refused as before.
 """
 
 

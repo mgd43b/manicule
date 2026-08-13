@@ -32,6 +32,7 @@ from manicule.core.provenance import (
     Provenance,
     SourceMetadata,
 )
+from manicule.parsers.config import ADF_MEDIA_TYPE, CONFLUENCE_MEDIA_TYPE
 
 CANONICAL = "https://docs.example.test/pages/123456/retry-policy"
 
@@ -266,15 +267,41 @@ def test_a_naive_retrieval_timestamp_is_refused_on_the_snapshot_too() -> None:
         LocalSnapshot(path="mirror/123456.html", retrieved_at=datetime(2026, 3, 4))  # noqa: DTZ001 - the input under test
 
 
-def test_a_declared_content_type_must_be_a_media_type() -> None:
-    """Half-interpreting a value somebody expected to be interpreted is worse than refusing."""
-    with pytest.raises(ValidationError, match="type/subtype"):
-        SourceMetadata(title="Retry policy", content_type="text/html; charset=utf-8")
-    with pytest.raises(ValidationError, match="type/subtype"):
-        SourceMetadata(title="Retry policy", content_type="not a media type")
-    assert (
-        SourceMetadata(title="Retry policy", content_type="text/html").content_type == "text/html"
-    )
+def test_a_declared_content_type_must_be_a_well_formed_media_type() -> None:
+    """Malformed is refused; carrying parameters is not malformed.
+
+    **This assertion was the other way round, and the reasoning behind it reached the wrong
+    rule.** It refused any parameter on the grounds that a value with ``;charset=`` on it "is a
+    value somebody expected to be interpreted, and interpreting half of it is worse than refusing
+    all of it". True — but the alternative to interpreting half is accepting the whole, not
+    refusing the whole. The value is stored and compared here, never split, so nothing is
+    half-interpreted either way.
+
+    What is checked is that the whole string is well-formed, so a truncated parameter is still
+    refused and a reader is never handed something it must guess at.
+    """
+    for malformed in ("text/html;charset", "text/html;;", "text/html;", "not a media type"):
+        with pytest.raises(ValidationError, match="media type"):
+            SourceMetadata(title="Retry policy", content_type=malformed)
+
+    for declared in ("text/html", "text/html; charset=utf-8", 'text/plain;charset="utf-8"'):
+        assert SourceMetadata(title="Retry policy", content_type=declared).content_type == declared
+
+
+def test_a_record_can_state_the_media_type_manicule_itself_routed_by() -> None:
+    """The case that forced the rule to change, and it was already broken before this parser.
+
+    Both Confluence body formats are identified by a profile parameter, and the parameter is not
+    decoration: it is the whole of what distinguishes storage format from the XHTML underneath it,
+    and ADF from any other JSON. A record that cannot state the type a document was routed by
+    has to lie about it or say nothing, and both of those are worse than parsing a semicolon.
+
+    ``ADF_MEDIA_TYPE`` is asserted here as well as the new one because it was refused too, and had
+    been since the day this validator was written — latent only because nothing had yet put it in
+    a record.
+    """
+    for declared in (ADF_MEDIA_TYPE, CONFLUENCE_MEDIA_TYPE):
+        assert SourceMetadata(title="Retry policy", content_type=declared).content_type == declared
 
 
 # --- reading a record back out of storage ----------------------------------------------------

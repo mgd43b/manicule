@@ -1,6 +1,7 @@
 # Parsing and chunking
 
-Design for the twelve parsers, the anchor strategy behind every citation, and the chunker.
+Design for the twelve file-type parsers, the two Confluence body formats, the anchor strategy
+behind every citation, and the chunker.
 Ticket [#4](https://github.com/mgd43b/manicule/issues/4).
 
 `PLAN.md` §5 picks the libraries and settles OCR. [`docs/contracts.md`](contracts.md) §1
@@ -417,14 +418,16 @@ emitted — the parser emits `Unlocated(reason="ambiguous heading path")` instea
 
 ### 2.4 Per-format anchor strategy
 
-Twelve parsers, eighteen extensions, plus the v1 source. Every row names the `Anchor`
-variant, where the location physically comes from, and whether provenance is real.
+Twelve parsers over eighteen extensions, plus the two Confluence body formats, which are not
+file types. Every row names the `Anchor` variant, where the location physically comes from, and
+whether provenance is real.
 
 | Parser | Extensions | Anchor | Location source | Provenance |
 |---|---|---|---|---|
 | **PDF** | `.pdf` | `PageAnchor(page, rects)` | pdfium page index; char boxes for the quoted range, merged into per-line rects | **Exact.** Page and box both real |
 | **Code** | 40+ | `LineAnchor(start, end, symbol)` | tree-sitter node byte range → line numbers; `symbol` from the AST (§8.2) | **Exact** |
 | **Confluence ADF** | — (v1 source) | `HeadingAnchor(path, fragment)` | ADF `heading` nodes; fragment is Confluence's own anchor | **Exact**, deep-links to the section |
+| **Confluence storage** | — (body format) | `HeadingAnchor(path, fragment\|None)` | `selectolax` heading elements; fragment from the heading's `id=` or a preceding `anchor` macro | **Partial** — fragment only where the author published one; ambiguous repeats are `Unlocated` |
 | **Markdown** | `.md` `.mdx` | `HeadingAnchor(path, fragment)` | `markdown-it-py` token `map` (source line span) → heading tree; slug synthesised | **Exact** |
 | **HTML** | `.html` `.htm` | `HeadingAnchor(path, fragment\|None)` | `selectolax` heading elements; fragment from the nearest preceding `id=` | **Partial** — fragment only where the author supplied an `id` |
 | **DOCX** | `.docx` | `HeadingAnchor(path, fragment)` | paragraph style (`Heading N`); slug synthesised | **Sections only.** No page numbers, ever — see §2.5 |
@@ -441,10 +444,42 @@ file-type list: XLSX and CSV share one parser because the anchor and the block m
 identical once a CSV is given a sheet name. The code parser is the exception to the
 eighteen — its extension set is the grammar pack's language list, which is deliberately
 wider than the capability floor, since real ASTs across many languages is one of the two
-upgrades this ticket exists for. Confluence ADF is a thirteenth row and not a
-file type — it registers under `application/json;profile=atlas-doc-format` and its node
-handling is specified in [`confluence.md`](connectors/confluence.md) §5, listed here because
-it is the v1 source and its anchors have to obey the same rules as everything else.
+upgrades this ticket exists for.
+
+**The last two rows are body formats rather than file types**, which is why the count above
+separates them. Both are Confluence, both register under a profiled media type, and neither has
+an extension because neither is ever a file the way a `.docx` is.
+
+- **Confluence ADF** registers under `application/json;profile=atlas-doc-format`, is the v1
+  source, and its node handling is specified in
+  [`confluence.md`](connectors/confluence.md) §5.
+- **Confluence storage** registers under `application/xhtml+xml;profile=confluence-storage`.
+  It is XHTML with Confluence's `ac:` and `ri:` vocabulary mixed in, and it was routed as
+  `text/html` until the storage parser existed. The base type is real — an HTML engine is the
+  right way to read it — but the profile is what stops it reaching the HTML parser, which read
+  `ac:parameter` as prose and put a code macro's language, a diagram's engine and a Jira
+  macro's JQL query into the index as text the page did not contain.
+
+**Both of these media types are manicule's conventions, not registered ones.** Atlassian
+publishes no IANA type for either body format, so `application/json;profile=atlas-doc-format` and
+`application/xhtml+xml;profile=confluence-storage` were coined here — the first by the ADF parser,
+the second by following it. They are stable identifiers *within this project* and nothing outside
+it will recognise them. Written down because a convention that reads like a standard gets cited as
+one: a future reader deciding what a third-party tool should emit, or what to send in an `Accept`
+header, would be reasoning from a string this repository invented. The profile syntax itself is
+ordinary RFC 9110 — a parameter on a real base type — so the shape is standard even where the
+value is ours. The fixture extension `.storage` is a convention of the same kind, and exists only
+so the test corpus can route a file to this parser.
+
+Both obey the same anchor rules as everything else. Storage format's fragments are `Partial` for
+the HTML parser's reason and one of its own: Confluence synthesises heading ids at *render* time,
+so a stored body usually publishes none, and synthesising one here would produce a citation that
+looks precise and lands at the top of the page (§2.5).
+
+**Changing what a body format is routed as re-routes every document already ingested under the
+old type**, which no version bump can express — the stored lineage names the parser that read it
+last, and that parser has not changed. `Change.ROUTING` in `manicule.ingest.pipeline` is the axis
+that notices, and `storage.md` §6.4 has the reasoning.
 
 `.mdx` goes through the Markdown parser. JSX component tags are not Markdown; they are
 emitted as `media` blocks carrying their tag name, never as prose, because a component
@@ -810,13 +845,19 @@ improvement; raising one requires a note in the PR saying which fixture forced i
 | PDF | 0.00 | 0.10 |
 | Code, Plain text, XLSX, CSV, Markdown, Confluence ADF | 0.00 | — |
 | PPTX | 0.00 | 0.20 |
-| DOCX, HTML, Jupyter | 0.05 | — |
+| DOCX, HTML, Jupyter, Confluence storage | 0.05 | — |
 | Email | 0.05 | — |
 | Structured | 0.10 | — |
 
 Archive is absent because it emits no chunks (§9.1), so it has nothing to budget. Both
 ratios are asserted per parser against its own fixture corpus, never pooled across parsers —
 pooling would let a well-behaved parser's fixtures pay for a badly-behaved one's.
+
+Confluence storage shares HTML's budget and shares its reason: a fragment is published by the
+author or not at all, so two sections with the same heading path and no `anchor` macro between
+them are honestly unlocatable. Confluence ADF is `0.00` beside it because ADF carries the
+source's own anchor on every heading — the same product, and the difference is the body format
+rather than the parser's care.
 
 PDF is `0.00` unlocated and `0.10` page-level because pdfium reports a page index for every
 page — a PDF chunk is never *unlocated*, at worst it is *page-level* when box extraction
