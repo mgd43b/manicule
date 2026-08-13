@@ -9,6 +9,7 @@ was checked by disabling the guard and watching the suite go red.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import override
 
@@ -25,7 +26,16 @@ from manicule.core.content import (
     RawDocument,
     Retention,
 )
-from manicule.core.embedding import EmbedFingerprint, IndexFingerprints, Vector
+from manicule.core.embedding import (
+    UNRECORDED_IDENTITY,
+    EmbedFingerprint,
+    IndexFingerprints,
+    StoredVector,
+    Vector,
+    VectorState,
+    classify_stored_vector,
+    embedding_input_identity,
+)
 from manicule.core.errors import ParseError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.glossary import GlossaryEntry
@@ -391,23 +401,72 @@ UTC_ZERO = datetime.fromtimestamp(0, tz=UTC)
 """A fixed instant, so a soft delete in a fake is always outside any grace period."""
 
 
+@dataclass
+class VectorRow:
+    """One stored row, holding what a Lance row holds.
+
+    The chunk travels with the vector because a real row carries ``chunk_json``, and the
+    embedding-input identity travels with both because a real row carries ``embed_identity``.
+    A fake that kept only the vector could not answer whether a stored vector still describes
+    a chunk, which is the question the reuse path is about.
+    """
+
+    document_id: str
+    vector: Vector
+    embed_text: str
+    identity: str
+
+
 class MemoryVectors:
     """A vector store that records what it was asked to remove."""
 
     def __init__(self) -> None:
-        self.rows: dict[str, tuple[str, Vector]] = {}
+        self.rows: dict[str, VectorRow] = {}
         self.deleted_documents: list[str] = []
         self._fingerprint: EmbedFingerprint | None = None
+        self._middleware: tuple[str, ...] = ()
 
-    async def ensure_ready(self, fingerprint: EmbedFingerprint) -> None:
+    async def ensure_ready(
+        self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
+    ) -> None:
         self._fingerprint = fingerprint
+        self._middleware = tuple(embed_text_middleware)
 
     async def fingerprint(self) -> EmbedFingerprint | None:
         return self._fingerprint
 
     async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
         for chunk, vector in zip(chunks, vectors, strict=True):
-            self.rows[chunk.id] = (chunk.document_id, vector)
+            self.rows[chunk.id] = VectorRow(
+                document_id=chunk.document_id,
+                vector=vector,
+                embed_text=chunk.embed_text,
+                identity=self._identity_of(chunk.embed_text),
+            )
+
+    async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
+        verdicts: dict[str, StoredVector] = {}
+        for chunk in chunks:
+            row = self.rows.get(chunk.id)
+            if row is None or self._fingerprint is None:
+                verdicts[chunk.id] = StoredVector(state=VectorState.ABSENT)
+                continue
+            verdicts[chunk.id] = classify_stored_vector(
+                chunk,
+                recorded_identity=row.identity,
+                stored_embed_text=row.embed_text,
+                stored_vector=list(row.vector),
+                embed=self._fingerprint,
+                middleware=self._middleware,
+            )
+        return verdicts
+
+    def _identity_of(self, embed_text: str) -> str:
+        if self._fingerprint is None:
+            return UNRECORDED_IDENTITY
+        return embedding_input_identity(
+            embed_text, embed=self._fingerprint, middleware=self._middleware
+        )
 
     async def search(
         self,
@@ -420,8 +479,8 @@ class MemoryVectors:
 
     async def delete_document(self, document_id: str) -> None:
         self.deleted_documents.append(document_id)
-        for key, (owner, _) in list(self.rows.items()):
-            if owner == document_id:
+        for key, row in list(self.rows.items()):
+            if row.document_id == document_id:
                 del self.rows[key]
 
     async def delete_chunks(self, chunk_ids: list[str]) -> None:

@@ -456,6 +456,15 @@ class Runtime:
         # readings that agreed today would part company the first time either grew a filter.
         middleware = await self.middleware()
         fingerprint = chunker.fingerprint.with_middleware(middleware.declarations())
+        # Prepared a second time, now that the middleware declarations are known. `ensure_ready`
+        # is idempotent and the fingerprint is the same one; what this adds is the declaration
+        # set the store folds into every embedding-input identity it writes. It is done here
+        # rather than in `_build_prepared_vectors` because ingest is the only path that writes
+        # vectors, and making retrieval load the middleware registry to answer a query would be
+        # a cost paid by the wrong caller.
+        await vectors.ensure_ready(
+            embedder.fingerprint, embed_text_middleware=fingerprint.embed_text_middleware
+        )
         # Before a single document is fetched. An index built by a different chunker or a
         # different embedder is refused here rather than discovered halfway through a run,
         # by which point half the corpus disagrees with the other half.

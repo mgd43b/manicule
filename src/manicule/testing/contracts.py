@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
-from manicule.core.embedding import EmbedFingerprint, Pooling, Vector
+from manicule.core.embedding import EmbedFingerprint, Pooling, Vector, VectorState
 from manicule.core.errors import ContextOverflowError, FingerprintMismatchError, ManiculeError
 from manicule.core.organisation import ChunkRelationType, CitationState, CollectionRule
 from manicule.core.protocols import (
@@ -400,6 +400,105 @@ async def assert_vector_store_rejects_foreign_vectors(
     _fail(
         "the store accepted a second model with the same dimension. Vectors from two models "
         "are not comparable, and nothing downstream can detect that they were mixed"
+    )
+
+
+async def assert_vector_store_reuses_by_embedding_input(
+    make_store: Callable[[], VectorStore], chunks: Sequence[Chunk]
+) -> None:
+    """Check that a store answers reuse on the embedding input, not on the chunk id.
+
+    The reuse decision is what stops a corpus-wide re-parse costing a corpus-wide re-embed, and
+    it is a *storage* guarantee: the pipeline asks a store what it holds and believes the
+    answer. A backend that answered on chunk id alone would preserve a stale vector under
+    current chunk text — the one failure this whole path exists to prevent — and it would do it
+    invisibly, because every write succeeds and every search returns.
+
+    So this is run against every store manicule ships, and against any store a plugin
+    contributes. Five cases, each of which a plausible wrong implementation gets wrong:
+
+    1. **An unchanged chunk is readable**, and comes back with the vector that was stored.
+    2. **A chunk whose ``embed_text`` changed while its id did not is stale.** The case an
+       id-keyed implementation gets wrong, and the reason the store is asked about chunks
+       rather than about ids.
+    3. **A chunk that moved position, with neither text nor embedding input changed, is
+       readable.** Position is not part of the embedding input and must not invalidate.
+    4. **A chunk with no row at all is absent**, rather than missing from the answer. The
+       answer is total: one verdict per chunk asked about.
+    5. **Every verdict that is not readable carries no vector.** A caller that reads
+       ``verdict.vector`` without checking the state must get nothing rather than something.
+    """
+    fingerprint = _fingerprint(8)
+    store = make_store()
+    await store.ensure_ready(fingerprint)
+
+    needed = 3
+    original = list(chunks[:needed])
+    if len(original) < needed:  # pragma: no cover - the caller supplies a fixture with enough
+        _fail("this check needs at least three chunks to move one and leave two alone")
+    # One-hot, so every vector is already unit length and a store that L2-normalises on write
+    # and one that does not both hand back exactly what they were given. The comparison below
+    # is then about reuse rather than about which store normalises where.
+    vectors: list[Vector] = [
+        [1.0 if column == row else 0.0 for column in range(8)] for row in range(len(original))
+    ]
+    await store.upsert(original, vectors)
+
+    unchanged, rewritten, moved = original
+    rewritten = rewritten.model_copy(update={"embed_text": f"Somewhere else > {rewritten.text}"})
+    moved = moved.model_copy(update={"position": moved.position + 100})
+    never_stored = unchanged.model_copy(
+        update={
+            "id": f"{unchanged.id}-absent",
+            "text": "never stored",
+            "embed_text": "never stored",
+        }
+    )
+
+    verdicts = await store.stored_vectors([unchanged, rewritten, moved, never_stored])
+    _require(
+        set(verdicts) == {unchanged.id, rewritten.id, moved.id, never_stored.id},
+        "the store answered about a different set of chunks than it was asked about. The "
+        "answer is total — one verdict per chunk — so a caller never has to guess what a "
+        "missing key meant",
+    )
+
+    _require(
+        verdicts[unchanged.id].state is VectorState.READABLE,
+        "the store would not reuse the vector of a chunk nothing about which changed. Every "
+        "re-parse of an unchanged document then costs a full re-embed of it",
+    )
+    _require(
+        list(verdicts[unchanged.id].vector) == list(vectors[0]),
+        "the store returned a vector that is not the one it was given to store. A reused "
+        "vector that is not the stored vector is a silently different index",
+    )
+    _require(
+        verdicts[rewritten.id].state is VectorState.STALE,
+        "the store offered a stored vector for a chunk whose embed_text had changed. A chunk "
+        "id is derived from `text` and the vector is produced from `embed_text`, so an id "
+        "surviving is not evidence the embedded string did — this is the reuse that keeps a "
+        "stale vector under current chunk text",
+    )
+    _require(
+        verdicts[moved.id].state is VectorState.READABLE,
+        "the store refused to reuse the vector of a chunk that only moved position. Position "
+        "is not part of the embedding input, so a document whose sections were reordered "
+        "would re-embed in full for no change to any embedded string",
+    )
+    _require(
+        verdicts[never_stored.id].state is VectorState.ABSENT,
+        "the store claimed to hold something for a chunk it has never been given",
+    )
+    _require(
+        all(
+            not verdict.vector
+            for verdict in verdicts.values()
+            if verdict.state is not VectorState.READABLE
+        ),
+        "the store returned a vector alongside a verdict that says it must not be used. A "
+        "caller that reads the vector without reading the state then embeds nothing and "
+        "stores the wrong thing",
     )
 
 

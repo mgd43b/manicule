@@ -22,7 +22,14 @@ import hashlib
 import math
 from typing import TYPE_CHECKING, override
 
-from manicule.core.embedding import EmbedFingerprint, Pooling
+from manicule.core.embedding import (
+    EmbedFingerprint,
+    Pooling,
+    StoredVector,
+    VectorState,
+    classify_stored_vector,
+    embedding_input_identity,
+)
 from manicule.core.retrieval import Candidate
 from manicule.evaluation.corpus import CorpusVersion
 from manicule.evaluation.systems import ResultItem, SystemResult
@@ -125,10 +132,14 @@ class CosineVectorStore:
     def __init__(self) -> None:
         self._rows: dict[str, tuple[Chunk, Vector]] = {}
         self._fingerprint: EmbedFingerprint | None = None
+        self._middleware: tuple[str, ...] = ()
         self.searches = 0
 
-    async def ensure_ready(self, fingerprint: EmbedFingerprint) -> None:
+    async def ensure_ready(
+        self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
+    ) -> None:
         self._fingerprint = fingerprint
+        self._middleware = tuple(embed_text_middleware)
 
     async def fingerprint(self) -> EmbedFingerprint | None:
         return self._fingerprint
@@ -136,6 +147,26 @@ class CosineVectorStore:
     async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
         for chunk, vector in zip(chunks, vectors, strict=True):
             self._rows[chunk.id] = (chunk, list(vector))
+
+    async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
+        verdicts: dict[str, StoredVector] = {}
+        for chunk in chunks:
+            row = self._rows.get(chunk.id)
+            if row is None or self._fingerprint is None:
+                verdicts[chunk.id] = StoredVector(state=VectorState.ABSENT)
+                continue
+            stored_chunk, vector = row
+            verdicts[chunk.id] = classify_stored_vector(
+                chunk,
+                recorded_identity=embedding_input_identity(
+                    stored_chunk.embed_text, embed=self._fingerprint, middleware=self._middleware
+                ),
+                stored_embed_text=stored_chunk.embed_text,
+                stored_vector=vector,
+                embed=self._fingerprint,
+                middleware=self._middleware,
+            )
+        return verdicts
 
     async def search(
         self,

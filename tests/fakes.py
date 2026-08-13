@@ -24,7 +24,16 @@ from manicule.core.content import (
     ParsedBlock,
     RawDocument,
 )
-from manicule.core.embedding import EmbedFingerprint, Pooling, Vector
+from manicule.core.embedding import (
+    UNRECORDED_IDENTITY,
+    EmbedFingerprint,
+    Pooling,
+    StoredVector,
+    Vector,
+    VectorState,
+    classify_stored_vector,
+    embedding_input_identity,
+)
 from manicule.core.errors import FingerprintMismatchError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import chunk_id, content_hash, document_id
@@ -198,13 +207,23 @@ class TruncatingEmbedder(HashEmbedder):
 
 
 class MemoryVectorStore:
-    """A vector store with no assumptions about dimension."""
+    """A vector store with no assumptions about dimension.
+
+    Holds the same three things per row a Lance row holds — the chunk, the vector, and the
+    embedding-input identity — and classifies them with the same shared rule, so a pipeline
+    test run against this store measures the reuse behaviour the real one has rather than a
+    convenient approximation of it.
+    """
 
     def __init__(self) -> None:
         self._fingerprint: EmbedFingerprint | None = None
-        self._rows: dict[str, tuple[Chunk, Vector]] = {}
+        self._middleware: tuple[str, ...] = ()
+        self._rows: dict[str, tuple[Chunk, Vector, str]] = {}
 
-    async def ensure_ready(self, fingerprint: EmbedFingerprint) -> None:
+    async def ensure_ready(
+        self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
+    ) -> None:
+        self._middleware = tuple(embed_text_middleware)
         if self._fingerprint is None:
             self._fingerprint = fingerprint
             return
@@ -219,7 +238,63 @@ class MemoryVectorStore:
             if expected is not None and len(vector) != expected:
                 msg = f"vector for {chunk.id} has {len(vector)} dimensions, expected {expected}"
                 raise ValueError(msg)
-            self._rows[chunk.id] = (chunk, vector)
+            self._rows[chunk.id] = (chunk, vector, self._identity_of(chunk.embed_text))
+
+    async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
+        verdicts: dict[str, StoredVector] = {}
+        for chunk in chunks:
+            row = self._rows.get(chunk.id)
+            if row is None or self._fingerprint is None:
+                verdicts[chunk.id] = StoredVector(state=VectorState.ABSENT)
+                continue
+            stored_chunk, vector, identity = row
+            verdicts[chunk.id] = classify_stored_vector(
+                chunk,
+                recorded_identity=identity,
+                stored_embed_text=stored_chunk.embed_text,
+                stored_vector=list(vector),
+                embed=self._fingerprint,
+                middleware=self._middleware,
+            )
+        return verdicts
+
+    def _identity_of(self, embed_text: str) -> str:
+        """What this store records beside a vector, or nothing when it has no fingerprint yet.
+
+        A store that has never been through ``ensure_ready`` cannot name the vector space it is
+        writing into, so it records :data:`~manicule.core.embedding.UNRECORDED_IDENTITY` rather
+        than inventing one — the same thing a row predating the identity column holds.
+        """
+        if self._fingerprint is None:
+            return UNRECORDED_IDENTITY
+        return embedding_input_identity(
+            embed_text, embed=self._fingerprint, middleware=self._middleware
+        )
+
+    def corrupt(
+        self, chunk_id: str, *, vector: Vector | None = None, identity: str | None = None
+    ) -> None:
+        """Damage one row the way a half-written directory or an edited table would.
+
+        ``vector`` replaces the stored vector — pass a wrong-length one for a row that cannot
+        be read at the index's dimension. ``identity`` replaces the recorded identity, for a
+        row whose metadata claims something the chunk beside it contradicts.
+        """
+        stored_chunk, stored_vector, stored_identity = self._rows[chunk_id]
+        self._rows[chunk_id] = (
+            stored_chunk,
+            stored_vector if vector is None else vector,
+            stored_identity if identity is None else identity,
+        )
+
+    def forget_vector(self, chunk_id: str) -> None:
+        """Delete one vector row, leaving the chunk wherever the document store has it."""
+        del self._rows[chunk_id]
+
+    def vector_of(self, chunk_id: str) -> Vector | None:
+        """The stored vector, for a test that has to compare one against itself later."""
+        row = self._rows.get(chunk_id)
+        return None if row is None else row[1]
 
     async def search(
         self,
@@ -230,13 +305,15 @@ class MemoryVectorStore:
         del filter
         scored = [
             Candidate(chunk=chunk, score=-_distance(vector, stored), scores={"dense": 1.0})
-            for chunk, stored in self._rows.values()
+            for chunk, stored, _ in self._rows.values()
         ]
         scored.sort(key=lambda candidate: candidate.score, reverse=True)
         return scored[:k]
 
     async def delete_document(self, document_id: str) -> None:
-        stale = [key for key, (chunk, _) in self._rows.items() if chunk.document_id == document_id]
+        stale = [
+            key for key, (chunk, _, _) in self._rows.items() if chunk.document_id == document_id
+        ]
         for key in stale:
             del self._rows[key]
 
@@ -250,21 +327,26 @@ class FixedDimensionVectorStore(MemoryVectorStore):
     _ASSUMED = 768
 
     @override
-    async def ensure_ready(self, fingerprint: EmbedFingerprint) -> None:
+    async def ensure_ready(
+        self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
+    ) -> None:
         if fingerprint.dimension != self._ASSUMED:
             msg = f"table is {self._ASSUMED}-dimensional"
             raise ValueError(msg)
-        await super().ensure_ready(fingerprint)
+        await super().ensure_ready(fingerprint, embed_text_middleware=embed_text_middleware)
 
 
 class ForgetfulVectorStore(MemoryVectorStore):
     """A store that checks the dimension but not the model."""
 
     @override
-    async def ensure_ready(self, fingerprint: EmbedFingerprint) -> None:
+    async def ensure_ready(
+        self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
+    ) -> None:
         if self._fingerprint and self._fingerprint.dimension != fingerprint.dimension:
             raise FingerprintMismatchError("dimension changed")
         self._fingerprint = fingerprint
+        self._middleware = tuple(embed_text_middleware)
 
 
 def _distance(left: Vector, right: Vector) -> float:

@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 from typing import TYPE_CHECKING, Any, Final
 
@@ -65,12 +66,19 @@ from lancedb.pydantic import Vector as FixedSizeVector
 from pydantic import create_model
 
 from manicule.core.content import Chunk
-from manicule.core.embedding import EmbedFingerprint
+from manicule.core.embedding import (
+    UNRECORDED_IDENTITY,
+    EmbedFingerprint,
+    StoredVector,
+    VectorState,
+    classify_stored_vector,
+    embedding_input_identity,
+)
 from manicule.core.errors import ManiculeError
 from manicule.core.retrieval import Candidate, Filter
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
     from pathlib import Path
 
     from lancedb.db import AsyncConnection
@@ -89,7 +97,11 @@ FINGERPRINT_HASH_LENGTH: Final = 8
 ID_COLUMN: Final = "id"
 VECTOR_COLUMN: Final = "vector"
 CHUNK_COLUMN: Final = "chunk_json"
+IDENTITY_COLUMN: Final = "embed_identity"
 DISTANCE_COLUMN: Final = "_distance"
+
+IDENTITY_QUERY_PAGE: Final = 512
+"""Chunk ids per ``IN`` predicate when reading rows back. See :meth:`LanceVectorStore._rows_for`."""
 
 FILTERABLE_COLUMNS: Final = frozenset({"document_id", "kind", "lang", "position"})
 """The promoted columns a predicate may name.
@@ -217,16 +229,53 @@ def predicate_for(filter: Filter | None) -> str | None:  # noqa: A002 - the doma
     return " AND ".join(terms) if terms else None
 
 
+FLOAT32_EPSILON: Final = 2.0**-23
+"""The spacing of :class:`float` values either side of 1.0 in the column's own precision.
+
+The vector column is ``fixed_size_list<float32, dimension>``, so ``float32`` is what this
+module stores in and the smallest difference it can represent near 1.0 is this.
+"""
+
+
+def _embed_text_of(record: dict[str, Any]) -> str | None:
+    """The ``embed_text`` of the chunk a row carries, or ``None`` if the row cannot say.
+
+    Reads the one field rather than validating the whole :class:`~manicule.core.content.Chunk`,
+    because this is a hot read on every document a sweep touches and the rest of the model is
+    not being asked about. ``None`` covers every way the column can fail to answer — not JSON,
+    not an object, no ``embed_text``, an ``embed_text`` that is not a string — since they all
+    mean the same thing to the caller: this row cannot be checked against itself.
+    """
+    try:
+        decoded = json.loads(str(record[CHUNK_COLUMN]))
+    except (ValueError, TypeError, KeyError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    value = decoded.get("embed_text")
+    return value if isinstance(value, str) else None
+
+
 def unit(vector: Vector) -> list[float]:
     """``vector`` scaled to length one, so that cosine distance is ``1 - similarity``.
 
     A vector of all zeros has no direction and is returned unchanged. Nothing here can invent
     one for it, and cosine similarity against it is undefined rather than small — see
     :meth:`LanceVectorStore.search` for what the store does about that.
+
+    **A vector already of unit length within the column's precision is also returned
+    unchanged**, and that is what makes a reused vector a reused vector rather than a
+    very slightly different one. Read a stored vector back and the ``float32`` rounding leaves
+    its length a few parts in 10^8 from one; dividing by that length and rounding to
+    ``float32`` again lands on a different value in roughly one row in five hundred, measured.
+    So without this, re-writing a row with the vector it already holds would perturb the odd
+    row by one ulp, and "the vector was not recomputed" would be a claim no test could make
+    exactly. The correction being skipped is smaller than :data:`FLOAT32_EPSILON`, which is
+    smaller than the column can represent: it moves bits and cannot move meaning.
     """
     values = [float(value) for value in vector]
     norm = math.sqrt(math.fsum(value * value for value in values))
-    if norm == 0.0:
+    if norm == 0.0 or abs(norm - 1.0) < FLOAT32_EPSILON:
         return values
     return [value / norm for value in values]
 
@@ -260,6 +309,7 @@ def _row_model(dimension: int) -> type[LanceModel]:
         "lang": (str | None, None),
         "position": (int, ...),
         CHUNK_COLUMN: (str, ...),
+        IDENTITY_COLUMN: (str, ...),
     }
     return create_model("ManiculeVectorRow", __base__=LanceModel, **fields)
 
@@ -287,14 +337,22 @@ class LanceVectorStore:
         self._connection: AsyncConnection | None = None
         self._fingerprint: EmbedFingerprint | None = None
         self._table: AsyncTable | None = None
+        self._middleware: tuple[str, ...] = ()
 
     # --- lifecycle -----------------------------------------------------------------------
 
-    async def ensure_ready(self, fingerprint: EmbedFingerprint) -> None:
+    async def ensure_ready(
+        self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
+    ) -> None:
         """Prepare the store for vectors from ``fingerprint``.
 
         First call writes ``_manicule_meta`` and creates ``chunks__<fp8>`` at the dimension
         the embedder reports. Later calls compare what is stored.
+
+        A table created before :data:`IDENTITY_COLUMN` existed gains it here, filled with
+        :data:`UNRECORDED_IDENTITY`. That is the whole of the migration: it is one Lance
+        ``add_columns``, it needs no re-embedding, and it costs no forward pass — see
+        :meth:`stored_vectors` for what an unrecorded identity is allowed to be derived from.
 
         Raises:
             FingerprintMismatchError: When the directory already holds vectors from a
@@ -318,6 +376,7 @@ class LanceVectorStore:
                 stored.require_match(fingerprint)
             self._table = await self._ensure_table(connection, fingerprint)
             self._fingerprint = fingerprint
+            self._middleware = tuple(embed_text_middleware)
 
     async def teardown(self) -> None:
         """Close the LanceDB connection. Safe to call when none was ever opened."""
@@ -354,7 +413,7 @@ class LanceVectorStore:
         if not chunks:
             return
         rows = [
-            self._row(chunk, vector, fingerprint.dimension)
+            self._row(chunk, vector, fingerprint)
             for chunk, vector in zip(chunks, vectors, strict=True)
         ]
         await (
@@ -449,7 +508,86 @@ class LanceVectorStore:
             return 0
         return await table.count_rows()
 
-    # --- internals -----------------------------------------------------------------------
+    async def stored_vectors(self, chunks: Sequence[Chunk]) -> Mapping[str, StoredVector]:
+        """What this store holds for each of ``chunks``, and whether it can still be used.
+
+        The rule, in the order it is applied, because each step rejects something the step
+        after it would have accepted:
+
+        1. **A row that cannot be read as a chunk is corrupt.** Nothing about it can be
+           checked, and an unreadable row is not a vector to reuse.
+        2. **A row that contradicts itself is corrupt.** The recorded identity is compared
+           against one derived from the chunk stored beside it, and a disagreement means the
+           metadata does not describe the vector. Identity metadata asserting that a usable
+           vector exists is exactly the thing that must not be taken on trust — so a row
+           claiming to be about the input being asked for, while saying two different things
+           about what that input was, is repaired rather than believed.
+        3. **A row about a different embedding input is stale.** This is the case chunk-id
+           reuse gets wrong: the id survived a re-parse, the breadcrumb in ``embed_text`` did
+           not, and the stored vector describes a string this chunk no longer contains.
+        4. **A row of the wrong dimension is corrupt**, however current its identity.
+        5. Everything left is readable, and its vector is returned exactly as stored.
+
+        **A row written before the identity column is reconstructed, not distrusted.** Its
+        embedding input is read from the chunk in :data:`CHUNK_COLUMN`, which
+        :meth:`upsert` wrote from the same object, in the same call, as the vector beside it —
+        so it is the exact prior embedding input rather than a guess at one. That is what makes
+        the migration free: an existing corpus keeps every vector it has. The reconstruction is
+        reported through
+        :attr:`~manicule.core.embedding.StoredVector.identity_recorded` rather than hidden,
+        and writing the row again records the identity for good.
+        """
+        table, fingerprint = self._ready()
+        verdicts = {chunk.id: StoredVector(state=VectorState.ABSENT) for chunk in chunks}
+        if not chunks:
+            return verdicts
+        by_id = {chunk.id: chunk for chunk in chunks}
+        for record in await self._rows_for(table, sorted(by_id)):
+            chunk = by_id.get(str(record[ID_COLUMN]))
+            if chunk is None:  # pragma: no cover - the predicate asked for these ids only
+                continue
+            verdicts[chunk.id] = self._verdict(chunk, record, fingerprint)
+        return verdicts
+
+    async def _rows_for(self, table: AsyncTable, chunk_ids: Sequence[str]) -> list[dict[str, Any]]:
+        """Every stored row among ``chunk_ids``, read in bounded pages.
+
+        Paged because the predicate is an ``IN`` list and the caller's set is not bounded by
+        anything this method controls: one query per document is small, one query per corpus
+        is a SQL string megabytes long. The page size is a property of the query, not of the
+        work, so it needs no tuning knob.
+        """
+        rows: list[dict[str, Any]] = []
+        for start in range(0, len(chunk_ids), IDENTITY_QUERY_PAGE):
+            page = chunk_ids[start : start + IDENTITY_QUERY_PAGE]
+            listed = ", ".join(quote(chunk_id) for chunk_id in page)
+            rows.extend(
+                await table.query()
+                .where(f"{ID_COLUMN} IN ({listed})")
+                .select([ID_COLUMN, VECTOR_COLUMN, CHUNK_COLUMN, IDENTITY_COLUMN])
+                .limit(len(page))
+                .to_list()
+            )
+        return rows
+
+    def _verdict(
+        self, chunk: Chunk, record: dict[str, Any], fingerprint: EmbedFingerprint
+    ) -> StoredVector:
+        """Classify one stored row against the chunk it is being offered for.
+
+        The three things a Lance row knows are read here; what they *mean* is decided by
+        :func:`~manicule.core.embedding.classify_stored_vector`, which every backend shares so
+        that two of them cannot answer one question two ways.
+        """
+        stored = record.get(VECTOR_COLUMN)
+        return classify_stored_vector(
+            chunk,
+            recorded_identity=str(record[IDENTITY_COLUMN] or UNRECORDED_IDENTITY),
+            stored_embed_text=_embed_text_of(record),
+            stored_vector=None if stored is None else [float(value) for value in stored],
+            embed=fingerprint,
+            middleware=self._middleware,
+        )
 
     async def _unranked(self, table: AsyncTable, k: int, predicate: str | None) -> list[Candidate]:
         """Candidates for a query the store cannot rank. See :meth:`search`."""
@@ -462,15 +600,17 @@ class LanceVectorStore:
             for record in records
         ]
 
-    @staticmethod
-    def _row(chunk: Chunk, vector: Vector, dimension: int) -> dict[str, object]:
-        """One Lance row: the normalised vector, the promoted columns, and the chunk."""
+    def _row(
+        self, chunk: Chunk, vector: Vector, fingerprint: EmbedFingerprint
+    ) -> dict[str, object]:
+        """One Lance row: the normalised vector, the promoted columns, the chunk, its identity."""
         values = unit(vector)
-        if len(values) != dimension:
+        if len(values) != fingerprint.dimension:
             msg = (
                 f"chunk {chunk.id!r} was offered a {len(values)}-dimension vector but the "
-                f"index was built for {dimension}. The dimension comes from the embedder's "
-                f"fingerprint, so a disagreement here means two embedders are in play."
+                f"index was built for {fingerprint.dimension}. The dimension comes from the "
+                f"embedder's fingerprint, so a disagreement here means two embedders are in "
+                f"play."
             )
             raise ValueError(msg)
         return {
@@ -481,7 +621,12 @@ class LanceVectorStore:
             "lang": chunk.lang,
             "position": chunk.position,
             CHUNK_COLUMN: chunk.model_dump_json(),
+            IDENTITY_COLUMN: self._identity_of(chunk.embed_text, fingerprint),
         }
+
+    def _identity_of(self, embed_text: str, fingerprint: EmbedFingerprint) -> str:
+        """This store's one rule for what a stored vector's embedding input was."""
+        return embedding_input_identity(embed_text, embed=fingerprint, middleware=self._middleware)
 
     def _ready(self) -> tuple[AsyncTable, EmbedFingerprint]:
         """The open table and its fingerprint, or a refusal naming what was skipped."""
@@ -540,8 +685,25 @@ class LanceVectorStore:
     ) -> AsyncTable:
         name = table_name(fingerprint)
         if name in await self._table_names(connection):
-            return await connection.open_table(name)
+            table = await connection.open_table(name)
+            await self._ensure_identity_column(table)
+            return table
         return await connection.create_table(name, schema=_row_model(fingerprint.dimension))
+
+    async def _ensure_identity_column(self, table: AsyncTable) -> None:
+        """Add :data:`IDENTITY_COLUMN` to a table created before it existed.
+
+        The whole migration for an existing ``vectors/`` directory, and it is deliberately the
+        cheapest one available: a column of empty strings, no row rewritten, no vector read and
+        no forward pass. Every existing row is then :data:`UNRECORDED_IDENTITY`, which
+        :meth:`stored_vectors` reconstructs from the chunk the row already carries — so the
+        upgrade costs an ``add_columns`` and nothing else, and an existing corpus keeps every
+        vector it has. Idempotent, because :meth:`ensure_ready` runs on every process start.
+        """
+        schema = await table.schema()
+        if IDENTITY_COLUMN in {str(field.name) for field in schema}:
+            return
+        await table.add_columns({IDENTITY_COLUMN: f"'{UNRECORDED_IDENTITY}'"})
 
     async def _existing_table(self) -> AsyncTable | None:
         """The vector table if the directory has one, without requiring :meth:`ensure_ready`.
@@ -568,9 +730,12 @@ class LanceVectorStore:
 __all__ = [
     "EXEMPT_FILTER_FIELDS",
     "FILTERABLE_COLUMNS",
+    "FLOAT32_EPSILON",
+    "IDENTITY_COLUMN",
     "META_TABLE",
     "PUSHED_DOWN_FILTER_FIELDS",
     "TABLE_PREFIX",
+    "UNRECORDED_IDENTITY",
     "LanceVectorStore",
     "VectorStoreStateError",
     "fingerprint_hash",

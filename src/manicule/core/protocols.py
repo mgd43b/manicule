@@ -34,7 +34,7 @@ from typing import Protocol, runtime_checkable
 
 from manicule.core.anchors import Anchor
 from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
-from manicule.core.embedding import EmbedFingerprint, TokenStates, Vector
+from manicule.core.embedding import EmbedFingerprint, StoredVector, TokenStates, Vector
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.generation import Token
 from manicule.core.organisation import (
@@ -325,12 +325,22 @@ class TokenStateEmbedder(Embedder, Protocol):
 class VectorStore(Protocol):
     """Dense vector storage and nearest-neighbour search."""
 
-    async def ensure_ready(self, fingerprint: EmbedFingerprint) -> None:
+    async def ensure_ready(
+        self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
+    ) -> None:
         """Prepare the store for vectors from ``fingerprint``.
 
         The vector table is created here, on first ingest, using the dimension the embedder
         reports — never a constant known ahead of time. On every later call the stored
         fingerprint is compared and a mismatch raises.
+
+        ``embed_text_middleware`` is
+        :attr:`~manicule.core.fingerprints.ChunkFingerprint.embed_text_middleware`: the sorted
+        ``name@version`` of every middleware that declares it rewrites embedded text. The store
+        needs it because it, and not its caller, derives the embedding-input identity it stores
+        beside each vector (:func:`~manicule.core.embedding.embedding_input_identity`). The
+        default is correct for a configuration in which no middleware declares the capability,
+        which is every configuration that has not opted in.
 
         Raises:
             FingerprintMismatchError: When the store already holds vectors from a different
@@ -347,6 +357,31 @@ class VectorStore(Protocol):
         """Store vectors against chunks, replacing any existing rows for those chunk ids.
 
         ``chunks`` and ``vectors`` are parallel and must be the same length.
+
+        The store records each vector's embedding-input identity alongside it, derived from
+        the chunk's ``embed_text``, the fingerprint the store was prepared with, and the
+        middleware declaration it was given. Derived here rather than supplied by the caller
+        so that there is one rule for writing it and one rule for reading it back —
+        :meth:`stored_vectors` is the read, and two places computing one identity is how the
+        two come to disagree.
+        """
+        ...
+
+    async def stored_vectors(self, chunks: Sequence[Chunk]) -> Mapping[str, StoredVector]:
+        """What this store holds for each of ``chunks``, and whether it can still be used.
+
+        Asked about *chunks* rather than chunk ids, deliberately. A chunk id is derived from
+        ``text`` while a vector is produced from ``embed_text``, so a store handed only an id
+        could answer nothing better than "a row exists" — and reuse on that answer preserves a
+        stale vector under current text, which is the one failure this whole path exists to
+        avoid. Handing over the chunk is what lets the store compare the embedding input.
+
+        Returns:
+            One :class:`~manicule.core.embedding.StoredVector` per chunk, keyed by chunk id,
+            with an entry for **every** chunk asked about — including the ones with no row, so
+            a caller never has to decide what a missing key meant. A vector is returned only
+            with :attr:`~manicule.core.embedding.VectorState.READABLE`, and is the stored
+            vector exactly as stored.
         """
         ...
 
