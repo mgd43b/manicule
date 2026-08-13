@@ -12,12 +12,18 @@ Fixture                                              Rank of the definition
 ===================================================  ===============================
 The glossary line as its own short passage, thirty   **1 of 33** — no failure
 ordinary uses of "now" around it
-The glossary as one chunk holding 27 entries         **1 of 31**, cosine 0.4655 —
+The glossary as one chunk holding 25 entries         **1 of 31**, cosine 0.4655 —
                                                      ranked fine, but below the noise
                                                      floor, so confidence said ``none``
 The above, plus fifteen passages that *use* the      **15 of 61** — the failure
 acronym in running text
 ===================================================  ===============================
+
+Those ranks are the historical record of how the fixture was arrived at, measured by a method
+this suite no longer performs — attempting to re-derive them produced different figures, so they
+are left as the account they are rather than restated as current fact. What *is* current is
+:mod:`tests.glossary.test_measured`, which measures the shipped retriever and states the numbers
+it produced. The corpus is 62 chunks since the supplement was added, not 61.
 
 So reproducing it needed two ingredients, and a fixture missing either one proves nothing:
 
@@ -35,6 +41,20 @@ The distractors deliberately **do not** contain the literal expansion. An earlie
 every passage the phrase "network operations workspace", which made the expanded query rank the
 glossary *last* — a fixture that would have proved expansion harmful, for a reason no corpus
 has.
+
+**A second glossary page carries the description-boundary material**, and it is separate from
+the first for a reason that outlives this change: the twenty-five entry chunk is what every
+cosine in this suite and in ``docs/retrieval.md`` §8 was measured against, so adding a line to
+it would retire those measurements without failing anything. See :data:`SUPPLEMENT_ENTRIES`.
+What the supplement holds, each a category the extraction rules can get wrong:
+
+* :data:`DESCRIBED_ENTRY` — a definition trailed by nine words of prose, which the detector
+  refused wholesale before it could tell an expansion from a description.
+* :data:`STYLIZED_ENTRY` — the same shape with a stylized spelling, so display preservation and
+  description-trimming are proved *together* rather than on two fixtures each built for one.
+* :data:`PROSE_ON_THE_GLOSSARY_PAGE` — three lines that look like definitions and are not, on a
+  page whose title supplies the evidence that carries them to exactly the threshold. Two of the
+  three were recorded as real entries before this fixture existed.
 """
 
 from __future__ import annotations
@@ -45,6 +65,67 @@ GLOSSARY_TITLE: Final = "Glossary of terms"
 
 ACRONYM: Final = "NOW"
 EXPANSION: Final = "Network Operations Workspace"
+
+DESCRIBED_ACRONYM: Final = "NOVA"
+DESCRIBED_EXPANSION: Final = "Network Operations Visibility Assistant"
+DESCRIBED_ENTRY: Final = (
+    f"{DESCRIBED_ACRONYM} — {DESCRIBED_EXPANSION}, a service used to correlate operational "
+    "signals across systems."
+)
+"""A definition trailed by a description: four words of term, nine of prose.
+
+Recorded as no entry at all before ``core_expansion`` existed — thirteen words is over
+``MAX_EXPANSION_WORDS``, so the whole line was refused and nothing downstream could help.
+"""
+
+STYLIZED_DISPLAY: Final = "ReLAY"
+STYLIZED_ACRONYM: Final = "RELAY"
+STYLIZED_EXPANSION: Final = "Retention Export Ledger And Yield"
+STYLIZED_ENTRY: Final = (
+    f"{STYLIZED_DISPLAY} — {STYLIZED_EXPANSION}, the nightly export path between zones."
+)
+"""A term whose spelling is stylized, carrying a description as well.
+
+Two requirements on one line on purpose. A fixture proving stylized display on a bare definition
+and a second proving description-trimming on an ordinary term would leave the case where both
+apply untested, and that is the case a real glossary is full of.
+"""
+
+PROSE_ON_THE_GLOSSARY_PAGE: Final[tuple[str, ...]] = (
+    "NOTE - this paragraph describes an operational consideration, not a term.",
+    "Today - the system is operating normally.",
+    "API - when enabled, the process starts automatically.",
+)
+"""Prose that looks like a definition, on a page that says it is a glossary.
+
+**The placement is the whole test.** On an ordinary page a spaced hyphen scores 0.45 against a
+0.60 threshold, so every line here is refused by arithmetic that has nothing to do with this
+feature and a fixture placed there passes whether the detector is right or wrong. Under
+:data:`SUPPLEMENT_TITLE` the context evidence adds the missing 0.15, the total is exactly the
+threshold, and the scoring gate admits all three — so this is the only placement where refusing
+them proves anything. Do not move them off a glossary page.
+
+Two of the three were recorded as real entries before ``core_expansion`` existed: ``NOTE`` at
+nine words and ``API`` at six, both under :data:`~manicule.ingest.glossary.MAX_EXPANSION_WORDS`.
+"""
+
+SUPPLEMENT_TITLE: Final = "Glossary supplement: newer terminology"
+
+SUPPLEMENT_ENTRIES: Final[tuple[str, ...]] = (DESCRIBED_ENTRY, STYLIZED_ENTRY)
+"""The definitions that carry descriptions, on a page of their own.
+
+**A second document rather than two more lines on the first**, and that is a constraint this
+suite has to keep. Every cosine recorded against :data:`GLOSSARY_ENTRIES` is a property of that
+exact chunk; growing it would leave ``STRONG_SIMILARITY`` and the §8 tables citing a corpus that
+no longer exists, which is the quietest way a measured constant goes wrong. Measured directly:
+adding these two lines and the prose to the twenty-five entry page moved its cosine to ``What is
+NOW?`` from 0.4432 to 0.4984. Both are still below the 0.54 noise floor, so no claim would have
+*broken* — the numbers would just no longer have been the numbers.
+
+A separate page is also the better fixture. A term defined on one page while a question is asked
+against a corpus of several is what a real deployment looks like, and it means promotion has to
+find the right document rather than the only one.
+"""
 
 GLOSSARY_ENTRIES: Final[tuple[str, ...]] = (
     "ATLAS — Automated Transfer Ledger And Scheduler",
@@ -73,7 +154,16 @@ GLOSSARY_ENTRIES: Final[tuple[str, ...]] = (
     "YARROW — Yield And Retention Reporting Observation Window",
     "ZEPHYR — Zone Export Pipeline Health Yield Runner",
 )
-"""Twenty-five terms on one page. The count is the dilution, and the dilution is the point."""
+"""Twenty-five terms on one page. The count is the dilution, and the dilution is the point.
+
+**Do not add entries here.** This tuple is the chunk every cosine recorded in this suite and in
+``docs/retrieval.md`` §8 was measured against — 0.4655 for ``What is NOW?``, 0.702 and 0.747 for
+the two phrasings :data:`~manicule.retrieval.confidence.STRONG_SIMILARITY` is justified from. A
+line added here changes the chunk's vector and silently retires all three: the constants would
+still cite measurements, and the corpus they name would no longer be the corpus that produced
+them. New material goes on :data:`SUPPLEMENT_ENTRIES`, which is a second document and leaves
+this one byte-identical.
+"""
 
 ORDINARY: Final[tuple[str, ...]] = (
     "The nightly reconciliation job is running now, so the report will lag by one cycle. "
@@ -219,11 +309,37 @@ QUERY_PUNCTUATED: Final = "What is N.O.W.?"
 QUERY_FULL: Final = f"What is the {EXPANSION}?"
 QUERY_ORDINARY_USE: Final = "should I restart the daemon now or wait for the window"
 QUERY_ABSENT: Final = "What is ZZQX?"
+QUERY_DESCRIBED: Final = f"What is {DESCRIBED_ACRONYM}?"
+QUERY_STYLIZED: Final = f"What is {STYLIZED_DISPLAY}?"
+QUERY_STYLIZED_LOWER: Final = f"what does {STYLIZED_ACRONYM.lower()} stand for?"
+QUERY_UNRELATED: Final = "how do I renew a passport at the post office"
+"""A question about nothing in this corpus, phrased as a real question rather than as a
+nonsense token — ``QUERY_ABSENT`` already covers a term that does not exist, and the two fail
+differently: one has no lexical match anywhere, the other is ordinary English about a subject
+the corpus never mentions."""
 
 
 def glossary_page() -> str:
-    """The glossary as one chunk, which is how 512/64 chunking delivers it."""
+    """The glossary as one chunk, which is how 512/64 chunking delivers it.
+
+    Unchanged since the measurements in ``docs/retrieval.md`` §8 were taken, and it has to stay
+    that way — see :data:`GLOSSARY_ENTRIES`.
+    """
     return f"{GLOSSARY_TITLE}\n\n" + "\n".join(GLOSSARY_ENTRIES)
+
+
+def supplement_page() -> str:
+    """The second glossary: two described definitions and three lines of prose, one chunk.
+
+    The prose sits *inside* it rather than on a page of its own, because a definition-shaped
+    sentence is only hard to refuse where the page vouches for it.
+    """
+    return (
+        f"{SUPPLEMENT_TITLE}\n\n"
+        + "\n".join(SUPPLEMENT_ENTRIES)
+        + "\n"
+        + "\n".join(PROSE_ON_THE_GLOSSARY_PAGE)
+    )
 
 
 def passages() -> tuple[str, ...]:
@@ -233,18 +349,33 @@ def passages() -> tuple[str, ...]:
 
 __all__ = [
     "ACRONYM",
+    "DESCRIBED_ACRONYM",
+    "DESCRIBED_ENTRY",
+    "DESCRIBED_EXPANSION",
     "EXPANSION",
     "GLOSSARY_ENTRIES",
     "GLOSSARY_TITLE",
     "IN_USE",
     "ORDINARY",
+    "PROSE_ON_THE_GLOSSARY_PAGE",
     "QUERY_ABSENT",
     "QUERY_ACRONYM",
+    "QUERY_DESCRIBED",
     "QUERY_FULL",
     "QUERY_LOWER",
     "QUERY_MIXED_CASE",
     "QUERY_ORDINARY_USE",
     "QUERY_PUNCTUATED",
+    "QUERY_STYLIZED",
+    "QUERY_STYLIZED_LOWER",
+    "QUERY_UNRELATED",
+    "STYLIZED_ACRONYM",
+    "STYLIZED_DISPLAY",
+    "STYLIZED_ENTRY",
+    "STYLIZED_EXPANSION",
+    "SUPPLEMENT_ENTRIES",
+    "SUPPLEMENT_TITLE",
     "glossary_page",
     "passages",
+    "supplement_page",
 ]

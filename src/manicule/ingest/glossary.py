@@ -100,14 +100,125 @@ GLOSSARY_WORDS: Final[frozenset[str]] = frozenset(
 )
 
 MAX_EXPANSION_WORDS: Final = 10
-"""Longer than this and it is a sentence about the term, not the term written out."""
+"""Longer than this and it is a sentence about the term, not the term written out.
+
+Applied to whichever reading of the right-hand side :func:`core_expansion` settles on, so a
+definition trailed by a description is measured on its expansion rather than on the description
+— which is what stopped ``NOVA — Network Operations Visibility Assistant, a service used to
+correlate operational signals across systems`` from being recorded at all.
+"""
+
+_NEVER_OPENS_AN_EXPANSION: Final[frozenset[str]] = frozenset(
+    {
+        # Subordinators. What follows one is the circumstance in which something is true, and a
+        # circumstance is not a thing that can be named: ``when enabled, the process starts
+        # automatically`` says *when*, and no term is called ``when``.
+        "after",
+        "although",
+        "because",
+        "before",
+        "if",
+        "once",
+        "since",
+        "though",
+        "unless",
+        "until",
+        "when",
+        "whenever",
+        "whether",
+        "while",
+        # Words that point instead of naming. ``this paragraph describes an operational
+        # consideration`` refers to something already on the page; an expansion is self-contained
+        # and refers to nothing, because it *is* the thing being introduced. ``_LEADING_ARTICLES``
+        # already makes this judgement about ``this`` for the parenthetical form — same call,
+        # applied to the other forms.
+        "he",
+        "it",
+        "she",
+        "that",
+        "these",
+        "they",
+        "this",
+        "those",
+        "we",
+        "you",
+        # Existential ``there``. ``there is no supported route`` asserts; it does not name.
+        "there",
+    }
+)
+"""Words no expansion begins with, tested at the first word and nowhere else.
+
+**The rule that refuses prose on a page that admits everything else.** A spaced hyphen on a page
+titled "Glossary" scores exactly ``MIN_DEFINITION_CONFIDENCE`` — ``_FORM_WEIGHT[EM_DASH]`` plus
+:data:`GLOSSARY_CONTEXT_EVIDENCE`, 0.45 + 0.15 — so *every* upper-case token followed by a dash
+is admitted there on the strength of the page alone. Measured on ``origin/main`` before this
+rule existed, both ``NOTE - this paragraph describes an operational consideration, not a term``
+and ``API - when enabled, the process starts automatically`` were recorded as definitions: nine
+words and six, so :data:`MAX_EXPANSION_WORDS` never fired on either and nothing else looked.
+
+**What this does not test, stated because an earlier draft claimed it did.** It is not a test for
+a noun phrase, and the fixtures above are not counter-examples to one: ``this paragraph`` *is* a
+noun phrase. What actually disqualifies both of them is the finite verb — ``describes``,
+``starts`` — and nothing here looks for a verb. Finding one is a parser's job, this module is
+deterministic by construction and has no parser to call, and a word list that pretended to do it
+would be a rule whose justification is wider than its mechanism. So the claim is narrowed to what
+the list can actually support: these particular words do not begin expansions, one word at a
+time, for the two reasons given beside them. Prose opening with an ordinary noun or an imperative
+verb — ``WARNING — do not edit these records by hand`` — is admitted, and that is a known gap.
+
+**Do not close it by adding ``note``, ``warning`` and ``caution`` as refused *terms*.** The
+objection is not that such a list would overclaim — it would not; admonition labels are document
+furniture and a list of them tests exactly what it names. The objection is the trade. ``WARNING —
+a log level indicating a recoverable condition`` is an ordinary definition in operations and
+logging documentation, which is the corpus this project exists for: the gate buys one false
+positive and sells a false negative in the domain most likely to be indexed. That stays a bad
+trade however carefully the list is drawn, so drawing it more carefully is not the fix.
+
+The fix, if a real corpus ever needs one, is **structural and lives in the parser rather than
+here**. An admonition in Confluence storage format is ``<ac:structured-macro ac:name="warning">``
+and not a ``TERM — text`` line at all; :mod:`manicule.connectors.macros` already reads those
+elements by name. A parser knows what a word list can only guess at, and by the time text reaches
+this module the distinction has been flattened away.
+
+**A first word written like an abbreviation is the abbreviation, not the pronoun**, so
+:func:`acronym_shaped` is consulted before the list. This is not a nicety: it was measured.
+``ITSM — IT service management`` and ``ITIL — IT infrastructure library`` are ordinary
+definitions whose initials do not spell their terms, so the list is the only judge of them, and
+without the shape test ``IT`` collides with the pronoun ``it`` and both are silently lost. The
+same gate that tells ``NOW`` from ``Note`` on the left of the dash tells ``IT`` from ``it`` on
+the right of it.
+
+The list never overrides initials evidence. If a phrase's initials spell the term then the two
+strings agree about what the term is, which is stronger than anything one word can say — which
+is why ``ONCE — Operational Node Configuration Engine`` and ``WHEN — Workload Health Event
+Notifier`` survive being their own counter-examples.
+"""
+
+_DESCRIPTION_BOUNDARY_RE: Final = re.compile(r"[,;]|(?<=[.!?])\s")
+"""Where a description may begin: a comma, a semicolon, or the end of a sentence.
+
+Each match yields a *candidate* prefix and nothing more. Truncating at the first comma
+unconditionally is the obvious version of this and it is wrong in both directions — it would cut
+``Retention And Vault Index Node Export, Cold`` in half, and it would hand
+``when enabled, the process starts automatically`` a two-word prefix that looks far more like an
+expansion than the sentence it came from. :func:`core_expansion` still has to be convinced.
+"""
 
 _UPPERCASE_SHARE: Final = 0.6
 """How much of a term's alphabetic content must be upper case.
 
-Not 1.0, because ``IPv6`` and ``mDNS`` are abbreviations and a rule that refused them would be
-wrong about real corpora. Not lower, because at 0.5 a two-letter capitalised word — ``It``,
-``Of`` — becomes an abbreviation and every sentence beginning becomes a candidate.
+Not 1.0, because ``IPv6`` is an abbreviation — two of its three letters are upper case, so it
+clears 0.6 and would fail a stricter rule. Not lower, because at 0.5 a two-letter capitalised
+word — ``It``, ``Of`` — becomes an abbreviation and every sentence beginning becomes a candidate.
+
+**This share is only half of the gate, and the other half is not negotiable by tuning it.**
+:func:`acronym_shaped` also requires an initial capital, so a term beginning lower case is refused
+at the first character whatever its share. ``mDNS`` is 0.75 upper and still refused; so are
+``eSIM`` and ``gRPC``. This docstring used to cite ``mDNS`` as a reason for the value of this
+constant, which was wrong twice over: the constant does not admit it, and no value of the constant
+could. Lower-case-initial abbreviations are outside what this module detects. Widening it is a
+behaviour change across all six written forms — every sentence that begins ``it``, ``the`` or
+``and`` becomes a candidate term — and it wants its own measurement, not an edit here.
 """
 
 _FUNCTION_WORDS: Final[frozenset[str]] = frozenset(
@@ -202,6 +313,89 @@ def _usable_expansion(expansion: str) -> str:
     return trimmed
 
 
+def has_a_refused_opening(expansion: str) -> bool:
+    """Whether ``expansion`` begins with a word listed in :data:`_NEVER_OPENS_AN_EXPANSION`.
+
+    Named for what it tests rather than for what a phrase beginning that way tends to be. It
+    reads one word and compares it against a list; it does not decide whether the phrase is a
+    clause, a noun phrase or a sentence, and calling it something that implied otherwise would be
+    the wider-than-the-mechanism claim the constant's docstring warns about.
+
+    An abbreviation is exempt, because ``IT`` and ``it`` are different words that casefold to one
+    — see the constant.
+    """
+    first = next((word for word in re.split(r"[^\w'’]+", expansion) if word), "")  # noqa: RUF001
+    if acronym_shaped(first):
+        return False
+    return first.casefold() in _NEVER_OPENS_AN_EXPANSION
+
+
+def _phrase_after(captured: str, acronym: str) -> str:
+    """Which words of ``captured`` are the term, rather than the description following it.
+
+    **The mirror image of :func:`_phrase_before`, and deliberately the same idea rather than a
+    second mechanism.** That function has no left-hand delimiter to work from and asks the
+    acronym which *suffix* spells it; this one has no right-hand delimiter and asks the acronym
+    which *prefix* does. Read them together — one rule, applied from each end.
+
+    Shortest wins here as it does there, for the same reason: the first prefix that spells the
+    term is where the term stops, and a longer one that also spells it has swallowed prose.
+    Candidate prefixes are the description boundaries only, so this can never cut mid-phrase.
+
+    Returns the empty string when no prefix spells the acronym, which the caller reads as "no
+    evidence about where this ends" rather than as "no expansion here".
+    """
+    for boundary in _DESCRIPTION_BOUNDARY_RE.finditer(captured):
+        prefix = _usable_expansion(captured[: boundary.start()])
+        if prefix and initials_match(acronym, prefix):
+            return prefix
+    return ""
+
+
+def core_expansion(acronym: str, expansion: str) -> str:
+    """The term written out, with any trailing description removed. Empty if there is none.
+
+    **The boundary decision is conditional on evidence, never applied first and scored
+    afterwards**, and that ordering is the whole of this function. Cutting at the first comma and
+    then scoring the prefix inverts the two rules that were doing the work: measured on
+    ``origin/main``, ``API - when enabled, the process starts automatically`` truncates to the
+    two-word ``when enabled``, which is *shorter* and therefore *more* expansion-shaped by every
+    length rule in this module. Truncation removes the very thing that was refusing it.
+
+    So a prefix has to earn the cut, and only one signal is strong enough to award it:
+
+    1. **Initials, whole then trimmed.** If the entire right-hand side spells the term it is kept
+       entire — ``ATLAS — Automated Transfer Ledger And Scheduler`` has no description to strip.
+       Otherwise :func:`_phrase_after` asks the acronym where the term ends, exactly as
+       :func:`_phrase_before` asks it where a parenthetical's term begins. ``NOVA — Network
+       Operations Visibility Assistant, a service used to correlate operational signals across
+       systems`` is thirteen words and refused outright today; its four-word prefix spells
+       ``NOVA``, and that agreement between the two strings is what says where the term ends and
+       the prose begins. Nothing else in this module knows.
+
+    2. **No initials, no cut.** The right-hand side is then taken whole or not at all, and it is
+       refused if it opens with a word no expansion opens with. Keeping it whole is the
+       conservative reading: without initials there is no evidence about *where* an expansion
+       ends, and a guess would store a phrase the source never wrote. ``HTTP — HyperText Transfer
+       Protocol, the protocol of the web`` therefore keeps its description, which is what it did
+       before this function existed; :data:`MAX_EXPANSION_WORDS` still bounds it.
+
+    The opening test applies only in the second case, which is also the only case where it can do
+    harm — measured at 24 of 26 real definitions kept before the abbreviation exemption and 26 of
+    26 after. Initials agreement is a property of two strings and outranks a judgement made from
+    one word of one of them.
+    """
+    whole = _usable_expansion(expansion)
+    if whole and initials_match(acronym, whole):
+        return whole
+    trimmed = _phrase_after(expansion, acronym)
+    if trimmed:
+        return trimmed
+    if whole and not has_a_refused_opening(whole):
+        return whole
+    return ""
+
+
 def score_definition(
     acronym: str, expansion: str, form: DefinitionForm, *, glossary_context: bool
 ) -> float:
@@ -253,6 +447,10 @@ def _phrase_before(captured: str, acronym: str) -> str:
 
     When nothing spells it, the leading article is dropped and the rest is kept, because an
     article is never part of a term and everything else might be.
+
+    :func:`_phrase_after` is this same question asked from the other end — where a term *stops*
+    when a description follows it — and answers it the same way, by asking the acronym. Change
+    one and read the other.
     """
     words = captured.split()
     for length in range(1, len(words) + 1):
@@ -363,7 +561,7 @@ def detect_in_chunk(chunk: Chunk, *, glossary_context: bool = False) -> list[Glo
         if not acronym_shaped(candidate.display):
             continue
         acronym = normalise_acronym(candidate.display)
-        expansion = _usable_expansion(candidate.expansion)
+        expansion = core_expansion(acronym, candidate.expansion)
         if not acronym or not expansion or normalise_acronym(expansion) == acronym:
             continue
         confidence = score_definition(acronym, expansion, candidate.form, glossary_context=context)
@@ -423,8 +621,10 @@ __all__ = [
     "MAX_EXPANSION_WORDS",
     "MIN_DEFINITION_CONFIDENCE",
     "acronym_shaped",
+    "core_expansion",
     "detect_entries",
     "detect_in_chunk",
+    "has_a_refused_opening",
     "initials_match",
     "initials_of",
     "score_definition",

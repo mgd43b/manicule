@@ -160,6 +160,25 @@ NOTHING_RESEMBLES: Final = (
     "every passage retrieved sits at or below the level this corpus returns for a question it "
     "has no answer to, so these are its nearest passages rather than relevant ones"
 )
+DEFINITION_CITED: Final = (
+    "the context contains a glossary entry that explicitly defines a term this question asked "
+    "the meaning of, and the citation resolves to it. The score stays where the similarity put "
+    "it — a detector's confidence that some text is a definition is not a cosine and is not "
+    "added to one — so this reports what was found rather than a number that was adjusted"
+)
+"""What is said instead of :data:`NOTHING_RESEMBLES` when a definition was cited.
+
+**The correctness fix, and it needs no calibration.** The two sentences cannot both be true.
+:data:`NOTHING_RESEMBLES` is a claim about the *corpus* — that it holds nothing addressing the
+question — and a glossary entry defining the exact term the question named is a
+counter-example to it sitting in the context the reader is looking at. Reporting both is not a
+threshold set too high; it is two paths that never spoke, one reading a cosine and the other
+reading a lookup.
+
+Note what does **not** change: the score, the band, the components and the ceiling. A question
+whose answer is one line of a twenty-five entry page really does have weak dense evidence, and
+saying so is right. What was wrong was the sentence next to it.
+"""
 UNREACHABLE_BAND: Final = (
     "this pipeline's suppressed components put a higher band out of reach regardless of the "
     "evidence, so the band reports the ceiling rather than the corpus"
@@ -395,6 +414,7 @@ def score_confidence(
     legs: Sequence[str] = ("dense", "lexical"),
     rerank_stage: str | None = None,
     exhausted_budget: bool = False,
+    explicit_definition: bool = False,
     noise_similarity: float = NOISE_SIMILARITY,
     strong_similarity: float = STRONG_SIMILARITY,
 ) -> Confidence:
@@ -409,6 +429,12 @@ def score_confidence(
             this particular query is evidence and is scored; it is not a reason to suppress.
         rerank_stage: The stage name a reranker scored under, or ``None`` if none ran.
         exhausted_budget: Whether a leg stopped at its own caps. Caps the band at ``medium``.
+        explicit_definition: Whether the context holds a glossary entry defining a term this
+            question asked the meaning of. **Changes no number** — see :data:`DEFINITION_CITED`.
+            It is passed in rather than derived here because deciding it needs the query text
+            and the glossary lookup, neither of which this module may see: everything here works
+            from candidates and scales, and reaching for a query would make the score depend on
+            the wording of the question as well as on what was retrieved.
         noise_similarity: Cosine at or below which a passage carries no information.
         strong_similarity: Cosine at which a passage is fully on-topic.
 
@@ -419,6 +445,10 @@ def score_confidence(
     """
     pipeline = identity or PipelineIdentity()
     if not passages:
+        # No context means no passage to have been the definition, whatever the lookup found.
+        # `explicit_definition` is deliberately not carried through here: the caller sets it from
+        # a chunk being *present*, so this branch is unreachable with it true, and honouring it
+        # would define behaviour for a state that cannot exist.
         return Confidence(
             score=0.0,
             band=ConfidenceBand.NONE,
@@ -484,8 +514,12 @@ def score_confidence(
     # The `none` band now *means* this, whenever similarity was actually measured: the rescale
     # puts a passage at the corpus's noise level at zero, so a run that lands here retrieved
     # nothing that stands above what an unanswerable question returns.
+    #
+    # Unless a definition of the queried term is sitting in the context, in which case the claim
+    # is simply false and a different true thing is said instead. The *score* is untouched either
+    # way — the branch chooses a sentence, never a number.
     if band is ConfidenceBand.NONE and SIMILARITY in components:
-        reason = NOTHING_RESEMBLES
+        reason = DEFINITION_CITED if explicit_definition else NOTHING_RESEMBLES
 
     return Confidence(
         score=score,
@@ -494,6 +528,7 @@ def score_confidence(
         suppressed=suppressed,
         ceiling=ceiling,
         reason=reason,
+        explicit_definition=explicit_definition,
         pipeline=pipeline,
     )
 
@@ -552,6 +587,15 @@ class ConfidenceDiagnostics(BaseModel):
     evidence_documents: int = Field(
         default=0, ge=0, description="Documents that cleared the noise floor and were combined."
     )
+    explicit_definition: bool = Field(
+        default=False,
+        description="Whether a glossary entry defining the queried term reached the context. "
+        "Appears here rather than in :attr:`components` or :attr:`suppressed` because it is "
+        "neither: a component has a weight and contributes, a suppressed component has a weight "
+        "and was prevented from contributing and so lowers :attr:`ceiling`, and this has no "
+        "weight at all. Listing it beside the weighted components would invite exactly the "
+        "reading it exists to prevent — that a definition is worth some number of points.",
+    )
 
 
 def explain_confidence(
@@ -560,6 +604,7 @@ def explain_confidence(
     legs: Sequence[str] = ("dense", "lexical"),
     rerank_stage: str | None = None,
     exhausted_budget: bool = False,
+    explicit_definition: bool = False,
     noise_similarity: float = NOISE_SIMILARITY,
     strong_similarity: float = STRONG_SIMILARITY,
 ) -> ConfidenceDiagnostics:
@@ -574,6 +619,7 @@ def explain_confidence(
         legs=legs,
         rerank_stage=rerank_stage,
         exhausted_budget=exhausted_budget,
+        explicit_definition=explicit_definition,
         noise_similarity=noise_similarity,
         strong_similarity=strong_similarity,
     )
@@ -619,6 +665,7 @@ def explain_confidence(
         weights=dict(WEIGHTS),
         passages=tuple(detail),
         evidence_documents=sum(1 for value in strongest.values() if value > 0.0),
+        explicit_definition=confidence.explicit_definition,
     )
 
 
@@ -626,6 +673,7 @@ __all__ = [
     "AGREEMENT",
     "BANDS",
     "BUDGET_CAPPED",
+    "DEFINITION_CITED",
     "NOISE_SIMILARITY",
     "NOTHING_RESEMBLES",
     "NOTHING_RETRIEVED",
