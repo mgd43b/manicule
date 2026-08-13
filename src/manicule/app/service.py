@@ -202,8 +202,8 @@ def _sidecar_ordering_would_have_helped(moving: Sequence[Document]) -> bool:
     that is path-keyed *because of when the conversion ran*, which is the one thing arriving
     earlier would have changed.
 
-    Keyed off :attr:`~manicule.core.enriched.AdapterOutcome.IDENTITY_NOT_APPLIED` so that this
-    and :func:`_identity_deliberately_unapplied` read the same field for the same reason. They
+    Keyed off :attr:`~manicule.connectors.enriched.AdapterOutcome.IDENTITY_NOT_APPLIED` so that
+    this and :func:`_identity_deliberately_unapplied` read the same field for the same reason. They
     are two halves of one judgement about that outcome, and having one test it while the other
     tested the record's mere existence is how they came to disagree.
     """
@@ -1713,7 +1713,7 @@ class ApplicationService:
                 name="document-content",
                 state="ok",
                 detail=(
-                    "no documents are indexed, so none can be serving text from before its "
+                    "no documents are indexed, so none can be serving text from before their "
                     "identity was repaired"
                     if not documents
                     else f"no document is serving text from before its identity was repaired{bound}"

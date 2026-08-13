@@ -664,10 +664,10 @@ def term_forms(acronym: str, display: str = "") -> frozenset[str]:
     can widen it by containing the right letters.
 
     **Both members are NFKC-normalised here rather than assumed to be**, because the two callers
-    disagree about what they pass. :func:`detect` passes a
-    :func:`~manicule.core.glossary.normalise_acronym` key, already normalised;
-    :func:`_phrase_before`
-    passes the raw surface the parentheses held, deliberately, because there it *is* the display
+    disagree about what they pass. :func:`detect_in_chunk` passes a
+    :func:`~manicule.core.glossary.normalise_acronym` key, already normalised.
+    :func:`_phrase_before` passes the raw surface the parentheses held, deliberately, and there
+    that surface *is* the display
     spelling. Normalising only in :func:`initial_skeleton` would leave that second caller building
     a set whose two members were in different normal forms from each other, which is the same
     unreachable-comparison-form defect one call site along. A set intersection is only meaningful

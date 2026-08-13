@@ -573,10 +573,10 @@ class FilesystemConnector:
 
         **The record is repaired as well as the metadata key, because they are read by different
         things and only fixing one leaves the defect visible.**
-        :meth:`~manicule.ingest.pipeline.Pipeline._store_record` takes a document's title from the
-        provenance record first and falls back to what discovery reported, which for a local file
-        is its *filename*; the parser separately reads ``metadata["title"]`` to anchor the
-        content above the first heading. So an empty manifest title cost the citation its name
+        :meth:`~manicule.ingest.pipeline.IngestPipeline._store_record` takes a document's title
+        from the provenance record first and falls back to what discovery reported, which for a
+        local file is its *filename*; the parser separately reads ``metadata["title"]`` to anchor
+        the content above the first heading. So an empty manifest title cost the citation its name
         *and* the parse its anchor, by two different routes, and writing the fallback into only
         one of them would have fixed the half nobody looks at.
         """
