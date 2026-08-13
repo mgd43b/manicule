@@ -172,7 +172,7 @@ dev = [
   # coverage warns on an option it does not recognise, and `filterwarnings = ["error"]` turns
   # that into a hard stop — so on too old a release the suite does not run slower, it refuses
   # to run, reporting an unrecognised option rather than anything about the version. The floor
-  # is the release the timings in that comment were measured on.
+  # is the release the `[tool.coverage.run]` timings below were measured on.
   "coverage>=7.15",
   "ruff>=0.8",
   "pyright>=1.1.390",
