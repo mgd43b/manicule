@@ -48,6 +48,7 @@ from __future__ import annotations
 import re
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Final
 
 from selectolax.lexbor import LexborHTMLParser, LexborNode
 
@@ -1058,14 +1059,53 @@ def _list_lines(node: LexborNode, depth: int, refs: list[JsonValue] | None = Non
     """
     marker = "1." if node.tag == "ol" else "-"
     for item in node.iter():
-        if item.tag not in {"li", "dt", "dd"}:
+        if item.tag not in _ITEM_TAGS:
             continue
         own = collapse_run(_item_parts(item, refs))
         if own:
-            yield f"{_INDENT * depth}{marker} {own}"
+            yield f"{_INDENT * depth}{_item_prefix(item.tag or '', marker)}{own}"
         for nested in item.iter():
             if nested.tag in _NESTED_LISTS:
                 yield from _list_lines(nested, depth + 1, refs)
+
+
+_ITEM_TAGS: Final = frozenset({"li", "dt", "dd"})
+
+_DEFINITION_BODY_MARKER: Final = ": "
+"""What a ``<dd>`` is written with, and it is the reason a definition list is readable at all.
+
+**A definition list carries a relationship, and rendering every part with the same bullet threw
+it away.** ``<dt>NOW</dt><dd>Network Operations Workspace</dd>`` used to come out as two
+indistinguishable ``- `` lines, so a reader could not tell which was the term and neither could
+:func:`~manicule.ingest.glossary.detect_in_chunk` — measured at 0 of 4 definitions found on a
+page whose glossary was written this way. The relationship is the *only* thing a ``<dl>`` adds
+over a ``<ul>``, and it is what did not survive.
+
+``TERM`` on its own line with ``: definition`` beneath it is the convention Markdown definition
+lists already use, so it is what a reader of the chunk sees and what a citation quotes. It is
+also, not by coincidence, exactly the shape
+:data:`~manicule.ingest.glossary._DEFINITION_MARKER_RE` has always read: that form was
+implemented and tested and could never fire, because no parser produced the only rendering it
+accepts. **This change makes an existing detector rule reachable rather than adding one.**
+
+A ``<dt>`` gets no marker for the same reason: it is the term, and a bullet in front of it would
+be structure competing with the ``: `` that says what the next line is.
+"""
+
+
+def _item_prefix(tag: str, marker: str) -> str:
+    """What precedes a list item's own text.
+
+    A second ``<dd>`` under one ``<dt>`` is rendered like the first, and the detector reads only
+    the first because the line above the second is itself a ``: `` line, which is not a term. That
+    is the conservative outcome and it is left alone: choosing which of two definitions a term
+    has is the judgement this feature is forbidden to make.
+    """
+    if tag == "dt":
+        return ""
+    if tag == "dd":
+        return _DEFINITION_BODY_MARKER
+    return f"{marker} "
 
 
 def _item_parts(item: LexborNode, refs: list[JsonValue] | None = None) -> Iterator[InlinePart]:

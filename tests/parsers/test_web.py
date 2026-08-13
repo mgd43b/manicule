@@ -812,3 +812,18 @@ async def test_script_and_style_are_decomposed_before_the_recovery_matters() -> 
     assert "window.__owned=1" not in text
     assert ".x{}" not in text
     assert "The client retries twice." in text
+
+
+async def test_a_definition_list_renders_the_relationship_it_carries() -> None:
+    """The same rendering as the storage parser, because storage format is XHTML.
+
+    Two answers to one question would be a difference nobody chose, and it would reach the
+    corpus as two glossaries that behave differently depending on which connector fetched the
+    page. ``<dl>`` had no test in this suite either.
+    """
+    blocks = await _blocks(
+        "<dl><dt>NOW</dt><dd>Network Operations Workspace</dd></dl>", title="Page"
+    )
+
+    listing = next(block for block in blocks if block.kind is BlockKind.LIST)
+    assert listing.text.splitlines() == ["NOW", ": Network Operations Workspace"]

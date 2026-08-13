@@ -647,3 +647,35 @@ async def test_an_html_body_is_built_from_block_text_alone() -> None:
         "says *about* a block can now move an email LineAnchor — and PARSERS['email'].rules has "
         "to move with PARSERS['html'].rules again"
     )
+
+
+async def test_an_html_body_holding_a_definition_list_moves_its_line_numbers(
+    parser: MailParser,
+) -> None:
+    """**Why ``email`` is bumped for this change when it was not bumped for ``rows``.**
+
+    ``_html_to_text`` joins the web parser's block *text*, so a change that moves only a block's
+    metadata leaves an HTML-only body byte-identical — that is the 3 -> 4 case in
+    ``parsers/versions.py`` and ``test_an_html_body_is_built_from_block_text_alone`` is what
+    keeps it true. This change moves the text, so the opposite holds and the bump is a fact
+    rather than symmetry.
+
+    Asserted by parsing a message rather than by reading the call graph, because the call graph
+    is what made the previous case look like this one.
+    """
+    body = (
+        "<html><body><p>Terms</p>"
+        "<dl><dt>NOW</dt><dd>Network Operations Workspace</dd></dl></body></html>"
+    )
+    message = EmailMessage()
+    message["Subject"] = "Glossary"
+    message["From"] = "sender@example.test"
+    message["To"] = "recipient@example.test"
+    message.set_content(body, subtype="html")
+
+    blocks = await read_blocks(parser, raw_of(message.as_bytes(), "message/rfc822", uri="m.eml"))
+    lines = [line for block in blocks for line in block.text.splitlines()]
+
+    assert ": Network Operations Workspace" in lines, (
+        "the definition-list rendering reaches an HTML-only mail body, so its line numbers move"
+    )

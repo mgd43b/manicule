@@ -442,14 +442,34 @@ def _list_lines(node: LexborNode, depth: int) -> Iterator[str]:
     """
     marker = "1." if node.tag == "ol" else "-"
     for item in node.iter():
-        if item.tag not in {"li", "dt", "dd"}:
+        if item.tag not in _ITEM_TAGS:
             continue
         own = collapse_run(_parts(item, skip=_NESTED_LISTS))
         if own:
-            yield f"{_INDENT * depth}{marker} {own}"
+            yield f"{_INDENT * depth}{_item_prefix(item.tag or '', marker)}{own}"
         for nested in item.iter():
             if nested.tag in {"ul", "ol"}:
                 yield from _list_lines(nested, depth + 1)
+
+
+_ITEM_TAGS: Final = frozenset({"li", "dt", "dd"})
+
+
+def _item_prefix(tag: str, marker: str) -> str:
+    """What precedes a list item's own text: a bullet, a number, or a definition-list marker.
+
+    ``<dt>`` bare and ``<dd>`` as ``: definition`` — the Markdown definition-list convention, and
+    the shape :data:`~manicule.ingest.glossary._DEFINITION_MARKER_RE` has always read. Rendering
+    both with the same bullet discarded the one thing a ``<dl>`` says that a ``<ul>`` does not,
+    which is which of the two lines is the term. The same rendering as
+    :func:`~manicule.parsers.confluence._item_prefix`, because storage format *is* XHTML here and
+    two answers to one question would be a difference nobody chose.
+    """
+    if tag == "dt":
+        return ""
+    if tag == "dd":
+        return ": "
+    return f"{marker} "
 
 
 def _assemble(found: Sequence[_Found], title: str) -> _Reading:

@@ -123,7 +123,16 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # byte-identical and only the metadata beside it is new — but that metadata is what
     # `_split_table` divides an oversized table at, so a stored table stops being cut mid-row.
     # See the shared note under `markdown` below.
-    "confluence": ParserVersions(rules="4", distributions=("selectolax",)),
+    #
+    # 4 -> 5: a definition list renders its relationship. `<dt>NOW</dt><dd>Network Operations
+    # Workspace</dd>` was two indistinguishable `- ` lines and is now `NOW` above
+    # `: Network Operations Workspace`, which is the Markdown definition-list convention and the
+    # only shape `ingest.glossary._DEFINITION_MARKER_RE` accepts. This moves `text`, so it is a
+    # bump on the first clause rather than the middle one — every storage document holding a
+    # `<dl>` produces different characters, and a stored chunk of one is a rendering no parser
+    # would produce today. Measured at 0 of 4 definitions found on a `<dl>` glossary before and
+    # 4 of 4 after; the detector rule was correct throughout and had no input.
+    "confluence": ParserVersions(rules="5", distributions=("selectolax",)),
     "docx": ParserVersions(rules="1", distributions=("python-docx", "lxml")),
     # 1 -> 2: an HTML-only mail body's line numbers address the text
     # `mail._html_to_text` builds from the web parser's blocks, and the web parser now
@@ -145,7 +154,15 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # `test_an_html_body_is_built_from_block_text_alone` in `tests/parsers/test_mail.py` is what
     # keeps that true; a bump here would be symmetry rather than a fact, and it would re-parse
     # and re-embed every email in the corpus to produce identical text.
-    "email": ParserVersions(rules="3", distributions=("selectolax",)),
+    #
+    # 3 -> 4: the definition-list rendering, and this one *does* move the text — which is why
+    # the paragraph above is worth having rather than a rule of thumb that email never follows
+    # html. `<dt>NOW</dt><dd>Network Operations Workspace</dd>` reaches `_html_to_text` through
+    # the web parser's blocks and now joins as `NOW` above `: Network Operations Workspace`
+    # instead of two `- ` lines, so an HTML-only body holding a `<dl>` produces different
+    # characters and every `LineAnchor` after that list addresses a different line. Confirmed by
+    # parsing a message, not by reading the call graph.
+    "email": ParserVersions(rules="4", distributions=("selectolax",)),
     # 1 -> 2: CDATA sections are recovered as text rather than deleted by the HTML parser's
     # bogus-comment reparse. Every document containing one produces different text now, and
     # the bump is what re-parses them from retained bytes instead of leaving a corpus that is
@@ -167,7 +184,19 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # and this does not. `mail._html_to_text` joins the blocks' `text` and never reads their
     # metadata, and an HTML-only body carrying a 300-row table parses to byte-identical blocks
     # and byte-identical anchors across this change — run, not inferred.
-    "html": ParserVersions(rules="4", distributions=("selectolax",)),
+    #
+    # 4 -> 5: a definition list renders its relationship — `<dt>` bare above `: definition`
+    # rather than both as `- `. Same edit and same reason as `confluence`'s 4 -> 5; storage
+    # format is XHTML and two answers to one question would be a difference nobody chose.
+    #
+    # `email` **is** bumped with this one, which is the reverse of the 3 -> 4 pair above and the
+    # reason that note is written the way it is. `mail._html_to_text` joins these blocks' `text`,
+    # and this change moves `text` rather than only the metadata beside it: an HTML-only body
+    # holding a `<dl>` now renders `NOW` above `: Network Operations Workspace` where it rendered
+    # two `- ` lines, so every `LineAnchor` after that list addresses a different line. Run
+    # against a message rather than reasoned about — `web-blocks/N` is unchanged because the join
+    # rule really is the same; what moved is what it joins.
+    "html": ParserVersions(rules="5", distributions=("selectolax",)),
     # 1 -> 2: two changes from #109, and the second is the one that is easy to miss.
     #
     # Table blocks carry `rows`, as for the three parsers above. **And `header_rows` changed
