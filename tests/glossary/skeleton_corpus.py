@@ -347,13 +347,19 @@ boundary prefix that spells its term under any of the four readings, so nothing 
 expansion stops; the documented answer is to keep the whole right-hand side and let
 ``MAX_EXPANSION_WORDS`` bound it.
 
-**This is the population a widening would damage first**, and it is the reason it is measured
-separately from the entries-or-not question. A matcher that scanned for letters would find
-``MOSAIC`` inside ``MicroObject Storage Index, the layer …`` — ``M``, ``O``, ``S``, ``a`` in
-``layer``, ``i`` and ``c`` in ``addressable`` — cut there, and store a phrase that means something
-narrower than the line says. The failure would not be a false positive anywhere: the entry count
-would be unchanged and only the stored text would be wrong, which is why entry counts alone cannot
-measure this.
+**Measured separately from the entries-or-not question because the failure is invisible to it.**
+A rule that cut at the first description boundary without being convinced would keep all three
+entries and store ``central processor``, ``MicroObject Storage Index`` and ``Retention Capacity``
+— the count unchanged, only the text wrong. Entry counts cannot see that, which is why the
+assertion is on the stored expansion.
+
+Of the three, only ``RECAP`` has a boundary prefix that a free-subsequence scan would accept:
+``Retention Capacity`` contains ``R``, ``E``, ``C``, ``A``, ``P`` in order. ``central processor``
+has no ``U`` for ``CPU`` and ``MicroObject Storage Index`` no second ``C`` for ``MOSAIC``. Worth
+recording because an earlier draft asserted the opposite for all three and was wrong about two of
+them: the population is chosen for the conservative fallback, not for requirement 3, and the
+fixtures that separate a scanning matcher from this one are ``COMPOUND_NEGATIVES``' second line
+and ``SKELETON_NEGATIVES``' second.
 """
 
 LABELLED: Final[tuple[Labelled, ...]] = (

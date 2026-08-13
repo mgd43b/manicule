@@ -143,9 +143,22 @@ def test_each_negative_is_refused_by_the_widened_matcher(item: labelled.Labelled
 def test_no_initials_agreement_still_means_no_cut(line: str, acronym: str, expansion: str) -> None:
     """The conservative half of the boundary rule, measured against the *wider* matcher.
 
-    A widening is easiest to get wrong here rather than on the entry count: a matcher that scanned
-    for letters would keep detecting exactly these three entries and would quietly store a shorter
-    phrase in each. The count would not move, so only comparing the stored text can see it.
+    Nothing here says where the expansion ends, so the whole right-hand side is kept. The failure
+    this catches leaves the entry count unchanged and only the stored text wrong, which is why it
+    is asserted on the text.
+
+    **What reddens it, established by running the mutations rather than by reasoning.** Cutting at
+    the first description boundary unconditionally — the wrong fix ``core_expansion`` warns about —
+    turns all three into ``central processor``, ``MicroObject Storage Index`` and ``Retention
+    Capacity``. That is the guard.
+
+    It is **not** sensitive to a free-subsequence matcher, and an earlier version of this docstring
+    claimed it was. Replacing :func:`~manicule.ingest.glossary.initials_match` with a scan leaves
+    this test green, because ``core_expansion`` asks about the *whole* right-hand side first: the
+    scan accepts that, the whole is returned, and the expected value is the whole. The failure is
+    real and lands somewhere else. Requirement 3 is held down by
+    ``test_a_free_subsequence_scan_would_match_and_this_matcher_refuses``, whose fixtures are built
+    so that the whole right-hand side is over the length bound and cannot be returned instead.
     """
     found = _detected(line)
 
@@ -385,6 +398,46 @@ async def test_the_promoted_passage_still_carries_what_the_expansion_was_trimmed
         if passage.chunk.id == entries["SORT"].chunk_id
     )
     assert "SORT — SecOps Reliability Toolkit" in promoted.chunk.text
+
+
+def test_detection_needs_no_embedding_backend_and_repeats_exactly() -> None:
+    """Requirement 9, which is two claims and only one of them is about determinism.
+
+    **No model.** Asserted in a subprocess, because by the time this module is imported the suite
+    has loaded a good deal and an in-process check would measure the wrong thing. Importing the
+    detector loads no MLX, no ONNX runtime, no torch and no tokenizer, so "deterministic across
+    embedding backends" is true of it in the strong sense: it cannot observe which backend is
+    installed. ``tests/test_import_boundary.py`` makes the same claim about ``manicule.ingest`` as
+    a package; this makes it about the module that grew a new comparison form, where a helper
+    reaching for a normaliser out of an embedding package would be an easy mistake to make.
+
+    **Same input, same entries.** Detection over the whole labelled corpus twice, compared field
+    by field. The rule that could break this is the new one: :func:`initials_forms` returns a
+    ``frozenset``, and a set iterated into a result would order entries by hash seed rather than
+    by the document. It does not — the sets are intersected and never iterated into output — and
+    this is what says so, run under the suite's random-order plugin on every seed it picks.
+    """
+    import json  # noqa: PLC0415 - a subprocess check, needed nowhere else in this module
+    import subprocess  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    probe = (
+        "import json, sys; import manicule.ingest.glossary; "
+        "print(json.dumps(sorted(name for name in sys.modules "
+        "if name.split('.')[0] in "
+        "{'mlx', 'mlx_embeddings', 'onnxruntime', 'torch', 'transformers', "
+        "'sentence_transformers', 'tokenizers', 'numpy'})))"
+    )
+    loaded = subprocess.run(  # noqa: S603 - the interpreter running this suite, no shell
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+
+    assert json.loads(loaded.stdout) == [], "importing the detector loaded an embedding backend"
+
+    first = [_detected(item.line) for item in labelled.LABELLED]
+    second = [_detected(item.line) for item in labelled.LABELLED]
+
+    assert first == second
 
 
 def test_the_bound_on_the_skeleton_is_the_value_the_sweep_chose() -> None:
