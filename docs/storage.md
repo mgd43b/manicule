@@ -279,6 +279,7 @@ class Document(Base):
     parse_fp:      Mapped[str | None]                          # canonical, §6.4
     chunk_fp:      Mapped[str | None]                          # short hash, §6.4
     embed_fp:      Mapped[str | None]
+    glossary_fp:   Mapped[str | None]                          # canonical, §6.4
 
     metadata_:     Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     created_at:    Mapped[datetime]
@@ -392,7 +393,7 @@ which needs no counter and is correct even after a crash.
 Indexes: `(workspace_id, status)`, `(workspace_id, uri)`, `(content_hash)`,
 `(workspace_id, deleted_at) WHERE deleted_at IS NOT NULL` (the trash view; live-row queries
 fold `deleted_at IS NULL` into the partial indexes above), `(connector_id)`,
-`(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`.
+`(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`, `(glossary_fp)`.
 
 ### 4.2.1 Authoritative source metadata, and why it is not a column
 
@@ -1029,6 +1030,41 @@ predating the column keeps it, and reads as "no evidence this text is current", 
 writing today's library versions into rows extracted months ago would assert something nobody
 knows. The price is one re-parse of the corpus; the alternative is a lineage column that lies
 from the day it ships.
+
+**`documents.glossary_fp` is the fourth, and it is per-document for the opposite reason to
+`parse_fp`.** There *is* one detector where there are as many parsers as media types, so a
+corpus-wide value would be expressible — but the repair it enables reads stored chunks one
+document at a time, so the comparison has to name documents rather than refuse a run. Refusing
+every run against a corpus whose detector has moved would make a detector fix unshippable,
+because the fix is what makes the corpus stale.
+
+It carries the canonical `GlossaryFingerprint` ([`ingest.md`](ingest.md) §10.2): the detection
+strategy's name, a digest over the sources that decide what a definition is, and the configured
+middleware chain. One consumer reads it:
+
+```sql
+-- everything a detector change moved, plus everything nothing has read definitions out of
+SELECT id FROM documents WHERE glossary_fp IS NULL OR glossary_fp <> :installed
+```
+
+The `IS NULL` half is load-bearing rather than defensive: SQL's three-valued logic makes
+`glossary_fp <> :installed` *unknown* for a `NULL`, so the plain inequality silently excludes
+every row predating the column — which is the whole population the first release has to repair.
+
+**Ingest's change detection does not read it, and that is deliberate.** A detector change must
+not make a document look like it needs re-parsing: that is rung 3 work charged for a change to a
+regular expression, and it is the coupling `parse_fp`'s own design exists to avoid. So
+`glossary_fp` is on the row and not on the domain `Document`, which is what makes consulting it
+from change detection impossible rather than merely discouraged.
+
+**It is queryable without reading a definition**, which is what makes `doctor` affordable: "how
+much of this corpus disagrees with the installed detector" is a count over an indexed text
+column, and a check that read the vocabulary to decide whether the vocabulary is current would
+cost the thing it is asking about.
+
+**`NULL` is not backfilled**, for the reason it is not backfilled one column along, and with a
+cheaper remedy: the repair reads chunks rather than retained bytes, so the price of admitting
+ignorance is a text pass rather than a re-parse and a re-embed.
 
 **`parse_fp` cannot express a re-route, and this is the limit of it rather than a defect in
 it.** The query above compares each document against the current fingerprint *of the parser it

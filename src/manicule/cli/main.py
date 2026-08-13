@@ -92,14 +92,41 @@ parser bump touched, and would find out from the elapsed time.
 """
 
 REINDEX_NEEDS_A_TARGET = (
-    "say what to re-parse: a document id, or --stale for every document whose parse "
-    "fingerprint is no longer one an installed parser produces"
+    "say what to re-parse: a document id, --stale for every document whose parse fingerprint "
+    "is no longer one an installed parser produces, or --stale-glossary for every document "
+    "whose glossary came from a detector this build has changed"
+)
+
+REINDEX_IS_ONE_RUNG = (
+    "pass --stale or --stale-glossary, not both. They are different repairs at different "
+    "prices: --stale re-parses from retained bytes and re-embeds whatever moves, which is "
+    "corpus-sized GPU work, and --stale-glossary reads the chunks already stored and runs "
+    "regular expressions over them. Running them together would charge the second's job at "
+    "the first's price with no way to see which one did what."
+)
+"""Why ``--stale --stale-glossary`` is refused rather than run in sequence.
+
+The same shape as :data:`REINDEX_IS_ONE_OR_ALL`, and refused for the sharper of its two
+reasons. There the two readings differ by the size of the corpus; here they differ by whether
+the machine spends an afternoon embedding. A person who meant the cheap repair and got both
+finds out from the elapsed time, which is the one way nobody should have to find out.
+
+They are not otherwise exclusive, and the ordering when both are wanted is stated rather than
+implied: run ``--stale`` first. A re-parse re-runs detection on every document it rebuilds, so
+doing it second would redo work the glossary sweep had just finished.
+"""
+
+GLOSSARY_IS_NOT_A_DOCUMENT_SWEEP = (
+    "--stale-glossary sweeps the whole corpus for documents whose glossary came from a "
+    "superseded detector; an id names one document to re-parse from its retained bytes. "
+    "Re-parsing one document already re-runs detection on it, so there is nothing the pair "
+    "could mean that the id alone does not already do."
 )
 
 DRY_RUN_IS_A_SWEEP_OPTION = (
-    "--dry-run applies to --stale, which selects documents before repairing them. Re-parsing "
-    "one named document has no selection to plan, so a dry run of it would report nothing and "
-    "look like a run that found nothing to do."
+    "--dry-run applies to --stale and --stale-glossary, which select documents before "
+    "repairing them. Re-parsing one named document has no selection to plan, so a dry run of "
+    "it would report nothing and look like a run that found nothing to do."
 )
 """Why ``document reindex <id> --dry-run`` is refused rather than ignored.
 
@@ -443,6 +470,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "document_delete": r.DocumentDeleted,
     "document_reindex": r.DocumentReindexed,
     "document_reindex_stale": r.StaleReparseReport,
+    "document_redetect_glossary": r.StaleGlossaryReport,
     "doctor": r.Diagnosis,
     "connector_list": r.ConnectorList,
     "connector_login": r.ConnectorSignedIn,
@@ -736,29 +764,56 @@ def document_reindex(
             help="Re-parse every document an installed parser has moved past, instead of one.",
         ),
     ] = False,
+    stale_glossary: Annotated[
+        bool,
+        typer.Option(
+            "--stale-glossary",
+            help="Re-detect definitions for every document a changed detector has moved past. "
+            "Reads stored chunks: no parser, no connector, no embedder.",
+        ),
+    ] = False,
     dry_run: Annotated[
-        bool, typer.Option("--dry-run", help="With --stale: report the plan and write nothing.")
+        bool,
+        typer.Option("--dry-run", help="With a sweep: report the plan and write nothing."),
     ] = False,
     batch: Annotated[
-        int, typer.Option("--batch", min=1, help="With --stale: documents per page.")
+        int, typer.Option("--batch", min=1, help="With a sweep: documents per page.")
     ] = DEFAULT_SWEEP_BATCH,
 ) -> None:
-    """Re-parse from the bytes ingest retained: one document, or every stale one.
+    """Rebuild from what is already stored: one document, or every stale one.
 
-    Touches no network either way. `--stale` rebuilds every document whose recorded parse
+    Touches no network on any path. `--stale` rebuilds every document whose recorded parse
     fingerprint is not one an installed parser would produce now, which is what a parser
-    upgrade leaves behind. Chunks that do not move keep their ids and their vectors, and a
-    document with no retained bytes is named rather than failing the sweep. Stopping it is
-    safe at any point; running it again resumes.
+    upgrade leaves behind; chunks that do not move keep their ids and their vectors, and a
+    document with no retained bytes is named rather than failing the sweep.
+
+    `--stale-glossary` is the rung below it and the cheaper repair. Detection is a stage of its
+    own — its grammar, its evidence weights and its normalisation change without moving any
+    parse, chunk or embedding fingerprint — so a corrected detector reaches an existing corpus
+    through this and through nothing else. It reads the chunks already stored, runs no parser,
+    fetches nothing and produces no vector, so it costs no GPU time at all.
+
+    Stopping either is safe at a document boundary; running it again resumes.
     """
+    sweeping = stale or stale_glossary
+    if stale and stale_glossary:
+        raise typer.BadParameter(REINDEX_IS_ONE_RUNG)
     if stale and document_id is not None:
         raise typer.BadParameter(REINDEX_IS_ONE_OR_ALL)
-    if not stale:
+    if stale_glossary and document_id is not None:
+        raise typer.BadParameter(GLOSSARY_IS_NOT_A_DOCUMENT_SWEEP)
+    if not sweeping:
         if document_id is None:
             raise typer.BadParameter(REINDEX_NEEDS_A_TARGET)
         if dry_run:
             raise typer.BadParameter(DRY_RUN_IS_A_SWEEP_OPTION)
         emit("document_reindex", lambda service: service.document_reindex(document_id))
+        return
+    if stale_glossary:
+        emit(
+            "document_redetect_glossary",
+            lambda service: service.document_redetect_glossary(batch=batch, dry_run=dry_run),
+        )
         return
     emit(
         "document_reindex_stale",

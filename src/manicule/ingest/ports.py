@@ -135,6 +135,7 @@ class IngestStore(Protocol):
         chunk_fp: str | None,
         embed_fp: str | None,
         parse_fp: str | None = None,
+        glossary_fp: str | None = None,
     ) -> None:
         """Record which fingerprints *this document* was last built with.
 
@@ -155,6 +156,13 @@ class IngestStore(Protocol):
                 for a document produced by a parser manicule does not ship and so cannot
                 version — recording nothing is the honest answer, and repair selection reads
                 it as "eligible" rather than as "current".
+            glossary_fp: Canonical ``GlossaryFingerprint``, or ``None`` to leave it. **This is
+                the path for a document whose entries were not rewritten**, and there is one
+                such case: detection switched off, where the rows stay exactly as they are and
+                what gets recorded is that no detector ran. When entries *are* rewritten the
+                fingerprint travels with them through
+                :meth:`GlossaryWriter.replace_glossary_entries`, so that the rows and the claim
+                about which rules produced them are one transaction rather than two.
         """
         ...
 
@@ -184,7 +192,16 @@ class IngestStore(Protocol):
         *,
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
-    ) -> int: ...
+        glossary_fp_other_than: str | None = None,
+    ) -> int:
+        """How many documents match. A count, so a diagnostic need not page a corpus.
+
+        ``glossary_fp_other_than`` is here rather than only on :meth:`select_documents`
+        because ``doctor`` asks the question and wants the number: an operator is told how many
+        documents disagree with the installed detector, and reading them out to count them
+        would make a health check proportional to the corpus.
+        """
+        ...
 
     async def select_documents(
         self,
@@ -194,6 +211,7 @@ class IngestStore(Protocol):
         media_types: Collection[str] | None = None,
         chunk_fp_other_than: str | None = None,
         parse_fp_current: Collection[str] | None = None,
+        glossary_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> Sequence[Document]:
@@ -204,6 +222,13 @@ class IngestStore(Protocol):
             statuses: Restrict to these document statuses.
             media_types: Restrict to these media types.
             chunk_fp_other_than: Everything a *different* chunker built.
+            glossary_fp_other_than: Everything a *different* detector read definitions out of,
+                plus everything nothing has read definitions out of at all. A single value
+                rather than the set ``parse_fp_current`` takes, because there is one detector
+                where there are as many parsers as media types — and it is spelled as an
+                exclusion rather than as "is current" so that the ``NULL`` rows, which are every
+                document indexed before the column existed, fall inside the selection rather
+                than outside it.
             parse_fp_current: Every parse fingerprint that is current, as canonical strings.
                 Selects the complement — documents whose text was produced by a parser
                 version no longer installed, plus documents with no recorded lineage at all.
@@ -281,15 +306,59 @@ class GlossaryWriter(Protocol):
     """
 
     async def replace_glossary_entries(
-        self, document_id: str, entries: Sequence[GlossaryEntry]
+        self, document_id: str, entries: Sequence[GlossaryEntry], *, fingerprint: str
     ) -> None:
-        """Make this document's entries exactly ``entries``.
+        """Make this document's entries exactly ``entries``, produced by ``fingerprint``.
 
         Replace rather than merge, on the same principle as ``replace_chunks``: a document is
         re-ingested whole, so merging would leave definitions from a version of the page that
         no longer exists — still queryable, still citing a passage nobody can read.
+
+        **``fingerprint`` is required rather than optional, and that is the point of it.** It is
+        the canonical :class:`~manicule.core.fingerprints.GlossaryFingerprint` of the detector
+        that produced these entries, and making it a keyword nobody can omit is the loudest
+        available answer to the question "what stops a future caller writing rows with no
+        lineage" — a default would let one path forget, and a document with entries and no
+        fingerprint is exactly the state this whole feature exists to make impossible.
+
+        **Both writes are one transaction.** An implementation that wrote the rows and then the
+        fingerprint would leave a crash window in which the entries are the new detector's and
+        the column still names the old one — a document that reports itself stale while being
+        current is merely wasteful, but the same window the other way round is a document
+        reporting itself current while serving superseded rows, and that is the defect. Storing
+        them together removes the question.
+
+        ``entries`` may be empty, and an empty write is a real write: it records that the
+        current detector read this document and found nothing, which is a different fact from
+        nobody having read it.
         """
         ...
 
 
-__all__ = ["GlossaryWriter", "IngestStore"]
+@runtime_checkable
+class GlossaryStore(GlossaryWriter, Protocol):
+    """A glossary store that can also be read back. What the rung-0 repair needs.
+
+    Wider than :class:`GlossaryWriter` and deliberately a second protocol rather than two more
+    methods on it: the pipeline only ever writes, and widening what it demands would make an
+    optional feature more expensive to implement for the one caller that needs the least.
+
+    The repair needs both reads for reasons it cannot avoid. It reports what a corrected
+    detector *did* — entries gained, entries lost, documents whose vocabulary did not move —
+    and a sweep that could not read what it replaced could only report that it ran.
+    """
+
+    async def glossary_entries(self, document_id: str) -> Sequence[GlossaryEntry]:
+        """Every entry one document states, in a stable order."""
+        ...
+
+    async def glossary_lineage(self, document_id: str) -> str | None:
+        """Which detector last decided this document's entries, or ``None`` if none has.
+
+        The lineage read that touches no glossary text, which is what makes "is this corpus
+        current" answerable at the cost of an indexed column rather than of the vocabulary.
+        """
+        ...
+
+
+__all__ = ["GlossaryStore", "GlossaryWriter", "IngestStore"]

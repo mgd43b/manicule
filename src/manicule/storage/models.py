@@ -262,17 +262,28 @@ class Document(Base):
     parse_fp: Mapped[str | None] = mapped_column(Text)
     chunk_fp: Mapped[str | None] = mapped_column(Text)
     embed_fp: Mapped[str | None] = mapped_column(Text)
+    glossary_fp: Mapped[str | None] = mapped_column(Text)
     """Which fingerprints this document was last built with.
 
     Per-document lineage is what makes invalidation set-valued: a grammar upgrade that
     changes only code documents is a query, not a corpus-wide rebuild.
 
-    ``parse_fp`` is the one of the three with no corpus-wide counterpart in ``index_state``,
+    ``parse_fp`` is one of the two with no corpus-wide counterpart in ``index_state``,
     and deliberately so. One document has one parser, so there is no single parse identity a
     whole index can be compared against — a ``pypdfium2`` bump makes the PDFs stale and says
     nothing about the Markdown. ``NULL`` means no recorded lineage: every row predating the
     column, and every document produced by a parser manicule does not ship and therefore
     cannot version.
+
+    ``glossary_fp`` is the other, for the opposite reason: there *is* one detector, but its
+    output is repaired one document at a time from chunks already stored, so the comparison has
+    to name documents rather than refuse a run. It is on this table rather than beside the
+    entries so that the question "which documents disagree with the installed detector" is an
+    indexed predicate over ``documents`` — answerable without reading one word of glossary text,
+    and answerable at all for a document that correctly stores no entries. ``NULL`` means the
+    entries were never computed; a fingerprint whose ``detector`` reads ``disabled`` means
+    detection was switched off when this document was last ingested, and the two are different
+    states on purpose.
     """
 
     doc_metadata: Mapped[JsonValue] = mapped_column("metadata", JSON, nullable=False, default=dict)
@@ -306,6 +317,7 @@ class Document(Base):
         Index("ix_documents_parse_fp", "parse_fp"),
         Index("ix_documents_chunk_fp", "chunk_fp"),
         Index("ix_documents_embed_fp", "embed_fp"),
+        Index("ix_documents_glossary_fp", "glossary_fp"),
         Index(
             "ix_documents_deleted_at",
             "workspace_id",

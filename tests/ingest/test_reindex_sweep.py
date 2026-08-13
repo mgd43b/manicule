@@ -86,6 +86,7 @@ class BoundedSelects(fakes.MemoryIngestStore):
         media_types: Collection[str] | None = None,
         chunk_fp_other_than: str | None = None,
         parse_fp_current: Collection[str] | None = None,
+        glossary_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> Sequence[Document]:
@@ -103,6 +104,7 @@ class BoundedSelects(fakes.MemoryIngestStore):
             media_types=media_types,
             chunk_fp_other_than=chunk_fp_other_than,
             parse_fp_current=parse_fp_current,
+            glossary_fp_other_than=glossary_fp_other_than,
             limit=limit,
             offset=offset,
         )

@@ -1,7 +1,8 @@
-"""Re-ingest from what is already on disk. Three verbs, three rungs of the ladder.
+"""Re-ingest from what is already on disk. Four verbs, four rungs of the ladder.
 
 | Verb | Reads | Rung | Network |
 |---|---|---|---|
+| :func:`redetect_glossary` | ``chunks.text`` | 0 | none |
 | :func:`repair` | ``chunks`` | 1-2 | none |
 | :func:`re_embed` | ``chunks.embed_text`` | 2 | none |
 | :func:`re_parse` | ``blobs`` | 3 | none |
@@ -11,6 +12,13 @@ Only the last can fail for reasons outside the machine, and it is the only one t
 reproducible. Everything above it is a pure function of what is already stored. That is the
 whole return on retaining original bytes, and it is why ``--re-parse`` is a first-class verb
 rather than a flag on sync.
+
+**Rung 0 is cheaper than rung 1 and that is why it is a separate verb rather than a wider
+sweep.** Re-detecting a glossary reads chunk text and writes rows: it runs no parser, opens no
+blob, and never reaches the embedder — so it costs no GPU time and does not touch a vector.
+Folding it into the re-parse sweep would work and would charge a corpus-sized parse and
+re-embed for a change to a regular expression, which is the thing an operator most needs to be
+able to avoid.
 
 **Selection is a query, never a scan**, because ``documents.chunk_fp`` and
 ``documents.embed_fp`` record per-document lineage: a tree-sitter grammar upgrade invalidates
@@ -27,17 +35,18 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from manicule.core.content import DocumentStatus, RawDocument
-from manicule.core.errors import ContextOverflowError
+from manicule.core.errors import ContextOverflowError, PolicyError
 from manicule.ingest.embedding import embed_chunks
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
 
     from manicule.core.content import Document
-    from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
+    from manicule.core.fingerprints import ChunkFingerprint, GlossaryFingerprint, ParseFingerprint
+    from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Embedder, VectorStore
     from manicule.ingest.pipeline import BlobSink, IngestPipeline
-    from manicule.ingest.ports import IngestStore
+    from manicule.ingest.ports import GlossaryStore, IngestStore
 
 
 NO_RETAINED_BYTES = "no retained bytes (original_ref is unset); only a forced re-sync can repair it"
@@ -83,6 +92,7 @@ async def select(
     media_types: Collection[str] | None = None,
     chunk_fingerprint: ChunkFingerprint | None = None,
     parse_fingerprints: Collection[ParseFingerprint] | None = None,
+    glossary_fingerprint: GlossaryFingerprint | None = None,
     limit: int | None = None,
     offset: int = 0,
 ) -> Sequence[Document]:
@@ -90,6 +100,15 @@ async def select(
 
     ``chunk_fingerprint`` selects documents built by *something else* — the shape that makes a
     grammar upgrade a targeted repair rather than a corpus-wide rebuild.
+
+    ``glossary_fingerprint`` does the same for the detector, and it is the selector without
+    which a detector fix reaches nothing. Detection runs at ingest, downstream of parsing; a
+    re-sync of unchanged bytes skips before it; and neither ``chunk_fp`` nor ``parse_fp`` moves
+    when a detection rule changes. So a corpus can hold entries produced by rules corrected
+    several times over and be *correct* about every fingerprint it records. Pass what the
+    installed detector would produce now —
+    :func:`~manicule.ingest.glossary_lineage.glossary_fingerprint` — and the selection is
+    everything that disagrees with it, ``NULL`` included.
 
     ``parse_fingerprints`` does the same one stage earlier, and is what turns a library bump
     into a re-parse of the documents that library produced. Pass what every installed parser
@@ -118,6 +137,7 @@ async def select(
         media_types=media_types,
         chunk_fp_other_than=chunk_fingerprint.canonical() if chunk_fingerprint else None,
         parse_fp_current=current,
+        glossary_fp_other_than=(glossary_fingerprint.canonical() if glossary_fingerprint else None),
         limit=limit,
         offset=offset,
     )
@@ -591,15 +611,271 @@ async def _left_the_selection(
     return rebuilt is not None and rebuilt.parse_fp in current
 
 
+DETECTION_IS_OFF = (
+    "glossary detection is switched off (rag.glossary.detect_on_ingest = false), so there is "
+    "no detector to bring documents up to date with. Recomputing would run rules the "
+    "configuration says not to run; recording the disabled state instead would erase the "
+    "record of which detector produced the entries that are still being served. Turn detection "
+    "on and run this again."
+)
+"""Why glossary repair refuses rather than proceeding when detection is disabled.
+
+The plan refuses too, and that is not an oversight. Under a disabled detector the installed
+fingerprint *is* the disabled one, so the selection would be "every document whose entries a
+detector did produce" — which on a working corpus is all of them, reported as work to do that
+this command would not do. A number that large and that wrong is worse than a refusal that
+names the setting.
+"""
+
+
+@dataclass
+class GlossarySweep:
+    """What one glossary-only repair pass did, in counts an operator can act on.
+
+    Separate from :class:`StaleSweep` rather than more fields on it, because the two answer
+    different questions and share no interesting number. A re-parse reports chunks kept and
+    chunks new, because its cost is embedding and those are what it will be charged for. This
+    reports entries, because its cost is a regular expression over text already in memory and
+    the thing an operator wants to know is what the corrected rules did to the vocabulary.
+    """
+
+    dry_run: bool = False
+    selected: int = 0
+    """Documents whose recorded glossary lineage is not what the installed detector produces."""
+
+    redetected: int = 0
+    """Documents whose entries were recomputed. Zero on a dry run, by construction."""
+
+    unchanged: int = 0
+    """Of ``redetected``, those whose entry set came out exactly as it went in.
+
+    **The expected majority, and the number that says a detector fix was narrow.** Lineage
+    records the detector's identity rather than a document's content, so every document is stale
+    after any change to it — and nothing can tell which ones come out different without running
+    the rules. A document counted here still advances its fingerprint: the point of the sweep is
+    that the corpus can say which detector read it, and "the answer did not move" is an answer.
+    """
+
+    changed: int = 0
+    """Of ``redetected``, those whose entry set moved.
+
+    Compared as a set of entries rather than as a count of them, and that is not fussiness: the
+    change this feature was built for — #110's heading gate against #108's list markers —
+    removes false entries and adds real ones on the same page, and a count would report a
+    document whose whole vocabulary was replaced as untouched.
+    """
+
+    entries_before: int = 0
+    entries_after: int = 0
+    """Entries across every document redetected, going in and coming out.
+
+    Two totals rather than a net, for the same reason: a pass that removes eleven false headings
+    and adds eleven list definitions is not a pass that did nothing.
+    """
+
+    failed: int = 0
+    failures: list[str] = field(default_factory=list[str])
+    """One line per document the detector could not read, naming it and the error.
+
+    A failure leaves that document's rows and its stale lineage exactly as they were, so it is
+    still selected next time and still reported by ``doctor``. The sweep continues: one
+    document's text tripping a rule is not a reason to leave the rest of a corpus on
+    superseded rules.
+    """
+
+
+def _entry_shape(entry: GlossaryEntry) -> tuple[str, str, str, str, float, tuple[str, ...]]:
+    """One entry reduced to everything about it a reader can observe.
+
+    Aliases are sorted because the store returns them sorted and the detector returns them in
+    the order the source wrote them, and two comparisons that disagreed about that would report
+    a change nobody made. The confidence is in here on purpose: a change to an evidence weight
+    moves it without moving a single term, and that is still a change to what is stored.
+    """
+    return (
+        entry.acronym,
+        entry.expansion,
+        entry.chunk_id,
+        entry.form.value,
+        entry.confidence,
+        tuple(sorted(entry.aliases)),
+    )
+
+
+async def redetect_glossary(
+    document: Document,
+    *,
+    store: IngestStore,
+    glossary: GlossaryStore,
+    fingerprint: GlossaryFingerprint,
+) -> tuple[int, int, bool] | str:
+    """Recompute one document's entries from its stored chunks. Rung 0.
+
+    **The cost boundary is the signature.** A store to read chunks through, a place to put
+    entries, and the identity of what produced them. There is no ``pipeline``, no ``blobs``, no
+    ``embedder`` and no ``vectors`` argument, so this function could not fetch a source, open a
+    retained blob, run a parser or produce a vector if it wanted to — which is a stronger
+    statement than a comment promising it does not, and
+    ``tests/glossary/test_repair.py::test_the_repair_reaches_no_parser_no_blob_and_no_embedder``
+    asserts it of this signature rather than of one run, because a run only shows what that run
+    did.
+
+    A document with no stored chunks is not an error and not unrepairable: it states no
+    definitions, that is a derived result, and it is recorded as one. The verb that repairs a
+    document with no chunks is ``--re-parse``, and it is a different problem.
+
+    **The write is inside the failure handling as well as the detection**, and that is not
+    defensive breadth. There is a real race: an entry's ``chunk_id`` is a foreign key, this reads
+    the chunks and then writes rows citing them, and a sync re-ingesting the same document in
+    between replaces exactly those chunks — so the insert fails with ``FOREIGN KEY constraint
+    failed``. Unlike the parse sweep, this one takes no lock and shares none, because never
+    reaching the model is the whole point of it. Left uncaught, one concurrently-synced document
+    aborts a corpus-wide repair partway through; caught, it is one line in the report and one
+    document still selected next time.
+
+    Returns:
+        How many entries the document had, how many it has, and whether the set moved — or a
+        one-line reason when the repair did not complete, in which case **nothing was written**
+        for this document, so the previous entries are still servable and the stale lineage is
+        still stale.
+    """
+    # Imported here rather than at module scope, which keeps `manicule.ingest.reindex` free of
+    # the detector for every caller that only re-parses or re-embeds — this module is imported
+    # by the app runtime to answer a plan, and a plan reads rows.
+    from manicule.ingest.glossary import detect_entries  # noqa: PLC0415
+
+    before = await glossary.glossary_entries(document.id)
+    chunks = await store.document_chunks(document.id)
+    try:
+        entries = detect_entries(chunks, title=document.title, media_type=document.media_type)
+        await glossary.replace_glossary_entries(
+            document.id, entries, fingerprint=fingerprint.canonical()
+        )
+    except Exception as exc:  # noqa: BLE001 - one document's repair, never the sweep's
+        return f"{document.id} ({document.uri}): {type(exc).__name__}: {exc}"
+    moved = {_entry_shape(entry) for entry in before} != {_entry_shape(entry) for entry in entries}
+    return len(before), len(entries), moved
+
+
+async def plan_stale_glossary(
+    *,
+    store: IngestStore,
+    fingerprint: GlossaryFingerprint,
+    batch: int = DEFAULT_SWEEP_BATCH,
+) -> GlossarySweep:
+    """What :func:`redetect_stale_glossary` would do. The selection, and nothing else.
+
+    A function rather than a flag, for the reason :func:`plan_stale` gives: a plan reads rows,
+    and taking a writer it would not use is how a survey acquires the ability to write.
+
+    Args:
+        store: Where the selection is queried.
+        fingerprint: What the installed detector would produce now.
+        batch: Documents per page.
+
+    Raises:
+        PolicyError: Detection is switched off. See :data:`DETECTION_IS_OFF`.
+    """
+    _require_detection(fingerprint)
+    sweep = GlossarySweep(dry_run=True)
+    while True:
+        # The offset is the count, exactly: a plan writes nothing, so every document it has seen
+        # is still in the selection and still in front of the next page.
+        page = await select(
+            store, glossary_fingerprint=fingerprint, limit=batch, offset=sweep.selected
+        )
+        if not page:
+            return sweep
+        sweep.selected += len(page)
+
+
+async def redetect_stale_glossary(
+    *,
+    store: IngestStore,
+    glossary: GlossaryStore,
+    fingerprint: GlossaryFingerprint,
+    batch: int = DEFAULT_SWEEP_BATCH,
+) -> GlossarySweep:
+    """Bring every document's glossary up to the installed detector. Rung 0, corpus-wide.
+
+    **Paged, with the cursor counting what the pass left behind**, exactly as
+    :func:`re_parse_stale` does and for the same reason: a repaired document leaves the
+    selection, so the set shrinks under the iteration, and a page number would skip whatever
+    shifted forward into the slots it vacated. Here the arithmetic is simpler because this
+    function knows locally whether each document was repaired — there is no parser that might
+    decline to record a fingerprint — so the cursor advances only for failures.
+
+    **A document is the transaction boundary**, and cancellation is safe at one. Each document's
+    rows and lineage are written together and committed before the next is read, so an
+    interrupted run leaves every document it finished internally consistent and every document
+    it did not still selected. Resuming is running the command again.
+
+    **A second run selects nothing.** A repaired document records the installed fingerprint, so
+    the predicate that found it no longer does — including for a document that produced no
+    entries at all, which is the case a design recording lineage only against rows would loop on
+    for ever.
+
+    Args:
+        store: Where the selection is queried and chunks are read.
+        glossary: Where entries and their lineage are written.
+        fingerprint: What the installed detector would produce now.
+        batch: Documents per page.
+
+    Raises:
+        PolicyError: Detection is switched off. See :data:`DETECTION_IS_OFF`.
+    """
+    _require_detection(fingerprint)
+    sweep = GlossarySweep()
+    left_behind = 0
+    while True:
+        page = await select(
+            store, glossary_fingerprint=fingerprint, limit=batch, offset=left_behind
+        )
+        if not page:
+            return sweep
+        for document in page:
+            sweep.selected += 1
+            counted = await redetect_glossary(
+                document, store=store, glossary=glossary, fingerprint=fingerprint
+            )
+            if isinstance(counted, str):
+                # Nothing was written, so this document is still in the selection and has to
+                # keep its place in the cursor. Advancing past it is what makes the loop
+                # terminate on a corpus where nothing can be repaired at all.
+                sweep.failed += 1
+                sweep.failures.append(counted)
+                left_behind += 1
+                continue
+            before, after, moved = counted
+            sweep.redetected += 1
+            sweep.entries_before += before
+            sweep.entries_after += after
+            if moved:
+                sweep.changed += 1
+            else:
+                sweep.unchanged += 1
+
+
+def _require_detection(fingerprint: GlossaryFingerprint) -> None:
+    if fingerprint.detects:
+        return
+    raise PolicyError(DETECTION_IS_OFF)
+
+
 __all__ = [
     "DEFAULT_SWEEP_BATCH",
+    "DETECTION_IS_OFF",
     "NO_RETAINED_BYTES",
+    "GlossarySweep",
     "ReindexReport",
     "StaleSweep",
     "plan_stale",
+    "plan_stale_glossary",
     "re_embed",
     "re_parse",
     "re_parse_stale",
+    "redetect_glossary",
+    "redetect_stale_glossary",
     "reindex_document",
     "repair",
     "select",

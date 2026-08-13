@@ -1,9 +1,10 @@
 """Fingerprints — the identity of a process that produced stored data.
 
-Three exist: :class:`~manicule.core.embedding.EmbedFingerprint` for vectors,
-:class:`ChunkFingerprint` for chunk boundaries, and :class:`ParseFingerprint` for the text
-and anchors a parser extracted. All three are persisted alongside the index and compared
-before anything is written, because all three describe transformations whose output is
+Four exist: :class:`~manicule.core.embedding.EmbedFingerprint` for vectors,
+:class:`ChunkFingerprint` for chunk boundaries, :class:`ParseFingerprint` for the text
+and anchors a parser extracted, and :class:`GlossaryFingerprint` for the definitions a
+detector read out of chunks. All four are persisted alongside the index and compared
+before anything is written, because all four describe transformations whose output is
 useless when mixed with output from a different version of themselves — and useless in the
 quiet way, where nothing raises and every answer is slightly wrong.
 
@@ -29,6 +30,17 @@ corpus, so they are compared once per run and a mismatch refuses the run.
 :class:`ParseFingerprint` describes one parser applied to one document, so it is compared per
 document and a mismatch invalidates that document and no other. §6.4 of ``docs/storage.md``
 calls that per-document lineage; parsing is the case where it is the *only* honest scope.
+:class:`GlossaryFingerprint` is per document as well, for a different reason: there is one
+detector rather than many, but its output is repaired one document at a time from chunks that
+are already stored, so a mismatch has to name the documents rather than refuse the run.
+
+**A mismatch does not raise for that last one, and it is the only exception.** The three above
+describe data that is *incomparable* across versions — a vector from another model, chunks from
+another budget — so mixing them is a defect nothing downstream can detect and the only available
+answer is to stop. Glossary entries from a superseded detector are merely wrong, which is a
+repairable state and one an operator has to be able to survey, re-index around and fix in place.
+Refusing every run against a corpus whose detector has moved would make a detector fix
+unshippable: the fix is what makes the corpus stale.
 """
 
 from __future__ import annotations
@@ -55,6 +67,18 @@ measured with a stand-in vocabulary.
 The whole of what follows the prefix is identity as well, and that is the point of §1.2 of
 ``docs/parsing.md``: a stand-in counter must name the vocabulary it stood in with *and* the
 safety factor it inflated by, because both move every boundary.
+"""
+
+DETECTION_DISABLED: Final = "disabled"
+"""What :attr:`GlossaryFingerprint.detector` says when detection was switched off.
+
+A recorded value rather than an absent one, which is the whole of requirement 8. ``NULL``
+already means "never recomputed", and if a disabled run also wrote nothing then the two states
+would be one column value and an operator could not tell a corpus that has no definitions from
+one whose definitions were never looked for. Turning detection back on changes the installed
+fingerprint, so every document stamped this way is selected by the glossary repair on the next
+survey — which is the behaviour somebody switching the feature back on expects and would
+otherwise have to know to ask for.
 """
 
 
@@ -280,4 +304,87 @@ class ParseFingerprint(Fingerprint):
         return f"{self.parser} rules {self.version} ({listed or 'no parsing libraries'})"
 
 
-__all__ = ["PROVISIONAL_TOKENIZER_PREFIX", "ChunkFingerprint", "Fingerprint", "ParseFingerprint"]
+class GlossaryFingerprint(Fingerprint):
+    """The identity of the process that decided one document's stored glossary entries.
+
+    Parsing, chunking and embedding were versioned; detection was not, and it is a separate
+    stage with rules of its own that change independently of all three. The consequence was an
+    index reporting current parser, chunker and embedder fingerprints while serving definitions
+    produced by rules that had since been corrected — and reporting itself current while doing
+    it, because ``documents.parse_fp`` is what selection reads and no detector change moves it.
+
+    **Detection is downstream of parsing and is not implied by it.** A re-sync of unchanged
+    bytes skips before detection runs, so a corrected detector reaches an existing document only
+    when something unrelated to the detector happens to that document. Inferring glossary
+    freshness from parse freshness would leave the media types nobody bumped stale for ever and
+    would migrate the rest by accident, which is coupling that hides the problem rather than
+    fixing it.
+
+    **The empty result is a derived result.** A document that states no definitions under the
+    current detector records this fingerprint and no entries, and that is a different fact from
+    a document whose entries were never computed at all — which records ``NULL``. Only recording
+    lineage where there are rows to hang it on would make the two indistinguishable, and would
+    look correct on every fixture that happens to contain a definition.
+    """
+
+    IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = ("detector", "rules", "middleware")
+
+    detector: str = Field(
+        min_length=1,
+        description="Which detection strategy produced the entries, or "
+        f"``{DETECTION_DISABLED!r}`` when detection was switched off for the run that last "
+        "touched this document. A name rather than a boolean beside it, so that the disabled "
+        "state is a value somebody reads out of the column rather than a combination of empty "
+        "fields they have to interpret.",
+    )
+    rules: str = Field(
+        default="",
+        description="A digest over the sources that decide what a definition is — the grammar, "
+        "the thresholds, the evidence weights, the boundary model and the normalisation that "
+        "turns a surface form into a key. Empty when detection is disabled, because none of "
+        "them ran.",
+    )
+    middleware: tuple[str, ...] = Field(
+        default=(),
+        description="Sorted ``name@version`` for **every** configured middleware, not only the "
+        "ones declaring ``mutates_embedded_text``. That declaration is the wrong filter here "
+        "and using it would be a guard that looks right: ``embed_text`` is precisely the field "
+        "detection does not read, while the two it does read — a chunk's boundaries, decided by "
+        "block metadata a hook may rewrite in ``after_parse``, and its ``heading_path``, which "
+        "no digest in "
+        ":class:`~manicule.ingest.middleware.MiddlewareRunner` covers — carry no declaration at "
+        "all. So the whole chain is named. Empty when detection is disabled.",
+    )
+
+    @classmethod
+    def disabled(cls) -> GlossaryFingerprint:
+        """What a document records when detection was switched off.
+
+        Carries nothing but the state itself. Rules and middleware are omitted rather than
+        recorded-and-ignored, because neither ran: folding them in would churn the lineage of
+        documents nobody detected anything for every time an unrelated hook was configured,
+        and would make two disabled states compare unequal for a reason that had no effect.
+        """
+        return cls(detector=DETECTION_DISABLED)
+
+    @property
+    def detects(self) -> bool:
+        """Whether this fingerprint describes a detector that ran."""
+        return self.detector != DETECTION_DISABLED
+
+    @override
+    def describe(self) -> str:
+        if not self.detects:
+            return "glossary detection disabled"
+        hooks = ", ".join(self.middleware) if self.middleware else "no middleware"
+        return f"{self.detector} rules {self.rules} ({hooks})"
+
+
+__all__ = [
+    "DETECTION_DISABLED",
+    "PROVISIONAL_TOKENIZER_PREFIX",
+    "ChunkFingerprint",
+    "Fingerprint",
+    "GlossaryFingerprint",
+    "ParseFingerprint",
+]

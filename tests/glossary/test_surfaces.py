@@ -42,6 +42,7 @@ from manicule.core.content import BlockKind
 from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
 from manicule.core.retrieval import Filter, Query
 from manicule.ingest.glossary import detect_entries
+from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.retrieval.cache import L1QueryCache
 from manicule.retrieval.confidence import DEFINITION_CITED, NOTHING_RESEMBLES
 from manicule.retrieval.router import QueryRouter
@@ -149,7 +150,9 @@ async def _with_a_published_source(store: SqliteDocStore) -> list[Chunk]:
     await store.replace_chunks(document.id, chunks)
     entries = detect_entries(chunks, title=document.title)
     assert entries, "the fixture must actually detect a definition, or it tests nothing"
-    await store.replace_glossary_entries(document.id, entries)
+    await store.replace_glossary_entries(
+        document.id, entries, fingerprint=glossary_fingerprint().canonical()
+    )
     return chunks
 
 

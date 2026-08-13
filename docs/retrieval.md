@@ -1595,6 +1595,21 @@ real definition, and two independent gates apply:
    (0.80), a dash form on a glossary page clears it alone (0.60), and a colon form with neither
    does not (0.40).
 
+**Detection is versioned, and the version is not the parser's.** Every rule in this section is
+manicule's own and changes independently of parsing, chunking and embedding — so an index can
+report a current fingerprint for all three while serving entries produced by rules corrected
+several times since. `documents.glossary_fp` records which detector decided a document's
+entries, including when it decided there were none, and `manicule document reindex
+--stale-glossary` recomputes the documents that disagree with the installed one from chunks
+already stored: no parser, no connector, no embedder. [`ingest.md`](ingest.md) §10.2 has the
+fingerprint's inputs, the disabled-detection semantics and the migration policy.
+
+**`rag.glossary.min_entry_confidence` is a query-time floor and not part of that lineage.** It
+decides which stored entries a query will act on, which is why raising it takes effect against a
+corpus already indexed — the remedy available to somebody who cannot re-ingest. The threshold
+that decides what is *stored* is the 0.6 above, and moving that is a detector change like any
+other.
+
 ### 14.3.1 Where the term ends and the description begins
 
 A glossary line is often a definition followed by prose about it:

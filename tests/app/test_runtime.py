@@ -545,3 +545,84 @@ async def test_collections_and_tags_reach_the_real_store(runtime: Runtime) -> No
 
     await store.delete_collection(collection.id)
     assert await store.list_collections() == []
+
+
+async def test_the_pipeline_stamps_exactly_what_the_glossary_repair_looks_for(
+    manicule_environment: Path,
+) -> None:
+    """One fingerprint, four readers, and the failure if they disagree is total.
+
+    ``status`` reports it, ``doctor`` counts the documents that differ from it, the repair writes
+    it, and the pipeline stamps it at ingest. Two of those computing it separately is not a
+    subtle bug: every freshly ingested document would be reported stale, the repair would write
+    a value ``doctor`` still called wrong, and the sweep would never converge.
+
+    Asserted through the real runtime rather than by reading the two call sites, because what
+    could drift is *how each one reads configuration* — and both going through
+    :meth:`Runtime.middleware` is exactly what this checks.
+    """
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        declared = await (await opened.ingestion()).glossary_fingerprint()
+        pipeline = await opened.pipeline()
+
+        assert declared.detects
+        assert pipeline.glossary_lineage == declared.canonical()
+
+
+async def test_turning_detection_off_in_configuration_reaches_the_pipeline(
+    manicule_environment: Path,
+) -> None:
+    """``rag.glossary.detect_on_ingest`` had never been read by anything outside settings.
+
+    It shipped with #87 documented as the switch an operator throws while investigating a
+    detector that is producing rubbish, and ``_build_pipeline`` did not pass it — so a
+    configuration saying ``detect_on_ingest = false`` detected on ingest anyway. Measured on
+    ``35742f9``: ``grep -rn detect_on_ingest src/`` returned one line, its own declaration.
+
+    It has to reach the pipeline now, because the glossary fingerprint records enablement, and a
+    column recording a state configuration cannot actually reach would be a lie told in the
+    schema rather than a setting quietly doing nothing.
+    """
+    from manicule.core.fingerprints import DETECTION_DISABLED  # noqa: PLC0415
+
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, detect_on_ingest=False
+    ) as opened:
+        declared = await (await opened.ingestion()).glossary_fingerprint()
+        pipeline = await opened.pipeline()
+
+        assert declared.detector == DETECTION_DISABLED
+        assert pipeline.glossary_lineage == declared.canonical(), (
+            "the pipeline detected on ingest against a configuration that says not to"
+        )
+
+
+def _runtime_with_a_buildable_pipeline(
+    environment: Path, *, detect_on_ingest: bool = True
+) -> Runtime:
+    """A runtime whose ``pipeline()`` can actually be resolved.
+
+    Both components are bound rather than stubbed past. The chunker is the reason: a real one
+    counts tokens with a stand-in vocabulary until an embedder is bound, and ingest refuses a
+    provisional fingerprint outright — correctly, and unhelpfully for a test about a different
+    fingerprint entirely. Binding a chunker whose boundaries are already measured lets the
+    pipeline build so that what it stamps can be read off it.
+    """
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+    from tests.ingest.fakes import BlockChunker  # noqa: PLC0415 - fakes, local to this harness
+
+    found = discover()
+    bound = found.registry.bind("test")
+    # Named ``local`` rather than something invented: provider names are what the credential
+    # policy reads, and anything outside the keyless set is required to carry an API key.
+    bound.add(keys.EMBEDDER.named("local"), lambda _: HashEmbedder())
+    bound.add(keys.CHUNKER.named("block"), lambda _: BlockChunker())
+    settings = Settings(
+        data_dir=environment / "data",
+        embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
+        rag={  # pyright: ignore[reportArgumentType]
+            "chunker": "block",
+            "glossary": {"detect_on_ingest": detect_on_ingest},
+        },
+    )
+    return Runtime(settings, discovery=found)

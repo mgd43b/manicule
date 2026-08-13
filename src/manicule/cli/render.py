@@ -364,6 +364,35 @@ def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
         )
 
 
+def render_stale_glossary(out: Console, payload: r.StaleGlossaryReport) -> None:
+    """The glossary sweep's counts, and the documents whose text the detector could not read.
+
+    Entries rather than chunks, because this rung is charged in neither. What it spent is a
+    pass over stored text; what it produced is a vocabulary, and the two totals either side of
+    it are the honest way to report a pass that removed eleven wrong entries and added eleven
+    right ones.
+
+    **No definition reaches this function.** The payload carries none, which is deliberate — the
+    subject of this command is the corpus's own vocabulary, and a terminal is the last place to
+    print it.
+    """
+    if payload.dry_run:
+        out.print("[dim]dry run: nothing was detected or written[/dim]")
+    table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_row("selected", str(payload.selected))
+    if not payload.dry_run:
+        table.add_row("re-detected", str(payload.redetected))
+        table.add_row("  unchanged", str(payload.unchanged))
+        table.add_row("  changed", str(payload.changed))
+        table.add_row("entries", f"{payload.entries_before} -> {payload.entries_after}")
+    table.add_row("failed", str(payload.failed))
+    out.print(table)
+    for line in payload.failures:
+        out.print(f"[red]{escape(line)}[/red]")
+    if payload.dry_run and payload.selected:
+        out.print("\n[dim]next: [/dim]manicule document reindex --stale-glossary")
+
+
 # --- ingest -----------------------------------------------------------------------------------
 
 
@@ -405,6 +434,12 @@ def render_index_status(out: Console, payload: r.IndexStatus) -> None:
         table.add_row(f"  {status}", str(count))
     table.add_row("embedding", escape(payload.embedding or "not yet committed"))
     table.add_row("chunking", escape(payload.chunking or "not yet committed"))
+    table.add_row("glossary", escape(payload.glossary or "not reported"))
+    if payload.stale_glossary:
+        # Beside the detector it disagrees with, rather than left to `doctor`. Somebody reading
+        # `status` after upgrading is asking exactly this question, and a line naming the
+        # detector with nothing next to it would read as "current".
+        table.add_row("  awaiting re-detection", str(payload.stale_glossary))
     table.add_row("schema", escape(payload.schema_revision or "unmigrated"))
     table.add_row("data directory", escape(payload.data_dir))
     out.print(table)
@@ -806,6 +841,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.DocumentDeleted: lambda out, p: render_document_deleted(out, _as(r.DocumentDeleted, p)),
     r.DocumentReindexed: lambda out, p: render_document_reindexed(out, _as(r.DocumentReindexed, p)),
     r.StaleReparseReport: lambda out, p: render_stale_reparse(out, _as(r.StaleReparseReport, p)),
+    r.StaleGlossaryReport: lambda out, p: render_stale_glossary(out, _as(r.StaleGlossaryReport, p)),
     r.IngestReport: lambda out, p: render_ingest(out, _as(r.IngestReport, p)),
     r.IndexStatus: lambda out, p: render_index_status(out, _as(r.IndexStatus, p)),
     r.Stats: lambda out, p: render_stats(out, _as(r.Stats, p)),

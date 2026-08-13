@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from manicule.core.retrieval import Filter
 from manicule.ingest.glossary import detect_entries
+from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.retrieval.assembly import ContextAssembler
 from manicule.retrieval.cache import L1QueryCache
 from manicule.retrieval.dense import DenseStage
@@ -81,7 +82,9 @@ async def index(
     ]
     await store.replace_chunks(document.id, chunks)
     entries = detect_entries(chunks, title=title) if detect else []
-    await store.replace_glossary_entries(document.id, entries)
+    await store.replace_glossary_entries(
+        document.id, entries, fingerprint=glossary_fingerprint().canonical()
+    )
     return document, chunks
 
 

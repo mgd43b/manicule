@@ -15,6 +15,7 @@ import pytest
 from manicule.core.content import DocumentStatus
 from manicule.core.glossary import DefinitionForm, GlossaryEntry
 from manicule.core.ids import glossary_entry_id
+from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.retrieval.expansion import ExpansionPolicy, resolve_expansion
 from manicule.retrieval.ports import GlossarySource
 from manicule.storage.docstore import SqliteDocStore
@@ -155,7 +156,9 @@ async def test_writing_an_empty_list_clears_a_document_without_touching_its_chun
     document_id = await a_glossary(store, "glossary", f"NOW — {EXPANSION}")
     assert await store.glossary_entries(document_id)
 
-    await store.replace_glossary_entries(document_id, [])
+    await store.replace_glossary_entries(
+        document_id, [], fingerprint=glossary_fingerprint().canonical()
+    )
 
     assert await store.glossary_entries(document_id) == []
     assert await store.document_chunks(document_id), "the chunks are deliberately left alone"
@@ -169,7 +172,9 @@ async def test_entries_are_refused_when_they_name_another_document(
 
     with pytest.raises(ValueError, match="name document"):
         await store.replace_glossary_entries(
-            document_id, [an_entry("some-other-document", "chunk-x")]
+            document_id,
+            [an_entry("some-other-document", "chunk-x")],
+            fingerprint=glossary_fingerprint().canonical(),
         )
 
 

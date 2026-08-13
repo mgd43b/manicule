@@ -2307,3 +2307,88 @@ async def test_a_document_that_was_never_re_keyed_is_not_reported_as_owing_a_re_
     backend.store.add(make_document(backend.workspace, source="handbook", source_id="notes.md"))
 
     assert _check(await ApplicationService(backend).doctor(), "document-content").state == "ok"
+
+
+# --- glossary lineage ------------------------------------------------------------------------
+
+
+async def test_doctor_reports_a_corpus_serving_definitions_the_detector_did_not_produce(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Requirement 11: a clean ``doctor`` has to mean the glossary is current too.
+
+    Before this check every fingerprint the command reported was about parsing, chunking or
+    embedding — so an index whose definitions were three detector versions out of date passed
+    with nothing amber anywhere, and the thing a green result invites a reader to assume is
+    precisely that the index is current rather than that three of its four stages are.
+
+    ``degraded`` rather than ``failing``, on the reading the document-content check already
+    uses: the documents are indexed, the definitions are cited and resolvable and may well be
+    right. What is true is that they came out of rules this build has changed.
+    """
+    diagnosis = await service.doctor()
+
+    check = _check(diagnosis, "glossary")
+    assert check.state == "degraded"
+    assert check.remedy == "manicule document reindex --stale-glossary"
+    assert check.facts["stale"] == 1
+    assert "detector did not produce" in check.detail
+    del backend
+
+
+async def test_doctor_is_clean_once_every_document_names_the_installed_detector(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The control, without which the check above proves only that the fixture was empty."""
+    from manicule.ingest.glossary_lineage import glossary_fingerprint  # noqa: PLC0415
+
+    for known in backend.store.documents:
+        backend.store.glossary_lineage[known] = glossary_fingerprint().canonical()
+
+    check = _check(await service.doctor(), "glossary")
+
+    assert check.state == "ok"
+    assert check.facts["stale"] == 0
+
+
+async def test_status_names_the_detector_beside_the_other_three_stages(
+    service: ApplicationService,
+) -> None:
+    """``status`` is where somebody looks to find out what built this index.
+
+    Until this line existed it answered with the three stages that had fingerprints and said
+    nothing at all about the fourth, which is the same omission one surface along.
+    """
+    from manicule.ingest.glossary_lineage import DETECTOR  # noqa: PLC0415
+
+    status = await service.index_status()
+
+    assert status.glossary.startswith(f"{DETECTOR} rules sha256:")
+    assert status.stale_glossary == 1
+
+
+async def test_the_glossary_sweep_reaches_the_port_with_what_the_caller_asked_for(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The service is an adapter here; the selection and the fingerprint are the runtime's."""
+    report = await service.document_redetect_glossary(batch=7, dry_run=True)
+
+    assert backend.ingestion_.glossary_sweeps == [(7, True)]
+    assert report.dry_run
+    assert report.selected == backend.ingestion_.glossary_sweep.selected
+    assert (report.redetected, report.changed, report.unchanged) == (0, 0, 0)
+
+
+async def test_a_real_glossary_sweep_carries_every_count_back(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Each number is different in the fixture, so a payload that dropped one is visible."""
+    report = await service.document_redetect_glossary(batch=25)
+
+    sweep = backend.ingestion_.glossary_sweep
+    assert (report.selected, report.redetected) == (sweep.selected, sweep.redetected)
+    assert (report.unchanged, report.changed) == (sweep.unchanged, sweep.changed)
+    assert (report.entries_before, report.entries_after) == (
+        sweep.entries_before,
+        sweep.entries_after,
+    )

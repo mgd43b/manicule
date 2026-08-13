@@ -178,6 +178,68 @@ async def test_parse_lineage_arrives_empty_and_leaves_the_rest_alone(data_dir: P
         await engine.dispose()
 
 
+async def test_glossary_lineage_arrives_empty_so_the_first_release_repairs_rather_than_trusts(
+    data_dir: Path,
+) -> None:
+    """``documents.glossary_fp`` over a database whose glossary was detected by older rules.
+
+    **Not backfilled, and that is the decision the revision is making.** Writing the installed
+    fingerprint into existing rows would be one statement and would assert that entries detected
+    before anything recorded a detector came out of the rules installed now — which is false for
+    every corpus indexed before this column, and is exactly the plausible falsehood the
+    fingerprints exist to prevent. ``NULL`` means "nobody has looked", the repair selects on it,
+    and the price is one sweep over stored chunks with no parser and no embedder in it.
+
+    The seeded glossary row is left alone on the way through, both directions. Losing a
+    definition to a lineage migration would be the migration causing the harm it is adding a
+    column to detect.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision=_first_revision())
+        await _seed(engine)
+        counts = await _row_counts(engine)
+        original = await _document_values(engine)
+
+        await upgrade(engine)
+        assert await _document_values(engine, "glossary_fp") == {"glossary_fp": None}, (
+            "an existing document must not be claimed to have been read by today's detector"
+        )
+        assert await _row_counts(engine) == counts, "no entry may be lost to a column"
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE documents SET glossary_fp = :fp"), {"fp": _SEEDED_GLOSSARY_FP}
+            )
+        assert await _document_values(engine, "glossary_fp") == {"glossary_fp": _SEEDED_GLOSSARY_FP}
+
+        # An indexed column, so the downgrade has to drop the index first or SQLite refuses —
+        # at the moment somebody is downgrading under pressure, which is the worst time to find
+        # out that a path nobody has run is not a path.
+        await downgrade(engine, _first_revision())
+        assert await _row_counts(engine) == counts, "the downgrade must not cascade"
+        assert await _document_values(engine) == original, (
+            "dropping glossary_fp must not disturb the columns beside it"
+        )
+
+        await upgrade(engine)
+        assert await _document_values(engine, "glossary_fp") == {"glossary_fp": None}
+        assert await _row_counts(engine) == counts
+    finally:
+        await engine.dispose()
+
+
+_SEEDED_GLOSSARY_FP = (
+    '{"detector":"deterministic","middleware":[],"rules":"sha256:0000000000000000"}'
+)
+"""A glossary lineage value the assertions above compare against something specific.
+
+A placeholder would defeat the test the same way :data:`_SEEDED_PARSE_FP`'s docstring describes:
+a migration that rewrote every lineage column to the empty string would pass an assertion that
+only checked the column still existed.
+"""
+
+
 _SEEDED_GLOSSARY = (
     "INSERT INTO glossary_entries (id, document_id, chunk_id, acronym, display, expansion, "
     "location, form, confidence, created_at) "

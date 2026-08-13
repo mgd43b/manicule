@@ -122,13 +122,33 @@ class GlossaryMixin(WorkspaceScoped):
     """
 
     async def replace_glossary_entries(
-        self, document_id: str, entries: Sequence[GlossaryEntry]
+        self, document_id: str, entries: Sequence[GlossaryEntry], *, fingerprint: str
     ) -> None:
-        """Make this document's entries exactly ``entries``.
+        """Make this document's entries exactly ``entries``, and record what produced them.
 
         Refuses entries attributed to another document rather than silently rewriting their
         ``document_id``: an entry that arrived under the wrong document is a caller bug, and
         correcting it here would file one document's vocabulary under another's scope.
+
+        **The rows and ``documents.glossary_fp`` move in one transaction**, which is what makes
+        the lineage a fact about the rows rather than a claim beside them. Two statements in two
+        transactions leave a window, and one direction of that window is the failure this
+        feature exists to prevent: entries rewritten, fingerprint not yet advanced is merely a
+        document that will be repaired again for nothing, but fingerprint advanced and entries
+        not rewritten is a document reporting itself current while serving the old detector's
+        definitions.
+
+        **An empty ``entries`` still writes the fingerprint.** "The current detector read this
+        document and found no definitions" is a derived result and is recorded as one; without
+        it, a corpus of ordinary prose would be indistinguishable from a corpus nobody has run a
+        detector over, and every sweep would select every document for ever.
+
+        Args:
+            document_id: Which document's vocabulary this is.
+            entries: Exactly what it states now, possibly nothing.
+            fingerprint: Canonical
+                :class:`~manicule.core.fingerprints.GlossaryFingerprint` of the detector that
+                produced ``entries``.
 
         Raises:
             ValueError: An entry names a different document.
@@ -147,10 +167,13 @@ class GlossaryMixin(WorkspaceScoped):
             row = await self._live_document(session, document_id)
             if row is None:
                 # Not an error. A document that vanished mid-run has nothing to say, and
-                # raising here would turn a race into a failed ingest.
+                # raising here would turn a race into a failed ingest. There is no row to stamp
+                # a fingerprint on either, which is the honest outcome: lineage is a column of
+                # `documents`, and this document is not one.
                 await self._clear_entries(session, document_id)
                 return
             await self._clear_entries(session, document_id)
+            row.glossary_fp = fingerprint
             aliases: list[tuple[str, str]] = []
             for entry in entries:
                 entry_id = glossary_entry_id(entry.chunk_id, entry.acronym, entry.expansion)
@@ -177,6 +200,23 @@ class GlossaryMixin(WorkspaceScoped):
             await session.flush()
             for entry_id, alias in aliases:
                 session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
+
+    async def glossary_lineage(self, document_id: str) -> str | None:
+        """Which detector last decided this document's entries, or ``None`` if none has.
+
+        **One column, no join, and that is requirement 3 in one method.** Asking "is this
+        document's vocabulary current" must not cost the vocabulary: a corpus-wide answer is a
+        scan of an indexed text column, and a scan that dragged in ``glossary_entries`` would
+        read every definition in the index to answer a question about none of them.
+
+        The two absent answers are different and neither is inferred from the other. ``None``
+        for a document nothing has ever detected against, and a fingerprint whose ``detector``
+        reads ``disabled`` for one last ingested while detection was switched off — which is a
+        document that may hold perfectly good entries from before the switch.
+        """
+        async with self._sessions() as session:
+            row = await self._live_document(session, document_id)
+            return row.glossary_fp if row is not None else None
 
     async def _clear_entries(self, session: AsyncSession, document_id: str) -> None:
         await session.execute(

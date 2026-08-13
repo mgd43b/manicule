@@ -55,6 +55,7 @@ from manicule.core.ids import content_hash, document_id
 from manicule.core.provenance import Provenance
 from manicule.ingest.embedding import embed_chunks
 from manicule.ingest.glossary import detect_entries
+from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.ports import GlossaryWriter
 from manicule.ingest.refusals import require_measured
 from manicule.ingest.workers import AttemptResult
@@ -204,6 +205,19 @@ class DocumentOutcome:
     somebody else's.
     """
 
+    glossary_detail: str = ""
+    """Why detection did not produce this document's entries, when it did not.
+
+    **A field of its own rather than a second use of ``detail``**, and the separation is
+    load-bearing rather than tidy. :func:`~manicule.ingest.reindex.re_parse` reads an
+    ``indexed`` outcome carrying a ``detail`` as "the parse failed and the previous version was
+    kept", which is exactly the right reading of that field — and putting a detector failure
+    there would make a re-parse of a perfectly rebuilt document report a failure, skip the
+    lineage read-back that keeps its sweep cursor honest, and count the document as unrepaired.
+    A detector failure is not a parse failure. It costs this document's glossary and nothing
+    else.
+    """
+
     members: tuple[str, ...] = ()
     """Source ids of documents found inside this one, queued rather than recursed into."""
 
@@ -232,6 +246,16 @@ class RunReport:
     by_status: dict[str, int] = field(default_factory=dict[str, int])
     error: str = ""
 
+    glossary_failures: list[str] = field(default_factory=list[str])
+    """One line per document whose definitions the detector could not read.
+
+    Here rather than nowhere, because "does not advance the fingerprint" is only half of failing
+    closed. The other half is that somebody finds out: the document keeps the entries it had and
+    keeps its stale lineage, so the next survey names it — but a run that hit a detector bug on
+    every document and reported a clean sweep of green counters would be a system that had
+    stopped detecting anything and said nothing about it.
+    """
+
     @property
     def indexed(self) -> int:
         return self.by_status.get(DocumentStatus.INDEXED.value, 0)
@@ -246,6 +270,10 @@ class RunReport:
             self.expanded += 1
         else:
             self.discovered += 1
+        if outcome.glossary_detail:
+            self.glossary_failures.append(
+                f"{outcome.document_id or outcome.source_id}: {outcome.glossary_detail}"
+            )
         if outcome.skipped == "version":
             self.skipped_version += 1
             return
@@ -264,6 +292,7 @@ class RunReport:
                 "skipped_hash": self.skipped_hash,
                 "by_status": dict(self.by_status),
                 "error": self.error,
+                "glossary_failures": list(self.glossary_failures),
             }
         }
 
@@ -318,6 +347,17 @@ class IngestPipeline:
         # nothing, which reads from the outside as a detector that finds nothing.
         self._glossary = glossary if glossary is not None else _writer_of(store)
         self._detect_glossary = detect_glossary and self._glossary is not None
+        # Read once per pipeline rather than per document: it digests two source files and the
+        # answer cannot change under a running process. `None` where the store cannot hold
+        # entries at all — there is no glossary state in that index, so there is no lineage to
+        # claim about it, and stamping one would describe rows that have nowhere to live.
+        self._glossary_lineage = (
+            None
+            if self._glossary is None
+            else glossary_fingerprint(
+                enabled=detect_glossary, middleware=middleware.chain()
+            ).canonical()
+        )
         self._fetching = asyncio.Semaphore(max(1, fetch_concurrency))
         self._embedding = asyncio.Lock()
         self._mutations: dict[str, tuple[asyncio.Lock, int]] = {}
@@ -362,6 +402,17 @@ class IngestPipeline:
                 self._mutations[document_id] = (lock, holders - 1)
             else:
                 del self._mutations[document_id]
+
+    @property
+    def glossary_lineage(self) -> str | None:
+        """The detector identity this pipeline stamps, or ``None`` if it stamps none.
+
+        Public because it is the thing that has to agree with what
+        :meth:`~manicule.app.ports.Ingesting.glossary_fingerprint` reports and what the repair
+        selects against, and an agreement nothing can read is an agreement nobody can check.
+        ``None`` only where the store cannot hold entries at all.
+        """
+        return self._glossary_lineage
 
     # --- a run ---------------------------------------------------------------------------
 
@@ -674,12 +725,22 @@ class IngestPipeline:
             expected=expected,
         )
         if result.status is not DocumentStatus.PARSED:
+            glossary_detail = ""
             if result.status is not DocumentStatus.FAILED:
                 # A container's members and an "unsupported media type" verdict are both
                 # conclusions a parser version reached about these bytes, and both are now
                 # what is stored. A failure is not: it is the absence of a conclusion, and
                 # claiming lineage for it would mark a document current on the strength of
                 # the run that could not read it.
+                #
+                # The glossary is settled here for the same reason and by the same rule
+                # `_nothing_to_index` states: a document with no chunks states no definitions,
+                # and saying so explicitly rather than leaving it to the chunk cascade is what
+                # keeps it a property of the pipeline instead of a property of one store's
+                # schema. `_store_record` above has already emptied the chunks; a store holding
+                # them elsewhere would otherwise keep a whole glossary for a page that no longer
+                # has any text in it — and, now, keep it behind a lineage nothing ever advances.
+                glossary_detail = await self._store_definitions(document, [])
                 await self._store.set_lineage(
                     document.id,
                     chunk_fp=None,
@@ -693,6 +754,7 @@ class IngestPipeline:
                     status=document.status,
                     document_id=document.id,
                     detail=result.status_detail,
+                    glossary_detail=glossary_detail,
                     members=tuple(member.source_id for member in members),
                 ),
                 members,
@@ -879,7 +941,8 @@ class IngestPipeline:
         # the chunk cascade, because the cascade is a property of one store's schema and this
         # is a property of the pipeline: a store that kept its chunks in a separate service
         # would leave a whole glossary behind for a page that no longer has any text in it.
-        await self._store_definitions(stored, [])
+        # It is also a derived empty result, so it records lineage like any other.
+        glossary_detail = await self._store_definitions(stored, [])
         # The determination "there is no text in this" is itself the output of a parser
         # version. Without lineage here, a document that yielded nothing would be re-parsed on
         # every sync forever — and, worse, the day a library learns to read it, nothing would
@@ -893,6 +956,7 @@ class IngestPipeline:
             status=stored.status,
             document_id=stored.id,
             detail=settled.status_detail,
+            glossary_detail=glossary_detail,
         )
 
     async def _commit(
@@ -944,7 +1008,7 @@ class IngestPipeline:
             # and a glossary lookup only ever reads entries of indexed documents — so entries
             # written by a run that died before its vectors are invisible until the repair
             # finishes the job.
-            await self._store_definitions(document, chunks)
+            glossary_detail = await self._store_definitions(document, chunks)
             await self._vectors.upsert(chunks, vectors)
         except Exception as exc:  # noqa: BLE001 - a store failure is this document's
             return await self._demote(
@@ -973,6 +1037,7 @@ class IngestPipeline:
             status=DocumentStatus.INDEXED,
             document_id=indexed.id,
             chunks=len(chunks),
+            glossary_detail=glossary_detail,
         )
 
     async def _publish(self, document: Document, *, expected: DocumentRevision | None) -> Document:
@@ -993,7 +1058,7 @@ class IngestPipeline:
             raise _SupersededError(committed.stored)
         return committed.stored
 
-    async def _store_definitions(self, document: Document, chunks: Sequence[Chunk]) -> None:
+    async def _store_definitions(self, document: Document, chunks: Sequence[Chunk]) -> str:
         """Read this document's glossary definitions and make them its stored ones.
 
         **Unconditionally a replace, including with an empty list.** A document that used to
@@ -1001,11 +1066,46 @@ class IngestPipeline:
         something was found would leave the old three answering queries, cited to a page that
         no longer says them. That is the failure this whole feature could most easily
         introduce: a definition that is wrong, confident, and looks exactly like a right one.
+
+        **The write carries its own lineage**, so the entries and the statement of what produced
+        them are one transaction. That is what makes an empty glossary a derived result rather
+        than an absence: a document with no entries and a recorded fingerprint has been read by
+        the current detector, and one with no entries and no fingerprint has not.
+
+        **A detector failure fails closed and says so.** ``detect_entries`` is regular
+        expressions over lines and has no model to be unavailable, so it raising means a bug in
+        this repository — and the two things that must not happen then are the two that would be
+        automatic. Nothing is written, so the entries a working detector produced stay exactly
+        where they are and stay servable; and the fingerprint is not advanced, so this document
+        remains selected by ``document reindex --stale-glossary`` and by ``doctor`` until the
+        fix ships. The rest of the ingest is unaffected: chunks, vectors and the other three
+        lineages are this document's index, and a glossary bug is not allowed to cost them.
+
+        Returns:
+            Why detection did not produce this document's entries, or the empty string when it
+            did — or when there was nothing for it to do.
         """
-        if not self._detect_glossary or self._glossary is None:
-            return
-        entries = detect_entries(chunks, title=document.title, media_type=document.media_type)
-        await self._glossary.replace_glossary_entries(document.id, entries)
+        if self._glossary is None or self._glossary_lineage is None:
+            return ""
+        if not self._detect_glossary:
+            # Detection is switched off. The rows are left exactly as they are, which is what
+            # `rag.glossary.detect_on_ingest` promises an operator investigating a detector that
+            # is producing rubbish — and the lineage records that no detector ran, which is a
+            # value in the column rather than an absence somebody has to interpret. Switching
+            # detection back on changes the installed fingerprint, so every document stamped
+            # this way is selected by the next survey.
+            await self._store.set_lineage(
+                document.id, chunk_fp=None, embed_fp=None, glossary_fp=self._glossary_lineage
+            )
+            return ""
+        try:
+            entries = detect_entries(chunks, title=document.title, media_type=document.media_type)
+        except Exception as exc:  # noqa: BLE001 - a detector bug costs this document's glossary
+            return f"glossary detection failed: {type(exc).__name__}: {exc}"
+        await self._glossary.replace_glossary_entries(
+            document.id, entries, fingerprint=self._glossary_lineage
+        )
+        return ""
 
     # --- change detection ------------------------------------------------------------------
 
