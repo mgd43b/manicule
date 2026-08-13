@@ -8,6 +8,7 @@ from manicule.core.retrieval import Candidate, ConfidenceBand, PipelineIdentity
 from manicule.retrieval.confidence import (
     AGREEMENT,
     BANDS,
+    DEFINITION_CITED,
     NOISE_SIMILARITY,
     NOTHING_RESEMBLES,
     RERANK,
@@ -529,6 +530,39 @@ def test_the_diagnostic_reports_every_input_to_the_score() -> None:
     assert len(counted) == 1
     assert counted[0].raw_similarity == pytest.approx(GLOSSARY_HIT)
     assert counted[0].evidence > 0.0
+
+
+def test_the_diagnostic_reports_a_cited_definition_without_giving_it_a_weight() -> None:
+    """Requirement: the diagnostics explain every component, including the one that is not one.
+
+    ``explicit_definition`` appears as a field of its own and is deliberately **absent** from
+    both ``components`` and ``suppressed``. A component has a weight and contributes; a suppressed
+    component has a weight and was prevented from contributing, which is why it lowers the
+    ceiling. This has no weight at all, and listing it beside things that do would invite exactly
+    the reading it exists to prevent — that a definition is worth some number of points.
+
+    The weighted arithmetic is asserted **identical** to the same run without the flag, so a
+    diagnostic that quietly started scoring it would fail here rather than in a band somewhere.
+    """
+    passages = _context(NOISE_SIMILARITY - 0.05, NOISE_SIMILARITY - 0.10)
+
+    plain = explain_confidence(passages, legs=("dense",), rerank_stage=None)
+    cited = explain_confidence(
+        passages, legs=("dense",), rerank_stage=None, explicit_definition=True
+    )
+
+    assert not plain.explicit_definition
+    assert plain.reason == NOTHING_RESEMBLES
+    assert cited.explicit_definition
+    assert cited.reason == DEFINITION_CITED
+
+    assert "explicit_definition" not in cited.components
+    assert "explicit_definition" not in cited.suppressed
+    assert cited.components == plain.components
+    assert cited.score == plain.score
+    assert cited.band is plain.band
+    assert cited.ceiling == plain.ceiling
+    assert cited.weights == plain.weights
 
 
 def test_the_diagnostic_agrees_with_the_score_it_explains() -> None:

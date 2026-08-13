@@ -260,7 +260,7 @@ class Retriever:
                 context,
                 identity,
                 exhausted_budget=exhausted,
-                explicit_definition=cites_a_definition(query, expansion, context),
+                explicit_definition=_cites_a_definition(query, expansion, context),
             ),
             trace=RetrievalTrace(
                 route=routing.route,
@@ -517,7 +517,7 @@ class Retriever:
                 # The expansion is recomputed on a hit rather than cached, so the classification
                 # is computed from the same three facts a miss would use and a cached answer
                 # cannot report the contradiction a fresh one no longer can.
-                explicit_definition=cites_a_definition(query, expansion, context),
+                explicit_definition=_cites_a_definition(query, expansion, context),
             ),
             trace=RetrievalTrace(
                 route=Route.RETRIEVE,
@@ -565,7 +565,7 @@ class Retriever:
         )
 
 
-def cites_a_definition(query: Query, expansion: QueryExpansion, context: Context) -> bool:
+def _cites_a_definition(query: Query, expansion: QueryExpansion, context: Context) -> bool:
     """Whether this result answers a question about a term by showing that term's definition.
 
     Three conditions, and dropping any one of them turns a classification into a boost.
@@ -695,5 +695,4 @@ __all__ = [
     "RetrievalResult",
     "Retriever",
     "build_retriever",
-    "cites_a_definition",
 ]

@@ -506,7 +506,7 @@ async def test_a_fetched_definition_still_obeys_a_chunk_level_restriction(
     It is also the one query shape that separates "a definition exists" from "a definition is in
     front of the reader": the alias resolves, the entry is found, and the passage is then refused
     by the chunk-level filter. Written after a mutation showed that dropping the in-context
-    condition from ``cites_a_definition`` broke nothing — a result claiming an explicit definition
+    condition from ``_cites_a_definition`` broke nothing — a result claiming an explicit definition
     while showing a context that does not contain one is the failure this half now catches.
     """
     retriever = await _with_glossary(store, indexed)
@@ -654,7 +654,7 @@ async def test_a_mention_of_the_term_is_not_enough_to_claim_a_definition(
     **It fires on ``exact_case``, which is the same ``MatchReason`` that ``What is NOVA?``
     records.** So the reason a match was admitted cannot distinguish these two queries, and a
     classification reading it would be true for both. That is why
-    :func:`~manicule.retrieval.retriever.cites_a_definition` asks ``definitional_frame`` directly
+    :func:`~manicule.retrieval.retriever._cites_a_definition` asks ``definitional_frame`` directly
     rather than inspecting the recorded reason — this assertion is what pins that down.
 
     This is requirement 7 at its sharpest. "We are showing you a definition" and "you asked what
