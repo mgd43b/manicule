@@ -33,7 +33,7 @@ per data directory. The pid file stays where #126 put it; it answers a different
 
 .. code-block:: text
 
-    client → server   one line: an Invoke or a Handover
+    client → server   one line: an Invoke, a Handover or a Forget
     server → client   zero or more Progress lines, then exactly one Result line, then EOF
 
 A connection *is* a request, so there is no request id, no multiplexing and no session state to
@@ -78,6 +78,7 @@ __all__ = [
     "MAX_FRAME_BYTES",
     "SOCKET_MODE",
     "ControlServer",
+    "Forget",
     "Handover",
     "Invoke",
     "Progress",
@@ -286,6 +287,24 @@ class Handover(BaseModel):
         )
 
 
+class Forget(BaseModel):
+    """Drop the session for this instance, if there is one.
+
+    A frame of its own rather than a :class:`Handover` with no cookies in it. "An empty
+    credential means delete the credential" is the kind of implicit rule that reads fine in the
+    code that wrote it and is a data-loss bug in the code that reads it — and this one deletes a
+    credential somebody would have to open a browser to replace.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["forget"] = "forget"
+    base_url: str = Field(min_length=1)
+
+    def to_line(self) -> bytes:
+        return _line(self.model_dump(mode="json"))
+
+
 class Progress(BaseModel):
     """Something happened that is worth saying before the operation is over.
 
@@ -319,10 +338,14 @@ class Result(BaseModel):
         return _line(self.model_dump(mode="json"))
 
 
-type Request = Invoke | Handover
+type Request = Invoke | Handover | Forget
 type Response = Progress | Result
 
-_REQUESTS: Mapping[str, type[Invoke] | type[Handover]] = {"invoke": Invoke, "handover": Handover}
+_REQUESTS: Mapping[str, type[Invoke] | type[Handover] | type[Forget]] = {
+    "invoke": Invoke,
+    "handover": Handover,
+    "forget": Forget,
+}
 
 
 def _line(payload: Mapping[str, object]) -> bytes:

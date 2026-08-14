@@ -136,6 +136,20 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         # than no lock. It reads; `--fix` writes grammars and vocabularies into the *cache*
         # directory rather than the data directory, so even that stays on this side.
         "doctor",
+        # Setting the machine up, on the same rule `doctor --fix` is here for: it writes the
+        # configuration file and pre-seeds the cache, and touches no data directory at all.
+        # Classifying it as a writer was harmless while a writer meant "takes a lock nobody
+        # else wants". It stopped being harmless when write commands started going to a
+        # server, because `init` is what somebody runs *before* there is anything to serve —
+        # requiring one first is a cycle, and sending it to one would be a running process
+        # rewriting configuration it had already read.
+        "init",
+        # Capturing a Confluence session. It used to write one to the macOS Keychain, which
+        # was not the data directory either; now it hands the session to the server over the
+        # control socket and writes nothing anywhere. What it still needs is a server to hand
+        # it to, and `manicule connector login` refuses on its own when there is not one —
+        # which is a different requirement from this lock and is stated where it applies.
+        "connector_login",
         # Copies *out*. Both read the data directory and write somewhere else, so neither
         # needs the writer's exclusion — and making them writers would mean no backup could be
         # taken while a server was up, which is when somebody most wants one. The cost is

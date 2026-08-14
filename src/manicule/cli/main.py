@@ -32,12 +32,14 @@ from typing import TYPE_CHECKING, Annotated, Any
 import typer
 from typer.core import TyperGroup, TyperOption
 
+from manicule.app import commands
 from manicule.app import results as r
+from manicule.app.commands import Command
 from manicule.app.dispatch import error_info, run_op, writes
 from manicule.app.results import Envelope, failed
 from manicule.app.runtime import Runtime
 from manicule.app.service import DEFAULT_SOURCE, DEFAULT_SWEEP_BATCH, ApplicationService
-from manicule.cli import render
+from manicule.cli import proxy, render
 from manicule.core.errors import ConfigError, ManiculeError
 from manicule.core.version import CORE_VERSION
 from manicule.generation.answers import EventKind
@@ -443,15 +445,15 @@ def main_callback(
 async def _execute(op: str, call: Callable[[ApplicationService], Awaitable[Payload]]) -> Envelope:
     """Open a runtime, run one operation, close it. Never leaks an exception a caller owns.
 
-    **The operation decides whether this process takes the data directory.**
-    :func:`~manicule.app.dispatch.writes` answers from the operation's name and defaults to
-    "yes", so a command added later takes the lock without anybody remembering to ask for it.
-    Nothing here is optional or per-command: every command on this surface arrives through this
-    function, which is the whole reason the decision is made here rather than in each of them.
+    **This is the read path.** Every operation reaching it is named in
+    :data:`~manicule.app.dispatch.READ_ONLY_OPS`, so the runtime is opened without the writer
+    lock and no server has to exist for it to work — which is the property that keeps ``search``,
+    ``ask`` and ``doctor`` answering while a sync is running somewhere else. Operations that
+    write arrive through :func:`submit` instead.
 
-    The ``async with`` is inside the ``try`` because the lock is taken by ``__aenter__``.
-    Another process holding the directory is exactly as much an outcome a caller can act on as
-    configuration that will not load, and it gets the same envelope rather than a traceback.
+    The ``async with`` is inside the ``try`` because a runtime can fail to open for reasons that
+    have nothing to do with the lock. Configuration that will not load is exactly as much an
+    outcome a caller can act on, and it gets the same envelope rather than a traceback.
     """
     try:
         runtime = Runtime.open(writer=writes(op), **STATE.overrides)
@@ -466,8 +468,62 @@ async def _execute(op: str, call: Callable[[ApplicationService], Awaitable[Paylo
 
 
 def emit(op: str, call: Callable[[ApplicationService], Awaitable[Payload]]) -> None:
-    """Run an operation, print it the way the caller asked for, and set the exit status."""
+    """Run a read operation in this process, print it, and set the exit status."""
     print_envelope(asyncio.run(_execute(op, call)))
+
+
+def submit(command: Command) -> None:
+    """Run a command that may write — here or in the server — print it, and set the exit status.
+
+    The counterpart to :func:`emit`, and the difference between the two is which process the
+    work happens in. A reader can tell at every call site which is which, which is the point of
+    there being two functions rather than one that branches.
+    """
+    print_envelope(asyncio.run(_dispatch(command)))
+
+
+async def _dispatch(command: Command) -> Envelope:
+    """Decide where a command runs, and run it there.
+
+    Three outcomes, and the middle one is the change this whole arrangement is for:
+
+    * It does not write — run it here, with no lock and no server. ``collection orphans``
+      without ``--confirm`` is the case that makes this a property of the *invocation* rather
+      than of the operation's name.
+    * It writes and a server is answering — send it, and print what comes back.
+    * It writes and nothing is answering — refuse, naming ``manicule serve``. Not a local
+      fallback: the credential a sync needs lives in the server's memory and nowhere else, so a
+      local run would be one that cannot authenticate, reported as a sync that failed.
+
+    ``init`` reaches the first branch rather than being special-cased here. It writes the
+    configuration file and the cache and touches no data directory, so
+    :data:`~manicule.app.dispatch.READ_ONLY_OPS` names it and ``writes()`` answers ``False`` —
+    which is what keeps ``manicule init`` from requiring a server before there is anything for
+    one to serve.
+    """
+    if not command.writes():
+        return await _locally(command)
+    served = proxy.listening(STATE.overrides)
+    if served is None:
+        return proxy.refuse(
+            command, workspace=STATE.workspace or UNKNOWN_WORKSPACE, overrides=STATE.overrides
+        )
+    return await proxy.forward(served, command, workspace=STATE.workspace or UNKNOWN_WORKSPACE)
+
+
+async def _locally(command: Command) -> Envelope:
+    """Run a command in this process, taking the writer lock only if it needs one."""
+    try:
+        runtime = Runtime.open(writer=command.writes(), **STATE.overrides)
+        async with runtime:
+            service = ApplicationService(runtime)
+            return await run_op(
+                command.op,
+                service.workspace,
+                lambda: commands.run(service, command, commands.silent),
+            )
+    except (ManiculeError, ValueError, OSError) as exc:
+        return failed(command.op, STATE.workspace or UNKNOWN_WORKSPACE, error_info(exc))
 
 
 def print_envelope(envelope: Envelope) -> None:
@@ -754,9 +810,11 @@ def index(
         raise typer.Exit(
             watch_path(path, source=source, reindex=reindex, overrides=STATE.overrides)
         )
-    emit(
-        "index_path",
-        lambda service: service.index_path(path, source=source, limit=limit, force=reindex),
+    submit(
+        Command(
+            "index_path",
+            {"path": str(path), "source": source, "limit": limit, "force": reindex},
+        )
     )
 
 
@@ -796,7 +854,7 @@ def document_delete(
     ] = False,
 ) -> None:
     """Remove a document from the index."""
-    emit("document_delete", lambda service: service.document_delete(document_id, hard=hard))
+    submit(Command("document_delete", {"document_id": document_id, "hard": hard}))
 
 
 @document_app.command("reindex")
@@ -855,18 +913,12 @@ def document_reindex(
             raise typer.BadParameter(REINDEX_NEEDS_A_TARGET)
         if dry_run:
             raise typer.BadParameter(DRY_RUN_IS_A_SWEEP_OPTION)
-        emit("document_reindex", lambda service: service.document_reindex(document_id))
+        submit(Command("document_reindex", {"document_id": document_id}))
         return
     if stale_glossary:
-        emit(
-            "document_redetect_glossary",
-            lambda service: service.document_redetect_glossary(batch=batch, dry_run=dry_run),
-        )
+        submit(Command("document_redetect_glossary", {"batch": batch, "dry_run": dry_run}))
         return
-    emit(
-        "document_reindex_stale",
-        lambda service: service.document_reindex_stale(batch=batch, dry_run=dry_run),
-    )
+    submit(Command("document_reindex_stale", {"batch": batch, "dry_run": dry_run}))
 
 
 # --- collection -------------------------------------------------------------------------------
@@ -878,10 +930,7 @@ def collection_create(
     description: Annotated[str | None, typer.Option(help="What this collection is for.")] = None,
 ) -> None:
     """Create a collection. A name already in use is refused rather than merged."""
-    emit(
-        "collection_create",
-        lambda service: service.collection_create(name, description=description),
-    )
+    submit(Command("collection_create", {"name": name, "description": description}))
 
 
 @collection_app.command("list")
@@ -896,10 +945,7 @@ def collection_rename(
     name: Annotated[str, typer.Argument(help="The new name.")],
 ) -> None:
     """Rename a collection. Nothing is re-indexed and no membership moves."""
-    emit(
-        "collection_rename",
-        lambda service: service.collection_rename(collection_id, name),
-    )
+    submit(Command("collection_rename", {"collection_id": collection_id, "name": name}))
 
 
 @collection_app.command("update")
@@ -915,9 +961,8 @@ def collection_update(
     optional flag, `collection update <id>` with nothing else erased the description it exists
     to change.
     """
-    emit(
-        "collection_update",
-        lambda service: service.collection_update(collection_id, description=description),
+    submit(
+        Command("collection_update", {"collection_id": collection_id, "description": description})
     )
 
 
@@ -926,7 +971,7 @@ def collection_delete(
     collection_id: Annotated[str, typer.Argument(help="The collection id.")],
 ) -> None:
     """Delete a collection. The documents in it are untouched."""
-    emit("collection_delete", lambda service: service.collection_delete(collection_id))
+    submit(Command("collection_delete", {"collection_id": collection_id}))
 
 
 @collection_app.command("add")
@@ -935,10 +980,7 @@ def collection_add(
     document_id: Annotated[list[str], typer.Argument(help="Documents to add.")],
 ) -> None:
     """Add documents to a collection. Nothing is re-embedded."""
-    emit(
-        "collection_add",
-        lambda service: service.collection_add(collection_id, tuple(document_id)),
-    )
+    submit(Command("collection_add", {"collection_id": collection_id, "document_ids": document_id}))
 
 
 @collection_app.command("remove")
@@ -947,9 +989,8 @@ def collection_remove(
     document_id: Annotated[list[str], typer.Argument(help="Documents to remove.")],
 ) -> None:
     """Remove documents from a collection. The documents themselves survive."""
-    emit(
-        "collection_remove",
-        lambda service: service.collection_remove(collection_id, tuple(document_id)),
+    submit(
+        Command("collection_remove", {"collection_id": collection_id, "document_ids": document_id})
     )
 
 
@@ -990,7 +1031,7 @@ def collection_orphans(
     Command line only. It destroys data, and this project keeps that class of operation off
     the surfaces an unattended caller reaches.
     """
-    emit("collection_orphans", lambda service: service.collection_orphans(delete=confirm))
+    submit(Command("collection_orphans", {"delete": confirm}))
 
 
 # --- connector --------------------------------------------------------------------------------
@@ -1008,7 +1049,7 @@ def connector_sync(
     limit: Annotated[int | None, typer.Option(help="Stop after this many documents.")] = None,
 ) -> None:
     """Run one configured connector."""
-    emit("connector_sync", lambda service: service.connector_sync(name, limit=limit))
+    submit(Command("connector_sync", {"name": name, "limit": limit}))
 
 
 @connector_app.command("sidecar")
@@ -1043,9 +1084,11 @@ def connector_sidecar(
     Command line only. It is the one operation that writes into the corpus *directory* rather
     than into the index, so it stays on the surface where a person is present.
     """
-    emit(
-        "connector_sidecar",
-        lambda service: service.connector_sidecar(root, source=source, force=force),
+    submit(
+        Command(
+            "connector_sidecar",
+            {"root": None if root is None else str(root), "source": source, "force": force},
+        )
     )
 
 
@@ -1095,8 +1138,12 @@ def connector_login(
 
     manicule never asks for your password, cannot use one, and has nowhere to put one.
 
-    Command line only. It opens a window on this machine and writes a credential to the
-    keychain, neither of which belongs on a surface an unattended caller can reach.
+    **A server has to be running.** The session is handed to it and held in its memory, and
+    nothing is written to disk on any path — so a capture with nowhere to go is refused before
+    you are asked to sign in, rather than after.
+
+    Command line only. It opens a window on this machine, which does not belong on a surface an
+    unattended caller can reach.
     """
     # An option that reaches nothing is refused rather than accepted, on the rule
     # `INSECURE_TARGET_IS_A_BACKUP_OPTION` states. Here rather than in the service because these
@@ -1110,11 +1157,28 @@ def connector_login(
     if timeout is not None and timeout <= 0:
         raise typer.BadParameter(BROWSER_TIMEOUT_MUST_BE_POSITIVE)
 
+    # Checked before anything is captured, and before anybody is asked to sign in. A person who
+    # opens a browser, completes a second factor and *then* hears there is nowhere to put the
+    # result has been made to do the work twice.
+    served = proxy.listening(STATE.overrides)
+    if served is None:
+        print_envelope(
+            proxy.refuse(
+                Command("connector_login", {"name": name}),
+                workspace=STATE.workspace or UNKNOWN_WORKSPACE,
+                overrides=STATE.overrides,
+            )
+        )
+        return
+
     # Prompting is skipped for every path that is not the paste, so `--browser` does not stop to
     # ask for the thing it is there to avoid — and `--forget` does not ask for a secret it is
     # about to delete.
     manual = not (browser or browser_state is not None or forget)
     cookies = read_secret(SESSION_PROMPT) if manual else ""
+    # Run here rather than sent to the server, and the store is what crosses instead. The
+    # browser has to open where the person is; the credential has to end up where the syncs
+    # run. `HandoverStore` is that seam, so the capture flow itself is unchanged.
     emit(
         "connector_login",
         lambda service: service.connector_login(
@@ -1125,6 +1189,7 @@ def connector_login(
             browser_state=browser_state,
             timeout_seconds=timeout,
             allow_insecure_state=allow_insecure_state,
+            store=proxy.HandoverStore(served),
         ),
     )
 
@@ -1146,7 +1211,7 @@ def workspace_switch(
     ] = False,
 ) -> None:
     """Record a different active workspace. It takes effect at the next start."""
-    emit("workspace_switch", lambda service: service.workspace_switch(name, create=create))
+    submit(Command("workspace_switch", {"name": name, "create": create}))
 
 
 # --- auth -------------------------------------------------------------------------------------
@@ -1159,10 +1224,7 @@ def auth_create_key(
     expires_days: Annotated[int | None, typer.Option(help="Days until it expires.")] = None,
 ) -> None:
     """Mint an API key for this workspace. The secret is shown once and never stored."""
-    emit(
-        "auth_create_key",
-        lambda service: service.api_key_create(name, role=role, expires_days=expires_days),
-    )
+    submit(Command("auth_create_key", {"name": name, "role": role, "expires_days": expires_days}))
 
 
 @auth_app.command("list-keys")
@@ -1176,7 +1238,7 @@ def auth_revoke_key(
     name_or_id: Annotated[str, typer.Argument(help="The key's name or id.")],
 ) -> None:
     """Revoke an API key. Immediate, and irreversible."""
-    emit("auth_revoke_key", lambda service: service.api_key_revoke(name_or_id))
+    submit(Command("auth_revoke_key", {"name_or_id": name_or_id}))
 
 
 # --- plugin -----------------------------------------------------------------------------------
@@ -1195,13 +1257,13 @@ def plugin_list(
 @plugin_app.command("add")
 def plugin_add(name: Annotated[str, typer.Argument(help="The plugin's name.")]) -> None:
     """Enable an installed plugin. This never installs one — see the output if it is missing."""
-    emit("plugin_add", lambda service: service.plugin_add(name))
+    submit(Command("plugin_add", {"name": name}))
 
 
 @plugin_app.command("remove")
 def plugin_remove(name: Annotated[str, typer.Argument(help="The plugin's name.")]) -> None:
     """Disable a plugin. The distribution stays installed and is not touched."""
-    emit("plugin_remove", lambda service: service.plugin_remove(name))
+    submit(Command("plugin_remove", {"name": name}))
 
 
 # --- config -----------------------------------------------------------------------------------
@@ -1227,7 +1289,7 @@ def config_set(
     value: Annotated[str, typer.Argument(help="JSON when it parses; a string when it does not.")],
 ) -> None:
     """Write one setting, validating the whole configuration before saving it."""
-    emit("config_set", lambda service: service.config_set(key, value))
+    submit(Command("config_set", {"key": key, "value": value}))
 
 
 # --- operations -------------------------------------------------------------------------------
@@ -1256,7 +1318,7 @@ def backup(
     if restore is not None:
         if allow_insecure_target:
             raise typer.BadParameter(INSECURE_TARGET_IS_A_BACKUP_OPTION)
-        emit("restore", lambda service: service.restore(restore, force=force))
+        submit(Command("restore", {"source": str(restore), "force": force}))
         return
     if output is None:
         raise typer.BadParameter(BACKUP_NEEDS_A_TARGET)
@@ -1290,7 +1352,7 @@ def import_corpus(
     force: Annotated[bool, typer.Option("--force", help="Re-parse unchanged documents.")] = False,
 ) -> None:
     """Ingest an exported archive, re-deriving chunks and vectors on this machine."""
-    emit("import", lambda service: service.import_corpus(path, force=force))
+    submit(Command("import", {"path": str(path), "force": force}))
 
 
 @app.command("reset-index")
@@ -1302,7 +1364,7 @@ def reset_index(
     """Delete every document, chunk and vector in this workspace."""
     if not yes:
         raise typer.BadParameter(RESET_NEEDS_CONFIRMATION)
-    emit("reset_index", lambda service: service.reset_index())
+    submit(Command("reset_index"))
 
 
 @app.command()
@@ -1330,7 +1392,7 @@ def init(
     ] = False,
 ) -> None:
     """Write a starting configuration, choosing what this machine can actually run."""
-    emit("init", lambda service: service.initialize(force=force))
+    submit(Command("init", {"force": force}))
 
 
 @app.command()
@@ -1343,7 +1405,7 @@ def upgrade(
     ] = False,
 ) -> None:
     """Back up, then report exactly how to upgrade. It does not run a package manager."""
-    emit("upgrade", lambda service: service.upgrade(version=version, skip_backup=skip_backup))
+    submit(Command("upgrade", {"version": version, "skip_backup": skip_backup}))
 
 
 @app.command()
@@ -1372,7 +1434,8 @@ def completion(
 # --- serving ----------------------------------------------------------------------------------
 
 
-@app.command()
+@app.command("serve")
+@app.command("start")
 def start(
     *,
     mcp_only: Annotated[
@@ -1447,4 +1510,5 @@ __all__ = [
     "emit",
     "main",
     "print_envelope",
+    "submit",
 ]

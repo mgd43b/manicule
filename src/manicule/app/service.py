@@ -65,13 +65,14 @@ if TYPE_CHECKING:
     from manicule.connectors.config import ConfluenceConfig
     from manicule.connectors.enriched import EnrichedProfile
     from manicule.connectors.filesystem import FilesystemConnector
+    from manicule.connectors.sessions import SessionStore
     from manicule.core.content import Chunk, Document
     from manicule.core.organization import Collection, Tag
     from manicule.core.retrieval import Confidence
     from manicule.embedding.artifacts import WeightsPlan
     from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
     from manicule.generation.ports import ConversationRecord
-    from manicule.ingest.pipeline import RunReport
+    from manicule.ingest.pipeline import RunReport, Watching
     from manicule.parsers.config import SourceCodeConfig
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
@@ -576,6 +577,7 @@ class ApplicationService:
         source: str = DEFAULT_SOURCE,
         limit: int | None = None,
         force: bool = False,
+        watching: Watching | None = None,
     ) -> r.IngestReport:
         """Index a file or a directory.
 
@@ -585,6 +587,8 @@ class ApplicationService:
                 changing it re-indexes rather than updates.
             limit: Stop after this many discovered documents.
             force: Re-parse documents whose content has not changed.
+            watching: Called with one sentence per document reaching a terminal outcome, for a
+                caller streaming progress to somebody. ``None`` when nobody is watching.
 
         Raises:
             UnknownEntityError: The path does not exist.
@@ -596,7 +600,11 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         ingestion = await self._backend.ingestion()
         report = await ingestion.index_path(
-            await asyncio.to_thread(target.resolve), name=source, limit=limit, force=force
+            await asyncio.to_thread(target.resolve),
+            name=source,
+            limit=limit,
+            force=force,
+            watching=watching,
         )
         return _ingest_payload(report, started)
 
@@ -648,8 +656,16 @@ class ApplicationService:
             }
         )
 
-    async def connector_sync(self, name: str, *, limit: int | None = None) -> r.IngestReport:
+    async def connector_sync(
+        self, name: str, *, limit: int | None = None, watching: Watching | None = None
+    ) -> r.IngestReport:
         """Run one configured connector.
+
+        ``watching`` is called with one sentence each time a document reaches a terminal
+        outcome. It exists for the proxied command line, where a sync runs in the server and the
+        person who asked for it is looking at a different process's terminal — without it a long
+        sync is indistinguishable from a hung one. Nothing else passes it, including the
+        scheduler, which has nobody to tell.
 
         Raises:
             UnknownEntityError: Configuration has no connector by that name.
@@ -673,7 +689,7 @@ class ApplicationService:
             )
             raise PolicyError(msg)
         ingestion = await self._backend.ingestion()
-        report = await ingestion.sync(name, limit=limit)
+        report = await ingestion.sync(name, limit=limit, watching=watching)
         return _ingest_payload(report, started)
 
     async def connector_login(
@@ -687,6 +703,7 @@ class ApplicationService:
         timeout_seconds: float | None = None,
         allow_insecure_state: bool = False,
         provider: BrowserSessionProvider | None = None,
+        store: SessionStore | None = None,
     ) -> r.ConnectorSignedIn:
         """Capture the browser session a Confluence source authenticates with, or forget it.
 
@@ -720,6 +737,12 @@ class ApplicationService:
             allow_insecure_state: Import a state file other users on this machine can read.
             provider: What opens the browser. ``None`` uses Playwright. A parameter so the flow
                 can be exercised without one, on the same principle as ``capture``'s ``transport``.
+            store: Where the captured session goes. ``None`` uses this process's own vault,
+                which is right for a server running this on its own behalf and wrong for the
+                command line — there the browser opens where the person is and the credential
+                has to end up in the server, so the command line passes a store that hands it
+                over the control socket. A parameter rather than a branch on "am I a server",
+                because a session's destination is a fact the caller knows and this does not.
 
         Raises:
             UnknownEntityError: Configuration has no connector by that name.
@@ -778,16 +801,16 @@ class ApplicationService:
             )
             raise ConfigError(msg)
         config = ConfluenceConfig.model_validate(configured.options)
-        store = default_store()
+        keeper = store if store is not None else default_store()
         if forget:
-            store.forget(config.base_url)
+            await keeper.forget(config.base_url)
             return r.ConnectorSignedIn(
                 name=name,
                 base_url=config.base_url,
                 account="",
                 captured_at="",
                 expires_at="",
-                stored_in=store.describe(),
+                stored_in=keeper.describe(),
                 forgotten=True,
             )
 
@@ -797,16 +820,16 @@ class ApplicationService:
                 await self._browser_cookies(
                     config, provider=provider, timeout_seconds=timeout_seconds
                 ),
-                store=store,
+                store=keeper,
             )
         elif browser_state is not None:
             session = await capture_cookies(
                 config,
                 _state_cookies(config, browser_state, allow_insecure=allow_insecure_state),
-                store=store,
+                store=keeper,
             )
         else:
-            session = await capture(config, cookies, store=store)
+            session = await capture(config, cookies, store=keeper)
         expires = session.captured_at + timedelta(hours=config.session_max_age_hours)
         return r.ConnectorSignedIn(
             name=name,
@@ -814,7 +837,7 @@ class ApplicationService:
             account=session.account,
             captured_at=session.captured_at.isoformat(),
             expires_at=expires.isoformat(),
-            stored_in=store.describe(),
+            stored_in=keeper.describe(),
         )
 
     async def _browser_cookies(

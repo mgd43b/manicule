@@ -55,7 +55,7 @@ from manicule.connectors.browser import (
     read_state_file,
 )
 from manicule.connectors.errors import SessionExpiredError
-from manicule.connectors.sessions import MemoryStore
+from manicule.connectors.sessions import SessionVault
 from manicule.core.errors import ConfigError, PolicyError, UnknownEntityError
 from tests.app.fakes import FakeBackend
 from tests.connectors.fake_confluence import FakeConfluence, FakePage
@@ -431,7 +431,7 @@ async def login(
     provider: object = None,
     monkeypatch: pytest.MonkeyPatch,
     site: FakeConfluence,
-    store: MemoryStore,
+    store: SessionVault,
     **kwargs: object,
 ) -> r.ConnectorSignedIn:
     """Run ``connector_login`` against a fake instance and a fake store.
@@ -450,7 +450,7 @@ async def login(
 
 
 def _patch_sessions(
-    monkeypatch: pytest.MonkeyPatch, *, site: FakeConfluence, store: MemoryStore
+    monkeypatch: pytest.MonkeyPatch, *, site: FakeConfluence, store: SessionVault
 ) -> None:
     """Point the session module at the fake instance and the fake store.
 
@@ -476,7 +476,7 @@ async def test_a_successful_browser_login_stores_the_session(
     """Spec item 3. The account comes back from the instance, not from the browser."""
     service, _ = service_for()
     site = instance()
-    store = MemoryStore()
+    store = SessionVault()
 
     result = await login(
         service,
@@ -495,7 +495,7 @@ async def test_only_the_instances_cookies_are_persisted(
 ) -> None:
     """Spec item 13, asserted on what is in the store rather than on what the filter returned."""
     service, _ = service_for()
-    store = MemoryStore()
+    store = SessionVault()
 
     await login(
         service,
@@ -524,7 +524,7 @@ async def test_a_browser_session_the_instance_refuses_is_not_stored(
     service, _ = service_for()
     site = instance()
     site.sign_out()
-    store = MemoryStore()
+    store = SessionVault()
 
     with pytest.raises(SessionExpiredError):
         await login(
@@ -543,7 +543,7 @@ async def test_a_failed_login_leaves_a_working_session_alone(
 ) -> None:
     """Spec item 15. Replacement is atomic because the write is the last thing that happens."""
     service, _ = service_for()
-    store = MemoryStore()
+    store = SessionVault()
     await login(
         service,
         provider=FakeProvider([cookie()]),
@@ -573,7 +573,7 @@ async def test_a_browser_that_finds_no_cookies_for_the_instance_is_a_stated_refu
 ) -> None:
     """Spec item 8: the browser opened and sign-in never reached Confluence."""
     service, _ = service_for()
-    store = MemoryStore()
+    store = SessionVault()
 
     with pytest.raises(ConfigError) as refusal:
         await login(
@@ -706,7 +706,7 @@ async def test_a_browser_that_does_not_finish_stores_nothing(
 ) -> None:
     """Spec items 4, 5 and 6. Ctrl-C is included because it must not be swallowed."""
     service, _ = service_for()
-    store = MemoryStore()
+    store = SessionVault()
 
     with pytest.raises(type(failure)) as raised:
         await login(
@@ -733,7 +733,7 @@ async def test_the_configured_timeout_reaches_the_provider(
         provider=provider,
         monkeypatch=monkeypatch,
         site=instance(),
-        store=MemoryStore(),
+        store=SessionVault(),
     )
 
     assert provider.calls == [42.0]
@@ -755,7 +755,7 @@ async def test_a_zero_timeout_is_not_folded_into_the_configured_default(
         provider=provider,
         monkeypatch=monkeypatch,
         site=instance(),
-        store=MemoryStore(),
+        store=SessionVault(),
         timeout_seconds=0.0,
     )
 
@@ -773,7 +773,7 @@ async def test_an_explicit_timeout_overrides_the_configured_one(
         provider=provider,
         monkeypatch=monkeypatch,
         site=instance(),
-        store=MemoryStore(),
+        store=SessionVault(),
         timeout_seconds=9.0,
     )
 
@@ -788,7 +788,7 @@ async def test_a_state_file_is_imported_and_verified(
 ) -> None:
     """Spec item 9, through the service rather than through the parser."""
     service, _ = service_for()
-    store = MemoryStore()
+    store = SessionVault()
     path = written_state(tmp_path, state(entry(), entry("SSOSESSION", domain=IDP_HOST, path="/")))
 
     await login(
@@ -809,7 +809,7 @@ async def test_a_state_file_with_nothing_for_this_instance_is_refused(
 ) -> None:
     """Spec item 11. Most often it is a state file from a different site."""
     service, _ = service_for()
-    store = MemoryStore()
+    store = SessionVault()
     path = written_state(tmp_path, state(entry("SSOSESSION", domain=IDP_HOST, path="/")))
 
     with pytest.raises(ConfigError) as refusal:
@@ -828,7 +828,7 @@ async def test_an_imported_state_the_instance_refuses_is_not_stored(
     service, _ = service_for()
     site = instance()
     site.sign_out()
-    store = MemoryStore()
+    store = SessionVault()
     path = written_state(tmp_path, state(entry()))
 
     with pytest.raises(SessionExpiredError):
@@ -901,7 +901,7 @@ async def test_two_ways_in_at_once_are_refused(kwargs: dict[str, Any]) -> None:
 async def test_the_manual_paste_still_works(monkeypatch: pytest.MonkeyPatch) -> None:
     """Spec item 2. It keeps the stronger property and is not deprecated."""
     service, _ = service_for()
-    store = MemoryStore()
+    store = SessionVault()
     _patch_sessions(monkeypatch, site=instance(), store=store)
 
     result = await service.connector_login("wiki", cookies="JSESSIONID=session-value")
@@ -954,7 +954,7 @@ async def test_no_cookie_value_appears_in_the_result(monkeypatch: pytest.MonkeyP
         provider=FakeProvider([cookie(value="the-secret-value")]),
         monkeypatch=monkeypatch,
         site=instance(),
-        store=MemoryStore(),
+        store=SessionVault(),
     )
 
     assert "the-secret-value" not in json.dumps(result.model_dump(mode="json"), default=str)

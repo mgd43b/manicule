@@ -15,13 +15,9 @@ that page and the index.
 
 from __future__ import annotations
 
-import os
-import subprocess
+import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
-from typing import Any, Final, cast
-from unittest.mock import patch
-from uuid import uuid4
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -34,7 +30,6 @@ from manicule.connectors import (
     SessionExpiredError,
     UntrustedLinkError,
     resolve_credentials,
-    sessions,
 )
 from manicule.connectors.client import ConfluenceClient
 from manicule.connectors.credentials import (
@@ -46,8 +41,7 @@ from manicule.connectors.credentials import (
 from manicule.connectors.errors import ConnectorError
 from manicule.connectors.intercept import Answer, signed_out
 from manicule.connectors.sessions import (
-    KeychainStore,
-    MemoryStore,
+    SessionVault,
     capture,
     load_session,
     parse_cookies,
@@ -70,25 +64,6 @@ from tests.connectors.support import (
     server_config,
     sso_config,
 )
-
-REQUIRE_KEYCHAIN_ENV: Final = "REQUIRE_KEYCHAIN"
-"""Set to any non-empty value to turn this suite's Keychain skips into failures. CI sets it.
-
-Read at import, before a fixture has had the chance to touch the environment, and named
-outside manicule's own ``MANICULE_`` namespace — which the test environment fixture empties
-before each test, and which has already once disarmed a switch of exactly this kind.
-"""
-
-KEYCHAIN_REQUIRED: Final = bool(os.environ.get(REQUIRE_KEYCHAIN_ENV, "").strip())
-
-NO_KEYCHAIN: Final = not KeychainStore.available() and not KEYCHAIN_REQUIRED
-"""Whether to skip the cases that need a real Keychain.
-
-The Keychain is macOS's, so on Linux these skip — and on the ubuntu matrix that is all of them,
-which would leave the tests holding the most dangerous credential manicule stores running on
-one developer's machine and nowhere else. The macOS job sets the variable, and then a missing
-``/usr/bin/security`` is a failure that says so rather than a skip nobody reads.
-"""
 
 
 def _instance(**overrides: object) -> FakeConfluence:
@@ -490,19 +465,20 @@ async def test_a_session_that_ages_out_mid_sync_stops_the_run() -> None:
 def test_a_session_older_than_the_ceiling_is_refused_before_the_connector_is_built() -> None:
     """A dead session should cost a startup message, not a run that reports progress."""
     config = sso_config(SERVER_BASE, session_max_age_hours=2.0)
-    store = MemoryStore()
-    store.save(
-        BrowserSession(
-            base_url=config.base_url,
-            account=SESSION_ACCOUNT,
-            captured_at=CAPTURED_AT,
-            cookies={"JSESSIONID": SecretStr("ABC123")},
+    store = SessionVault()
+    asyncio.run(
+        store.save(
+            BrowserSession(
+                base_url=config.base_url,
+                account=SESSION_ACCOUNT,
+                captured_at=CAPTURED_AT,
+                cookies={"JSESSIONID": SecretStr("ABC123")},
+            )
         )
     )
     with pytest.raises(SessionExpiredError, match="session_max_age_hours"):
         credential_for(
             config,
-            environ={},
             store=store,
             now=lambda: CAPTURED_AT + timedelta(hours=3),
         )
@@ -511,7 +487,7 @@ def test_a_session_older_than_the_ceiling_is_refused_before_the_connector_is_bui
 def test_no_stored_session_is_a_startup_refusal_naming_the_command() -> None:
     config = sso_config(SERVER_BASE)
     with pytest.raises(ConfigError, match="manicule connector login"):
-        credential_for(config, environ={}, store=MemoryStore())
+        credential_for(config, store=SessionVault())
 
 
 def test_a_browser_session_configuration_needs_no_token() -> None:
@@ -629,7 +605,7 @@ def test_a_personal_access_token_on_cloud_is_refused() -> None:
 def test_a_browser_session_cannot_be_derived_from_configuration() -> None:
     """The client's own default credential covers the token modes and refuses this one, so a
     caller that skipped the factory gets a message rather than a connector that sends nothing."""
-    with pytest.raises(ConfigError, match="keychain"):
+    with pytest.raises(ConfigError, match="the running server's memory"):
         token_credential(sso_config(SERVER_BASE))
 
 
@@ -657,7 +633,7 @@ def test_something_that_is_not_a_cookie_is_refused_by_saying_what_to_paste() -> 
 async def test_capturing_a_session_proves_it_works_before_storing_it() -> None:
     instance = _instance()
     config = sso_config(instance.base_url)
-    store = MemoryStore()
+    store = SessionVault()
     session = await capture(
         config,
         "JSESSIONID=ABC123",
@@ -676,7 +652,7 @@ async def test_a_session_that_does_not_work_is_not_stored() -> None:
     instance = _instance()
     instance.sign_out()
     config = sso_config(instance.base_url)
-    store = MemoryStore()
+    store = SessionVault()
     with pytest.raises(SessionExpiredError):
         await capture(
             config,
@@ -689,54 +665,152 @@ async def test_a_session_that_does_not_work_is_not_stored() -> None:
     assert store.load(config.base_url) is None
 
 
-def test_a_stored_session_survives_being_written_and_read_back() -> None:
-    """The keychain holds one string, so the record has to make the round trip through one."""
+def test_a_session_is_held_in_memory_and_given_back() -> None:
+    """The whole credential store, and the whole of what it has to do."""
+    vault = SessionVault()
     session = BrowserSession(
         base_url=SERVER_BASE,
         account=SESSION_ACCOUNT,
         captured_at=CAPTURED_AT,
         cookies={"JSESSIONID": SecretStr("ABC=123+/"), "other": SecretStr("x;y")},
     )
-    restored = BrowserSession.from_json(session.to_json())
 
-    assert restored.base_url == session.base_url
-    assert restored.account == session.account
-    assert restored.captured_at == session.captured_at
-    assert {name: value.get_secret_value() for name, value in restored.cookies.items()} == {
+    asyncio.run(vault.save(session))
+    held = vault.load(SERVER_BASE)
+
+    assert held is not None
+    assert {name: value.get_secret_value() for name, value in held.cookies.items()} == {
         "JSESSIONID": "ABC=123+/",
         "other": "x;y",
     }
+    assert held.captured_at == CAPTURED_AT, "the capture time is what the age ceiling measures"
 
 
-def test_the_environment_carries_a_session_where_there_is_no_keychain() -> None:
-    config = sso_config(SERVER_BASE)
-    session = load_session(
-        config,
-        environ={config.session_env: "JSESSIONID=FROM-ENV"},
-        store=MemoryStore(),
-        now=CAPTURED_AT,
-    )
-
-    assert session is not None
-    assert session.cookies["JSESSIONID"].get_secret_value() == "FROM-ENV"
-
-
-def test_a_captured_session_wins_over_a_stale_environment_variable() -> None:
-    """Otherwise ``manicule connector login`` would appear not to have worked."""
-    config = sso_config(SERVER_BASE)
-    store = MemoryStore()
-    store.save(
-        BrowserSession(
-            base_url=config.base_url,
-            account=SESSION_ACCOUNT,
-            captured_at=CAPTURED_AT,
-            cookies={"JSESSIONID": SecretStr("FROM-KEYCHAIN")},
+def test_a_session_is_filed_under_the_site_it_came_from() -> None:
+    """A session is not portable between instances, and this is what stops one being offered
+    to another. Trailing slashes are one site rather than two, one of which would be found."""
+    vault = SessionVault()
+    asyncio.run(
+        vault.save(
+            BrowserSession(
+                base_url="https://wiki.example.test/",
+                account=SESSION_ACCOUNT,
+                captured_at=CAPTURED_AT,
+                cookies={"JSESSIONID": SecretStr("ABC123")},
+            )
         )
     )
-    session = load_session(config, environ={config.session_env: "JSESSIONID=FROM-ENV"}, store=store)
 
-    assert session is not None
-    assert session.cookies["JSESSIONID"].get_secret_value() == "FROM-KEYCHAIN"
+    assert vault.load("https://wiki.example.test") is not None
+    assert vault.load("https://other.example.test") is None
+
+
+def test_forgetting_a_session_says_whether_there_was_one() -> None:
+    vault = SessionVault()
+    asyncio.run(
+        vault.save(
+            BrowserSession(
+                base_url=SERVER_BASE,
+                account=SESSION_ACCOUNT,
+                captured_at=CAPTURED_AT,
+                cookies={"JSESSIONID": SecretStr("ABC123")},
+            )
+        )
+    )
+
+    assert asyncio.run(vault.forget(SERVER_BASE)) is True
+    assert vault.load(SERVER_BASE) is None
+    assert asyncio.run(vault.forget(SERVER_BASE)) is False
+
+
+def test_the_vault_offers_no_way_to_read_a_session_it_was_not_asked_for() -> None:
+    """A diagnostic wants to know *whether* there is a session, never what it is.
+
+    ``len`` is the whole of the introspection, deliberately. This is now the only place a live
+    corporate credential exists in the running system, so an accessor that handed back the
+    collection would be the one line a future report, dump or ``doctor`` check would reach for.
+    """
+    vault = SessionVault()
+    asyncio.run(
+        vault.save(
+            BrowserSession(
+                base_url=SERVER_BASE,
+                account=SESSION_ACCOUNT,
+                captured_at=CAPTURED_AT,
+                cookies={"JSESSIONID": SecretStr("TOP-SECRET-SESSION")},
+            )
+        )
+    )
+
+    assert len(vault) == 1
+    public = {name for name in dir(vault) if not name.startswith("_")}
+    assert public == {"describe", "forget", "load", "save"}, (
+        f"the vault grew a public member: {sorted(public)}. Every one of them is a route to a "
+        f"live session, so a new one is a decision rather than a convenience."
+    )
+    assert "TOP-SECRET-SESSION" not in repr(vault)
+    assert "TOP-SECRET-SESSION" not in vault.describe()
+
+
+def test_a_session_is_gone_when_the_process_that_held_it_is() -> None:
+    """The lifetime, stated as a test because it is the design rather than a limitation.
+
+    A fresh vault is what a restarted server has. There is no file to read back, no keychain to
+    consult and no environment variable to fall back to — which is why the refusal names
+    ``connector login`` rather than reporting a fault.
+    """
+    first = SessionVault()
+    asyncio.run(
+        first.save(
+            BrowserSession(
+                base_url=SERVER_BASE,
+                account=SESSION_ACCOUNT,
+                captured_at=CAPTURED_AT,
+                cookies={"JSESSIONID": SecretStr("ABC123")},
+            )
+        )
+    )
+
+    restarted = SessionVault()
+
+    assert first.load(SERVER_BASE) is not None
+    assert restarted.load(SERVER_BASE) is None
+    assert load_session(sso_config(SERVER_BASE), store=restarted) is None
+
+
+def test_there_is_no_second_place_a_session_can_come_from() -> None:
+    """One mechanism, not three — asserted over what the module *does*, not what it says.
+
+    There were three: the macOS Keychain, a file, and an environment variable. Each was a place
+    a live corporate credential outlived the process that captured it, and the keychain was also
+    what prompted the operator for their password on every write.
+
+    **Asserted over the syntax tree rather than over the source text**, because the module's own
+    docstring explains at length what was removed and why — so a check that grepped for
+    ``keychain`` would fail on the paragraph that documents its absence, and the obvious repair
+    would be to stop writing the paragraph. What is actually forbidden is a *call*: reading the
+    environment, opening a file, or running a subprocess. Those are nodes.
+    """
+    import ast  # noqa: PLC0415 - only this assertion reads a syntax tree
+    import inspect  # noqa: PLC0415
+
+    from manicule.connectors import sessions as module  # noqa: PLC0415
+
+    tree = ast.parse(inspect.getsource(module))
+    called = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    read = {
+        ast.unparse(node) for node in ast.walk(tree) if isinstance(node, ast.Attribute | ast.Name)
+    }
+
+    forbidden = {name for name in called if name in {"open", "subprocess.run", "Path"}}
+    assert forbidden == set(), (
+        f"{module.__name__} calls {sorted(forbidden)}. A session is held in memory; a call that "
+        f"opens a file or runs a program is a second place for one to be."
+    )
+    assert "os.environ" not in read, "a session is being read from the environment again"
+    assert not any(name.startswith("keyring") or "Keychain" in name for name in called), (
+        "a keychain is being consulted again"
+    )
 
 
 def test_a_session_never_shows_its_cookies_in_a_repr() -> None:
@@ -747,165 +821,3 @@ def test_a_session_never_shows_its_cookies_in_a_repr() -> None:
     assert "ABC123" not in repr(credential)
     assert "ABC123" not in credential.describe()
     assert "ABC123" not in credential.renewal()
-
-
-def test_a_session_the_keychain_cannot_parse_says_how_to_replace_it() -> None:
-    with pytest.raises(ValueError, match="carries no cookies"):
-        BrowserSession.from_json('{"base_url": "x", "captured_at": "2026-08-12T09:00:00+00:00"}')
-
-
-@pytest.mark.skipif(NO_KEYCHAIN, reason="the Keychain is macOS's")
-def test_the_keychain_really_holds_a_session_and_gives_it_back() -> None:
-    """Against the real ``/usr/bin/security``, because that is the decision being tested.
-
-    A mocked subprocess would prove that this module builds the argument list it was written to
-    build. What is actually in question is whether a session survives the Keychain's own
-    encoding, whether the item can be read back without a dialog on a machine running a sync
-    unattended, and whether cookies containing ``=``, ``+`` and ``;`` come back as they went in.
-    None of that is answerable without the Keychain.
-    """
-    store = KeychainStore(f"manicule test {uuid4()}")
-    session = BrowserSession(
-        base_url=SERVER_BASE,
-        account=SESSION_ACCOUNT,
-        captured_at=CAPTURED_AT,
-        cookies={"JSESSIONID": SecretStr("A+b/c=="), "seraph.confluence": SecretStr("x;y")},
-    )
-    try:
-        assert store.load(SERVER_BASE) is None
-        store.save(session)
-        restored = store.load(SERVER_BASE)
-
-        assert restored is not None
-        assert restored.account == SESSION_ACCOUNT
-        assert restored.captured_at == CAPTURED_AT
-        assert {name: value.get_secret_value() for name, value in restored.cookies.items()} == {
-            "JSESSIONID": "A+b/c==",
-            "seraph.confluence": "x;y",
-        }
-        assert store.forget(SERVER_BASE) is True
-        assert store.load(SERVER_BASE) is None
-        assert store.forget(SERVER_BASE) is False
-    finally:
-        store.forget(SERVER_BASE)
-
-
-@pytest.mark.skipif(NO_KEYCHAIN, reason="the Keychain is macOS's")
-def test_a_session_larger_than_the_keychains_stdin_buffer_survives() -> None:
-    """The defect a real Keychain found, kept caught.
-
-    ``/usr/bin/security`` reads a secret from stdin through a 128-byte buffer and keeps the
-    first 128 bytes of anything longer, reporting success either way. An ordinary session record
-    is already past that, and an instance behind single sign-on issues cookies of its own
-    besides Confluence's — this one is about two kilobytes, which is not unusual for SAML. A
-    truncated record does not fail to store; it stores, comes back as a broken credential, and
-    authenticates as nobody.
-    """
-    store = KeychainStore(f"manicule test {uuid4()}")
-    session = BrowserSession(
-        base_url=SERVER_BASE,
-        account=SESSION_ACCOUNT,
-        captured_at=CAPTURED_AT,
-        cookies={
-            "JSESSIONID": SecretStr("A" * 32),
-            "seraph.confluence": SecretStr("B" * 40),
-            "MSISAuth": SecretStr("C" * 1800),
-        },
-    )
-    try:
-        store.save(session)
-        restored = store.load(SERVER_BASE)
-
-        assert restored is not None
-        assert restored.cookies["MSISAuth"].get_secret_value() == "C" * 1800
-    finally:
-        store.forget(SERVER_BASE)
-
-
-@pytest.mark.skipif(NO_KEYCHAIN, reason="the Keychain is macOS's")
-def test_a_keychain_that_gives_back_something_else_stores_nothing() -> None:
-    """The read-back is what turns a *different* buffer limit into a loud failure.
-
-    Chunking works around the limit that exists today. This is what happens when the assumption
-    behind the chunk size stops holding: nothing is stored, and the message says so — rather
-    than a credential that is silently half of one.
-    """
-    store = KeychainStore(f"manicule test {uuid4()}")
-    session = BrowserSession(
-        base_url=SERVER_BASE,
-        account=SESSION_ACCOUNT,
-        captured_at=CAPTURED_AT,
-        cookies={"JSESSIONID": SecretStr("D" * 400)},
-    )
-    try:
-        with (
-            patch.object(sessions, "CHUNK_BYTES", 400),
-            pytest.raises(ConfigError, match="nothing has been stored"),
-        ):
-            store.save(session)
-
-        assert store.load(SERVER_BASE) is None
-    finally:
-        store.forget(SERVER_BASE)
-
-
-@pytest.mark.skipif(NO_KEYCHAIN, reason="the Keychain is macOS's")
-def test_a_session_is_filed_under_the_site_it_came_from() -> None:
-    """A session is not portable between instances, and one offered to the wrong site would
-    authenticate as nobody there while looking configured."""
-    store = KeychainStore(f"manicule test {uuid4()}")
-    session = BrowserSession(
-        base_url=SERVER_BASE,
-        account=SESSION_ACCOUNT,
-        captured_at=CAPTURED_AT,
-        cookies={"JSESSIONID": SecretStr("ABC")},
-    )
-    try:
-        store.save(session)
-
-        assert store.load("https://other.example.com") is None
-        assert store.load(f"{SERVER_BASE}/") is not None, "a trailing slash is the same site"
-    finally:
-        store.forget(SERVER_BASE)
-
-
-@pytest.mark.skipif(NO_KEYCHAIN, reason="the Keychain is macOS's")
-def test_the_session_never_reaches_the_command_line() -> None:
-    """``security`` reads it from stdin. Passing it as an argument would put a live corporate
-    session in this process's command line, where anything on the machine can read it."""
-    recorded: list[list[str]] = []
-    store = KeychainStore(f"manicule test {uuid4()}")
-    real = subprocess.run
-
-    def watched(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        recorded.append(list(arguments))
-        return cast(
-            "subprocess.CompletedProcess[str]",
-            real(arguments, **kwargs),
-        )
-
-    session = BrowserSession(
-        base_url=SERVER_BASE,
-        account=SESSION_ACCOUNT,
-        captured_at=CAPTURED_AT,
-        cookies={"JSESSIONID": SecretStr("TOP-SECRET-SESSION")},
-    )
-    try:
-        with patch.object(subprocess, "run", watched):
-            store.save(session)
-    finally:
-        store.forget(SERVER_BASE)
-
-    assert recorded, "the keychain command ran"
-    flattened = " ".join(" ".join(call) for call in recorded)
-    assert "TOP-SECRET-SESSION" not in flattened
-    assert "-A" not in flattened, "any application reading it silently is not the grant we want"
-
-
-def test_a_session_stored_without_a_timezone_is_read_as_utc() -> None:
-    """A record written by an older version, or edited by hand, must not compare naively."""
-    restored = BrowserSession.from_json(
-        '{"captured_at": "2026-08-12T09:00:00", "cookies": {"JSESSIONID": "x"}}'
-    )
-
-    assert restored.captured_at == datetime(2026, 8, 12, 9, 0, tzinfo=UTC)

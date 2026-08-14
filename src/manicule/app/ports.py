@@ -46,7 +46,7 @@ if TYPE_CHECKING:
         SharedTurn,
     )
     from manicule.generation.sharing import ShareLink
-    from manicule.ingest.pipeline import RunReport
+    from manicule.ingest.pipeline import RunReport, Watching
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
@@ -135,13 +135,26 @@ class Ingesting(Protocol):
     """The ingest operations a surface can start."""
 
     async def index_path(
-        self, path: Path, *, name: str, limit: int | None = None, force: bool = False
+        self,
+        path: Path,
+        *,
+        name: str,
+        limit: int | None = None,
+        force: bool = False,
+        watching: Watching | None = None,
     ) -> RunReport:
         """Ingest a file or a directory as the source called ``name``."""
         ...
 
-    async def sync(self, connector: str, *, limit: int | None = None) -> RunReport:
-        """Run one configured connector."""
+    async def sync(
+        self, connector: str, *, limit: int | None = None, watching: Watching | None = None
+    ) -> RunReport:
+        """Run one configured connector.
+
+        ``watching`` is called with one sentence per document reaching a terminal outcome, so a
+        caller streaming to a person can show a long sync moving. It is called from inside the
+        pipeline and must neither block nor raise.
+        """
         ...
 
     async def connector(self, name: str) -> Connector:

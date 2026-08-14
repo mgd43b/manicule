@@ -98,6 +98,16 @@ if TYPE_CHECKING:
     from manicule.parsers.expansion import MemberOutcome
 
 
+type Watching = Callable[[str], None]
+"""How a run says what it has done so far, for a caller streaming progress to a person.
+
+Called from inside an ingest worker after each document reaches a terminal outcome, so it must
+not block and must not raise. The one implementation appends a string to a list; the socket
+turns that into a frame on its own tick, which is what keeps a slow reader from becoming
+backpressure on the pipeline.
+"""
+
+
 class _StageError(Exception):
     """One stage's failure, carrying where it happened.
 
@@ -426,6 +436,9 @@ class _Sync:
     bodies: Conveyor[_Fetched]
     """Fetch to ingest. Carries bytes, so its depth is what bounds a run's memory."""
 
+    watching: Watching | None = None
+    """Where to say what has happened so far, or ``None`` when nobody is watching."""
+
     accepted: int = 0
     """Top-level documents handed to the fetch stage. What ``--limit`` bounds, counted where
     the bound is applied rather than derived afterwards from what finished."""
@@ -590,7 +603,13 @@ class IngestPipeline:
 
     # --- a run: three stages, two bounded hand-offs -----------------------------------------
 
-    async def run(self, connector: Connector, *, limit: int | None = None) -> RunReport:
+    async def run(
+        self,
+        connector: Connector,
+        *,
+        limit: int | None = None,
+        watching: Watching | None = None,
+    ) -> RunReport:
         """Ingest everything a connector reports as changed since its watermark.
 
         **Three stages, joined by two bounded hand-offs, and every bound derived from
@@ -630,11 +649,20 @@ class IngestPipeline:
         No watermark is written on either path and no task outlives this call. A second
         ``Ctrl-C`` inside the grace window skips the wait, which is what makes the impatient
         case safe rather than different (``docs/ingest.md`` §13.3).
+
+        Args:
+            connector: The source to pull.
+            limit: Stop discovery after this many top-level documents.
+            watching: Called with one sentence each time a document reaches a terminal outcome,
+                for a caller that is streaming progress to somebody. It is called from inside an
+                ingest worker, so it must not block and must not raise — the one implementation
+                appends to a list. ``None`` is the ordinary case and costs a branch per document.
         """
         run = _Sync(
             connector=connector,
             report=RunReport(connector=connector.name),
             limit=limit,
+            watching=watching,
             watermark=await self._store.get_watermark(connector.name),
             refs=Conveyor(
                 name="fetch",
@@ -799,6 +827,14 @@ class IngestPipeline:
                 # The first outcome is the discovered document; anything after it came out of
                 # the inside of it.
                 run.report.record(outcome, expanded=position > 0)
+            if run.watching is not None:
+                # After the whole document, not per outcome: a container that expanded into
+                # five hundred members is one thing that happened to somebody watching, and
+                # five hundred lines of it is not progress.
+                run.watching(
+                    f"{run.connector.name}: {run.report.indexed} indexed, "
+                    f"{run.report.skipped} unchanged, {run.report.failed} failed"
+                )
 
     async def _stop_within_grace(self, run: _Sync, stages: asyncio.Task[None]) -> None:
         """Stop pulling the source, let what is accepted finish, cancel the rest at the deadline.
