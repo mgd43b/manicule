@@ -31,12 +31,14 @@ from manicule.core.anchors import LineAnchor
 from manicule.core.content import BlockKind, Chunk, Document, ParsedBlock
 from manicule.core.embedding import (
     UNRECORDED_IDENTITY,
+    Vector,
     VectorState,
     embedding_input_identity,
 )
 from manicule.core.errors import ContextOverflowError
 from manicule.core.ids import chunk_id
-from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
+from manicule.core.lifecycle import Metric, SupportsMetrics
+from manicule.ingest.embedding import CACHE_HIT_METRIC, EmbeddingWork, embed_or_reuse
 from manicule.ingest.reindex import re_parse_stale, repair, select
 from tests.fakes import PassThroughMiddleware
 from tests.ingest import fakes
@@ -716,11 +718,15 @@ async def test_the_partition_adds_up_however_the_work_falls() -> None:
 
     assert work.chunks == len(chunks)
     assert work.reused + work.embedded == work.chunks
-    assert work.input_changed + work.repaired == work.embedded
+    assert work.input_changed + work.first_seen + work.repaired == work.embedded
     assert work.vectors_new + work.vectors_replaced == work.embedded
     assert (work.reused, work.repaired, work.input_changed) == (1, 2, 1), (
         "one untouched, one whose row went missing, one whose row contradicts itself, and one "
         "chunk the index has never seen"
+    )
+    assert work.first_seen == 0, (
+        "the index holds chunks for this document, so nothing here is growth — the unmatched "
+        "chunk is a change, and calling it new would price a narrow bump as a first sync"
     )
 
 
@@ -840,3 +846,253 @@ async def test_a_document_that_never_reached_the_model_reports_no_reuse() -> Non
             f"before the model has not had a vector reused, and crediting it would report "
             f"avoided work that was never faced"
         )
+
+
+async def test_growth_and_change_are_counted_apart() -> None:
+    """A first ingest and a corpus-wide bump must not price the same.
+
+    Both send every chunk to the model, so ``embedded`` alone cannot tell them apart — and an
+    operator reading one number would conclude a narrow parser change had rewritten the corpus.
+    ``first_seen`` is the document having held nothing; ``input_changed`` is it having held
+    something that no longer matches.
+
+    The trap this encodes is the definition I got wrong first: "the chunk id is new" looks like
+    the same question and is not, because an id is derived from its text, so **every** chunk
+    whose text moved arrives with an id the index has never seen. Keyed that way, the re-parse
+    below would report growth rather than change.
+    """
+    store, vectors, blobs, embedder = await indexed({"a": f"alpha\nbe{MARKER}ta"})
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    stored = list(store.chunks[document.id])
+
+    _, fresh = await embed_or_reuse(embedder, stored, vectors=fakes.MemoryVectors(), previous={})
+    assert (fresh.first_seen, fresh.input_changed) == (len(stored), 0), (
+        "an index holding nothing for this document is growth, all of it"
+    )
+
+    sweep = await re_parse_stale(
+        store=store,
+        pipeline=rebuilt(store, vectors, blobs, embedder),
+        blobs=blobs,
+        parse_fingerprints=fingerprints("2"),
+    )
+
+    assert sweep.embedding.embedded == 1, "the bump moves one chunk's text and no other"
+    assert (sweep.embedding.input_changed, sweep.embedding.first_seen) == (1, 0), (
+        "and that chunk is a change even though its id is one the index has never seen, "
+        "because its text is what the id is derived from"
+    )
+
+
+class PrefixingEmbedMiddleware(PassThroughMiddleware):
+    """Rewrites ``embed_text`` and declares it, which is the only legal way to do so.
+
+    A real middleware of the kind the identity has to account for: display text untouched, so
+    every chunk id survives and every citation still resolves, and the string the model sees
+    prefixed with something the corpus does not contain.
+    """
+
+    name = "prefixing-embed"
+    mutates_embedded_text = True
+
+    def __init__(self, prefix: str) -> None:
+        self.prefix = prefix
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        del document
+        return [
+            chunk.model_copy(update={"embed_text": f"{self.prefix}{chunk.embed_text}"})
+            for chunk in chunks
+        ]
+
+
+async def test_a_middleware_that_rewrites_embed_text_re_embeds_and_keeps_every_id() -> None:
+    """Requirement 3 of the durable-reuse spec, driven end to end rather than at the digest.
+
+    Asserting that the *declaration* changes the identity is a claim about a hash function.
+    This is the claim that matters: a middleware that actually rewrites ``embed_text`` runs
+    through the pipeline, every chunk id survives because display text never moved, and every
+    vector is rebuilt anyway because the string the model sees did.
+
+    Both halves are needed. Re-embedding alone would also be what a system that had given up
+    on reuse does; the surviving ids are what make it the interesting case.
+    """
+    store, vectors, blobs, embedder = await indexed({"a": "alpha\nbeta"})
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    identifiers = {chunk.id for chunk in store.chunks[document.id]}
+    texts = {chunk.id: chunk.text for chunk in store.chunks[document.id]}
+    embedder.batches.clear()
+
+    sweep = await re_parse_stale(
+        store=store,
+        pipeline=rebuilt(
+            store,
+            vectors,
+            blobs,
+            embedder,
+            parser=fakes.LineParser(),
+            middleware=(PrefixingEmbedMiddleware("Runbook > "),),
+        ),
+        blobs=blobs,
+        parse_fingerprints=fingerprints("2"),
+    )
+
+    rebuilt_chunks = store.chunks[document.id]
+    assert {chunk.id for chunk in rebuilt_chunks} == identifiers, (
+        "display text never moved, so every id survives and every citation still resolves"
+    )
+    assert {chunk.id: chunk.text for chunk in rebuilt_chunks} == texts
+    assert all(chunk.embed_text.startswith("Runbook > ") for chunk in rebuilt_chunks), (
+        "the fixture must actually have rewritten the embedded string"
+    )
+    assert sum(embedder.batches) == 2, "and both chunks were embedded despite keeping their ids"
+    assert (sweep.embedding.reused, sweep.embedding.input_changed) == (0, 2)
+
+
+async def test_reuse_survives_a_process_restart() -> None:
+    """Durable means durable: a second process reuses what the first stored.
+
+    The distinction the whole change turns on. An in-memory cache would report the same zero
+    inside one warm process and could not report it here, because nothing in this test carries
+    state across the boundary except the store's own directory.
+
+    Simulated by discarding every component except the stores and building the pipeline again —
+    which is what a restart is from the corpus's point of view, and is why the 20,000-chunk
+    figure in the documents is taken in a fresh interpreter.
+    """
+    store, vectors, blobs, first_embedder = await indexed({"a": "alpha\nbeta\ngamma"})
+    assert sum(first_embedder.batches) == 3, "the first process embedded the corpus"
+
+    # A new embedder, so no in-memory cache anywhere can be carrying the answer, and a new
+    # pipeline built from nothing but the stores.
+    second_embedder = fakes.CountingEmbedder()
+    assert second_embedder is not first_embedder
+
+    sweep = await re_parse_stale(
+        store=store,
+        pipeline=rebuilt(store, vectors, blobs, second_embedder, parser=fakes.LineParser()),
+        blobs=blobs,
+        parse_fingerprints=fingerprints("2"),
+    )
+
+    assert second_embedder.batches == [], (
+        "the second process made no model call at all, and it holds no cache that could have "
+        "absorbed one — what it read was the identity the first process persisted"
+    )
+    assert (sweep.reparsed, sweep.embedding.reused) == (1, 3)
+    assert sweep.embedding.cache_hits == 0, "and nothing was served by a warm cache either"
+
+
+async def test_a_mixed_batch_returns_every_vector_against_the_chunk_it_belongs_to() -> None:
+    """Ordering, asserted rather than assumed, on the shape most able to break it.
+
+    Reused vectors come from a store lookup and embedded ones come back from the model in a
+    different call; the two are woven together by position. Get that wrong and every citation
+    from the seam onward resolves to somebody else's text — with no error, because a vector is
+    a vector.
+
+    The fixture alternates hit and miss so a naive concatenation, which would pass on any run
+    where the two groups happen to be contiguous, cannot.
+    """
+    embedder = fakes.CountingEmbedder()
+    vectors = fakes.MemoryVectors()
+    await vectors.ensure_ready(embedder.fingerprint)
+    chunks = [
+        a_chunk(text=f"line {index}", embed_text=f"Doc > line {index}").model_copy(
+            update={"id": f"chunk-{index}", "position": index}
+        )
+        for index in range(8)
+    ]
+    # Every other chunk already stored, so the partition alternates.
+    stored = chunks[::2]
+    known = await embedder.embed([chunk.embed_text for chunk in stored])
+    await vectors.upsert(stored, known)
+    embedder.batches.clear()
+
+    produced, work = await embed_or_reuse(embedder, chunks, vectors=vectors)
+
+    assert (work.reused, work.embedded) == (4, 4), "the fixture must alternate, not clump"
+    expected = await embedder.embed([chunk.embed_text for chunk in chunks])
+    assert [list(vector) for vector in produced] == [list(vector) for vector in expected], (
+        "every position holds the embedding of the chunk at that position, whether it came "
+        "from the store or from the model"
+    )
+
+
+class CachingEmbedder(fakes.CountingEmbedder):
+    """An embedder that publishes a warm-cache hit count, as the real backends do.
+
+    ``HashEmbedder`` and its subclasses hold no cache, so every other test in this file sees
+    ``cache_hits`` at zero — which is correct and proves nothing about the reading. This
+    publishes the same metric name ``EmbeddingCache`` does, so the path that reports the number
+    is exercised by something that can make it move.
+    """
+
+    def __init__(self, *, serves_per_call: int = 0) -> None:
+        super().__init__()
+        self.serves_per_call = serves_per_call
+        self.served = 0
+
+    @override
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        # Incremented *during* the call, as a real cache does — it serves some of the inputs
+        # and passes the rest to the model. A fixture that moved the number before or after
+        # would measure something the delta cannot see.
+        self.served += min(self.serves_per_call, len(texts))
+        return await super().embed(texts)
+
+    def metrics(self) -> tuple[Metric, ...]:
+        return (Metric(name=CACHE_HIT_METRIC, value=float(self.served)),)
+
+
+async def test_the_warm_cache_is_reported_apart_from_durable_reuse() -> None:
+    """Two ways of not calling the model, counted separately because they are not the same.
+
+    ``reused`` is durable and survives a restart; ``cache_hits`` is a bounded LRU inside one
+    warm process. Reporting them as one number is the confusion that made a corpus-wide sweep
+    look absorbed when it was not, and it is the reason `docs/parsing.md` §4.5 needed correcting
+    twice.
+
+    The count is a *delta* across the call rather than the embedder's lifetime total, so a
+    second operation in the same process reports what it served and not what its predecessor
+    did.
+    """
+    embedder = CachingEmbedder(serves_per_call=2)
+    vectors = fakes.MemoryVectors()
+    await vectors.ensure_ready(embedder.fingerprint)
+    chunks = [
+        a_chunk(text=f"line {index}", embed_text=f"Doc > line {index}").model_copy(
+            update={"id": f"chunk-{index}", "position": index}
+        )
+        for index in range(3)
+    ]
+    embedder.served = 7  # whatever this process had served before the operation began
+
+    _, work = await embed_or_reuse(embedder, chunks, vectors=vectors)
+
+    assert work.cache_hits == 2, (
+        "the delta across this call, not the embedder's lifetime total — otherwise the second "
+        "operation in a process inherits the first one's savings"
+    )
+    assert work.reused == 0, "and nothing was durably reused, which is the other number"
+    assert work.embedded == 3
+
+
+async def test_an_embedder_with_no_cache_reports_no_cache_hits() -> None:
+    """Zero is a measurement here, not an absence of one.
+
+    An embedder publishing no metrics served nothing from a cache, because it has none. That is
+    honestly zero rather than unmeasured, which is what lets the counter be read without a
+    caveat attached.
+    """
+    embedder = fakes.CountingEmbedder()
+    vectors = fakes.MemoryVectors()
+    await vectors.ensure_ready(embedder.fingerprint)
+
+    _, work = await embed_or_reuse(embedder, [a_chunk()], vectors=vectors)
+
+    assert not isinstance(embedder, SupportsMetrics), "the fixture must publish no metrics"
+    assert work.cache_hits == 0

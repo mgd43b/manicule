@@ -25,9 +25,10 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from manicule.core.embedding import VectorState, require_within_context
+from manicule.core.lifecycle import SupportsMetrics
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -134,7 +135,7 @@ class EmbeddingWork:
     them:
 
     - ``reused + embedded == chunks``
-    - ``input_changed + repaired == embedded == vectors_new + vectors_replaced``
+    - ``input_changed + first_seen + repaired == embedded == vectors_new + vectors_replaced``
 
     They are scoped to that function on purpose. A caller may build one of these by hand from
     what it knows — :func:`~manicule.ingest.reindex.re_embed` does, because it embeds
@@ -153,11 +154,35 @@ class EmbeddingWork:
     """Chunks handed to the embedder. The honest count of embedding work done."""
 
     input_changed: int = 0
-    """Of ``embedded``, those whose embedding input is new or has changed.
+    """Of ``embedded``, those the index held an embedding input for and no longer matches.
 
-    Includes the chunk whose ``text`` — and therefore whose id — did not move at all while the
-    heading breadcrumb in its ``embed_text`` did. That chunk is why reuse is not keyed on the
-    chunk id, and it is counted here rather than under ``reused``.
+    The chunk whose ``text`` — and therefore whose id — did not move at all while the heading
+    breadcrumb in its ``embed_text`` did is the case this counts, and it is why reuse is not
+    keyed on the chunk id.
+
+    **Kept apart from** ``first_seen``, because the two say opposite things about a corpus. A
+    re-parse that reports changed inputs moved text that was already indexed; one that reports
+    first-seen chunks grew. Reading a bump's cost from a number that adds them together tells an
+    operator a narrow parser change was broad.
+    """
+
+    first_seen: int = 0
+    """Of ``embedded``, chunks of a document the index held nothing for.
+
+    A first ingest, or a document that had no chunks to hold. Nothing was reused for them
+    because there was never anything to reuse, which is not the same fact as an input having
+    changed — and a report that added the two together would price a first sync and a
+    corpus-wide bump identically.
+
+    **Scoped to the document rather than to the chunk, deliberately.** "This chunk id is new"
+    looks like the same question and is not: an id is derived from its text, so a chunk whose
+    text moved arrives with an id the index has never seen. Counting those here would call a
+    narrow parser change growth. Within a document the index already holds, an unmatched chunk
+    is a change, and it is counted as one.
+
+    Requires the caller to supply ``previous``. Without it every unmatched chunk is
+    ``input_changed`` — the conservative direction, which can overstate change and never
+    understates it.
     """
 
     repaired: int = 0
@@ -171,6 +196,28 @@ class EmbeddingWork:
 
     forward_calls: int = 0
     """Batches the embedder was actually asked for. Counted at the call, not derived from it."""
+
+    cache_hits: int = 0
+    """Chunks the embedder served from its in-memory cache instead of the model.
+
+    **The layer above the one this module implements, reported apart from it so the two are
+    never read as one.** ``reused`` is durable: it survives a restart and does not depend on
+    what a process happened to see earlier. This is a bounded LRU over duplicate ``embed_text``
+    within a warm process, and it is what ``docs/parsing.md`` §4.5 measured as unable to absorb
+    a corpus-wide sweep.
+
+    Read from the embedder's own ``metrics()``, so it is that component's count rather than a
+    second tally kept here. **Zero is unambiguous**: an embedder with no cache serves nothing
+    from a cache, and one with a cold cache serves nothing either — both are honestly none
+    rather than unmeasured.
+
+    There is deliberately no counter for reuse missed because the *fingerprint* changed. A
+    changed embedding fingerprint does not produce misses: it refuses the run
+    (:func:`~manicule.ingest.refusals.check_before_run`) and names the price, and the vectors
+    live in a table named after the fingerprint so a new one never meets the old rows at all. A
+    counter for it could only ever read zero, and this repository has shipped enough knobs that
+    control nothing.
+    """
 
     vectors_new: int = 0
     """Of ``embedded``, those the store held no row for. A row that did not exist before.
@@ -268,6 +315,12 @@ async def embed_or_reuse(
     counts = dict.fromkeys(VectorState, 0)
     backfilled = 0
     repaired = 0
+    first_seen = 0
+    # Whether the caller looked and found the index holding nothing for these chunks at all.
+    # **Not "this chunk id is new"**, which is a different and wrong test: a chunk id is derived
+    # from its text, so a chunk whose text moved arrives with an id the index has never seen and
+    # would be counted as growth when it is exactly the change being measured.
+    nothing_held = previous is not None and not previous
 
     for position, chunk in enumerate(chunks):
         verdict = verdicts[chunk.id]
@@ -280,6 +333,8 @@ async def embed_or_reuse(
             verdict.state is VectorState.ABSENT and held.get(chunk.id) == chunk.embed_text
         ):
             repaired += 1
+        elif nothing_held:
+            first_seen += 1
         pending.append(chunk)
         positions.append(position)
 
@@ -290,6 +345,7 @@ async def embed_or_reuse(
         del batch
         forward_calls += 1
 
+    before_hits = _cache_hits(embedder)
     async with lock if lock is not None else nullcontext():
         produced = await embed_chunks(
             embedder,
@@ -310,13 +366,41 @@ async def embed_or_reuse(
         chunks=len(chunks),
         reused=len(reused),
         embedded=len(pending),
-        input_changed=len(pending) - repaired,
+        input_changed=len(pending) - repaired - first_seen,
+        first_seen=first_seen,
         repaired=repaired,
         forward_calls=forward_calls,
+        cache_hits=_cache_hits(embedder) - before_hits,
         vectors_new=counts[VectorState.ABSENT],
         vectors_replaced=counts[VectorState.STALE] + counts[VectorState.CORRUPT],
         vectors_backfilled=backfilled,
     )
 
 
-__all__ = ["MAX_BATCH", "EmbeddingWork", "batch_size", "embed_chunks", "embed_or_reuse"]
+CACHE_HIT_METRIC: Final = "embedding_cache_hits"
+"""What an embedder calls its in-memory cache's hit count, in :meth:`Embedder.metrics`."""
+
+
+def _cache_hits(embedder: Embedder) -> int:
+    """How many lookups this embedder's in-memory cache has served, in total.
+
+    Read from the embedder's own published metric rather than from a private attribute, so
+    this is that component's count rather than a second tally kept here and able to disagree
+    with it. An embedder that publishes no metrics, or no cache, answers zero — which is the
+    true number of vectors a cache served in both cases, not an unmeasured one.
+    """
+    if not isinstance(embedder, SupportsMetrics):
+        return 0
+    return sum(
+        int(metric.value) for metric in embedder.metrics() if metric.name == CACHE_HIT_METRIC
+    )
+
+
+__all__ = [
+    "CACHE_HIT_METRIC",
+    "MAX_BATCH",
+    "EmbeddingWork",
+    "batch_size",
+    "embed_chunks",
+    "embed_or_reuse",
+]

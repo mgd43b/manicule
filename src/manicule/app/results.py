@@ -577,10 +577,18 @@ class EmbeddingCost(Payload):
     """Chunks handed to the embedder."""
 
     input_changed: int = Field(default=0, ge=0)
-    """Of ``embedded``, those whose embedding input was new or had changed.
+    """Of ``embedded``, those the index held an embedding input for and no longer matches.
 
     Includes a chunk whose ``text`` did not move — and which therefore kept its id and its
-    citations — while the heading breadcrumb in its ``embed_text`` did.
+    citations — while the heading breadcrumb in its ``embed_text`` did. Kept apart from
+    ``first_seen`` because a corpus that changed and a corpus that grew are different findings.
+    """
+
+    first_seen: int = Field(default=0, ge=0)
+    """Of ``embedded``, chunks the index has no previous embedding input for at all.
+
+    Growth rather than change. Nothing was reused for them because there was never anything to
+    reuse.
     """
 
     repaired: int = Field(default=0, ge=0)
@@ -592,6 +600,17 @@ class EmbeddingCost(Payload):
 
     forward_calls: int = Field(default=0, ge=0)
     """Batches the embedder was asked for. The number an accelerator's time is proportional to."""
+
+    cache_hits: int = Field(default=0, ge=0)
+    """Chunks the embedder served from its in-memory cache rather than the model.
+
+    The warm layer above durable reuse, reported apart from it because the two are routinely
+    read as one. ``reused`` survives a process restart; this does not.
+
+    There is deliberately no counter for reuse missed because the embedding *fingerprint*
+    changed. That does not produce misses — it refuses the run and names the price — so such a
+    counter could only ever read zero.
+    """
 
     vectors_new: int = Field(default=0, ge=0)
     """Of ``embedded``, those the store held no row for.

@@ -828,6 +828,23 @@ row, because the first two are metadata and metadata can be wrong. The identity 
 row is also cross-checked against one derived from the `chunk_json` beside it; a row that says
 two different things about what it embedded is rebuilt rather than believed.
 
+**Why a digest is safe to compare, and what it assumes.** `embed_identity` is a SHA-256 over a
+canonical JSON array of five values — a version tag, the document id, the fingerprint's
+canonical form, the sorted middleware declarations, and the exact `embed_text`. The array is
+what makes the encoding injective: no run of one field can be read as the start of the next, so
+two different inputs cannot serialise to one string. `ensure_ascii` escapes every code point,
+which also means a lone surrogate — which a parser can produce and a `str` can hold — encodes
+rather than raising. **The text is never Unicode-normalised**: NFC and NFD of one word tokenise
+differently and embed differently, so they are two inputs, and a digest that merged them would
+reuse a vector for text the model never saw.
+
+What is assumed is second-preimage resistance of SHA-256 — that no attacker-chosen text
+produces another text's digest. That is not a load-bearing assumption here in the way it would
+be for a signature: the corpus is the operator's own, an identity is scoped to one document, and
+the row is cross-checked against the chunk stored beside it before its vector is reused. A
+collision would have to survive that check as well. Assumed rather than argued away, and stated
+so the next reader knows which it is.
+
 **Migration is one `add_columns` and no re-embedding.** An existing table gains the column in
 `ensure_ready`, filled with the empty string, and every row then reads as *identity not
 recorded*. Such a row is reconstructed rather than distrusted: `upsert` wrote its `chunk_json`
@@ -836,6 +853,14 @@ the exact prior embedding input rather than a guess at one. An existing corpus t
 every vector it has, the reconstruction is reported as `embedding.vectors_backfilled`
 ([`ingest.md`](ingest.md) §10.1), and the first write of each row records its identity for good.
 Backup, restore and export are unaffected: the column travels with the table like every other.
+
+**There is no garbage collection to define for reused vectors, because there is no second
+store.** A durable reuse cache would need one — entries outliving the chunks they were made for,
+and a rule for collecting them. Here the reused vector *is* the vector row, held against the
+chunk id it belongs to, so it is collected by the thing that already collects vector rows: the
+tombstone sweep (§8.2), which deletes by id from a list rather than by anti-joining a live
+table. Nothing accumulates that was not already accumulating, and correctness never depends on
+collection having happened.
 
 **`chunk_json` is a departure from the original design, forced by the protocol.** An earlier
 draft of this section said the Lance row holds no text: a search would return `(id, distance)`
