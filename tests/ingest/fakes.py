@@ -8,7 +8,9 @@ was checked by disabling the guard and watching the suite go red.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
+import asyncio
+from collections.abc import AsyncGenerator, AsyncIterator, Collection, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import override
@@ -43,10 +45,100 @@ from manicule.core.glossary import GlossaryEntry
 from manicule.core.ids import chunk_id, content_hash
 from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
+from manicule.ingest.workers import AttemptResult, InProcessRunner
+from manicule.parsers.chain import Attempt, Outcome
 from manicule.parsers.expansion import ExpandedMember, MemberFailure, MemberOutcome
 from tests.fakes import MEDIA_TYPE, HashEmbedder
 
 CONTAINER_MEDIA_TYPE = "application/x-fake-archive"
+
+
+# --- gates ------------------------------------------------------------------------------------
+
+
+class Gate:
+    """A place work stops until a test lets it through, and a count of who was inside.
+
+    **The reason every concurrency fake here is built on one of these rather than on a sleep.**
+    A test that sleeps and then asserts "two fetches overlapped" passes when the machine is idle
+    and fails on a loaded runner, and — much worse — passes against a sequential implementation
+    often enough to look green. A gate makes the assertion about arrivals rather than about
+    timing: :meth:`wait_for` returns only when the stated number of callers are all inside at
+    once, and if they never are, it raises instead of guessing.
+
+    :attr:`peak` is what a bound is asserted against, because a bound is a statement about a
+    maximum and sampling ``inside`` is a statement about when somebody looked.
+    """
+
+    def __init__(self, *, capacity: int | None = None, opened: bool = False) -> None:
+        self.arrivals = asyncio.Semaphore(0)
+        self.inside = 0
+        self.peak = 0
+        self.entries = 0
+        self.capacity = capacity
+        """When set, arriving with this many already inside raises rather than being counted.
+
+        A ceiling asserted at the moment it is crossed rather than afterwards from a peak. The
+        two differ in what they say when the code is wrong: a peak reports a number, and this
+        reports the document that was the straw.
+        """
+
+        self._open = asyncio.Event()
+        if opened:
+            self._open.set()
+
+    @asynccontextmanager
+    async def holding(self) -> AsyncGenerator[None]:
+        """Count one caller for the length of the block, parking until the gate opens.
+
+        An opened gate does not park and does not yield to the loop, so a caller is counted for
+        exactly as long as the work inside the block takes — which is what makes the same object
+        serve both "hold everything until I say" and "just tell me how many overlapped".
+        """
+        self.inside += 1
+        self.peak = max(self.peak, self.inside)
+        self.entries += 1
+        try:
+            if self.capacity is not None and self.inside > self.capacity:
+                msg = f"{self.inside} callers inside a gate with room for {self.capacity}"
+                raise AssertionError(msg)
+            self.arrivals.release()
+            await self._open.wait()
+            yield
+        finally:
+            self.inside -= 1
+
+    async def pass_through(self) -> None:
+        """Arrive, wait for the gate to open, and leave."""
+        async with self.holding():
+            pass
+
+    async def wait_for(self, callers: int, *, patience_s: float = 10.0) -> None:
+        """Block until ``callers`` have arrived, or fail saying how many ever did.
+
+        ``patience_s`` is how long the *test* is willing to be wrong for, not a timeout on
+        anything under test — which is why the expiry is an assertion failure naming the peak
+        rather than a ``TimeoutError`` a caller would have to interpret. A caller wrapping this
+        in its own ``asyncio.timeout`` would get the bare error and none of the diagnosis.
+
+        Raises:
+            AssertionError: They did not arrive. That is what a sequential implementation looks
+                like from here, and it is the failure this whole file exists to produce.
+        """
+        try:
+            async with asyncio.timeout(patience_s):
+                for _ in range(callers):
+                    await self.arrivals.acquire()
+        except TimeoutError:
+            msg = (
+                f"waited for {callers} callers to be inside the gate at once; the most that ever "
+                f"were is {self.peak}, from {self.entries} arrival(s)"
+            )
+            raise AssertionError(msg) from None
+
+    def open(self) -> None:
+        """Let everyone waiting through, and everyone who arrives later."""
+        self._open.set()
 
 
 # --- stores --------------------------------------------------------------------------------
@@ -676,6 +768,105 @@ class CountingEmbedder(HashEmbedder):
         return await super().embed(texts)
 
 
+class ExclusiveEmbedder(CountingEmbedder):
+    """Refuses to be called while it is already inside a call, and says which document did it.
+
+    **The strongest available statement of "the model is serialized"**, and it is stronger than
+    a peak counter for one reason: it fails at the moment of overlap, in the task that caused
+    it, rather than reporting a number afterwards that somebody has to interpret. With one
+    accelerator and one unified-memory pool, a second concurrent batch is contention rather than
+    throughput (``docs/ingest.md`` §6.6), so overlap is a defect and not a slow path.
+
+    ``inside`` is written and read with no ``await`` between, which is what makes the check
+    sound on an event loop: two coroutines cannot interleave a read-modify-write.
+    """
+
+    def __init__(self, dimension: int = 5) -> None:
+        super().__init__(dimension=dimension)
+        self.inside = 0
+        self.overlaps = 0
+
+    @override
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        if self.inside:
+            self.overlaps += 1
+            msg = f"a second batch of {len(texts)} reached the embedder while one was running"
+            raise AssertionError(msg)
+        self.inside += 1
+        try:
+            return await super().embed(texts)
+        finally:
+            self.inside -= 1
+
+
+class GatedEmbedder(ExclusiveEmbedder):
+    """Serialized, and parked inside the model until a test lets it out.
+
+    What makes the embedder the bottleneck on purpose, which is the only way to observe what
+    the stages in front of it do when the stage behind them stops.
+    """
+
+    def __init__(self, dimension: int = 5) -> None:
+        super().__init__(dimension=dimension)
+        self.gate = Gate()
+
+    @override
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        if self.inside:
+            self.overlaps += 1
+            msg = f"a second batch of {len(texts)} reached the embedder while one was running"
+            raise AssertionError(msg)
+        self.inside += 1
+        try:
+            await self.gate.pass_through()
+            return await HashEmbedder.embed(self, texts)
+        finally:
+            self.inside -= 1
+
+
+# --- parse runners ------------------------------------------------------------------------------
+
+
+class GatedRunner:
+    """A parse runner that parks every attempt, so parse concurrency is observable.
+
+    Stands in for :class:`~manicule.ingest.workers.WorkerPool` rather than for a parser: what is
+    being measured is how many attempts one connector sync has in the pool at once, and a real
+    pool would make that a fact about subprocess scheduling instead of about the pipeline.
+    """
+
+    def __init__(self, parsers: Mapping[str, object], *, capacity: int | None = None) -> None:
+        self._inner = InProcessRunner(parsers)
+        self.gate = Gate(capacity=capacity)
+
+    async def run_attempt(self, name: str, raw: RawDocument) -> AttemptResult:
+        await self.gate.pass_through()
+        return await self._inner.run_attempt(name, raw)
+
+
+class BrokenRunner:
+    """A runner that reports one named document's attempt as a killed worker.
+
+    The shape :class:`~manicule.ingest.workers.WorkerPool` produces when a parser overruns its
+    deadline or its memory limit: a *hard failure* naming the limit, never a decline. Reproduced
+    here rather than by killing a real worker because what is under test is that one document's
+    dead worker does not disturb the documents beside it.
+    """
+
+    def __init__(self, parsers: Mapping[str, object], *, kill: str) -> None:
+        self._inner = InProcessRunner(parsers)
+        self._kill = kill
+        self.killed: list[str] = []
+
+    async def run_attempt(self, name: str, raw: RawDocument) -> AttemptResult:
+        if raw.source_id == self._kill:
+            self.killed.append(raw.source_id)
+            return AttemptResult(
+                [], Attempt(parser=name, outcome=Outcome.FAILED, reason="worker killed: timeout")
+            )
+        return await self._inner.run_attempt(name, raw)
+
+
 # --- connectors ------------------------------------------------------------------------------
 
 
@@ -749,6 +940,48 @@ class DictConnector:
                 raise RuntimeError(msg)
             emitted += 1
             yield source_id
+
+
+class ObservedConnector(DictConnector):
+    """A connector that counts what it yielded and can park inside every fetch.
+
+    Two observations, and they answer the two halves of "is the fetch stage really concurrent":
+    :attr:`fetching` says how many fetches overlapped, and :attr:`yields` says how far ahead of
+    durable progress the source was paged. The second is the one an unbounded design gets wrong
+    while looking fine — it is the count that decides whether a pagination cursor lives long
+    enough to be used (``docs/connectors/confluence.md`` §2).
+    """
+
+    def __init__(
+        self,
+        documents: Mapping[str, str],
+        *,
+        name: str = "memory",
+        fetch_capacity: int | None = None,
+        park_fetches: bool = False,
+    ) -> None:
+        super().__init__(documents, name=name)
+        self.fetching = Gate(capacity=fetch_capacity, opened=not park_fetches)
+        self.yields = 0
+        self.yielded = asyncio.Semaphore(0)
+        """Released as each document leaves ``discover``, before the pipeline has taken it.
+
+        A permit therefore means "the source produced this one", which is the quantity a
+        backpressure claim is about. Counting acceptances instead would be counting the
+        pipeline's own bookkeeping back to itself.
+        """
+
+    @override
+    async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+        async for found in super().discover(watermark):
+            self.yields += 1
+            self.yielded.release()
+            yield found
+
+    @override
+    async def fetch(self, ref: DocRef) -> RawDocument:
+        async with self.fetching.holding():
+            return await super().fetch(ref)
 
 
 # --- middleware --------------------------------------------------------------------------------
