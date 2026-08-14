@@ -167,9 +167,12 @@ def test_the_dependencies_are_read_off_the_imports_rather_than_listed() -> None:
     library reaches a fingerprint's inputs and the hand-kept list beside it does not move. There
     is no list here to fail to update — the digested sources' own imports are the list.
 
-    Asserted against a second, independent reading of the same syntax trees. A test that named
-    ``pydantic`` would pass just as well against a hard-coded tuple, which is the thing it exists
-    to rule out.
+    Asserted against a second reading of the same syntax trees rather than against a name. The
+    claim that supports is narrow and worth stating as such: it is not that two independent
+    algorithms agree — this one is deliberately the same algorithm — it is that **no name is
+    written down on either side**, so a `libraries()` quietly replaced by a hard-coded tuple
+    fails here the moment the imports and the tuple part company. The test above names
+    ``pydantic``, and that one would not.
     """
     third_party = {
         name
@@ -243,9 +246,9 @@ def _digested_bytes() -> bytes:
 def _imported_top_level() -> set[str]:
     """Top-level module names the digested sources import, read here rather than imported.
 
-    A second reading of the same syntax trees, deliberately not sharing code with the one under
-    test: two implementations agreeing is evidence, and one implementation agreeing with itself
-    is not.
+    Deliberately not calling the module under test, so that what the assertion compares is a
+    reading of the *files* against a reading of the *fingerprint* — with no name written down on
+    either side of it.
     """
     found: set[str] = set()
     for package, name in SOURCES:

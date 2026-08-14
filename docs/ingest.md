@@ -1180,6 +1180,13 @@ has just replaced, and the write is refused. It is told apart from a genuine fai
 — the chunk ids are read again, and ids that have moved are what a sync leaves behind — rather
 than by matching an error message, which would tie this to one store.
 
+**Adding an input to the fingerprint re-stales the corpus, and that is the mechanism working.**
+`libraries` was added after the column shipped, so a document stamped by the first release
+disagrees with the installed detector and is selected again. It is not a regression and not a
+second migration: the earlier fingerprint described fewer inputs than actually decide a stored
+entry, so it was over-claiming, and a corpus that had been swept under it was current only by
+the narrower definition. The cost is one more pass over stored text.
+
 **Ordering, when both sweeps are wanted.** Run `--stale` first. A re-parse re-runs detection on
 every document it rebuilds, so doing it second would redo work the glossary sweep had just
 finished. Passing both flags in one invocation is refused rather than sequenced: they differ by

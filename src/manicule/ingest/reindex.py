@@ -990,10 +990,13 @@ async def redetect_glossary(
     from manicule.ingest.glossary import detect_entries  # noqa: PLC0415
 
     named = f"{document.id} ({document.uri})"
-    before = await glossary.glossary_entries(document.id)
+    # The refusal is decided before the previous entries are read, so a corpus of documents this
+    # cannot repair costs one query each rather than two. It also reads in the order the
+    # reasoning runs: whether there is anything to detect over, and only then what is there now.
     chunks = await store.document_chunks(document.id)
     if not chunks and document.expects_chunks:
         return GlossaryOutcome(unrepairable=f"{named}: {NO_STORED_CHUNKS}")
+    before = await glossary.glossary_entries(document.id)
     try:
         entries = detect_entries(chunks, title=document.title, media_type=document.media_type)
     except Exception as exc:  # noqa: BLE001 - a detector bug costs this document and no other
