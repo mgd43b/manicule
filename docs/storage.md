@@ -822,11 +822,30 @@ impossible to express rather than merely unlikely to be written. The cost is reu
 two documents, which is worth almost nothing: `embed_text` carries the document's own title in
 its breadcrumb, so two documents rarely produce the same embedding input at all.
 
-Three things must all hold before a stored vector is reused: the same fingerprint, the same
-embedding input **for that document**, and a **readable** vector for that identity. The last is checked by reading the
-row, because the first two are metadata and metadata can be wrong. The identity recorded in the
-row is also cross-checked against one derived from the `chunk_json` beside it; a row that says
-two different things about what it embedded is rebuilt rather than believed.
+#### The reuse invariant
+
+A stored vector may be reused **if and only if all three hold**:
+
+1. **The same complete embedding fingerprint** — `EmbedFingerprint.canonical()`, which is
+   manicule's own definition of vector-space compatibility: model id, revision, dimension,
+   pooling, normalization, tokenizer.
+2. **The same embedding input, for that document** — the exact post-middleware `embed_text`,
+   every code point of it, under the document that owns it. Never Unicode-normalised, and never
+   the chunk id, the display text, the content hash or the parse fingerprint.
+3. **A readable stored vector actually exists for that identity** — established by reading the
+   row, not by believing what it says about itself.
+
+**Clause 3 is manicule's own and is the one to keep.** Two specifications have now been written
+for this problem by different authors, and *both* state only the first two. A row whose recorded
+identity says "current" while its vector is missing, unreadable, or of the wrong dimension
+satisfies both documents and is refused here — because a claim that a vector exists is not a
+vector existing, which is the defect this repository has removed in five other places. The
+identity recorded in a row is also cross-checked against one derived from the `chunk_json`
+beside it; a row that says two different things about what it embedded is rebuilt rather than
+believed.
+
+Anything weaker than all three preserves a stale vector under current chunk text, silently, for
+as long as the index lives.
 
 **Why a digest is safe to compare, and what it assumes.** `embed_identity` is a SHA-256 over a
 canonical JSON array of five values — a version tag, the document id, the fingerprint's

@@ -1009,6 +1009,10 @@ The mismatch runs the other way too — a document with a paragraph inserted at 
 every chunk below it without moving one embedded string, so those chunks are *not* in
 `chunks_kept` and their vectors are reused anyway.
 
+**What is reused, and under what condition**, is `storage.md` §6.2's numbered reuse invariant —
+three clauses, of which the third (*a readable stored vector actually exists*) is manicule's own
+and is absent from both written specifications for this problem.
+
 **What is a count of forward passes is `embedding`**, and it is measured at the model rather
 than inferred from row identity. The sweep partitions every prepared chunk three ways and
 reports the parts separately, because the remedy differs:
