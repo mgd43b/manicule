@@ -49,6 +49,14 @@ TEMPORARY_REDIRECT = 307
 PERMANENT_REDIRECTS = frozenset({301, 308})
 """The statuses this door must never answer with. See :data:`frontdoor.TEMPORARY_REDIRECT`."""
 
+ORIGIN = "http://testserver"
+"""The origin Starlette's test client presents itself as, which is what the door reflects back.
+
+Named rather than written into an assertion, because it is the *client's* value and not one of
+this project's — the door builds its addresses from whatever ``Host`` a request arrived with,
+which is the property under test.
+"""
+
 
 def _client(*, web: bool) -> TestClient:
     """The production application, with the browser surface on or off."""
@@ -174,7 +182,7 @@ def test_no_web_prints_addresses_a_person_can_copy() -> None:
     and through a proxy or a forwarded port the bind is not that address at all.
     """
     body = _front_door(web=False).text
-    assert f"http://testserver{frontdoor.MCP_ENDPOINT}" in body, body
+    assert f"{ORIGIN}{frontdoor.MCP_ENDPOINT}" in body, body
 
 
 # --- --mcp-only -------------------------------------------------------------------------------
@@ -195,6 +203,20 @@ def test_mcp_only_says_mcp_is_the_only_thing_here() -> None:
     assert "--mcp-only" in response.text
     assert frontdoor.MCP_ENDPOINT in response.text
     assert frontdoor.UI not in response.text, "there is no browser surface on this process"
+
+
+def test_the_mcp_only_door_sets_the_header_it_has_no_middleware_to_inherit() -> None:
+    """It reflects the ``Host`` into its body, and this is the application with no middleware.
+
+    Every response the HTTP API serves carries ``X-Content-Type-Options`` from
+    :data:`manicule.api.app.SECURITY_HEADERS`. ``--mcp-only`` is served by the library's own
+    application, which has none of that — so the one response this project adds to it is the one
+    response that has to say so itself.
+    """
+    with _mcp_only() as client:
+        response = client.get("/", headers={"Host": "someone-elses-name.test"})
+    assert response.headers.get("x-content-type-options") == "nosniff", dict(response.headers)
+    assert "someone-elses-name.test" in response.text, "the address is the one the request used"
 
 
 def _initialize(client: StarletteTestClient, target: str) -> Response:
@@ -272,12 +294,16 @@ def test_the_advertised_mcp_address_answers_directly_on_both_ways_of_serving_it(
 # --- the serving path actually installs it ------------------------------------------------------
 
 
+def _body(function: object) -> ast.AST:
+    """A function's own source, parsed. Dedented, because ``ast`` refuses an indented block."""
+    return ast.parse(textwrap.dedent(inspect.getsource(function)))  # type: ignore[arg-type]
+
+
 def _calls(function: object) -> set[str]:
     """Every plain function name called in ``function``'s body, read off its source."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))  # type: ignore[arg-type]
     return {
         node.func.id
-        for node in ast.walk(tree)
+        for node in ast.walk(_body(function))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
 
@@ -288,10 +314,9 @@ def _keywords(function: object, called: str) -> dict[str, str]:
     The *value* as written, not merely the name, because "a path was passed" and "the advertised
     path was passed" are different claims and only the second is the one worth keeping.
     """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))  # type: ignore[arg-type]
     return {
         keyword.arg: ast.unparse(keyword.value)
-        for node in ast.walk(tree)
+        for node in ast.walk(_body(function))
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == called

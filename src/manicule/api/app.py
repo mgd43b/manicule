@@ -162,7 +162,7 @@ from the route somebody added last.
 """
 
 
-async def open_the_browser_surface(request: Request) -> RedirectResponse:
+async def _open_the_browser_surface(request: Request) -> RedirectResponse:
     """``GET /`` when the browser surface is mounted: go there.
 
     A redirect rather than the dashboard served at two paths, so the address bar ends up
@@ -180,7 +180,7 @@ async def open_the_browser_surface(request: Request) -> RedirectResponse:
     )
 
 
-async def say_what_is_served(request: Request) -> PlainTextResponse:
+async def _say_what_is_served(request: Request) -> PlainTextResponse:
     """``GET /`` under ``--no-web``: name the surfaces that *are* here.
 
     Not a redirect, because there is nothing to redirect to. Sending somebody to a browser
@@ -396,7 +396,7 @@ def build_app(
     # decision this function makes.
     app.add_api_route(
         "/",
-        open_the_browser_surface if web else say_what_is_served,
+        _open_the_browser_surface if web else _say_what_is_served,
         methods=["GET"],
         name="front_door",
         summary="The browser surface, or — when it is not served — what this process is serving.",
@@ -480,6 +480,4 @@ __all__ = [
     "TITLE",
     "build_app",
     "frame_policy",
-    "open_the_browser_surface",
-    "say_what_is_served",
 ]

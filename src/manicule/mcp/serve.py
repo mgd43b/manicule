@@ -72,9 +72,16 @@ async def _front_door(request: Request) -> PlainTextResponse:
     """``GET /`` on an ``--mcp-only`` socket: say so, and name the endpoint that is here.
 
     The address is read off the request rather than off the bind, so what a person is shown is
-    the address they actually reached this process on.
+    the address they actually reached this process on — which means the body carries a value out
+    of the ``Host`` header. It is ``text/plain`` and ``nosniff``, so there is nothing for a
+    browser to interpret; the header is set **here** rather than inherited, because this
+    application is the library's and has none of the middleware
+    :data:`manicule.api.app.SECURITY_HEADERS` puts on every other response this project serves.
     """
-    return PlainTextResponse(frontdoor.mcp_alone(str(request.base_url).rstrip("/")))
+    return PlainTextResponse(
+        frontdoor.mcp_alone(str(request.base_url).rstrip("/")),
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
 
 
 def signpost(server: FastMCP) -> None:

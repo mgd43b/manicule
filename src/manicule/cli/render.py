@@ -698,6 +698,20 @@ the two strings agree so the mirror cannot drift.
 """
 
 
+_SIGNPOST_WIDTH: Final = len("API documentation")
+"""How wide the labels below the address line are padded, so their addresses share a column.
+
+The longest of them, named rather than counted, because the thing being kept true is that no
+label is wider than the padding — a label that overflowed would push its own address out of
+line and read as the one that is broken.
+"""
+
+
+def _signpost(out: Console, label: str, target: str) -> None:
+    """One "here is where X is" line under the address, in the shared column."""
+    out.print(f"[dim]{label.ljust(_SIGNPOST_WIDTH)}[/dim]  {target}")
+
+
 def render_address(
     out: Console, payload: r.ServerAddress, *, web: bool | None = None, stopped: bool = False
 ) -> None:
@@ -752,20 +766,6 @@ def render_address(
     # a client had the port and had to know the path.
     _signpost(out, "MCP endpoint", f"{where}{frontdoor.MCP_ENDPOINT}")
     _signpost(out, "API documentation", f"{where}{frontdoor.DOCS}")
-
-
-_SIGNPOST_WIDTH: Final = len("API documentation")
-"""How wide the labels below the address line are padded, so their addresses share a column.
-
-The longest of them, named rather than counted, because the thing being kept true is that no
-label is wider than the padding — a label that overflowed would push its own address out of
-line and read as the one that is broken.
-"""
-
-
-def _signpost(out: Console, label: str, target: str) -> None:
-    """One "here is where X is" line under the address, in the shared column."""
-    out.print(f"[dim]{label.ljust(_SIGNPOST_WIDTH)}[/dim]  {target}")
 
 
 def render_upgrade(out: Console, payload: r.UpgradeReport) -> None:
