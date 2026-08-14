@@ -122,7 +122,7 @@ RULES: tuple[tuple[str, str], ...] = (
     (r"flavour", "flavor"),
     (r"harbour", "harbor"),
     (r"honour", "honor"),
-    (r"labour(?![a-z]*atory)", "labor"),
+    (r"labour", "labor"),
     (r"neighbour", "neighbor"),
     (r"rigour", "rigor"),
     (r"valour", "valor"),
@@ -135,7 +135,7 @@ RULES: tuple[tuple[str, str], ...] = (
     (r"splendour", "splendor"),
     (r"demeanour", "demeanor"),
     # -re
-    (r"centre(?![a-z])|centres(?![a-z])|centred(?![a-z])", "center"),
+    (r"centre(?![a-z])|centres(?![a-z])|centred(?![a-z])|centring(?![a-z])", "center-"),
     (r"theatre", "theater"),
     (r"fibre(?![a-z])|fibres(?![a-z])", "fiber"),
     (r"calibre", "caliber"),
@@ -144,10 +144,12 @@ RULES: tuple[tuple[str, str], ...] = (
     (r"sombre", "somber"),
     (r"spectre", "specter"),
     (r"lustre", "luster"),
-    # -ogue, where American drops the tail
+    # -ogue, where American drops the tail. ``dialogue`` is deliberately absent: American
+    # English keeps it for a conversation and shortens it only for the UI widget, and no rule
+    # here can tell those apart. A family that would misfire on correct prose is worse than an
+    # uncovered one, because the repair for a check that cries wolf is to switch it off.
     (r"catalogue", "catalog"),
     (r"analogue", "analog"),
-    (r"dialogue", "dialog"),
     # -ce nouns
     (r"licence", "license"),
     (r"defence", "defense"),
@@ -167,7 +169,9 @@ RULES: tuple[tuple[str, str], ...] = (
     # A single l where American English doubles it.
     (r"fulfil(?![lm])", "fulfill"),
     (r"fulfilment", "fulfillment"),
-    (r"enrol(?![l])", "enroll"),
+    # ``(?![lm])`` on both stems, so ``enrolment`` and ``fulfilment`` are reported once by the
+    # rule that knows the right ending rather than twice, the second time with wrong advice.
+    (r"enrol(?![lm])", "enroll"),
     (r"enrolment", "enrollment"),
     (r"instalment", "installment"),
     (r"skilful", "skillful"),
@@ -363,6 +367,7 @@ def test_no_british_spelling_reaches_the_tracked_tree() -> None:
         ("in self-defence", "defence"),
         ("the catalogue of plugins", "catalogue"),
         ("centred on the page", "centred"),
+        ("centring the column", "centring"),
         ("we analysed the corpus", "analysed"),
         ("the run was cancelled", "cancelled"),
         ("travelling between zones", "travelling"),
@@ -396,6 +401,10 @@ def test_the_check_catches_a_spelling_of_each_family(sentence: str, expected: st
         "a promise it raised and revised",  # so are these
         "the laboratory result",  # not ``labour``
         "collaborate on the parametrization",  # already American
+        "a laboratory result nobody collaborated on",  # not ``labour``
+        "fulfilling the request",  # correct under either spelling of the verb
+        "a dialogue between two operators",  # American English keeps this one
+        "the greyhound slipped its lead",  # ``grey`` is listed; ``greyhound`` is not it
     ],
 )
 def test_the_check_leaves_american_english_alone(sentence: str) -> None:
