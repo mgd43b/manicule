@@ -678,7 +678,7 @@ class IngestPipeline:
         """Start every stage, and return when discovery is spent and every acceptance is done.
 
         One :class:`asyncio.TaskGroup`, so the stages are children of this call: it returns only
-        when all of them have, and cancelling it cancels and joins all of them. There is no
+        when all of them have, and canceling it cancels and joins all of them. There is no
         detached task and nothing to leak.
 
         A stage task raising cancels its siblings, and that is deliberate rather than tolerated:

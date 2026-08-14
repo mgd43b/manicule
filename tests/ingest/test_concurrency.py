@@ -720,7 +720,7 @@ async def test_a_graceful_stop_carries_what_was_already_accepted_to_a_terminal_o
 
 
 async def test_a_canceled_run_stops_pulling_the_source_even_while_it_drains() -> None:
-    """The grace window finishes accepted work; it is not a licence to keep reading the source.
+    """The grace window finishes accepted work; it is not a license to keep reading the source.
 
     Without this, ``Ctrl-C`` on a large sync would keep enumerating and keep fetching for the
     whole grace window — a canceled command still hammering a rate-limited API, which is the
