@@ -132,6 +132,37 @@ def requires_mlx(model_id: str) -> None:
     pytest.skip("MLX is not usable on this machine")
 
 
+def requires_metal() -> None:
+    """Skip unless MLX is executing on **Metal**, not on its CPU device.
+
+    :func:`requires_mlx` is a different question and does not answer this one. It asks whether
+    ``mx.eval`` works, and it works on MLX's CPU device too. So do the memory counters: with
+    ``mx.set_default_device(mx.cpu)``, a 16 MiB allocation reports ``get_active_memory() ==
+    16777216``, indistinguishable from the Metal figure. A test that asserted "MLX reports
+    non-zero memory" would therefore pass on a machine with no GPU **having exercised the wrong
+    allocator entirely** — green while checking nothing, which is the failure mode this module
+    exists to prevent.
+
+    It matters because the thing being guarded is specifically a Metal phenomenon: the
+    unbounded free-buffer cache is the Metal allocator's, the memory it retains is unified
+    memory, and the reason ``ps`` cannot see it is that Metal buffers are not ordinary resident
+    pages. None of that is true of the CPU device.
+
+    A skip rather than a failure, because this is a property of the hardware rather than of a
+    pre-seed somebody forgot — there is no action that would fix it on a machine without a GPU.
+    The reason names the device so a CI log says which allocator actually ran.
+    """
+    from manicule.embedding.runtimes import mlx_core  # noqa: PLC0415 - an embeddings extra
+
+    mx = mlx_core()
+    if mx.metal.is_available():
+        return
+    pytest.skip(
+        f"MLX is running on {mx.default_device()}, not Metal, so the Metal allocator this "
+        f"asserts about was never exercised"
+    )
+
+
 def _cached(repo: str, patterns: tuple[str, ...]) -> bool:
     from huggingface_hub import snapshot_download  # noqa: PLC0415 - an embeddings extra
 
@@ -242,6 +273,7 @@ __all__ = [
     "model_available",
     "onnx_weights_available",
     "require_model",
+    "requires_metal",
     "requires_mlx",
     "write_model",
     "write_tokenizer",
