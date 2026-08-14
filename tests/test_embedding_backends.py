@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -41,6 +42,7 @@ import pytest
 
 from manicule.core.embedding import Pooling
 from manicule.core.errors import ContextOverflowError
+from manicule.core.lifecycle import Metric
 from manicule.core.protocols import Embedder, TokenStateEmbedder
 from manicule.embedding.cards import read_card
 from manicule.embedding.pooling import l2_normalize, pool
@@ -375,6 +377,36 @@ async def test_a_real_model_refuses_text_it_would_truncate(backend: str) -> None
 
     with pytest.raises(ContextOverflowError, match=f"{limit}-token limit"):
         await embedder.embed([" ".join(["word"] * (limit + 50))])
+
+
+async def test_mlx_memory_metrics_are_readable_off_the_worker_thread() -> None:
+    """Reading the allocator gauges from another thread must not abort the process.
+
+    This backend already aborts — ``libc++abi: terminating … There is no Stream(gpu, N) in
+    current thread``, uncatchable — when a graph built on one thread is evaluated on another,
+    which is why the embedder owns exactly one worker. ``metrics()`` is the one MLX call that
+    deliberately does *not* run there: it is synchronous, and an operator scrapes it from the
+    event loop or from a metrics thread while a forward pass is in flight on the worker.
+
+    That is safe because MLX's **allocator** is process-global while its **streams** are
+    thread-local, and these gauges query the allocator. Safe by a different mechanism than the
+    rest of the class, so it is asserted rather than assumed — the failure mode is a dead
+    server, not a red test.
+    """
+    require(PARITY_MODEL, "mlx")
+    embedder = await embedder_for(PARITY_MODEL, "mlx")
+    await embedder.embed(["a short text, so that something has been allocated"])
+
+    from_a_foreign_thread: list[Metric] = []
+    thread = threading.Thread(
+        target=lambda: from_a_foreign_thread.extend(embedder.metrics()),
+    )
+    thread.start()
+    thread.join()
+
+    published = {metric.name for metric in from_a_foreign_thread}
+    assert {"mlx_active_bytes", "mlx_cache_bytes", "mlx_peak_bytes"} <= published
+    assert next(m for m in from_a_foreign_thread if m.name == "mlx_active_bytes").value > 0
 
 
 def test_repeated_embedding_holds_a_bounded_physical_footprint() -> None:

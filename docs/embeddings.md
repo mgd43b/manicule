@@ -358,8 +358,8 @@ The fix is one call, at load, on the worker thread that owns the streams: bound 
 before the weights are loaded, so the model's own gigabyte is already inside the bound.
 Teardown clears it, because dropping the model frees its buffers into the cache rather than to
 the system. **Vectors are unaffected and measured to be so** — the allocator decides what is
-*retained*, not what is *computed*, and 40 vectors across 1024 dimensions come back bit-for-
-identical with a maximum elementwise difference of exactly `0.0`.
+*retained*, not what is *computed*, and 40 vectors across 1024 dimensions come back
+bit-for-bit identical, with a maximum elementwise difference of exactly `0.0`.
 
 With the bound, the same 120-pass workload:
 
