@@ -1006,20 +1006,28 @@ async def test_a_whole_space_fetch_asserts_no_root_at_all() -> None:
 
 @pytest.mark.parametrize(
     "root",
-    ["Architecture", "100100 ", "", "100100 OR 1=1", "abc"],
-    ids=["title", "trailing-space-is-fine", "empty", "injection", "letters"],
+    ["Architecture", "", "100100 OR 1=1", "abc", "100100; DROP"],
+    ids=["title", "empty", "injection", "letters", "statement"],
 )
 def test_a_root_page_id_that_is_not_a_content_id_is_refused_at_startup(root: str) -> None:
     """Ids reach CQL unquoted, so "is it digits" is the whole of the injection defense.
 
-    ``"100100 "`` is the exception and is accepted after stripping: surrounding whitespace in a
-    configuration file is a typing artifact rather than a different id.
+    Not an escaping rule but a shape rule, which is the stronger of the two: a value that could
+    end a literal and continue as query syntax never reaches a query at all, so there is no
+    escaping to get subtly wrong. Against a search endpoint the result of getting it wrong is
+    not an error — it is results, from a query nobody wrote.
     """
-    if root.strip().isdigit():
-        assert cloud_config(base_url="https://confluence.example.test/x", root_page_ids=(root,))
-        return
     with pytest.raises(ValueError, match="page id"):
         cloud_config(base_url="https://confluence.example.test/x", root_page_ids=(root,))
+
+
+def test_a_root_page_id_survives_the_whitespace_a_configuration_file_collects() -> None:
+    """Surrounding whitespace is a typing artifact, not a different page."""
+    config = cloud_config(
+        base_url="https://confluence.example.test/x", root_page_ids=(f" {ARCHITECTURE} ",)
+    )
+
+    assert config.root_page_ids == (ARCHITECTURE,)
 
 
 def test_root_page_ids_are_stored_deduplicated_and_in_a_stable_order() -> None:

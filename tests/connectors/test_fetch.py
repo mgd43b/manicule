@@ -19,7 +19,12 @@ from manicule.connectors import (
     RateLimitedError,
     UntrustedLinkError,
 )
-from manicule.connectors.confluence import ANCESTORS, STORAGE_MEDIA_TYPE, VERSION_TOKEN
+from manicule.connectors.confluence import (
+    ANCESTOR_IDS,
+    ANCESTORS,
+    STORAGE_MEDIA_TYPE,
+    VERSION_TOKEN,
+)
 from manicule.core.sources import DocRef
 from manicule.parsers.config import ADF_MEDIA_TYPE
 from tests.connectors.fake_confluence import (
@@ -264,6 +269,29 @@ async def test_a_breadcrumb_without_its_space_key_does_not_claim_to_be_complete(
 
     assert raw.metadata[ANCESTORS] == ["Platform", "Auth Service"]
     assert raw.metadata["breadcrumb_complete"] is False
+
+
+async def test_recovered_ancestors_bring_their_ids_and_not_only_their_titles() -> None:
+    """The Cloud ancestors endpoint reports both, so recording one of them is a choice.
+
+    An empty ancestor-id list is indistinguishable from a page at the top of its space, and
+    that is a different fact about a different page. Whichever fetch happened to run last would
+    otherwise decide which of the two the document asserts.
+    """
+    instance = FakeConfluence(
+        pages=[
+            FakePage(id="1", title="Page", space="ENG", parent="7"),
+            FakePage(id="7", title="Platform", space="ENG"),
+        ]
+    )
+    connector = await connected(instance)
+    try:
+        raw = await connector.fetch(DocRef(source_id="1", uri=f"{instance.base_url}/pages/1"))
+    finally:
+        await connector.teardown()
+
+    assert raw.metadata[ANCESTORS] == ["Platform"]
+    assert raw.metadata[ANCESTOR_IDS] == ["7"]
 
 
 async def test_a_server_breadcrumb_comes_from_the_fetch_own_expansion() -> None:

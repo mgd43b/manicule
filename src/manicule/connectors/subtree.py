@@ -174,7 +174,7 @@ class Subtree:
                     continue
                 covering = self.covering_roots(space, page_id, ancestor_ids(result))
                 if not covering:
-                    raise ConnectorError(self.out_of_scope(space, page_id, result))
+                    raise ConnectorError(self.out_of_scope(space, page_id))
                 found[page_id] = covering
 
         await self._check_not_falsely_empty(space, found)
@@ -223,11 +223,11 @@ class Subtree:
             return False
         return bool(_results(payload))
 
-    def out_of_scope(self, space: str, page_id: str, result: Mapping[str, object]) -> str:
+    def out_of_scope(self, space: str, page_id: str) -> str:
         """Why a page the source returned is being refused rather than filtered away.
 
-        Names the source, the space and the page id, and nothing from the response body beyond
-        the id — a refusal is read in logs, and a page title is content.
+        Takes the id rather than the result it came in. A refusal is read in logs and a page
+        title is content, so the response is not a thing this message should be holding at all.
         """
         roots = ", ".join(self.roots_in(space))
         excluded = (
@@ -236,7 +236,6 @@ class Subtree:
             if page_id in self.roots_in(space)
             else ""
         )
-        del result
         return (
             f"source {self._source!r}: the search for the page tree(s) {roots} in space "
             f"{space} returned page {page_id}, which is not in them.{excluded} The query "

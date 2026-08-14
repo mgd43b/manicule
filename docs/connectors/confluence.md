@@ -434,8 +434,8 @@ what makes the incremental attachment case correct rather than approximately cor
 
 ### Changing the roots
 
-A watermark is a position **within a scope**, and the two are meaningless apart. `Watermark.
-metadata` therefore records the scope its positions were reached in, and when the configured
+A watermark is a position **within a scope**, and the two are meaningless apart.
+`Watermark.metadata` therefore records the scope its positions were reached in, and when the configured
 roots or `include_root_pages` change, every stored position is discarded and the run enumerates
 the new scope in full. Anything less loses documents: every page in a newly configured tree that
 has not changed since the stored instant is already behind it, so an incremental query would

@@ -383,7 +383,7 @@ class ConfluenceConnector:
             page_id = _str(result.get("id"))
             roots = scope.covering_roots(space, page_id, subtree.ancestor_ids(result))
             if not roots:
-                raise ConnectorError(scope.out_of_scope(space, page_id, result))
+                raise ConnectorError(scope.out_of_scope(space, page_id))
             found = self._discovered(result, space=space, base=base, roots=roots)
             if found is not None:
                 yield found, cql.parse_when(_version_when(result))
@@ -676,9 +676,10 @@ class ConfluenceConnector:
             report.unresolved.extend(unresolved_because(self._macros_in(body), _RESOLUTION_OFF))
 
         ancestors: list[JsonValue] = list(body.ancestors) or list(_metadata_ancestors(ref))
+        ancestor_ids = body.ancestor_ids or _str_values(ref, ANCESTOR_IDS)
         complete = True
         if not ancestors:
-            titles, complete = await self._ancestor_titles_of(ref.source_id)
+            titles, ancestor_ids, complete = await self._ancestors_of(ref.source_id)
             ancestors = list(_str_list(space_key, *titles))
             # A breadcrumb starts at the space key, and on Cloud there may be no way to learn
             # it here: the body endpoint reports a numeric space id, and a ref rebuilt
@@ -708,7 +709,7 @@ class ConfluenceConnector:
         # stopped being subtree-scoped clears the provenance of the pages it keeps instead of
         # leaving them asserting a root that no longer selects anything.
         metadata[ROOT_PAGE_IDS] = list(_str_values(ref, ROOT_PAGE_IDS)) or None
-        metadata[ANCESTOR_IDS] = list(body.ancestor_ids or _str_values(ref, ANCESTOR_IDS))
+        metadata[ANCESTOR_IDS] = list(ancestor_ids)
         metadata.update(report.as_metadata())
         if expected is not None and body.version != expected:
             metadata["version_disagreement"] = {"discovered": expected, "fetched": body.version}
@@ -763,14 +764,18 @@ class ConfluenceConnector:
             return find_adf_macros(_adf_document(body.body, body.page_id))
         return find_storage_macros(body.body)
 
-    async def _ancestor_titles_of(self, page_id: str) -> tuple[tuple[str, ...], bool]:
-        """Ancestor titles for a page whose discovery record carried none, and whether they are
-        all there.
+    async def _ancestors_of(self, page_id: str) -> tuple[tuple[str, ...], tuple[str, ...], bool]:
+        """Ancestor titles and ids for a page whose discovery record carried none, and whether
+        the titles are all there.
 
-        Discovery expands ``ancestors`` and puts the titles on the ref, so this runs only for a
-        ref built somewhere else — a re-fetch from a stored one, a targeted single-page sync.
-        The Atlassian Document Format endpoint does not carry ancestors, hence a second call
-        rather than a wider expansion.
+        Discovery expands ``ancestors`` and puts both on the ref, so this runs only for a ref
+        built somewhere else — a re-fetch from a stored one, a targeted single-page sync. The
+        Atlassian Document Format endpoint does not carry ancestors, hence a second call rather
+        than a wider expansion.
+
+        **Ids come back from the same response as the titles**, because otherwise this path
+        would record an empty ancestor-id list for a page that has ancestors — and an empty list
+        is indistinguishable from a page at the top of its space, which is a different fact.
 
         The flag is returned rather than swallowed because a breadcrumb missing a level is not
         visibly wrong: it retrieves slightly worse and says nothing. An ancestor whose title
@@ -778,15 +783,20 @@ class ConfluenceConnector:
         number into the text the embedder reads.
         """
         if not self._is_cloud:
-            return (), True
+            return (), (), True
         url = f"{self._client.url(_V2_PAGE_PATH)}/{page_id}/ancestors"
         try:
             payload = await self._client.get_json(url, [("limit", "25")])
         except NotFoundError:
-            return (), True
+            return (), (), True
         entries = _results(payload)
         titles = tuple(_str(entry.get("title")) for entry in entries)
-        return tuple(title for title in titles if title), all(titles)
+        found = tuple(_str(entry.get("id")) for entry in entries)
+        return (
+            tuple(title for title in titles if title),
+            tuple(entry for entry in found if entry),
+            all(titles),
+        )
 
     async def _adf_body(self, page_id: str) -> _Body:
         url = f"{self._client.url(_V2_PAGE_PATH)}/{page_id}"
