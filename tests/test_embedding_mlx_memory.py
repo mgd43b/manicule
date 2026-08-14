@@ -82,7 +82,7 @@ def install_fake_mlx(monkeypatch: pytest.MonkeyPatch) -> FakeMlxCore:
     mlx = types.ModuleType("mlx")
     mlx.core = core  # pyright: ignore[reportAttributeAccessIssue] - standing in for a module
     monkeypatch.setitem(sys.modules, "mlx", mlx)
-    monkeypatch.setitem(sys.modules, "mlx.core", core)  # pyright: ignore[reportArgumentType]
+    monkeypatch.setitem(sys.modules, "mlx.core", core)
 
     def load_model(path: Path, *, path_to_repo: str) -> object:
         core.calls.append("load_model")
@@ -201,9 +201,7 @@ async def test_metrics_publish_what_resident_memory_cannot_show(
     assert published["mlx_peak_bytes"] == 33
     assert published["mlx_cache_limit_bytes"] == 64 * MEGABYTE
     assert all(
-        metric.unit == "bytes"
-        for metric in embedder.metrics()
-        if metric.name.startswith("mlx_")
+        metric.unit == "bytes" for metric in embedder.metrics() if metric.name.startswith("mlx_")
     )
 
 

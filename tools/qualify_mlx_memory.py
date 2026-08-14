@@ -30,11 +30,13 @@ Apple Silicon only: without Metal there is no unified-memory allocator to qualif
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import platform
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -133,7 +135,7 @@ def _bytes_from(value: str) -> int | None:
 # --- the child: the real embedder, on the real weights --------------------------------------
 
 
-def generate(count: int, count_tokens: Any) -> list[str]:
+def generate(count: int, count_tokens: Callable[[str], int]) -> list[str]:
     """Deterministic inputs of varying length, none over :data:`MAX_CONTENT_TOKENS`.
 
     Varying on purpose. manicule pads a batch to its own longest member, so at batch one every
@@ -158,10 +160,15 @@ def generate(count: int, count_tokens: Any) -> list[str]:
 
 async def run_child(passes: int, cache_limit_mb: int | None) -> None:
     """Load the model, embed one text at a time, and report after each pass on stdout."""
-    import mlx.core as mx
+    # Deferred, and it matters: only the child may import MLX. The parent measures a process
+    # holding Metal allocations, and it cannot be one of them.
+    import mlx.core as mx  # noqa: PLC0415
 
-    from manicule.embedding.cards import read_card
-    from manicule.embedding.runtimes.mlx_backend import DEFAULT_CACHE_LIMIT_BYTES, MlxEmbedder
+    from manicule.embedding.cards import read_card  # noqa: PLC0415
+    from manicule.embedding.runtimes.mlx_backend import (  # noqa: PLC0415
+        DEFAULT_CACHE_LIMIT_BYTES,
+        MlxEmbedder,
+    )
 
     limit = DEFAULT_CACHE_LIMIT_BYTES if cache_limit_mb is None else cache_limit_mb * 1024 * 1024
     card = read_card(MODEL)
@@ -237,8 +244,10 @@ def qualify(arguments: argparse.Namespace) -> dict[str, Any]:
     loaded: dict[str, Any] = {}
     aborted: str | None = None
 
-    assert child.stdout is not None
-    assert child.stdin is not None
+    if child.stdout is None or child.stdin is None:  # pragma: no cover - both are PIPE above
+        msg = "the child was started without the pipes the handshake runs over"
+        raise RuntimeError(msg)
+
     for line in child.stdout:
         record = json.loads(line)
         if record["event"] == "loaded":
@@ -271,14 +280,22 @@ def qualify(arguments: argparse.Namespace) -> dict[str, Any]:
         _release(child)
 
     child.wait()
-    return _report(arguments, baseline, loaded, samples, aborted, child.returncode)
+    return _report(
+        arguments,
+        samples,
+        baseline=baseline,
+        loaded=loaded,
+        aborted=aborted,
+        exit_code=child.returncode,
+    )
 
 
 def _report(
     arguments: argparse.Namespace,
+    samples: list[dict[str, Any]],
+    *,
     baseline: int | None,
     loaded: dict[str, Any],
-    samples: list[dict[str, Any]],
     aborted: str | None,
     exit_code: int,
 ) -> dict[str, Any]:
@@ -366,7 +383,8 @@ def _report(
 
 def _release(child: subprocess.Popen[str]) -> None:
     """Let the child run the next pass, now that this one has been measured."""
-    assert child.stdin is not None
+    if child.stdin is None:  # pragma: no cover - started with a pipe
+        return
     try:
         child.stdin.write("\n")
         child.stdin.flush()
@@ -395,9 +413,9 @@ def _say(arguments: argparse.Namespace, message: str) -> None:
 
 def weights_cached() -> bool:
     """Whether the MLX conversion is already on disk. Never fetches."""
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import snapshot_download  # noqa: PLC0415 - an embeddings extra
 
-    from manicule.embedding.artifacts import mlx_repo
+    from manicule.embedding.artifacts import mlx_repo  # noqa: PLC0415 - an embeddings extra
 
     try:
         snapshot_download(mlx_repo(MODEL), allow_patterns=["*.safetensors"], local_files_only=True)
@@ -432,8 +450,6 @@ def main() -> int:
     arguments = parser.parse_args()
 
     if arguments.child:
-        import asyncio
-
         asyncio.run(run_child(arguments.passes, arguments.cache_limit_mb))
         return 0
 

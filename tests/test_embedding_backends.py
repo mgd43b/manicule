@@ -29,7 +29,11 @@ skips, or fails under ``MANICULE_REQUIRE_EMBEDDING_MODELS``, which CI sets.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from collections.abc import Iterator
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import numpy as np
@@ -48,6 +52,8 @@ from manicule.testing import (
 from tests.embedding_support import (
     FULL_MODEL,
     PARITY_MODEL,
+    REQUIRE_MODELS_ENV,
+    is_required,
     require_model,
     requires_mlx,
 )
@@ -369,3 +375,43 @@ async def test_a_real_model_refuses_text_it_would_truncate(backend: str) -> None
 
     with pytest.raises(ContextOverflowError, match=f"{limit}-token limit"):
         await embedder.embed([" ".join(["word"] * (limit + 50))])
+
+
+def test_repeated_embedding_holds_a_bounded_physical_footprint() -> None:
+    """The MLX allocator bound, measured on real weights rather than asserted on a fake.
+
+    Runs ``tools/qualify_mlx_memory.py``, which embeds one text at a time and measures the
+    child process from *outside* with ``footprint``. That indirection is the whole point: MLX
+    allocates through Metal, ``ps`` does not report Metal buffers, and before the bound landed
+    this workload took physical footprint from 2.45 to 25.0 GiB while RSS fell. A test that
+    measured resident memory would have reported success throughout.
+
+    **Gated on the model being named rather than merely cached.** It is minutes of real forward
+    passes, so it runs when somebody has asked for ``BAAI/bge-m3`` explicitly — which is also
+    what keeps 4.6 GB of weights out of every CI run.
+    """
+    if not is_required(FULL_MODEL):
+        pytest.skip(f"set {REQUIRE_MODELS_ENV} to include {FULL_MODEL} to run the qualification")
+    require_model(FULL_MODEL, mlx=True)
+    requires_mlx(FULL_MODEL)
+
+    completed = subprocess.run(  # noqa: S603 - our own script, fixed arguments
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parent.parent / "tools" / "qualify_mlx_memory.py"),
+            "--passes",
+            "40",
+            "--settle-passes",
+            "5",
+            "--quiet",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = json.loads(completed.stdout)
+    assert report["passes_measured"] >= 40
+    assert report["max_content_tokens"] <= report["content_token_ceiling"]
