@@ -711,7 +711,7 @@ class IngestPipeline:
                 await closer()
             # However discovery ended, the stage in front of it has to be told, or every fetch
             # worker waits for an item that is never coming and the run never returns.
-            await refs.finish()
+            refs.finish()
 
     async def _fetch_into(
         self, run: _Sync, refs: Conveyor[DiscoveredDoc], bodies: Conveyor[_Fetched]
@@ -734,9 +734,15 @@ class IngestPipeline:
                 # they wait in as well as the worker that has one. A block cannot express that,
                 # so the pair is written out.
                 self._bodies.enter()
-                await bodies.put(accepted)
+                try:
+                    await bodies.put(accepted)
+                except BaseException:
+                    # A put that never landed is a body nothing downstream will release, so the
+                    # accounting is undone here rather than left for a stage that never sees it.
+                    self._bodies.leave()
+                    raise
         finally:
-            await bodies.finish()
+            bodies.finish()
 
     async def _ingest_from(self, run: _Sync, bodies: Conveyor[_Fetched]) -> None:
         """One ingest worker: parse, chunk, embed and commit one document, then the next.

@@ -89,6 +89,14 @@ class Conveyor[T]:
     **Not closed by whoever finishes first.** A stage with several producers is not done when
     one of them is, so :meth:`finish` counts them down and the last one out sends the
     end-of-stream. Closing on the first producer would abandon whatever the others still had.
+
+    **The bound is a semaphore rather than the queue's own ``maxsize``, and the reason is the
+    end-of-stream.** :meth:`finish` runs from a producer's ``finally``, which is where a stage
+    lands when the run is being torn down — and at that moment the consumers are being canceled
+    too. A ``maxsize`` queue would make sending the sentinels block on a full queue nobody will
+    ever drain again, inside a ``finally``, which is a teardown that never completes and a
+    command that never returns. Bounding the *items* with a semaphore leaves the sentinels free
+    to be delivered into an unbounded queue, so :meth:`finish` cannot wait for anything.
     """
 
     def __init__(self, *, name: str, capacity: int, consumers: int, producers: int = 1) -> None:
@@ -97,43 +105,54 @@ class Conveyor[T]:
             raise ValueError(msg)
         self.name = name
         self.capacity = capacity
+        self.depth = 0
         self.peak_depth = 0
         self.blocked_puts = 0
-        self._items: asyncio.Queue[T | _EndOfStream] = asyncio.Queue(maxsize=capacity)
+        self._items: asyncio.Queue[T | _EndOfStream] = asyncio.Queue()
+        self._room = asyncio.Semaphore(capacity)
         self._consumers = consumers
         self._producers = producers
-
-    @property
-    def depth(self) -> int:
-        """How many items are waiting right now."""
-        return self._items.qsize()
 
     async def put(self, item: T) -> None:
         """Hand an item on, waiting while the next stage is full.
 
         The wait is the backpressure, and it is counted rather than merely permitted.
         """
-        if self._items.full():
+        if self._room.locked():
             self.blocked_puts += 1
-        await self._items.put(item)
-        self.peak_depth = max(self.peak_depth, self._items.qsize())
+        await self._room.acquire()
+        self.depth += 1
+        self.peak_depth = max(self.peak_depth, self.depth)
+        self._items.put_nowait(item)
 
     async def take(self) -> T | None:
-        """The next item, or ``None`` when this consumer has reached the end of the stream."""
-        item = await self._items.get()
-        return None if isinstance(item, _EndOfStream) else item
+        """The next item, or ``None`` when this consumer has reached the end of the stream.
 
-    async def finish(self) -> None:
+        The room an item occupied is given back as it leaves the queue rather than when the
+        consumer has finished with it, which is what makes the capacity a statement about how
+        much is *waiting* — the quantity a queue depth is supposed to be about. What a consumer
+        is holding is bounded by how many consumers there are.
+        """
+        item = await self._items.get()
+        if isinstance(item, _EndOfStream):
+            return None
+        self.depth -= 1
+        self._room.release()
+        return item
+
+    def finish(self) -> None:
         """One producer is done. When the last one is, every consumer is told.
 
-        The decrement and the comparison have no ``await`` between them, so two producers
-        finishing in the same tick cannot both read zero and send two rounds of sentinels.
+        Synchronous and unable to wait, which is what makes it safe in the ``finally`` that every
+        producer ends in — see the class docstring. The decrement and the comparison have no
+        ``await`` between them, so two producers finishing in the same tick cannot both read zero
+        and send two rounds of sentinels.
         """
         self._producers -= 1
         if self._producers > 0:
             return
         for _ in range(self._consumers):
-            await self._items.put(_END)
+            self._items.put_nowait(_END)
 
     def report(self) -> QueueReport:
         return QueueReport(
