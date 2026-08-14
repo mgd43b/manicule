@@ -40,23 +40,70 @@ buy nothing, so the row is gone rather than half-built. Per-user visibility is
 
 ### 1.1 Browser sessions, for an instance behind an identity provider
 
-Self-hosted Confluence fronted by Okta, ADFS, Azure AD or similar commonly has personal access
-tokens disabled by policy, and then the only credential its users can obtain is the session
-their browser already holds. Five decisions carry it.
+Self-hosted Confluence fronted by an identity provider commonly has personal access tokens
+disabled by policy, and then the only credential its users can obtain is the session their
+browser already holds. There are three ways to hand one over, and the differences between them
+are security differences rather than convenience ones.
 
-**manicule never sees the password.** The person signs in to their own browser, against their
-own identity provider, with whatever second factor it demands, and pastes the resulting `Cookie`
-header into `manicule connector login <source>`. No password, no one-time code and no device
-approval passes through manicule — and that is a property of the design rather than a promise
-about the code, because there is no parameter and no code path that could accept one.
+```console
+$ manicule connector login wiki --browser        # opens a browser; you sign in there
+$ manicule connector login wiki --browser-state ./storage-state.json
+$ manicule connector login wiki                  # paste the Cookie header
+```
 
-**No browser is driven.** A driven Playwright browser would be more ergonomic and its licence
-(Apache-2.0) is compatible, so the objection is not licensing. It is that a driven browser is
-one manicule controls the DOM of, and the person is asked to type a corporate password into it:
-"manicule never sees the password" would become a matter of restraint rather than of capability.
-Two practical arguments run the same way — a driven Chromium is an unfamiliar device to a
-conditional-access policy and is often refused outright, and a browser download is a heavy
-dependency for a paste.
+**manicule never asks for the password and has nowhere to put one.** No password, no one-time
+code and no device approval passes through manicule on any of the three, and that much is a
+property of the code rather than a promise about it: there is no parameter that could carry one
+and no branch that would accept one.
+
+**The three differ in what "manicule cannot see your password" means.** This is the one thing to
+read before choosing:
+
+| | What manicule does | The guarantee |
+|---|---|---|
+| paste (default) | asks for a `Cookie` header you copied | **cannot** see the page you typed into — there is no browser |
+| `--browser-state` | reads a file another tool wrote | **cannot**, for the same reason |
+| `--browser` | opens a browser at your Confluence URL | **does not** — it reads no page content, and a test enforces that over the module's source |
+
+Earlier releases refused to drive a browser at all, and the reason was exactly the row above: a
+driven browser is one manicule controls the DOM of, and you are asked to type a corporate
+password into it. That argument was not wrong. What overruled it is that for a token-less
+instance the paste was not the safer of two options — it was the *only* option, and it asks
+somebody to open developer tools and hand-carry a live session cookie into a terminal every time
+their session expires.
+
+So `--browser` exists, the weakening is real, and it is bounded by three things rather than by
+intent: the browser is opened and then observed **only** through its cookie jar and whether the
+window is still open; nothing is typed, clicked or filled for you; and
+`tests/connectors/test_browser_login.py` fails if an accessor that reads page content appears in
+`connectors/browser.py`.
+
+**The paste path is not deprecated and is not a fallback.** It keeps the stronger guarantee and
+needs nothing installed. If that guarantee is what you want, use it.
+
+**The browser is an optional extra**, because it downloads one:
+
+```console
+$ pip install 'manicule[browser-auth]'
+$ playwright install chromium
+```
+
+Without them `--browser` fails immediately naming both commands. It does **not** quietly fall
+back to asking for a Cookie header — someone who asked for a browser and got a paste prompt
+would reasonably conclude the feature is broken.
+
+**Only your Confluence's cookies are taken.** Signing in through an identity provider means
+visiting it, and it sets cookies of its own — frequently an account you use at several
+companies. Those are filtered out before anything is stored, by domain, path, `secure` and
+expiry, using the browser's own rules: a host-only cookie must match the host exactly, a domain
+cookie matches on a label boundary (`.example.test` covers `wiki.example.test` and not
+`notexample.test`), and a path matches on a segment boundary, which is what makes an instance
+under a context path such as `/confluence` work without also importing a neighbouring
+application's cookies.
+
+**A driven Chromium may be refused by conditional access.** It is a new device to a policy that
+tracks them, and some tenants will decline it outright. That is a property of the tenant rather
+than a bug here; the paste path is unaffected because the browser is yours.
 
 **The session lives in the macOS Keychain.** Not `config.toml`, even at `0600`: a session cookie
 is the sync account's whole identity at that company rather than a scoped grant, and a
@@ -89,6 +136,64 @@ fresh sign-in resumes rather than starting over. `session_max_age_hours` (defaul
 manicule's own ceiling on how long it will keep using one: a cookie carries no expiry a client
 can read, and an age manicule measures itself is the only thing that can turn "too old to try"
 into a **startup** refusal rather than something the first page of a sync discovers.
+
+### 1.1a Importing a browser state file
+
+`--browser-state` reads a Playwright `storage_state` JSON document — the thing
+`context.storage_state(path=...)` writes — and takes the cookies in it that apply to your
+configured instance. It is the path for a machine that cannot open a window (a remote shell, a
+container) but can receive a file from one that can.
+
+```console
+$ manicule connector login wiki --browser-state ./storage-state.json
+```
+
+Four rules, each of which refuses rather than guesses:
+
+- **The file is never written to.** It is yours, it may belong to other tooling, and a login
+  that rewrote it would be a surprise in somebody else's workflow.
+- **It must not be readable by other users.** It holds live session cookies. A group- or
+  world-readable file is refused with the `chmod` to run; `--allow-insecure-state` imports it
+  anyway, which is a decision made out loud rather than a silent skip. The check does not apply
+  on Windows, where the POSIX bits a stat reports are not the access control the platform
+  enforces.
+- **It is parsed defensively and never quoted back.** One malformed entry does not cost a good
+  file; a file with no usable entry is refused. No part of the document reaches an error
+  message, because the whole document is secret.
+- **`localStorage` is ignored.** Confluence authenticates with cookies; page state is not
+  manicule's business.
+
+A state file from a different site is the usual cause of "no cookies for
+`https://confluence.example.test/confluence`" — the document records whatever was signed in when
+it was written.
+
+### 1.1b Signing out, and signing back in
+
+```console
+$ manicule connector login wiki --forget      # remove the stored session
+$ manicule connector login wiki --browser     # take a new one
+```
+
+`--forget` removes the keychain entry for that instance. It does not sign you out of Confluence
+itself, which is your browser's business and your identity provider's.
+
+**A failed login never costs you a working session.** Verification happens before the store is
+touched, so a timeout, a closed window, a dead cookie or a state file for the wrong site leaves
+whatever was stored exactly as it was. There is no delete-then-write window because the write is
+the last thing that happens and it happens only on success.
+
+### 1.1c When it does not work
+
+| Symptom | What it means | What to do |
+|---|---|---|
+| `browser sign-in needs Playwright` | the extra is not installed | run both commands it names — the package and `playwright install chromium` are two steps |
+| `the browser would not start` | the package is installed, the browser is not | `playwright install chromium` |
+| `sign-in did not complete within the timeout` | five minutes elapsed | `--timeout 600`, or set `browser_timeout_seconds`. Conditional access with a device-approval step is the usual reason |
+| `the browser was closed before sign-in finished` | the window was shut | re-run and leave it open until Confluence itself has loaded |
+| `the browser finished with no cookies for <url>` | sign-in never reached Confluence, or `base_url` is wrong | check `base_url` names the site root **including any context path** |
+| a sign-in page was stored as content | it cannot be — §1.3 | nothing; the refusal is the design |
+| `... was captured N hours ago` | the session aged past `session_max_age_hours` | sign in again; nothing is lost, the watermark did not advance |
+| the tenant refuses the browser | conditional access does not recognise a driven Chromium | use the paste path, which uses your own browser |
 
 ### 1.2 The credential is checked before the connector is constructed
 
@@ -469,6 +574,10 @@ differ, it is here — check these first when one is available:
 | Sign-in redirects go to `/login.action` or a listed SSO servlet | Let a session expire and re-run | Caught by origin or by the body markers instead; add the path |
 | Nothing legitimate redirects off the configured origin | A full sync including attachments | An attachment download refuses instead of following. Cloud is the case to watch: if its `_links.download` redirects to a media CDN, that redirect is now refused loudly rather than followed |
 | `security` still truncates a stdin secret at 128 bytes | The Keychain round-trip test | The chunk size is wrong; the read-back comparison turns it into a refusal rather than a truncated credential |
+| A driven Chromium is accepted by the tenant's conditional-access policy | `connector login --browser` against the real instance | The browser path is unusable there; the paste path still works, because that browser is the person's own |
+| Sign-in completes without the person needing a second tab or window | Same | The poll watches one context's jar; a flow that finishes elsewhere would time out. The state-import path is the workaround |
+| The session cookies Confluence needs are set on the configured origin rather than on a parent domain only | Same, then `connector sync` | The origin filter keeps too little and login reports no applicable cookies. The domain rule already accepts a parent-domain cookie, so this is about an unusual scope rather than the common case |
+| `browser_timeout_seconds` (default 300) is long enough for the provider's slowest path | A sign-in with device approval | Raise it or pass `--timeout`; the failure is a refusal that stores nothing |
 
 ---
 

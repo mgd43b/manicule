@@ -1015,20 +1015,68 @@ def connector_sidecar(
 @connector_app.command("login")
 def connector_login(
     name: Annotated[str, typer.Argument(help="The configured source's name.")],
+    *,
+    browser: Annotated[
+        bool,
+        typer.Option("--browser", help="Open a browser and sign in there instead of pasting."),
+    ] = False,
+    browser_state: Annotated[
+        Path | None,
+        typer.Option(
+            "--browser-state",
+            help="Import cookies from a Playwright storage_state JSON file.",
+        ),
+    ] = None,
+    timeout: Annotated[
+        float | None,
+        typer.Option(
+            "--timeout",
+            help="Seconds to wait for browser sign-in. Defaults to browser_timeout_seconds.",
+        ),
+    ] = None,
+    allow_insecure_state: Annotated[
+        bool,
+        typer.Option(
+            "--allow-insecure-state",
+            help="Import a --browser-state file that other users on this machine can read.",
+        ),
+    ] = False,
     forget: Annotated[
         bool, typer.Option("--forget", help="Remove the stored session instead of taking one.")
     ] = False,
 ) -> None:
     """Capture the browser session a Confluence source behind single sign-on signs in with.
 
-    Sign in to Confluence in your own browser first, then paste the Cookie header from its
-    developer tools when this asks. manicule never asks for your password, cannot use one,
-    and has nowhere to put one.
+    `--browser` opens a browser at the source's URL and waits while you sign in — including any
+    second factor or conditional-access step. Nothing is typed for you and no page content is
+    read; manicule watches only the cookie jar, and stores nothing until the instance confirms
+    who you are. It needs `manicule[browser-auth]`.
+
+    Without it, sign in to Confluence in your own browser and paste the Cookie header from its
+    developer tools when this asks. That path needs nothing installed and keeps the stronger
+    property: with no browser to drive, manicule cannot see the page you type into.
+
+    manicule never asks for your password, cannot use one, and has nowhere to put one.
+
+    Command line only. It opens a window on this machine and writes a credential to the
+    keychain, neither of which belongs on a surface an unattended caller can reach.
     """
-    cookies = "" if forget else read_secret(SESSION_PROMPT)
+    # Prompting is skipped for every path that is not the paste, so `--browser` does not stop to
+    # ask for the thing it is there to avoid — and `--forget` does not ask for a secret it is
+    # about to delete. Mutual exclusion is the service's, so one refusal covers every surface.
+    manual = not (browser or browser_state is not None or forget)
+    cookies = read_secret(SESSION_PROMPT) if manual else ""
     emit(
         "connector_login",
-        lambda service: service.connector_login(name, cookies=cookies, forget=forget),
+        lambda service: service.connector_login(
+            name,
+            cookies=cookies,
+            forget=forget,
+            browser=browser,
+            browser_state=browser_state,
+            timeout_seconds=timeout,
+            allow_insecure_state=allow_insecure_state,
+        ),
     )
 
 

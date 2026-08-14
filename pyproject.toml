@@ -118,6 +118,24 @@ connectors = [     # #9
   # the same code path a live instance would take rather than against a mocked-out client.
   "httpx>=0.28",
 ]
+browser-auth = [
+  # Interactive sign-in for a Confluence Server instance behind an identity provider, where
+  # personal access tokens are commonly disabled by policy and the only credential a person can
+  # obtain is the session their own browser holds.
+  #
+  # An extra rather than a dependency, and the split matters more here than elsewhere: this
+  # pulls a browser *driver*, and `playwright install chromium` then downloads a browser — some
+  # hundreds of megabytes that an installation authenticating with an API token has no use for
+  # whatsoever. `manicule connector login --browser` reports both steps by name when the import
+  # fails, and deliberately does not fall back to asking for a pasted Cookie header: a person
+  # who asked for the browser flow and silently got the manual one would conclude the flow does
+  # not work, which is worse than being told what to install.
+  #
+  # Apache-2.0, which is compatible with GPL-3.0-or-later. Licensing was never the objection to
+  # driving a browser — `connectors/sessions.py` records what the objection actually was, and
+  # what changed.
+  "playwright>=1.49",
+]
 serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #12 — the browser UI.
   # Typer derives the command line from type hints, so the signature of a service call and
   # the shape of the command that reaches it cannot drift. MIT.
@@ -211,6 +229,12 @@ dev = [
   # The connector stack, for the same reason: `uv sync --all-groups` is what CI runs, and the
   # Confluence suites need the HTTP client they drive their synthetic instance through.
   "manicule[connectors]",
+  # The browser driver, so the Playwright provider is type-checked and importable in CI. This
+  # is the *package* only — `playwright install chromium` downloads the browser and CI does not
+  # run it. Every test of the login flow drives `BrowserSessionProvider` with a fake, so the
+  # suite neither downloads nor launches a browser; the one test that would needs the binary
+  # and skips with a reason when it is absent.
+  "manicule[browser-auth]",
   # The context fitter's tokenizer, for the same reason. `manicule[rerank]` is deliberately
   # *not* here: it is torch, and the cross-encoder's ordering, truncation and failure rules are
   # exercised through `PairScorer` — a seam that exists so those rules can be tested without a
@@ -404,6 +428,7 @@ addopts = "-ra --strict-markers --strict-config"
 markers = [
   "contract: protocol conformance suites that every implementation must pass",
   "slow: starts real subprocesses; the only way to test what a process boundary buys",
+  "browser: needs a downloaded browser binary; skipped when one is not installed",
 ]
 filterwarnings = ["error"]
 

@@ -253,6 +253,18 @@ ABSENT: tuple[tuple[str, str, Reach, str], ...] = (
     ),
     (
         "POST",
+        "/api/v1/connectors/login",
+        Reach.UNROUTED,
+        "browser sign-in opens a window on the host and writes a credential to the keychain",
+    ),
+    (
+        "POST",
+        "/api/v1/admin/connectors/login",
+        Reach.UNROUTED,
+        "the same operation under an admin path",
+    ),
+    (
+        "POST",
         "/api/v1/admin/reindex",
         Reach.UNROUTED,
         "a corpus-wide re-parse runs the embedder over everything a parser bump touched",
@@ -340,6 +352,42 @@ def test_no_route_installs_a_plugin() -> None:
         f"a route installs plugins: {offending}. Installing a plugin fetches and executes code, "
         f"so it stays on the command line; this surface only enables one that an operator has "
         f"already put on disk."
+    )
+
+
+def test_no_route_signs_a_connector_in() -> None:
+    """Asserted by name as well as by path, because a path probe cannot cover what nobody named.
+
+    ``connector login`` was already command-line only, and what changed is how much that matters:
+    it now **opens a browser window on the host** and waits for a person, on top of writing a
+    credential to the keychain. A request that launches a GUI on the server is a new kind of
+    authority rather than a new operation — and an unattended caller reaching it would hang for
+    the length of the timeout with a window nobody is sitting at.
+
+    The two ``ABSENT`` entries above cover the paths somebody would guess. This covers the one
+    they would not, which is the gap ``tests/routing_support`` names in as many words.
+
+    **Matched on the operation rather than on the route's name**, and the difference is not
+    academic: the first version of this test looked for ``login`` in the path or the name, and a
+    route mounted at ``/admin/sources/authenticate`` called ``sign_in_connector`` passed it
+    while calling ``connector_login``. A word list is a guess about what somebody will call
+    their route; the service operation is what the route actually reaches, and there is exactly
+    one name for it.
+    """
+    import inspect  # noqa: PLC0415 - only this assertion reads a handler's source
+
+    offending: list[str] = []
+    for route in walk_routes():
+        try:
+            source = inspect.getsource(route.endpoint)
+        except (OSError, TypeError):  # pragma: no cover - a handler with no readable source
+            continue
+        if "connector_login" in source:
+            offending.append(f"{route.name} {route.path}")
+    assert sorted(offending) == [], (
+        f"a route signs a connector in: {sorted(offending)}. Browser sign-in opens a window on "
+        f"this machine and stores a credential; both belong on the surface where a person is "
+        f"present."
     )
 
 
