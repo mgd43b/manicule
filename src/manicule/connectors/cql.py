@@ -32,6 +32,7 @@ __all__ = [
     "latest",
     "parse_when",
     "quote",
+    "status_clause",
     "subtree_clause",
     "title_query",
 ]
@@ -74,6 +75,29 @@ def quote(value: str) -> str:
         raise ValueError(msg)
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def status_clause(*, current_only: bool) -> tuple[str, ...]:
+    """``("status = current",)`` or nothing, and the choice is the caller's to state.
+
+    **Two deployments disagree about whether this field exists.** Cloud's search accepts
+    ``status`` and needs it: reconciliation depends on a deleted page *not* being returned
+    (``docs/connectors/confluence.md`` §3), and a query that quietly included trashed content
+    would report every deleted page as still present, so deletion detection would run, succeed,
+    and find nothing forever. The standard Data Center content-search resource **rejects** the
+    field outright and returns current content by default, so the same clause is an HTTP 400
+    there rather than a safeguard.
+
+    **No default, and keyword-only.** A default would have to be one deployment's answer, and
+    whichever one it was would be silently wrong for the other every time somebody added a call
+    site without thinking about it — which is exactly how a query builder comes to have seven
+    callers and six of them correct. Requiring the word makes a forgotten call site a type
+    error at the point it is written rather than an HTTP 400 against somebody's live wiki.
+
+    A tuple rather than a string so that "no clause" is an empty sequence to splice, not an
+    empty string a caller has to remember to filter out of a join.
+    """
+    return ("status = current",) if current_only else ()
 
 
 def subtree_clause(roots: Sequence[str], *, include_roots: bool) -> str:
@@ -120,6 +144,7 @@ def subtree_clause(roots: Sequence[str], *, include_roots: bool) -> str:
 def content_query(
     space: str,
     *,
+    current_only: bool,
     types: Sequence[str] = ("page",),
     since: str | None = None,
     ordered: bool = True,
@@ -127,13 +152,10 @@ def content_query(
 ) -> str:
     """The CQL for one space's content, optionally only what changed since ``since``.
 
-    ``status = current`` is explicit rather than assumed. Reconciliation depends on a deleted
-    page *not* being returned (``docs/connectors/confluence.md`` §3); a query that quietly
-    included trashed content would report every deleted page as still present, and deletion
-    detection would run, succeed, and find nothing forever.
-
     Args:
         space: Space key.
+        current_only: Whether to write ``status = current``. **Required, and keyword-only.**
+            See :func:`status_clause` for why it has no default.
         types: Content types to enumerate, e.g. ``("page", "attachment")``.
         since: A :data:`CQL_TIMESTAMP`-formatted timestamp, or ``None`` for everything.
         ordered: Sort oldest first. Deterministic enumeration, so an interrupted run resumes
@@ -149,7 +171,7 @@ def content_query(
     clauses = [
         f"type in ({kinds})" if len(types) > 1 else f"type = {types[0]}",
         f"space = {quote(space)}",
-        "status = current",
+        *status_clause(current_only=current_only),
     ]
     if subtree:
         clauses.append(subtree)
@@ -159,9 +181,15 @@ def content_query(
     return f"{query} order by lastmodified asc" if ordered else query
 
 
-def title_query(space: str, title: str) -> str:
+def title_query(space: str, title: str, *, current_only: bool) -> str:
     """The CQL that finds one page by its title, which is how an ``include`` names its target."""
-    return f"type = page AND space = {quote(space)} AND title = {quote(title)} AND status = current"
+    clauses = [
+        "type = page",
+        f"space = {quote(space)}",
+        f"title = {quote(title)}",
+        *status_clause(current_only=current_only),
+    ]
+    return " AND ".join(clauses)
 
 
 def parse_when(value: object) -> datetime | None:

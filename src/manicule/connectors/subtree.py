@@ -163,7 +163,19 @@ class Subtree:
 
         found: dict[str, tuple[str, ...]] = {}
         params = [
-            ("cql", cql.content_query(space, types=(_PAGE,), subtree=self.clause(space))),
+            (
+                "cql",
+                cql.content_query(
+                    space,
+                    # The same property the connector's own queries read. Server and Data
+                    # Center reject `status`, and a subtree enumeration that carried it would
+                    # fail with an HTTP 400 *after* discovery had already succeeded — which is
+                    # the shape of bug that gets reported as "attachments are broken".
+                    current_only=self._config.current_only,
+                    types=(_PAGE,),
+                    subtree=self.clause(space),
+                ),
+            ),
             ("limit", str(self._config.page_size)),
             ("expand", "ancestors"),
         ]
