@@ -316,10 +316,12 @@ async def test_doctor_counts_the_documents_that_predate_the_record(
 
 
 async def test_doctor_says_a_routine_sync_will_not_perform_the_migration() -> None:
-    """The sentence that stops somebody running a sync, seeing it succeed, and stopping.
+    """The sentence that stops somebody running a sync, seeing nothing change, and giving up.
 
-    An unchanged page is neither re-enumerated nor re-fetched, so the incremental operation an
-    operator would reach for first is exactly the one that does nothing here.
+    This is the non-obvious half. "Re-fetch these pages" reads like an instruction `connector
+    sync` carries out, and it does not — so the message names **both** mechanisms that stop it,
+    because an operator who is told only that it will not work has no way to tell a limitation
+    from a bug.
     """
     backend = _configured(FakeBackend(), wiki="confluence")
     backend.store.add(_wiki_document(backend))
@@ -327,6 +329,8 @@ async def test_doctor_says_a_routine_sync_will_not_perform_the_migration() -> No
     check = _check(await ApplicationService(backend).doctor(), "wiki-provenance")
 
     assert "routine incremental sync will not" in check.detail
+    assert "watermark" in check.detail, "the reason it is never enumerated"
+    assert "version token" in check.detail, "the reason it would skip even if it were"
     assert "must not be invented" in check.detail
     assert "resync" in check.remedy
 
@@ -362,7 +366,13 @@ async def test_doctor_ignores_documents_from_every_other_kind_of_source(
     check = _check(await ApplicationService(backend).doctor(), "wiki-provenance")
 
     assert check.state == "ok"
-    assert "no live Confluence source is configured" in check.detail
+    assert check.detail == "no live Confluence source is configured"
+    # Not a word about records or migrations. An installation that has never pointed at a wiki
+    # is not an audience for either, and a health command that explains an inapplicable
+    # migration to everybody is how people learn to skim `doctor`.
+    assert "record" not in check.detail
+    assert "sync" not in check.detail
+    assert check.facts == {}
 
 
 async def test_doctor_reports_a_fully_recorded_corpus_as_healthy(stored: Document) -> None:
@@ -374,6 +384,10 @@ async def test_doctor_reports_a_fully_recorded_corpus_as_healthy(stored: Documen
 
     assert check.state == "ok"
     assert check.facts["sources"] == ["wiki"]
+    # A healthy corpus reports no count. Zero affected documents dressed as a finding is a
+    # number somebody has to read and then work out means nothing.
+    assert "missing_provenance" not in check.facts
+    assert check.remedy == ""
 
 
 async def test_doctor_changes_nothing_when_asked_to_fix() -> None:

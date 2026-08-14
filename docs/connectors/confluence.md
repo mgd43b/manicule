@@ -592,6 +592,14 @@ which are local, cheap and idempotent, and re-crawling somebody else's wiki is n
 Hiding a recrawl behind a health command is the same defect as hiding one behind an incremental
 sync.
 
+**No automated lever is provided, and that is a decision rather than an oversight.** Clearing the
+stored version tokens and invalidating the source's watermark would make the next sync do exactly
+the right work, and building it means new methods on the ingest store and the application port.
+It is not built because the population it would serve is currently **empty**: this connector has
+never been run against a live instance (§10), so there are no pre-change documents anywhere to
+migrate. Machinery for a corpus that does not exist would be shaped by a guess about what its
+migration needs. The check is what tells somebody when that stops being true.
+
 Re-fetching preserves identity: a page is keyed on its content id, so enrichment updates the
 existing document rather than creating a second one. It is safe to interrupt and safe to repeat —
 whatever was not reached still carries no record, and the next `doctor` counts exactly those.

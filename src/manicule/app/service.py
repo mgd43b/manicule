@@ -1953,10 +1953,12 @@ class ApplicationService:
             if connector.type == CONNECTOR_NAME
         )
         if not live:
+            # Plainly, and with no mention of records or migrations. Somebody running `doctor`
+            # on an installation that has never pointed at a wiki is not an audience for either.
             return r.Check(
                 name="wiki-provenance",
                 state="ok",
-                detail="no live Confluence source is configured, so none can be missing a record",
+                detail="no live Confluence source is configured",
             )
         try:
             store = await self._backend.documents()
@@ -2004,8 +2006,10 @@ class ApplicationService:
                 f"and correctly cited from their own fields; what they cannot supply is a "
                 f"claim-level citation carrying the page's version and modification time. The "
                 f"modification time was never stored locally and must not be invented, so these "
-                f"pages have to be fetched again — which a routine incremental sync will not do, "
-                f"because an unchanged page is neither re-enumerated nor re-fetched."
+                f"pages have to be fetched again. **A routine incremental sync will not do it**: "
+                f"the stored watermark means discovery does not enumerate a page nobody has "
+                f"edited, and its version token is unchanged, so it would skip without a fetch "
+                f"even if it were enumerated. Re-sync {affected[0]} in full."
             ),
             facts=cast(
                 "dict[str, JsonValue]",
