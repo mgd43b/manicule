@@ -27,6 +27,7 @@ import pytest
 
 from manicule.core.fingerprints import DETECTION_DISABLED
 from manicule.ingest.glossary_lineage import (
+    DERIVED_FROM,
     DETECTOR,
     NOT_DIGESTED,
     SOURCES,
@@ -150,6 +151,13 @@ def test_a_dependency_that_decides_a_stored_entry_is_recorded_with_its_version()
 
     ``pydantic`` validates :class:`~manicule.core.glossary.GlossaryEntry`'s field constraints, so
     it decides which rows may be persisted at all.
+
+    **The interpreter is recorded too, at its feature version**, because ``unicodedata`` is not
+    the only standard-library module that decides an entry: ``re`` compiles every written form,
+    ``str.isupper`` is the whole of the shape gate, and ``str.casefold`` decides whether two
+    aliases are one. Recording the Unicode data version alone would catch one of two failures
+    with the same shape. ``3.13`` rather than ``3.13.11`` is the deliberate half — see
+    :func:`~manicule.ingest.glossary_lineage.libraries` for the risk that accepts.
     """
     import unicodedata  # noqa: PLC0415 - read for its data version, as the fingerprint does
 
@@ -157,6 +165,11 @@ def test_a_dependency_that_decides_a_stored_entry_is_recorded_with_its_version()
 
     assert recorded["unicodedata"] == unicodedata.unidata_version
     assert recorded["pydantic"] == version("pydantic")
+    assert recorded["python"] == f"{sys.version_info.major}.{sys.version_info.minor}"
+    assert recorded["python"].count(".") == 1, (
+        "the patch level would re-stale every corpus on a bugfix release, and would make two "
+        "machines one patch apart disagree about a restored index"
+    )
     assert glossary_fingerprint().libraries == libraries()
 
 
@@ -184,6 +197,74 @@ def test_the_dependencies_are_read_off_the_imports_rather_than_listed() -> None:
 
     assert third_party, "the fixture assumes the detector imports something outside stdlib"
     assert third_party <= recorded, f"{sorted(third_party - recorded)} reached no fingerprint"
+
+
+def test_the_detector_may_not_import_dynamically() -> None:
+    """The one blind spot in the derivation, converted from silent into forbidden.
+
+    Everything else :func:`libraries` cannot see has a reason attached in
+    :data:`~manicule.ingest.glossary_lineage.DERIVED_FROM`. This one does not: an
+    ``importlib.import_module('x')`` is a function call, the walk cannot resolve it, and the
+    dependency it pulls in would decide stored entries with nothing recording its version.
+
+    A limit nobody can act on is worth less than a rule, so it is a rule. If detection ever
+    genuinely needs a dynamic import, this fails and whoever wrote it has to decide how the
+    fingerprint covers it — which is the conversation that would otherwise not happen.
+
+    **Matched on the name being called rather than on how it was reached**, because the obvious
+    version of this had the same blind spot as the derivation it defends: checking `ast.Attribute`
+    for `import_module` misses `from importlib import import_module` followed by a bare call, and
+    the guard would then be silent about exactly the thing it exists to make loud. All four
+    spellings are caught — bare, attribute, `builtins.__import__`, and the rebound name.
+
+    **It is over-broad by the same rule, and that is the trade rather than an oversight.** Any
+    `.import_module(...)` is flagged whether or not it is importlib's. Narrowing it would mean
+    resolving the binding — machinery whose only purpose is to grant an exemption, in two files
+    that today import nothing but `re`, `unicodedata`, `typing`, `enum` and ``pydantic``. A false
+    positive here is one loud failure landing on whoever wrote the line, with an assertion
+    message telling them what to decide; a false negative is a dependency deciding stored entries
+    with no version recorded anywhere, in silence. Those are not symmetrical, and the guard is
+    aimed at the second.
+    """
+    # Matched on the *name being called*, however it was bound. An earlier version of this
+    # checked `ast.Name` for `__import__` and `ast.Attribute` for `import_module`, which let
+    # `from importlib import import_module` followed by a bare `import_module("x")` through —
+    # a guard with the same blind spot as the thing it guards is worth less than none.
+    dynamic = {"__import__", "import_module"}
+    offenders: list[str] = []
+    for package, name in SOURCES:
+        tree = ast.parse(_source_path(package, name).read_bytes())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            called = node.func
+            invoked = (
+                called.id
+                if isinstance(called, ast.Name)
+                else called.attr
+                if isinstance(called, ast.Attribute)
+                else ""
+            )
+            if invoked in dynamic:
+                offenders.append(f"{package}.{name}: {invoked}(...)")
+
+    assert not offenders, (
+        f"{offenders} imports dynamically, which the fingerprint's derivation cannot follow. "
+        f"The dependency would decide stored entries with no version recorded anywhere. Import "
+        f"it statically, or decide how libraries() is to cover it and say so in DERIVED_FROM."
+    )
+
+
+def test_every_stated_limit_of_the_derivation_carries_its_reasoning() -> None:
+    """A map of holes is only useful if each one says what it costs.
+
+    The same rule :data:`NOT_DIGESTED` is held to, and for the same reason: a limit stated
+    without its consequence is a sentence a reader skims, and this map exists precisely for the
+    reader who would otherwise assume the derivation is total.
+    """
+    assert DERIVED_FROM
+    for limit, reasoning in DERIVED_FROM.items():
+        assert len(reasoning) > 80, f"the {limit!r} limit is named without being explained"
 
 
 @pytest.mark.parametrize(

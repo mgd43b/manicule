@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 __all__ = [
+    "DERIVED_FROM",
     "DETECTOR",
     "NOT_DIGESTED",
     "SOURCES",
@@ -123,6 +124,49 @@ rule far wider than its justification.
 """
 
 
+DERIVED_FROM: Final[dict[str, str]] = {
+    "import statements, at any nesting": (
+        "every `import` and `from ... import` in the digested files reaches the walk, wherever "
+        "it sits — inside a function, under `if TYPE_CHECKING`, in a `try/except ImportError`. "
+        "`ast.walk` visits the whole tree rather than the module body, and a TYPE_CHECKING "
+        "import is the case worth naming: it never executes, so no runtime inspection would see "
+        "it, and a rule arriving through one would otherwise be a rule nothing covered."
+    ),
+    "one level of imports, not their imports": (
+        "the digested files' own imports are read; what *those* modules import is not. For "
+        "`manicule` modules that is closed rather than open, and NOT_DIGESTED is where: anything "
+        "the walk finds is either digested — in which case its own imports are walked too — or "
+        "named there with the reason it cannot change what gets stored. For a third-party "
+        "module it is closed by the entry below instead, since a distribution's dependencies "
+        "move with the version recorded for it."
+    ),
+    "static imports only": (
+        "`importlib.import_module('x')` and `__import__('x')` are function calls, so the walk "
+        "cannot resolve them and would miss the dependency in silence. That is the one blind "
+        "spot with no reasoning behind it, so it is not left as one: "
+        "`tests/glossary/test_lineage.py` fails if a digested source contains either form, "
+        "which turns the thing this cannot see into the thing it is not allowed to do."
+    ),
+    "a distribution's own pins": (
+        "pydantic's version is recorded and pydantic-core's is not — no version is written down "
+        "here, because one in a comment is one that goes stale on the next upgrade. Pydantic "
+        "pins its core exactly, so the recorded version implies it; a distribution that did not "
+        "pin its own would be a gap, and would be a gap in that distribution rather than here."
+    ),
+}
+"""What :func:`libraries` and :func:`detector_imports` actually read, and what they do not.
+
+Written in :data:`NOT_DIGESTED`'s style and for its reason. A derived mechanism fails silently
+when its derivation has a hole, so the holes are the part worth stating — a reader who assumes
+the digest plus these versions is *total* will one day be wrong, and the useful thing is to know
+in advance which way.
+
+The interpreter entry in :func:`libraries` carries the other limit, which is granularity rather
+than coverage: the feature version is recorded, so a standard-library behaviour change that ships
+in a patch release is not caught. See there for why that trade was taken.
+"""
+
+
 def _read(package: str, name: str) -> bytes:
     """One digested source's bytes, newline-folded.
 
@@ -170,7 +214,7 @@ def libraries() -> tuple[str, ...]:
     changes; it cannot catch a rule changing underneath an unchanged file, and that is exactly
     what a dependency upgrade is.
 
-    Two kinds are recorded and neither was, until the specification asked:
+    Three kinds are recorded and none was, until the specification asked:
 
     **Distributions the digested sources import.** ``manicule.core.glossary`` imports
     ``pydantic``, which validates :class:`~manicule.core.glossary.GlossaryEntry`'s field
@@ -180,10 +224,28 @@ def libraries() -> tuple[str, ...]:
 
     **The Unicode database.** :func:`~manicule.core.glossary.normalise_acronym` NFKC-normalises,
     so the version of the character database decides a stored *lookup key*; #121 put NFKC into
-    :func:`~manicule.ingest.glossary.initial_skeleton` as well. It moves with the interpreter and
-    has no distribution to look up, so it is the one input the derivation above cannot see and
-    the one entry here that is named. Recorded as ``unicodedata@<unidata_version>`` so that it
-    reads like the rest.
+    :func:`~manicule.ingest.glossary.initial_skeleton` as well. It has no distribution to look
+    up, so it is named rather than derived.
+
+    **The interpreter, at its feature version.** ``unicodedata`` is not the only standard-library
+    module that decides an entry, and recording it alone would catch one of two failures with the
+    same shape. ``re`` compiles every written form; ``str.isupper`` is the whole of the shape
+    gate; ``str.casefold`` decides whether two aliases are one. None has a distribution, and all
+    of them move with the interpreter.
+
+    :data:`DERIVED_FROM` states what this therefore does *not* catch. The choice worth repeating
+    here is the granularity: ``3.13`` rather than ``3.13.11``. CPython's own policy is that a
+    patch release fixes bugs without changing documented behaviour, so re-staling a corpus on one
+    would be invalidating for a change that is not supposed to exist — and two machines a patch
+    apart would disagree about a restored corpus for a reason nobody could act on. **The accepted
+    risk is a behaviour change that ships in a patch release anyway**, which is real, narrow, and
+    chosen over churning every corpus on every patch upgrade.
+
+    ``unicodedata`` is kept beside it even though CPython moves the two together, so it is
+    redundant rather than additive — it costs no extra invalidation and it makes a stale
+    fingerprint legible. ``unicodedata@15.1.0 -> 16.0.0`` says normalisation moved;
+    ``python@3.13 -> 3.14`` says the interpreter did, and an operator reading a diff should not
+    have to know which release changed which table.
 
     Sorted, so the value is a set of facts rather than an import order.
 
@@ -203,8 +265,11 @@ def libraries() -> tuple[str, ...]:
     }
     return tuple(
         sorted(
-            [f"unicodedata@{unicodedata.unidata_version}"]
-            + [f"{name}@{version(name)}" for name in named]
+            [
+                f"python@{sys.version_info.major}.{sys.version_info.minor}",
+                f"unicodedata@{unicodedata.unidata_version}",
+                *(f"{name}@{version(name)}" for name in named),
+            ]
         )
     )
 
