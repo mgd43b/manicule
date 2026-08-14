@@ -112,23 +112,47 @@ that reached the instance and was then turned away still gets the *wait longer* 
 before Confluence answers at all. The heuristic errs toward telling you to wait, which costs a
 timeout you were spending anyway rather than talking you out of a setup that works.
 
-**The session lives in the macOS Keychain.** Not `config.toml`, even at `0600`: a session cookie
-is the sync account's whole identity at that company rather than a scoped grant, and a
-configuration file reaches version control eventually. The configuration model forbids unknown
-keys, so a `session_cookie` written there is a startup error rather than a working setting.
-Nothing lands under `<data_dir>`, so `docs/storage.md` §7.1 and the `doctor` permissions check
-do not come into it. On a machine with no Keychain the fallback is `$CONFLUENCE_SESSION_COOKIE`,
-a per-run credential manicule never writes down.
+**The session lives in the running server's memory, and nowhere else. No server, no sync.**
 
-Two things about the Keychain are worth recording because neither is guessable. Items are
-created with `-T /usr/bin/security`, which is the narrowest grant that still lets an unattended
-sync read them without raising a dialog; `-A`, which would let anything read them silently, is
-not used. And **`security` truncates a secret read from stdin at 128 bytes, silently, reporting
-success** — measured, not assumed. A session record is longer than that and an instance behind
-single sign-on issues cookies of its own besides Confluence's, so the record is written in
-120-byte pieces across numbered items and read back and compared before the capture is called
-done. Passing the secret as a command-line argument would avoid the chunking and put a live
-corporate session into a process listing.
+That sentence is the whole of the credential design and it has a consequence worth stating
+before the reasoning: `manicule connector sync` for a Confluence source **requires a running
+`manicule serve`**, and re-authenticating after the server restarts is the expected path rather
+than a failure. The refusal you get when there is no session says so and names the command.
+
+There were three places a session could live and now there is one. Each of the two that went had
+a defect that could not be fixed where it was:
+
+- **The macOS Keychain prompted, repeatedly.** Every write recreated its item and therefore
+  discarded the authorization you had granted, so running syncs meant retyping your login
+  password for a program that is not allowed to know it. The machinery that made this worse —
+  `security` silently truncating a stdin secret at 128 bytes, so a session record had to be
+  written in 120-byte pieces across numbered items and read back and compared — is gone with it.
+- **There was no store at all on Linux or in a container**, so `--browser` there captured a
+  session it had nowhere to put. `$CONFLUENCE_SESSION_COOKIE` stood in for one, which is a live
+  corporate credential written into a shell's history and inherited by every process started
+  from it. `session_env` is deleted; the configuration model forbids unknown keys, so a
+  configuration still setting it is refused loudly rather than quietly ignored.
+
+A session held in a long-lived process's memory has none of those problems. It is never written
+anywhere, it prompts for nothing, it behaves identically on every platform, and it is gone when
+the process stops. **That last one is the point rather than the price**: `--browser` has made
+re-authenticating a few seconds of clicking, so a credential whose lifetime is the server's is
+one you re-take deliberately instead of one that persists indefinitely.
+
+Nothing lands under `<data_dir>`, so `docs/storage.md` §7.1 and the `doctor` permissions check
+still do not come into it. A `session_cookie` written into `config.toml` is still a startup error
+rather than a working setting.
+
+**The hand-off, and why the browser opens where you are.** `connector login` runs in *your*
+process, because `--browser` opens a window and a window opened by a background server is one
+nobody is sitting at. The syncs run in the server. What joins them is the control socket
+(`docs/deployment.md` §6.1): the command verifies the session against your instance exactly as it
+always did, then hands it over a `0600` Unix domain socket to the server, which holds it. Your
+command-line process keeps no copy.
+
+If no server is running, `connector login` says so **before** it opens a browser — being asked
+to complete a second factor and only then told there was nowhere to put the result would be
+asking you to do the work twice.
 
 **Capture proves the session before storing it.** A cookie copied short, copied from the wrong
 tab, or copied from a session that had already timed out is indistinguishable from a working one
@@ -181,8 +205,10 @@ $ manicule connector login wiki --forget      # remove the stored session
 $ manicule connector login wiki --browser     # take a new one
 ```
 
-`--forget` removes the keychain entry for that instance. It does not sign you out of Confluence
-itself, which is your browser's business and your identity provider's.
+`--forget` asks the running server to drop the session it holds for that instance. It does not
+sign you out of Confluence itself, which is your browser's business and your identity
+provider's. Stopping the server has the same effect on every session it holds, which is the
+blunter version of the same thing.
 
 **A failed login never costs you a working session.** Verification happens before the store is
 touched, so a timeout, a closed window, a dead cookie or a state file for the wrong site leaves
@@ -764,7 +790,6 @@ differ, it is here — check these first when one is available:
 | `X-AUSERNAME` is on REST responses, and is the account `user/current` reported | A sync runs rather than refusing as "a different account" | The account check misfires; it is one of three sign-in signals, so removing it costs the weakest of them |
 | Sign-in redirects go to `/login.action` or a listed SSO servlet | Let a session expire and re-run | Caught by origin or by the body markers instead; add the path |
 | Nothing legitimate redirects off the configured origin | A full sync including attachments | An attachment download refuses instead of following. Cloud is the case to watch: if its `_links.download` redirects to a media CDN, that redirect is now refused loudly rather than followed |
-| `security` still truncates a stdin secret at 128 bytes | The Keychain round-trip test | The chunk size is wrong; the read-back comparison turns it into a refusal rather than a truncated credential |
 | A driven Chromium is accepted by the tenant's conditional-access policy | `connector login --browser` against the real instance | The browser path is unusable there; the paste path still works, because that browser is the person's own |
 | Sign-in completes without the person needing a second tab or window | Same | The poll watches one context's jar; a flow that finishes elsewhere would time out. The state-import path is the workaround |
 | The session cookies Confluence needs are set on the configured origin rather than on a parent domain only | Same, then `connector sync` | The origin filter keeps too little and login reports no applicable cookies. The domain rule already accepts a parent-domain cookie, so this is about an unusual scope rather than the common case |
@@ -802,7 +827,7 @@ and every one of those failures is quiet, which is why they are worth listing.
 |---|---|
 | Configuration and the credential refusal | `manicule/connectors/config.py` |
 | The credential seam: tokens, sessions, expiry | `manicule/connectors/credentials.py` |
-| Capturing a session, and the Keychain | `manicule/connectors/sessions.py` |
+| Capturing a session, and where one is held | `manicule/connectors/sessions.py` |
 | Telling an answer from a sign-in page | `manicule/connectors/intercept.py` |
 | CQL construction, quoting, watermark timestamps | `manicule/connectors/cql.py` |
 | Root-page validation, subtree membership, the empty-subtree guard | `manicule/connectors/subtree.py` |

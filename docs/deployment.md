@@ -383,7 +383,92 @@ you intend to keep private.
 
 ---
 
-## 6. Still open
+## 6. Running manicule as a server
+
+`manicule serve` is the long-lived writer. It takes the data directory's lock for its whole life
+(§2, and `docs/ingest.md` §6.4), runs whatever schedule configuration asks for, holds any
+captured Confluence session in memory, and answers write commands from the command line over a
+Unix domain socket. `manicule start` is the same command under its older name; both work.
+
+**What this changes for somebody using manicule, in one table.**
+
+| | With a server running | With none |
+|---|---|---|
+| `search`, `ask`, `doctor`, `document list` | work | work |
+| `connector sync`, `index`, `document reindex`, the repair verbs | run **in the server** | refused, naming `manicule serve` |
+| `connector login` | captures here, hands the session to the server | refused before it opens a browser |
+| A Confluence sync | uses the session the server holds | there is no session to use |
+
+The refusal is deliberate and it is not a fallback. A Confluence session lives in the server's
+memory and nowhere else, so a sync in a process that is not the server has no credential and
+never will; falling back to a local run would mean falling back to a run that cannot
+authenticate, reported as a sync that failed rather than as an arrangement nobody set up. And
+**nothing starts a server for you**. A command line that spawned a background writer you did not
+ask for would hold the lock, outlive your terminal, and be found later by somebody wondering what
+has the data directory.
+
+`manicule init` is the one write that does not need a server, because it writes the
+configuration file a server reads at startup — requiring one first would be a cycle.
+
+### 6.1 The control socket
+
+A `0600` Unix domain socket, inside a `0700` directory owned by you, in this machine's runtime
+directory: `$XDG_RUNTIME_DIR` on Linux, `$TMPDIR` on macOS, `/tmp/manicule-<uid>` otherwise. It
+is named for a digest of the data directory it serves, so one data directory has one socket and
+two have two.
+
+**Not the HTTP API**, for two reasons that are worth keeping separate. A route that started a
+sync would cross the line `docs/surfaces.md` draws and `tests/api/test_routes.py` asserts by
+name — the destructive operations have no route, and #113 refused one for corpus-wide reparse
+because an unattended caller could hold the accelerator for an hour. And an HTTP control channel
+would drag the bind policy (§4) and the authentication model into a question a socket with no
+network does not raise. **The bind policy is unchanged by any of this**, and the socket is not a
+way around it: it is unreachable from the network, and what protects it is the filesystem.
+
+**It is not in the data directory**, which is where the pid file is, and the reason is measured
+rather than stylistic: `sockaddr_un.sun_path` is 104 bytes on macOS and an ordinary data
+directory under a per-user temporary path is already past that before a filename is added.
+
+The client checks the owner and the mode before it writes a byte. A socket anybody else can
+reach is refused rather than used.
+
+### 6.2 Scheduled syncs
+
+Per source, beside the source:
+
+```toml
+[connectors.handbook]
+type = "confluence"
+enabled = true
+schedule_s = 3600          # sync this source hourly
+
+[connectors.runbooks]
+type = "filesystem"
+schedule_s = 600           # and this one every ten minutes
+```
+
+Four things about it, each of which is a decision rather than an accident:
+
+- **Only a server runs it.** An unserved installation has no process to run a schedule in.
+- **A source with no `schedule_s` is not scheduled**, which is every configuration written
+  before this existed.
+- **`enabled = false` is honored.** A disabled source is never scheduled, whatever its
+  `schedule_s` says — a schedule is exactly where a source you turned off would come back to
+  life without anybody typing anything.
+- **The first run is one interval after startup, not at startup.** Restarting is how a session
+  is re-taken, so it is something you will do deliberately and often; a server that swept every
+  scheduled source on startup would turn each of those into a full corpus sync nobody asked for.
+
+A source never overlaps itself: the loop awaits its own sync before waiting again, so a source
+whose sync takes longer than its interval runs back to back. A sync that fails does not stop the
+schedule — the failure is reported and the next interval is tried, because an instance that was
+down at ten past may be up at twenty past, and a session that expired needs a person rather than
+a stopped loop.
+
+`schedule_s` existed before and was deleted in #98, because it configured a scheduler that did
+not exist and would have been cited as evidence that one did. It is back because one does.
+
+## 7. Still open
 
 Not settled here, and deliberately:
 
