@@ -751,6 +751,14 @@ class IngestPipeline:
                 # how many fetched bodies are held in memory at once — which spans the queue
                 # they wait in as well as the worker that has one. A block cannot express that,
                 # so the pair is written out.
+                #
+                # **A `put` canceled before it lands leaves this entry unpaired, and that costs
+                # nothing.** Only the peak is reported, and the peak was already right the moment
+                # `enter` ran: this worker *is* holding a body while it waits. What goes stale is
+                # the running count, which is per run (see `_Sync.bodies_held`) and is read by
+                # nothing — and the only thing that cancels a fetch worker is the run ending.
+                # Undoing it here would be a guard with no failure behind it; what has to stay
+                # true is that this gauge belongs to the run rather than to the pipeline.
                 run.bodies_held.enter()
                 await bodies.put(accepted)
         finally:
