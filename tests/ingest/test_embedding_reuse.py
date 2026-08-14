@@ -31,12 +31,14 @@ from manicule.core.anchors import LineAnchor
 from manicule.core.content import BlockKind, Chunk, Document, ParsedBlock
 from manicule.core.embedding import (
     UNRECORDED_IDENTITY,
+    Vector,
     VectorState,
     embedding_input_identity,
 )
 from manicule.core.errors import ContextOverflowError
 from manicule.core.ids import chunk_id
-from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
+from manicule.core.lifecycle import Metric, SupportsMetrics
+from manicule.ingest.embedding import CACHE_HIT_METRIC, EmbeddingWork, embed_or_reuse
 from manicule.ingest.reindex import re_parse_stale, repair, select
 from tests.fakes import PassThroughMiddleware
 from tests.ingest import fakes
@@ -1018,3 +1020,79 @@ async def test_a_mixed_batch_returns_every_vector_against_the_chunk_it_belongs_t
         "every position holds the embedding of the chunk at that position, whether it came "
         "from the store or from the model"
     )
+
+
+class CachingEmbedder(fakes.CountingEmbedder):
+    """An embedder that publishes a warm-cache hit count, as the real backends do.
+
+    ``HashEmbedder`` and its subclasses hold no cache, so every other test in this file sees
+    ``cache_hits`` at zero — which is correct and proves nothing about the reading. This
+    publishes the same metric name ``EmbeddingCache`` does, so the path that reports the number
+    is exercised by something that can make it move.
+    """
+
+    def __init__(self, *, serves_per_call: int = 0) -> None:
+        super().__init__()
+        self.serves_per_call = serves_per_call
+        self.served = 0
+
+    @override
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        # Incremented *during* the call, as a real cache does — it serves some of the inputs
+        # and passes the rest to the model. A fixture that moved the number before or after
+        # would measure something the delta cannot see.
+        self.served += min(self.serves_per_call, len(texts))
+        return await super().embed(texts)
+
+    def metrics(self) -> tuple[Metric, ...]:
+        return (Metric(name=CACHE_HIT_METRIC, value=float(self.served)),)
+
+
+async def test_the_warm_cache_is_reported_apart_from_durable_reuse() -> None:
+    """Two ways of not calling the model, counted separately because they are not the same.
+
+    ``reused`` is durable and survives a restart; ``cache_hits`` is a bounded LRU inside one
+    warm process. Reporting them as one number is the confusion that made a corpus-wide sweep
+    look absorbed when it was not, and it is the reason `docs/parsing.md` §4.5 needed correcting
+    twice.
+
+    The count is a *delta* across the call rather than the embedder's lifetime total, so a
+    second operation in the same process reports what it served and not what its predecessor
+    did.
+    """
+    embedder = CachingEmbedder(serves_per_call=2)
+    vectors = fakes.MemoryVectors()
+    await vectors.ensure_ready(embedder.fingerprint)
+    chunks = [
+        a_chunk(text=f"line {index}", embed_text=f"Doc > line {index}").model_copy(
+            update={"id": f"chunk-{index}", "position": index}
+        )
+        for index in range(3)
+    ]
+    embedder.served = 7  # whatever this process had served before the operation began
+
+    _, work = await embed_or_reuse(embedder, chunks, vectors=vectors)
+
+    assert work.cache_hits == 2, (
+        "the delta across this call, not the embedder's lifetime total — otherwise the second "
+        "operation in a process inherits the first one's savings"
+    )
+    assert work.reused == 0, "and nothing was durably reused, which is the other number"
+    assert work.embedded == 3
+
+
+async def test_an_embedder_with_no_cache_reports_no_cache_hits() -> None:
+    """Zero is a measurement here, not an absence of one.
+
+    An embedder publishing no metrics served nothing from a cache, because it has none. That is
+    honestly zero rather than unmeasured, which is what lets the counter be read without a
+    caveat attached.
+    """
+    embedder = fakes.CountingEmbedder()
+    vectors = fakes.MemoryVectors()
+    await vectors.ensure_ready(embedder.fingerprint)
+
+    _, work = await embed_or_reuse(embedder, [a_chunk()], vectors=vectors)
+
+    assert not isinstance(embedder, SupportsMetrics), "the fixture must publish no metrics"
+    assert work.cache_hits == 0
