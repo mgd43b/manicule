@@ -267,7 +267,6 @@ WRITERS: frozenset[str] = frozenset(
         "collection_rename",
         "collection_update",
         "config_set",
-        "connector_login",
         "connector_sidecar",
         "connector_sync",
         "document_delete",
@@ -276,7 +275,6 @@ WRITERS: frozenset[str] = frozenset(
         "document_reindex_stale",
         "import",
         "index_path",
-        "init",
         "plugin_add",
         "plugin_remove",
         "reset_index",
@@ -286,6 +284,13 @@ WRITERS: frozenset[str] = frozenset(
     }
 )
 """Every command-line operation that takes the directory, written out on purpose.
+
+**Two operations left this list when the server took over the writing**, and both left for the
+same reason rather than for convenience. ``init`` writes the configuration file and pre-seeds the
+cache; ``connector_login`` used to write a keychain item and now hands a session to a server over
+the control socket. Neither touches the data directory, so neither takes its lock — and both had
+to move, because a write command with no server refuses, and requiring a server in order to run
+``manicule init`` is a cycle.
 
 **The point of writing it out is that neither set may be the default.** The code defaults to
 "writer", which is the safe direction and is what stops a command added in a hurry from indexing
@@ -500,9 +505,13 @@ NO_RUNTIME_COMMANDS: frozenset[str] = frozenset(
         # It is here rather than in WRITERS because it emits no operation for `_cli_ops` to
         # find — it is the runtime, not a call through one.
         "start",
+        # The same command under the name the documentation uses. `start` and `serve` are one
+        # function registered twice: `serve` says what it does, and `start` is what scripts and
+        # habits already type, so neither is taken away.
+        "serve",
     }
 )
-"""Commands that never reach ``_execute``, and what each one does instead.
+"""Commands that never reach ``_execute`` or ``_dispatch``, and what each one does instead.
 
 Every other command opens a runtime through that one function, which is what makes the
 classification a property of the surface rather than of a convention. These four are the

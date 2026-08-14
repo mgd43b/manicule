@@ -49,7 +49,7 @@ from manicule.generation.ports import (
     SharedTurn,
 )
 from manicule.generation.sharing import ShareLink, redact_for_anonymous
-from manicule.ingest.pipeline import RunReport
+from manicule.ingest.pipeline import RunReport, Watching
 from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
 from manicule.retrieval.retriever import RetrievalResult
 from manicule.storage.organization import normalize_name
@@ -807,15 +807,29 @@ class FakeIngestion:
     three surfaces if ``changed`` and ``unchanged`` happened to match."""
 
     async def index_path(
-        self, path: Path, *, name: str, limit: int | None = None, force: bool = False
+        self,
+        path: Path,
+        *,
+        name: str,
+        limit: int | None = None,
+        force: bool = False,
+        watching: Watching | None = None,
     ) -> RunReport:
         del name, limit, force
         self.paths.append(path)
+        if watching is not None:
+            # Reported once, so that a caller streaming progress sees this fake do the thing
+            # the real one does rather than a silence a test would have to know to expect.
+            watching(f"{path}: 1 indexed, 0 unchanged, 0 failed")
         return self.report
 
-    async def sync(self, connector: str, *, limit: int | None = None) -> RunReport:
+    async def sync(
+        self, connector: str, *, limit: int | None = None, watching: Watching | None = None
+    ) -> RunReport:
         del limit
         self.synced.append(connector)
+        if watching is not None:
+            watching(f"{connector}: 1 indexed, 0 unchanged, 0 failed")
         return self.report
 
     async def connector(self, name: str) -> Any:

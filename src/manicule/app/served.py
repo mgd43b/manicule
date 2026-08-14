@@ -150,7 +150,7 @@ def _succeeded(op: str, workspace: str, data: dict[str, JsonValue]) -> dict[str,
 
     Assembled here rather than through :func:`~manicule.app.results.succeeded` because that one
     takes a :class:`~manicule.app.results.Payload`, and a hand-off produces no payload the
-    contract knows: it is an acknowledgement between two manicule processes rather than an
+    contract knows: it is an acknowledgment between two manicule processes rather than an
     operation's result. Giving it a payload model would put it in ``--json``'s vocabulary, where
     nothing would ever read it.
     """

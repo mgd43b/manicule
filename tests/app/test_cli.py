@@ -19,7 +19,9 @@ from typer._click.exceptions import NoSuchOption, UsageError
 from typer.testing import CliRunner
 
 import manicule.cli.main as cli
+from manicule.app import commands
 from manicule.app import results as r
+from manicule.app.commands import Command
 from manicule.app.dispatch import run_op
 from manicule.app.results import succeeded
 from manicule.app.service import ApplicationService
@@ -55,15 +57,30 @@ def service() -> ApplicationService:
 def _bind(monkeypatch: pytest.MonkeyPatch, service: ApplicationService) -> None:
     """Point the command line at an already-built service.
 
-    One function is substituted — the one that would otherwise read the suite machine's
-    configuration and open a database. Everything above it, including argument parsing,
-    dispatch, rendering and the exit status, is the real thing.
+    Two functions are substituted, one per path: :func:`~manicule.cli.main._execute` runs a read
+    in this process, and :func:`~manicule.cli.main._dispatch` decides where a write runs and
+    would otherwise look for a server. Both are the seam where the suite machine's configuration
+    would be read and a database opened. Everything above them — argument parsing, the binder
+    table, rendering and the exit status — is the real thing.
+
+    The write path is bound to ``commands.run``, which is **the same call the server makes when
+    a proxied command reaches it**. That is deliberate rather than convenient: these tests then
+    exercise the operation exactly as a served one runs it, and
+    ``tests/app/test_proxy.py`` asserts the two agree by running both.
     """
 
     async def execute(op: str, call: Any) -> Envelope:
         return await run_op(op, service.workspace, lambda: call(service))
 
+    async def dispatch(command: Command) -> Envelope:
+        return await run_op(
+            command.op,
+            service.workspace,
+            lambda: commands.run(service, command, commands.silent),
+        )
+
     monkeypatch.setattr(cli, "_execute", execute)
+    monkeypatch.setattr(cli, "_dispatch", dispatch)
 
 
 @pytest.fixture
@@ -858,12 +875,17 @@ MINIMUM_CLI_MODULES = 5
 Present to catch a scan reading the wrong directory, not to track the package's size.
 """
 
-OP_TAKING_CALLS: frozenset[str] = frozenset({"emit", "run_op", "succeeded", "failed"})
+OP_TAKING_CALLS: frozenset[str] = frozenset({"emit", "run_op", "succeeded", "failed", "Command"})
 """Functions whose **first positional argument** is an operation name.
 
-``Envelope(op=...)`` is the fifth shape and is a keyword rather than a positional, which is
+``Envelope(op=...)`` is the sixth shape and is a keyword rather than a positional, which is
 why it is handled separately below. It is also the one a scan written from a quick reading of
 ``main.py`` misses, because ``completion`` is the only operation that uses it.
+
+``Command`` is how every operation that *writes* names itself now: the command line builds one
+and hands it to :func:`~manicule.cli.main.submit`, which either runs it here or sends it to a
+server. It is a constructor rather than a function and the scan does not care — what it reads
+is the first positional literal, and for a command that is the op.
 """
 
 

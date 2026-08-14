@@ -167,11 +167,17 @@ def test_no_tool_re_parses_the_whole_corpus() -> None:
     )
 
 
-def test_the_command_line_offers_exactly_twenty_commands() -> None:
+def test_the_command_line_offers_exactly_twenty_one_commands() -> None:
     """Counted from the built command tree rather than from the source.
 
     A command registered on a sub-application and never attached would be in the file and not
     in the interface, which is the kind of thing a source-level count misses.
+
+    ``serve`` and ``start`` are one function registered under two names, and the count says
+    twenty-one rather than twenty because that is what somebody typing ``manicule --help`` sees.
+    ``serve`` is the name the documentation uses and the one every refusal names, because it
+    says what the process does; ``start`` is what scripts and habits already type, so it is kept
+    rather than broken.
     """
     import typer.main  # noqa: PLC0415 - only this assertion needs the click tree
 
@@ -194,12 +200,13 @@ def test_the_command_line_offers_exactly_twenty_commands() -> None:
         "plugin",
         "reset-index",
         "search",
+        "serve",
         "start",
         "stop",
         "upgrade",
         "workspace",
     ]
-    assert len(names) == 20
+    assert len(names) == 21
 
 
 def test_only_the_command_line_can_ask_doctor_to_repair_anything(

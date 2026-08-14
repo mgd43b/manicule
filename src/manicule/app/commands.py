@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 from manicule.app import control
 from manicule.app.dispatch import writes as writes_by_name
@@ -81,7 +81,7 @@ class Arguments:
     def text(self, name: str) -> str:
         value = self.values.get(name)
         if not isinstance(value, str):
-            raise ValueError(self._wrong(name, "a string", value))
+            self._refuse(name, "a string", value)
         return value
 
     def optional_text(self, name: str) -> str | None:
@@ -89,13 +89,13 @@ class Arguments:
         if value is None:
             return None
         if not isinstance(value, str):
-            raise ValueError(self._wrong(name, "a string or nothing", value))
+            self._refuse(name, "a string or nothing", value)
         return value
 
     def flag(self, name: str) -> bool:
         value = self.values.get(name, False)
         if not isinstance(value, bool):
-            raise ValueError(self._wrong(name, "true or false", value))
+            self._refuse(name, "true or false", value)
         return value
 
     def count(self, name: str, *, default: int) -> int:
@@ -105,7 +105,7 @@ class Arguments:
         # `bool` before `int`, because in Python a bool *is* an int and `--batch true` would
         # otherwise be accepted as a batch of one.
         if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(self._wrong(name, "a whole number", value))
+            self._refuse(name, "a whole number", value)
         return value
 
     def optional_count(self, name: str) -> int | None:
@@ -113,7 +113,7 @@ class Arguments:
         if value is None:
             return None
         if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(self._wrong(name, "a whole number or nothing", value))
+            self._refuse(name, "a whole number or nothing", value)
         return value
 
     def path(self, name: str) -> Path:
@@ -126,21 +126,29 @@ class Arguments:
     def texts(self, name: str) -> tuple[str, ...]:
         value = self.values.get(name, [])
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-            raise ValueError(self._wrong(name, "a list of strings", value))
+            self._refuse(name, "a list of strings", value)
         return tuple(str(item) for item in value)
 
-    def _wrong(self, name: str, expected: str, value: JsonValue) -> str:
-        """Why an argument was refused, naming the type it was and never quoting the value.
+    def _refuse(self, name: str, expected: str, value: JsonValue) -> NoReturn:
+        """Refuse an argument, naming the type it was and never quoting the value.
 
         The type rather than the value on purpose. Nothing on this socket is a secret except a
         handover, which is a different frame entirely — but an argument reader is exactly the
         sort of thing that grows a new caller later, and a reader that has never quoted a value
         cannot start leaking one by being reused.
+
+        **A ``ValueError`` rather than the ``TypeError`` the shape suggests**, and the choice is
+        load-bearing rather than stylistic. :func:`~manicule.app.dispatch.run_op` turns
+        ``ManiculeError``, ``ValueError`` and ``OSError`` into failure envelopes and lets
+        everything else propagate as a defect. A client sending an argument of the wrong type —
+        an older command line against a newer server, most likely — is an outcome the caller can
+        act on and should read as one, not a traceback out of a socket handler.
         """
-        return (
+        msg = (
             f"{self.op} was given {name}={type(value).__name__}, and it takes {expected}. The "
             f"value is not repeated here."
         )
+        raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)

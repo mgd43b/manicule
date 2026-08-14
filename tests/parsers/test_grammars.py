@@ -25,6 +25,7 @@ import pytest
 from typer.testing import CliRunner
 
 import manicule.cli.main as cli
+from manicule.app import commands
 from manicule.app.dispatch import run_op
 from manicule.app.service import ApplicationService
 from manicule.config.settings import Settings
@@ -586,7 +587,18 @@ def test_every_command_the_pre_seed_names_as_its_caller_actually_calls_it(
     async def execute(op: str, call: Callable[[ApplicationService], Any]) -> Any:
         return await run_op(op, service.workspace, lambda: call(service))
 
+    async def dispatch(command: Any) -> Any:
+        return await run_op(
+            command.op,
+            service.workspace,
+            lambda: commands.run(service, command, commands.silent),
+        )
+
+    # Both paths, because the commands `prefetch` names are on both sides of the reader/writer
+    # split: `doctor --fix` reads and `init` writes configuration. Binding one would silently
+    # skip whichever claim landed on the other.
     monkeypatch.setattr(cli, "_execute", execute)
+    monkeypatch.setattr(cli, "_dispatch", dispatch)
     for claim in claims:
         seen.clear()
         result = CliRunner().invoke(cli.app, ["--json", *claim])

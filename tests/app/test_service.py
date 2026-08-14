@@ -1865,18 +1865,35 @@ async def test_an_enabled_connector_is_not_refused(backend: FakeBackend) -> None
     assert report.connector
 
 
-async def test_schedule_s_is_refused_rather_than_silently_doing_nothing() -> None:
-    """There is no scheduler. A setting that does nothing is a promise the software breaks.
+async def test_schedule_s_is_accepted_now_that_something_reads_it() -> None:
+    """#98 deleted this field because it configured a scheduler that did not exist.
 
-    Loud rejection is the point: a config carrying it was already being ignored, and an operator
-    who believed it was polling needs to find out from manicule rather than from a stale index.
+    It is back because one does. The rejection was never about the concept — it was about a
+    setting that was reported by ``connector list`` and read by nothing, which would have been
+    cited as evidence that scheduling worked. What makes accepting it honest again is
+    :class:`~manicule.app.served.Scheduler`, and
+    ``tests/app/test_scheduler.py`` is where the reading is proven rather than asserted here.
+    """
+    from manicule.config.settings import ConnectorSettings  # noqa: PLC0415
+
+    configured = ConnectorSettings.model_validate({"type": "filesystem", "schedule_s": 300})
+
+    assert configured.schedule_s == 300
+
+
+async def test_a_schedule_of_zero_or_less_is_refused() -> None:
+    """An interval of zero is a loop with no wait in it, which is not a schedule.
+
+    Refused at validation rather than clamped, because every clamp picks a number the operator
+    did not write — and the two candidates here are "never" and "constantly".
     """
     from pydantic import ValidationError  # noqa: PLC0415
 
     from manicule.config.settings import ConnectorSettings  # noqa: PLC0415
 
-    with pytest.raises(ValidationError, match="schedule_s"):
-        ConnectorSettings.model_validate({"type": "filesystem", "schedule_s": 300})
+    for interval in (0, -1):
+        with pytest.raises(ValidationError, match="schedule_s"):
+            ConnectorSettings.model_validate({"type": "filesystem", "schedule_s": interval})
 
 
 async def test_the_check_offers_its_command_as_a_remedy_not_only_inside_a_sentence(
