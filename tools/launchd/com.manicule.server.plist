@@ -3,9 +3,9 @@
 <!--
   Run manicule as a per-user launchd agent.
 
-  A template, not an installed file: three values have to be yours before it will work, and each
-  is marked REPLACE below. Copy it, edit it, then load it — `docs/deployment.md` §6.3 has the
-  four commands and the reasons.
+  A template, not an installed file. Four paths below are placeholders and each one says so in
+  the value itself, so searching your copy for the placeholder word is how you know you have
+  finished editing it — `docs/deployment.md` §6.3 has the commands and the reasons.
 
     ~/Library/LaunchAgents/com.manicule.server.plist
 
@@ -19,7 +19,7 @@
   <key>Label</key>
   <string>com.manicule.server</string>
 
-  <!-- REPLACE: the absolute path to the `manicule` console script. `which manicule` prints it.
+  <!-- SET THIS: the absolute path to the `manicule` console script. `which manicule` prints it.
        An absolute path because launchd does not read your shell's profile: PATH here is the
        system default, and a bare `manicule` is a job that fails to start with no clear reason
        why. The `transport http` flag below serves the JSON API, the browser surface
@@ -50,7 +50,7 @@
   <key>ThrottleInterval</key>
   <integer>30</integer>
 
-  <!-- REPLACE both, with absolute paths under your own home. launchd does not create parent
+  <!-- SET THESE, to absolute paths under your own home. launchd does not create parent
        directories, so `mkdir -p ~/Library/Logs/manicule` first. Two files rather than one:
        stdout is the transport's own output and stderr is where the scheduler reports a sync
        that did not run — including the one that says nobody has signed in since this process
@@ -60,7 +60,7 @@
   <key>StandardErrorPath</key>
   <string>/REPLACE/WITH/PATH/TO/Library/Logs/manicule/server.err.log</string>
 
-  <!-- REPLACE: your home directory. The working directory matters because a relative
+  <!-- SET THIS: your home directory. The working directory matters because a relative
        `[connectors.<name>] root` in configuration is resolved from it, and launchd's default is
        `/`, which would silently point a filesystem source at the wrong tree. -->
   <key>WorkingDirectory</key>

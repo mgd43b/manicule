@@ -474,15 +474,23 @@ not exist and would have been cited as evidence that one did. It is back because
 
 ### 6.3 Running it under launchd
 
-`tools/launchd/com.manicule.server.plist` is a template with three values marked `REPLACE`. Copy
-it, edit those three, then load it:
+`tools/launchd/com.manicule.server.plist` is a template. Four paths in it contain `REPLACE` —
+the `manicule` executable, the two log files and the working directory — so `grep REPLACE` on
+your copy is how you know you have finished editing it. Copy, edit, check, load:
 
 ```bash
 mkdir -p ~/Library/Logs/manicule
 cp tools/launchd/com.manicule.server.plist ~/Library/LaunchAgents/
-$EDITOR ~/Library/LaunchAgents/com.manicule.server.plist   # the three REPLACE values
+$EDITOR ~/Library/LaunchAgents/com.manicule.server.plist   # `which manicule` gives the first
+grep REPLACE ~/Library/LaunchAgents/com.manicule.server.plist   # silence means it is finished
+plutil -lint ~/Library/LaunchAgents/com.manicule.server.plist   # and that it is still a plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.manicule.server.plist
 ```
+
+An **absolute** path to `manicule` matters more than it looks: launchd does not read your
+shell's profile, so `PATH` is the system default and a bare `manicule` is a job that fails to
+start with nothing useful in the log. So does `WorkingDirectory` — launchd's default is `/`, and
+a relative `[connectors.<name>] root` would resolve against the root of the disk.
 
 `launchctl print gui/$(id -u)/com.manicule.server` says whether it is running and what it last
 exited with. To stop it: `launchctl bootout gui/$(id -u)/com.manicule.server`.

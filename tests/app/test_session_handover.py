@@ -414,6 +414,37 @@ async def test_no_session_value_reaches_a_report_a_person_reads(
     assert "server" in payload.stored_in, "the report says where the session actually went"
 
 
+async def test_no_session_value_reaches_the_reply_that_says_what_is_held(
+    socket_for: Callable[[], Path],
+) -> None:
+    """The one new control frame, and it is the frame whose *purpose* is to talk about sessions.
+
+    ``Handover``'s acknowledgment has been checked since #139. This is the other direction — a
+    client asking what the server holds — and it is the more dangerous of the two, because the
+    honest implementation reaches into the vault and the tempting one hands back what it found.
+
+    **Found by disabling the guard and watching nothing go red.** Every other assertion in this
+    file searches something a *surface* rendered; none of them touched this reply, so a listing
+    that carried the sessions themselves passed the whole suite.
+    """
+    path = socket_for()
+    vault = SessionVault()
+    await vault.save(a_session())
+    server = a_server(path, vault)
+    await server.start()
+    try:
+        answered = await control.connect(path, control.Held(), on_progress=lambda _: None)
+    finally:
+        await server.aclose()
+
+    assert answered["ok"] is True, answered
+    assert SENTINEL not in json.dumps(answered)
+    # And it did report the session, so the search above looked at a reply that had one to leak.
+    data = answered["data"]
+    assert isinstance(data, dict)
+    assert data["held"] == [{"base_url": SITE, "account": "sync.user"}], data
+
+
 async def test_no_session_value_reaches_a_tool_result_on_the_network_surface() -> None:
     """The MCP endpoint mounted on the HTTP port, which is a surface that did not exist before.
 
@@ -445,6 +476,32 @@ async def test_no_session_value_reaches_a_tool_result_on_the_network_surface() -
     checks = {check["name"]: check for check in answered["data"]["checks"]}
     assert checks["sessions"]["state"] == "ok", checks["sessions"]
     assert "sync.user" in checks["sessions"]["detail"], checks["sessions"]
+
+
+async def test_no_session_value_reaches_a_failed_call_on_the_network_surface() -> None:
+    """The failure path, which is where a value leaks if it leaks anywhere.
+
+    A success is composed by a payload model somebody wrote; a failure is composed from an
+    exception's own message, and an exception is the thing most likely to have been raised near
+    a credential with the credential in scope. So a tool is called in a way that fails while a
+    session is held, and the whole refused envelope is searched.
+    """
+    from tests.api.live import mounted  # noqa: PLC0415 - a socket-shaped fixture
+    from tests.api.support import backend_with_a_document  # noqa: PLC0415
+
+    backend, _ = backend_with_a_document()
+    backend.settings.connectors["handbook"] = _confluence_source()
+    await SESSIONS.save(a_session())
+    try:
+        async with mounted(backend) as client:
+            refused = (
+                await client.call_tool("document_get", {"document_id": "no-such-document"})
+            ).structured_content or {}
+    finally:
+        await SESSIONS.forget(SITE)
+
+    assert refused["ok"] is False, "the call succeeded, so no failure was searched"
+    assert SENTINEL not in json.dumps(refused)
 
 
 async def test_no_session_value_reaches_an_http_response() -> None:
