@@ -27,7 +27,7 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import typer
 from typer.core import TyperGroup, TyperOption
@@ -46,6 +46,8 @@ from manicule.generation.answers import EventKind
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
+
+    from pydantic import JsonValue
 
     from manicule.app.results import Payload
     from manicule.generation.answers import AnswerEvent
@@ -980,7 +982,12 @@ def collection_add(
     document_id: Annotated[list[str], typer.Argument(help="Documents to add.")],
 ) -> None:
     """Add documents to a collection. Nothing is re-embedded."""
-    submit(Command("collection_add", {"collection_id": collection_id, "document_ids": document_id}))
+    # Cast rather than annotated: `list` is invariant, so a `list[str]` is not a
+    # `list[JsonValue]` however it is spelled, and every list of strings is a list of JSON
+    # values. `Arguments.texts` checks the shape again on the way out, which is where a caller
+    # that sent something else is refused.
+    documents = cast("list[JsonValue]", list(document_id))
+    submit(Command("collection_add", {"collection_id": collection_id, "document_ids": documents}))
 
 
 @collection_app.command("remove")
@@ -989,8 +996,9 @@ def collection_remove(
     document_id: Annotated[list[str], typer.Argument(help="Documents to remove.")],
 ) -> None:
     """Remove documents from a collection. The documents themselves survive."""
+    documents = cast("list[JsonValue]", list(document_id))
     submit(
-        Command("collection_remove", {"collection_id": collection_id, "document_ids": document_id})
+        Command("collection_remove", {"collection_id": collection_id, "document_ids": documents})
     )
 
 

@@ -31,7 +31,7 @@ from manicule.connectors.sessions import SessionVault
 from tests.app.fakes import FakeBackend, make_chunk, make_document
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from manicule.app.results import Envelope
 
@@ -86,6 +86,20 @@ def run(argv: Sequence[str]) -> Any:
     return CliRunner().invoke(cli.app, list(argv))
 
 
+def _always(answer: Path | None) -> Callable[[Mapping[str, Any]], Path | None]:
+    """A stand-in for ``proxy.listening`` that always answers the same way.
+
+    A named function rather than a lambda because pyright infers nothing about a lambda's
+    parameter here, and ``overrides`` is the parameter whose shape a reader most wants stated.
+    """
+
+    def answering(overrides: Mapping[str, Any]) -> Path | None:
+        del overrides
+        return answer
+
+    return answering
+
+
 def bind_local(monkeypatch: pytest.MonkeyPatch, service: ApplicationService) -> None:
     """Make the command line run write commands here, as it does with no server."""
 
@@ -105,7 +119,7 @@ def bind_served(
     and the handler are all the real ones, which is the point: what is being compared has to be
     the shipping path or the comparison is between a local run and a mock.
     """
-    monkeypatch.setattr(proxy, "listening", lambda overrides: path)
+    monkeypatch.setattr(proxy, "listening", _always(path))
     return control.ControlServer(path, ControlHandler(service, SessionVault()))
 
 
@@ -275,7 +289,7 @@ def test_a_write_command_with_no_server_refuses_and_names_the_fix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Not a fallback to a local run, and not a daemon started on somebody's behalf."""
-    monkeypatch.setattr(proxy, "listening", lambda overrides: None)
+    monkeypatch.setattr(proxy, "listening", _always(None))
     result = run(["connector", "sync", "handbook"])
 
     assert result.exit_code == 1
@@ -298,7 +312,7 @@ async def test_a_socket_that_cannot_be_used_is_not_reported_as_no_server(
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     monkeypatch.setenv("MANICULE_DATA_DIR", str(data_dir))
-    monkeypatch.setattr(control, "socket_path", lambda _: path)
+    monkeypatch.setattr(control, "socket_path", _always(path))
 
     server = control.ControlServer(path, ControlHandler(a_service(), SessionVault()))
     await server.start()
@@ -334,7 +348,7 @@ def test_a_write_command_with_no_server_starts_nothing(
     import os  # noqa: PLC0415
     import subprocess  # noqa: PLC0415 - only this assertion needs the module
 
-    monkeypatch.setattr(proxy, "listening", lambda overrides: None)
+    monkeypatch.setattr(proxy, "listening", _always(None))
 
     started: list[object] = []
 
@@ -369,7 +383,7 @@ def test_a_read_command_needs_no_server(monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.setattr(cli, "_execute", execute)
 
-    def no_server(overrides: object) -> None:
+    def no_server(overrides: Mapping[str, Any]) -> Path | None:
         msg = "a read command asked whether a server was running"
         raise AssertionError(msg)
 
@@ -391,7 +405,13 @@ def test_collection_orphans_needs_a_server_only_when_it_would_delete(
     was writing to.
     """
     asked: list[str] = []
-    monkeypatch.setattr(proxy, "listening", lambda overrides: (asked.append("asked"), None)[1])
+
+    def note(overrides: Mapping[str, Any]) -> Path | None:
+        del overrides
+        asked.append("asked")
+        return None
+
+    monkeypatch.setattr(proxy, "listening", note)
     service = a_service()
 
     async def execute(op: str, call: Any) -> Envelope:
@@ -405,7 +425,7 @@ def test_collection_orphans_needs_a_server_only_when_it_would_delete(
     assert asked == [], "listing orphans asked for a server it does not need"
 
     monkeypatch.undo()
-    monkeypatch.setattr(proxy, "listening", lambda overrides: None)
+    monkeypatch.setattr(proxy, "listening", _always(None))
     deleting = run(["collection", "orphans", "--confirm"])
 
     assert deleting.exit_code == 1
@@ -439,7 +459,7 @@ def test_a_write_refuses_while_a_server_holds_the_lock_and_cannot_be_reached(
     monkeypatch.setenv("MANICULE_DATA_DIR", str(data_dir))
     # No socket, and the directory held: a server that is running and unreachable looks exactly
     # like this from outside.
-    monkeypatch.setattr(proxy, "listening", lambda overrides: None)
+    monkeypatch.setattr(proxy, "listening", _always(None))
 
     with InstanceLock(data_dir):
         refused = run(["connector", "sync", "handbook"])

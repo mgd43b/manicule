@@ -774,6 +774,13 @@ class IngestPipeline:
                 accepted = await self._accept(run.connector, discovered)
                 if isinstance(accepted, DocumentOutcome):
                     run.report.record(accepted)
+                    # Reported here as well as in the ingest stage, because a document that
+                    # skips never reaches the ingest stage at all — and a resync of a corpus
+                    # nobody has touched is *entirely* skips. Without this, the longest quiet
+                    # run there is is the one that says nothing: an unchanged ten-thousand-page
+                    # corpus walked at the speed of the store, reporting for the first time when
+                    # it finished.
+                    _report_progress(run)
                     continue
                 # Entered here and left in the ingest stage, because what is being counted is
                 # how many fetched bodies are held in memory at once — which spans the queue
@@ -827,14 +834,10 @@ class IngestPipeline:
                 # The first outcome is the discovered document; anything after it came out of
                 # the inside of it.
                 run.report.record(outcome, expanded=position > 0)
-            if run.watching is not None:
-                # After the whole document, not per outcome: a container that expanded into
-                # five hundred members is one thing that happened to somebody watching, and
-                # five hundred lines of it is not progress.
-                run.watching(
-                    f"{run.connector.name}: {run.report.indexed} of "
-                    f"{run.report.discovered} discovered documents indexed"
-                )
+            # After the whole document, not per outcome: a container that expanded into five
+            # hundred members is one thing that happened to somebody watching, and five hundred
+            # lines of it is not progress.
+            _report_progress(run)
 
     async def _stop_within_grace(self, run: _Sync, stages: asyncio.Task[None]) -> None:
         """Stop pulling the source, let what is accepted finish, cancel the rest at the deadline.
@@ -2044,6 +2047,28 @@ class IngestPipeline:
             document_id=document.id,
             detail=detail,
         )
+
+
+def _report_progress(run: _Sync) -> None:
+    """Tell the watcher where the run has got to, if anybody is watching.
+
+    **One function for both stages**, because a document that skips is reported from the fetch
+    stage and a document that lands is reported from the ingest stage — and two call sites that
+    worded the same thing differently would make a sync's output change shape halfway through
+    depending on what the corpus happened to contain.
+
+    Counters rather than a narration of one document. The number somebody wants from a long sync
+    is how far through it is, and counters make each line **supersede** the one before it, which
+    is what lets a caller show only the newest.
+    """
+    if run.watching is None:
+        return
+    unchanged = run.report.skipped_version + run.report.skipped_hash
+    settled = run.report.indexed + unchanged
+    run.watching(
+        f"{run.connector.name}: {settled} of {run.report.discovered} settled "
+        f"({run.report.indexed} indexed, {unchanged} unchanged)"
+    )
 
 
 def _first_failure(failures: BaseExceptionGroup[Exception]) -> str:

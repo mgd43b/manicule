@@ -18,7 +18,7 @@ import os
 import socket as socketlib
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import pytest
 from pydantic import SecretStr
@@ -83,7 +83,7 @@ class Echo:
         }
 
 
-async def serving(path: Path, handler: Echo) -> control.ControlServer:
+async def serving(path: Path, handler: control.Handler) -> control.ControlServer:
     server = control.ControlServer(path, handler)
     await server.start()
     return server
@@ -385,6 +385,7 @@ async def test_a_failure_envelope_crosses_unchanged(socket_for: Callable[[], Pat
     path = socket_for()
 
     class Refusing(Echo):
+        @override
         async def handle(
             self, request: control.Request, report: Callable[[str], None]
         ) -> dict[str, JsonValue]:

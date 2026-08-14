@@ -34,6 +34,7 @@ from manicule.config.settings import ConnectorSettings
 from manicule.connectors.sessions import SessionVault
 from manicule.core.content import Chunk, Document, RawDocument
 from manicule.core.ids import content_hash
+from manicule.core.sources import DocRef
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
 from manicule.ingest.workers import InProcessRunner
@@ -44,8 +45,7 @@ from tests.ingest import fakes
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
 
-    from manicule.core.protocols import Embedder, Middleware
-    from manicule.core.sources import Connector
+    from manicule.core.protocols import Connector, Embedder, Middleware
     from manicule.ingest.pipeline import RunReport, Watching
 
 
@@ -244,10 +244,20 @@ class GatedConnector(fakes.ObservedConnector):
         self._gate = gate
 
     @override
-    async def fetch(self, ref: str) -> RawDocument:
+    async def fetch(self, ref: DocRef) -> RawDocument:
         fetched = await super().fetch(ref)
         await self._gate.pass_through()
         return fetched
+
+
+def _open_both(first: fakes.Gate, second: fakes.Gate) -> Callable[[], None]:
+    """Release two gates on shutdown, as one callable with nothing to return."""
+
+    def release() -> None:
+        first.open()
+        second.open()
+
+    return release
 
 
 def corpus(count: int, *, prefix: str) -> dict[str, str]:
@@ -297,8 +307,48 @@ async def test_a_proxied_sync_reports_progress_from_the_real_pipeline(
     assert data["ingested"] == 12, "the run did not index the whole corpus"
     assert len(store.documents) == 12
     assert seen, "a twelve-document sync reported no progress at all"
-    assert seen[-1] == "handbook: 12 of 12 discovered documents indexed", seen
+    assert seen[-1] == "handbook: 12 of 12 settled (12 indexed, 0 unchanged)", seen
     assert all("handbook" in line for line in seen), seen
+
+
+async def test_a_sync_that_changes_nothing_still_reports_progress(
+    socket_for: Callable[[], Path],
+) -> None:
+    """The longest quiet run there is, and the one that reported nothing at all.
+
+    **Found by running it.** A document that skips on change detection never reaches the ingest
+    stage — that is the whole point of putting the check in the fetch stage — so a resync of a
+    corpus nobody has touched settled every document and said nothing until it finished. On a
+    ten-thousand-page corpus that is precisely the long silent sync progress exists to prevent,
+    and it is the *commonest* shape a scheduled resync takes.
+    """
+    path = socket_for()
+    service, ingestion, _ = served(
+        {"proxied": fakes.ObservedConnector(corpus(8, prefix="doc"), name="handbook")},
+        fetch_concurrency=2,
+        parse_workers=2,
+    )
+    # Indexed once, so the run under test finds every document unchanged.
+    await ingestion.sync("proxied")
+
+    server = control.ControlServer(path, ControlHandler(service, SessionVault()))
+    await server.start()
+    seen: list[str] = []
+    try:
+        answered = await control.connect(
+            path,
+            control.Invoke(op="connector_sync", arguments={"name": "proxied", "limit": None}),
+            on_progress=seen.append,
+        )
+    finally:
+        await server.aclose()
+
+    data = answered["data"]
+    assert isinstance(data, dict)
+    assert data["ingested"] == 0, "the second run should have found nothing to do"
+    assert data["skipped"] == 8
+    assert seen, "a run that skipped eight documents reported nothing at all"
+    assert seen[-1] == "handbook: 8 of 8 settled (0 indexed, 8 unchanged)", seen
 
 
 # --- the keyed per-document lock ------------------------------------------------------------------
@@ -385,9 +435,7 @@ async def test_one_document_is_never_written_by_the_scheduler_and_the_proxy_at_o
         },
         middleware=(Watching(),),
     )
-    async with Overlap(service, socket_for(), release=lambda: (fetched.open(), inside.open())) as (
-        both
-    ):
+    async with Overlap(service, socket_for(), release=_open_both(fetched, inside)) as both:
         both.start_scheduled()
         both.start_proxied()
         # Both runs have fetched and neither has taken the lock. Releasing them on one tick is

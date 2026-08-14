@@ -275,9 +275,39 @@ printf 'def retry(attempts: int) -> None:\n    """Retry up to `attempts` times w
 printf '# Retries\n\nThe retry policy waits one second between attempts.\n' > /tmp/smoke/corpus/retries.md
 manicule init
 assert_healthy
+
+# A write command goes to the server, so the smoke test starts one — which is the point of
+# running it this way rather than a workaround for it. `manicule index` used to run in this
+# shell and take the data directory itself; a served manicule holds that directory for its
+# whole life, so indexing here is now a proxied command over the control socket. If the socket
+# does not bind inside this image, or the proxy cannot reach it, this step fails at the point
+# an operator would hit it rather than at the point somebody reads the documentation.
+#
+# `--transport http` on loopback rather than `stdio`, because a stdio server reads the protocol
+# from its own stdin and would exit immediately in a build step. `--network=none` is still in
+# force: a loopback socket opens no route out of the container.
+manicule serve --transport http --port 8765 &
+SERVER=$!
+
+# Waiting on the socket rather than on a sleep. The socket is the same liveness signal the
+# command line proxies on, so this waits for exactly the condition the next command needs.
+SOCKET_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/manicule-$(id -u)"
+for _ in $(seq 1 100); do
+  if [ -n "$(ls -A "$SOCKET_DIR" 2>/dev/null)" ]; then break; fi
+  sleep 0.1
+done
+[ -n "$(ls -A "$SOCKET_DIR" 2>/dev/null)" ] || {
+  echo "the server never opened its control socket in $SOCKET_DIR" >&2
+  exit 1
+}
+
 manicule index /tmp/smoke/corpus
 # `--json` so the assertion is on the result rather than on prose that wraps in a terminal
 # box. A search that returns nothing exits 0 with an empty list, so the count is the check.
+#
+# `search` deliberately runs while the server is still up: it takes no writer lock and must
+# keep answering with one holding the data directory, which is the half of this arrangement
+# that would be worst to get wrong.
 manicule --json search "retry policy" --top 2 | python -c "
 import json, sys
 hits = json.load(sys.stdin)['data']['hits']
@@ -285,6 +315,8 @@ print('search hits:', [hit['title'] for hit in hits])
 if not hits:
     raise SystemExit('the image indexed two documents and then matched neither')
 "
+manicule stop
+wait "$SERVER" 2>/dev/null || true
 rm -rf /tmp/smoke
 SMOKE
 

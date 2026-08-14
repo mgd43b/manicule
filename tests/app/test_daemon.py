@@ -103,14 +103,16 @@ def test_stopping_removes_the_control_socket_the_server_left_behind(
     socket = socket_path(data_dir)
     socket.touch()
     write_pidfile(data_dir, transport="http", host="127.0.0.1", port=8765)
+
     # A pid that is not ours and is not alive, so `stop` takes the "nothing running" path and
     # this asserts the tidying happens on the path that does stop something.
-    monkeypatch.setattr(
-        "manicule.cli.serving.stop_server",
-        lambda directory: Running(
+    def stopped(directory: Path) -> Running:
+        del directory
+        return Running(
             pid=os.getpid(), started_at=0.0, transport="http", host="127.0.0.1", port=8765
-        ),
-    )
+        )
+
+    monkeypatch.setattr("manicule.cli.serving.stop_server", stopped)
 
     envelope = stop_running({}, workspace="default")
 

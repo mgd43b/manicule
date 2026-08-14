@@ -36,7 +36,7 @@ from manicule.connectors.credentials import BrowserSession
 from manicule.core.errors import ManiculeError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Awaitable, Callable, Mapping
 
     from pydantic import JsonValue
 
@@ -233,7 +233,7 @@ class Scheduler:
         service: ApplicationService,
         sources: Mapping[str, float],
         *,
-        sleep: Callable[[float], object] = asyncio.sleep,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._service = service
         self._sources = dict(sources)

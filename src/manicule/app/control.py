@@ -376,14 +376,15 @@ def read_request(line: bytes) -> Request:
     if not isinstance(decoded, dict):
         msg = "the control socket carried JSON that is not an object, so it names no request"
         raise ProtocolError(msg)
-    kind = decoded.get("kind")
+    frame = cast("dict[str, object]", decoded)
+    kind = frame.get("kind")
     model = _REQUESTS.get(kind) if isinstance(kind, str) else None
-    if model is None:
+    if model is None or not isinstance(kind, str):
         known = ", ".join(sorted(_REQUESTS))
         msg = f"the control socket named request kind {kind!r}. Known kinds: {known}"
         raise ProtocolError(msg)
     try:
-        return model.model_validate(decoded)
+        return model.model_validate(frame)
     except ValidationError as exc:
         raise ProtocolError(_refusal(kind, exc)) from exc
 
@@ -422,11 +423,12 @@ def read_response(line: bytes) -> Response:
     if not isinstance(decoded, dict):
         msg = "the server sent JSON that is not an object"
         raise ProtocolError(msg)
-    kind = decoded.get("kind")
+    frame = cast("dict[str, object]", decoded)
+    kind = frame.get("kind")
     if kind == "progress":
-        return Progress.model_validate(decoded)
+        return Progress.model_validate(frame)
     if kind == "result":
-        return Result.model_validate(decoded)
+        return Result.model_validate(frame)
     msg = f"the server sent response kind {kind!r}. Known kinds: progress, result"
     raise ProtocolError(msg)
 
@@ -845,8 +847,8 @@ async def _await_result(
         except (asyncio.LimitOverrunError, ValueError) as exc:
             msg = f"the manicule server sent a frame longer than {MAX_FRAME_BYTES} bytes"
             raise ProtocolError(msg) from exc
-        frame = read_response(line)
-        if isinstance(frame, Progress):
-            on_progress(frame.message)
+        answer = read_response(line)
+        if isinstance(answer, Progress):
+            on_progress(answer.message)
             continue
-        return cast("dict[str, JsonValue]", frame.envelope)
+        return answer.envelope
