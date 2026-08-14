@@ -23,6 +23,20 @@ bind that was not asked for three separate times.
 **Every tool says what it does to the installation**, in the four hints ``tools/list``
 carries — see :func:`hints`. They are a description, never a permission: a client decides what
 it will call, and nothing here consults them.
+
+**Over a socket, the mutating tools are not registered at all.** Over stdio they are
+unreachable from a network by construction — stdin and stdout are a pipe — and moving MCP onto
+a socket destroys that property unless something replaces it. What replaces it is
+``read_only=True``: :func:`build_server` consults the very hints above and never calls
+``@mcp.tool`` for a tool whose ``readOnlyHint`` is not true, so the write tools are absent from
+``tools/list``, absent from ``tools/call``, and absent from the process's dispatch table for
+that server object. That is the same kind of guarantee ``tests/api/test_routes.py`` keeps for
+the HTTP surface, made the same way: **structurally, not by a check a caller could be granted
+an exception to.**
+
+The classification is read from the registrations and from nowhere else, so a tool added
+tomorrow is excluded until somebody writes down what it does — the safe direction, and the same
+mechanism ``tests/mcp/test_annotations.py`` already holds the hints to.
 """
 
 from __future__ import annotations
@@ -79,6 +93,28 @@ such thing"; `collection_counts` is what tells you how much you did not look at.
 **Keep retrieval small.** Three searches at `limit=4` or `5` answers most questions. Add a
 fourth only to close a gap you can name. Paraphrase what you cite and keep its title, URI and
 heading path — copying long passages forward spends context on text you have already read.
+"""
+
+READ_ONLY_NOTICE = """\
+
+## This server is read-only
+
+It is being served over a socket, so it offers only the tools that read. Indexing, deleting,
+syncing a source, writing configuration and enabling a plugin are **not** absent by accident and
+are not behind a permission you can be granted: they are not registered on this server at all.
+
+They are reachable where a person is present — `manicule <command>` at a terminal, or an MCP
+client that launches `manicule serve` over stdio. If a task needs one, say which command it
+needs and stop; there is nothing here to retry.
+"""
+"""What the read-only server tells a client about the tools it will not find.
+
+Appended to :data:`INSTRUCTIONS` rather than replacing it, because everything the full surface
+says about scoping a question and reading `ok` is true of this one too.
+
+It exists so that "I cannot do that" is a sentence the assistant can say **before** calling
+something that is not there. A client that discovers the absence from an unknown-tool error has
+already spent a turn on it, and the obvious recovery from an unknown tool is to try another name.
 """
 
 
@@ -163,11 +199,70 @@ TOOL_NAMES: tuple[str, ...] = (
 
 Here as data as well as decorators so that "the server offers exactly these" is a test rather
 than a count somebody keeps in their head.
+
+**It is the whole surface, not the network one.** There is deliberately no second tuple naming
+the tools a socket may carry: that set is *derived* from each registration's ``readOnlyHint`` by
+:class:`_Registrar`, so there is nothing to keep in step and nothing to fall out of step with.
 """
 
 
+class _Registrar:
+    """Registers one tool at a time, and knows which ones a socket may carry.
+
+    Every tool goes through :meth:`tool` instead of ``@mcp.tool`` directly, for two reasons that
+    are each sufficient on their own.
+
+    **It is where the read-only surface is decided.** ``readOnlyHint`` is already written at
+    every registration and already checked against behavior by ``tests/mcp/test_annotations.py``,
+    so a network surface built from it inherits that scrutiny rather than needing its own. A
+    second list of "tools a socket may carry" would be a second answer to a question already
+    answered, and the two would agree until they did not.
+
+    **It is where "named twice" is checked.** :attr:`named` is every tool the module registered,
+    whether or not this surface carries it, so the comparison against :data:`TOOL_NAMES` is
+    exactly as strong on the read-only server as on the full one — a tool omitted from the tuple
+    fails on both, rather than passing on whichever surface happened to drop it.
+    """
+
+    def __init__(self, mcp: FastMCP, *, read_only: bool) -> None:
+        self._mcp = mcp
+        self._read_only = read_only
+        self.named: dict[str, ToolAnnotations] = {}
+        """Every tool this module registered, and what each says it does."""
+
+        self.carried: set[str] = set()
+        """The ones this surface actually offers. Equal to :attr:`named` unless read-only."""
+
+    def tool(
+        self, annotations: ToolAnnotations
+    ) -> Callable[[Callable[..., Awaitable[dict[str, Any]]]], Callable[..., Awaitable[dict[str, Any]]]]:
+        """Register one tool, unless this surface reads only and that one does not.
+
+        The function is handed straight back either way, exactly as ``@mcp.tool`` does, so the
+        wiring check at the end of :func:`build_server` reads ``__name__`` off the same object on
+        both surfaces.
+
+        ``annotations.readOnlyHint is True`` rather than a truth test, and rather than
+        ``not annotations.destructiveHint``: the field is ``bool | None``, and a tool that left
+        it unanswered must be excluded rather than admitted by a falsy comparison going the
+        convenient way. :func:`hints` makes all four required, so this cannot fire today; it is
+        the direction the code fails in if that ever stops being true.
+        """
+
+        def register(
+            function: Callable[..., Awaitable[dict[str, Any]]],
+        ) -> Callable[..., Awaitable[dict[str, Any]]]:
+            self.named[function.__name__] = annotations
+            if self._read_only and annotations.readOnlyHint is not True:
+                return function
+            self.carried.add(function.__name__)
+            return self._mcp.tool(annotations=annotations)(function)
+
+        return register
+
+
 def _register_collections(
-    mcp: FastMCP,
+    register: _Registrar,
     service: ApplicationService,
     dispatch: Callable[[str, Callable[[], Awaitable[Payload]]], Awaitable[dict[str, Any]]],
 ) -> tuple[Any, ...]:
@@ -179,12 +274,16 @@ def _register_collections(
     surface-versus-``TOOL_NAMES`` comparison every other tool is held to — a group registered
     here and forgotten there would be exactly the drift that check exists to catch.
 
+    ``register`` is the :class:`_Registrar` rather than the server, so this group is filtered by
+    the same rule as every other tool. Passing the ``FastMCP`` here and the registrar elsewhere
+    is precisely how nine tools would end up on a socket that carries none of the others.
+
     Note the one operation deliberately absent: there is no tool that deletes documents left
     in no collection. It destroys data, so it stays on the command line with the rest of that
     class -- ``reset-index``, ``backup``, ``import`` -- where a person is present.
     """
 
-    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=False, reaches_out=False))
+    @register.tool(hints(reads=False, removes=False, repeatable=False, reaches_out=False))
     async def collection_create(name: str, description: str | None = None) -> dict[str, Any]:
         """Create a named set of documents.
 
@@ -199,7 +298,7 @@ def _register_collections(
             "collection_create", lambda: service.collection_create(name, description=description)
         )
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def collection_list() -> dict[str, Any]:
         """List every collection in this workspace, with the rule each one carries.
 
@@ -212,7 +311,7 @@ def _register_collections(
         """
         return await dispatch("collection_list", service.collection_list)
 
-    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=True, reaches_out=False))
+    @register.tool(hints(reads=False, removes=True, repeatable=True, reaches_out=False))
     async def collection_rename(collection_id: str, name: str) -> dict[str, Any]:
         """Rename a collection. Nothing is re-indexed and no membership moves.
 
@@ -224,7 +323,7 @@ def _register_collections(
             "collection_rename", lambda: service.collection_rename(collection_id, name)
         )
 
-    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=True, reaches_out=False))
+    @register.tool(hints(reads=False, removes=True, repeatable=True, reaches_out=False))
     async def collection_update(collection_id: str, description: str) -> dict[str, Any]:
         """Set a collection's description, leaving its membership alone.
 
@@ -241,7 +340,7 @@ def _register_collections(
             lambda: service.collection_update(collection_id, description=description),
         )
 
-    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=False, reaches_out=False))
+    @register.tool(hints(reads=False, removes=True, repeatable=False, reaches_out=False))
     async def collection_delete(collection_id: str) -> dict[str, Any]:
         """Delete a collection. **The documents in it are untouched.**
 
@@ -253,7 +352,7 @@ def _register_collections(
         """
         return await dispatch("collection_delete", lambda: service.collection_delete(collection_id))
 
-    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=True, reaches_out=False))
+    @register.tool(hints(reads=False, removes=False, repeatable=True, reaches_out=False))
     async def collection_add(collection_id: str, document_ids: list[str]) -> dict[str, Any]:
         """Add documents to a collection.
 
@@ -268,7 +367,7 @@ def _register_collections(
             "collection_add", lambda: service.collection_add(collection_id, tuple(document_ids))
         )
 
-    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=True, reaches_out=False))
+    @register.tool(hints(reads=False, removes=False, repeatable=True, reaches_out=False))
     async def collection_remove(collection_id: str, document_ids: list[str]) -> dict[str, Any]:
         """Remove documents from a collection. The documents themselves survive.
 
@@ -286,7 +385,7 @@ def _register_collections(
             lambda: service.collection_remove(collection_id, tuple(document_ids)),
         )
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def collection_documents(
         collection_id: str, limit: int = 50, offset: int = 0
     ) -> dict[str, Any]:
@@ -306,7 +405,7 @@ def _register_collections(
             lambda: service.collection_documents(collection_id, limit=limit, offset=offset),
         )
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def collection_counts(collection_id: str) -> dict[str, Any]:
         """Count a collection's documents and chunks, as they are now.
 
@@ -338,18 +437,33 @@ def _register_collections(
     )
 
 
-def build_server(service: ApplicationService) -> FastMCP:
-    """Register every tool against ``service`` and return the server.
+def build_server(service: ApplicationService, *, read_only: bool = False) -> FastMCP:
+    """Register the tools this surface offers against ``service`` and return the server.
 
     Takes the service rather than building one, so the suites drive the real FastMCP tool
     manager against a fake backend — which is what makes the parity test meaningful. A server
     that constructed its own runtime could only be tested by starting a whole manicule.
+
+    Args:
+        read_only: Register only the tools whose ``readOnlyHint`` is true. **This is what every
+            socket passes**, and it is a different thing from refusing a mutating call: the
+            tools are never registered, so there is no handler behind the name and nothing that
+            an authenticated caller, a misconfigured client or a future middleware could reach.
+            Off by default, because the default transport is stdio and the full surface is the
+            point of running manicule under an assistant at all.
+
+    Raises:
+        AssertionError: A tool was registered without being listed in :data:`TOOL_NAMES`, or
+            listed without being registered, or the read-only surface carried something that
+            does not report itself read-only. All three are startup failures rather than tests,
+            because each is a surface nothing describes.
     """
     mcp: FastMCP = FastMCP(
         name=SERVER_NAME,
         version=CORE_VERSION,
-        instructions=INSTRUCTIONS,
+        instructions=INSTRUCTIONS + READ_ONLY_NOTICE if read_only else INSTRUCTIONS,
     )
+    register = _Registrar(mcp, read_only=read_only)
 
     async def dispatch(op: str, call: Callable[[], Awaitable[Payload]]) -> dict[str, Any]:
         return (await run_op(op, service.workspace, call)).as_json()
@@ -358,7 +472,7 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # Not read-only, for two reasons that are each sufficient: with a `conversation_id` it
     # persists this turn, and the model it calls may be a provider on somebody else's machine.
-    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=False, reaches_out=True))
+    @register.tool(hints(reads=False, removes=False, repeatable=False, reaches_out=True))
     async def ask(
         question: str,
         *,
@@ -401,7 +515,7 @@ def build_server(service: ApplicationService) -> FastMCP:
             ),
         )
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def search(
         query: str,
         *,
@@ -467,7 +581,7 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # `reaches_out`, because the tree it walks is a part of this machine manicule does not own
     # and cannot enumerate in advance. No network is involved; the hint is not about networks.
-    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=False, reaches_out=True))
+    @register.tool(hints(reads=False, removes=False, repeatable=False, reaches_out=True))
     async def index_path(
         path: str,
         source: str = "local",
@@ -496,7 +610,7 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- documents ------------------------------------------------------------------------
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def document_list(
         limit: int = 50,
         offset: int = 0,
@@ -518,7 +632,7 @@ def build_server(service: ApplicationService) -> FastMCP:
             ),
         )
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def document_get(document_id: str, chunks: bool = False) -> dict[str, Any]:
         """Read one document's metadata, and optionally every chunk it was split into.
 
@@ -530,7 +644,7 @@ def build_server(service: ApplicationService) -> FastMCP:
             "document_get", lambda: service.document_get(document_id, chunks=chunks)
         )
 
-    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=False, reaches_out=False))
+    @register.tool(hints(reads=False, removes=True, repeatable=False, reaches_out=False))
     async def document_delete(document_id: str, hard: bool = False) -> dict[str, Any]:
         """Remove a document from the index.
 
@@ -543,7 +657,7 @@ def build_server(service: ApplicationService) -> FastMCP:
             "document_delete", lambda: service.document_delete(document_id, hard=hard)
         )
 
-    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=True, reaches_out=False))
+    @register.tool(hints(reads=False, removes=False, repeatable=True, reaches_out=False))
     async def document_reindex(document_id: str) -> dict[str, Any]:
         """Re-parse one document from the bytes ingest retained. Touches no network.
 
@@ -558,7 +672,7 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- state ----------------------------------------------------------------------------
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def index_status() -> dict[str, Any]:
         """Report what is in the index and what it was built with.
 
@@ -567,7 +681,7 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("index_status", service.index_status)
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def stats() -> dict[str, Any]:
         """Count documents and chunks, grouped by source, media type and status."""
         return await dispatch("stats", service.stats)
@@ -575,7 +689,7 @@ def build_server(service: ApplicationService) -> FastMCP:
     # Read-only because `fix` is not on this surface: the repairs that write to the machine and
     # may fetch from the network are passed by the command line alone, and
     # `tests/app/test_surface_parity.py` holds that line.
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def doctor() -> dict[str, Any]:
         """Check configuration, plugins, storage, the index and the network bind.
 
@@ -586,12 +700,12 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- connectors -----------------------------------------------------------------------
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def connector_list() -> dict[str, Any]:
         """List configured sources, with what each one's last sync recorded."""
         return await dispatch("connector_list", service.connector_list)
 
-    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=False, reaches_out=True))
+    @register.tool(hints(reads=False, removes=False, repeatable=False, reaches_out=True))
     async def connector_sync(name: str, limit: int | None = None) -> dict[str, Any]:
         """Run one configured connector, ingesting what changed since its watermark.
 
@@ -603,7 +717,7 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- configuration --------------------------------------------------------------------
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def config_get(key: str = "") -> dict[str, Any]:
         """Read configuration, with every credential masked.
 
@@ -612,7 +726,7 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("config_get", lambda: service.config_get(key))
 
-    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=True, reaches_out=False))
+    @register.tool(hints(reads=False, removes=True, repeatable=True, reaches_out=False))
     async def config_set(key: str, value: str) -> dict[str, Any]:
         """Write one setting to the config file, validating the whole tree first.
 
@@ -628,7 +742,7 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- workspaces -----------------------------------------------------------------------
 
-    @mcp.tool(annotations=READS)
+    @register.tool(READS)
     async def workspace_list() -> dict[str, Any]:
         """List the workspaces this installation knows about, and say which is active.
 
@@ -637,7 +751,7 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("workspace_list", service.workspace_list)
 
-    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=True, reaches_out=False))
+    @register.tool(hints(reads=False, removes=True, repeatable=True, reaches_out=False))
     async def workspace_switch(name: str, create: bool = False) -> dict[str, Any]:
         """Record a different active workspace. It takes effect at the next start.
 
@@ -658,7 +772,7 @@ def build_server(service: ApplicationService) -> FastMCP:
     # Read-only and `reaches_out` together, which is the pair a name would have got wrong:
     # `registry=True` fetches the community listing over the network. It writes nothing either
     # way, so the first hint is true and the fourth is what says a call may leave this machine.
-    @mcp.tool(annotations=hints(reads=True, removes=False, repeatable=True, reaches_out=True))
+    @register.tool(hints(reads=True, removes=False, repeatable=True, reaches_out=True))
     async def plugin_list(registry: bool = False) -> dict[str, Any]:
         """List installed plugins and the components each one registers.
 
@@ -672,7 +786,7 @@ def build_server(service: ApplicationService) -> FastMCP:
     # `reaches_out`, which the name argues against and the code settles: a name that is not
     # installed sends `plugin_add` to the community registry to find out whether it exists, so
     # that the refusal can name the command that would install it.
-    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=True, reaches_out=True))
+    @register.tool(hints(reads=False, removes=False, repeatable=True, reaches_out=True))
     async def plugin_add(name: str) -> dict[str, Any]:
         """Enable an installed plugin.
 
@@ -686,7 +800,7 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("plugin_add", lambda: service.plugin_add(name))
 
-    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=True, reaches_out=False))
+    @register.tool(hints(reads=False, removes=False, repeatable=True, reaches_out=False))
     async def plugin_remove(name: str) -> dict[str, Any]:
         """Disable a plugin. The distribution stays installed and is not touched.
 
@@ -695,13 +809,13 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("plugin_remove", lambda: service.plugin_remove(name))
 
-    collections = _register_collections(mcp, service, dispatch)
+    collections = _register_collections(register, service, dispatch)
 
     # Every tool, named twice — once by its decorator and once in `TOOL_NAMES` — and the two
     # are compared here rather than in a test. A tool added without being listed would
     # otherwise be a surface nothing describes, and a name listed without a tool would be a
     # tool a client is told about and cannot call. Both are startup failures.
-    registered = {
+    declared = {
         # `__name__`, because FastMCP derives a tool's name from its function's and the
         # decorator hands the function straight back. Reading the name off the registry
         # instead would need an await, and this is a wiring check rather than a query.
@@ -729,15 +843,41 @@ def build_server(service: ApplicationService) -> FastMCP:
             *collections,
         )
     }
-    if registered != set(TOOL_NAMES):
-        missing = sorted(set(TOOL_NAMES) - registered)
-        extra = sorted(registered - set(TOOL_NAMES))
+    # `register.named` as well as the function objects: the first is what every registration
+    # recorded on its way through, the second is what this function can see. They differ only if
+    # a tool was registered and then dropped from the tuple above, which is the drift this pair
+    # exists to catch — and on the read-only surface it is the *only* thing that can catch it,
+    # since the tool itself is deliberately not on the server to be listed.
+    if declared != set(TOOL_NAMES) or set(register.named) != set(TOOL_NAMES):
+        found = declared | set(register.named)
+        missing = sorted(set(TOOL_NAMES) - found)
+        extra = sorted(found - set(TOOL_NAMES))
         msg = (
             f"the MCP tool surface and TOOL_NAMES disagree. Registered but unlisted: "
             f"{extra or 'none'}. Listed but not registered: {missing or 'none'}."
         )
         raise AssertionError(msg)
+    carried_but_writes = sorted(
+        name
+        for name in register.carried
+        if register.named[name].readOnlyHint is not True and read_only
+    )
+    if carried_but_writes:  # pragma: no cover - `_Registrar.tool` is what makes this unreachable
+        msg = (
+            f"the read-only MCP surface carries tool(s) that do not report themselves read-only: "
+            f"{carried_but_writes}. That surface is served over a socket, so this would be a "
+            f"write operation reachable from the network."
+        )
+        raise AssertionError(msg)
     return mcp
 
 
-__all__ = ["INSTRUCTIONS", "READS", "SERVER_NAME", "TOOL_NAMES", "build_server", "hints"]
+__all__ = [
+    "INSTRUCTIONS",
+    "READS",
+    "READ_ONLY_NOTICE",
+    "SERVER_NAME",
+    "TOOL_NAMES",
+    "build_server",
+    "hints",
+]
