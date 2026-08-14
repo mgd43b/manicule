@@ -211,7 +211,26 @@ def build_app(
     # that answers every request with "session manager not initialized". Passing it here is what
     # makes shutting the HTTP server down also close the MCP sessions, which is the last step of
     # the order `manicule.cli.serving` keeps.
-    mcp = mcp_surface(service, transport="http").server.http_app(path="/")
+    mcp = mcp_surface(service, transport="http").server.http_app(
+        path="/",
+        # **Nothing about one call outlives it, and both flags say that in a different way.**
+        #
+        # `stateless_http` builds the protocol session per request and tears it down with the
+        # response, so there is no session identifier, no server-side session table and no
+        # per-connection state of any kind. That is the honest shape for this surface: it is
+        # read-only, it starts nothing long-running, and it sends no server-initiated messages,
+        # so a session would be bookkeeping with nothing in it. It is also the answer to "can
+        # one client see another's state" — there is no state to see, rather than a table with
+        # a lock on it.
+        #
+        # `json_response` answers a call with one JSON body instead of an event stream carrying
+        # one event. Same reason, and it matters twice over at shutdown: an event stream is a
+        # connection a client may hold open indefinitely, which is what
+        # `manicule.api.serve.DRAIN_SECONDS` exists to bound, and a half-read one is a resource
+        # nobody closed. A request/response surface has neither problem.
+        stateless_http=True,
+        json_response=True,
+    )
 
     app = FastAPI(
         title=TITLE,
