@@ -130,9 +130,9 @@ alongside it.
 | Surface | Started by | Shape |
 |---|---|---|
 | **Command line** | `manicule <command>` | 20 commands; `--json` anywhere data is emitted |
-| **HTTP API** | `manicule start --transport http` | 11 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
+| **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
 | **Browser** | the same process, at `/ui` | 12 areas of server-rendered HTML, 11 of them in the navigation |
-| **MCP** | `manicule start --mcp-only` | 19 tools over stdio, which opens no socket |
+| **MCP** | `manicule start --mcp-only` | 28 tools over stdio, which opens no socket; 13 read-only tools at `/mcp/` when served over a port |
 
 They are adapters over one application service, and `tests/app/test_surface_parity.py` holds
 them to it: for the same operation and the same arguments the CLI under `--json`, the MCP tool
@@ -144,17 +144,23 @@ result envelope is the whole of stdout — no prose, no progress, nothing else �
 that same envelope with `"ok": false`, a typed `error` and a non-zero exit status. So `jq` reads
 well-formed JSON whether the command succeeded or not.
 
-**The HTTP API** is eleven route groups over the same service — health, documents, chat with SSE
+**The HTTP API** is twelve route groups over the same service — health, documents, chat with SSE
 streaming, conversations and shareable links, collections, tags, admin, plugins, auth, a
-workbench and a websocket channel — plus an embeddable chat widget at `/widget`. `manicule start
---transport http` serves it on `127.0.0.1:8765`, and only there unless three separate things say
-otherwise. It prints where it is listening, including the two paths below:
+workbench, a websocket channel and an MCP endpoint — plus an embeddable chat widget at
+`/widget`. `manicule start --transport http` serves them on `127.0.0.1:8765`, and only there
+unless three separate things say otherwise. It prints where it is listening, including the two
+paths below:
 
 ```
 HTTP API on http://127.0.0.1:8765 (this machine only)
 browser surface  http://127.0.0.1:8765/ui
 API documentation http://127.0.0.1:8765/api/docs
 ```
+
+**MCP is served from that same process and port**, at `/mcp/`, and it carries the **read-only
+tools only** — the write tools are not registered on it rather than refused, so there is no
+handler behind `document_delete` or `connector_sync` there at all. Over stdio, where one client
+talks to one process down a pipe, the whole surface is offered. `docs/surfaces.md` §6.1 says why.
 
 `/api/docs` is Swagger over the OpenAPI document at `/api/openapi.json`. Every response is the
 same envelope the CLI prints under `--json`.

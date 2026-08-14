@@ -635,11 +635,13 @@ invented them here would be a second, weaker copy of that subsystem.
 ## 6. Where a server listens
 
 `manicule start` serves MCP over **stdio** by default, which opens no socket at all. There is
-no address to get wrong on the path everybody uses.
+no address to get wrong on the path everybody uses, and stdio carries the **whole** tool
+surface — stdin and stdout are a pipe between one client and one process, so a write tool on it
+is unreachable from a network by construction.
 
-`--transport http` serves the **HTTP API**; add `--mcp-only` to serve the MCP protocol over
-that socket instead. Either way the address goes through `manicule.app.bind.resolve_bind`, and
-a non-loopback bind needs **all three** of:
+`--transport http` serves the **HTTP API, the browser surface and MCP together**, on one port.
+`--mcp-only` serves MCP alone over that socket. Either way the address goes through
+`manicule.app.bind.resolve_bind`, and a non-loopback bind needs **all three** of:
 
 1. a host that is not loopback — and the configured default is `127.0.0.1`, so this is always
    something a person wrote down;
@@ -659,6 +661,66 @@ an address; `manicule.api.app.build_app` decides whether an *application* may ex
 refuses to build an unauthenticated one whose address is not loopback. That one fires even when
 something other than `manicule start` is doing the listening — a container entry point, a
 production ASGI server, a hand-written uvicorn call.
+
+### 6.1 MCP over a socket carries the read-only tools only
+
+The endpoint is `/mcp` on the same port, and a client is configured with the trailing slash:
+`http://127.0.0.1:8765/mcp/`. A **path rather than a second port**, because one port is one bind
+decision, one address in a plist, one firewall rule and one thing to remember; a second port
+would need its own answer to every question §6 answers here, and the way that goes wrong is that
+it gets a *different* answer.
+
+**Every mutating tool is absent from it.** Not refused — absent. `manicule.mcp.server` is asked
+for the read-only surface, and it never calls `@mcp.tool` for a tool whose `readOnlyHint` is not
+true, so there is no handler behind `document_delete`, `connector_sync`, `config_set`,
+`plugin_add`, `index_path`, `ask` or the nine collection verbs on that server object. A call to
+one is an unknown tool.
+
+That is the same guarantee `tests/api/test_routes.py` keeps for the HTTP route table, kept the
+same way and asserted in the same file: `ABSENT` names the operations with no route, and
+`ABSENT_TOOLS` names the tools with no registration, each with the reason it is absent. Both
+lists are held to being complete rather than merely true, so a tool added tomorrow lands in one
+of the two or fails a test.
+
+**The classification is the one already at the registrations** — the four hints of §4.1, decided
+from behavior and checked against it by `tests/mcp/test_annotations.py`. There is no second
+table of "tools a socket may carry", and no setting that grants an exception: a structural
+guarantee traded for a configuration one is a guarantee that fails silently. The server also
+*says* so — the read-only surface's instructions tell a client the write tools are not there and
+where they are — so "I cannot do that" is available before a turn is spent discovering it.
+
+**Nothing about a call outlives it.** The mount is stateless and answers with JSON rather than an
+event stream, so there is no session identifier, no server-side session table, and no connection
+a client can hold open. Two clients cannot see each other's state because there is no state to
+see; what they share is the process — one `Runtime`, one pipeline, one session vault, one
+schedule — which is right, because each of those is a fact about the process rather than about a
+caller. `tests/api/test_both_surfaces.py` drives two clients at once over a real socket and
+proves each is answered with what it asked for.
+
+**Write operations are reachable where a person is present**: at the command line, over stdio,
+and over the control socket of `docs/deployment.md` §6.1. A write over the network is out of
+scope rather than unimplemented — it is its own decision with its own threat model.
+
+### 6.2 Stopping it
+
+Four things stop, in this order, because each step's work is what the next must not interrupt:
+
+1. **the scheduler**, so no new sync starts — canceling a loop cancels the sync it was inside;
+2. **the ingest stages** of whatever was running, which drain within `ingest.shutdown_grace_s`;
+3. **the control socket**, which waits for the write commands already in flight;
+4. **the MCP sessions and the HTTP server**, together and last, because one lifespan owns both.
+
+A second interrupt stops waiting. Each step announces itself on stderr, because a stop can take
+as long as the grace window plus whatever a proxied command is still doing — which is exactly
+the interval in which somebody reaches for `kill -9` and gets the half-written index the grace
+window exists to prevent.
+
+**manicule handles the signal itself, and that is a change rather than a detail.** uvicorn
+captures `SIGINT` and `SIGTERM` for the length of `serve()`, and on the way out it restores the
+previous handler and re-raises — so the transport shuts down *first* and the three steps above
+run afterwards, in whatever order is left. `manicule.api.serve.Server` overrides one method to
+take the signals back. `tests/app/test_shutdown.py` asserts the order from outside a real
+process that was sent a real `SIGTERM`; reverting that override turns it red.
 
 ---
 
@@ -717,9 +779,9 @@ left to be discovered.
 
 ## 9. The HTTP API
 
-`manicule.api`. Eleven route groups, `manicule start --transport http`, OpenAPI at
+`manicule.api`. Twelve route groups, `manicule start --transport http`, OpenAPI at
 `/api/docs`. Every route parses a request, calls one service method, and renders the envelope
-above.
+above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its own protocol.
 
 ### 9.1 The groups
 
@@ -736,6 +798,7 @@ above.
 | auth | `GET /auth/providers`, `GET /auth/session`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}` |
 | workbench | `GET /api/v1/workbench?document_id=…` |
 | websocket chat | `WS /api/v1/chat/ws` |
+| mcp | `POST /mcp/` — the read-only tool surface of §6.1 |
 
 Plus the embeddable widget: `GET /widget/widget.js` and a static page at `GET /widget`, and the
 browser surface at `/ui` — twelve areas of server-rendered HTML over the same service, mounted on

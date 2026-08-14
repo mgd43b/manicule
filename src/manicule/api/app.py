@@ -1,4 +1,4 @@
-"""Assembling the HTTP application: eleven route groups over one application service.
+"""Assembling the HTTP application: twelve route groups over one application service.
 
 The service is passed in rather than built here, exactly as :func:`manicule.mcp.server.build_server`
 takes one. That is what lets the suites drive the **real** routing, the real dependency

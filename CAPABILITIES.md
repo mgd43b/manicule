@@ -105,6 +105,12 @@ Ticket: #8 — **built.** Twenty-eight tools over the same application service t
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
+**All twenty-eight over stdio; the thirteen read-only ones over a socket.** MCP is also served
+at `/mcp/` on the HTTP port, and every mutating tool is *absent* from that surface rather than
+refused on it — see [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are
+unreachable from a network by construction, and a socket has to replace that property rather
+than assume it.
+
 - [x] `ask`
 - [x] `collection_add`
 - [x] `collection_counts`
@@ -144,10 +150,12 @@ collection into the trash, which in a corpus where collections are optional is m
 
 ## HTTP endpoints — 56
 
-Ticket: #11 — **built.** Eleven route groups over the same application service the CLI and the
+Ticket: #11 — **built.** Twelve route groups over the same application service the CLI and the
 MCP server use: health · documents · chat · conversations · collections · tags · admin ·
-plugins · auth · workbench · websocket chat, plus an embeddable widget. Every response is the
-envelope `--json` prints; the reference is [`docs/surfaces.md`](docs/surfaces.md) §9.
+plugins · auth · workbench · websocket chat · mcp, plus an embeddable widget. Every response is
+the envelope `--json` prints; the reference is [`docs/surfaces.md`](docs/surfaces.md) §9. The
+twelfth is the mounted MCP endpoint, which speaks its own protocol rather than returning
+envelopes over routes.
 
 Struck-through entries are **deliberately absent**, each for a stated reason. This surface is
 the one an unattended caller reaches, so an operation that destroys data, opens an ingest path

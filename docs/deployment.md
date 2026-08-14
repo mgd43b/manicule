@@ -215,8 +215,12 @@ knowing:
 is still the ordinary way to run it. `manicule start --transport http` serves the HTTP API
 ([#11](https://github.com/mgd43b/manicule/issues/11)) on `security.transport.port`, 8765 by
 default, **and the browser surface at `/ui`**
-([#12](https://github.com/mgd43b/manicule/issues/12)) on the same socket. There is no separate
-UI server and no second port.
+([#12](https://github.com/mgd43b/manicule/issues/12)) **and MCP at `/mcp/`** on the same socket.
+There is no separate UI server, no separate MCP server and no second port.
+
+MCP served that way carries the **read-only tools only** — every mutating tool is absent from it
+rather than refused on it, for the reason `docs/surfaces.md` §6.1 gives. Over stdio, where one
+client talks to one process down a pipe, the whole surface is offered.
 
 The browser surface is for the loopback, single-operator installation. A browser cannot attach a
 header to a page load and this build has no session cookie, so with `security.auth.mode` set to
