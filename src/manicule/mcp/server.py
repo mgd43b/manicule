@@ -19,6 +19,10 @@ still propagate: a bug is not a result.
 the path everybody uses. The HTTP transport exists, goes through
 :func:`~manicule.app.bind.resolve_bind` like every other server, and refuses a non-loopback
 bind that was not asked for three separate times.
+
+**Every tool says what it does to the installation**, in the four hints ``tools/list``
+carries — see :func:`hints`. They are a description, never a permission: a client decides what
+it will call, and nothing here consults them.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from manicule.app.dispatch import run_op
 from manicule.core.version import CORE_VERSION
@@ -41,13 +46,87 @@ SERVER_NAME = "manicule"
 INSTRUCTIONS = """\
 Search and question-answering over a self-hosted document index.
 
-Start with `search` when you want passages and `ask` when you want an answer with citations.
+Every tool returns the same envelope: `ok`, `op`, `workspace`, and then `data` or `error`.
+Read `ok` first. Everything is scoped to one workspace and nothing crosses between them.
+
+`search` ranks passages and asks no model anything; `ask` answers in prose with citations.
 Every citation resolves to a real location in a real document, and one that could not be
 verified is deleted rather than shown — so an answer with no citations means nothing could be
 verified, not that nothing was found.
 
-Every tool returns the same envelope: `ok`, `op`, `workspace`, and then `data` or `error`.
-Read `ok` first. Everything is scoped to one workspace and nothing crosses between them.
+## Scope every question to a collection, and resolve the collection first
+
+1. `collection_list` — find the collection by name. Keep both fields it reports: `id` is
+   stable and is what `collection_counts` takes; `name` is what `search` and `ask` take as a
+   scope.
+2. `collection_counts(collection_id)` — the current document and chunk totals. They are
+   counted from membership when you ask, which is why they are a separate call and why no row
+   in `collection_list` carries a total: a remembered total reports the day it was written.
+3. `search(query, collections=[name], limit=5)` — name the scope on **every** call. Nothing is
+   remembered between calls. `data.collections` repeats the scope the search actually ran
+   under; read it rather than assuming the argument arrived.
+
+**A scope that fails is a refusal, not permission to widen.** A name this workspace does not
+have comes back `ok: false` with `UnknownEntityError`, and no search runs — deliberately, since
+a restriction that silently vanished would return the whole workspace, ranked and plausible.
+Correct the name or say you cannot answer. Do not retry the same query without `collections`.
+
+**Retrieving nothing is not proof that there is nothing.** `search` returns the top `limit`
+passages of one ranking, so an empty or weak result means the top of that ranking held nothing,
+not that the corpus does not. Say "nothing in <collection> supports this", never "there is no
+such thing"; `collection_counts` is what tells you how much you did not look at.
+
+**Keep retrieval small.** Three searches at `limit=4` or `5` answers most questions. Add a
+fourth only to close a gap you can name. Paraphrase what you cite and keep its title, URI and
+heading path — copying long passages forward spends context on text you have already read.
+"""
+
+
+def hints(*, reads: bool, removes: bool, repeatable: bool, reaches_out: bool) -> ToolAnnotations:
+    """The four hints ``tools/list`` carries for one tool, from four questions about it.
+
+    The questions are asked in English so that they can be answered from the tool's behavior
+    rather than from its name, and translated here — once — into the specification's own
+    vocabulary. Every argument is required and none has a default: a tool added tomorrow has to
+    answer all four, and a default is how the wrong answer gets given by nobody.
+
+    **These are hints. They are not authorization.** The specification says so and this server
+    behaves accordingly: nothing reads them back, no tool is gated on them, and a client that
+    ignores them reaches exactly what it reached before. What they buy is an operator being
+    able to approve `search` without also approving `document_delete` — see
+    ``docs/surfaces.md`` §4.1.
+
+    Args:
+        reads: The call leaves the index, the configuration and the installation as it found
+            them. Retrieval's one append to ``query_logs`` is the exception the whole project
+            already makes for it (:data:`~manicule.app.dispatch.READ_ONLY_OPS`): it records
+            that a read happened rather than changing what any read reports.
+        removes: The call can remove or overwrite something it does not carry enough
+            information to put back. ``collection_remove`` is *not* one — it names the
+            documents, so ``collection_add`` with the same ones restores it — while
+            ``collection_update`` is, because the description it overwrites is not in the call.
+        repeatable: Calling it again with the same arguments changes nothing further.
+        reaches_out: It can reach something outside this installation — a remote system, or a
+            part of this machine manicule does not own.
+
+    Returns:
+        The annotations, ready to hand to ``@mcp.tool``.
+    """
+    return ToolAnnotations(
+        readOnlyHint=reads,
+        destructiveHint=removes,
+        idempotentHint=repeatable,
+        openWorldHint=reaches_out,
+    )
+
+
+READS = hints(reads=True, removes=False, repeatable=True, reaches_out=False)
+"""A tool that reads this installation and reaches nothing beyond it.
+
+Named because twelve tools are exactly this and repeating the four arguments twelve times
+would invite one of them to be edited alone. It is a *value*, not a list of tool names: which
+tools carry it is written at the registrations and nowhere else, so there is no second table to
+fall out of step with them.
 """
 
 TOOL_NAMES: tuple[str, ...] = (
@@ -105,7 +184,7 @@ def _register_collections(
     class -- ``reset-index``, ``backup``, ``import`` -- where a person is present.
     """
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=False, reaches_out=False))
     async def collection_create(name: str, description: str | None = None) -> dict[str, Any]:
         """Create a named set of documents.
 
@@ -120,12 +199,20 @@ def _register_collections(
             "collection_create", lambda: service.collection_create(name, description=description)
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def collection_list() -> dict[str, Any]:
-        """List every collection in this workspace, with the rule each one carries."""
+        """List every collection in this workspace, with the rule each one carries.
+
+        **Start here whenever a question names a collection.** Each row carries both identities
+        and they are not interchangeable: `id` is stable and is what `collection_counts` takes,
+        `name` is what `search` and `ask` take as a scope.
+
+        No row carries a document or chunk total. That is `collection_counts`, computed when
+        you ask it, because a total remembered here would report the day it was written.
+        """
         return await dispatch("collection_list", service.collection_list)
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=True, reaches_out=False))
     async def collection_rename(collection_id: str, name: str) -> dict[str, Any]:
         """Rename a collection. Nothing is re-indexed and no membership moves.
 
@@ -137,7 +224,7 @@ def _register_collections(
             "collection_rename", lambda: service.collection_rename(collection_id, name)
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=True, reaches_out=False))
     async def collection_update(collection_id: str, description: str) -> dict[str, Any]:
         """Set a collection's description, leaving its membership alone.
 
@@ -154,7 +241,7 @@ def _register_collections(
             lambda: service.collection_update(collection_id, description=description),
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=False, reaches_out=False))
     async def collection_delete(collection_id: str) -> dict[str, Any]:
         """Delete a collection. **The documents in it are untouched.**
 
@@ -166,7 +253,7 @@ def _register_collections(
         """
         return await dispatch("collection_delete", lambda: service.collection_delete(collection_id))
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=True, reaches_out=False))
     async def collection_add(collection_id: str, document_ids: list[str]) -> dict[str, Any]:
         """Add documents to a collection.
 
@@ -181,9 +268,14 @@ def _register_collections(
             "collection_add", lambda: service.collection_add(collection_id, tuple(document_ids))
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=True, reaches_out=False))
     async def collection_remove(collection_id: str, document_ids: list[str]) -> dict[str, Any]:
         """Remove documents from a collection. The documents themselves survive.
+
+        Not annotated as removing anything, and that is the annotation being accurate rather
+        than generous: the call names the documents, so `collection_add` with the same ones
+        puts the membership back. `collection_delete` is the one that cannot be undone from
+        its own arguments.
 
         Args:
             collection_id: The collection to remove from.
@@ -194,11 +286,15 @@ def _register_collections(
             lambda: service.collection_remove(collection_id, tuple(document_ids)),
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def collection_documents(
         collection_id: str, limit: int = 50, offset: int = 0
     ) -> dict[str, Any]:
         """List a collection's documents, those added by hand and those a rule selects alike.
+
+        **A page, not a census.** `count` is how many this page holds, so paging until a short
+        page comes back is the only way to see everything here. For "how many are there", ask
+        `collection_counts`, which counts the whole membership in one call.
 
         Args:
             collection_id: The collection to read.
@@ -210,15 +306,22 @@ def _register_collections(
             lambda: service.collection_documents(collection_id, limit=limit, offset=offset),
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def collection_counts(collection_id: str) -> dict[str, Any]:
         """Count a collection's documents and chunks, as they are now.
 
-        Both are computed on the call. A rule-driven collection has no stored membership, so
-        there is no total to remember and none is reported.
+        **The authoritative answer to how much a collection holds**, and the only one. Both
+        numbers are computed from membership on the call, which is why `collection_list`
+        reports no total: one remembered there would report the day it was written. A
+        rule-driven collection has no stored membership at all, so there is nothing to
+        remember even in principle.
+
+        Ask this rather than counting a `collection_documents` page or the hits a `search`
+        returned. A page is a page, and a search returns its top `limit` — neither is a total,
+        and treating one as a total understates a corpus silently.
 
         Args:
-            collection_id: The collection to count.
+            collection_id: The collection to count, as `collection_list` reported its `id`.
         """
         return await dispatch("collection_counts", lambda: service.collection_counts(collection_id))
 
@@ -253,7 +356,9 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- questions ------------------------------------------------------------------------
 
-    @mcp.tool
+    # Not read-only, for two reasons that are each sufficient: with a `conversation_id` it
+    # persists this turn, and the model it calls may be a provider on somebody else's machine.
+    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=False, reaches_out=True))
     async def ask(
         question: str,
         *,
@@ -296,7 +401,7 @@ def build_server(service: ApplicationService) -> FastMCP:
             ),
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def search(
         query: str,
         *,
@@ -310,6 +415,21 @@ def build_server(service: ApplicationService) -> FastMCP:
 
         Cheaper and more predictable than ``ask`` when you want the source material rather
         than prose about it, and the right tool when you intend to read the passages yourself.
+
+        **Name the scope on every call.** Nothing is remembered between calls, so a `search`
+        with no `collections` searches the whole workspace however the last one was scoped.
+        `data.collections` repeats the scope this search ran under — read it rather than
+        assuming the argument arrived.
+
+        **This returns the top `limit` passages of one ranking, which is not a census of the
+        corpus.** An empty or weak result means the top of that ranking held nothing, not that
+        the corpus does not hold it. Say so that way, and use `collection_counts` for how much
+        was not looked at. Small limits — 4 or 5 — answer most questions and leave room to ask
+        another.
+
+        Reading is all this does, with one exception stated rather than hidden: the retrieval
+        is recorded in the local query log, which notes that a search happened and changes
+        nothing any search, answer or listing reports.
 
         Args:
             query: What to search for.
@@ -345,7 +465,9 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- ingest ---------------------------------------------------------------------------
 
-    @mcp.tool
+    # `reaches_out`, because the tree it walks is a part of this machine manicule does not own
+    # and cannot enumerate in advance. No network is involved; the hint is not about networks.
+    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=False, reaches_out=True))
     async def index_path(
         path: str,
         source: str = "local",
@@ -374,7 +496,7 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- documents ------------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def document_list(
         limit: int = 50,
         offset: int = 0,
@@ -396,7 +518,7 @@ def build_server(service: ApplicationService) -> FastMCP:
             ),
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def document_get(document_id: str, chunks: bool = False) -> dict[str, Any]:
         """Read one document's metadata, and optionally every chunk it was split into.
 
@@ -408,7 +530,7 @@ def build_server(service: ApplicationService) -> FastMCP:
             "document_get", lambda: service.document_get(document_id, chunks=chunks)
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=False, reaches_out=False))
     async def document_delete(document_id: str, hard: bool = False) -> dict[str, Any]:
         """Remove a document from the index.
 
@@ -421,7 +543,7 @@ def build_server(service: ApplicationService) -> FastMCP:
             "document_delete", lambda: service.document_delete(document_id, hard=hard)
         )
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=True, reaches_out=False))
     async def document_reindex(document_id: str) -> dict[str, Any]:
         """Re-parse one document from the bytes ingest retained. Touches no network.
 
@@ -436,7 +558,7 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- state ----------------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def index_status() -> dict[str, Any]:
         """Report what is in the index and what it was built with.
 
@@ -445,12 +567,15 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("index_status", service.index_status)
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def stats() -> dict[str, Any]:
         """Count documents and chunks, grouped by source, media type and status."""
         return await dispatch("stats", service.stats)
 
-    @mcp.tool
+    # Read-only because `fix` is not on this surface: the repairs that write to the machine and
+    # may fetch from the network are passed by the command line alone, and
+    # `tests/app/test_surface_parity.py` holds that line.
+    @mcp.tool(annotations=READS)
     async def doctor() -> dict[str, Any]:
         """Check configuration, plugins, storage, the index and the network bind.
 
@@ -461,12 +586,12 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- connectors -----------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def connector_list() -> dict[str, Any]:
         """List configured sources, with what each one's last sync recorded."""
         return await dispatch("connector_list", service.connector_list)
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=False, reaches_out=True))
     async def connector_sync(name: str, limit: int | None = None) -> dict[str, Any]:
         """Run one configured connector, ingesting what changed since its watermark.
 
@@ -478,7 +603,7 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- configuration --------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def config_get(key: str = "") -> dict[str, Any]:
         """Read configuration, with every credential masked.
 
@@ -487,7 +612,7 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("config_get", lambda: service.config_get(key))
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=True, reaches_out=False))
     async def config_set(key: str, value: str) -> dict[str, Any]:
         """Write one setting to the config file, validating the whole tree first.
 
@@ -503,7 +628,7 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- workspaces -----------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations=READS)
     async def workspace_list() -> dict[str, Any]:
         """List the workspaces this installation knows about, and say which is active.
 
@@ -512,7 +637,7 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("workspace_list", service.workspace_list)
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=True, repeatable=True, reaches_out=False))
     async def workspace_switch(name: str, create: bool = False) -> dict[str, Any]:
         """Record a different active workspace. It takes effect at the next start.
 
@@ -530,7 +655,10 @@ def build_server(service: ApplicationService) -> FastMCP:
 
     # --- plugins --------------------------------------------------------------------------
 
-    @mcp.tool
+    # Read-only and `reaches_out` together, which is the pair a name would have got wrong:
+    # `registry=True` fetches the community listing over the network. It writes nothing either
+    # way, so the first hint is true and the fourth is what says a call may leave this machine.
+    @mcp.tool(annotations=hints(reads=True, removes=False, repeatable=True, reaches_out=True))
     async def plugin_list(registry: bool = False) -> dict[str, Any]:
         """List installed plugins and the components each one registers.
 
@@ -541,7 +669,10 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("plugin_list", lambda: service.plugin_list(registry=registry))
 
-    @mcp.tool
+    # `reaches_out`, which the name argues against and the code settles: a name that is not
+    # installed sends `plugin_add` to the community registry to find out whether it exists, so
+    # that the refusal can name the command that would install it.
+    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=True, reaches_out=True))
     async def plugin_add(name: str) -> dict[str, Any]:
         """Enable an installed plugin.
 
@@ -555,7 +686,7 @@ def build_server(service: ApplicationService) -> FastMCP:
         """
         return await dispatch("plugin_add", lambda: service.plugin_add(name))
 
-    @mcp.tool
+    @mcp.tool(annotations=hints(reads=False, removes=False, repeatable=True, reaches_out=False))
     async def plugin_remove(name: str) -> dict[str, Any]:
         """Disable a plugin. The distribution stays installed and is not touched.
 
@@ -609,4 +740,4 @@ def build_server(service: ApplicationService) -> FastMCP:
     return mcp
 
 
-__all__ = ["INSTRUCTIONS", "SERVER_NAME", "TOOL_NAMES", "build_server"]
+__all__ = ["INSTRUCTIONS", "READS", "SERVER_NAME", "TOOL_NAMES", "build_server", "hints"]

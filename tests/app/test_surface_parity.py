@@ -374,6 +374,13 @@ PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
         ("GET", "/api/v1/collections/col-0/counts", {}),
         None,
     ),
+    (
+        "collection_documents",
+        {"collection_id": "col-0"},
+        ["collection", "documents", "col-0"],
+        ("GET", "/api/v1/collections/col-0/documents", {}),
+        None,
+    ),
 )
 """One row per operation: the MCP tool, the command, the HTTP request, and the page.
 

@@ -246,8 +246,10 @@ for reading.
 
 ## 4. The operations
 
-Nineteen MCP tools and nineteen CLI commands. They are not a one-to-one mapping: some
-commands group several operations, and some operations have no tool at all.
+Twenty-eight MCP tools and twenty-one CLI commands. They are not a one-to-one mapping: some
+commands group several operations, and some operations have no tool at all. Both counts are
+asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
+server and the built command tree.
 
 | Operation (`op`) | MCP tool | Command | Payload |
 |---|---|---|---|
@@ -273,6 +275,17 @@ commands group several operations, and some operations have no tool at all.
 | `plugin_list` | ✓ | `plugin list` | installed plugins and components |
 | `plugin_add` | ✓ | `plugin add` | what was enabled |
 | `plugin_remove` | ✓ | `plugin remove` | what was disabled |
+| `collection_create` | ✓ | `collection create` | the collection that was made |
+| `collection_list` | ✓ | `collection list` | every collection, and the rule each carries |
+| `collection_rename` | ✓ | `collection rename` | the collection, renamed |
+| `collection_update` | ✓ | `collection update` | the collection, described |
+| `collection_delete` | ✓ | `collection delete` | what was deleted; the documents survive |
+| `collection_add` | ✓ | `collection add` | how many memberships changed |
+| `collection_remove` | ✓ | `collection remove` | the same, the other way |
+| `collection_documents` | ✓ | `collection documents` | a page of a collection's documents |
+| `collection_counts` | ✓ | `collection counts` | documents and chunks, counted now |
+| `collection_orphans` | — | `collection orphans` | documents in no collection, and what was done |
+| `connector_sidecar` | — | `connector sidecar` | a manifest written beside each mirrored page |
 | `backup` / `restore` | — | `backup` | where it went, what it holds |
 | `export` | — | `export` | a portable archive |
 | `import` | — | `import` | run counters |
@@ -286,10 +299,12 @@ commands group several operations, and some operations have no tool at all.
 ### Operations with no MCP tool, and why
 
 `reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,
-`document_reindex_stale` and the `auth` verbs are command-line only. Each of them either
-destroys data, mints a credential, or changes what the installation *is* — and a tool an
-assistant can call unattended should not be able to do any of that. The nineteen tools read the
-corpus, write documents into it, and adjust configuration. That is the whole surface.
+`connector_sidecar`, `collection_orphans`, `document_reindex_stale` and the `auth` verbs are
+command-line only. Each of them either destroys data, mints a credential, writes into the
+operator's own corpus directory, or changes what the installation *is* — and a tool an
+assistant can call unattended should not be able to do any of that. The twenty-eight tools read
+the corpus, write documents into it, group them, and adjust configuration. That is the whole
+surface, and `tests/app/test_surface_parity.py` asserts each of these absences by name.
 
 `document_reindex_stale` is there for a fourth reason, and it is the one that also keeps it off
 the HTTP surface (`tests/api/test_routes.py`). It re-parses, re-chunks and re-embeds every
@@ -301,6 +316,118 @@ because one document is a bound.
 `connector_login` is in that list for the credential reason and for one more: it reads a secret
 from a terminal without echoing it. A surface that cannot do that would have to accept the
 secret as a parameter, and a session cookie in a tool call is a session cookie in a transcript.
+
+### 4.1 What each tool says it does, and why that is not permission
+
+Every tool publishes the four hints MCP defines — `readOnlyHint`, `destructiveHint`,
+`idempotentHint`, `openWorldHint` — in `tools/list`. Thirteen of the twenty-eight say they only
+read.
+
+**They are a description, and nothing in manicule reads them back.** No tool is gated on its own
+annotation, there is no server-wide `approve` or `trusted` default, and a client that ignores the
+whole block reaches exactly what it reached before. That is the specification's own position and
+it is also the only honest one here: the same operations are on the HTTP surface and the command
+line, neither of which has annotations at all, so a server enforcing its own hints would be
+enforcing them on one caller in three.
+
+**What they buy is an operator being able to approve one tool.** Before this, a non-interactive
+client had two options for `search`: prompt a person on every call, or auto-approve the server —
+and the same server deletes documents, rewrites configuration, enables plugins, synchronizes
+connectors and re-indexes. "Trust the whole server" is not a narrower permission than "trust
+`document_delete`", it is the same permission. One pass over `tools/list` now separates them, so
+the right operator policy is to approve the read-only tools by name and leave the rest asking.
+
+The four questions are asked in English at each registration and translated in
+`manicule.mcp.server.hints`, once. None of them has a default, so a tool added later answers all
+four or does not build:
+
+| Question | Hint | True when |
+|---|---|---|
+| does it read? | `readOnlyHint` | the index, the configuration and the installation are as it found them |
+| does it remove? | `destructiveHint` | it can remove or overwrite something the call cannot put back from its own arguments |
+| is it repeatable? | `idempotentHint` | calling it again with the same arguments changes nothing further |
+| does it reach out? | `openWorldHint` | it can reach a remote system, or a part of this machine manicule does not own |
+
+Four of the answers are worth stating because a name would have got them wrong:
+
+- **`ask` is not read-only.** It reads the corpus exactly as `search` does, and with a
+  `conversation_id` it persists the turn — and the model it calls may be a provider on somebody
+  else's machine. Two independent reasons, either one sufficient.
+- **`plugin_list` is read-only *and* open-world.** `registry=True` fetches the community
+  listing over the network. It still writes nothing, so both hints are true at once.
+- **`plugin_add` reaches out too**, which reads oddly for a tool that installs nothing: a name
+  that is not installed sends it to the registry to find out whether it exists, so the refusal
+  can name the command that would install it.
+- **`collection_remove` is not destructive.** It names the documents it removes, so
+  `collection_add` with the same ones restores the membership. `collection_delete` is the one
+  that cannot be undone from its own arguments.
+
+**`search` carries `readOnlyHint: true` and does perform one write**, and it is stated here
+rather than hidden: retrieval appends a row to the local query log. That is the exception this
+project already makes for it — `manicule.app.dispatch.READ_ONLY_OPS` has carried it since before
+the annotations existed, and §9.7 says why a failed write there does not fail the query. It
+records that a read happened; it changes nothing any search, answer or listing reports, and it is
+readable only through the admin query-log surface. Nothing else on the read-only side writes at
+all, which is asserted rather than claimed: `tests/mcp/test_annotations.py` calls every tool that
+says it reads and compares the whole backend across the call.
+
+**`READ_ONLY_OPS` is not this list and must not be wired to it.** It answers a different
+question — does this operation need the data directory's exclusive writer lock — and it answers
+"read-only" for `ask`, `backup`, `export` and `init`, none of which is read-only in the sense a
+client cares about. Two questions, two answers, and the overlap is a coincidence of the English.
+
+### 4.2 Qualifying a question against a collection, without spending the context on it
+
+The server's `instructions` tell a fresh client to do four things in order, and
+`tests/mcp/qualification.py` is that procedure written as something that runs, over the protocol,
+against a synthetic corpus. The order is not interchangeable.
+
+1. **`collection_list`** — resolve the name. Keep both identities: `id` is stable and is what
+   `collection_counts` takes, `name` is what `search` and `ask` take as a scope.
+2. **`collection_counts(collection_id)`** — the document and chunk totals.
+3. **`search(query, collections=[name], limit=5)`** — three of these at most, each aimed at a
+   different part of the question, and a fourth only to close a gap that can be named.
+4. **One more search, scoped the same way, for the thing you expect to be absent.** A control.
+
+**Why counts are a separate operation.** They are computed from membership when asked. Nothing in
+`collection_list` carries a total, and copying one there to save a round trip would make every
+number it reports as old as the last write — while a rule-driven collection has no materialized
+membership to have remembered in the first place. `manicule.app.service.collection_counts` pages
+the same clause `collection_documents` pages, rather than issuing a second counting query, for
+the same reason: a number that disagrees with the list it claims to count is worse than a slower
+number.
+
+**Why every query repeats its scope.** There is no session. A `search` with no `collections`
+searches the whole workspace however the previous call was scoped, so the scope travels on each
+call and comes back in `data.collections` — which is what lets a caller check that the argument
+arrived rather than assuming it. A name that is not a collection here is refused with
+`UnknownEntityError` and **no search runs**: a restriction that silently vanished would return the
+whole workspace, ranked and plausible, which is the one failure mode worse than an error.
+
+**Why top-`limit` absence is not corpus absence.** `search` returns the top passages of one
+ranking. Finding nothing means the top of that ranking held nothing — not that the corpus does
+not hold it — so the refusal a client writes has to carry the scope, the size of the collection
+and the sample it took. "Nothing in *Engineering Architecture* supports this; the collection holds
+3 documents and 15 chunks and the search returned 1 passage, none of which mentions the topic" is
+a true sentence. "There is no such thing" is not, and nothing about the result distinguishes them.
+
+**The recipe is bounded, and the bound is measured rather than assumed.** Each run records the
+number of searches, the passages asked for, the passages returned, the passages left after
+deduplication by document and heading, the serialized bytes of every MCP result, and an estimated
+generator-token contribution where this machine has a BPE vocabulary — `None` where it does not,
+because an unmeasured run reported as zero is an unmeasured run inside every budget. The ceilings
+are declared before the run, not read off it.
+
+**There is no summarizer between the search and the client.** The recipe assembles evidence and
+hands it on; deciding what the evidence means happens outside it, where it can be seen. A
+compaction step would be a component choosing what the client is allowed to read, and it would
+have to be proposed explicitly, keep provenance, be replaceable, and be evaluated on its own.
+
+Nothing in that suite depends on a hosted model, and that is deliberate: the transcript, the
+accounting, the evidence and the refusal's inputs are all deterministic. Running a real model
+over a `Qualification` is a useful thing to do by hand, and the record of one belongs with the
+provider, the model, the reasoning setting, the date and the exact prompt — not in a test that
+would go red when somebody else's sampler changed.
 
 ---
 
