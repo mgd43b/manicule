@@ -326,24 +326,170 @@ Per page, `version.number` is the change token — cheaper than hashing content.
 `Watermark.metadata`, and a space's entry moves only after that space's walk finishes; a
 consumer that abandoned discovery part-way is offered no watermark at all. A watermark built
 from a prefix skips whatever the rest of the walk would have returned, and nothing looks for
-it again.
+it again. The same metadata records the **scope** those positions were reached in — §2.1.
+
+## 2.1 Scoping to a page tree instead of a whole space
+
+A space is usually far more than anybody wants indexed. `root_page_ids` names one or more
+pages, and the source becomes those pages and everything currently beneath them:
+
+```toml
+[connectors.architecture]
+type = "confluence"
+
+[connectors.architecture.options]
+base_url = "https://confluence.example.test/confluence"
+deployment = "server"
+auth = "browser_session"
+spaces = ["ENG"]
+root_page_ids = ["100100"]
+include_root_pages = true
+include_attachments = false
+```
+
+That indexes page `100100` and its current descendants, and nothing else in `ENG`. Leaving
+`root_page_ids` out is the whole-space behavior every existing configuration has, unchanged.
+
+**The page id is the `pageId` in a page's URL** — a decimal number. A title will not do: two
+pages in one space can share one, and the id is what survives a rename. A non-numeric value is
+refused when the configuration is read, which is also what makes the id safe to put in a query
+unquoted, and therefore makes CQL injection through this setting structurally impossible rather
+than escaped.
+
+### `spaces` and `root_page_ids` narrow one scope between them
+
+They are not two lists that add up. `spaces` says which spaces this source may read at all;
+`root_page_ids` says which trees inside them it actually reads. The effective scope is the
+intersection, and the combinations that cannot be honored that way are **refused at startup**
+rather than resolved by a rule nobody would guess:
+
+| Configuration | Result |
+|---|---|
+| `spaces` only | Whole spaces. Unchanged. |
+| `root_page_ids` only | Those trees. Each root's space is read from the root itself. |
+| Both, every root inside an allowed space, every allowed space holding a root | Those trees. |
+| A root in a space `spaces` does not list | **Refused.** Honoring it would mean `spaces` had silently stopped being an allowlist. |
+| A listed space holding no configured root | **Refused.** It would enumerate nothing while appearing to sync, and reconciliation would then propose deleting everything it ever contributed. |
+| A root in a space this account cannot see (no allowlist) | **Refused**, for the same reason a mistyped space key is. |
+
+### `include_root_pages` defaults to true
+
+`root_page_ids = ["100100"]` names page `100100`, and a corpus containing everything under it
+*except it* is not what anybody writes that down to mean. The default is chosen for the
+direction the mistake fails in: `false` leaves exactly one page missing — the one that was
+named — and nothing about the run says so, while `true` costs one extra page to somebody who
+wanted only the children and they notice immediately. Setting it with no `root_page_ids` is
+refused rather than ignored.
+
+It is written into the query rather than applied to the results, so what a run is scoped to is
+what it asked for.
+
+### How descendants are resolved, and what bounds it
+
+Confluence's own `ancestor` predicate, which matches at any depth:
+
+```
+?cql=type = page AND space = "ENG" AND status = current
+     AND (ancestor = 100100 OR id = 100100)
+     order by lastmodified asc
+    &expand=version,ancestors,space,container
+```
+
+**There is no client-side walk**, and therefore no queue of page ids, no cycle detection, no
+depth ceiling, and no second enumeration a moved page can fall between. A tree forty levels
+deep is one query. A cycle — which Confluence does not permit, but which a client walking
+`child/page` would still have to survive — cannot arise, because nothing follows a parent link.
+
+**What comes back is checked against what was asked for.** Every page carries its own ancestor
+ids in the same response, so membership is re-derived from the page rather than inferred from
+the source having returned it. A page that is not in the configured trees **stops the run**. The
+check exists for one failure: a deployment that accepted `ancestor` and did not apply it would
+answer with the whole space, and a connector that trusted the query would index all of it while
+reporting a subtree. Filtering the difference away instead would produce the right documents
+while paying for, and claiming, the whole space.
+
+**An empty answer is not an empty subtree.** Reconciliation deletes what it does not see, so a
+descendant enumeration that comes back empty is cross-checked: each root is asked, through
+`child/page`, whether it has a child. A root that does stops the run. Without that, a
+deployment which accepts the predicate and matches nothing reports the whole subtree as
+deleted — a successful query, no rows, no error anywhere.
+
+### Attachments follow their page, and that is where a subtree still pays per space
+
+`ancestor` is relied on for pages and **not** for attachments: Confluence exposes an
+attachment's container page, and the container is the authoritative answer in any case. So an
+attachment is in scope exactly when the page holding it is, which has one consequence worth
+stating plainly rather than discovering:
+
+- The **page** query is narrowed at the source.
+- The **attachment** query is not. It stays space-wide, and its results are matched against the
+  subtree's page ids client-side.
+
+With `include_attachments = false` — the common shape for a first scoped run — no attachment
+query is sent at all and the run costs the page tree only. With it on, a scoped run also
+resolves the whole subtree's page ids once (ids and ancestor ids, bounded by the subtree rather
+than by the space) so that an attachment added to a page that has *not* changed since the
+watermark can still be placed. That is an ids-only enumeration of the subtree per run, and it is
+what makes the incremental attachment case correct rather than approximately correct.
+
+### Changing the roots
+
+A watermark is a position **within a scope**, and the two are meaningless apart.
+`Watermark.metadata` therefore records the scope its positions were reached in, and when the configured
+roots or `include_root_pages` change, every stored position is discarded and the run enumerates
+the new scope in full. Anything less loses documents: every page in a newly configured tree that
+has not changed since the stored instant is already behind it, so an incremental query would
+never return it, and nothing would ever return it again.
+
+The change is reported at `WARNING` on `manicule.connectors.confluence`, naming both scopes.
+Documents indexed under a root that is no longer configured are **not** touched by that run —
+the next reconciliation pass proposes removing them, and the deletion ceiling (§3) still applies
+to that proposal.
+
+A watermark stored before this connector had scopes carries none, and is read as whole-space,
+which is the only scope it can have been recorded in.
+
+### `connector sync --limit` is not a subtree
+
+`--limit` bounds how much work a run does. It takes an arbitrary prefix of discovery, which for
+a space ordered by `lastmodified` is whichever pages happened to be edited longest ago — not a
+coherent part of anything, and not stable between runs.
+
+**No watermark is recorded from a limited run, and the reason is worth being exact about,**
+because it is not the one the shape of the code suggests. The pipeline stops consuming discovery
+and then reports the run as **clean** — there is no error, so `RunReport.clean` is true and the
+watermark write is attempted. What prevents it is the connector: its enumeration was abandoned,
+so it offers no position at all, and nothing is stored. Delete that guard and a limited run
+silently records a position past every page it never received.
+
+Use `--limit` to try a connector out. Use `root_page_ids` to say what a source *is*.
 
 ## 3. Deletions — the part most implementations miss
 
 CQL returns what exists. A page deleted since the last sync simply stops appearing, so a
 watermark sync **never learns it is gone** and the index keeps serving it forever.
 
-Two mechanisms, both needed:
+**One mechanism, and this section used to claim two.** It listed a "trash check" beside the
+reconciliation pass, under the heading "both needed", and then said in its own second clause
+that the trash check does not cover this. Both halves cannot be true, and the code has only ever
+had one: there is no CQL query that reports what *stopped* existing, because CQL returns what
+exists. The reconciliation diff is the mechanism.
 
-- **Reconciliation pass** — periodically (weekly) list all page IDs in scope with
-  `expand=` empty, diff against indexed IDs, and soft-delete the difference. Cheap: IDs
-  only, no bodies.
-- **Trash check** — `?cql=type=page AND space=ENG AND label=...` does not cover this;
-  the reconciliation diff is the reliable route.
+- **Reconciliation pass** — periodically (weekly) list every content ID in scope, diff against
+  indexed IDs, and soft-delete the difference. Cheap: IDs only, no bodies. The request sends
+  **no `expand` parameter at all**; an earlier version of this line said `expand=` empty, which
+  is a parameter that is not sent and would not be worth sending.
 
 **Attachments are reconciled with pages**, because they are enumerated with pages (§2). A
 document the pass omits is a document the pipeline deletes, so "attachments are handled
 elsewhere" would be a slow way of emptying them out of the index.
+
+**Reconciliation enumerates exactly the scope discovery does**, and in a subtree-scoped source
+that is a single object answering both (§2.1) rather than the same rule implemented twice.
+Scoped on one side only is the failure that has no small version: discovery narrow and
+reconciliation wide leaves the index never shrinking, and the reverse soft-deletes every page
+outside the tree. A scoped pass expands `ancestors`, which a whole-space pass has no use for,
+and that is the one place the two differ in cost.
 
 **A failure mid-enumeration raises rather than returning what it has.** The ids seen so far
 are a prefix, not the truth, and diffing a prefix against the stored set marks everything not
@@ -388,11 +534,29 @@ has no reader here.
 >
 > Neither argument was ever a measurement. Both were checkable in four lines.
 
-Ancestors — the page hierarchy used for breadcrumbs in §7 — come from discovery, which
-expands them for every page it returns, so the fetch needs no second call. A ref built
-somewhere else (a re-fetch, a targeted single-page sync) carries none, and then the Cloud
-ancestors endpoint is asked; an ancestor whose title it omits is skipped rather than filled
-in with an id, and the document records that its breadcrumb is incomplete.
+Ancestors — the page hierarchy used for breadcrumbs in §7 — come from three places depending on
+the deployment, and this paragraph used to name only the first of them.
+
+- **Discovery**, which expands `ancestors` for every page it returns. The ordinary path on both
+  deployments, and the reason a fetch needs no second call.
+- **The fetch's own expansion, on Server and Data Center.** `body.storage` is requested with
+  `expand=body.storage,version,ancestors,space`, so a storage-format fetch has a complete
+  breadcrumb including the space key whatever the ref carried — and prefers it. There is no
+  second call there either, and there never was.
+- **The Cloud ancestors endpoint**, asked only for a ref built somewhere else (a re-fetch, a
+  targeted single-page sync) on a deployment whose body endpoint carries no ancestors. An
+  ancestor whose title it omits is skipped rather than filled in with an id.
+
+**A breadcrumb starts at the space key, and on that last path there may be no way to learn it.**
+The Cloud body endpoint reports a numeric space id rather than the key, so a ref carrying
+neither ancestors nor a space key produces a breadcrumb one level short: `Platform > Auth
+Service` where the rest of the corpus reads `ENG > Platform > Auth Service`, which retrieves
+worse against exactly the queries a space key disambiguates. Inventing the key is not available
+and is not wanted. Saying so is, and `breadcrumb_complete` is false whenever the breadcrumb is
+short — including for this, which it did not use to cover.
+
+Every page also keeps its ancestors as **ids** alongside the titles. Titles are what a reader
+sees; ids are what says which page an ancestor is, and they are what survives a rename.
 
 **A page that comes back with no ADF body at all** — the format declined for a page that
 exists, which is not the same as an empty page — is read as storage format instead. Only that
@@ -471,6 +635,12 @@ heading on the *rendering* page, and Confluence derives its anchor there — so 
 Discovered with pages rather than through `GET /wiki/rest/api/content/{id}/child/attachment`,
 because the CQL query in §2 already covers `type = attachment` — one enumeration, watermarked
 and reconcilable, instead of one extra call per page that no watermark can narrow.
+
+In a **subtree-scoped** source (§2.1) that is a second CQL enumeration rather than the same one,
+because only pages have a descendant predicate worth relying on. It is still one enumeration
+rather than a call per page, it is still watermarked, and each attachment's scope is decided by
+the page holding it — never by the attachment's own position, which Confluence does not expose
+as reliably.
 
 Download and route through the normal parser chain — a PDF attached to a page is a PDF.
 Each attachment keeps a link to its parent page so citations resolve to both.
@@ -571,6 +741,12 @@ differ, it is here — check these first when one is available:
 | Assumption | What to check | If it is wrong |
 |---|---|---|
 | `status = current` is accepted by CQL on both deployments | A search returns results rather than a 400 | Deletion detection is the thing at risk: without it, trashed pages may still be returned |
+| **`ancestor` is accepted and matches descendants at any depth** | Scope one source to a page tree three levels deep and check the grandchildren arrive | A 400 is the loud outcome and needs nothing. The two quiet ones are guarded: a predicate that is accepted and ignored refuses on the first page outside the tree, and one that matches nothing refuses on the `child/page` cross-check |
+| **`ancestor in (a, b)` and `id in (a, b)` are accepted, and parenthesized `OR` between them is** | Configure two roots in one space | Fall back to one query per root; the scope is unchanged and the request count rises by the number of roots |
+| **A bare numeric literal is accepted where `ancestor` and `id` want a content id** | Any scoped run | Quote them. The ids are checked to be digits before they reach a query, so quoting would be a formatting change rather than a safety one |
+| **`GET /rest/api/content/{id}/child/page` exists on both deployments** | Scope to a root whose tree is genuinely one page | The empty-subtree cross-check stops working. It answers `False` on a 404 and so fails open — the guard would go quiet rather than misfire, which is the wrong direction and is why this row is here |
+| **`GET /rest/api/content/{id}` reports `status` and `space.key` for a page on Cloud** | Configure any root against Cloud | Root validation cannot establish the space, and refuses. Cloud's v2 page endpoint reports a numeric space id, so the v1 route is the one that answers this |
+| **An attachment search result carries `container.id` under `expand=container`** | A scoped run with `include_attachments = true` | Every attachment is judged out of scope and none is indexed — quiet under-collection, and the row is here because nothing downstream would notice |
 | `order by lastmodified asc` is accepted alongside cursor pagination | Same | Drop the ordering; enumeration becomes non-deterministic but stays correct |
 | `_links.next` carries the full query and a raw `+` in the cursor | Log one link verbatim | The `%2B` handling is unnecessary but harmless; a *different* encoding would need its own handling |
 | Cloud v2 `GET /pages/{id}/ancestors` returns titles, root first | Fetch one page whose ref carries no ancestors | Breadcrumbs from that path are reversed or short; discovery's own expansion is unaffected |
@@ -598,6 +774,7 @@ and every one of those failures is quiet, which is why they are worth listing.
 | | manicule | Without it |
 |---|---|---|
 | Discovery | CQL watermark, cursor pagination | a full space walk every sync |
+| Scope | a page tree, narrowed at the source and checked on arrival | a whole space, or `--limit`'s arbitrary prefix |
 | Deletions | reconciliation diff | removed pages served forever |
 | Body format | ADF on Cloud, parsed storage on Server | one dialect handled, the other guessed at |
 | Extraction | typed node walk | markup stripped to a run of words |
@@ -621,6 +798,7 @@ and every one of those failures is quiet, which is why they are worth listing.
 | Capturing a session, and the Keychain | `manicule/connectors/sessions.py` |
 | Telling an answer from a sign-in page | `manicule/connectors/intercept.py` |
 | CQL construction, quoting, watermark timestamps | `manicule/connectors/cql.py` |
+| Root-page validation, subtree membership, the empty-subtree guard | `manicule/connectors/subtree.py` |
 | `_links.next`, the `%2B` rule, origin checking | `manicule/connectors/pagination.py` |
 | Auth headers, redirects, 429/5xx retry, downloads, paging | `manicule/connectors/client.py` |
 | `include`/`excerpt-include`, both body formats | `manicule/connectors/macros.py` |

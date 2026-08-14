@@ -19,7 +19,12 @@ from manicule.connectors import (
     RateLimitedError,
     UntrustedLinkError,
 )
-from manicule.connectors.confluence import ANCESTORS, STORAGE_MEDIA_TYPE, VERSION_TOKEN
+from manicule.connectors.confluence import (
+    ANCESTOR_IDS,
+    ANCESTORS,
+    STORAGE_MEDIA_TYPE,
+    VERSION_TOKEN,
+)
 from manicule.core.sources import DocRef
 from manicule.parsers.config import ADF_MEDIA_TYPE
 from tests.connectors.fake_confluence import (
@@ -238,6 +243,77 @@ async def test_a_ref_without_ancestors_still_gets_a_breadcrumb() -> None:
 
     assert raw.metadata[ANCESTORS] == ["ENG", "Platform", "Auth Service"]
     assert raw.metadata["breadcrumb_complete"] is True
+
+
+async def test_a_breadcrumb_without_its_space_key_does_not_claim_to_be_complete() -> None:
+    """The Cloud body endpoint reports a numeric space id, not the key a breadcrumb starts with.
+
+    So a ref that carries neither ancestors nor a space key — a re-fetch from a stored record
+    written before this connector kept one — produces a breadcrumb one level short: every chunk
+    of that page is prefixed ``Platform > Auth Service`` where the rest of the corpus reads
+    ``ENG > Platform > Auth Service``, and it retrieves worse against exactly the queries a
+    space key disambiguates.
+
+    Inventing the key is not available and is not wanted; saying so is. ``breadcrumb_complete``
+    exists for a breadcrumb that is short, and it has to be false when this one is, or a
+    survey of incomplete breadcrumbs reports clean while the gap is in the index.
+    """
+    instance = FakeConfluence(
+        pages=[FakePage(id="1", title="Page", space="ENG", ancestors=("Platform", "Auth Service"))]
+    )
+    connector = await connected(instance)
+    try:
+        raw = await connector.fetch(DocRef(source_id="1", uri=f"{instance.base_url}/pages/1"))
+    finally:
+        await connector.teardown()
+
+    assert raw.metadata[ANCESTORS] == ["Platform", "Auth Service"]
+    assert raw.metadata["breadcrumb_complete"] is False
+
+
+async def test_recovered_ancestors_bring_their_ids_and_not_only_their_titles() -> None:
+    """The Cloud ancestors endpoint reports both, so recording one of them is a choice.
+
+    An empty ancestor-id list is indistinguishable from a page at the top of its space, and
+    that is a different fact about a different page. Whichever fetch happened to run last would
+    otherwise decide which of the two the document asserts.
+    """
+    instance = FakeConfluence(
+        pages=[
+            FakePage(id="1", title="Page", space="ENG", parent="7"),
+            FakePage(id="7", title="Platform", space="ENG"),
+        ]
+    )
+    connector = await connected(instance)
+    try:
+        raw = await connector.fetch(DocRef(source_id="1", uri=f"{instance.base_url}/pages/1"))
+    finally:
+        await connector.teardown()
+
+    assert raw.metadata[ANCESTORS] == ["Platform"]
+    assert raw.metadata[ANCESTOR_IDS] == ["7"]
+
+
+async def test_a_server_breadcrumb_comes_from_the_fetch_own_expansion() -> None:
+    """Storage format expands ``ancestors`` alongside the body, so no ref and no second call.
+
+    Worth pinning because ``docs/connectors/confluence.md`` §4 read as though discovery were
+    the only source of a breadcrumb; on Server and Data Center the fetch has its own, it is
+    complete including the space key, and it is preferred over anything the ref carries.
+    """
+    instance = FakeConfluence(
+        base_url=SERVER_BASE,
+        pages=[FakePage(id="1", title="Page", space="ENG", ancestors=("Platform", "Auth Service"))],
+    )
+    connector = await connected(instance, server_config(instance.base_url))
+    try:
+        raw = await connector.fetch(DocRef(source_id="1", uri=f"{SERVER_BASE}/pages/1"))
+    finally:
+        await connector.teardown()
+
+    assert raw.metadata[ANCESTORS] == ["ENG", "Platform", "Auth Service"]
+    assert raw.metadata["breadcrumb_complete"] is True
+    assert [request.url.path for request in instance.requests] == ["/confluence/rest/api/content/1"]
 
 
 async def test_a_page_whose_adf_body_is_declined_falls_back_to_storage() -> None:

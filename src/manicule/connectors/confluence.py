@@ -28,6 +28,7 @@ it.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -35,7 +36,7 @@ from typing import cast
 
 from pydantic import JsonValue
 
-from manicule.connectors import cql
+from manicule.connectors import cql, subtree
 from manicule.connectors.client import ConfluenceClient
 from manicule.connectors.config import CONNECTOR_NAME, ConfluenceConfig, Deployment
 from manicule.connectors.errors import BodyUnavailableError, ConnectorError, NotFoundError
@@ -50,6 +51,7 @@ from manicule.connectors.macros import (
     resolve_storage,
     unresolved_because,
 )
+from manicule.connectors.subtree import CONTENT_PATH, SEARCH_PATH, Subtree
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.lifecycle import HealthReport, Metric
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
@@ -57,11 +59,16 @@ from manicule.parsers.config import CONFLUENCE_MEDIA_TYPE
 
 __all__ = [
     "ADF_BODY",
+    "ANCESTOR_IDS",
+    "ROOT_PAGE_IDS",
+    "SCOPE",
     "STORAGE_BODY",
     "STORAGE_MEDIA_TYPE",
     "VERSION_TOKEN",
     "ConfluenceConnector",
 ]
+
+_log = logging.getLogger("manicule.connectors.confluence")
 
 ADF_BODY = "atlas_doc_format"
 STORAGE_BODY = "storage"
@@ -99,9 +106,7 @@ executed, and both read as settled arguments against doing the work. What a pars
 what it puts in the index, are each checkable in four lines.
 """
 
-_SEARCH_PATH = "/rest/api/content/search"
 _SPACE_PATH = "/rest/api/space"
-_CONTENT_PATH = "/rest/api/content"
 _V2_PAGE_PATH = "/api/v2/pages"
 
 _SEARCH_EXPAND = "version,ancestors,space,container"
@@ -133,6 +138,37 @@ has to fill it. The page's own title is *not* part of it — the chunker appends
 a breadcrumb carrying it twice reaches the embedder as emphasis nobody intended.
 """
 
+ANCESTOR_IDS = "ancestor_ids"
+"""Metadata key carrying the page's ancestors as content ids, outermost first.
+
+Beside :data:`ANCESTORS` rather than instead of it, because they answer different questions and
+only one of them survives a rename. Titles are what a reader sees in a breadcrumb; ids are what
+says *which* page an ancestor is, which is what a scope check and anybody auditing why a page
+was indexed both need."""
+
+ROOT_PAGE_IDS = "root_page_ids"
+"""Metadata key naming the configured root page(s) that put this document in scope.
+
+**Derived synchronization metadata, and nothing more.** It records why manicule holds this
+document; it is not part of the document's identity, which stays the Confluence page id, and it
+is not part of its address, which stays the canonical URL. Absent entirely when no roots are
+configured, so its presence means "this source is subtree-scoped" rather than "somebody wrote a
+default down"."""
+
+SCOPE = "scope"
+"""Watermark metadata key holding the scope a stored position was recorded within.
+
+A position and the scope it was reached in are one fact. See
+:attr:`~manicule.connectors.config.ConfluenceConfig.scope_identity` for why reusing one against
+the other is the failure worth a full re-enumeration to avoid."""
+
+WHOLE_SPACE = "whole-space"
+"""What a watermark stored before subtree scoping existed is read as.
+
+Not ``""`` and not ``None``: those would make "no scope recorded" a third state that every
+comparison would have to handle, when in fact there is only one scope such a watermark can have
+had. Written out so that the backward-compatible reading is a value rather than an omission."""
+
 
 @dataclass(frozen=True, slots=True)
 class _Body:
@@ -145,6 +181,7 @@ class _Body:
     body_format: str
     space_key: str = ""
     ancestors: tuple[str, ...] = ()
+    ancestor_ids: tuple[str, ...] = ()
     webui: str = ""
     base: str = ""
 
@@ -227,13 +264,54 @@ class ConfluenceConnector:
         return Watermark(
             value=_newest(spaces.values()),
             observed_at=datetime.now(tz=UTC),
-            metadata={"spaces": cast("Metadata", dict(spaces))},
+            metadata={
+                "spaces": cast("Metadata", dict(spaces)),
+                SCOPE: self._config.scope_identity,
+            },
         )
 
-    def _since(self, watermark: Watermark | None, space: str) -> str | None:
+    def _resume_from(self, watermark: Watermark | None) -> Mapping[str, str]:
+        """The stored per-space positions, or nothing when they belong to a different scope.
+
+        A watermark says "everything up to here has been seen" — but only of the scope it was
+        recorded in. Point a source at a different page tree and the same sentence becomes
+        false: every page in the new tree that has not changed since is already behind the
+        stored position, so an incremental query would never return it, and nothing would ever
+        return it again.
+
+        So a scope change discards every position and re-enumerates. That costs one full pass
+        and is right in both directions — a root added brings unchanged pages into scope, and a
+        root removed leaves indexed documents outside it — where partitioning the old positions
+        by root would save that one pass and be wrong the first time a page moved between two
+        of them.
+
+        A watermark stored before this connector had scopes at all carries no scope key, and is
+        read as :data:`WHOLE_SPACE`: that is the only scope it can have been recorded in, so an
+        installation that has not configured roots resumes exactly as before.
+        """
+        if watermark is None:
+            return {}
+        stored = watermark.metadata.get(SCOPE)
+        recorded = stored if isinstance(stored, str) and stored else WHOLE_SPACE
+        current = self._config.scope_identity
+        if recorded == current:
+            return _space_watermarks(watermark)
+        _log.warning(
+            "source %r: the configured Confluence scope changed from [%s] to [%s]. Every "
+            "stored per-space position has been discarded and this run enumerates the new "
+            "scope in full, because a position recorded in one scope says nothing about "
+            "another. Documents already indexed from outside the new scope are not touched by "
+            "this run; the next reconciliation pass is what proposes removing them, and the "
+            "deletion ceiling still applies to that proposal.",
+            self.name,
+            recorded,
+            current,
+        )
+        return {}
+
+    def _since(self, carried: Mapping[str, str], space: str) -> str | None:
         """The CQL timestamp this space's query starts from, or ``None`` for everything."""
-        stored = _space_watermarks(watermark).get(space)
-        when = cql.parse_when(stored)
+        when = cql.parse_when(carried.get(space))
         if when is None:
             return None
         return cql.cql_timestamp(when, timedelta(minutes=self._config.watermark_overlap_minutes))
@@ -247,28 +325,26 @@ class ConfluenceConnector:
         own stored position, minus an overlap, because CQL compares ``lastmodified`` at minute
         granularity and the alternative to overlapping is missing whatever shared the last
         recorded minute.
+
+        "In scope" is the whole space when no root pages are configured, and one or more page
+        trees inside it when they are (``docs/connectors/confluence.md`` §2.1). The roots are
+        validated **before the first query goes out**, so a root that is missing or outside the
+        space allowlist stops the run rather than producing a smaller subtree than the one that
+        was configured.
         """
+        carried = self._resume_from(watermark)
         self._observed = {}
-        self._carried = dict(_space_watermarks(watermark))
+        self._carried = dict(carried)
         self._enumerated = False
 
-        types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
-        for space in await self._spaces():
-            query = cql.content_query(space, types=types, since=self._since(watermark, space))
-            params = [
-                ("cql", query),
-                ("limit", str(self._config.page_size)),
-                ("expand", _SEARCH_EXPAND),
-            ]
+        spaces = await self._spaces()
+        scope = await self._scope(spaces)
+
+        for space in spaces if scope is None else scope.spaces():
             newest: datetime | None = None
-            async for payload in self._client.paginate(self._client.url(_SEARCH_PATH), params):
-                base = _link_base(payload, self._config.base_url)
-                for result in _results(payload):
-                    found = self._discovered(result, space=space, base=base)
-                    if found is None:
-                        continue
-                    newest = cql.latest([newest, cql.parse_when(_version_when(result))])
-                    yield found
+            async for found, when in self._changed_in(space, scope, self._since(carried, space)):
+                newest = cql.latest([newest, when])
+                yield found
             # Only after the space's enumeration has run to completion: a watermark advanced
             # from a partial walk skips whatever the rest of the walk would have returned, and
             # nothing ever looks for it again.
@@ -276,8 +352,89 @@ class ConfluenceConnector:
                 self._observed[space] = newest
         self._enumerated = True
 
+    async def _changed_in(
+        self, space: str, scope: Subtree | None, since: str | None
+    ) -> AsyncIterator[tuple[DiscoveredDoc, datetime | None]]:
+        """One space's changed documents, each with the instant its version was saved.
+
+        Whole-space mode is the single query §2 describes, covering pages and attachments
+        together. Subtree mode is two queries, and the reason they are two is the difference
+        between what Confluence will narrow and what it will not:
+
+        - **Pages are narrowed at the source**, by ``ancestor``. A page that comes back anyway
+          is a refusal, because the alternative is a sync that pays for a whole space and
+          reports a subtree.
+        - **Attachments are not.** There is no descendant predicate for an attachment worth
+          relying on, so they are enumerated space-wide and matched against the page holding
+          them — which is the authoritative answer in any case, and the one §6 of the
+          documentation says to use.
+        """
+        if scope is None:
+            types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
+            query = cql.content_query(space, types=types, since=since)
+            async for result, base in self._search(query, expand=_SEARCH_EXPAND):
+                found = self._discovered(result, space=space, base=base)
+                if found is not None:
+                    yield found, cql.parse_when(_version_when(result))
+            return
+
+        pages = cql.content_query(space, types=(PAGE,), since=since, subtree=scope.clause(space))
+        async for result, base in self._search(pages, expand=_SEARCH_EXPAND):
+            page_id = _str(result.get("id"))
+            roots = scope.covering_roots(space, page_id, subtree.ancestor_ids(result))
+            if not roots:
+                raise ConnectorError(scope.out_of_scope(space, page_id))
+            found = self._discovered(result, space=space, base=base, roots=roots)
+            if found is not None:
+                yield found, cql.parse_when(_version_when(result))
+
+        if not self._config.include_attachments:
+            return
+
+        # Every in-scope page id, not only the ones this incremental query returned: an
+        # attachment can be added to a page that has not itself changed since the watermark,
+        # and its container would then be a page this run has never seen.
+        members = await scope.members(space)
+        attachments = cql.content_query(space, types=(ATTACHMENT,), since=since)
+        async for result, base in self._search(attachments, expand=_SEARCH_EXPAND):
+            container = _str(_obj(result.get("container")).get("id"))
+            roots = members.get(container, ())
+            if not roots:
+                continue
+            found = self._discovered(result, space=space, base=base, roots=roots)
+            if found is not None:
+                yield found, cql.parse_when(_version_when(result))
+
+    async def _search(
+        self, query: str, *, expand: str = ""
+    ) -> AsyncIterator[tuple[Mapping[str, object], str]]:
+        """Every result of one CQL query, with the link base the page it arrived on declared."""
+        params = [("cql", query), ("limit", str(self._config.page_size))]
+        if expand:
+            params.append(("expand", expand))
+        async for payload in self._client.paginate(self._client.url(SEARCH_PATH), params):
+            base = _link_base(payload, self._config.base_url)
+            for result in _results(payload):
+                yield result, base
+
+    async def _scope(self, spaces: Sequence[str]) -> Subtree | None:
+        """The configured page trees, validated, or ``None`` for whole-space syncing.
+
+        ``None`` rather than an empty subtree, so that "no roots configured" is a different
+        object from "roots configured and none of them resolved" — the second is a refusal, and
+        a shared empty value would have made it look like the first.
+        """
+        if not self._config.root_page_ids:
+            return None
+        return await subtree.resolve(self._client, self._config, spaces, source=self.name)
+
     def _discovered(
-        self, result: Mapping[str, object], *, space: str, base: str
+        self,
+        result: Mapping[str, object],
+        *,
+        space: str,
+        base: str,
+        roots: Sequence[str] = (),
     ) -> DiscoveredDoc | None:
         kind = _str(result.get("type"))
         source_id = _str(result.get("id"))
@@ -296,10 +453,16 @@ class ConfluenceConnector:
         }
         if version is not None:
             metadata[VERSION] = version
+        if roots:
+            # Why this document is here, kept beside what it is. Derived metadata: the page id
+            # is still its identity and the canonical URL is still its address, and neither is
+            # computed from this.
+            metadata[ROOT_PAGE_IDS] = list(roots)
 
         if kind == PAGE:
             page_crumbs: list[JsonValue] = [space_key, *_ancestor_titles(result)]
             metadata[ANCESTORS] = page_crumbs
+            metadata[ANCESTOR_IDS] = list(subtree.ancestor_ids(result))
             media_type = self._page_media_type()
             size = None
         else:
@@ -402,23 +565,49 @@ class ConfluenceConnector:
     async def reconcile(self) -> AsyncIterator[SourceId]:
         """Yield the id of everything that still exists, ids only.
 
-        No expansions, no bodies, no versions — which is what makes a full enumeration
-        affordable often enough to matter. Any failure propagates rather than being caught and
-        smoothed over: the pipeline refuses to diff a partial enumeration, because the ids seen
-        so far are a prefix and diffing a prefix soft-deletes everything past it
-        (``docs/ingest.md`` §11.1).
+        No bodies and no versions — which is what makes a full enumeration affordable often
+        enough to matter. Any failure propagates rather than being caught and smoothed over:
+        the pipeline refuses to diff a partial enumeration, because the ids seen so far are a
+        prefix and diffing a prefix soft-deletes everything past it (``docs/ingest.md`` §11.1).
+
+        **This enumerates the same scope discovery does, by asking the same object.** A pass
+        that reconciled a whole space against an index built from one page tree would soft-
+        delete nothing and hide nothing; the mirror of it — discovery scoped and reconciliation
+        wider, or the reverse — deletes the difference. So subtree membership is decided by
+        :meth:`~manicule.connectors.subtree.Subtree.covering_roots` in both, and it is the same
+        method rather than the same rule written twice.
+
+        Subtree mode expands ``ancestors``, which whole-space mode has no use for. That is the
+        one place the two differ in cost, and it buys the check that a page the source returned
+        is really in the tree that was asked for.
         """
-        types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
-        for space in await self._spaces():
-            params = [
-                ("cql", cql.content_query(space, types=types, ordered=False)),
-                ("limit", str(self._config.page_size)),
-            ]
-            async for payload in self._client.paginate(self._client.url(_SEARCH_PATH), params):
-                for result in _results(payload):
+        spaces = await self._spaces()
+        scope = await self._scope(spaces)
+        if scope is None:
+            types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
+            for space in spaces:
+                query = cql.content_query(space, types=types, ordered=False)
+                async for result, _ in self._search(query):
                     source_id = _str(result.get("id"))
                     if source_id:
                         yield source_id
+            return
+
+        for space in scope.spaces():
+            # The page enumeration and the scope are one thing: `members` is the live query,
+            # already checked page by page against the configured roots and already guarded
+            # against a subtree that only looks empty.
+            members = await scope.members(space)
+            for page_id in members:
+                yield page_id
+            if not self._config.include_attachments:
+                continue
+            query = cql.content_query(space, types=(ATTACHMENT,), ordered=False)
+            async for result, _ in self._search(query, expand="container"):
+                container = _str(_obj(result.get("container")).get("id"))
+                source_id = _str(result.get("id"))
+                if source_id and container in members:
+                    yield source_id
 
     # --- fetch ---------------------------------------------------------------------------
 
@@ -487,10 +676,18 @@ class ConfluenceConnector:
             report.unresolved.extend(unresolved_because(self._macros_in(body), _RESOLUTION_OFF))
 
         ancestors: list[JsonValue] = list(body.ancestors) or list(_metadata_ancestors(ref))
+        ancestor_ids = body.ancestor_ids or _str_values(ref, ANCESTOR_IDS)
         complete = True
         if not ancestors:
-            titles, complete = await self._ancestor_titles_of(ref.source_id)
+            titles, ancestor_ids, complete = await self._ancestors_of(ref.source_id)
             ancestors = list(_str_list(space_key, *titles))
+            # A breadcrumb starts at the space key, and on Cloud there may be no way to learn
+            # it here: the body endpoint reports a numeric space id, and a ref rebuilt
+            # elsewhere carries nothing. Inventing one is not available and is not wanted —
+            # but neither is calling the result complete. Every chunk of this page is prefixed
+            # one level short of the rest of the corpus, and this flag is the only thing that
+            # says so.
+            complete = complete and bool(space_key)
 
         metadata: Metadata = {
             KIND: PAGE,
@@ -503,6 +700,16 @@ class ConfluenceConnector:
             "body_format": body.body_format,
             "deployment": self._config.deployment.value,
         }
+        # Carried from the ref rather than recomputed, and carried on **every** fetch rather
+        # than only when there is something to say. The pipeline merges the stored metadata
+        # under the fetched metadata, so a key this fetch omits keeps whatever the last one
+        # wrote — which for a page that has since moved between two configured roots would be
+        # the root it used to hang off.
+        # ``None`` rather than an omitted key when nothing is scoped, so that a source which
+        # stopped being subtree-scoped clears the provenance of the pages it keeps instead of
+        # leaving them asserting a root that no longer selects anything.
+        metadata[ROOT_PAGE_IDS] = list(_str_values(ref, ROOT_PAGE_IDS)) or None
+        metadata[ANCESTOR_IDS] = list(ancestor_ids)
         metadata.update(report.as_metadata())
         if expected is not None and body.version != expected:
             metadata["version_disagreement"] = {"discovered": expected, "fetched": body.version}
@@ -557,14 +764,18 @@ class ConfluenceConnector:
             return find_adf_macros(_adf_document(body.body, body.page_id))
         return find_storage_macros(body.body)
 
-    async def _ancestor_titles_of(self, page_id: str) -> tuple[tuple[str, ...], bool]:
-        """Ancestor titles for a page whose discovery record carried none, and whether they are
-        all there.
+    async def _ancestors_of(self, page_id: str) -> tuple[tuple[str, ...], tuple[str, ...], bool]:
+        """Ancestor titles and ids for a page whose discovery record carried none, and whether
+        the titles are all there.
 
-        Discovery expands ``ancestors`` and puts the titles on the ref, so this runs only for a
-        ref built somewhere else — a re-fetch from a stored one, a targeted single-page sync.
-        The Atlassian Document Format endpoint does not carry ancestors, hence a second call
-        rather than a wider expansion.
+        Discovery expands ``ancestors`` and puts both on the ref, so this runs only for a ref
+        built somewhere else — a re-fetch from a stored one, a targeted single-page sync. The
+        Atlassian Document Format endpoint does not carry ancestors, hence a second call rather
+        than a wider expansion.
+
+        **Ids come back from the same response as the titles**, because otherwise this path
+        would record an empty ancestor-id list for a page that has ancestors — and an empty list
+        is indistinguishable from a page at the top of its space, which is a different fact.
 
         The flag is returned rather than swallowed because a breadcrumb missing a level is not
         visibly wrong: it retrieves slightly worse and says nothing. An ancestor whose title
@@ -572,15 +783,20 @@ class ConfluenceConnector:
         number into the text the embedder reads.
         """
         if not self._is_cloud:
-            return (), True
+            return (), (), True
         url = f"{self._client.url(_V2_PAGE_PATH)}/{page_id}/ancestors"
         try:
             payload = await self._client.get_json(url, [("limit", "25")])
         except NotFoundError:
-            return (), True
+            return (), (), True
         entries = _results(payload)
         titles = tuple(_str(entry.get("title")) for entry in entries)
-        return tuple(title for title in titles if title), all(titles)
+        found = tuple(_str(entry.get("id")) for entry in entries)
+        return (
+            tuple(title for title in titles if title),
+            tuple(entry for entry in found if entry),
+            all(titles),
+        )
 
     async def _adf_body(self, page_id: str) -> _Body:
         url = f"{self._client.url(_V2_PAGE_PATH)}/{page_id}"
@@ -606,7 +822,7 @@ class ConfluenceConnector:
         )
 
     async def _storage_body(self, page_id: str) -> _Body:
-        url = f"{self._client.url(_CONTENT_PATH)}/{page_id}"
+        url = f"{self._client.url(CONTENT_PATH)}/{page_id}"
         payload = await self._client.get_json(url, [("expand", _STORAGE_EXPAND)])
         body = _obj(_obj(payload.get("body")).get(STORAGE_BODY))
         links = _obj(payload.get("_links"))
@@ -619,6 +835,7 @@ class ConfluenceConnector:
             body_format=STORAGE_BODY,
             space_key=space_key,
             ancestors=(space_key, *_ancestor_titles(payload)) if space_key else (),
+            ancestor_ids=subtree.ancestor_ids(payload),
             webui=_str(links.get("webui")),
             base=_str(links.get("base")) or self._config.base_url,
         )
@@ -674,7 +891,7 @@ class ConfluenceConnector:
         if not title or not space:
             return ""
         params = [("cql", cql.title_query(space, title)), ("limit", "1")]
-        payload = await self._client.get_json(self._client.url(_SEARCH_PATH), params)
+        payload = await self._client.get_json(self._client.url(SEARCH_PATH), params)
         results = _results(payload)
         return _str(results[0].get("id")) if results else ""
 
@@ -747,7 +964,12 @@ def _ancestor_titles(result: Mapping[str, object]) -> tuple[str, ...]:
 
 
 def _metadata_ancestors(ref: DocRef) -> tuple[str, ...]:
-    value = ref.metadata.get(ANCESTORS)
+    return _str_values(ref, ANCESTORS)
+
+
+def _str_values(ref: DocRef, key: str) -> tuple[str, ...]:
+    """A list-of-strings metadata value from a ref, tolerating one written by anything else."""
+    value = ref.metadata.get(key)
     if not isinstance(value, list):
         return ()
     entries = cast("Sequence[object]", value)

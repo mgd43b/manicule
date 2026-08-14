@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import httpx
@@ -63,6 +63,8 @@ _SPACE = re.compile(r'space\s*=\s*"((?:[^"\\]|\\.)*)"')
 _TITLE = re.compile(r'title\s*=\s*"((?:[^"\\]|\\.)*)"')
 _SINCE = re.compile(r'lastmodified\s*>=\s*"([^"]*)"')
 _TYPES = re.compile(r"type\s*(?:=\s*(\w+)|in\s*\(([^)]*)\))")
+_ANCESTOR = re.compile(r"ancestor\s*(?:=\s*(\d+)|in\s*\(([^)]*)\))")
+_ID = re.compile(r"(?<![\w.])id\s*(?:=\s*(\d+)|in\s*\(([^)]*)\))")
 
 
 @dataclass(slots=True)
@@ -77,7 +79,29 @@ class FakePage:
     adf: Mapping[str, object] = field(default_factory=lambda: paragraph("body text"))
     storage: str = "<p>body text</p>"
     ancestors: tuple[str, ...] = ()
-    """Ancestor titles, outermost first."""
+    """Ancestor titles, outermost first, for a fixture that only cares about breadcrumbs.
+
+    Used when :attr:`parent` is unset. The ids that go with these are invented, because a test
+    of a breadcrumb has no page for an ancestor title to be. Anything about *scope* wants
+    :attr:`parent` instead, where the hierarchy is real pages and the ids are theirs.
+    """
+
+    parent: str = ""
+    """Id of this page's parent, which is what makes the hierarchy a real one.
+
+    Set it and ``ancestors`` is computed by walking up — real ids, real titles, in the order
+    Confluence reports them. Scope is decided on ancestor **ids**, so a fixture that named only
+    titles could never exercise it and would quietly agree with any implementation.
+    """
+
+    status: str = "current"
+    """``current``, ``archived`` or ``trashed``. Anything else is absent from search results,
+    exactly as Confluence's ``status = current`` makes it, while still being fetchable by id —
+    which is the difference a root-page check has to be able to see."""
+
+    kind: str = "page"
+    """What the source calls this content. ``blogpost`` is the other one that has an id somebody
+    can paste into a configuration file, and it is the one that has no descendants."""
 
     served_version: int | None = None
     """Version the *body* endpoints report, when it disagrees with what search reports."""
@@ -205,6 +229,29 @@ class FakeConfluence:
         exercise them. Empty by default, so a fixture that signs out has to be caught by
         something other than a header it did not set."""
 
+        self.forbidden_pages: set[str] = set()
+        """Page ids answered with 403 rather than served.
+
+        Losing access to a page is not the same event as the page being deleted, and the
+        difference is a subtree's worth of documents. A fixture needs to be able to produce the
+        first without producing the second.
+        """
+
+        self.ancestor_predicate = "applied"
+        """How this instance treats CQL's ``ancestor`` field: the deployment question that
+        cannot be settled from this repository.
+
+        Confluence answers an *unsupported* field with a parse error, which is loud and needs
+        no guarding. The two shapes worth modeling are the ones that succeed:
+
+        - ``"applied"`` — the descendant predicate works. What is assumed everywhere else.
+        - ``"ignored"`` — accepted and not applied, so the answer is the whole space. Every
+          request succeeds and every result is a real page, and a connector that trusted the
+          query would index a space while its configuration said one page tree.
+        - ``"empty"`` — accepted and matching nothing. This is the dangerous one: the subtree
+          reads as deleted, and reconciliation deletes what it does not see.
+        """
+
         self.body_calls: dict[str, int] = {}
         self._cursors: dict[str, tuple[str, int]] = {}
         self._cursor_seed = cursor_seed
@@ -234,6 +281,33 @@ class FakeConfluence:
     def delete(self, page_id: str) -> None:
         """Remove a page the way a user does: it simply stops appearing in CQL results."""
         self.pages.pop(page_id, None)
+
+    def move(self, page_id: str, parent: str) -> None:
+        """Reparent a page, which is what a user does by dragging it in the page tree.
+
+        The page keeps its id, its version history and its attachments. Everything that decides
+        whether it is still in scope changes, and nothing that decides what it *is* does — which
+        is the whole reason scope must never become part of a document's identity.
+        """
+        page = self.pages[page_id]
+        self.pages[page_id] = replace(page, parent=parent)
+
+    def chain(self, page: FakePage) -> list[FakePage]:
+        """``page``'s ancestors, outermost first, walked up through :attr:`FakePage.parent`.
+
+        Stops on a page it has already seen. Confluence does not permit a cycle in its page
+        tree, but a fixture can build one, and a fake that hung on it would be testing the test
+        rather than the connector.
+        """
+        found: list[FakePage] = []
+        seen = {page.id}
+        current = self.pages.get(page.parent) if page.parent else None
+        while current is not None and current.id not in seen:
+            seen.add(current.id)
+            found.append(current)
+            current = self.pages.get(current.parent) if current.parent else None
+        found.reverse()
+        return found
 
     def queries(self) -> list[str]:
         """Every CQL query that was asked, in order."""
@@ -282,6 +356,8 @@ class FakeConfluence:
             return self._search(request)
         if path.startswith("/api/v2/pages/"):
             return self._v2_page(path)
+        if path.endswith("/child/page") and path.startswith("/rest/api/content/"):
+            return self._child_pages(path)
         if path.startswith("/rest/api/content/"):
             return self._v1_page(path)
         if path.startswith("/download/"):
@@ -316,6 +392,8 @@ class FakeConfluence:
                 for page in self.pages.values()
                 if (not space or page.space == space)
                 and (not title or page.title == title)
+                and page.status == "current"
+                and self._within(page, query)
                 and _after(page.when, since.group(1) if since else None)
             )
         if "attachment" in kinds and not title:
@@ -328,12 +406,54 @@ class FakeConfluence:
             )
         return sorted(found, key=lambda item: (item.when, item.id))
 
+    def _within(self, page: FakePage, query: str) -> bool:
+        """Whether a page satisfies the query's ``ancestor`` and ``id`` predicates.
+
+        Both are absent from a whole-space query, and then every page qualifies. When they are
+        present they are combined with OR, because that is the only way the connector writes
+        them: descendants of the roots, or the roots themselves.
+
+        :attr:`ancestor_predicate` is what makes this fake able to be a deployment that does not
+        support the field while still answering 200.
+        """
+        ancestors = _listed(_ANCESTOR.search(query))
+        ids = _listed(_ID.search(query))
+        if not ancestors and not ids:
+            return True
+        if self.ancestor_predicate == "ignored":
+            return True
+        if page.id in ids:
+            return True
+        if self.ancestor_predicate == "empty":
+            return False
+        return any(parent.id in ancestors for parent in self.chain(page))
+
+    def _child_pages(self, path: str) -> httpx.Response:
+        """``/rest/api/content/{id}/child/page`` — the direct children of one page.
+
+        The second opinion the connector asks for when a descendant query comes back empty. It
+        deliberately does **not** consult the ``ancestor`` predicate, so a fake that has been
+        told to ignore that predicate still answers this one honestly, which is exactly the
+        asymmetry the guard depends on.
+        """
+        page_id = path.removeprefix("/rest/api/content/").removesuffix("/child/page")
+        if page_id in self.forbidden_pages:
+            return httpx.Response(403, json={"message": "no access"})
+        if page_id not in self.pages:
+            return httpx.Response(404, json={"message": "no such page"})
+        children = [
+            {"id": page.id, "type": "page", "status": page.status, "title": page.title}
+            for page in sorted(self.pages.values(), key=lambda page: page.id)
+            if page.parent == page_id and page.status == "current"
+        ]
+        return httpx.Response(200, json={"results": children, "size": len(children)})
+
     def _result(self, item: FakePage | FakeAttachment, expand: str) -> dict[str, object]:
         if isinstance(item, FakePage):
             row: dict[str, object] = {
                 "id": item.id,
-                "type": "page",
-                "status": "current",
+                "type": item.kind,
+                "status": item.status,
                 "title": item.title,
                 "version": {"number": item.version, "when": item.when},
                 "_links": {"webui": f"/spaces/{item.space}/pages/{item.id}/{item.title}"},
@@ -341,10 +461,7 @@ class FakeConfluence:
             if "space" in expand:
                 row["space"] = {"key": item.space, "name": self.spaces.get(item.space, "")}
             if "ancestors" in expand:
-                row["ancestors"] = [
-                    {"id": f"anc-{index}", "title": title}
-                    for index, title in enumerate(item.ancestors)
-                ]
+                row["ancestors"] = self._ancestor_rows(item)
             return row
         parent = self.pages.get(item.page_id)
         return {
@@ -368,6 +485,22 @@ class FakeConfluence:
             },
         }
 
+    def _ancestor_rows(self, page: FakePage) -> list[dict[str, object]]:
+        """``expand=ancestors``, outermost first.
+
+        Real pages with their real ids when :attr:`FakePage.parent` builds the hierarchy;
+        invented ids beside the given titles otherwise, because a fixture that names only
+        titles has no pages for them to be.
+        """
+        if page.parent:
+            return [
+                {"id": found.id, "type": "page", "title": found.title} for found in self.chain(page)
+            ]
+        return [
+            {"id": f"anc-{index}", "type": "page", "title": title}
+            for index, title in enumerate(page.ancestors)
+        ]
+
     def _v2_page(self, path: str) -> httpx.Response:
         rest = path.removeprefix("/api/v2/pages/")
         page_id, _, tail = rest.partition("/")
@@ -375,15 +508,7 @@ class FakeConfluence:
         if page is None:
             return httpx.Response(404, json={"message": "no such page"})
         if tail == "ancestors":
-            return httpx.Response(
-                200,
-                json={
-                    "results": [
-                        {"id": f"anc-{index}", "type": "page", "title": title}
-                        for index, title in enumerate(page.ancestors)
-                    ]
-                },
-            )
+            return httpx.Response(200, json={"results": self._ancestor_rows(page)})
         version = self._served_version(page)
         body: dict[str, object] = (
             {"atlas_doc_format": {"value": json.dumps(page.adf)}} if page.adf_available else {}
@@ -405,6 +530,8 @@ class FakeConfluence:
 
     def _v1_page(self, path: str) -> httpx.Response:
         page_id = path.removeprefix("/rest/api/content/")
+        if page_id in self.forbidden_pages:
+            return httpx.Response(403, json={"message": "no access"})
         page = self.pages.get(page_id)
         if page is None:
             return httpx.Response(404, json={"message": "no such page"})
@@ -412,7 +539,8 @@ class FakeConfluence:
             200,
             json={
                 "id": page.id,
-                "type": "page",
+                "type": page.kind,
+                "status": page.status,
                 "title": page.title,
                 "space": {"key": page.space, "name": self.spaces.get(page.space, "")},
                 "version": {
@@ -421,10 +549,7 @@ class FakeConfluence:
                     ),
                     "when": page.when,
                 },
-                "ancestors": [
-                    {"id": f"anc-{index}", "title": title}
-                    for index, title in enumerate(page.ancestors)
-                ],
+                "ancestors": self._ancestor_rows(page),
                 "body": {"storage": {"value": page.storage, "representation": "storage"}},
                 "_links": {
                     "base": self.base_url,
@@ -495,6 +620,15 @@ class FakeConfluence:
             # The cursor itself is written unencoded, exactly as Confluence writes it.
             payload["_links"]["next"] = f"{path}?{kept}&cursor={issued}"
         return httpx.Response(200, json=payload)
+
+
+def _listed(match: re.Match[str] | None) -> set[str]:
+    """The ids in ``field = 1`` or ``field in (1, 2)``, or an empty set for neither."""
+    if match is None:
+        return set()
+    if match.group(1):
+        return {match.group(1).strip()}
+    return {part.strip() for part in (match.group(2) or "").split(",") if part.strip()}
 
 
 def _kinds(query: str) -> set[str]:
