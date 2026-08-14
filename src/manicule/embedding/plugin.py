@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from manicule.container import keys
 from manicule.core.errors import ConfigError
-from manicule.embedding.config import EmbedderConfig
+from manicule.embedding.config import EmbedderConfig, MlxEmbedderConfig
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
 
 if TYPE_CHECKING:
@@ -64,15 +64,27 @@ def _card(context: BuildContext) -> tuple[ModelCard, EmbedderConfig]:
 
 def _build_mlx(context: BuildContext) -> Embedder:
     # Deferred: this is where MLX and Metal are loaded.
-    from manicule.embedding.runtimes.mlx_backend import MlxEmbedder  # noqa: PLC0415
+    from manicule.embedding.runtimes.mlx_backend import MEGABYTE, MlxEmbedder  # noqa: PLC0415
 
-    card, config = _card(context)
+    if not isinstance(context.config, MlxEmbedderConfig):
+        # Checked before anything is read, because the registry validates against the model a
+        # component registered and so this is the factory being called from outside the
+        # container. Falling back to the shared model's defaults would silently drop the cache
+        # bound, which is the one setting here that stops a run from taking the machine down.
+        msg = (
+            f"the mlx embedder was built with {type(context.config).__name__} where it "
+            f"declares {MlxEmbedderConfig.__name__}. Its cache bound would not be applied."
+        )
+        raise ConfigError(msg)
+    config = context.config
+    card, _ = _card(context)
     embedding = context.settings.embedding
     return MlxEmbedder(
         card,
         weights=config.weights,
         batch_size=embedding.batch_size,
         cache_entries=embedding.cache_entries,
+        cache_limit_bytes=config.cache_limit_mb * MEGABYTE,
     )
 
 
@@ -104,7 +116,7 @@ class EmbeddingPlugin:
         registry.add(
             keys.EMBEDDER.named(MLX_NAME),
             _build_mlx,
-            config_model=EmbedderConfig,
+            config_model=MlxEmbedderConfig,
             summary="Metal-native, in-process, on Apple Silicon. Pools from token states.",
         )
         registry.add(

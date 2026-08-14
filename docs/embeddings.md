@@ -187,7 +187,13 @@ provider = "mlx"               # or "onnx"
 weights = ""                   # the artifact to execute, when it is not the model's own repo
 pooling = ""                   # only for a model that declares none; contradicting one is refused
 max_sequence_length = 0        # only for a model that declares none, in usable content tokens
+cache_limit_mb = 2048          # ceiling on MLX's retained Metal buffers (§3.5)
 ```
+
+`cache_limit_mb` is the only setting here that is one backend's alone, and it is on the MLX
+config model rather than the shared one so that writing it under
+`[plugins.config."embedder.onnx"]` is *refused*. onnxruntime has no such allocator, and quietly
+accepting the setting would leave an operator believing they had bounded something.
 
 A model outside the known-good set is accepted, and everything that decides vector-space
 compatibility is read from **its own repository** rather than from a table — which is stronger
@@ -309,6 +315,76 @@ nothing, and the fast path on Apple hardware already exists — it is called MLX
 
 That is the Apple-hardware principle in operative form. Throughput may differ by machine.
 Vectors may not.
+
+### 3.5 MLX keeps every buffer it has finished with, and `ps` cannot see them
+
+This is the first defect a real corpus produced rather than a fixture. Indexing with MLX and
+`bge-m3`, an operator's server reached **36.17 GiB** in Activity Monitor after three newly
+embedded documents, having already met the macOS out-of-memory dialog on an earlier run — with
+`fetch_concurrency = 2`, `parse_workers = 1`, `max_embed_batch = 1` and `batch_size = 1`.
+Embedding was serialized and each forward pass received one chunk, so none of the usual
+explanations applied.
+
+**What survives a forward pass is MLX's free-buffer cache**, and nothing else. MLX does not
+return a buffer to the system when it is finished with it; it keeps it in a size-keyed free
+list against a later request for the same size. That is right for a training loop, where every
+step has identical shapes. It is wrong here: manicule pads each batch to its own longest
+member, so at batch one nearly every pass has a *distinct* sequence length and therefore a
+distinct buffer size, and almost nothing is ever reused. The list only grows, bounded solely by
+MLX's own cache limit — which defaults to very nearly the whole machine, measured **60.8 GiB of
+a 64 GiB Mac**.
+
+Measured over 46 batch-one passes on `bge-m3` fp16, before the bound:
+
+| | first pass | 46th pass | change |
+|---|---:|---:|---:|
+| Physical footprint (`footprint`) | 2.45 GiB | 25.00 GiB | **+22.55** |
+| MLX free-buffer cache | 0.83 GiB | 22.52 GiB | **+21.69** |
+| MLX live arrays | 1.058 GiB | 1.060 GiB | +0.002 |
+| Resident memory (`ps`) | 1.59 GiB | 1.30 GiB | **−0.28** |
+
+96.2% of the growth is the cache. Live MLX memory grew by two megabytes, which rules out a
+reachable lazy graph, a retained model state, an over-large batch and manicule's own vector
+cache in one number.
+
+**The trap is the last row.** Resident memory *fell* while the process grew by twenty-two
+gigabytes, because Metal buffers are not ordinary resident anonymous pages. Anyone measuring
+with `ps`, `psutil` or `resource.getrusage` concludes there is nothing wrong — which is why
+[`ingest.md`](ingest.md) §6.2's RSS polling, correct for parse workers, says nothing at all
+about this, and why `MlxEmbedder` publishes `mlx_active_bytes`, `mlx_cache_bytes` and
+`mlx_peak_bytes` as metrics rather than leaving an operator with the number that lies.
+
+The fix is one call, at load, on the worker thread that owns the streams: bound the cache
+before the weights are loaded, so the model's own gigabyte is already inside the bound.
+Teardown clears it, because dropping the model frees its buffers into the cache rather than to
+the system. **Vectors are unaffected and measured to be so** — the allocator decides what is
+*retained*, not what is *computed*, and 40 vectors across 1024 dimensions come back
+bit-for-bit identical, with a maximum elementwise difference of exactly `0.0`.
+
+With the bound, the same 120-pass workload:
+
+| | unbounded | `cache_limit_mb = 2048` |
+|---|---:|---:|
+| Peak physical footprint | 18.0 GiB (still climbing at abort) | **3.87 GiB** |
+| Growth after 10 settle passes | +11.93 GiB | **+0.22 GiB** |
+| Passes completed | aborted at a guard | 120 |
+
+`tools/qualify_mlx_memory.py` is what produced both columns. It runs the real embedder in a
+child process and measures *that child* from outside with `footprint`, because a process cannot
+be trusted to report the memory the measurement is about. The child blocks until the parent has
+measured each pass — without that it races to completion and exits while the parent drains a
+pipe of buffered records, measuring a process that is idle, tearing down, or gone. That failure
+looks exactly like a plateau, and it reported a false pass before it was found.
+
+It downloads nothing and refuses unless the weights are already cached, so it is gated on
+`REQUIRE_EMBEDDING_MODELS` naming `BAAI/bge-m3` (§6.5) and stays out of ordinary CI.
+
+**Residual risk in `mlx-embeddings==0.1.0`.** None of this is that library's doing, and no
+upstream report is warranted: the retention is MLX's documented allocator behavior with its
+default limit, and `mx.set_cache_limit` is the supported way to bound it. What remains is that
+the cache limit is *process-global* rather than per-embedder, so a process running two MLX
+components is bounded by whichever set it last. manicule builds one embedder, so this is a
+property to know rather than a bug to carry.
 
 ---
 
@@ -517,6 +593,23 @@ invisible without this test because every individual vector looks fine.
 `assert_protocol_signatures` against `Embedder` and `TokenStateEmbedder` —
 `@runtime_checkable` checks that an attribute exists and never what it accepts.
 
+### 6.6 Bounded memory, split between a fake and a real child process
+
+Two levels, because the claim has two halves and one of them cannot be faked.
+
+`tests/test_embedding_mlx_memory.py` replaces the MLX runtime wholesale and asserts the
+*lifecycle*: that the bound is applied, that it is the configured one, and that it happens
+**before** `load_model` rather than after — order being the assertion, since a limit set
+afterwards inherits more than a gigabyte of the model's own allocations. It runs on Linux with
+no MLX installed, in milliseconds. Removing either allocator call fails four of these by name.
+
+Whether the bound actually holds physical memory down is a claim about Metal, and no fake can
+answer it. That is `tools/qualify_mlx_memory.py`, reached from
+`test_repeated_embedding_holds_a_bounded_physical_footprint`, which runs real weights and
+measures the child from outside. It is gated on `REQUIRE_EMBEDDING_MODELS` *naming* `bge-m3` —
+stricter than "the weights happen to be cached", because it costs minutes of real forward
+passes and nobody should meet it by accident.
+
 ---
 
 ## 7. Traps
@@ -544,6 +637,11 @@ invisible without this test because every individual vector looks fine.
   caught. Found the first time the backend ran under `asyncio.to_thread`, which hands out
   whichever pool thread is free. Each embedder therefore owns **one** worker thread, loads on
   it, runs on it, and converts to numpy on it before returning.
+- **MLX's memory is invisible to `ps`, and its free-buffer cache is unbounded by default.**
+  Metal buffers are not ordinary resident pages, so resident memory can *fall* while the
+  process grows by tens of gigabytes — measured, 1.59 → 1.30 GiB of RSS across a 2.45 → 25.0
+  GiB rise in physical footprint. The default cache limit is very nearly the whole machine.
+  §3.5.
 - **The Hugging Face cache follows `XDG_CACHE_HOME`.** The suite redirects that per test, so a
   model sitting on disk becomes invisible and every model suite skips — green, having checked
   nothing. `tests/conftest.py` pins `HF_HUB_CACHE` for the session, the same hazard the

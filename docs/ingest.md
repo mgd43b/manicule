@@ -617,14 +617,25 @@ to remove the failure modes instead of catching them:
 - **A too-long input cannot reach the embedder**, because the `ChunkFingerprint` check (§7)
   refuses at startup when the chunk budget exceeds `max_sequence_length`. This is the single
   reason that check is a startup refusal rather than a per-document guard.
-- **Memory is bounded by batch size**, derived from the fingerprint rather than hardcoded
-  (§8.2).
+- **The live working set is bounded by batch size**, derived from the fingerprint rather than
+  hardcoded (§8.2). This is worth stating precisely, because an earlier version of this line
+  said "memory is bounded by batch size" and that turned out to be false in the way that
+  matters. Batch size bounds what a forward pass holds *at once*; it says nothing about what
+  the runtime *retains afterwards*. The defect in
+  [`embeddings.md`](embeddings.md) §3.5 reached 36 GiB at `batch_size = 1`, because MLX keeps
+  every buffer it has finished with. Retention is bounded separately, by `cache_limit_mb`.
 - **Input is not attacker-shaped by the time it arrives.** Parse and chunk have already run,
   in a sandbox, and produced bounded token counts.
 
 Residual risk, stated rather than hidden: an OOM inside MLX takes the process down, and §6.4's
 sweep is what recovers it. That is a worse outcome than a killed parse worker, and it is the
 price of an in-process embedder.
+
+**§6.2's RSS polling does not see the embedder at all**, and not only because embed is
+in-process rather than in a child. Metal allocations are not ordinary resident pages, so
+resident memory is the wrong instrument here even when it is pointed at the right process — it
+fell while the process grew twenty-two gigabytes. The embedder publishes `mlx_cache_bytes`
+and friends as metrics for exactly this reason.
 
 > **Prior art.** Everything runs in one process, `BATCH_SIZE` is the constant `32` regardless of
 > model or chunk size, and contextual-retrieval and chunk-augmentation features issue two LLM
