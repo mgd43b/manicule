@@ -1130,13 +1130,29 @@ behind a coupling nobody could see — so parsing and detection are independentl
 | `libraries` | `name@version` for everything outside this repository that decides a stored entry | a digest catches a rule *we* change and cannot catch one changing underneath an unchanged file |
 | `middleware` | `name@version` for every configured hook | detection reads `Chunk.text` boundaries and `heading_path`, neither of which any middleware declaration covers |
 
-**`libraries` is derived from the sources' own imports, not from a list.** Two things reach it.
-`pydantic` validates `GlossaryEntry`'s field constraints, so it decides which rows may be
-persisted at all. `unicodedata` is the sharper one: `normalise_acronym` NFKC-folds a surface into
-the stored *lookup key*, and #121 put NFKC into `initial_skeleton` as well — so the character
-database version decides what a term is filed under, and it moves with the interpreter rather
-than with any distribution. It is the one entry named by hand, because a standard-library module
-has no distribution to look up and is the case the derivation cannot see.
+**`libraries` is derived from the sources' own imports, not from a list.** `pydantic` validates
+`GlossaryEntry`'s field constraints, so it decides which rows may be persisted at all.
+`unicodedata` is the sharper one: `normalise_acronym` NFKC-folds a surface into the stored
+*lookup key*, and #121 put NFKC into `initial_skeleton` as well — so the character database
+version decides what a term is filed under.
+
+**The interpreter is recorded beside it, at its feature version**, because `unicodedata` is not
+the only standard-library module that decides an entry and recording it alone would catch one of
+two failures with the same shape. `re` compiles every written form, `str.isupper` is the whole of
+the shape gate, and `str.casefold` decides whether two aliases are one. None has a distribution.
+
+`python@3.13` rather than `python@3.13.11` is deliberate. CPython's policy is that a patch
+release fixes bugs without changing documented behaviour, so re-staling a corpus on one would
+invalidate for a change that is not supposed to exist — and two machines a patch apart would
+disagree about a restored index for a reason nobody could act on. **The accepted risk is a
+behaviour change that ships in a patch release anyway.**
+
+**What the derivation does not see** is written down in `glossary_lineage.DERIVED_FROM`, in the
+style `NOT_DIGESTED` uses, because a derived mechanism fails silently when its derivation has a
+hole. Imports at any nesting are covered — inside a function, under `if TYPE_CHECKING`, in a
+`try/except ImportError` — since the walk reads the whole syntax tree. What it cannot follow is a
+*dynamic* import, and rather than leave that as a limit it is a rule: the suite fails if a
+digested source calls `importlib.import_module` or `__import__`.
 
 **It is derived, not maintained.** `ParserVersions.rules` is a number somebody has to remember
 to move, and its own table records two parsers bumped for changes they did not make, by
