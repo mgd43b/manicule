@@ -453,6 +453,95 @@ def test_a_right_hand_side_with_no_initials_evidence_is_kept_whole() -> None:
     ]
 
 
+# --- a term with its expansion in brackets -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "heading_path"),
+    [
+        ("Holds the runbooks for the on-call rota.", ("Glossary", f"NOW ({EXPANSION})")),
+        (f"### NOW ({EXPANSION})\n\nHolds the runbooks.", ("Glossary",)),
+        (f"NOW ({EXPANSION}) holds the runbooks.", ("Glossary",)),
+    ],
+    ids=["breadcrumb", "markdown-heading", "prose-line"],
+)
+def test_a_term_followed_by_its_expansion_in_brackets_is_detected(
+    text: str, heading_path: tuple[str, ...]
+) -> None:
+    """``TERM (Expansion)`` — the reverse of the parenthetical form, and it was read nowhere.
+
+    Reported as a heading problem, and it is not one. ``_PARENTHETICAL_RE`` requires two words
+    before the bracket, so it reads ``Network Operations Workspace (NOW)`` and cannot read the
+    other order **in prose either** — the ``prose-line`` case here produced nothing before this
+    rule existed, on a line with no heading anywhere near it. The heading is only where the shape
+    is most often written.
+
+    Three routes to the same words, because the chunker lifts a heading into ``heading_path``
+    while a passed-through Markdown one stays a line, and the same shape should be read the same
+    way whichever arrives.
+    """
+    entries = detect_in_chunk(chunk(text, heading_path=heading_path))
+
+    assert [(entry.acronym, entry.expansion) for entry in entries] == [("NOW", EXPANSION)]
+    assert entries[0].form is DefinitionForm.PARENTHETICAL
+
+
+def test_a_bracketed_expansion_takes_the_parenthetical_weight_and_not_the_headings() -> None:
+    """**The weight decision, asserted through its consequence rather than by reading a table.**
+
+    The author typed brackets, and a bracket is a separator — precisely what ``HEADING`` lacks and
+    the reason ``a_heading_may_define`` requires initials agreement of it. So this must not inherit
+    ``HEADING``'s 0.45 for appearing in one.
+
+    The arithmetic then does the work: 0.35 + ``GLOSSARY_CONTEXT_EVIDENCE`` is 0.50, below the
+    threshold, so a page calling itself a glossary cannot admit one on its own say-so; with
+    initials agreement it reaches 0.70.
+
+    **The confidence is asserted exactly, and that is the guard.** Measured by giving the rule
+    ``HEADING``'s 0.45 instead: this line scores **0.95**, where the same two strings written
+    ``The Network Operations Workspace (NOW)`` score 0.85. Same brackets, same agreement, a
+    different number for the word order — which is the real cost of the wrong weight, and it is
+    not the one an earlier draft of this docstring claimed. ``CPU (central processor)`` is refused
+    under *either* weight; at 0.45 it is held out by ``a_heading_may_define`` requiring initials
+    agreement of the heading form, which is a rule about a different form doing this one's work by
+    accident.
+
+    **And 0.85 is the answer the prose form already gives**, which is why this is consistency
+    rather than a new judgement — the third assertion is the same fact written the other way
+    round, refused today by the identical sum.
+    """
+    admitted = detect_in_chunk(
+        chunk("Holds the runbooks.", heading_path=("Glossary", f"NOW ({EXPANSION})"))
+    )
+    assert [entry.confidence for entry in admitted] == [0.85]
+
+    refused = detect_in_chunk(
+        chunk("Executes instructions.", heading_path=("Glossary", "CPU (central processor)"))
+    )
+    assert refused == [], "0.35 + 0.15 is 0.50, and a glossary page may not carry it alone"
+
+    assert detect_in_chunk(chunk("The central processor (CPU) executes instructions.")) == []
+
+
+def test_a_bracketed_aside_that_does_not_spell_the_term_is_refused() -> None:
+    """Brackets after a term are not evidence that what is in them is an expansion.
+
+    ``NOW (see the runbook)`` is the shape and not the thing, and it is refused by the same sum
+    that admits the real one — no initials agreement, so 0.35 + 0.15 falls short. This is the
+    counterpart that keeps the rule from being "a term followed by a bracket is a definition".
+    """
+    assert detect_in_chunk(chunk("NOW (see the runbook) is where tickets live.")) == []
+
+
+def test_the_existing_parenthetical_order_is_unchanged() -> None:
+    """``Expansion (TERM)`` still reads as it did; the new rule is a second shape, not a rewrite."""
+    entries = detect_in_chunk(chunk(f"The {EXPANSION} (NOW) holds the runbooks."))
+
+    assert [(entry.acronym, entry.expansion, entry.confidence) for entry in entries] == [
+        ("NOW", EXPANSION, 0.85)
+    ]
+
+
 # --- definition lists -----------------------------------------------------------------------
 
 

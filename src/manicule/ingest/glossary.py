@@ -548,6 +548,58 @@ _PARENTHETICAL_RE: Final = re.compile(
     rf"(?P<expansion>[A-Za-z][\w'’-]*(?:[ \t]+[\w'’&/-]+){{1,{MAX_EXPANSION_WORDS - 1}}})"  # noqa: RUF001
     r"\s*\(\s*(?P<terms>[^()]{2,64}?)\s*\)"
 )
+_HEADING_TEXT_RE: Final = re.compile(r"^\s*#{1,6}\s+(?P<text>\S.*?)\s*$")
+"""A Markdown heading's own text, whatever shape it is.
+
+:data:`_HEADING_RE` captures a heading that is *only* a term, which is what the heading form
+needs. This one captures the rest so that :data:`_TERM_FIRST_PARENTHETICAL_RE` can be asked
+about a heading a parser left in the text — the structural chunker lifts headings into
+:attr:`~manicule.core.content.Chunk.heading_path`, but a passed-through Markdown one is still a
+line, and the same words should be read the same way either way.
+"""
+
+_TERM_FIRST_PARENTHETICAL_RE: Final = re.compile(
+    rf"^\s*(?P<term>{_TERM})\s*\(\s*(?P<expansion>[^()]{{2,120}}?)\s*\)"
+)
+"""``TERM (Expansion)`` — the term first, its expansion in the brackets.
+
+**The reverse of :data:`_PARENTHETICAL_RE`, and it was read nowhere.** That pattern requires at
+least two words before the bracket, so it reads ``Network Operations Workspace (NOW)`` and cannot
+read ``NOW (Network Operations Workspace)`` — not in a heading, and not in prose either. Measured
+before this existed: ``'NOW (Network Operations Workspace) holds the runbooks.'`` produced nothing
+while the same fact written the other way round produced an entry at 0.85. The shape was reported
+as a heading problem and is not one; the heading is only where it is most often written.
+
+**It takes :attr:`~manicule.core.glossary.DefinitionForm.PARENTHETICAL`'s 0.35, and that is the
+decision rather than a default.** The author typed brackets, and a bracket is a separator —
+precisely what :attr:`~manicule.core.glossary.DefinitionForm.HEADING` lacks, and the reason
+:func:`a_heading_may_define` requires initials agreement of it. So this must not inherit
+``HEADING``'s 0.45 for appearing in one.
+
+The arithmetic then does the work: 0.35 + :data:`GLOSSARY_CONTEXT_EVIDENCE` is 0.50, below
+:data:`MIN_DEFINITION_CONFIDENCE`, so a page calling itself a glossary cannot admit one on its own
+say-so; with initials agreement it reaches 0.70. ``NOW (Network Operations Workspace)`` is
+recorded and ``CPU (central processor)`` is not — **which is the answer the prose form already
+gives**: ``The central processor (CPU) executes instructions.`` is refused today by the same sum.
+Consistency with a rule that exists, rather than a new judgement about headings.
+
+**What taking 0.45 would actually cost, measured rather than assumed.** An earlier draft of this
+said ``CPU (central processor)`` would then be stored, and that is false: under ``HEADING`` it is
+refused by :func:`a_heading_may_define`, which requires initials agreement of that form. The real
+cost is subtler and worse. ``NOW (Network Operations Workspace)`` would score **0.95** where the
+same two strings written ``The Network Operations Workspace (NOW)`` score 0.85 — the same brackets,
+the same agreement, a different number for the word order. And the case that must not be admitted
+would be held out by a rule about a *different* form, which is the accident this weight was chosen
+to avoid rather than a reason to be relaxed about it.
+
+**Position deliberately buys nothing, and that was considered rather than missed.** There is a
+plausible argument that a bracket inside a heading is likelier to be a definition than one in
+running prose, because headings name things. It may be true. It is unmeasured, and a fourth weight
+introduced on plausibility is exactly the move the rest of this module was written by undoing. If a
+real corpus ever shows heading parentheticals are systematically definitions, that is a measured
+change with a number behind it.
+"""
+
 _TABLE_RULE_RE: Final = re.compile(r"^[\s|:-]+$")
 
 _LIST_MARKER_RE: Final = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
@@ -1051,6 +1103,10 @@ def _from_line(line: str, previous: str) -> list[_Candidate]:
             _Candidate(previous.strip(), marker["expansion"], DefinitionForm.DEFINITION_LIST)
         )
 
+    term_first = _term_first_parenthetical(line)
+    if term_first is not None:
+        found.append(term_first)
+
     for parenthetical in _PARENTHETICAL_RE.finditer(line):
         terms = [part.strip() for part in parenthetical["terms"].split(",") if part.strip()]
         if terms:
@@ -1064,6 +1120,20 @@ def _from_line(line: str, previous: str) -> list[_Candidate]:
             )
 
     return found
+
+
+def _term_first_parenthetical(text: str) -> _Candidate | None:
+    """``TERM (Expansion)`` read out of ``text``, or ``None``.
+
+    A function rather than an inline match because three callers need it and they reach the same
+    words by different routes: a line of a chunk, a Markdown heading a parser left in the text,
+    and the innermost element of a breadcrumb the structural chunker lifted a heading into. Those
+    are one shape written once, and reading it three ways is how they would drift apart.
+    """
+    matched = _TERM_FIRST_PARENTHETICAL_RE.match(text)
+    if matched is None:
+        return None
+    return _Candidate(matched["term"].strip(), matched["expansion"], DefinitionForm.PARENTHETICAL)
 
 
 def _heading_definitions(lines: Sequence[str], breadcrumb: Sequence[str]) -> list[_Candidate]:
@@ -1087,7 +1157,18 @@ def _heading_definitions(lines: Sequence[str], breadcrumb: Sequence[str]) -> lis
                 _Candidate(heading["term"].strip(), body, DefinitionForm.HEADING),
             )
 
+    for line in lines:
+        heading_text = _HEADING_TEXT_RE.match(line)
+        if heading_text is not None:
+            in_text = _term_first_parenthetical(heading_text["text"])
+            if in_text is not None:
+                found.append(in_text)
+
     innermost = breadcrumb[-1].strip() if breadcrumb else ""
+    breadcrumb_parenthetical = _term_first_parenthetical(innermost)
+    if breadcrumb_parenthetical is not None:
+        found.append(breadcrumb_parenthetical)
+
     body = next((line for line in lines if line.strip()), "")
     if innermost and body and not _HEADING_RE.match(body):
         found.append(_Candidate(innermost, body, DefinitionForm.HEADING))
