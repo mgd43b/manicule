@@ -148,7 +148,7 @@ async def test_a_partial_answer_is_persisted_so_it_can_be_shared_and_rated() -> 
     assert store.written[0].finish_reason is FinishReason.ERROR
 
 
-async def test_a_cancelled_answer_still_writes_what_it_had() -> None:
+async def test_a_canceled_answer_still_writes_what_it_had() -> None:
     """``CancelledError`` is delivered once, so an ``await`` in a ``finally`` reached by
     cancellation completes normally. Tested rather than assumed, because the folklore is
     wrong and the shield exists for a *second* cancellation, not the first."""
@@ -168,13 +168,13 @@ async def test_a_cancelled_answer_still_writes_what_it_had() -> None:
     task = asyncio.create_task(consume())
     await asyncio.sleep(0.06)
     task.cancel()
-    with__cancelled = False
+    with__canceled = False
     try:
         await task
     except asyncio.CancelledError:
-        with__cancelled = True
+        with__canceled = True
 
-    assert with__cancelled is True
+    assert with__canceled is True
     assert len(store.written) == 1, "a partial answer that exists nowhere cannot be rated"
     assert store.written[0].content
 

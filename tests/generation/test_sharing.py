@@ -26,7 +26,7 @@ CEILING_S = 30 * 24 * 3600
 
 def test_a_minted_link_carries_the_token_once_and_stores_only_its_hash() -> None:
     """The database is backed up, exported and imported, so a plaintext token travels into
-    artefacts that leave the access boundary that created it."""
+    artifacts that leave the access boundary that created it."""
     link = new_share("conv-1", ttl_s=30 * 24 * 3600, maximum_ttl_s=CEILING_S, now=NOW)
 
     assert len(link.token) >= 40
@@ -121,7 +121,7 @@ def test_an_anonymous_viewer_gets_a_label_and_never_the_anchors_contents(
     """The same message renders differently by audience, and the difference is **content
     only** — never the existence of a citation, never whether it verified.
 
-    **Parametrised over the anchors that actually disclose something**, which the original
+    **Parametrized over the anchors that actually disclose something**, which the original
     test was not: it used a ``PageAnchor`` throughout and asserted on field *names*, so it
     passed while the anchor's contents flowed through a differently-named field. Rendering the
     location with the prompt's own helper put ``lines 41-58 of charge_customer_card`` and

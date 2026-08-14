@@ -35,7 +35,7 @@ from typing import NoReturn
 from manicule.core.anchors import Anchor, HeadingAnchor, PageAnchor, Unlocated
 from manicule.core.content import BlockKind, Chunk, Document, ParsedBlock, RawDocument
 from manicule.core.protocols import Chunker, Parser, read_blocks
-from manicule.testing.normalise import contains_claimed_text, normalise
+from manicule.testing.normalize import contains_claimed_text, normalize
 
 TIGHTNESS: dict[str, float] = {
     "line": 1.0,
@@ -230,8 +230,8 @@ def _assert_tightness(items: Sequence[_Located], resolved: dict[str, str | None]
         bound = TIGHTNESS.get(anchor.kind)
         if bound is None:  # pragma: no cover - every located kind has a bound
             continue
-        text = normalise(resolved[key] or "")
-        covered = _covered_length(text, [normalise(item.text) for item in group])
+        text = normalize(resolved[key] or "")
+        covered = _covered_length(text, [normalize(item.text) for item in group])
         _require(
             covered > 0,
             f"{group[0].where}: nothing in the resolved text matched, so tightness cannot "
@@ -242,7 +242,7 @@ def _assert_tightness(items: Sequence[_Located], resolved: dict[str, str | None]
             len(text) <= bound * allowed,
             f"{group[0].where}: anchor {anchor!r} resolves to {len(text)} characters to "
             f"address {covered} of them ({len(text) / allowed:.2f}x, limit {bound}x). An "
-            f"anchor much larger than what it addresses cites its neighbours too",
+            f"anchor much larger than what it addresses cites its neighbors too",
         )
 
 
@@ -254,7 +254,7 @@ def _fixed_overhead(anchor: Anchor) -> int:
     quietly doubling as a section-length check.
     """
     if isinstance(anchor, HeadingAnchor):
-        return len(normalise(anchor.path[-1]))
+        return len(normalize(anchor.path[-1]))
     return 0
 
 
@@ -268,27 +268,27 @@ def _assert_discrimination(
         carry an overlap window by design; **false for blocks**, which never do. Applying the
         exclusion to blocks would let a parser through whenever one block's text happened to
         end with the next one's — which is exactly what a section anchor confused with its
-        neighbour looks like.
+        neighbor looks like.
     """
-    normalised = [normalise(item.text) for item in items]
+    normalized = [normalize(item.text) for item in items]
     for outer_index, outer in enumerate(items):
         if isinstance(outer.anchor, Unlocated) or _is_page_level(outer.anchor):
             continue
-        haystack = normalise(resolved[_anchor_key(outer.anchor)] or "")
+        haystack = normalize(resolved[_anchor_key(outer.anchor)] or "")
         outer_key = _anchor_key(outer.anchor)
         for inner_index, inner in enumerate(items):
             if inner_index == outer_index or _anchor_key(inner.anchor) == outer_key:
                 continue
             if isinstance(inner.anchor, Unlocated) or _nests(outer.anchor, inner.anchor):
                 continue
-            needle = normalised[inner_index]
+            needle = normalized[inner_index]
             if (
                 overlapping
                 and abs(inner_index - outer_index) == 1
                 and {outer.kind, inner.kind} <= _OVERLAPPING_KINDS
             ):
                 first, second = sorted((outer_index, inner_index))
-                shared = _shared_overlap(normalised[first], normalised[second])
+                shared = _shared_overlap(normalized[first], normalized[second])
                 if inner_index > outer_index:
                     needle = needle[shared:]
                 if not needle:

@@ -39,7 +39,7 @@ from manicule.core.embedding import Pooling
 from manicule.core.errors import ContextOverflowError
 from manicule.core.protocols import Embedder, TokenStateEmbedder
 from manicule.embedding.cards import read_card
-from manicule.embedding.pooling import l2_normalise, pool
+from manicule.embedding.pooling import l2_normalize, pool
 from manicule.testing import (
     assert_embedder_contract,
     assert_protocol_signatures,
@@ -70,7 +70,7 @@ COSINE_TOLERANCE: Final = 0.9999
 Measured on ``bge-m3``: cosine 1.000000 to six decimal places between MLX fp16 weights and the
 fp32 ONNX export, with a largest component difference of 1.8e-05. The gate sits roughly a
 hundred times looser than the measurement, which leaves room for a different ONNX release
-without leaving room for a different model — 8-bit quantised ``bge-m3`` scores 0.9998 against
+without leaving room for a different model — 8-bit quantized ``bge-m3`` scores 0.9998 against
 fp16 and fails this.
 """
 
@@ -198,12 +198,12 @@ async def test_the_mlx_convenience_field_is_the_wrong_reduction_for_this_model(
     convenience = np.asarray(output.text_embeds.astype(mx.float32), dtype=np.float32)
 
     states = np.asarray(encoded.states, dtype=np.float32)
-    mean_pooled = l2_normalise(pool(states, np.asarray(mask), Pooling.MEAN))
+    mean_pooled = l2_normalize(pool(states, np.asarray(mask), Pooling.MEAN))
 
     against_convenience = [float(a @ b) for a, b in zip(ours, convenience, strict=True)]
     assert max(against_convenience) < 0.95, (
         f"the convenience field agreed with the model's declared pooling ({against_convenience}). "
-        f"If mlx-embeddings has started honouring 1_Pooling/config.json this test should be "
+        f"If mlx-embeddings has started honoring 1_Pooling/config.json this test should be "
         f"rewritten, not deleted — but check before believing it"
     )
     assert np.allclose(mean_pooled, convenience, atol=1e-3), (
@@ -252,7 +252,7 @@ async def test_an_onnx_export_offers_no_reliable_shortcut_either(model_id: str) 
     pooled = [item for item in outputs if item.ndim == 2]
     if not pooled:
         return
-    cosines = [float(a @ b) for a, b in zip(ours, l2_normalise(pooled[0]), strict=True)]
+    cosines = [float(a @ b) for a, b in zip(ours, l2_normalize(pooled[0]), strict=True)]
     assert min(cosines) > COSINE_TOLERANCE, (
         f"{model_id}'s pooled ONNX output disagrees with the model's declared pooling "
         f"({cosines}); recorded here because it is the mirror image of the MLX case"
@@ -293,7 +293,7 @@ async def test_the_two_runtimes_produce_the_same_vectors(model_id: str) -> None:
 async def test_the_two_runtimes_record_interchangeable_identities(model_id: str) -> None:
     """Byte-equal canonical fingerprints, which is what an index actually compares.
 
-    The runtime and the artefact are both recorded and neither is in identity — so the MLX
+    The runtime and the artifact are both recorded and neither is in identity — so the MLX
     conversion and the ONNX export of one model write against the same index, and a machine
     that changes runtime does not re-embed.
     """

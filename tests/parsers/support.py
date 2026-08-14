@@ -1,7 +1,7 @@
 """Shared scaffolding for the parser suites.
 
 One place builds the documents and one place runs the checks, so that a parser cannot pass by
-being tested more gently than its neighbours.
+being tested more gently than its neighbors.
 """
 
 from __future__ import annotations

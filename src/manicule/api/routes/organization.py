@@ -64,7 +64,7 @@ async def collection_documents(
 ) -> Response:
     """A page, checked on the way out like every other document listing.
 
-    Rule-driven membership is **evaluated**, not materialised, so what comes back is what the
+    Rule-driven membership is **evaluated**, not materialized, so what comes back is what the
     rule selects now rather than what it selected when somebody last saved it.
     """
     del caller
@@ -85,7 +85,7 @@ async def collection_counts(
 ) -> Response:
     """Counted on the call, not remembered.
 
-    A rule-driven collection has no materialised membership to keep a total for, so a stored
+    A rule-driven collection has no materialized membership to keep a total for, so a stored
     number would be the answer to the day it was written.
     """
     del caller
@@ -179,7 +179,7 @@ async def delete_collection(
 
 @router.get("/tags", name="tag_list", summary="Every tag in this workspace.")
 async def list_tags(service: Service, caller: ViewerPrincipal) -> Response:
-    """Names are case-sensitive and normalised to NFKC, so two keyboards produce one tag."""
+    """Names are case-sensitive and normalized to NFKC, so two keyboards produce one tag."""
     del caller
     return await respond("tag_list", service, service.tag_list)
 

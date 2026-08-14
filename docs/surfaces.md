@@ -5,12 +5,12 @@ because `--json` is something scripts and assistants parse, and a shape nobody w
 whatever the code happened to do last.
 
 - **The application service** (`manicule.app.service.ApplicationService`) has all the
-  behaviour.
+  behavior.
 - **The command line** (`manicule.cli`), **the MCP server** (`manicule.mcp`), **the HTTP API**
   (`manicule.api`) and **the browser surface** (`manicule.web`) are adapters over it. None of
   them decides anything.
 
-The browser surface renders the same envelope as HTML rather than serialising it, and has its
+The browser surface renders the same envelope as HTML rather than serializing it, and has its
 own document: [`web.md`](web.md). Everything below applies to it too.
 
 ---
@@ -130,7 +130,7 @@ installation reports success at being broken.
 `--json` is not on the command line's exit status alone:
 
 - **stdout carries the envelope and nothing else.** No banner, no progress, no prose, and no
-  ANSI escape sequence even when the terminal has asked for colour.
+  ANSI escape sequence even when the terminal has asked for color.
 - **Everything human goes to stderr.** `manicule --json search x | jq` on a failed run reads
   an empty stream rather than an error message `jq` cannot parse.
 - **`--json` goes on either side of the command name.** `manicule --json doctor` and
@@ -144,35 +144,35 @@ installation reports success at being broken.
 - **Exit status is 0 on success, 1 on a failed operation, 2 on a usage error** that Typer
   rejected before the service was reached.
 
-### Colour, and the three variables that decide it
+### Color, and the three variables that decide it
 
-Colour applies to the **human** output only. Under `--json` the envelope is written straight to
-stdout rather than through Rich, so no colour variable can put a byte in it — that is a
+Color applies to the **human** output only. Under `--json` the envelope is written straight to
+stdout rather than through Rich, so no color variable can put a byte in it — that is a
 property of how it is written, not a setting, and it holds in every environment below.
 
-manicule imposes no colour policy of its own: `manicule.cli.render.console` passes no colour
-arguments, so both conventions are honoured by Rich and the behaviour is Rich's. What that
+manicule imposes no color policy of its own: `manicule.cli.render.console` passes no color
+arguments, so both conventions are honored by Rich and the behavior is Rich's. What that
 delegation means, as of Rich 14:
 
 | Environment | Human output |
 |---|---|
-| `FORCE_COLOR` set | coloured |
-| `FORCE_COLOR` and `NO_COLOR` set | **not** coloured |
-| `FORCE_COLOR` set, `TERM=dumb` | **not** coloured |
-| `NO_COLOR` alone | not coloured |
-| nothing set | coloured only when stdout is a terminal |
+| `FORCE_COLOR` set | colored |
+| `FORCE_COLOR` and `NO_COLOR` set | **not** colored |
+| `FORCE_COLOR` set, `TERM=dumb` | **not** colored |
+| `NO_COLOR` alone | not colored |
+| nothing set | colored only when stdout is a terminal |
 
 **`NO_COLOR` wins over `FORCE_COLOR`, but not by overriding it** — and the distinction is worth
 stating because it is what makes the pair predictable. They are separate mechanisms:
-`FORCE_COLOR` declares that the stream *is a terminal*, and `NO_COLOR` strips the colour back
+`FORCE_COLOR` declares that the stream *is a terminal*, and `NO_COLOR` strips the color back
 out of what gets written to it. With both set the stream is treated as a terminal and the
-output has no colour in it. Escape sequences that are not colour — bold, dim — still appear,
-which is what [no-color.org](https://no-color.org/) asks for: it governs colour, not styling.
+output has no color in it. Escape sequences that are not color — bold, dim — still appear,
+which is what [no-color.org](https://no-color.org/) asks for: it governs color, not styling.
 
-**`TERM=dumb` is not a colour switch and is the one that surprises.** It declares what the
+**`TERM=dumb` is not a color switch and is the one that surprises.** It declares what the
 terminal can *render*, and Rich believes a capability over a request: `TERM=dumb` with
 `FORCE_COLOR` set produces no escape sequences at all. Any environment whose terminal cannot
-render ANSI reports it, so the same command is coloured in one shell and plain in another with
+render ANSI reports it, so the same command is colored in one shell and plain in another with
 nothing about manicule having changed.
 
 `TTY_COMPATIBLE` is the same shape and is checked **before** `FORCE_COLOR`: `TTY_COMPATIBLE=0`
@@ -181,7 +181,7 @@ means "not a terminal" whatever else is set.
 The table is pinned by `tests/app/test_cli.py`, which asserts each row against captured stdout
 rather than trusting this document — so a Rich upgrade that changed what an operator's
 `NO_COLOR` does would fail the suite rather than the operator. The suite sets these variables
-explicitly for the same reason: colour is decided entirely by the environment, so a test that
+explicitly for the same reason: color is decided entirely by the environment, so a test that
 inherited the caller's shell would report on that shell rather than on manicule.
 
 ### Options `manicule` and its commands share
@@ -424,7 +424,7 @@ the last is a check that could not run, which is deliberately not `ok`.
 `state` is the **worst** state among the checks. `checked_at` is ISO 8601 in UTC: a health
 record with no time on it cannot be told from a stale one somebody pasted. `schema_version` is
 the shape of this payload and moves only when the shape does, which is what a consumer pinning
-behaviour actually wants — `manicule_version` and the envelope's `version` both move with every
+behavior actually wants — `manicule_version` and the envelope's `version` both move with every
 release whether or not anything changed.
 
 Checks: `configuration`, `transport`, `plugins`, `storage`, `permissions`, `index`, `grammars`,

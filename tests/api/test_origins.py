@@ -69,7 +69,7 @@ def test_the_browsers_own_signal_admits_a_first_party_request(site: str) -> None
 
 
 def test_a_sibling_subdomain_is_not_the_same_site() -> None:
-    """``same-site`` is deliberately not admitted: on a shared domain it is the neighbour this
+    """``same-site`` is deliberately not admitted: on a shared domain it is the neighbor this
     check exists for, and a different origin either way."""
     assert not permitted(
         "POST",
@@ -175,7 +175,7 @@ def test_the_browser_surfaces_own_calls_are_admitted() -> None:
     a browser surface at all.
     """
     backend, document = backend_with_a_document()
-    backend.organisation_.trash[document.id] = document
+    backend.organization_.trash[document.id] = document
     with client_for(backend) as client:
         response = client.post(
             f"/api/v1/documents/{document.id}/restore",
@@ -188,7 +188,7 @@ def test_the_browser_surfaces_own_calls_are_admitted() -> None:
 def test_a_program_with_no_browser_headers_is_unaffected() -> None:
     """Every existing client keeps working. This is the compatibility control."""
     backend, document = backend_with_a_document()
-    backend.organisation_.trash[document.id] = document
+    backend.organization_.trash[document.id] = document
     with client_for(backend) as client:
         response = client.post(f"/api/v1/documents/{document.id}/restore")
     assert response.status_code == 200

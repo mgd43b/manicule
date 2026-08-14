@@ -11,7 +11,7 @@ Two consequences shape everything below.
 
 **The heading is the location, so it has to be a real heading.** Levels come from the
 paragraph style — ``Heading 1``-``Heading 9``, matched on the style id, which Word keeps
-language-independent while it localises the display name — never from a font size or a line
+language-independent while it localizes the display name — never from a font size or a line
 that looks like a title. A document whose author styled headings by hand has no heading
 structure to recover, and inventing one would put a heading nobody wrote into the breadcrumb,
 which reaches the embedder.

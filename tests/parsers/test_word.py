@@ -134,7 +134,7 @@ async def test_a_section_resolves_up_to_the_next_heading_and_not_into_its_subsec
 
     assert resolved is not None
     assert "Cut a release branch" in resolved
-    assert "Demote the previous artefact" not in resolved, (
+    assert "Demote the previous artifact" not in resolved, (
         "the Deployment section resolved into its Rollback subsection"
     )
 
@@ -168,7 +168,7 @@ async def test_two_sections_with_one_heading_path_and_no_fragment_are_unlocated(
 ) -> None:
     """An address that names two places names neither, and the reason has to be actionable.
 
-    Two headings of ``🌏`` slugify to nothing, so no fragment can be synthesised and the path
+    Two headings of ``🌏`` slugify to nothing, so no fragment can be synthesized and the path
     is the only address — and it repeats. The blocks are ``Unlocated`` with a reason naming the
     path, the number of places it hits, and what to change. The two ``Configuration`` sections
     in the same fixture are the contrast: identical paths, but sluggable text, so they are

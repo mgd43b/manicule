@@ -99,7 +99,7 @@ async def test_two_stages_sharing_a_name_are_refused() -> None:
 async def test_a_stage_that_reads_the_frame_to_decide_what_to_do_is_visible() -> None:
     """The defect the rule below is aimed at, shown to be detectable before it is ruled out.
 
-    Nothing in the pipeline's behaviour may depend on whether anyone is recording. A stage that
+    Nothing in the pipeline's behavior may depend on whether anyone is recording. A stage that
     returns different candidates when observed is not a stage anybody can measure, and a check
     that has never seen one fail is not evidence that none can.
     """

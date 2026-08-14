@@ -75,7 +75,7 @@ class Filter(BaseModel):
         has no default and is always in this set.
 
         This is what lets a store enumerate what it was asked for and refuse the fields it
-        cannot honour. A store that silently drops one returns results the filter was written
+        cannot honor. A store that silently drops one returns results the filter was written
         to exclude, and the result still looks like a working search.
         """
         return frozenset(

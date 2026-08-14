@@ -179,7 +179,7 @@ def test_there_is_no_permissions_field() -> None:
 
 
 def test_two_plugins_cannot_claim_the_same_component() -> None:
-    """Silent shadowing would make behaviour depend on installation order."""
+    """Silent shadowing would make behavior depend on installation order."""
     registry = ComponentRegistry()
     registry.bind("first").add(keys.PARSER.named("pdf"), lambda _: _never(), media_types={"a/b"})
     with pytest.raises(DuplicateComponentError, match="first"):

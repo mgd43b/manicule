@@ -383,12 +383,12 @@ async def test_the_runtime_satisfies_every_port_the_service_asks_for(runtime: Ru
         Conversing,
         DocumentSurface,
         Keys,
-        Organising,
+        Organizing,
         Telemetry,
     )
 
     assert isinstance(await runtime.documents(), DocumentSurface)
-    assert isinstance(await runtime.organisation(), Organising)
+    assert isinstance(await runtime.organization(), Organizing)
     assert isinstance(await runtime.conversations(), Conversing)
     assert isinstance(await runtime.telemetry(), Telemetry)
     assert isinstance(await runtime.keys(), Keys)
@@ -534,8 +534,8 @@ async def test_an_expired_key_stops_verifying(runtime: Runtime) -> None:
 
 
 async def test_collections_and_tags_reach_the_real_store(runtime: Runtime) -> None:
-    """The organisation handle is the document store, and the surface needs both halves."""
-    store = await runtime.organisation()
+    """The organization handle is the document store, and the surface needs both halves."""
+    store = await runtime.organization()
     collection = await store.create_collection("Runbooks", description="Operational")
     assert [item.id for item in await store.list_collections()] == [collection.id]
 

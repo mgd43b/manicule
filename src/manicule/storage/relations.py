@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import delete, or_, select
 
 from manicule.core.errors import UnknownEntityError
-from manicule.core.organisation import ChunkEdge, ChunkRelationType
+from manicule.core.organization import ChunkEdge, ChunkRelationType
 from manicule.storage import models
 from manicule.storage.scoped import WorkspaceScoped
 
@@ -77,8 +77,8 @@ class RelationsMixin(WorkspaceScoped):
     ) -> None:
         """Remove an edge in the direction it was written. Idempotent.
 
-        Direction matters and is not symmetrised here. For
-        :attr:`~manicule.core.organisation.ChunkRelationType.PARENT` the two directions mean
+        Direction matters and is not symmetrized here. For
+        :attr:`~manicule.core.organization.ChunkRelationType.PARENT` the two directions mean
         opposite things, and a delete that quietly removed both would take out the edge the
         caller meant to keep.
         """
@@ -111,7 +111,7 @@ class RelationsMixin(WorkspaceScoped):
         chunk, or one belonging to a soft-deleted document. The first cannot be written through
         :meth:`relate` and would have to have arrived by hand; the second happens in the
         ordinary course of events, and surfacing it would let a deleted document reach a
-        reader through a neighbour that is still live.
+        reader through a neighbor that is still live.
         """
         async with self._sessions() as session:
             if chunk_id not in await self._visible_chunk_ids(session, (chunk_id,)):

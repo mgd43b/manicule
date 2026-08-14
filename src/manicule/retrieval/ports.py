@@ -89,11 +89,11 @@ class GlossarySource(Protocol):
         """Every entry in scope whose acronym or alias is one of ``keys``.
 
         Args:
-            keys: Normalised lookup keys, as :func:`~manicule.core.glossary.normalise_acronym`
-                produces them. A store must not normalise again: two normalisations that
+            keys: Normalized lookup keys, as :func:`~manicule.core.glossary.normalize_acronym`
+                produces them. A store must not normalize again: two normalizations that
                 disagree produce a lookup that silently misses, which reads exactly like a
                 corpus with no glossary in it.
-            filter: The query's whole restriction. A store that cannot honour a field of it
+            filter: The query's whole restriction. A store that cannot honor a field of it
                 must refuse rather than drop it — an entry admitted by an ignored
                 ``collection_ids`` is one collection's glossary leaking into another's search.
         """

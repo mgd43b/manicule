@@ -1,7 +1,7 @@
 """re-key documents on the identity their source declares
 
 A local file's identity used to be its resolved path, always. It is now the ``source_id`` a
-sidecar manifest declares, where one does, so that a mirror reorganised from by-space to by-tree
+sidecar manifest declares, where one does, so that a mirror reorganized from by-space to by-tree
 updates its pages instead of replacing every one of them. This revision moves the documents that
 were already ingested, so that the next sync updates them rather than indexing a second copy
 beside the first.

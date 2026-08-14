@@ -49,7 +49,7 @@ if TYPE_CHECKING:
         Ingesting,
         Keys,
         Maintenance,
-        Organising,
+        Organizing,
         Retrieving,
         Telemetry,
     )
@@ -71,7 +71,7 @@ ARCHIVE_VERSION = 1
 KEY_PREFIX = "mnk_"
 """What every API key starts with.
 
-A recognisable prefix so a leaked key is greppable — by its owner, and by a secret scanner
+A recognizable prefix so a leaked key is greppable — by its owner, and by a secret scanner
 that has been taught the pattern. The prefix plus six characters is what is stored in the
 clear, which is enough to tell two keys apart and not enough to be one.
 """
@@ -293,14 +293,14 @@ class Runtime:
         """Backup, restore, export and reset, over this runtime's engine."""
         return await self._once("maintenance", self._build_maintenance)
 
-    async def organisation(self) -> Organising:
+    async def organization(self) -> Organizing:
         """Collections, tags and the trash.
 
         The **same object** the document store is. Two handles over one workspace would be two
         opinions about which documents are live, and the collection reads join against exactly
         the predicate the document reads use.
         """
-        return await self._once("organisation", self._build_organisation)
+        return await self._once("organization", self._build_organization)
 
     async def conversations(self) -> Conversing:
         """Conversations, turns and share links, over this runtime's engine.
@@ -372,10 +372,10 @@ class Runtime:
             )
             raise AssemblyError(msg)
         self._engine = engine
-        await self._initialise_storage(store, engine)
+        await self._initialize_storage(store, engine)
         return store
 
-    async def _initialise_storage(self, store: object, engine: AsyncEngine) -> None:
+    async def _initialize_storage(self, store: object, engine: AsyncEngine) -> None:
         """Migrate the schema and make sure this workspace has a row. Both are writes.
 
         **This is the boundary a reader can cross**, and naming it is most of what makes the
@@ -387,8 +387,8 @@ class Runtime:
         So a reader does it **under the writer's lock**, and only when there is something to
         do. On an established directory both steps are no-ops, the check costs two statements,
         and no lock is taken at all — which is what keeps `doctor` and `search` runnable while
-        a sweep holds the directory. On a directory that needs initialising, a reader takes the
-        lock for exactly the length of the initialisation and gives it back; if a writer holds
+        a sweep holds the directory. On a directory that needs initializing, a reader takes the
+        lock for exactly the length of the initialization and gives it back; if a writer holds
         it, the reader is refused with the same message a second writer gets, which is the
         honest answer because it genuinely cannot proceed.
 
@@ -408,7 +408,7 @@ class Runtime:
                 await ensure()
             return
         if not self._migrated:
-            if await self._storage_needs_initialising(engine):
+            if await self._storage_needs_initializing(engine):
                 with InstanceLock(self._settings.data_dir):
                     await upgrade(engine)
             self._migrated = True
@@ -417,10 +417,10 @@ class Runtime:
             # nobody else is inserting, which no concurrent writer can be harmed by.
             await ensure()
 
-    async def _storage_needs_initialising(self, engine: AsyncEngine) -> bool:
+    async def _storage_needs_initializing(self, engine: AsyncEngine) -> bool:
         """Whether the schema is behind head. A read, and the only thing that decides the lock.
 
-        Deliberately narrower than "would the initialisation write anything". Creating a
+        Deliberately narrower than "would the initialization write anything". Creating a
         workspace row is a write too, but it is one statement guarded by its own transaction
         and it cannot corrupt anything a concurrent writer is doing; a migration rebuilds
         tables. Taking an exclusive lock to insert a row nobody else is inserting would refuse
@@ -490,8 +490,8 @@ class Runtime:
         await self.documents()
         return _Maintenance(self)
 
-    async def _build_organisation(self) -> Organising:
-        from manicule.app.ports import Organising as Surface  # noqa: PLC0415
+    async def _build_organization(self) -> Organizing:
+        from manicule.app.ports import Organizing as Surface  # noqa: PLC0415
 
         store = await self.documents()
         # Checked rather than cast, like the document surface itself. A store that does not
@@ -974,7 +974,7 @@ class _Keys:
         revoked one.
 
         ``last_used_at`` is deliberately **not** updated. It would turn every authenticated
-        read into a write, serialising the whole API behind SQLite's single writer, and
+        read into a write, serializing the whole API behind SQLite's single writer, and
         "when was this key last used" is a question the audit trail answers without that cost.
         """
         from sqlalchemy import or_, select  # noqa: PLC0415
@@ -1115,7 +1115,7 @@ class _Telemetry:
                 "profile": row.profile or "",
                 # The count, not the ids. A page of telemetry is read by a person looking for
                 # slow or low-confidence queries, and a list of chunk ids is corpus structure
-                # that has no business travelling with it.
+                # that has no business traveling with it.
                 "chunks": _length(row.retrieved_chunk_ids),
                 "confidence": row.confidence_score,
                 "elapsed_ms": row.response_time_ms,
@@ -1377,7 +1377,7 @@ def _write_private(path: Path, data: bytes) -> None:
     not the directory's. The same reasoning put the backup snapshot at ``0600``.
 
     The mode is passed to :func:`os.open` *and* applied to the descriptor, because the first
-    is honoured only when the call creates the file — the trap this whole family of bugs is
+    is honored only when the call creates the file — the trap this whole family of bugs is
     made of — and a re-export over yesterday's archive would otherwise keep yesterday's mode.
     Doing it through the descriptor means there is no window in which the path exists at a
     wider mode, which matters when ``--allow-insecure-target`` made the directory reachable.
@@ -1410,7 +1410,7 @@ def _read_archive(manifest_path: Path) -> ArchiveManifest:
     """Read an export manifest, refusing one this build cannot read.
 
     A newer archive is refused by version rather than parsed optimistically. Importing a
-    layout this build does not understand would silently drop whatever it did not recognise,
+    layout this build does not understand would silently drop whatever it did not recognize,
     and a partial corpus that reports a clean import is the failure worth preventing.
 
     Raises:

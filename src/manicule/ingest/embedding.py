@@ -14,7 +14,7 @@ with no error. :func:`~manicule.core.embedding.require_within_context` is what s
 that and the index, and :func:`manicule.testing.assert_refuses_oversized_chunks` is what holds
 this module to calling it.
 
-**Embedding is serialised, and that is what an in-process embedder means.** With a model
+**Embedding is serialized, and that is what an in-process embedder means.** With a model
 server, concurrency is a connection-pool question and more requests mean more throughput. With
 one model, one unified-memory pool and one accelerator, two concurrent batches produce
 contention rather than throughput. So this is a single consumer, and the parallelism upstream
@@ -296,7 +296,7 @@ async def embed_or_reuse(
             never reach the model at once (``docs/ingest.md`` §6.6); it is not a lock on the
             vector store. Taken around this whole function it would hold the single
             process-wide embedding lock across a vector-store read for every document — so a
-            sweep and a sync running beside each other would serialise on a read they could
+            sweep and a sync running beside each other would serialize on a read they could
             have done concurrently, which is contention rather than the thing the lock is for.
 
     Returns:

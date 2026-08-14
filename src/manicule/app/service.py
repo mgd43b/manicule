@@ -1,6 +1,6 @@
 """The application service: every operation manicule offers, once.
 
-Both surfaces are adapters over this class and neither contains any behaviour of its own.
+Both surfaces are adapters over this class and neither contains any behavior of its own.
 That is not tidiness — it is the only way the two can be checked against each other. A rule
 that lives in the CLI is a rule the MCP tool does not have, and the tool is the one an
 assistant reaches for unattended.
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     from manicule.connectors.enriched import EnrichedProfile
     from manicule.connectors.filesystem import FilesystemConnector
     from manicule.core.content import Chunk, Document
-    from manicule.core.organisation import Collection, Tag
+    from manicule.core.organization import Collection, Tag
     from manicule.core.retrieval import Confidence
     from manicule.embedding.artifacts import WeightsPlan
     from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
@@ -136,7 +136,7 @@ class AskAside:
 
     Carried for the same reason the band is: the envelope has the score and nothing that makes
     a small score legible. ``search`` has said this since retrieval learned to admit ignorance,
-    and ``ask`` showed the number alone — so the same underlying judgement was explained in one
+    and ``ask`` showed the number alone — so the same underlying judgment was explained in one
     command and bare in the other."""
 
     message_id: str | None = None
@@ -208,7 +208,7 @@ def _sidecar_ordering_would_have_helped(moving: Sequence[Document]) -> bool:
 
     Keyed off :attr:`~manicule.connectors.enriched.AdapterOutcome.IDENTITY_NOT_APPLIED` so that
     this and :func:`_identity_deliberately_unapplied` read the same field for the same reason. They
-    are two halves of one judgement about that outcome, and having one test it while the other
+    are two halves of one judgment about that outcome, and having one test it while the other
     tested the record's mere existence is how they came to disagree.
     """
     return any(
@@ -278,7 +278,7 @@ nobody took."""
 _IDENTITY_SAMPLE = 25
 """How many of the affected documents are listed individually.
 
-The count is the finding; the list is what makes it checkable. Twenty-five is enough to recognise
+The count is the finding; the list is what makes it checkable. Twenty-five is enough to recognize
 a pattern — one directory, one exporter, one space — without turning a diagnostic into an export."""
 
 
@@ -983,7 +983,7 @@ class ApplicationService:
 
         Every check here answers "would naming this source produce a conversion that agrees with
         the sync?", and each one fails loudly rather than degrading to the default profile —
-        which is the behaviour being removed. A silent fallback would put the operator back where
+        which is the behavior being removed. A silent fallback would put the operator back where
         they started: a command that runs, reports ``no_profile`` for every page, and leaves them
         to work out that the flag they passed did nothing.
 
@@ -1024,7 +1024,7 @@ class ApplicationService:
         if not isinstance(connector, FilesystemConnector):
             # Reachable only where a plugin has registered something else under the filesystem
             # name. Refused rather than duck-typed: the two attributes read below decide where
-            # this writes and what it recognises, and guessing that an unknown class means the
+            # this writes and what it recognizes, and guessing that an unknown class means the
             # same thing by them is how a conversion ends up rooted somewhere nobody named.
             # "builds an instance of X" rather than "builds a X": the type name is interpolated,
             # so no fixed article is right for all of them — the class this actually fires on
@@ -1642,7 +1642,7 @@ class ApplicationService:
 
         A local file's identity used to be its resolved path, always. It is now the ``source_id``
         a :mod:`~manicule.connectors.sidecar` manifest declares, where one does — so that a mirror
-        reorganised from by-space to by-tree updates its pages instead of replacing every one of
+        reorganized from by-space to by-tree updates its pages instead of replacing every one of
         them with a new document. Documents ingested before that keep the old identity until the
         next sync, and the next sync moves them. This is the dry run that says so first.
 
@@ -1679,7 +1679,7 @@ class ApplicationService:
                 detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
                 facts={"error_type": type(exc).__name__},
             )
-        # What identities are actually in use, so that a page-keyed document is recognised as the
+        # What identities are actually in use, so that a page-keyed document is recognized as the
         # twin of the path-keyed one beside it rather than as an unrelated row.
         claimed = {document.source_id for document in documents}
         moving = [
@@ -2031,7 +2031,7 @@ class ApplicationService:
         ``.py`` file marked unsupported. This is that something.
 
         **Degraded rather than failing when grammars are absent**, and the distinction is a
-        judgement about what a bad answer means. Nothing here is broken: an installation whose
+        judgment about what a bad answer means. Nothing here is broken: an installation whose
         corpus is Markdown and PDFs works perfectly with no grammars at all, and reporting a
         red check on it would teach an operator to ignore ``doctor``. What is true is that
         source files will be refused, which is a capability this installation does not
@@ -2342,7 +2342,7 @@ class ApplicationService:
         return await asyncio.to_thread(self._inspect_models, provider=provider)
 
     def _weights_plan(self, provider: str | None) -> WeightsPlan | None:
-        """The artefact the configured backend will load, or ``None`` with no embedding extra."""
+        """The artifact the configured backend will load, or ``None`` with no embedding extra."""
         from manicule.embedding.artifacts import planned_weights  # noqa: PLC0415 - an extra
 
         settings = self.settings
@@ -2760,7 +2760,7 @@ class ApplicationService:
         documents, chunks, vectors = await maintenance.reset_index()
         return r.ResetReport(documents=documents, chunks=chunks, vectors_removed=vectors)
 
-    async def initialise(self, *, force: bool = False) -> r.InitReport:
+    async def initialize(self, *, force: bool = False) -> r.InitReport:
         """Write a starting configuration, choosing what this machine can actually run.
 
         The hardware probe picks the embedding backend rather than recommending one, because
@@ -3098,15 +3098,15 @@ class ApplicationService:
         """Create a collection. A duplicate name is refused rather than merged.
 
         Raises:
-            ValueError: The name is empty once normalised.
+            ValueError: The name is empty once normalized.
             NameInUseError: A collection of that name already exists here.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         return _collection(await store.create_collection(name, description=description))
 
     async def collection_list(self) -> r.CollectionList:
         """Every collection in this workspace."""
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         found = await store.list_collections()
         return r.CollectionList(
             count=len(found), collections=tuple(_collection(item) for item in found)
@@ -3118,7 +3118,7 @@ class ApplicationService:
         Raises:
             UnknownEntityError: No such collection in this workspace.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         await store.delete_collection(collection_id)
         return r.CollectionDeleted(collection_id=collection_id, deleted=True)
 
@@ -3130,7 +3130,7 @@ class ApplicationService:
         Raises:
             UnknownEntityError: No such collection, or a document this workspace cannot see.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         changed = await store.add_to_collection(collection_id, list(document_ids))
         return r.CollectionMembership(
             collection_id=collection_id, changed=changed, document_ids=tuple(document_ids)
@@ -3144,7 +3144,7 @@ class ApplicationService:
         Raises:
             UnknownEntityError: No such collection in this workspace.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         changed = await store.remove_from_collection(collection_id, list(document_ids))
         return r.CollectionMembership(
             collection_id=collection_id, changed=changed, document_ids=tuple(document_ids)
@@ -3159,11 +3159,11 @@ class ApplicationService:
         re-index path from here for a later change to accidentally wire one up.
 
         Raises:
-            ValueError: The name is empty once normalised.
+            ValueError: The name is empty once normalized.
             UnknownEntityError: No such collection in this workspace.
             NameInUseError: Another collection here already has that name.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         return _collection(await store.rename_collection(collection_id, name))
 
     async def collection_update(
@@ -3185,21 +3185,21 @@ class ApplicationService:
         Raises:
             UnknownEntityError: No such collection in this workspace.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         return _collection(await store.describe_collection(collection_id, description or None))
 
     async def collection_counts(self, collection_id: str) -> r.CollectionCounts:
         """How many documents and chunks a collection holds, counted now.
 
         Both numbers are computed rather than stored. A rule-driven collection has no
-        materialised membership to count, and a remembered total would keep reporting the day
+        materialized membership to count, and a remembered total would keep reporting the day
         it was written.
 
         Raises:
             UnknownEntityError: No such collection in this workspace.
             CrossWorkspaceError: A document came back whose id was not minted here.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         collection = await store.get_collection(collection_id)
         if collection is None:
             msg = f"no collection {collection_id!r} in workspace {self.workspace!r}"
@@ -3256,7 +3256,7 @@ class ApplicationService:
         Raises:
             CrossWorkspaceError: A document came back whose id was not minted here.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         documents = await self._backend.documents()
         scope = Filter(workspace_ids=frozenset({self.workspace}))
 
@@ -3293,7 +3293,7 @@ class ApplicationService:
             UnknownEntityError: No such collection in this workspace.
             CrossWorkspaceError: A document came back whose id was not minted here.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         if await store.get_collection(collection_id) is None:
             msg = f"no collection {collection_id!r} in workspace {self.workspace!r}"
             raise UnknownEntityError(msg)
@@ -3314,14 +3314,14 @@ class ApplicationService:
         """Create a tag, or return the existing one of that name. Idempotent by design.
 
         Raises:
-            ValueError: The name is empty once normalised.
+            ValueError: The name is empty once normalized.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         return _tag(await store.ensure_tag(name, color=color))
 
     async def tag_list(self) -> r.TagList:
         """Every tag in this workspace."""
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         found = await store.list_tags()
         return r.TagList(count=len(found), tags=tuple(_tag(item) for item in found))
 
@@ -3331,7 +3331,7 @@ class ApplicationService:
         Raises:
             UnknownEntityError: No such tag in this workspace.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         await store.delete_tag(tag_id)
         return r.TagDeleted(tag_id=tag_id, deleted=True)
 
@@ -3342,7 +3342,7 @@ class ApplicationService:
             UnknownEntityError: No such document or tag in this workspace.
         """
         await self._require_document(document_id)
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         changed = await store.tag_document(document_id, list(tag_ids))
         return r.DocumentTags(
             document_id=document_id,
@@ -3357,7 +3357,7 @@ class ApplicationService:
             UnknownEntityError: No such document in this workspace.
         """
         await self._require_document(document_id)
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         changed = await store.untag_document(document_id, list(tag_ids))
         return r.DocumentTags(
             document_id=document_id,
@@ -3373,7 +3373,7 @@ class ApplicationService:
         Raises:
             CrossWorkspaceError: A document came back whose id was not minted here.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         entries = await store.list_trash(
             grace_s=self.settings.ingest.soft_delete_grace_s, limit=limit, offset=offset
         )
@@ -3403,7 +3403,7 @@ class ApplicationService:
             UnknownEntityError: Nothing was restored. The reason is in the message: no such
                 document, or one that is not in the trash.
         """
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         restoration = await store.restore_document(document_id)
         if not restoration.restored:
             raise UnknownEntityError(restoration.reason)
@@ -3528,7 +3528,7 @@ class ApplicationService:
                 available=False,
                 path=str(path),
                 caveat=(
-                    f"no preference judgements have been recorded at {path}. Retrieval quality "
+                    f"no preference judgments have been recorded at {path}. Retrieval quality "
                     f"is measured by running the pairwise harness against a query set; there "
                     f"is no number to report until somebody has judged some pairs."
                 ),
@@ -3541,7 +3541,7 @@ class ApplicationService:
                 path=str(path),
                 records=len(records),
                 caveat=(
-                    f"{len(records)} judgement(s) were recorded and no report can be built "
+                    f"{len(records)} judgment(s) were recorded and no report can be built "
                     f"from them: {exc}"
                 ),
             )
@@ -3773,12 +3773,12 @@ class ApplicationService:
 
         Names rather than ids, because a name is what a person types and what an assistant
         has to hand; ids are uuids nobody quotes. Lookup goes through ``find_collection``, so
-        the normalisation that applied when the collection was created applies here too and a
+        the normalization that applied when the collection was created applies here too and a
         label typed with a trailing space finds the collection it names.
 
         **An unknown name is refused, never dropped.** Dropping it would leave the filter
         with no collection restriction at all, and an empty field restricts nothing — so a
-        search scoped to a misspelt collection would quietly return the whole workspace,
+        search scoped to a misspelled collection would quietly return the whole workspace,
         ranked and plausible. That is the same inversion ``resolve_filter`` returns ``None``
         to prevent, arriving one layer earlier.
 
@@ -3787,7 +3787,7 @@ class ApplicationService:
         """
         if not names:
             return frozenset()
-        store = await self._backend.organisation()
+        store = await self._backend.organization()
         resolved: set[str] = set()
         for name in names:
             found = await store.find_collection(name)
@@ -3809,7 +3809,7 @@ class ApplicationService:
         answer path builds its source references from this hydration rather than reading the
         same rows again after the model has run. Re-reading them later would also have to happen
         in the ``finally`` that assembles the payload, which runs on cancellation, and a database
-        read on a cancelled path is a second failure mode on top of the first.
+        read on a canceled path is a second failure mode on top of the first.
         """
         return await self._require_scoped_chunks(
             candidate.chunk for candidate in retrieved.context.passages
@@ -3844,7 +3844,7 @@ class ApplicationService:
     async def _scoped_documents(self, document_ids: Iterable[str]) -> dict[str, Document]:
         """The documents of ``document_ids`` this workspace can see, keyed by id.
 
-        One query rather than one per document. ``document_ids`` is a field the store honours,
+        One query rather than one per document. ``document_ids`` is a field the store honors,
         so this is the scoped, trash-excluding lookup — and a ranked page routinely spans
         several documents, which made the per-document form N round trips on the hot path of
         every search and every answer.

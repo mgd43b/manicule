@@ -6,7 +6,7 @@ inspectable as twenty lines of code here, and are never stored in the repository
 
 Two of these are built by editing the archive after :mod:`zipfile` has written it, because
 they are archives that lie about themselves and no writer produces one on request: a member
-whose header declares a size its stream does not honour, and a member flagged as encrypted.
+whose header declares a size its stream does not honor, and a member flagged as encrypted.
 The editing is done against the record offsets the format defines rather than by scanning for
 byte patterns, so it cannot land in the middle of compressed data and quietly corrupt
 something else.
@@ -131,11 +131,11 @@ def _traversal() -> bytes:
 
 
 def _colliding() -> bytes:
-    """Three members that normalise to two names, plus two that normalise to none.
+    """Three members that normalize to two names, plus two that normalize to none.
 
     A zip may hold two entries with the same name — appending to an archive produces exactly
-    that — and ``a/b.txt`` and ``./a/b.txt`` normalise to one name as well. Storage reconciles
-    members by ``source_id``, which is derived from the normalised name, so a collision is not
+    that — and ``a/b.txt`` and ``./a/b.txt`` normalize to one name as well. Storage reconciles
+    members by ``source_id``, which is derived from the normalized name, so a collision is not
     an error anybody sees: the later member overwrites the earlier one and the archive quietly
     contributes fewer documents than it contains.
 
@@ -144,7 +144,7 @@ def _colliding() -> bytes:
     """
     entries = [
         ("reports/q1.txt", "The first quarter, written once.\n"),
-        ("./reports/q1.txt", "The first quarter again, under a name that normalises the same.\n"),
+        ("./reports/q1.txt", "The first quarter again, under a name that normalizes the same.\n"),
         ("reports/q1.txt", "The first quarter a third time, under a literally identical name.\n"),
         ("../escape-one.txt", "One member whose name climbs out of the root.\n"),
         ("../escape-two.txt", "Another, so a shared placeholder would collide.\n"),

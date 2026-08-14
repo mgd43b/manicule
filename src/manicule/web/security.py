@@ -1,6 +1,6 @@
 """Who may read a page, and what a refusal looks like when the reader is a browser.
 
-**The authorisation decision is not made here.** :func:`manicule.api.security.require` is the
+**The authorization decision is not made here.** :func:`manicule.api.security.require` is the
 one implementation of "does this principal clear this floor", and this module calls it. A
 second implementation for the browser surface is exactly the shape of bug this project has
 already found once: a rule that held on one surface and not on the one somebody was actually

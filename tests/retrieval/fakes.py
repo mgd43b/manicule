@@ -34,7 +34,7 @@ def profiles(**overrides: object) -> Profiles:
 
 
 class ListVectorStore:
-    """A vector store that returns a fixed list, best first, honouring only ``k``.
+    """A vector store that returns a fixed list, best first, honoring only ``k``.
 
     Stands in for LanceDB where the point of the test is what the *stage* does with rows that
     an index has already ranked — the dense leg's whole difficulty is that those rows say

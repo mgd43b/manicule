@@ -28,10 +28,10 @@ class EmbedderConfig(BaseModel):
 
     weights: str = Field(
         default="",
-        description="The artefact this backend should execute, when it is not the model's own "
+        description="The artifact this backend should execute, when it is not the model's own "
         "repository — a repository id or a local path. Empty means the built-in resolution: "
-        "the model's own files where the backend can read them, and the recorded unquantised "
-        "conversion where it cannot. A quantised artefact is refused whichever way it arrives.",
+        "the model's own files where the backend can read them, and the recorded unquantized "
+        "conversion where it cannot. A quantized artifact is refused whichever way it arrives.",
     )
     pooling: Pooling | None = Field(
         default=None,

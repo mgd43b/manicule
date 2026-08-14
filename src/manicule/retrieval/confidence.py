@@ -14,16 +14,16 @@ model misread it — and that is not a bug in this number.
 **Not comparable across configurations.** A score computed under one reranker and one computed
 under none are different measurements, which is why the pipeline identity travels with it.
 
-Only quantities with a defined scale are admissible. The fused RRF score is a rank artefact
+Only quantities with a defined scale are admissible. The fused RRF score is a rank artifact
 bounded by ``2/61`` and means nothing absolute; BM25 is corpus-relative and unbounded; and
 substring keyword coverage does no stemming and no IDF weighting, so a query for
 ``authenticate`` scores zero against a passage containing ``authentication`` — the precise
 failure the lexical index's stemming tokenizer exists to avoid. Cross-leg agreement replaces
 it, which is the same idea asked of the leg that already solved it.
 
-**Cosine is rescaled against the corpus's noise level, because raw cosine is not centred on
-zero.** A query with no relationship to anything indexed still returns its nearest neighbours,
-and those neighbours are not far away in absolute terms: measured over a 604-chunk corpus,
+**Cosine is rescaled against the corpus's noise level, because raw cosine is not centered on
+zero.** A query with no relationship to anything indexed still returns its nearest neighbors,
+and those neighbors are not far away in absolute terms: measured over a 604-chunk corpus,
 unrelated questions averaged at most 0.457 across their context passages while real ones
 averaged at least 0.531 (``docs/retrieval.md`` §8.4). Read raw, the two populations sit a
 fifteenth of a point apart and land in the same band, which is exactly what was reported.
@@ -41,10 +41,10 @@ of the reason the worse result outranked it. Telling corroboration from diffusio
 knowing whether the documents *agree*, which is an entailment check and not a count.
 
 **No fallback term.** When a component did not run, its weight is not redistributed and the
-remaining weights are not renormalised: the reachable ceiling drops instead. Substituting the
+remaining weights are not renormalized: the reachable ceiling drops instead. Substituting the
 retrieval average into the reranker's slot — the obvious-looking fix — makes retrieval count
 for 0.70 instead of 0.40, so *turning the reranker off raises the reported confidence* for
-identical retrieval, and the weaker pipeline claims more. Renormalising has the same effect by
+identical retrieval, and the weaker pipeline claims more. Renormalizing has the same effect by
 a more respectable route.
 """
 
@@ -71,12 +71,12 @@ WEIGHTS: Final[Mapping[str, float]] = {
     AGREEMENT: 0.15,
     RERANK: 0.30,
 }
-"""What each admissible component is worth. They sum to 1.0 and are never renormalised.
+"""What each admissible component is worth. They sum to 1.0 and are never renormalized.
 
 Similarity carries the weight support breadth used to hold, rather than that weight being
 dropped or spread. Breadth was removed at design time because it measured the wrong direction
 (see the module docstring); its 0.15 goes to the one component that survived contact with a
-measurement. Retiring a component and *renormalising after a component is suppressed at run
+measurement. Retiring a component and *renormalizing after a component is suppressed at run
 time* are different acts — the second is forbidden below and remains so.
 
 Keeping the total at 1.0 preserves the property the profiles were built around: a pipeline
@@ -108,13 +108,13 @@ against one edge could be crossed by a backend change. Platform may change throu
 never change output.
 
 This is a property of **the embedder and the corpus**, not a universal constant: BGE-M3's
-similarities are not centred on zero for unrelated text, and a different model or a much more
+similarities are not centered on zero for unrelated text, and a different model or a much more
 topically concentrated corpus puts the noise level somewhere else. Re-measure it the way it was
 measured — ask questions the corpus demonstrably cannot answer and read where their similarities
 land — rather than adjusting it until an example looks right.
 
 This is a property of **the embedder and the corpus**, not a universal constant: BGE-M3's
-similarities are not centred on zero for unrelated text, and a different model or a much more
+similarities are not centered on zero for unrelated text, and a different model or a much more
 topically concentrated corpus puts the noise level somewhere else. Re-measure it the way it was
 measured — ask questions the corpus demonstrably cannot answer and read where their similarities
 land — rather than adjusting it until an example looks right.
@@ -188,7 +188,7 @@ UNREACHABLE_BAND: Final = (
 def band_for(score: float) -> ConfidenceBand:
     """Which band a score falls in.
 
-    Deliberately **not** normalised by the run's ceiling. Dividing a score through by what the
+    Deliberately **not** normalized by the run's ceiling. Dividing a score through by what the
     arithmetic permitted would let a pipeline with no reranker reach ``high``, which is exactly
     the claim ``fast`` must not be able to make: the profile that skips the verification step
     must not be able to report that it verified. The ceiling is used instead by
@@ -447,8 +447,8 @@ def score_confidence(
     if not passages:
         # No context means no passage to have been the definition, whatever the lookup found.
         # `explicit_definition` is deliberately not carried through here: the caller sets it from
-        # a chunk being *present*, so this branch is unreachable with it true, and honouring it
-        # would define behaviour for a state that cannot exist.
+        # a chunk being *present*, so this branch is unreachable with it true, and honoring it
+        # would define behavior for a state that cannot exist.
         return Confidence(
             score=0.0,
             band=ConfidenceBand.NONE,

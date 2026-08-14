@@ -81,7 +81,7 @@ $ manicule connector sidecar --source docs pages
 It is resolved relative to the source's root and must stay inside it. A path that resolves
 outside — through `..`, through an absolute path elsewhere, or through a symlink — is refused,
 and so is a symlink named directly, because the walk beneath does not follow links either. A
-source name is not a licence to write manifests beside somebody else's files.
+source name is not a license to write manifests beside somebody else's files.
 
 The manifests a narrowed run writes are **byte-identical** to the ones a whole-root run would
 write, because no field in a manifest is relative to the conversion's root —
@@ -163,14 +163,14 @@ Listing a profile **replaces** the default rather than adding to it; list
 `name = "standalone-storage"` alongside to keep both. An empty list turns adaptation off, which
 is a supported configuration — it is how you establish whether an unexpected parse is the
 adapter's doing. `connector sidecar --source` refuses a source configured that way rather than
-running: with no profile there is nothing to recognise, so every page would report `no_profile`.
+running: with no profile there is nothing to recognize, so every page would report `no_profile`.
 
 **`labels` replaces the defaults too, and that is the easier one to get wrong.** The profile above
 understands `Identifier` and `Revision` and *stops* understanding `Page ID`, `Version`,
 `Last modified` and the rest. A page whose metadata section reads `<strong>Page ID:</strong>` under
 that profile is refused with `invalid_metadata` — "declares no page id" — rather than adapted,
 because the label it was found under maps to nothing. The keys are the spellings **in your
-documents**, normalised to lower case; the values are manicule's field names. If a field is not in
+documents**, normalized to lower case; the values are manicule's field names. If a field is not in
 the mapping it is not extracted, so a profile that omits an address mapping produces manifests with
 no `canonical_uri`:
 
@@ -231,7 +231,7 @@ place where provenance is extracted, and those two would drift.
 means writing a new directory per page, which doubles the corpus and then needs the original HTML
 kept as well to satisfy "immutable retention of the original". Worse, it has to *decide where the
 new files go*, and the page's own metadata is the obvious thing to name them after — at which
-point a page id of `../../../etc/cron.d/x` is a write primitive, and the defence is a path
+point a page id of `../../../etc/cron.d/x` is a write primitive, and the defense is a path
 validation somebody has to keep correct forever.
 
 **A sidecar** needs none of that. [`connectors/sidecar.py`](../../src/manicule/connectors/sidecar.py)
@@ -300,7 +300,7 @@ and it is idempotent.
 ## 5. Identity moved off the path, and that is a migration
 
 A local file's identity used to be its resolved path, always. It is now the `source_id` a manifest
-declares, where one does. The reason is that a mirror reorganised from by-space to by-tree has not
+declares, where one does. The reason is that a mirror reorganized from by-space to by-tree has not
 created new pages — but a connector keyed on the path reports every document deleted and every
 document new, and the curated collections and tags hanging off the old rows go with them.
 
@@ -404,7 +404,7 @@ nothing re-downloaded.
 
 ## 5c. What this still does not do
 
-Nothing is materialised on disk. There is no derived-artifact directory, so there is nothing to
+Nothing is materialized on disk. There is no derived-artifact directory, so there is nothing to
 place, name, exclude from discovery, or garbage-collect — the extraction is deterministic and
 happens in memory at the moment it is needed. The same walk therefore cannot index its own output,
 because there is no output for it to find.
@@ -512,7 +512,7 @@ identity it declares — which is precisely the state the sync after conversion 
 that, the tool would instruct an action that strands a row and then say nothing about it.
 
 Two files declaring one page id are **both** returned to their paths, and the conflict is reported.
-Not the second only: `documents` is `UNIQUE` on `(workspace_id, source, source_id)`, so honouring
+Not the second only: `documents` is `UNIQUE` on `(workspace_id, source, source_id)`, so honoring
 both would mean a silent overwrite — and keeping the *first* would make ownership depend on walk
 order, so renaming a directory would move one page's content onto another page's identity.
 

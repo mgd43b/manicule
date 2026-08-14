@@ -1,7 +1,7 @@
 """Defects found by review, each with the assertion that would have caught it.
 
 Every test here failed before the fix it names, with one marked exception that exists to pin
-a behaviour a fix must *not* change. They are collected rather than scattered
+a behavior a fix must *not* change. They are collected rather than scattered
 because what they have in common is the shape of the bug: in each case the suite was green,
 the code looked right, and the guarantee was not being kept.
 """
@@ -45,7 +45,7 @@ from manicule.generation.verification import (
     UnverifiableSource,
     load_documents,
 )
-from manicule.testing.normalise import contains_claimed_text
+from manicule.testing.normalize import contains_claimed_text
 from tests.generation.fakes import (
     FakeDocuments,
     FakeParser,
@@ -76,7 +76,7 @@ def canonical(text: str, chunks: int) -> list[tuple[str, str, tuple[int, ...]]]:
     """The event stream for one splitting, with adjacent text runs merged.
 
     Merging is what makes two splittings comparable at all: where the scanner *cuts* a run of
-    ordinary characters is an artefact of arrival, and only the markers and the resulting text
+    ordinary characters is an artifact of arrival, and only the markers and the resulting text
     are observable.
     """
     scanner = MarkerScanner()
@@ -146,7 +146,7 @@ def test_a_feed_whose_result_is_discarded_still_advances_the_scanner() -> None:
 def test_non_ascii_digits_are_not_silently_rewritten_as_slots(payload: str) -> None:
     """``\\d`` is Unicode-aware, so Eastern Arabic and full-width digits parsed as slots — and
     the canonical marker then replaced the model's bytes with ASCII, which is a wider edit
-    than the whitespace normalisation this syntax authorises."""
+    than the whitespace normalization this syntax authorizes."""
     events = canonical(f"{ATTEMPT_PREFIX}{payload}]]", 1)
 
     assert [kind for kind, _, _ in events] == [ScanEventKind.MALFORMED.value]
@@ -164,7 +164,7 @@ def test_an_empty_claim_is_not_contained_in_everything() -> None:
 
 
 async def test_a_slots_verdict_does_not_change_during_one_answer() -> None:
-    """The defect: a timeout verdict was synthesised and never recorded.
+    """The defect: a timeout verdict was synthesized and never recorded.
 
     Verification finishing after the first marker timed out gave a later marker for the same
     slot a different answer — so the reader was told the citation was dropped for a slow disk
@@ -208,7 +208,7 @@ async def test_a_slots_verdict_does_not_change_during_one_answer() -> None:
 
 
 async def test_closing_a_run_settles_every_slot_rather_than_leaving_it_waiting() -> None:
-    """Cancelling a task before its first step throws in *before* the body's ``try``, so the
+    """Canceling a task before its first step throws in *before* the body's ``try``, so the
     ``finally`` that settles the slots never ran — and the next ``verdict`` sat out its whole
     budget with nothing in flight."""
     verifier = CitationVerifier(resolver(FakeParser()), timeout_s=30.0)
@@ -284,7 +284,7 @@ async def test_a_parser_exception_message_never_reaches_the_record() -> None:
 # --- the provider -------------------------------------------------------------------------
 
 
-async def test_a_cancelled_first_token_wait_still_closes_the_provider_connection() -> None:
+async def test_a_canceled_first_token_wait_still_closes_the_provider_connection() -> None:
     """``except GenerationError`` does not catch ``CancelledError``, so a client that
     disconnected during the first-token wait left an open response to a model that kept
     generating — referenced only by a dead local."""
@@ -310,7 +310,7 @@ async def test_a_cancelled_first_token_wait_still_closes_the_provider_connection
         await task
 
     assert stream.closed is True, (
-        "the connection was open and referenced only by the frame that was cancelled"
+        "the connection was open and referenced only by the frame that was canceled"
     )
 
 
@@ -605,7 +605,7 @@ def test_dropping_a_passage_recomputes_the_context_token_count() -> None:
     assert filtered.token_count == filtered.passages[0].chunk.token_count
 
 
-def test_a_workspace_override_applies_however_its_key_is_capitalised() -> None:
+def test_a_workspace_override_applies_however_its_key_is_capitalized() -> None:
     """A raw dict lookup made a case-mismatched key an inert restriction that read as in
     force, and startup said nothing."""
     policy = EgressPolicy.of(

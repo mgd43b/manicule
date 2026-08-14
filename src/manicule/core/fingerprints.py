@@ -10,7 +10,7 @@ quiet way, where nothing raises and every answer is slightly wrong.
 
 They share these semantics deliberately:
 
-Comparison is on a canonical serialisation, byte for byte
+Comparison is on a canonical serialization, byte for byte
     Not on one field. A guard that compared only a dimension, or only a version number,
     passes exactly the cases that matter — two different models at the same dimension, two
     different grammars at the same chunk size.
@@ -77,7 +77,7 @@ already means "never recomputed", and if a disabled run also wrote nothing then 
 would be one column value and an operator could not tell a corpus that has no definitions from
 one whose definitions were never looked for. Turning detection back on changes the installed
 fingerprint, so every document stamped this way is selected by the glossary repair on the next
-survey — which is the behaviour somebody switching the feature back on expects and would
+survey — which is the behavior somebody switching the feature back on expects and would
 otherwise have to know to ask for.
 """
 
@@ -95,7 +95,7 @@ class Fingerprint(BaseModel):
         return {name: dumped[name] for name in self.IDENTITY_FIELDS}
 
     def canonical(self) -> str:
-        """A stable serialisation of :meth:`identity`.
+        """A stable serialization of :meth:`identity`.
 
         Keys sorted and separators fixed, so two runs of the same version produce byte-equal
         output and a stored fingerprint can be compared without being parsed.
@@ -289,7 +289,7 @@ class ParseFingerprint(Fingerprint):
     )
     libraries: dict[str, str] = Field(
         default_factory=dict,
-        description="Version by distribution for every library whose behaviour decides this "
+        description="Version by distribution for every library whose behavior decides this "
         "parser's text or anchors, e.g. ``{'pypdfium2': '5.12.1'}``. Keys are PEP 503 "
         "canonical names — ``ruamel-yaml``, never ``ruamel.yaml`` — because the same "
         "distribution spelled two ways is two keys and a bump that appears to change "
@@ -340,7 +340,7 @@ class GlossaryFingerprint(Fingerprint):
     rules: str = Field(
         default="",
         description="A digest over the sources that decide what a definition is — the grammar, "
-        "the thresholds, the evidence weights, the boundary model and the normalisation that "
+        "the thresholds, the evidence weights, the boundary model and the normalization that "
         "turns a surface form into a key. Empty when detection is disabled, because none of "
         "them ran.",
     )
@@ -352,7 +352,7 @@ class GlossaryFingerprint(Fingerprint):
         "upgrade is. Two reach here: ``pydantic``, which validates "
         ":class:`~manicule.core.glossary.GlossaryEntry`'s constraints and so decides which rows "
         "may be persisted at all, and ``unicodedata``, whose character-database version decides "
-        "what :func:`~manicule.core.glossary.normalise_acronym` NFKC-folds a surface into — a "
+        "what :func:`~manicule.core.glossary.normalize_acronym` NFKC-folds a surface into — a "
         "stored *lookup key*, moving with the interpreter rather than with any distribution. "
         "Derived from the digested sources' own imports rather than listed, so the one thing "
         "``ParserVersions.distributions`` documents going wrong — a dependency added and not "

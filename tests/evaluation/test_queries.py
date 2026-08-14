@@ -2,7 +2,7 @@
 
 Each refusal corresponds to a way a query set silently stops being what it claims: an unknown
 schema version loaded with fields missing, an export whose extra column is dropped, two
-queries sharing an id so one judgement overwrites another, and a set with no declared
+queries sharing an id so one judgment overwrites another, and a set with no declared
 provenance whose numbers are later quoted as measurements.
 """
 
@@ -65,7 +65,7 @@ def test_a_schema_version_this_build_does_not_know_is_refused() -> None:
 
 
 def test_two_queries_sharing_an_id_are_refused() -> None:
-    """Preferences key on the id, so a repeat overwrites a judgement instead of adding one."""
+    """Preferences key on the id, so a repeat overwrites a judgment instead of adding one."""
     with pytest.raises(ValueError, match="duplicate query ids"):
         a_set(
             queries=(

@@ -1,4 +1,4 @@
-"""Pooling and normalisation, done here rather than taken from a backend.
+"""Pooling and normalization, done here rather than taken from a backend.
 
 Every backend offers a finished vector under a friendly name, and the friendly name is not
 reliably the model's own pooling. Measured on ``BAAI/bge-m3``, a CLS-pooled model:
@@ -20,7 +20,7 @@ configuration declares.
 
 The rank check is the load-bearing part. Pooling a ``(batch, dimension)`` array does not
 fail — it reduces over the batch axis, and every text in the batch comes out holding the
-same plausible, normalised, entirely wrong vector.
+same plausible, normalized, entirely wrong vector.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ TOKEN_STATE_RANK = 3
 """``(batch, sequence, dimension)``. Anything else is not token states."""
 
 _EPSILON = 1e-12
-"""Guards the division in :func:`l2_normalise`. A zero vector normalises to itself."""
+"""Guards the division in :func:`l2_normalize`. A zero vector normalizes to itself."""
 
 
 def require_token_states(states: NDArrayLike, *, backend: str, model_id: str) -> None:
@@ -60,7 +60,7 @@ def require_token_states(states: NDArrayLike, *, backend: str, model_id: str) ->
         f"per-token hidden states of shape (batch, sequence, dimension) were expected. "
         f"This is what an already-pooled vector looks like arriving under a token-state "
         f"name, and pooling it would reduce over the batch axis instead of the sequence "
-        f"axis — one plausible, normalised, wrong vector per text, with nothing downstream "
+        f"axis — one plausible, normalized, wrong vector per text, with nothing downstream "
         f"able to tell. Read the encoder output rather than the backend's convenience field."
     )
     raise TokenStateError(msg)
@@ -70,7 +70,7 @@ def as_float32(array: NDArrayLike) -> np.ndarray:
     """Bring a backend's native array into numpy at a single, stated precision.
 
     Backends hand back arrays of their own: MLX ``bfloat16`` or ``float16`` on Metal,
-    ``float32`` from onnxruntime. Pooling and normalising at whatever precision arrived would
+    ``float32`` from onnxruntime. Pooling and normalizing at whatever precision arrived would
     make the vectors depend on the runtime's storage choice, which is the one thing the
     platform is not allowed to change. One conversion, here, and everything after it is
     float32 arithmetic on both backends.
@@ -142,7 +142,7 @@ def _last_token(states: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
     return states[np.arange(states.shape[0]), indices, :]
 
 
-def l2_normalise(vectors: np.ndarray) -> np.ndarray:
+def l2_normalize(vectors: np.ndarray) -> np.ndarray:
     """Scale each row to unit length.
 
     Applied unconditionally rather than read from the model's declared pipeline. A repository
@@ -156,7 +156,7 @@ def l2_normalise(vectors: np.ndarray) -> np.ndarray:
 def pool_token_states(
     token_states: TokenStates, pooling: Pooling, *, backend: str, model_id: str
 ) -> list[Vector]:
-    """The whole reduction: check the rank, pool, normalise, hand back plain sequences.
+    """The whole reduction: check the rank, pool, normalize, hand back plain sequences.
 
     Vectors leave as lists because they cross a storage boundary next, and a native array
     that has to be converted somewhere is best converted once, here.
@@ -179,14 +179,14 @@ def pool_token_states(
         )
         raise TokenStateError(msg)
 
-    pooled = l2_normalise(pool(states, mask, pooling))
+    pooled = l2_normalize(pool(states, mask, pooling))
     return [row.tolist() for row in pooled]
 
 
 __all__ = [
     "TOKEN_STATE_RANK",
     "as_float32",
-    "l2_normalise",
+    "l2_normalize",
     "pool",
     "pool_token_states",
     "require_token_states",

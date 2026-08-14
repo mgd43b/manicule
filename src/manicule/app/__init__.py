@@ -1,4 +1,4 @@
-"""The application service layer, which is the only place manicule's behaviour lives.
+"""The application service layer, which is the only place manicule's behavior lives.
 
 The command line and the MCP server are both adapters over :class:`ApplicationService`. So is
 the HTTP API when it arrives. Neither surface decides anything: they parse arguments, call one

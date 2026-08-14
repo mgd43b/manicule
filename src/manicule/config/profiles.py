@@ -50,7 +50,7 @@ class ProfileConfig(BaseModel):
         "fused RRF score with two legs cannot exceed 2/61, so a floor of 0.3 there discards "
         "every candidate in every profile and returns an empty result set that looks exactly "
         "like an empty corpus; and BM25 is corpus-relative and unbounded, so a constant has "
-        "nothing absolute to mean. Cosine over L2-normalised vectors is the one number in the "
+        "nothing absolute to mean. Cosine over L2-normalized vectors is the one number in the "
         "pipeline with a meaning that survives leaving the run it was computed in. It is a "
         "junk filter and deliberately not the relevance decision: that is confidence's job, "
         "because a threshold is a cliff and two embedding backends agreeing to cosine 0.9999 "
@@ -157,7 +157,7 @@ distributions rather than on it. That is deliberate. A floor placed at the separ
 cliff exactly where the decision is hardest, and MLX and ONNX agree only to cosine 0.9999 — worth
 about 0.01 of movement in a query-passage cosine — so a passage within that distance of the
 threshold could be returned on one backend and dropped on the other. Platform may change
-throughput; it must never change output. The relevance judgement therefore lives in confidence,
+throughput; it must never change output. The relevance judgment therefore lives in confidence,
 which is continuous, and this floor only removes what is not worth fusing.
 """
 

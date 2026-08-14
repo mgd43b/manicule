@@ -176,8 +176,8 @@ def pack_version() -> str:
     same string — the suite asserts that rather than assuming it. Reading the metadata answers
     without importing the pack, so recording a grammar version costs no native extension load
     on a machine whose corpus contains no code. It also answers on a machine where the native
-    extension cannot be loaded at all, which is the honest behaviour: a version is a fact about
-    what is installed, not about what has been initialised.
+    extension cannot be loaded at all, which is the honest behavior: a version is a fact about
+    what is installed, not about what has been initialized.
     """
     from importlib.metadata import version  # noqa: PLC0415 - see docstring
 
@@ -399,7 +399,7 @@ class GrammarFetchError(ManiculeError):
 
 
 def validate_languages(languages: Sequence[str]) -> tuple[str, ...]:
-    """Check declared language keys against the pack manifest, and canonicalise the set.
+    """Check declared language keys against the pack manifest, and canonicalize the set.
 
     Runs when a parser is constructed rather than when a document arrives, so that a typo is
     a startup failure with the alternatives listed rather than a document that quietly never

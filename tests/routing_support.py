@@ -19,7 +19,7 @@ each declared absence says which of those it is. :func:`classify` is the whole o
 
 **The walk proves it ran before it reports what it found.** ``app.routes`` is not a flat list on
 every FastAPI: from 0.13x an included router appears as a wrapper object, and a walk that only
-recognised :class:`~fastapi.routing.APIRoute` therefore found **nothing at all** — and reported
+recognized :class:`~fastapi.routing.APIRoute` therefore found **nothing at all** — and reported
 success, because every assertion built on it is a statement about every route and there were
 none. :func:`walk_routes` descends into whatever shape the framework used, and
 :data:`MINIMUM_ROUTES` is a floor below which the walk is assumed to have collapsed rather than
@@ -34,7 +34,7 @@ path, so it answers about *that request* and not about the operation in general:
   :class:`~fastapi.routing.APIWebSocketRoute` returns no match for one even at its own path —
   ``GET /api/v1/chat/ws`` classifies as :attr:`Reach.UNROUTED` today. So an operation
   reintroduced as a websocket at a path declared absent passes. That is *consistent* — no HTTP
-  verb reaches it — and it is still a way back in, and the defence against it is a reviewer
+  verb reaches it — and it is still a way back in, and the defense against it is a reviewer
   reading the diff.
 * **A path nobody wrote down is not checked.** These are declared lists, so an operation
   reappearing under a name nobody predicted is caught by the vocabulary assertions in
@@ -119,7 +119,7 @@ class Reach(enum.Enum):
     """Only a **placeholder** route matches, and it does not declare this method.
 
     A 405 by coincidence. The literal segment was swallowed by a path parameter, so the absence
-    holds only for as long as nobody adds that verb to the parameterised route. This is a latent
+    holds only for as long as nobody adds that verb to the parameterized route. This is a latent
     defect wherever it appears, and declaring it is how it stops being a silent one.
     """
 
@@ -167,7 +167,7 @@ def classify(method: str, path: str, routes: Iterable[APIRoute | APIWebSocketRou
             (siblings if route.path == path else shadows).append(found)
     # A shadow is reported ahead of a sibling when both exist. Starlette would answer 405 from
     # whichever it saw first, but the question here is whether the absence is *stable*, and one
-    # parameterised route that could gain this verb is enough to make it not.
+    # parameterized route that could gain this verb is enough to make it not.
     if shadows:
         return Reached(Reach.SHADOWED, shadows[0])
     if siblings:

@@ -8,7 +8,7 @@ nobody wrote down.
 Three properties this module is responsible for:
 
 **A stream always ends with an envelope.** Including when generation raised: the failure is
-serialised as the same ``ok: false`` envelope every other surface returns and sent as the
+serialized as the same ``ok: false`` envelope every other surface returns and sent as the
 final frame. A stream that just stops is indistinguishable, at the client, from a network that
 dropped — and the answer path deliberately persists partial answers precisely so they are not
 lost.
@@ -17,7 +17,7 @@ lost.
 newline inside answer text cannot terminate an SSE event early. Hand-built ``data:`` lines are
 the classic way an SSE endpoint becomes a frame-injection primitive.
 
-**Abandonment propagates.** When the client goes away the consuming task is cancelled, the
+**Abandonment propagates.** When the client goes away the consuming task is canceled, the
 generator is closed, and ``ask_stream``'s own ``finally`` runs — which is what releases the
 open response to the model. Nothing here swallows ``CancelledError``.
 """

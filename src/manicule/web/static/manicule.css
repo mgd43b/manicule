@@ -2,7 +2,7 @@
  *
  * Hand-written, and that is the point rather than an economy: nothing here is generated, so
  * `uv sync` remains the whole install and the container image stays free of a Node toolchain.
- * Two colour schemes, both stated as custom properties, so the theme toggle changes one
+ * Two color schemes, both stated as custom properties, so the theme toggle changes one
  * attribute rather than restyling anything.
  */
 

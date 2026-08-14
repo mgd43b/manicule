@@ -1,7 +1,7 @@
 """A synthetic corpus in which the baseline demonstrably fails.
 
 Everything here is invented for this suite. There are no private glossary entries, no
-organisation names, no URLs and no copied corpus text.
+organization names, no URLs and no copied corpus text.
 
 **Three earlier versions of this fixture did not reproduce the bug, and that is the most
 useful thing in this module.** Measured against the real embedder, with the definition ranked
@@ -30,7 +30,7 @@ So reproducing it needed two ingredients, and a fixture missing either one prove
 1. **The definition is diluted inside a chunk.** Chunking is 512/64, so a glossary page
    arrives as one chunk holding dozens of entries and any single definition is a fortieth of
    the vector. A fixture where the definition is its own one-line passage makes it the trivial
-   nearest neighbour of any question naming the term — the definition and the question are
+   nearest neighbor of any question naming the term — the definition and the question are
    nearly the same string.
 2. **The term is used far more often than it is defined.** This is what a real corpus looks
    like once a term exists: it is spelled out where it is defined and written as the acronym
@@ -134,7 +134,7 @@ GLOSSARY_ENTRIES: Final[tuple[str, ...]] = (
     "DELTA — Distributed Event Ledger Transfer Agent",
     "EMBER — Event Metrics Buffer And Export Relay",
     "GRANITE — Graph Retention And Node Index Tooling Environment",
-    "ISOTOPE — Index Storage Optimisation Tooling Endpoint",
+    "ISOTOPE — Index Storage Optimization Tooling Endpoint",
     "JUNIPER — Job Under Node Inspection Pipeline Runner",
     "KRYPTON — Key Rotation Yield Protocol Token Notary",
     "LANTERN — Ledger And Node Telemetry Export Runner Node",
@@ -164,13 +164,26 @@ still cite measurements, and the corpus they name would no longer be the corpus 
 them. New material goes on :data:`SUPPLEMENT_ENTRIES`, which is a second document and leaves
 this one byte-identical.
 
+**These bytes have moved exactly once, and here is what it cost.** The American-English sweep
+respelled ``Optimisation`` in the ISOTOPE line, because a synthetic fixture written in British
+English is still the project written in British English. That is the one edit this tuple has
+taken since the cosines above were recorded, and it was measured rather than waved through:
+against BGE-M3 through the MLX backend the page's cosine to ``What is NOW?`` went 0.4432 to
+0.4431, and the old and new pages embed to vectors 0.999969 alike. Both sit far below the 0.54
+noise floor, which is the entire content of the claim that rests on them. So the figures above
+are left as recorded — a redigit in the fourth decimal place is not a re-measurement, and
+restating them to four places they were never measured to would be the false precision this
+docstring exists to prevent. **The rule is unchanged: do not add, remove or reword entries
+here.** A *line* changes the vector by enough to matter; this did not, and that was checked
+rather than assumed.
+
 **Six of these are near-miss backronyms, and that is coverage rather than sloppiness.** They read
 as though their expansions spell them and they do not:
 
 ========  ===========================================  =============
 Term      Expansion                                    Spells
 ========  ===========================================  =============
-ISOTOPE   Index Storage Optimisation Tooling Endpoint  ISOTE
+ISOTOPE   Index Storage Optimization Tooling Endpoint  ISOTE
 JUNIPER   Job Under Node Inspection Pipeline Runner    JUNIPR
 KRYPTON   Key Rotation Yield Protocol Token Notary     KRYPTN
 MISTRAL   Metrics Ingest Stream Transfer And Load      MISTAL, MISTL
@@ -271,7 +284,7 @@ ORDINARY: Final[tuple[str, ...]] = (
     "What is stored now that the retention setting has changed? The original bytes, the "
     "extracted text and one version record for each revision seen.",
     "What is the escalation path now? The on-call engineer first, then the duty manager after "
-    "fifteen minutes without acknowledgement.",
+    "fifteen minutes without acknowledgment.",
     "What is the maximum file size now? Two hundred megabytes, above which the connector skips "
     "the file and records the reason.",
     "What is the difference between the two counters now? One counts rows fetched and the "

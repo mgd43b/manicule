@@ -4,7 +4,7 @@ The cached value is the ranked list of chunk ids with their per-stage scores —
 pipeline reached — and never the chunk text. On a hit, the ids are re-hydrated through the same
 join the dense leg uses.
 
-This is not a memory optimisation. It is what makes the cache incapable of the failure a
+This is not a memory optimization. It is what makes the cache incapable of the failure a
 content-caching version invites: **a hit cannot serve a soft-deleted, unindexed or
 foreign-workspace chunk, because the entry holds no chunks.** The boundary is re-enforced on
 every hit rather than snapshotted at the moment of the miss. Re-hydration costs one indexed

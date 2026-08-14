@@ -1,4 +1,4 @@
-"""What a model declares, what an artefact is allowed to be, and where both are refused.
+"""What a model declares, what an artifact is allowed to be, and where both are refused.
 
 Every case here is a synthetic repository written in the test, so the whole file runs offline
 in under a second and can express declarations no published model ships: two pooling flags at
@@ -132,7 +132,7 @@ def test_configuration_may_not_contradict_a_model_s_declared_pooling(tmp_path: P
 
 
 def test_an_unimplemented_pooling_mode_is_named_rather_than_skipped(tmp_path: Path) -> None:
-    """Skipping an unrecognised ``true`` indexes a max-pooled model as something else."""
+    """Skipping an unrecognized ``true`` indexes a max-pooled model as something else."""
     directory = write_model(
         tmp_path / "model",
         pooling_flags={"pooling_mode_max_tokens": True, "pooling_mode_mean_tokens": True},
@@ -222,10 +222,10 @@ def test_a_model_with_no_declared_pad_token_is_refused(tmp_path: Path) -> None:
         load_tokenizer(read_card(str(directory)))
 
 
-# --- artefacts ---------------------------------------------------------------------------
+# --- artifacts ---------------------------------------------------------------------------
 
 
-def test_the_mlx_artefact_for_bge_m3_is_not_its_own_repository() -> None:
+def test_the_mlx_artifact_for_bge_m3_is_not_its_own_repository() -> None:
     """``BAAI/bge-m3`` publishes a PyTorch pickle and no safetensors, which MLX cannot read.
 
     Recorded in a table rather than discovered at load time, so the fingerprint can name the
@@ -236,18 +236,18 @@ def test_the_mlx_artefact_for_bge_m3_is_not_its_own_repository() -> None:
     assert mlx_repo("BAAI/bge-m3", override="local/conversion") == "local/conversion"
 
 
-def test_quantised_weights_are_refused(tmp_path: Path) -> None:
-    """Quantisation changes the vectors, and nothing downstream would catch it.
+def test_quantized_weights_are_refused(tmp_path: Path) -> None:
+    """Quantization changes the vectors, and nothing downstream would catch it.
 
     4-bit ``bge-m3`` sits at cosine 0.92-0.97 to the same model in fp16 — a different space, not
     a rounding error. ``backend`` and ``weights_ref`` are excluded from fingerprint identity on
     the basis that a runtime does not change the output, so this is the only place the
     contradiction can be caught.
     """
-    directory = write_model(tmp_path / "quantised", quantization={"bits": 4, "group_size": 64})
+    directory = write_model(tmp_path / "quantized", quantization={"bits": 4, "group_size": 64})
     (directory / "model.safetensors").write_bytes(b"not really weights")
 
-    with pytest.raises(ConfigError, match="quantised to 4 bits"):
+    with pytest.raises(ConfigError, match="quantized to 4 bits"):
         mlx_weights(str(directory))
 
 
@@ -259,7 +259,7 @@ def test_weights_mlx_cannot_read_are_refused_with_the_conversion_named(tmp_path:
         mlx_weights(str(directory))
 
 
-def test_an_unquantised_artefact_is_accepted(tmp_path: Path) -> None:
+def test_an_unquantized_artifact_is_accepted(tmp_path: Path) -> None:
     directory = write_model(tmp_path / "fp16")
     (directory / "model.safetensors").write_bytes(b"not really weights")
 
@@ -274,7 +274,7 @@ def test_a_repository_with_no_onnx_export_is_refused(tmp_path: Path) -> None:
         onnx_weights(str(directory))
 
 
-def test_the_conventional_onnx_graph_is_preferred_over_its_quantisations(tmp_path: Path) -> None:
+def test_the_conventional_onnx_graph_is_preferred_over_its_quantizations(tmp_path: Path) -> None:
     """Repositories ship ``model_quantized.onnx`` beside ``model.onnx``, and they differ."""
     directory = write_model(tmp_path / "with-onnx")
     (directory / "onnx").mkdir()
@@ -286,7 +286,7 @@ def test_the_conventional_onnx_graph_is_preferred_over_its_quantisations(tmp_pat
     assert graph.name == "model.onnx"
 
 
-def test_a_lone_quantised_onnx_graph_is_refused(tmp_path: Path) -> None:
+def test_a_lone_quantized_onnx_graph_is_refused(tmp_path: Path) -> None:
     """The case the ambiguity refusal below cannot see, and the one that would load silently.
 
     An ONNX graph declares no precision of its own, unlike an MLX conversion's ``config.json``,
@@ -295,16 +295,16 @@ def test_a_lone_quantised_onnx_graph_is_refused(tmp_path: Path) -> None:
     admitting it puts vectors measured at cosine 0.92-0.97 to the named model into an index
     whose fingerprint says the runtime cannot have changed the output.
     """
-    directory = write_model(tmp_path / "quantised-onnx")
+    directory = write_model(tmp_path / "quantized-onnx")
     (directory / "onnx").mkdir()
     (directory / "onnx" / "model_quantized.onnx").write_bytes(b"graph")
 
-    with pytest.raises(ConfigError, match="quantised"):
+    with pytest.raises(ConfigError, match="quantized"):
         onnx_weights(str(directory))
 
 
 def test_a_lone_full_precision_onnx_graph_is_accepted(tmp_path: Path) -> None:
-    """Half precision is not quantisation: it is what the MLX side runs, and parity holds."""
+    """Half precision is not quantization: it is what the MLX side runs, and parity holds."""
     directory = write_model(tmp_path / "fp16-onnx")
     (directory / "onnx").mkdir()
     (directory / "onnx" / "model_fp16.onnx").write_bytes(b"graph")
@@ -315,7 +315,7 @@ def test_a_lone_full_precision_onnx_graph_is_accepted(tmp_path: Path) -> None:
 
 
 def test_several_onnx_graphs_and_no_conventional_one_is_refused(tmp_path: Path) -> None:
-    """Picking the first would pick a quantisation about a third of the time."""
+    """Picking the first would pick a quantization about a third of the time."""
     directory = write_model(tmp_path / "ambiguous")
     (directory / "onnx").mkdir()
     (directory / "onnx" / "model_fp16.onnx").write_bytes(b"graph")

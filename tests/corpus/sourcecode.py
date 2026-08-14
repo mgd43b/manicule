@@ -245,7 +245,7 @@ def register(name: str):
 @register("archive")
 @functools.lru_cache(maxsize=32)
 def archive_handler(payload: str) -> str:
-    """Handle one archive request, memoised."""
+    """Handle one archive request, memoized."""
     return payload.upper()
 
 

@@ -202,7 +202,7 @@ class ConfluenceClient:
             msg = (
                 f"{url} answered with {response.headers.get('content-type', 'no content type')} "
                 f"rather than JSON. A sign-in page from a proxy in front of Confluence is the "
-                f"usual cause — one manicule did not recognise as a sign-in page, since it "
+                f"usual cause — one manicule did not recognize as a sign-in page, since it "
                 f"would have been refused already if it had. Check that "
                 f"{self._config.base_url} is reachable without one. {self._credential.renewal()}"
             )

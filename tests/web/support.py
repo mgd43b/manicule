@@ -8,7 +8,7 @@ The one thing added here is a corpus that is **hostile on purpose**. Every strin
 :data:`MARKUP` is a place where text somebody else wrote reaches HTML, and each is planted in
 the field a real attacker would use: a document title comes from a file, a heading path comes
 from a parser reading that file, an answer body is a model writing about it, and a citation
-label is the document's own words travelling back out under manicule's name.
+label is the document's own words traveling back out under manicule's name.
 """
 
 from __future__ import annotations
@@ -178,7 +178,7 @@ def backend_with_hostile_text() -> tuple[FakeBackend, Document]:
         update={"heading_path": (MARKUP["heading"],)}
     )
     backend.store.add(hostile, chunk)
-    backend.organisation_.documents[hostile.id] = hostile
+    backend.organization_.documents[hostile.id] = hostile
 
     # What `/ui/search` ranks. The same chunk the store holds, so the hit's title, heading path
     # and text are the hostile document's own rather than a second fixture that could drift.
@@ -189,7 +189,7 @@ def backend_with_hostile_text() -> tuple[FakeBackend, Document]:
     # than inside a hit.
     backend.retriever_.expansion = _hostile_expansion(hostile, chunk)
     # What `/ui/documents/trash` lists.
-    backend.organisation_.trash[hostile.id] = hostile
+    backend.organization_.trash[hostile.id] = hostile
 
     turn = Turn(role="assistant", content=MARKUP["answer"], citations=(_hostile_citation(hostile),))
     backend.conversations_.seed(CONVERSATION, Turn(role="user", content="what happens"), turn)

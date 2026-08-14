@@ -145,8 +145,8 @@ def test_the_shipped_protocols_are_checkable() -> None:
 # --- async iterator lifetime ------------------------------------------------------------
 
 
-async def test_closing_finalises_a_generator_abandoned_part_way() -> None:
-    """A generator suspended at a yield holds whatever it had open until it is finalised.
+async def test_closing_finalizes_a_generator_abandoned_part_way() -> None:
+    """A generator suspended at a yield holds whatever it had open until it is finalized.
 
     Drained bare, that happens at garbage-collection time through the event loop's
     async-generator hook — possibly after the loop has closed. It leaks at best and has been
@@ -170,7 +170,7 @@ async def test_closing_finalises_a_generator_abandoned_part_way() -> None:
             if value == 2:
                 break
 
-    assert released == ["closed"], "the generator must be finalised when the block exits"
+    assert released == ["closed"], "the generator must be finalized when the block exits"
 
 
 async def test_closing_accepts_an_iterator_that_cannot_be_closed() -> None:

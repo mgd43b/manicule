@@ -107,7 +107,7 @@ class Routing(BaseModel):
         return self.route is not Route.RETRIEVE
 
 
-def normalise(text: str) -> str:
+def normalize(text: str) -> str:
     """Lowercase, collapse whitespace, and strip surrounding punctuation.
 
     Everything a full match should tolerate and nothing it should not. Interior punctuation
@@ -149,9 +149,9 @@ class QueryRouter:
                 f"invoke; add phrases for it, or remove the handler."
             )
             raise ConfigError(msg)
-        self._greetings = frozenset(normalise(phrase) for phrase in settings.greetings)
+        self._greetings = frozenset(normalize(phrase) for phrase in settings.greetings)
         self._utilities = {
-            normalise(phrase): kind for kind in self._available for phrase in UTILITY_PHRASES[kind]
+            normalize(phrase): kind for kind in self._available for phrase in UTILITY_PHRASES[kind]
         }
 
     @property
@@ -168,15 +168,15 @@ class QueryRouter:
             # length bound is what stops the second being read as the first.
             return Routing()
 
-        normalised = normalise(text)
-        if not normalised:
+        normalized = normalize(text)
+        if not normalized:
             return Routing()
-        utility = self._utilities.get(normalised)
+        utility = self._utilities.get(normalized)
         if utility is not None:
-            return Routing(route=Route.UTILITY, utility=utility, matched=normalised)
-        if normalised in self._greetings:
-            return Routing(route=Route.GREETING, matched=normalised)
+            return Routing(route=Route.UTILITY, utility=utility, matched=normalized)
+        if normalized in self._greetings:
+            return Routing(route=Route.GREETING, matched=normalized)
         return Routing()
 
 
-__all__ = ["UTILITY_PHRASES", "QueryRouter", "Routing", "UtilityKind", "normalise"]
+__all__ = ["UTILITY_PHRASES", "QueryRouter", "Routing", "UtilityKind", "normalize"]

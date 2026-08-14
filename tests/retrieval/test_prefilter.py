@@ -82,7 +82,7 @@ async def test_a_small_resolved_set_is_pushed_down(store: SqliteDocStore) -> Non
     assert split.count_is_exact
 
 
-async def test_too_many_ids_invert_the_plan_without_materialising_them_all(
+async def test_too_many_ids_invert_the_plan_without_materializing_them_all(
     store: SqliteDocStore,
 ) -> None:
     """Resolution stops one past the limit rather than listing a corpus to answer a threshold.
@@ -126,7 +126,7 @@ async def test_a_field_no_store_can_resolve_is_refused_rather_than_dropped(
 
     Refused rather than ignored, and by the store rather than by a hardcoded list in retrieval
     — so a store that later grows the capability simply works, and one that has not says which
-    field it cannot honour.
+    field it cannot honor.
     """
     with pytest.raises(ValueError, match="collection_ids"):
         await prefilter.resolve(

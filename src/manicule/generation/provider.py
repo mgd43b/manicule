@@ -263,7 +263,7 @@ class LitellmGenerator:
             msg = (
                 f"llm.provider {self._settings.provider!r} with llm.model "
                 f"{self._settings.model!r} composes to {self.model_id!r}, which the provider "
-                f"library does not recognise: {exc}. Provider prefixes include {prefixes}. "
+                f"library does not recognize: {exc}. Provider prefixes include {prefixes}. "
                 f"For an OpenAI-compatible server, use provider 'openai' with a base_url."
             )
             raise ConfigError(msg) from exc
@@ -474,7 +474,7 @@ class LitellmGenerator:
         """The provider call, as an async generator with cleanup around the ``yield``.
 
         The ``finally`` is the contract: ``aclose()`` throws :exc:`GeneratorExit` in at the
-        suspension point and a cancelled client's :exc:`asyncio.CancelledError` arrives at
+        suspension point and a canceled client's :exc:`asyncio.CancelledError` arrives at
         whatever ``await`` is live inside the provider read. One ``try``/``finally`` covers
         both, it awaits nothing unbounded, and it never yields — the final token carrying a
         finish reason is emitted on the normal path only, because a stream nobody is reading
@@ -551,7 +551,7 @@ class LitellmGenerator:
                     # otherwise have every one of them held until the first token, rebuilt from
                     # scratch on each retry — hundreds of thousands of objects on a long
                     # first-token budget. Past the bound the retry window simply closes, which
-                    # is the pre-existing behaviour and is safe: nothing has been delivered.
+                    # is the pre-existing behavior and is safe: nothing has been delivered.
                     if _delta_text(chunk) or len(leading) >= MAX_LEADING_CHUNKS:
                         return stream, leading
             except GenerationError as exc:
@@ -590,7 +590,7 @@ class LitellmGenerator:
             # Under streaming, a usage-bearing final chunk is gated on this flag; without it
             # usage is reachable only through a private attribute, which is not something to
             # build a correctness guarantee on. It is an OpenAI-compatible parameter, so for
-            # `ollama_chat` the library drops it before the request and honours it
+            # `ollama_chat` the library drops it before the request and honors it
             # client-side — which is fine, and is not the same as end-to-end support.
             "stream_options": {"include_usage": True},
             "temperature": self._settings.temperature,
@@ -673,7 +673,7 @@ class LitellmGenerator:
 def _backoff(attempt: int) -> float:
     """Exponential backoff with full jitter.
 
-    Jittered because an un-jittered backoff synchronises every client of a rate-limited
+    Jittered because an un-jittered backoff synchronizes every client of a rate-limited
     provider onto the same retry instant, which is the shape that turns one bad minute into
     a sustained one.
     """

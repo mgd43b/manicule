@@ -189,8 +189,8 @@ def _large() -> _Json:
         cells.append(
             _code(
                 f"run-{hour:02d}",
-                f"summarise(window={hour})\n",
-                outputs=[_stream(f"window {hour} totalled {hour * 311} events, {hour} retried\n")],
+                f"summarize(window={hour})\n",
+                outputs=[_stream(f"window {hour} totaled {hour * 311} events, {hour} retried\n")],
             )
         )
     return _notebook(4, 5, cells)

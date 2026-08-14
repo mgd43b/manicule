@@ -10,7 +10,7 @@ Three decisions shape the whole package, and each is stated where it is made:
 
 **It renders server-side, against the service, rather than consuming its own HTTP API.**
 :mod:`manicule.web.rendering` says why at length. The short form: a process that called itself
-over HTTP would need a credential to talk to itself, would serialise and re-parse every payload
+over HTTP would need a credential to talk to itself, would serialize and re-parse every payload
 for nothing, and would put a second network hop inside a page load.
 
 **Escaping is the load-bearing property, so it is unconditional.** The Jinja environment is

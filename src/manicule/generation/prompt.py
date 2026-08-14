@@ -50,7 +50,7 @@ Place a marker immediately after the claim it supports. Rules:
 """The part of the system prompt an operator cannot replace.
 
 Interpolated from the marker constants rather than spelled out, so the instruction given to
-the model and the syntax the binder recognises cannot drift apart.
+the model and the syntax the binder recognizes cannot drift apart.
 """
 
 SYSTEM_PROMPT = f"""\
@@ -76,7 +76,7 @@ def describe_location(anchor: Anchor) -> str:
     """A short human location for a slot label, or ``""`` when there is none.
 
     Deliberately not the anchor itself. What goes in front of a model is what a reader would
-    recognise — "page 4", "Sheet1!B4:D12" — and never an identifier a model could copy into
+    recognize — "page 4", "Sheet1!B4:D12" — and never an identifier a model could copy into
     its answer.
     """
     if isinstance(anchor, PageAnchor):

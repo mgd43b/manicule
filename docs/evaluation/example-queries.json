@@ -49,10 +49,10 @@
       "intent": "exact_identifier"
     },
     {
-      "id": "example-uncategorised-1",
+      "id": "example-uncategorized-1",
       "text": "why did my last search return nothing",
-      "intent": "uncategorised",
-      "note": "A fresh export starts here. Uncategorised is reported as its own row rather than folded into another category."
+      "intent": "uncategorized",
+      "note": "A fresh export starts here. Uncategorized is reported as its own row rather than folded into another category."
     }
   ]
 }

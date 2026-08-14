@@ -24,7 +24,7 @@ class QuerySetError(EvaluationError):
 
 
 class PreferenceRecordError(EvaluationError):
-    """A stored judgement could not be read back.
+    """A stored judgment could not be read back.
 
     Refused rather than skipped, for the reason :class:`QuerySetError` gives: a reader that
     drops the lines it does not understand reports a rate computed over an unknown subset, and
@@ -78,7 +78,7 @@ class ConfigurationDriftError(EvaluationError):
 
 
 class IncomparableRecordsError(EvaluationError):
-    """Records that may not be summarised together were handed to the reporter.
+    """Records that may not be summarized together were handed to the reporter.
 
     Different systems, different corpora or different query-set provenance. Averaging across
     any of them produces a figure nobody can attribute to anything, which is the failure mode

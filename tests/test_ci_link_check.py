@@ -18,7 +18,7 @@ and is what this module defends:
 
 Both are the same failure this repository keeps having — a check whose name is broader than
 what it verified — and neither is caught by asserting on an exit status, which is why the gate
-is the *report* instead. A report is an artefact only a real run produces.
+is the *report* instead. A report is an artifact only a real run produces.
 
 The tests below come in two halves: what `tools/check_link_report.py` decides, exercised
 against reports rather than by reading it, and whether the workflow is still wired to it.
@@ -164,7 +164,7 @@ def test_a_missing_report_says_the_check_never_ran(
 ) -> None:
     """ "It never ran" must not read as "it found nothing wrong".
 
-    This is what makes the guard undisableable: the report is an artefact only a completed run
+    This is what makes the guard undisableable: the report is an artifact only a completed run
     produces, so a download that failed — however quietly — cannot satisfy it.
 
     The message is asserted rather than just the exit status, and that is not fussiness. Reading
@@ -253,7 +253,7 @@ def test_nothing_in_the_docs_job_is_allowed_to_fail_quietly() -> None:
 
 
 def test_the_check_is_the_last_word_even_when_lychee_itself_failed() -> None:
-    """Unconditional, so the artefact is what decides rather than the step before it.
+    """Unconditional, so the artifact is what decides rather than the step before it.
 
     Without this the assertion is skipped exactly when it is most useful — after a run that
     exited non-zero, or one somebody made non-fatal — and the job's verdict comes from the step

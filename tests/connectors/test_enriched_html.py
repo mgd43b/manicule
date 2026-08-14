@@ -67,7 +67,7 @@ def page(
 
 
 def rows_with(*extra: tuple[str, str], drop: str = "") -> tuple[tuple[str, str], ...]:
-    """``ROWS`` plus ``extra``, optionally without the row labelled ``drop``."""
+    """``ROWS`` plus ``extra``, optionally without the row labeled ``drop``."""
     kept = tuple((label, value) for label, value in ROWS if label != drop)
     return kept + extra
 
@@ -372,7 +372,7 @@ def test_a_symlink_out_of_the_tree_writes_nothing_outside_it(tmp_path: Path) -> 
     """A write outside the root the operator named.
 
     Two mechanisms hold this — the walk skips symlinks, and every path is checked against the
-    root — and disabling *either* alone leaves it holding. That is defence in depth rather than a
+    root — and disabling *either* alone leaves it holding. That is defense in depth rather than a
     redundant check, and it is why the test below exists to pin the first one on its own.
     """
     outside = tmp_path.parent / "outside-the-root"

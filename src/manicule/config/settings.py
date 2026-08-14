@@ -71,7 +71,7 @@ def default_data_dir() -> Path:
 
 
 def default_cache_dir() -> Path:
-    """Where regenerable artefacts live. Safe to delete."""
+    """Where regenerable artifacts live. Safe to delete."""
     return _xdg("XDG_CACHE_HOME", ".cache")
 
 
@@ -94,7 +94,7 @@ class PrefixedDotEnvSource(DotEnvSettingsSource):
     """A ``.env`` source that reads manicule's variables and ignores everybody else's.
 
     A ``.env`` file is shared ground: it holds ``OPENAI_API_KEY``, database URLs and
-    whatever else the project needs. Treating every unrecognised line as a misspelled
+    whatever else the project needs. Treating every unrecognized line as a misspelled
     manicule setting would make a normal ``.env`` file unloadable, so only ``MANICULE_``
     names are considered here. Unknown *prefixed* names are still rejected, which is where
     a typo actually shows up.
@@ -247,7 +247,7 @@ class RedactionSettings(Section):
         description="Per-installation secret for ``method = 'hash'``, generated on first use "
         "and never sent anywhere. An *unsalted* digest of an email address is reversible by "
         "anyone with a word list, so sending one instead of the value would be privacy "
-        "theatre that costs answer quality and buys nothing.",
+        "theater that costs answer quality and buys nothing.",
     )
     timeout_s: float = Field(
         default=5.0,
@@ -1022,6 +1022,9 @@ class Settings(BaseSettings):
 
     @classmethod
     @override
+    # `settings_customise_sources` is pydantic-settings' own name for the hook it calls, and a
+    # name defined outside this repository is spelled the way its definition spells it. Under
+    # any other spelling this overrides nothing and the source order silently reverts.
     def settings_customise_sources(
         cls,
         settings_cls: type[BaseSettings],
@@ -1289,8 +1292,8 @@ def looks_secret(key: str) -> bool:
 
     One rule, used both to mask configuration for display and to omit it when writing.
     """
-    normalised = key.replace("-", "").replace("_", "").lower()
-    return any(marker.replace("_", "") in normalised for marker in _SECRET_KEYS)
+    normalized = key.replace("-", "").replace("_", "").lower()
+    return any(marker.replace("_", "") in normalized for marker in _SECRET_KEYS)
 
 
 def _mask(value: JsonValue, key: str = "") -> Any:  # noqa: ANN401 - recursive over JSON

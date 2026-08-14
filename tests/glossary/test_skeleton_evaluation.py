@@ -1,4 +1,4 @@
-"""The measured evaluation the ticket asks for, over a labelled corpus rather than the examples.
+"""The measured evaluation the ticket asks for, over a labeled corpus rather than the examples.
 
 Two halves, and both are needed for the same reason. **Detection** is measured line by line
 against :mod:`tests.glossary.skeleton_corpus`, which labels every line including the ones that
@@ -24,7 +24,7 @@ import pytest
 from manicule.core.retrieval import ConfidenceBand, Query
 from manicule.ingest.glossary import MIN_SKELETON_LENGTH, detect_entries
 from tests.evaluation.fakes import BagOfWordsEmbedder
-from tests.glossary import skeleton_corpus as labelled
+from tests.glossary import skeleton_corpus as labeled
 from tests.glossary import system
 from tests.glossary.corpus import passages
 from tests.storage_helpers import make_chunk, make_document
@@ -44,7 +44,7 @@ LIMIT = 10
 
 
 def _detected(line: str) -> list[GlossaryEntry]:
-    """Every entry one labelled line yields, **on a page that says it is a glossary**.
+    """Every entry one labeled line yields, **on a page that says it is a glossary**.
 
     The placement is not incidental. Off a glossary page a spaced hyphen scores 0.45 against a
     0.60 threshold, so every negative in this corpus would be refused by arithmetic that has
@@ -52,15 +52,15 @@ def _detected(line: str) -> list[GlossaryEntry]:
     earned. On one, the context evidence supplies the missing 0.15, the scoring gate admits every
     line, and what refuses the negatives is the expansion rules alone.
     """
-    document = make_document(source_id="glossary", title=labelled.GLOSSARY_TITLE)
-    chunk = make_chunk(document, 0, line, heading_path=(labelled.GLOSSARY_TITLE,))
-    return detect_entries([chunk], title=labelled.GLOSSARY_TITLE)
+    document = make_document(source_id="glossary", title=labeled.GLOSSARY_TITLE)
+    chunk = make_chunk(document, 0, line, heading_path=(labeled.GLOSSARY_TITLE,))
+    return detect_entries([chunk], title=labeled.GLOSSARY_TITLE)
 
 
-def test_detection_precision_and_recall_over_the_labelled_corpus() -> None:
+def test_detection_precision_and_recall_over_the_labeled_corpus() -> None:
     """The headline figures, and the baseline they are an improvement on.
 
-    Over 35 labelled lines — 18 positive, 17 negative — measured against this matcher and against
+    Over 35 labeled lines — 18 positive, 17 negative — measured against this matcher and against
     ``origin/main``'s:
 
     =========================  ===============  ==================
@@ -86,13 +86,13 @@ def test_detection_precision_and_recall_over_the_labelled_corpus() -> None:
     prose on a glossary page and six are constructed against the two new rules specifically. Zero
     are admitted.
     """
-    positives = [item for item in labelled.LABELLED if item.positive]
+    positives = [item for item in labeled.LABELED if item.positive]
     detections = 0
     right_term = 0
     right_boundary = 0
     false_positives: list[tuple[str, str, str]] = []
 
-    for item in labelled.LABELLED:
+    for item in labeled.LABELED:
         found = _detected(item.line)
         detections += len(found)
         hit = [entry for entry in found if entry.acronym == item.acronym] if item.positive else []
@@ -107,16 +107,16 @@ def test_detection_precision_and_recall_over_the_labelled_corpus() -> None:
 
     assert not false_positives, f"the widened matcher admitted prose: {false_positives}"
     assert detections == 18
-    assert right_term == len(positives) == 18, "recall is 1.000 over the labelled positives"
-    assert right_boundary == right_term, "every detected entry stored the labelled core expansion"
+    assert right_term == len(positives) == 18, "recall is 1.000 over the labeled positives"
+    assert right_boundary == right_term, "every detected entry stored the labeled core expansion"
 
 
 @pytest.mark.parametrize(
     "item",
-    [*labelled.CONVENTIONAL, *labelled.COMPOUND, *labelled.STYLIZED, *labelled.DESCRIBED],
+    [*labeled.CONVENTIONAL, *labeled.COMPOUND, *labeled.STYLIZED, *labeled.DESCRIBED],
     ids=lambda item: f"{item.category}-{item.acronym}",
 )
-def test_each_accepted_representation_is_read(item: labelled.Labelled) -> None:
+def test_each_accepted_representation_is_read(item: labeled.Labeled) -> None:
     """Every positive, one case each, so a convention that stops working is named in the failure.
 
     The ticket asks for every accepted representation to be documented. This is that list executed
@@ -130,10 +130,10 @@ def test_each_accepted_representation_is_read(item: labelled.Labelled) -> None:
 
 @pytest.mark.parametrize(
     "item",
-    [*labelled.COMPOUND_NEGATIVES, *labelled.SKELETON_NEGATIVES, *labelled.ORDINARY_MENTIONS],
+    [*labeled.COMPOUND_NEGATIVES, *labeled.SKELETON_NEGATIVES, *labeled.ORDINARY_MENTIONS],
     ids=lambda item: f"{item.category}-{item.line[:24]}",
 )
-def test_each_negative_is_refused_by_the_widened_matcher(item: labelled.Labelled) -> None:
+def test_each_negative_is_refused_by_the_widened_matcher(item: labeled.Labeled) -> None:
     """The other half, and the half the widening had to be measured against.
 
     Each of these is the negative case that limits one accepted representation, on a glossary page
@@ -142,7 +142,7 @@ def test_each_negative_is_refused_by_the_widened_matcher(item: labelled.Labelled
     assert _detected(item.line) == []
 
 
-@pytest.mark.parametrize(("line", "acronym", "expansion"), labelled.KEPT_WHOLE)
+@pytest.mark.parametrize(("line", "acronym", "expansion"), labeled.KEPT_WHOLE)
 def test_no_initials_agreement_still_means_no_cut(line: str, acronym: str, expansion: str) -> None:
     """The conservative half of the boundary rule, measured against the *wider* matcher.
 
@@ -182,12 +182,12 @@ async def _corpus(store: SqliteDocStore) -> list[Chunk]:
     """
     chunks: list[Chunk] = []
     for source_id, title, texts in (
-        ("skeleton-glossary", labelled.GLOSSARY_TITLE, [labelled.definitions_page()]),
-        ("skeleton-second", labelled.SECOND_TITLE, [labelled.second_page()]),
+        ("skeleton-glossary", labeled.GLOSSARY_TITLE, [labeled.definitions_page()]),
+        ("skeleton-second", labeled.SECOND_TITLE, [labeled.second_page()]),
         (
             "skeleton-handbook",
-            labelled.HANDBOOK_TITLE,
-            [*passages(), *labelled.HOMOGRAPH_USES],
+            labeled.HANDBOOK_TITLE,
+            [*passages(), *labeled.HOMOGRAPH_USES],
         ),
     ):
         _, indexed = await system.index(store, source_id, title, texts)
@@ -235,7 +235,7 @@ async def test_hit_rate_for_definitional_questions(store: SqliteDocStore) -> Non
     exactly the kind of round number this corpus exists to avoid.
 
     Three of these ask in a case the source never wrote — ``what is sort?``, ``what does safer
-    stand for?``, ``what is recap?`` — and they resolve because the *key* is normalised. That is
+    stand for?``, ``what is recap?`` — and they resolve because the *key* is normalized. That is
     requirement 1 measured rather than asserted: the skeleton is a comparison form and resolves
     nothing, so a lookup that had quietly started using it would fail all three.
     """
@@ -245,7 +245,7 @@ async def test_hit_rate_for_definitional_questions(store: SqliteDocStore) -> Non
 
     hits = {1: 0, 3: 0, 10: 0}
     baseline_hits = {1: 0, 3: 0, 10: 0}
-    for text, acronym in labelled.DEFINITIONAL_QUERIES:
+    for text, acronym in labeled.DEFINITIONAL_QUERIES:
         defining = entries[acronym].chunk_id
         after = system.rank_of((await wired.retrieve(_ask(text))).context.passages, defining)
         before = system.rank_of((await baseline.retrieve(_ask(text))).context.passages, defining)
@@ -272,7 +272,7 @@ async def test_unsupported_questions_are_rejected(store: SqliteDocStore) -> None
     _, wired = await _retrievers(store, chunks)
 
     fired: list[str] = []
-    for text in labelled.UNSUPPORTED_QUERIES:
+    for text in labeled.UNSUPPORTED_QUERIES:
         result = await wired.retrieve(_ask(text))
         assert result.confidence is not None
         if (result.expansion is not None and result.expansion.fired) or (
@@ -295,7 +295,7 @@ async def test_using_a_defined_token_is_not_asking_what_it_means(store: SqliteDo
     _, wired = await _retrievers(store, chunks)
 
     classified: list[str] = []
-    for text in labelled.NON_DEFINITIONAL_QUERIES:
+    for text in labeled.NON_DEFINITIONAL_QUERIES:
         result = await wired.retrieve(_ask(text))
         assert result.confidence is not None
         if result.confidence.explicit_definition:
@@ -322,9 +322,9 @@ async def test_no_confidence_band_moves(store: SqliteDocStore) -> None:
     baseline, wired = await _retrievers(store, chunks)
 
     queries = [
-        *(text for text, _ in labelled.DEFINITIONAL_QUERIES),
-        *labelled.UNSUPPORTED_QUERIES,
-        *labelled.NON_DEFINITIONAL_QUERIES,
+        *(text for text, _ in labeled.DEFINITIONAL_QUERIES),
+        *labeled.UNSUPPORTED_QUERIES,
+        *labeled.NON_DEFINITIONAL_QUERIES,
     ]
     moved: list[tuple[str, ConfidenceBand, float, ConfidenceBand, float]] = []
     for text in queries:
@@ -412,9 +412,9 @@ def test_detection_needs_no_embedding_backend_and_repeats_exactly() -> None:
     embedding backends" is true of it in the strong sense: it cannot observe which backend is
     installed. ``tests/test_import_boundary.py`` makes the same claim about ``manicule.ingest`` as
     a package; this makes it about the module that grew a new comparison form, where a helper
-    reaching for a normaliser out of an embedding package would be an easy mistake to make.
+    reaching for a normalizer out of an embedding package would be an easy mistake to make.
 
-    **Same input, same entries.** Detection over the whole labelled corpus twice, compared field
+    **Same input, same entries.** Detection over the whole labeled corpus twice, compared field
     by field. The rule that could break this is the new one: :func:`initials_forms` returns a
     ``frozenset``, and a set iterated into a result would order entries by hash seed rather than
     by the document. It does not — the sets are intersected and never iterated into output — and
@@ -433,8 +433,8 @@ def test_detection_needs_no_embedding_backend_and_repeats_exactly() -> None:
 
     assert json.loads(loaded.stdout) == [], "importing the detector loaded an embedding backend"
 
-    first = [_detected(item.line) for item in labelled.LABELLED]
-    second = [_detected(item.line) for item in labelled.LABELLED]
+    first = [_detected(item.line) for item in labeled.LABELED]
+    second = [_detected(item.line) for item in labeled.LABELED]
 
     assert first == second
 

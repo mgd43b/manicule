@@ -1,6 +1,6 @@
 """The same fixture through the shipped embedder, because the argument rests on a measurement.
 
-``tests/glossary/test_retrieval.py`` proves the behaviour deterministically, with a bag-of-words
+``tests/glossary/test_retrieval.py`` proves the behavior deterministically, with a bag-of-words
 stand-in. That is the right tool for a guard — it runs in milliseconds and cannot drift — but it
 cannot settle the question this feature was justified by, which is what **BGE-M3** does with this
 corpus. A stand-in embedder can be made to fail by choosing the fixture, and the accusation
@@ -74,8 +74,8 @@ async def test_the_real_embedder_buries_the_definition_and_the_glossary_recovers
     *lookup* rather than from the expanded embedding.
 
     This line read 0.4655 and that figure is **not** something the supplement moved: re-measuring
-    the 61-chunk corpus, with the glossary page byte-identical to what it has always been, also
-    produces 0.4368. The two were measured differently and the older method is not recorded. The
+    the 61-chunk corpus, with the glossary page as it then stood, also produces 0.4368. The two
+    were measured differently and the older method is not recorded. The
     claim that rests on it is unaffected either way — both values sit below the noise floor, which
     is the whole of what the sentence is for. ``docs/retrieval.md`` §14.1 and the historical table
     in ``corpus.py`` still quote 0.4655 and are left alone: they describe how the fixture was

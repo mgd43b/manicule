@@ -10,7 +10,7 @@ passage misrepresents a source. If a turn does not fit, it is dropped.
 gone leaves the model an answer to something it cannot see, which is worse than having
 neither — it invites the model to infer the missing question.
 
-**No summarisation.** A rolling summary is a generated artefact that then gets treated as a
+**No summarization.** A rolling summary is a generated artifact that then gets treated as a
 record of what was said, and it costs a model call per turn.
 
 The current user turn is never dropped: it is the question. If it alone does not fit, that is
@@ -33,7 +33,7 @@ _MARKER = re.compile(
     rf"{re.escape(ATTEMPT_PREFIX)}\s*:\s*(\d+(?:\s*,\s*\d+)*)\s*{re.escape(MARKER_CLOSE)}",
     re.IGNORECASE,
 )
-"""Markers in a stored answer, for neutralisation. Whole-string rather than incremental:
+"""Markers in a stored answer, for neutralization. Whole-string rather than incremental:
 history is complete text, not a stream."""
 
 
@@ -52,7 +52,7 @@ class Turn:
         return None
 
 
-def neutralise_markers(turn: Turn) -> str:
+def neutralize_markers(turn: Turn) -> str:
     """Rewrite a stored answer's markers into a non-bindable textual reference.
 
     **Slot numbers are per-answer.** Turn 1's ``[[cite:3]]`` referred to turn 1's third
@@ -82,13 +82,13 @@ def neutralise_markers(turn: Turn) -> str:
 
 
 def as_message(turn: Turn) -> ChatMessage:
-    """One turn as the provider will see it, with markers neutralised and syntax escaped.
+    """One turn as the provider will see it, with markers neutralized and syntax escaped.
 
     ``escape_markers`` runs afterwards for the same reason it runs on a passage: a *user*
     turn can contain marker syntax the model would otherwise copy, and a user can paste
     anything.
     """
-    content = neutralise_markers(turn) if turn.role == "assistant" else turn.content
+    content = neutralize_markers(turn) if turn.role == "assistant" else turn.content
     return {"role": turn.role, "content": escape_markers(content)}
 
 
@@ -162,4 +162,4 @@ def _pairs(turns: Sequence[Turn]) -> list[tuple[Turn, ...]]:
     return grouped
 
 
-__all__ = ["HistoryPlan", "Turn", "as_message", "fit_history", "neutralise_markers"]
+__all__ = ["HistoryPlan", "Turn", "as_message", "fit_history", "neutralize_markers"]

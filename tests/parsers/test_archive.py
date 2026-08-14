@@ -260,7 +260,7 @@ async def test_a_wide_archive_stops_at_the_member_count_limit(corpus: Path) -> N
     assert "member count exceeded" in _failures(outcomes)[0].reason
 
 
-async def test_a_tree_budget_already_spent_upstream_is_honoured(
+async def test_a_tree_budget_already_spent_upstream_is_honored(
     parser: ArchiveParser, corpus: Path
 ) -> None:
     """The budgets are whole-tree, and this parser expands one level.
@@ -283,9 +283,9 @@ async def test_a_tree_budget_already_spent_upstream_is_honoured(
 async def test_members_whose_names_collide_get_one_address_each(corpus: Path) -> None:
     """An archive contributes as many documents as it has members, or says why not.
 
-    Three of these entries normalise to one name — a literal duplicate, which appending to a
-    zip produces, and a ``./``-prefixed spelling — and two hostile names normalise to none.
-    Storage reconciles members by ``source_id``, which is derived from the normalised name, so
+    Three of these entries normalize to one name — a literal duplicate, which appending to a
+    zip produces, and a ``./``-prefixed spelling — and two hostile names normalize to none.
+    Storage reconciles members by ``source_id``, which is derived from the normalized name, so
     a collision is not an error anybody sees: the later member overwrites the earlier one and
     the archive quietly contributes fewer documents than it contains. Counting the addresses
     is the only way that shows up.
@@ -304,7 +304,7 @@ async def test_members_whose_names_collide_get_one_address_each(corpus: Path) ->
 async def test_a_member_named_to_escape_the_archive_root_is_rejected_and_never_rewritten(
     parser: ArchiveParser, corpus: Path
 ) -> None:
-    """Sanitising ``../escape.txt`` into ``escape.txt`` invents a document.
+    """Sanitizing ``../escape.txt`` into ``escape.txt`` invents a document.
 
     Members are parsed in memory and never written to disk, so the traversal cannot touch the
     filesystem — but the name still becomes a ``uri`` shown to users and stored in the index,
@@ -325,7 +325,7 @@ async def test_a_symlink_member_is_skipped_with_a_reason(
 ) -> None:
     """A zip can name a file outside itself in the Unix external attributes.
 
-    Nothing follows one today. The defence is against an extraction path being added later
+    Nothing follows one today. The defense is against an extraction path being added later
     without remembering, which is exactly the kind of change nobody re-reads this file before
     making.
     """
@@ -385,7 +385,7 @@ async def test_a_member_carries_the_path_hashes_that_will_detect_a_cycle_below_i
     """The recursion path travels with the member, because the parser holds no state.
 
     Without it every level would start its cycle detection over and a self-referential archive
-    would descend until the depth limit caught it — which is a limit, not a defence.
+    would descend until the depth limit caught it — which is a limit, not a defense.
     """
     members = _members(await _expand(parser, _raw(corpus, "nested.zip")))
     inner = next(member for member in members if member.uri.endswith("inner.zip"))

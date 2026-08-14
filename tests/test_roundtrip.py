@@ -19,7 +19,7 @@ from manicule.testing import (
     RoundTripReport,
     assert_location_budget,
     assert_round_trip,
-    normalise,
+    normalize,
 )
 
 MEDIA_TYPE = "text/plain"
@@ -113,7 +113,7 @@ async def test_an_anchor_covering_the_whole_document_is_caught_by_tightness() ->
     """Containment alone is satisfied by pointing at everything.
 
     Tightness is what does the real work: an anchor much larger than the text it addresses
-    cites its neighbours too, and the citation still resolves.
+    cites its neighbors too, and the citation still resolves.
     """
     with pytest.raises(AssertionError, match="resolves to"):
         await assert_round_trip(WholeDocumentParser(), _raw())
@@ -377,7 +377,7 @@ async def test_an_unlocated_anchor_must_not_resolve_to_anything() -> None:
         await assert_round_trip(ConfusedParser(), _raw())
 
 
-# --- normalisation -------------------------------------------------------------------------
+# --- normalization -------------------------------------------------------------------------
 
 
 def test_de_hyphenation_runs_before_whitespace_is_collapsed() -> None:
@@ -387,14 +387,14 @@ def test_de_hyphenation_runs_before_whitespace_is_collapsed() -> None:
     hyphenated words simply stop being joined and every affected comparison quietly starts
     relying on the substring check being lenient.
     """
-    assert normalise("config-\nuration options") == "configuration options"
+    assert normalize("config-\nuration options") == "configuration options"
 
 
 def test_ligatures_and_invisible_characters_are_folded_but_content_is_not_rewritten() -> None:
     """NFC rather than NFKC: NFKC would fold the ligatures for free and also rewrite ``½``,
     superscripts and full-width forms, which are content a citation must reproduce."""
-    assert normalise("ﬁle sepa­rately\u200b now") == "file separately now"
-    assert normalise("½ cup") == "½ cup"
+    assert normalize("ﬁle sepa­rately\u200b now") == "file separately now"
+    assert normalize("½ cup") == "½ cup"
 
 
 async def test_a_line_anchor_that_is_one_line_out_is_caught() -> None:

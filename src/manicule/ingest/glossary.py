@@ -25,13 +25,13 @@ and they are independent on purpose:
 
 **A term is three strings, and keeping them apart is a correctness property.** The *display* is
 what the source wrote — ``SaFeR`` — and it is stored verbatim, because a citation should quote
-the document rather than our normalisation. The *lookup key* is
-:func:`~manicule.core.glossary.normalise_acronym` of it — ``SAFER`` — and it is the only one of
+the document rather than our normalization. The *lookup key* is
+:func:`~manicule.core.glossary.normalize_acronym` of it — ``SAFER`` — and it is the only one of
 the three that anything resolves through, at ingest and at query time alike. The *initial
 skeleton* is :func:`initial_skeleton` of it — ``SFR`` — and it is a **comparison form**: it exists
-so that ``Service Failure Reporter`` can be recognised as the expansion, and it is stored nowhere,
+so that ``Service Failure Reporter`` can be recognized as the expansion, and it is stored nowhere,
 resolves nothing, and breaks no tie. Two definitions of ``SAFER`` disagree whatever their
-capitalisation says. The skeleton is computed where it is compared for exactly that reason — a
+capitalization says. The skeleton is computed where it is compared for exactly that reason — a
 stored copy is how a comparison form becomes a second key by accident.
 """
 
@@ -45,7 +45,7 @@ from manicule.core.glossary import (
     MAX_ACRONYM_LENGTH,
     DefinitionForm,
     GlossaryEntry,
-    normalise_acronym,
+    normalize_acronym,
 )
 
 if TYPE_CHECKING:
@@ -107,7 +107,7 @@ candidate can write for itself is not evidence, and 0.45 + 0.15 is exactly
 
 The title and the heading path are the two things a chunk cannot edit about itself. Dropping the
 first line lost nothing measurable: over every fixture in ``tests/glossary`` — both glossary
-pages, the forty-five ordinary passages, ``PROSE_ON_THE_GLOSSARY_PAGE``, and the whole labelled
+pages, the forty-five ordinary passages, ``PROSE_ON_THE_GLOSSARY_PAGE``, and the whole labeled
 skeleton corpus — the detected set is identical before and after.
 """
 
@@ -160,7 +160,7 @@ _NEVER_OPENS_AN_EXPANSION: Final[frozenset[str]] = frozenset(
         # Words that point instead of naming. ``this paragraph describes an operational
         # consideration`` refers to something already on the page; an expansion is self-contained
         # and refers to nothing, because it *is* the thing being introduced. ``_LEADING_ARTICLES``
-        # already makes this judgement about ``this`` for the parenthetical form — same call,
+        # already makes this judgment about ``this`` for the parenthetical form — same call,
         # applied to the other forms.
         "he",
         "it",
@@ -285,7 +285,7 @@ def brackets_balance(text: str) -> bool:
 
     **A stored expansion with an unmatched bracket is not untidy, it is a signature.** It is what
     truncation inside a parenthetical leaves behind, and it cannot arise from a source phrase that
-    was cut at a place its author would recognise. Checking it costs one pass and catches the
+    was cut at a place its author would recognize. Checking it costs one pass and catches the
     whole family without anybody having to understand which boundary rule went wrong — which is
     the argument for keeping it even though :func:`_description_boundaries` now prevents the case
     that motivated it. Measured: with the boundary model correct and this check removed,
@@ -324,7 +324,7 @@ def _description_boundaries(text: str) -> list[int]:
     ``Regional Network Edge (e.g`` then *passed* :func:`initials_match`, because
     :func:`initials_of` keeps only words whose first character is alphabetic — ``(e.g`` begins
     with a bracket, contributed nothing, and the three surviving words spelled ``RNE`` exactly.
-    So the cut was awarded by an artefact of that filter rather than by evidence, and ``RNE`` was
+    So the cut was awarded by an artifact of that filter rather than by evidence, and ``RNE`` was
     stored as meaning ``Regional Network Edge (e.g``.
 
     **A top-level opening bracket is itself a candidate.** Skipping the nested punctuation alone
@@ -341,7 +341,7 @@ def _description_boundaries(text: str) -> list[int]:
     no prefix before it agrees.
 
     **When a trailing bracket survives, in two clauses and no others.** An earlier draft of this
-    summarised it as "kept from a short line, dropped from a long one", which is true of the
+    summarized it as "kept from a short line, dropped from a long one", which is true of the
     fixtures it was written from and false in general — ``Regional Network Edge (Type Two)`` is
     short and is cut. The rule as implemented is:
 
@@ -377,7 +377,7 @@ def _description_boundaries(text: str) -> list[int]:
     prefer the *longest* agreeing prefix at a bracket, which would invert shortest-wins for this
     one position and would keep ``Regional Network Edge (e.g., a gateway)`` for the same reason.
     Nothing available here tells a qualifier from an example — that is another verb test — so the
-    choice is which way to be wrong, and it is made in favour of the rule that already governs
+    choice is which way to be wrong, and it is made in favor of the rule that already governs
     every other boundary.
 
     **No list of example markers.** ``e.g.`` and ``for example`` are what the specification names,
@@ -410,7 +410,7 @@ _UPPERCASE_SHARE: Final = 0.6
 """How much of a term's alphabetic content must be upper case.
 
 Not 1.0, because ``IPv6`` is an abbreviation — two of its three letters are upper case, so it
-clears 0.6 and would fail a stricter rule. Not lower, because at 0.5 a two-letter capitalised
+clears 0.6 and would fail a stricter rule. Not lower, because at 0.5 a two-letter capitalized
 word — ``It``, ``Of`` — becomes an abbreviation and every sentence beginning becomes a candidate.
 
 **This share is only half of the gate, and the other half is not negotiable by tuning it.**
@@ -419,7 +419,7 @@ at the first character whatever its share. ``mDNS`` is 0.75 upper and still refu
 ``eSIM`` and ``gRPC``. This docstring used to cite ``mDNS`` as a reason for the value of this
 constant, which was wrong twice over: the constant does not admit it, and no value of the constant
 could. Lower-case-initial abbreviations are outside what this module detects. Widening it is a
-behaviour change across all six written forms — every sentence that begins ``it``, ``the`` or
+behavior change across all six written forms — every sentence that begins ``it``, ``the`` or
 ``and`` becomes a candidate term — and it wants its own measurement, not an edit here.
 """
 
@@ -434,7 +434,7 @@ _CAMEL_COMPONENT_RE: Final = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 ``SORT — SecOps Reliability Toolkit`` is a definition whose ordinary word initials spell ``SRT``
 and whose *component* initials spell the term. The boundary is a property of the writer's own
-capitalisation, so this is one decomposition rather than a search — ``SecOps`` yields ``Sec`` and
+capitalization, so this is one decomposition rather than a search — ``SecOps`` yields ``Sec`` and
 ``Ops`` and nothing else can be read out of it.
 
 **Only this boundary, and the omission is the limit of the rule.** ``HTTPServer`` is not split;
@@ -454,7 +454,7 @@ MIN_SKELETON_LENGTH: Final = 3
 **The bound on the one widening in this module that runs in the dangerous direction.** A skeleton
 is shorter than the key it stands beside — that is what it is for — and a shorter comparison form
 is a weaker constraint, because fewer words have to agree before a prefix may call itself the
-expansion. Swept over the labelled corpus in ``tests/glossary/skeleton_corpus.py``, 18 positives
+expansion. Swept over the labeled corpus in ``tests/glossary/skeleton_corpus.py``, 18 positives
 and 17 negatives:
 
 =====  ==========  =======  ===================  ==========================================
@@ -581,7 +581,7 @@ The arithmetic then does the work: 0.35 + :data:`GLOSSARY_CONTEXT_EVIDENCE` is 0
 say-so; with initials agreement it reaches 0.70. ``NOW (Network Operations Workspace)`` is
 recorded and ``CPU (central processor)`` is not — **which is the answer the prose form already
 gives**: ``The central processor (CPU) executes instructions.`` is refused today by the same sum.
-Consistency with a rule that exists, rather than a new judgement about headings.
+Consistency with a rule that exists, rather than a new judgment about headings.
 
 **What taking 0.45 would actually cost, measured rather than assumed.** An earlier draft of this
 said ``CPU (central processor)`` would then be stored, and that is false: under ``HEADING`` it is
@@ -613,7 +613,7 @@ a list".
 
 **Removing it is what makes a bulleted glossary detectable at all**, and the gap was total rather
 than partial. Every form anchors its term at the first non-space character — ``_HYPHEN_RE`` and
-its two neighbours all begin ``^\\s*(?P<term>...)`` — and a marker occupies exactly that position,
+its two neighbors all begin ``^\\s*(?P<term>...)`` — and a marker occupies exactly that position,
 so a bullet defeated all three at once. Measured on ``origin/main``:
 
 - ``detect_in_chunk('- HDR - Hot Draining Router')`` → ``[]``
@@ -651,15 +651,15 @@ def initial_skeleton(display: str) -> str:
     """The significant skeleton of a deliberately mixed-case spelling. Empty when there is none.
 
     ``SaFeR`` is written with lower-case letters that belong to its *spelling* and not to its
-    initials: the writer capitalised ``S``, ``F`` and ``R`` because those are the letters the
+    initials: the writer capitalized ``S``, ``F`` and ``R`` because those are the letters the
     expansion's words begin with, and left ``a`` and ``e`` in lower case because they are
     connective. The skeleton is the upper-case and numeric characters in order — ``SFR``.
 
-    **A comparison form, never a key.** :func:`~manicule.core.glossary.normalise_acronym` owns
+    **A comparison form, never a key.** :func:`~manicule.core.glossary.normalize_acronym` owns
     the lookup and keeps it: ``SaFeR`` stores under ``SAFER``, a reader who types ``safer`` finds
     it, and a reader who types ``SFR`` does not, because ``SFR`` is never written anywhere. It is
     also never a tie-breaker — two definitions of ``SAFER`` are two definitions of ``SAFER``
-    whatever their internal capitalisation says, which is the ticket's requirement 7 and the
+    whatever their internal capitalization says, which is the ticket's requirement 7 and the
     reason this is a function rather than a field. A stored skeleton is a second copy that can
     disagree with the spelling it came from, and a second copy is how a comparison form becomes a
     key by accident.
@@ -683,12 +683,12 @@ def initial_skeleton(display: str) -> str:
     dropping it would leave ``IP``, two characters, and the bound would refuse that anyway.
 
     **NFKC first, because a comparison form in the wrong normal form compares against nothing.**
-    :func:`~manicule.core.glossary.normalise_acronym` normalises deliberately, so a ``SaFeR``
+    :func:`~manicule.core.glossary.normalize_acronym` normalizes deliberately, so a ``SaFeR``
     whose capitals are written full-width still keys under an ASCII ``SAFER``. Reading the display
     raw skeletoned it to a full-width ``SFR``, and :func:`term_forms` then held one member of each
     kind. No expansion's initials can spell a full-width string, so that skeleton was not merely
     wrong, it was unreachable — a stylized term with any compatibility character in it silently
-    lost the second form this function exists to give it. Normalising here repairs a full-width
+    lost the second form this function exists to give it. Normalizing here repairs a full-width
     digit the same way, so an ``IPv6`` written with one skeletons to ``IP6`` rather than to
     something no expansion and no bound can read.
     """
@@ -708,19 +708,19 @@ def initial_skeleton(display: str) -> str:
 def term_forms(acronym: str, display: str = "") -> frozenset[str]:
     """Every spelling of a term that an expansion's initials are allowed to spell.
 
-    At most two: the normalised key, and the :func:`initial_skeleton` of the source's own
+    At most two: the normalized key, and the :func:`initial_skeleton` of the source's own
     spelling when there is one. Both are computed from the term alone.
 
     **Nothing here reads the expansion**, and that is half of why requirement 3 holds. The set of
     strings a phrase is permitted to spell is fixed before any phrase is looked at, so no phrase
     can widen it by containing the right letters.
 
-    **Both members are NFKC-normalised here rather than assumed to be**, because the two callers
+    **Both members are NFKC-normalized here rather than assumed to be**, because the two callers
     disagree about what they pass. :func:`detect_in_chunk` passes a
-    :func:`~manicule.core.glossary.normalise_acronym` key, already normalised.
+    :func:`~manicule.core.glossary.normalize_acronym` key, already normalized.
     :func:`_phrase_before` passes the raw surface the parentheses held, deliberately, and there
     that surface *is* the display
-    spelling. Normalising only in :func:`initial_skeleton` would leave that second caller building
+    spelling. Normalizing only in :func:`initial_skeleton` would leave that second caller building
     a set whose two members were in different normal forms from each other, which is the same
     unreachable-comparison-form defect one call site along. A set intersection is only meaningful
     over one normal form, so this is the place that owns it.
@@ -744,10 +744,10 @@ def initials_of(
     rule about letters rather than about words.
 
     **The expansion is read raw, and unlike the term side that is a decision rather than an
-    oversight.** :func:`term_forms` NFKC-normalises both of its members because a key that has
-    been normalised and a skeleton that has not cannot be compared; the expansion has no such
-    disagreement to repair, since nothing normalises it anywhere —
-    :func:`~manicule.core.glossary.normalise_expansion` is case and whitespace only, on purpose.
+    oversight.** :func:`term_forms` NFKC-normalizes both of its members because a key that has
+    been normalized and a skeleton that has not cannot be compared; the expansion has no such
+    disagreement to repair, since nothing normalizes it anywhere —
+    :func:`~manicule.core.glossary.normalize_expansion` is case and whitespace only, on purpose.
     Adding NFKC *here* would not align two forms, it would change what a word boundary is, and
     measured on this function it changes four readings. A full-width ``Secure Automated
     Framework`` stops giving a full-width ``SAF`` and starts giving an ASCII one, which is the
@@ -918,7 +918,7 @@ def core_expansion(acronym: str, expansion: str, *, display: str = "") -> str:
 
     The opening test applies only in the second case, which is also the only case where it can do
     harm — measured at 24 of 26 real definitions kept before the abbreviation exemption and 26 of
-    26 after. Initials agreement is a property of two strings and outranks a judgement made from
+    26 after. Initials agreement is a property of two strings and outranks a judgment made from
     one word of one of them.
 
     **``display`` widens what counts as initials agreement, and therefore widens the authority to
@@ -1057,7 +1057,7 @@ def _phrase_before(captured: str, term: str) -> str:
     when a description follows it — and answers it the same way, by asking the acronym. Change
     one and read the other.
 
-    ``term`` is the surface the parentheses held rather than a normalised key, and it is used as
+    ``term`` is the surface the parentheses held rather than a normalized key, and it is used as
     both spellings :func:`initials_match` accepts. Renamed from ``acronym`` when the second
     spelling arrived: it had always been the display form, and calling it the key made the call
     below look like a mistake.
@@ -1199,9 +1199,9 @@ def detect_in_chunk(chunk: Chunk, *, glossary_context: bool = False) -> list[Glo
     for candidate in candidates:
         if not acronym_shaped(candidate.display):
             continue
-        acronym = normalise_acronym(candidate.display)
+        acronym = normalize_acronym(candidate.display)
         expansion = core_expansion(acronym, candidate.expansion, display=candidate.display)
-        if not acronym or not expansion or normalise_acronym(expansion) == acronym:
+        if not acronym or not expansion or normalize_acronym(expansion) == acronym:
             continue
         if candidate.form is DefinitionForm.HEADING and not a_heading_may_define(
             acronym, expansion, display=candidate.display
@@ -1219,7 +1219,7 @@ def detect_in_chunk(chunk: Chunk, *, glossary_context: bool = False) -> list[Glo
         aliases = tuple(
             dict.fromkeys(
                 key
-                for key in (normalise_acronym(extra) for extra in candidate.extra)
+                for key in (normalize_acronym(extra) for extra in candidate.extra)
                 if key and key != acronym
             )
         )

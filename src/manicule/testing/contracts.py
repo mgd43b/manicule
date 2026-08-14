@@ -29,7 +29,7 @@ from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
 from manicule.core.embedding import EmbedFingerprint, Pooling, Vector, VectorState
 from manicule.core.errors import ContextOverflowError, FingerprintMismatchError, ManiculeError
-from manicule.core.organisation import ChunkRelationType, CitationState, CollectionRule
+from manicule.core.organization import ChunkRelationType, CitationState, CollectionRule
 from manicule.core.protocols import (
     Chunker,
     ChunkRelationStore,
@@ -57,7 +57,7 @@ async def closing[T](iterator: AsyncIterator[T]) -> AsyncGenerator[AsyncIterator
     """Consume an async iterator and close it deterministically if it can be closed.
 
     An async *generator* suspended at a ``yield`` holds whatever it had open — a database
-    session, a file, an HTTP response — until it is finalised. Drained bare, that finalisation
+    session, a file, an HTTP response — until it is finalized. Drained bare, that finalization
     happens at garbage-collection time through the event loop's async-generator hook, possibly
     after the loop it belongs to has closed. That is a resource leak at best and an
     interpreter crash at worst; it has been observed to segfault CPython 3.13.
@@ -85,7 +85,7 @@ def _require(condition: object, message: str) -> None:
         _fail(message)
 
 
-def _normalise(text: str) -> str:
+def _normalize(text: str) -> str:
     """Collapse whitespace, which parsers legitimately reflow."""
     return " ".join(text.split())
 
@@ -197,7 +197,7 @@ async def assert_parser_contract(parser: Parser, raw: RawDocument) -> list[Parse
             f"resolved is a citation that cannot be checked; emit Unlocated instead",
         )
         _require(
-            _normalise(block.text) in _normalise(resolved or ""),
+            _normalize(block.text) in _normalize(resolved or ""),
             f"{where}: the anchor resolves to text the block does not claim.\n"
             f"  block:    {block.text[:120]!r}\n"
             f"  resolved: {(resolved or '')[:120]!r}",
@@ -252,7 +252,7 @@ def assert_chunker_contract(
             f"{where}: position is {chunk.position}, breaking document order",
         )
         _require(
-            _normalise(chunk.text) in _normalise(chunk.embed_text),
+            _normalize(chunk.text) in _normalize(chunk.embed_text),
             f"{where}: embed_text does not contain text. embed_text carries the heading "
             f"breadcrumb *and* the text; dropping the text embeds the scaffolding alone",
         )
@@ -440,9 +440,9 @@ async def assert_vector_store_reuses_by_embedding_input(
     original = list(chunks[:needed])
     if len(original) < needed:  # pragma: no cover - the caller supplies a fixture with enough
         _fail("this check needs at least three chunks to move one and leave two alone")
-    # One-hot, so every vector is already unit length and a store that L2-normalises on write
+    # One-hot, so every vector is already unit length and a store that L2-normalizes on write
     # and one that does not both hand back exactly what they were given. The comparison below
-    # is then about reuse rather than about which store normalises where.
+    # is then about reuse rather than about which store normalizes where.
     vectors: list[Vector] = [
         [1.0 if column == row else 0.0 for column in range(8)] for row in range(len(original))
     ]
@@ -817,7 +817,7 @@ async def assert_pipeline_enforces_scope(
     return candidates
 
 
-# --- organisation --------------------------------------------------------------------------
+# --- organization --------------------------------------------------------------------------
 #
 # Five suites for five protocols, and every one of them spends most of its length on the same
 # two properties, because those are the two that fail silently. **A write that names something
@@ -876,7 +876,7 @@ async def assert_collection_store_contract(
     _require(
         found is not None and found.id == collection.id,
         "a name with surrounding whitespace did not find the collection it names. Names are "
-        "normalised on the way in, so they must be normalised on the way out too — otherwise "
+        "normalized on the way in, so they must be normalized on the way out too — otherwise "
         "a label typed with a trailing space is a second, invisible collection",
     )
 
@@ -982,7 +982,7 @@ async def assert_tag_store_contract(
     )
     _require(
         again.color == tag.color,
-        "ensure_tag overwrote an existing tag's colour. Applying a label is a repeated "
+        "ensure_tag overwrote an existing tag's color. Applying a label is a repeated "
         "operation, and the last person to type the name should not decide how it looks",
     )
 
@@ -1228,7 +1228,7 @@ async def assert_chunk_relation_store_contract(
     _require(
         from_child[0].other_than(child) == parent and from_child[0].points_away_from(child),
         "an edge read from its source end lost its direction. For a parent link the two "
-        "directions mean opposite things, and a set of neighbours cannot recover which",
+        "directions mean opposite things, and a set of neighbors cannot recover which",
     )
 
     from_parent = await store.related(parent)

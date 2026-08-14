@@ -1,4 +1,4 @@
-"""Watching a directory, and the editor behaviour a naive watcher gets wrong."""
+"""Watching a directory, and the editor behavior a naive watcher gets wrong."""
 
 from __future__ import annotations
 

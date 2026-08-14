@@ -1,4 +1,4 @@
-"""Reading a file of judgements, per intent category, without overclaiming.
+"""Reading a file of judgments, per intent category, without overclaiming.
 
 Three properties, and each is a refusal or a disclosure rather than a calculation.
 
@@ -16,8 +16,8 @@ convention about how to present results — a field, set from the query set's de
 provenance, that the rendering reads.
 
 And it refuses more than it reports. Records from different systems, different corpora or
-different provenance are not summarised together, and records carrying a side that was at
-chance are not summarised at all.
+different provenance are not summarized together, and records carrying a side that was at
+chance are not summarized at all.
 """
 
 from __future__ import annotations
@@ -72,12 +72,12 @@ class IntentSummary(BaseModel):
 
     @property
     def decided(self) -> int:
-        """Judgements that expressed a preference. Ties and ``neither`` are not among them."""
+        """Judgments that expressed a preference. Ties and ``neither`` are not among them."""
         return self.left_wins + self.right_wins
 
     @property
     def left_win_rate(self) -> float | None:
-        """Left's share of the decided judgements, or ``None`` when none were decided.
+        """Left's share of the decided judgments, or ``None`` when none were decided.
 
         ``None`` rather than 0.5, because "nothing was decided" and "they split evenly" are
         different findings and only one of them is about the systems.
@@ -106,7 +106,7 @@ class IntentSummary(BaseModel):
 
 
 class PreferenceReport(BaseModel):
-    """A whole file of judgements, summarised and labelled."""
+    """A whole file of judgments, summarized and labeled."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -188,14 +188,14 @@ def _render_row(row: IntentSummary, left_label: str) -> str:
 
 
 def build_report(records: Iterable[PreferenceRecord]) -> PreferenceReport:
-    """Summarise a set of records, or refuse to.
+    """Summarize a set of records, or refuse to.
 
     Raises:
         IncomparableRecordsError: There are no records, or they span more than one pair of
             systems, more than one corpus, or more than one query-set provenance. Averaging
             across any of those produces a figure nobody can attribute to anything.
         AtChanceError: A record names a side that did not beat chance. Such a record should
-            not exist, and summarising one would launder noise into a rate.
+            not exist, and summarizing one would launder noise into a rate.
     """
     collected = list(records)
     if not collected:
@@ -213,7 +213,7 @@ def build_report(records: Iterable[PreferenceRecord]) -> PreferenceReport:
             excluded[reason] = excluded.get(reason, 0) + 1
 
     by_intent = tuple(
-        _summarise([r for r in admissible if r.intent is intent], intent=intent)
+        _summarize([r for r in admissible if r.intent is intent], intent=intent)
         for intent in sorted({record.intent for record in admissible})
     )
     return PreferenceReport(
@@ -230,7 +230,7 @@ def build_report(records: Iterable[PreferenceRecord]) -> PreferenceReport:
         right_probe=first.right_probe,
         total=len(collected),
         excluded=tuple(sorted(excluded.items())),
-        overall=_summarise(admissible, intent=None),
+        overall=_summarize(admissible, intent=None),
         by_intent=by_intent,
         stage_delta=_stage_delta(admissible),
     )
@@ -241,7 +241,7 @@ def _require_one_comparison(records: Sequence[PreferenceRecord], first: Preferen
     if len(pairs) > 1:
         listed = ", ".join(f"{left} vs {right}" for left, right in sorted(pairs))
         msg = (
-            f"these records cover more than one comparison ({listed}). Summarising them "
+            f"these records cover more than one comparison ({listed}). Summarizing them "
             f"together would average across different systems"
         )
         raise IncomparableRecordsError(msg)
@@ -275,7 +275,7 @@ def _require_discriminating(records: Sequence[PreferenceRecord]) -> None:
     the third place the same rule is enforced, and it is not redundant: records arrive from a
     file, files outlive the process that wrote them, and a file is exactly where a record
     written by some other tool would enter. The rule has to hold at the point the number is
-    produced, not only at the point the judgement was made.
+    produced, not only at the point the judgment was made.
     """
     failing = sorted(
         {
@@ -288,12 +288,12 @@ def _require_discriminating(records: Sequence[PreferenceRecord]) -> None:
     if failing:
         msg = (
             f"these records name a side that retrieves at chance ({', '.join(failing)}), so "
-            f"they are judgements about noise. No rate will be computed from them"
+            f"they are judgments about noise. No rate will be computed from them"
         )
         raise AtChanceError(msg)
 
 
-def _summarise(records: Sequence[PreferenceRecord], *, intent: Intent | None) -> IntentSummary:
+def _summarize(records: Sequence[PreferenceRecord], *, intent: Intent | None) -> IntentSummary:
     counts = dict.fromkeys(Preference, 0)
     for record in records:
         counts[record.preference] += 1

@@ -27,7 +27,7 @@ differs it differs for a reason worth stating:
   the URL the installed ``tiktoken`` asks for, with the digest that ``tiktoken`` declares for
   it. A release that changed either is caught by that check; one that changed neither needs no
   new bundle. The version is recorded for provenance, and reported, but is not a gate.
-- **No licence assertion, and no vocabulary bytes in manicule's own distribution.** The
+- **No license assertion, and no vocabulary bytes in manicule's own distribution.** The
   grammar pack publishes a permissive-only policy that a bundle can assert against. OpenAI
   publishes these files with no SPDX expression at all, so there is nothing here to assert and
   manicule will not redistribute what it cannot describe. The manifest records the URL each

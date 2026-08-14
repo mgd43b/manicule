@@ -20,7 +20,7 @@ this, which is per-task by construction.
 
 The cost of a contextvar is implicit coupling, and it is paid down by one rule:
 
-    **Nothing in the pipeline's behaviour may depend on the frame.**
+    **Nothing in the pipeline's behavior may depend on the frame.**
 
 A stage that returns different candidates when someone is recording is not a stage anybody can
 measure. :func:`record` no-ops when no frame is installed, which is what makes the rule cheap
@@ -135,7 +135,7 @@ class DenseReport(BaseModel):
     resolved_id_count_exact: bool = Field(
         default=True,
         description="Whether the count above is the whole answer. Resolution stops one past "
-        "``prefilter_id_limit``, so a query against a large corpus never materialises its "
+        "``prefilter_id_limit``, so a query against a large corpus never materializes its "
         "document list to answer a question the first thousand rows already answered — and a "
         "count that is really a lower bound says so rather than skewing the distribution the "
         "threshold will eventually be set from.",
@@ -230,7 +230,7 @@ class GlossaryReport(BaseModel):
         default="", description="The second query form. Empty when nothing fired."
     )
     terms: tuple[str, ...] = Field(
-        default=(), description="The normalised keys that fired, in query order."
+        default=(), description="The normalized keys that fired, in query order."
     )
     reasons: tuple[str, ...] = Field(
         default=(),
@@ -423,7 +423,7 @@ def _as_json(values: Mapping[str, object]) -> Metadata:
 
     Stages record through typed report models, which already dump to JSON. This exists for the
     loose ``record(key=value)`` form a plugin stage will reach for, so that one stage's stray
-    object cannot make a whole trace unserialisable.
+    object cannot make a whole trace unserializable.
     """
     return {name: _json_value(value) for name, value in values.items()}
 
@@ -439,7 +439,7 @@ def _json_value(value: object) -> JsonValue:
     if isinstance(value, list | tuple | set | frozenset):
         return [_json_value(item) for item in cast("Iterable[object]", value)]
     # Anything else is a stage's stray object. Recorded as its repr rather than dropped or
-    # raised: a diagnostic that cannot serialise must not be able to fail a query.
+    # raised: a diagnostic that cannot serialize must not be able to fail a query.
     return repr(value)
 
 

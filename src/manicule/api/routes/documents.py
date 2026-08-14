@@ -61,7 +61,7 @@ async def trash(
     """Longest-deleted first — the order the sweep will take them in.
 
     Declared **above** ``/documents/{document_id}``. Starlette matches routes in declaration
-    order, so the parameterised one would otherwise swallow ``trash`` as an id and answer 404
+    order, so the parameterized one would otherwise swallow ``trash`` as an id and answer 404
     for a route that exists.
     """
     del caller

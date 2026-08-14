@@ -64,7 +64,7 @@ class ErrorInfo(Payload):
 
 
 class Envelope(BaseModel):
-    """One operation's outcome, as it is serialised by both surfaces."""
+    """One operation's outcome, as it is serialized by both surfaces."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -119,7 +119,7 @@ DOCTOR_SCHEMA_VERSION = 1
 
 Distinct from ``Envelope.version`` on purpose. That one moves with every release whether or not
 any shape changed; this one moves only when the diagnosis payload gains, loses or repurposes a
-field. A consumer pinning behaviour wants the second, and giving it only the first forces it to
+field. A consumer pinning behavior wants the second, and giving it only the first forces it to
 diff release notes.
 """
 
@@ -303,10 +303,10 @@ class GlossaryExpansion(Payload):
     )
 
     acronym: str
-    """The normalised key that fired — ``NOW``."""
+    """The normalized key that fired — ``NOW``."""
 
     display: str
-    """The term as the source document writes it. Shown in preference to the normalised key,
+    """The term as the source document writes it. Shown in preference to the normalized key,
     so a reader sees the document's own words rather than ours."""
 
     expansion: str
@@ -502,7 +502,7 @@ class DocumentSummary(Payload):
         default=None,
         description="The document's authoritative source metadata, when it has any. On the "
         "summary as well as on a citation, because ``document list`` is where an operator looks "
-        "to find out whether a manifest was honoured — and a refused one says so here.",
+        "to find out whether a manifest was honored — and a refused one says so here.",
     )
 
 
@@ -1114,7 +1114,7 @@ class SearchQuality(Payload):
     as a measurement is the failure the whole harness exists to prevent.
     """
 
-    available: bool = Field(description="Whether any judgements have been recorded at all.")
+    available: bool = Field(description="Whether any judgments have been recorded at all.")
     is_evidence: bool = False
     caveat: str = ""
     path: str = ""
@@ -1383,7 +1383,7 @@ class SidecarReport(Payload):
     )
     profiles: tuple[str, ...] = Field(
         default=(),
-        description="The enriched-document profiles this run recognised, in the precedence "
+        description="The enriched-document profiles this run recognized, in the precedence "
         "order they were applied in.",
     )
     """Reported because it is the answer to the question a disappointing run raises.
@@ -1610,7 +1610,7 @@ class InitReport(Payload):
         "`index` spends minutes fetching before it indexes anything. A field rather than a "
         "sentence a renderer finds in `notes`: it is the one fact that changes what the next "
         "command feels like, and every surface should be able to say so in its own voice. "
-        "`False` also covers 'could not be determined' — a backend manicule knows no artefact "
+        "`False` also covers 'could not be determined' — a backend manicule knows no artifact "
         "route for is not one it may announce a download on behalf of.",
     )
 

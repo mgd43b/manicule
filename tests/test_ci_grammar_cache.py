@@ -11,7 +11,7 @@ with nothing but convention holding them together:
 
 **Every way this drifts is silent, and one way is silent and green.** Rename the directory on
 one side and the build stops finding it — and *keeps working*, because not finding it means
-fetching the release, which is exactly the behaviour the change was made to stop relying on. CI
+fetching the release, which is exactly the behavior the change was made to stop relying on. CI
 would go green while the cache it reports having restored is used by nothing. That is the
 failure this module exists to catch, and it is the same shape as the one
 ``tests/test_ci_switches.py`` was written for: a mechanism that is correct, configured, and
@@ -77,7 +77,7 @@ def test_the_directory_ci_stages_into_is_the_one_the_image_build_reads() -> None
     """The rename that leaves a green job quietly downloading the release on every run.
 
     Nothing fails when these two disagree. The build finds no staged pack, falls back to
-    fetching it, and passes — which is the pre-#80 behaviour wearing the cache's clothes, and
+    fetching it, and passes — which is the pre-#80 behavior wearing the cache's clothes, and
     the log line that would tell you so is one line in a build that prints thousands.
     """
     staged = staged_directory()

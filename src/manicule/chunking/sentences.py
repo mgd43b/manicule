@@ -69,7 +69,7 @@ def paragraphs(text: str) -> list[str]:
 def sentences(text: str) -> list[str]:
     """Split ``text`` into sentences, keeping them in order and losing nothing.
 
-    Joined back together with a single space, the result normalises to the input: this is a
+    Joined back together with a single space, the result normalizes to the input: this is a
     boundary finder, not a rewriter. Anything it cannot split confidently stays whole, which
     costs a little budget and never costs a word.
     """

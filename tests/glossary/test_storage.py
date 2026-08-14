@@ -360,7 +360,7 @@ async def test_a_scope_that_matches_no_document_consults_no_glossary(
 
 
 async def test_a_filter_by_source_restricts_the_vocabulary(store: SqliteDocStore) -> None:
-    """Document-level fields are honoured rather than dropped."""
+    """Document-level fields are honored rather than dropped."""
     await a_glossary(store, "glossary", f"NOW — {EXPANSION}")
 
     assert await store.entries_for(["NOW"], system.query_filter(sources=frozenset({"fixture"})))

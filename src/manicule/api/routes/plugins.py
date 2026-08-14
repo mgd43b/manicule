@@ -40,7 +40,7 @@ async def search_registry(
     """The community listing, when configuration permits consulting it.
 
     Only fetched while ``plugins.allow_install`` is on. A plugin runs with this process's full
-    authority, so browsing a catalogue of them is opt-in — and when it is off, the payload says
+    authority, so browsing a catalog of them is opt-in — and when it is off, the payload says
     so rather than returning an empty list that reads like "none are available".
 
     The filter is the service's, not this route's. It is one substring match, and that is

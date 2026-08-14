@@ -63,7 +63,7 @@ Check that the volume is mounted and that nobody else holds the deploy lock.
 
 ## Running it
 
-Copy the artefact into place, then restart each machine one at a time.
+Copy the artifact into place, then restart each machine one at a time.
 
 ```bash
 ledgerctl roll --wait
@@ -73,7 +73,7 @@ Wait for the health endpoint to answer before moving on to the next one.
 
 ## If it goes wrong
 
-Put the previous artefact back; it stays on disk for seven days.
+Put the previous artifact back; it stays on disk for seven days.
 
 > Going backwards does not undo a schema migration. Those apply forward only.
 """

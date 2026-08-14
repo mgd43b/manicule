@@ -1,7 +1,7 @@
 """Jupyter parsing: the heading tree, the cell id, and the version that decides which.
 
 Cell ids arrived in nbformat 4.5, so this format has two addressing regimes in one file type
-and the tests are organised around that: with ids, a block is addressed by ``(path, cell id)``;
+and the tests are organized around that: with ids, a block is addressed by ``(path, cell id)``;
 without them the path is all there is, and where the path repeats there is no address at all.
 :func:`test_a_repeated_path_without_cell_ids_is_unlocated_and_says_what_fixes_it` is the one to
 read — the reason has to tell the reader that re-saving the notebook restores exact addressing,
@@ -358,8 +358,8 @@ async def test_astral_text_survives_into_the_heading_the_fragment_and_the_output
 async def test_stopping_after_one_block_leaves_nothing_held_open(corpus: Path) -> None:
     """An abandoned generator must not be left suspended holding the notebook it opened.
 
-    CPython finalises a live async generator through the event loop that created it, so one
-    still suspended when that loop has closed is finalised against a torn-down runtime — a
+    CPython finalizes a live async generator through the event loop that created it, so one
+    still suspended when that loop has closed is finalized against a torn-down runtime — a
     crash inside the interpreter's allocator rather than a warning. This parser reads the whole
     notebook before it yields anything, so nothing is live at a suspension point, and re-parsing
     immediately afterwards checks that nothing was left in a state the next read trips over.

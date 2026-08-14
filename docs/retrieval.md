@@ -12,7 +12,7 @@ result is allowed to claim.
 > **Prior art.** Clearly-marked callouts like this one record a design manicule considered and
 > rejected, and say what the rejection buys. They are here because a decision is only legible
 > beside the alternative it ruled out. Every claim in this document stands on manicule's own
-> behaviour and is checkable against this repository.
+> behavior and is checkable against this repository.
 
 ---
 
@@ -142,7 +142,7 @@ them out:
 | A `contextvars.ContextVar` trace frame, installed by the runner | **Chosen.** Per-task by construction, so concurrent queries cannot cross; invisible to stages that ignore it; no signature changes |
 
 The contextvar is implicit coupling and that is a real cost, paid down by one rule and one
-test: **nothing in the pipeline's behaviour may depend on the trace frame**. `assert_retrieval_stage_contract`
+test: **nothing in the pipeline's behavior may depend on the trace frame**. `assert_retrieval_stage_contract`
 installs no frame, so a stage that only works while someone is recording fails there — but the
 sharper failure is a stage that behaves *differently* under one, and that needs both runs. So
 each shipped stage is run twice over identical input, once observed and once not, and must
@@ -239,7 +239,7 @@ has no remaining job, and it should go rather than linger, for three reasons tha
   meaning is whatever the store decides cannot be reviewed, and this is the one type where a
   reviewer must be able to see the whole restriction.
 - It is unusable today anyway. `predicate_for` in `manicule.storage.vectors` treats any
-  non-default field outside its pushdown set as unhonourable and raises, so a populated `extra`
+  non-default field outside its pushdown set as unhonorable and raises, so a populated `extra`
   is not a flexible escape hatch — it is an exception.
 - It is the same shape as the stage context object rejected in §2.3, and for the same reason:
   an escape hatch on a type this central never narrows again.
@@ -388,7 +388,7 @@ list below is what that ticket did, kept as the record of why each item was nece
   against declared field defaults.
 - `PUSHED_DOWN_FILTER_FIELDS` gains `langs`, and needs a companion set naming `workspace_ids` as
   **deliberately not pushed down**. This is the delicate one: the current code raises on any
-  field it cannot honour, and that refusal is doing real work. It must keep raising for
+  field it cannot honor, and that refusal is doing real work. It must keep raising for
   everything except the one field whose enforcement moved somewhere stronger, and the exemption
   has to be a named constant with the reason attached, not an omission.
 - `SqliteDocStore._require_same_workspace` compares a scalar; it becomes a subset check, and the
@@ -573,7 +573,7 @@ to mean anything against. The best lexical match in a small corpus and a mediocr
 corpus can produce the same magnitude.
 
 **On the dense leg's cosine similarity, inside the dense stage, before fusion.** Vectors are
-L2-normalised and the metric is cosine, so the score really is a cosine similarity in `[-1, 1]`
+L2-normalized and the metric is cosine, so the score really is a cosine similarity in `[-1, 1]`
 ([`storage.md`](storage.md) §6.2) — the one number in the pipeline with an absolute meaning that
 survives leaving the run it was computed in. Negative similarities clamp to 0 before comparison.
 
@@ -604,7 +604,7 @@ in a query-passage cosine. A floor placed at the separation — around 0.45-0.48
 knee is — would put the decision boundary within backend drift of real passages, so the same
 query could return a passage on Apple Silicon and drop it on x86. **Platform may change
 throughput; it must never change output.** A threshold is a cliff, and a cliff is the wrong
-instrument for a judgement this close.
+instrument for a judgment this close.
 
 So the floor is a junk filter and **not** the relevance decision. The relevance decision lives in
 confidence (§8.4), which is continuous: backend drift nudges a reported number by a thousandth
@@ -632,7 +632,7 @@ unbounded, corpus-relative one whose sign is negative and whose better values ar
 There is no scaling that makes them commensurable across corpora. Discarding the magnitudes and
 keeping the order is not an approximation — it is the point.
 
-So: **no score weighting, no per-leg weighting, no normalisation step.** A leg contributes rank
+So: **no score weighting, no per-leg weighting, no normalization step.** A leg contributes rank
 positions and nothing else.
 
 > **Prior art, and what happens when the magnitudes come back in.** `reciprocalRankFusion` takes
@@ -676,7 +676,7 @@ k=60)`. Three consequences, and the second is the one that matters:
 ### 5.3 What RRF does when a leg comes back short
 
 **A missing candidate contributes zero from that leg. It is not imputed a worst rank and not
-penalised.** The consequences are worth being explicit about, because they look like bugs and are
+penalized.** The consequences are worth being explicit about, because they look like bugs and are
 not:
 
 - A candidate ranked 1st in one leg and absent from the other scores `1/61 ≈ 0.0164`.
@@ -983,7 +983,7 @@ Two details in the similarity row are load-bearing, and both were defects fixed 
   similarity. Reading the absent score as `0.0` asserts the dense leg looked at it and found it
   orthogonal to the query — it never looked. On the query that exposed this, BM25's top hit was
   averaged in as a zero and cost the best answer in the corpus a twentieth of a point.
-- **"rescaled."** Raw cosine is not centred on zero, so unrelated text scores ~0.45 rather than
+- **"rescaled."** Raw cosine is not centered on zero, so unrelated text scores ~0.45 rather than
   ~0.0 and lands in the same band as a real match. §8.4 is the measurement and the constants.
 
 **There is no support-breadth term, and its removal was a measured correction.** `min(distinct
@@ -997,7 +997,7 @@ therefore keeps `fast`'s 0.70 ceiling exactly where §8.3 puts it.
 
 What is excluded, and why:
 
-- **The fused RRF score.** A rank artefact bounded by `2/61`; it has no absolute meaning (§4.5).
+- **The fused RRF score.** A rank artifact bounded by `2/61`; it has no absolute meaning (§4.5).
 - **BM25.** Corpus-relative and unbounded.
 - **Keyword coverage.** Replaced by cross-leg agreement, which is the same idea done properly.
   Substring matching of query keywords against passage text does no stemming and no IDF
@@ -1034,14 +1034,14 @@ the pipeline — and it must not excuse a query for being too poor to match anyt
 ### 8.3 No fallback term, and why `fast` cannot report high confidence
 
 When no reranker ran, the reranker term **contributes zero and the remaining weights are not
-renormalised.** The arithmetic maximum under `fast` is therefore 0.70.
+renormalized.** The arithmetic maximum under `fast` is therefore 0.70.
 
 > **The rule, stated as the property it protects.** A component that did not run must never be
 > filled in from one that did. Substituting the retrieval average into the reranker's empty slot
 > is the tempting shape, because it keeps the scale full — and it would make retrieval count for
 > `0.55 + 0.30 = 0.85` instead of 0.55, so **turning the reranker off would raise the reported
 > confidence** for identical retrieval. The pipeline that skipped the verification step would
-> claim more than the one that ran it. Renormalising the remaining weights reaches the same place
+> claim more than the one that ran it. Renormalizing the remaining weights reaches the same place
 > by a more respectable route and is refused for the same reason: manicule reports what it
 > measured, and a measurement not taken lowers the ceiling rather than borrowing a number.
 
@@ -1061,7 +1061,7 @@ boundary at 0.20 sat *inside* the real population, so `precise`, the profile tha
 reported "nothing here resembles your question" for questions the corpus answers. That is the
 original defect wearing the other mask.
 
-**`fast` topping out at `medium` is the intended behaviour, not an artefact.** `fast` is the
+**`fast` topping out at `medium` is the intended behavior, not an artifact.** `fast` is the
 profile that skips the verification step; it should not be able to claim it verified. This is
 also the most concrete difference between the profiles that a user ever sees, which makes the
 cost of choosing `fast` visible at the moment it matters.
@@ -1072,9 +1072,9 @@ nobody can act on, and one that cannot say what produced it is one #15 cannot co
 
 ### 8.4 Calibrating similarity against the corpus's own noise
 
-**Cosine is not centred on zero, and pretending otherwise is what let nonsense outrank a real
-question.** Dense retrieval always returns its nearest neighbours; on a corpus with nothing
-relevant in it, those neighbours are still returned and are *not* far away in absolute terms.
+**Cosine is not centered on zero, and pretending otherwise is what let nonsense outrank a real
+question.** Dense retrieval always returns its nearest neighbors; on a corpus with nothing
+relevant in it, those neighbors are still returned and are *not* far away in absolute terms.
 
 The measurement, over manicule's own documentation — 13 documents, 604 chunks, BGE-M3, all
 three profiles — asked 16 questions the corpus answers and 22 it demonstrably cannot (subjects
@@ -1183,12 +1183,12 @@ configurations, of which a profile is one. Compare a profile against itself over
 against another profile. Combining per document rather than averaging removed the largest source
 of cross-profile drift — a deeper profile no longer scores lower merely for showing more of the
 weak tail — but a reranked pipeline still reaches a ceiling an unreranked one cannot, and that
-difference is real rather than an artefact.
+difference is real rather than an artifact.
 
 ### 8.5 The diagnostic
 
 `explain_confidence` returns every input to a score: the components and what each weighed, every
-suppressed component and why, the normalisation constants, the band thresholds, the weights, and
+suppressed component and why, the normalization constants, the band thresholds, the weights, and
 per passage its raw cosine, its rescaled evidence, which legs scored it, and whether it was
 counted or displaced by a stronger passage from the same document.
 
@@ -1271,7 +1271,7 @@ The cached value is the ranked list of **chunk ids with their per-stage scores**
 the pipeline reached — and never the chunk text. On a hit, the ids are re-hydrated through the
 same join the dense leg uses (§4.2).
 
-This is not a memory optimisation. It is what makes the cache incapable of the failure a
+This is not a memory optimization. It is what makes the cache incapable of the failure a
 content-caching version invites:
 
 - **A cache hit cannot serve a soft-deleted, unindexed or foreign-workspace chunk**, because it
@@ -1290,7 +1290,7 @@ A hash over the canonical form of, in order:
 
 ```
 generation counter
-the whole Filter, canonicalised (workspace_ids sorted, then every other field)
+the whole Filter, canonicalized (workspace_ids sorted, then every other field)
 profile name + effective overrides
 Query.limit
 pipeline declaration (stage names, in order)
@@ -1334,7 +1334,7 @@ no eviction pass and no per-entry bookkeeping.
 
 The list is a liability, and the right way to hold it is to bump on the **write paths in the
 document store** rather than at each of these call sites — the same reasoning that puts FTS5
-synchronisation in triggers rather than in application code ([`storage.md`](storage.md) §6.1).
+synchronization in triggers rather than in application code ([`storage.md`](storage.md) §6.1).
 Application-level bookkeeping covers only the write paths someone remembered.
 
 **And "the write paths in the document store" is still a list, so it is not what shipped.** A
@@ -1419,7 +1419,7 @@ configuration a record names, and the per-stage spans as the attribution — whi
 ([`contracts.md`](contracts.md) §3).
 
 **Where it lives.** The trace is a return value, surfaced through `--json` and the API, and
-consumed by #15's harness, which writes its own versioned result artefacts. It does **not** go
+consumed by #15's harness, which writes its own versioned result artifacts. It does **not** go
 into `query_logs` — that table's `response_time_ms` is whole-query product telemetry, and a
 per-stage trace there would be a schema change in service of a consumer that keeps its results in
 the repository anyway. If operations later wants per-stage latency persisted
@@ -1516,13 +1516,13 @@ does not ship. A rule is only enforceable if it says what would count, so:
 |---|---|
 | **HyDE** | nDCG@10 of the fused list, on and off, restricted to the regime it claims — queries where the dense leg's top-1 cosine is below a floor. Report added p50 latency in the same table: it costs a generation call per query, so a small win that doubles latency does not ship |
 | **Multi-query expansion** | recall@50 of the union of legs, N=3 against N=1 — **at equal total candidate budget**. Compared against simply raising `candidates` by 3×, or it is buying recall with fetch rather than with expansion |
-| **Query decomposition** | Only meaningful on multi-hop questions, and #15's query set has no labelled multi-hop subset. Building that subset is the first deliverable; then nDCG@10 on it alone, since averaging it into the full set will hide the effect either way |
+| **Query decomposition** | Only meaningful on multi-hop questions, and #15's query set has no labeled multi-hop subset. Building that subset is the first deliverable; then nDCG@10 on it alone, since averaging it into the full set will hide the effect either way |
 | **Intent classification** | Its only proposed consumer is per-intent context allocation, which does not change retrieval at all — the same passages are retrieved and the window is divided differently. Needs an *answer*-quality metric, which #15 does not have yet. Nothing to measure it with today, and that is the finding |
 | **Cross-lingual expansion** | The null hypothesis is that it adds nothing, because bge-m3 is already one multilingual space ([`embeddings.md`](embeddings.md) §1.2). recall@20 on query-in-A / gold-passage-in-B pairs. A likely outcome is that this measurement retires the feature rather than admitting it |
 | **Parent-document retrieval** | nDCG@`final_top_k` with parents substituted for chunks, **plus a citation check**: the anchor must still resolve to the quoted span. A parent that widens the citation is a regression at any nDCG, because `contracts.md` §1 does not trade accuracy of location for relevance |
 | **Propositions** | Changes what is indexed and therefore the `ChunkFingerprint`, so adopting it costs a re-chunk *and* a re-embed — rungs 3 and 2 of the blast-radius ladder, and no re-fetch, because retained original bytes keep rung 4 out of it. recall@10 has to improve by enough to justify that, and it changes what a citation points at — same anchor obligation as above |
 | **Prompt compression** | Not a retrieval feature: it changes what the generator sees. Answer quality at fixed context tokens, and a hard check that no cited span was rewritten — PR #32 forbids middleware rewriting cited text and compression is the same act at the other end of the pipeline |
-| **Hallucination guard** | Precision *and* recall of the guard itself against a labelled set of grounded and ungrounded answers. Recall alone is the trap: a guard that suppresses correct answers is worse than no guard, and only precision shows it |
+| **Hallucination guard** | Precision *and* recall of the guard itself against a labeled set of grounded and ungrounded answers. Recall alone is the trap: a guard that suppresses correct answers is worse than no guard, and only precision shows it |
 | **BGE-M3 learned-sparse leg** | Recorded against #6 already. nDCG@10 with learned-sparse replacing the FTS5 BM25 leg — **on a multilingual corpus first**, where Porter stemming is English-only and the current lexical leg is at its weakest. Also a runtime change: neither installed backend exposes the head ([`embeddings.md`](embeddings.md) §1.4) |
 
 Two structural notes. Every one of these is a stage or a leg, so measuring it is a configuration
@@ -1675,7 +1675,7 @@ The two run in opposite directions and only one needed a floor. Splitting a comp
 *lengthen* a phrase's initials, and a longer string is satisfied by fewer terms — so it demands
 more agreement, not less. A skeleton is *shorter* than the key it stands beside, which is a weaker
 constraint: fewer words have to agree before a prefix may call itself the expansion. Swept over
-the labelled corpus in `tests/glossary/skeleton_corpus.py`, 18 positives and 17 negatives:
+the labeled corpus in `tests/glossary/skeleton_corpus.py`, 18 positives and 17 negatives:
 
 | Bound | Precision | Recall | Boundary precision | What moved |
 |---|---|---|---|---|
@@ -1709,14 +1709,14 @@ for `SFR`, and shows this one refusing both.
 
 `HTTP — HyperText Transfer Protocol, used by every browser` was this section's example of the
 conservative fallback and is now cut correctly, which is why the paragraph above uses `CPU`. That
-is a documented limitation closing, not a behaviour drifting: `HyperText` is a compound and its
+is a documented limitation closing, not a behavior drifting: `HyperText` is a compound and its
 components spell the term exactly.
 
 **A term is three strings and the third resolves nothing.** The *display* is what the source
-wrote, stored verbatim; the *lookup key* is `normalise_acronym` of it and is the only one anything
+wrote, stored verbatim; the *lookup key* is `normalize_acronym` of it and is the only one anything
 resolves through, at ingest and at query time alike; the *initial skeleton* is a comparison form,
 computed where it is compared and stored nowhere. `SaFeR` is found by `safer` and not by `SFR`,
-and two definitions of `SAFER` remain a conflict whatever their capitalisation says — §14.5's rule
+and two definitions of `SAFER` remain a conflict whatever their capitalization says — §14.5's rule
 that nothing picks a winner is not weakened by there being a new way to spell the loser.
 
 Measured end to end over that corpus: detection precision and recall **1.000/1.000** against
@@ -1932,10 +1932,10 @@ the fix**, so that whoever takes it starts from the right question.
 
 **The gate that refuses them is not the one it looks like.** `acronym_shaped` is the visible
 rule and it does refuse them — `Golden Path` is 0.20 upper case against a 0.6 share — but
-deleting it would change nothing, because `normalise_acronym` in `core/glossary.py` refuses them
+deleting it would change nothing, because `normalize_acronym` in `core/glossary.py` refuses them
 independently and it is the one that decides the *key*:
 
-| Surface | Upper | Length | Charset | `normalise_acronym` |
+| Surface | Upper | Length | Charset | `normalize_acronym` |
 |---|---|---|---|---|
 | `Golden Path` | `GOLDEN PATH` | 11 ≤ 12 | space not in `isalnum() or -&/` | `''` |
 | `Blast Radius` | `BLAST RADIUS` | 12 ≤ 12 | space refused | `''` |
@@ -1952,7 +1952,7 @@ string everything resolves through, at ingest and at query time alike (§14.3):
   not an abbreviation", which is the assumption being discarded rather than tuned. The charset
   rule would have to admit the separator, and `GlossaryEntry.acronym` carries a `min_length`
   constraint that decides what may be persisted at all.
-- **The query normaliser** — a query is tokenised and each token normalised before lookup
+- **The query normalizer** — a query is tokenized and each token normalized before lookup
   (§14.5). A multi-word key cannot be found by a single-token lookup however it is stored, so
   matching would need an n-gram pass over the query, and the homograph rules that stop `now`
   expanding every sentence would need an equivalent for phrases.
@@ -1970,7 +1970,7 @@ does not currently have**, and choosing one is the real work.
 
 **Not started, deliberately.** This is a note about a change nobody has been asked to make. The
 measurements behind it are in the nine-shape sweep: 0 of 3 multi-word terms detected, refused by
-`normalise_acronym` rather than by `acronym_shaped`.
+`normalize_acronym` rather than by `acronym_shaped`.
 
 ---
 
@@ -1993,7 +1993,7 @@ Calls made in the absence of a stated position.
 | `live_fraction` is workspace-scoped only, so it stays cacheable per `(generation, workspace)` | §4.3 |
 | Three distinct shortfall outcomes; `exhausted_budget` is a defect and the others are not | §4.4 |
 | `min_score` applies to dense cosine only, is 0.35 everywhere, and is a junk filter rather than the relevance decision | §4.5, §8.4 |
-| RRF is rank-only: no score weighting, no leg weighting, no normalisation | §5.1 |
+| RRF is rank-only: no score weighting, no leg weighting, no normalization | §5.1 |
 | Per-leg ranks are recovered from `Candidate.scores`; the fusion stage is configured with leg names | §5.2 |
 | A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |
 | The reranker raises rather than passing through, and truncates to what it scored | §6.1 |

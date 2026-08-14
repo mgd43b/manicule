@@ -1,6 +1,6 @@
 """A complete, minimal manicule plugin.
 
-Three components, one of each of the kinds whose behaviour is easiest to demonstrate
+Three components, one of each of the kinds whose behavior is easiest to demonstrate
 without a model or a database. Read top to bottom; it is short on purpose.
 """
 

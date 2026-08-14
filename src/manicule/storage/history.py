@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 from sqlalchemy import func, select
 
 from manicule.core.content import Document, DocumentStatus
-from manicule.core.organisation import (
+from manicule.core.organization import (
     CitationResolution,
     CitationState,
     DocumentVersion,

@@ -544,7 +544,7 @@ class ObservingEmbedder(fakes.CountingEmbedder):
         self.concurrent = max(self.concurrent, self.inside)
         try:
             # A real forward pass is not instantaneous, and a test whose two tasks never
-            # actually overlap in time would report serialisation it never observed.
+            # actually overlap in time would report serialization it never observed.
             await asyncio.sleep(0)
             return await super().embed(texts)
         finally:
@@ -565,7 +565,7 @@ async def test_a_sweep_and_a_sync_running_together_never_reach_the_model_at_once
     inside the embedder at once. It passed throughout the whole life of a lost-update bug on the
     *same* document, which is the shape of test that reports safety it never checked — so it is
     left exactly as narrow as its name and the tests below it check the other thing. See
-    ``docs/ingest.md`` §8.4 for why serialising the accelerator says nothing about the database.
+    ``docs/ingest.md`` §8.4 for why serializing the accelerator says nothing about the database.
     """
     embedder = ObservingEmbedder()
     store, vectors, blobs, _, _ = await corpus(
@@ -595,7 +595,7 @@ async def test_a_sweep_and_a_sync_running_together_never_reach_the_model_at_once
 # --- the same document, from both directions at once -------------------------------------------
 
 OLD = "SDR — Stale Document Record"
-"""What the corpus holds before a sync moves it, in a shape the glossary detector recognises.
+"""What the corpus holds before a sync moves it, in a shape the glossary detector recognizes.
 
 An em-dash definition whose initials spell the term, so one line of one document produces a
 document row, a chunk, a vector, a source record *and* a glossary entry. Every one of those is
@@ -737,7 +737,7 @@ async def test_a_sweep_holding_old_bytes_does_not_overwrite_the_sync_that_finish
     **Before the commit-time compare-and-swap this test failed on its first assertion**, with
     the stored content hash still the old one, and the chunks, glossary, source record and
     retained reference all reverted with it. The embedding lock the sweep shares with the sync
-    does not help: it serialises the *model*, and both operations went through it politely, one
+    does not help: it serializes the *model*, and both operations went through it politely, one
     after the other, on their way to writing over each other.
     """
     store, vectors, blobs, embedder, stale = await superseded_corpus()
@@ -831,7 +831,7 @@ async def test_a_correction_to_the_source_record_alone_is_enough_to_supersede_a_
     The corrected fetch goes in through ``ingest_raw`` rather than through a connector run,
     which is the same code path one document of a sync takes once its bytes are in hand. A whole
     run would not reach it: the token has not moved and the old parser finds its own lineage
-    current, so level 1 answers "unchanged" and never fetches — which is correct behaviour, and
+    current, so level 1 answers "unchanged" and never fetches — which is correct behavior, and
     is why a real installation meets this case through the connector that *did* notice.
     """
     store, vectors, blobs, embedder, stale = await superseded_corpus()
@@ -896,9 +896,9 @@ gives up immediately and a red run costs this once.
 class Rendezvous(TrimmingLineParser):
     """Version two of the parser, which reports whether two documents were inside it together.
 
-    **A barrier rather than a clock.** "Unrelated documents are not serialised" is a statement
+    **A barrier rather than a clock.** "Unrelated documents are not serialized" is a statement
     about two things happening at once, and the only honest way to observe it is to make each
-    one wait for the other: if the pipeline serialises them, the first waits alone. A test that
+    one wait for the other: if the pipeline serializes them, the first waits alone. A test that
     instead measured elapsed time would pass on a fast machine and fail on a loaded one while
     the code did the same thing both times.
     """
@@ -921,7 +921,7 @@ class Rendezvous(TrimmingLineParser):
             yield block
 
 
-async def test_a_sweep_and_a_sync_over_different_documents_are_not_serialised_by_the_guard() -> (
+async def test_a_sweep_and_a_sync_over_different_documents_are_not_serialized_by_the_guard() -> (
     None
 ):
     """The keyed guard, checked for the thing a keyed guard is *for*.
@@ -957,7 +957,7 @@ async def test_a_sweep_and_a_sync_over_different_documents_are_not_serialised_by
 
     assert parser.together == 2, (
         f"only one document was ever inside the parser; the two arrived separately as "
-        f"{parser.arrived}. Work on unrelated documents is being serialised, so the mutation "
+        f"{parser.arrived}. Work on unrelated documents is being serialized, so the mutation "
         f"guard is not keyed by document id"
     )
     assert (sweep.reparsed, sweep.superseded, sweep.failed) == (1, 0, 0)
@@ -998,10 +998,10 @@ class CancellingEmbedder(fakes.CountingEmbedder):
         return await super().embed(texts)
 
 
-async def test_a_sweep_cancelled_before_its_commit_serves_nothing_it_half_wrote() -> None:
+async def test_a_sweep_canceled_before_its_commit_serves_nothing_it_half_wrote() -> None:
     """``Ctrl-C`` in the middle of one document, and then the same command again.
 
-    Everything derived is compared against a snapshot taken before the cancelled run, in all
+    Everything derived is compared against a snapshot taken before the canceled run, in all
     four stores, because the failure this guards against is not a crash — it is a corpus that
     looks fine and answers with half of one parse and half of another.
     """
@@ -1057,7 +1057,7 @@ async def test_a_sweep_cancelled_before_its_commit_serves_nothing_it_half_wrote(
 class OvertakingEmbedder(fakes.CountingEmbedder):
     """A second writer that lands while the model is running, from outside the pipeline.
 
-    **Writes into the store directly, and that is the case being modelled.** The per-document
+    **Writes into the store directly, and that is the case being modeled.** The per-document
     mutation lock is an ``asyncio.Lock``: it holds inside one event loop in one process, and a
     second process opened on the same data directory takes no part in it. From in here that is
     indistinguishable from a row changing underneath with no warning — which is what this does,

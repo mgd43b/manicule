@@ -128,7 +128,7 @@ def _anchor_of(block: ParsedBlock) -> Anchor:
 
 
 async def test_a_rect_is_the_fraction_of_the_slide_its_shape_covers(corpus: Path) -> None:
-    """Normalised against the slide's own dimensions, origin top-left, no y-flip.
+    """Normalized against the slide's own dimensions, origin top-left, no y-flip.
 
     python-pptx reports EMU from the top-left, which is already ``Rect``'s convention, so the
     only work is the division — and the expected numbers here come from the inches the fixture
@@ -388,8 +388,8 @@ async def test_no_block_is_unlocated(corpus: Path) -> None:
 async def test_stopping_after_one_block_leaves_nothing_held_open(corpus: Path) -> None:
     """An abandoned generator must not be left suspended holding the presentation it opened.
 
-    CPython finalises a live async generator through the event loop that created it, so one
-    still suspended when that loop has closed is finalised against a torn-down runtime — a
+    CPython finalizes a live async generator through the event loop that created it, so one
+    still suspended when that loop has closed is finalized against a torn-down runtime — a
     crash inside the interpreter's allocator rather than a warning. This parser reads the whole
     presentation before it yields anything, so nothing is live at a suspension point, and re-parsing
     immediately afterwards checks that nothing was left in a state the next read trips over.

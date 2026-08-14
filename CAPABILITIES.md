@@ -1,6 +1,6 @@
 # Capabilities
 
-What a user can do, extracted from the OpenDocuments source rather than summarised. This is the capability floor manicule should meet or deliberately decline.
+What a user can do, extracted from the OpenDocuments source rather than summarized. This is the capability floor manicule should meet or deliberately decline.
 
 Tick when built. Strike through when dropped, with a reason. These are user-visible capabilities — *how* they are implemented is open, and in several cases should differ.
 
@@ -55,7 +55,7 @@ of those, so the mapping is noted where it is not obvious. The output shape is a
 - [x] `status` → `index` with no path, and `doctor`
 - [x] `switch <name>` → `workspace switch`
 - [x] `sync [name]` → `connector sync`
-- [ ] `test` — dialling a connector without ingesting. #9
+- [ ] `test` — dialing a connector without ingesting. #9
 - [ ] `trash` — listing the trash. #10
 - [ ] `update [name]` — editing a connector. See `add <type>`
 - [x] ask — option `--json` — a **global** option, so every command has it
@@ -301,7 +301,7 @@ Provider credentials additionally follow the conventional `<PROVIDER>_API_KEY` n
 - [x] `widgetAllowedDomains` → `security.transport.widget_allowed_domains`
 - [x] `workspaceOverrides` → `security.data_policy.workspace_overrides`
 - [x] `workspace` → `workspace`
-- [x] ~~`5`~~ — not a setting. An extraction artefact: the regex matched `5:` inside the
+- [x] ~~`5`~~ — not a setting. An extraction artifact: the regex matched `5:` inside the
   model name `qwen2.5:14b`.
 
 ### Deliberately absent

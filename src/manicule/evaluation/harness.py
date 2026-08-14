@@ -52,7 +52,7 @@ for a different question."""
 
 
 class PreferenceHarness:
-    """Two systems, one query set, one file of judgements."""
+    """Two systems, one query set, one file of judgments."""
 
     def __init__(
         self,
@@ -66,7 +66,7 @@ class PreferenceHarness:
     ) -> None:
         if left.config_label == right.config_label:
             msg = (
-                f"both sides are labelled {left.config_label!r}. The labels are what a report "
+                f"both sides are labeled {left.config_label!r}. The labels are what a report "
                 f"and every stored record use to say which configuration won, so two sides "
                 f"sharing one produce a file in which the winner cannot be identified"
             )

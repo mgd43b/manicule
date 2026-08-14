@@ -227,10 +227,10 @@ async def test_upserting_a_chunk_again_replaces_it_rather_than_storing_it_twice(
     assert found[0].chunk.document_id == "doc-2"
 
 
-async def test_a_stored_vector_is_normalised_whatever_length_it_arrived_at(
+async def test_a_stored_vector_is_normalized_whatever_length_it_arrived_at(
     store: LanceVectorStore,
 ) -> None:
-    """Cosine as ``1 - distance`` holds only for unit vectors, so normalising is not optional."""
+    """Cosine as ``1 - distance`` holds only for unit vectors, so normalizing is not optional."""
     await store.ensure_ready(fingerprint())
     await store.upsert([chunk("chunk-a")], [[0.0, 40.0, 0.0, 0.0]])
 
@@ -581,7 +581,7 @@ async def test_upserting_nothing_stores_nothing(store: LanceVectorStore) -> None
 # --- degenerate vectors ------------------------------------------------------------------
 
 
-async def test_a_vector_with_no_direction_is_left_alone_by_normalisation() -> None:
+async def test_a_vector_with_no_direction_is_left_alone_by_normalization() -> None:
     """There is no unit vector to scale it to, and inventing one would fabricate a direction."""
     assert unit([0.0, 0.0, 0.0]) == [0.0, 0.0, 0.0]
 
@@ -605,7 +605,7 @@ async def test_a_query_with_no_direction_returns_candidates_it_does_not_claim_to
     assert {candidate.score for candidate in found} == {0.0}
 
 
-async def test_a_query_with_no_direction_still_honours_the_filter(
+async def test_a_query_with_no_direction_still_honors_the_filter(
     store: LanceVectorStore,
 ) -> None:
     """The unrankable path is a second route to the rows, and skips no scoping on the way."""
@@ -683,7 +683,7 @@ async def test_a_reused_vector_is_the_stored_vector_to_the_last_bit(
 
     The claim "an unchanged chunk's vector was not recomputed" is only checkable if this is
     exactly true, and it is not free: a stored ``float32`` vector reads back with a length a
-    few parts in 10^8 from one, and re-normalising it perturbs the odd row by an ulp.
+    few parts in 10^8 from one, and re-normalizing it perturbs the odd row by an ulp.
     :data:`~manicule.storage.vectors.FLOAT32_EPSILON` is what stops that.
 
     **A fixed seed and 256 rows**, because the guard must fail deterministically when it is
@@ -695,7 +695,7 @@ async def test_a_reused_vector_is_the_stored_vector_to_the_last_bit(
     await store.ensure_ready(fingerprint(8))
     rng = random.Random(0)  # noqa: S311 - a fixture, seeded so the guard fails deterministically
     chunks = [chunk(f"chunk-{index}", position=index) for index in range(256)]
-    # Deliberately neither one-hot nor normalised, so the store does the scaling and the round
+    # Deliberately neither one-hot nor normalized, so the store does the scaling and the round
     # trip has something to lose.
     vectors: list[Vector] = [[rng.uniform(-1.0, 1.0) for _ in range(8)] for _ in chunks]
     await store.upsert(chunks, vectors)

@@ -1,4 +1,4 @@
-"""What a report says, what it refuses to say, and what it will not summarise at all."""
+"""What a report says, what it refuses to say, and what it will not summarize at all."""
 
 from __future__ import annotations
 
@@ -131,7 +131,7 @@ def test_a_report_from_an_example_query_set_says_so_in_its_first_line() -> None:
     assert report.render().startswith(ILLUSTRATIVE)
 
 
-def test_an_unverified_corpus_is_labelled_on_the_face_of_the_report() -> None:
+def test_an_unverified_corpus_is_labeled_on_the_face_of_the_report() -> None:
     """One side could not produce a digest, so sameness is a claim rather than a check."""
     report = build_report(
         records_with(
@@ -219,11 +219,11 @@ def test_a_stage_configured_differently_on_the_two_sides_counts_as_a_difference(
     assert report.stage_delta == ("dense",)
 
 
-def test_records_naming_a_side_at_chance_are_not_summarised() -> None:
+def test_records_naming_a_side_at_chance_are_not_summarized() -> None:
     """The third place the rule is enforced, and the one that guards a file read back later.
 
     Records arrive from disk, and a file outlives the process that wrote it — so the rule has
-    to hold where the number is produced, not only where the judgement was made. Constructed
+    to hold where the number is produced, not only where the judgment was made. Constructed
     here through the model's own back door being closed, which is why the fixture builds the
     record with a passing probe and the report is handed a doctored copy.
     """
@@ -233,12 +233,12 @@ def test_records_naming_a_side_at_chance_are_not_summarised() -> None:
         build_report([doctored])
 
 
-def test_records_from_two_different_comparisons_are_not_summarised_together() -> None:
+def test_records_from_two_different_comparisons_are_not_summarized_together() -> None:
     with pytest.raises(IncomparableRecordsError, match="more than one comparison"):
         build_report([a_record(), a_record(1, right=a_result("gamma"))])
 
 
-def test_records_from_two_different_corpora_are_not_summarised_together() -> None:
+def test_records_from_two_different_corpora_are_not_summarized_together() -> None:
     """As the corpus grows, last month's records stop being about the same thing."""
     grown = a_result("alpha", corpus_version=CorpusVersion(label="fixture", digest="sha256:bbb"))
 

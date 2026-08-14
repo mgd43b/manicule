@@ -189,7 +189,7 @@ async def test_the_large_fixture_round_trips_at_block_level(
     """The generated large document exercises the path a real corpus takes.
 
     Checked at block level: the chunk-level obligation for a document this size is the
-    chunker's overlap behaviour rather than the parser's, and it is covered where it belongs.
+    chunker's overlap behavior rather than the parser's, and it is covered where it belongs.
     """
     raw = raw_from(corpus / "plaintext" / "plaintext-large.txt", "text/plain")
     report = await check_fixture(parser, raw)
@@ -221,8 +221,8 @@ async def test_a_block_stream_stopped_after_one_block_is_not_left_suspended(
 ) -> None:
     """A consumer that stops early must not strand the generator.
 
-    An abandoned async generator stays suspended until CPython finalises it through the loop
-    that created it — and if that loop has closed, the finalisation runs against a torn-down
+    An abandoned async generator stays suspended until CPython finalizes it through the loop
+    that created it — and if that loop has closed, the finalization runs against a torn-down
     runtime and crashes inside the allocator, on a stack naming nothing anybody here wrote.
     """
     raw = raw_from(corpus / "plaintext" / "typical.txt", "text/plain")

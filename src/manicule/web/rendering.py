@@ -9,7 +9,7 @@ serving it — was rejected for four reasons, in order of weight:
    every request carries a key, including one this process made to its own socket. There is no
    key it could legitimately hold: minting one at startup is a second credential nobody
    revoked, and skipping authentication for "internal" calls is a bypass with a friendly name.
-2. **A second hop inside a page load.** Serialising a payload to JSON, opening a socket to
+2. **A second hop inside a page load.** Serializing a payload to JSON, opening a socket to
    ourselves, parsing it back, and then rendering it is work that buys nothing — the same
    objects are already in this process.
 3. **Two failure vocabularies.** A connection refused to our own port is not an operation that
@@ -32,7 +32,7 @@ protecting anything the moment somebody renders a fragment from a string or name
 
 What arrives here is not this project's text. A document title is whatever was in the file that
 was indexed; a heading path is whatever the parser found in it; an answer body is a model's
-output over those documents, and a citation label is the document's own words travelling back
+output over those documents, and a citation label is the document's own words traveling back
 out under manicule's name. Every one of those is a place where ``<script>`` reaches HTML, and
 the corpus is exactly where an attacker who can get a file indexed would put one.
 
@@ -208,7 +208,7 @@ async def panel(
 
     The same :func:`~manicule.app.dispatch.run_op` the command line, the MCP server and the
     HTTP routes use. That is the whole of the parity claim: the bytes a page renders come from
-    the object the other three surfaces serialise.
+    the object the other three surfaces serialize.
     """
     return Panel(envelope=await run_op(op, service.workspace, call))
 

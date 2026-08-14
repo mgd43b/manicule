@@ -11,7 +11,7 @@ would then be unjoinable to one of successes, quietly.
 
 **The enumeration proves it ran before it reports what it found.** ``app.routes`` is not a flat
 list of routes on every FastAPI: from 0.13x an included router appears as a wrapper object, and
-a walk that only recognised :class:`~fastapi.routing.APIRoute` therefore found **nothing at
+a walk that only recognized :class:`~fastapi.routing.APIRoute` therefore found **nothing at
 all** — and reported success, because "no route is misnamed" is trivially true of no routes.
 That is the failure mode this file exists to not have, so the walk lives in
 :mod:`tests.routing_support` — :func:`~tests.routing_support.walk_routes` descends into whatever

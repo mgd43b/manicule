@@ -7,9 +7,9 @@ like a measurement and is not, and the failure it produces is an index that work
 
 The declaration is read from the **canonical** repository even when the weights are executed
 from somewhere else. Conversions drop things: ``mlx-community/bge-m3-mlx-fp16`` ships no
-``1_Pooling/config.json`` at all, so a backend that read its pooling from the artefact it
+``1_Pooling/config.json`` at all, so a backend that read its pooling from the artifact it
 loaded would find nothing and fall back — to mean, which is wrong for this model. Identity
-belongs to the model; the artefact is an implementation detail of running it
+belongs to the model; the artifact is an implementation detail of running it
 (:mod:`manicule.embedding.artifacts`).
 """
 
@@ -53,7 +53,7 @@ _UNSUPPORTED_POOLING_FLAGS: Final[tuple[str, ...]] = (
 )
 """Declared reductions manicule does not implement.
 
-Named rather than ignored. Skipping an unrecognised ``true`` and taking the next flag that
+Named rather than ignored. Skipping an unrecognized ``true`` and taking the next flag that
 happens to be set is how a max-pooled model gets indexed as a mean-pooled one.
 """
 
@@ -105,7 +105,7 @@ class ModelCard(BaseModel):
     def fingerprint(self, *, backend: str, weights_ref: str = "") -> EmbedFingerprint:
         """The identity every vector this model produces is written against.
 
-        ``normalized`` is always ``True``: normalisation is applied in
+        ``normalized`` is always ``True``: normalization is applied in
         :mod:`manicule.embedding.pooling` rather than read from the model's declared pipeline.
         """
         return EmbedFingerprint(

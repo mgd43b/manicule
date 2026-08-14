@@ -13,7 +13,7 @@ and what a recorded result is allowed to claim.
 
 ## 1. The whole design in five sentences
 
-**A system must demonstrate it retrieves before its preferences are recorded. Judgement is
+**A system must demonstrate it retrieves before its preferences are recorded. Judgment is
 pairwise and blinded, never an absolute relevance label. A result names the corpus it was
 measured against and the configuration that produced it. Categories are reported as rows, and
 the average is one row among them. A report says what it is not.**
@@ -63,11 +63,11 @@ which produced it. The declaration travels into every recorded preference and in
 and a report built from an `example` set leads with a line saying the numbers are illustrative.
 `QuerySet.is_evidence` is a field-derived property, not a convention about presentation.
 
-**`intent` is a field, not a comment.** Four categories plus `uncategorised`, chosen because
+**`intent` is a field, not a comment.** Four categories plus `uncategorized`, chosen because
 they fail *differently* rather than because they are a taxonomy: a lexical leg carries exact
 identifiers and a dense leg carries paraphrase, and a reranker that earns its cost on
 explanatory questions often costs precision on identifier lookups. One averaged number over
-all four hides every one of those effects. `uncategorised` is reported as its own row rather
+all four hides every one of those effects. `uncategorized` is reported as its own row rather
 than folded into another — a bucket that quietly absorbs the awkward ones makes every other
 row look cleaner than it is.
 
@@ -138,7 +138,7 @@ machine.
 
 **It will not run against a retriever whose cache can hit.** A cached ranking is one sample
 counted twice at the cache's latency. A run that quietly served half its queries from memory
-would report a latency improvement that is an artefact and a quality figure computed from half
+would report a latency improvement that is an artifact and a quality figure computed from half
 as many observations as it claims. The retriever already knows whether a hit is *possible* —
 configuration alone is not enough, since a store with no generation counter disables the cache
 regardless ([`retrieval.md`](retrieval.md) §10) — so that is what is checked.
@@ -176,7 +176,7 @@ and nothing here asks it to be.
 **A system that retrieves at chance cannot be reported as anything but useless.**
 
 Before any preference is recorded, each side is put through a set of questions whose answers
-are known by construction — no relevance judgements and no labelling session.
+are known by construction — no relevance judgments and no labeling session.
 `probe_from_titles` derives them from the corpus: a document's own title, used as the query,
 with that document as the known answer. That is the least a retrieval system can be asked to
 do, which is exactly what a liveness check wants; a probe only a good system passes would be a
@@ -215,7 +215,7 @@ where a hand-edited or foreign record enters. Without it, a record claiming a de
 
 | Where | What it stops |
 |---|---|
-| `PreferenceHarness.certify`, before the first query | A session that records first and filters later, leaving judgements about noise on disk |
+| `PreferenceHarness.certify`, before the first query | A session that records first and filters later, leaving judgments about noise on disk |
 | `PreferenceRecord`'s validator | A record built by any other path — the model itself refuses to construct one |
 | `build_report`, over records read back | A file written by some other tool, or by an older build. Files outlive the process that wrote them, so the rule has to hold where the number is produced |
 
@@ -226,7 +226,7 @@ shipped `Retriever` over the shipped `DenseStage` against a migrated database, t
 exactly one thing: the embedder.
 
 - An embedder whose vector is a hash of the whole string — correctly shaped, correctly
-  normalised, deterministic, and unrelated to meaning — is **refused**, at 1 hit in 24 against
+  normalized, deterministic, and unrelated to meaning — is **refused**, at 1 hit in 24 against
   a 5% chance rate (p = 0.71).
 - An embedder with real semantic content is **admitted**, at 24 hits in 24 (p = 6e-32).
 
@@ -240,12 +240,12 @@ whose only retrieval mechanism has no semantic content.
 
 ---
 
-## 6. Judgement is pairwise, and blinded
+## 6. Judgment is pairwise, and blinded
 
 Two ranked lists side by side and one keypress: `a`, `b`, tie, neither, skip, quit. Seconds per
 query is the design constraint.
 
-**Pairwise rather than absolute relevance labels.** Absolute judgements need a scale, a
+**Pairwise rather than absolute relevance labels.** Absolute judgments need a scale, a
 definition of relevant and a minute of attention per passage. A preference answers the question
 actually being asked — *is this configuration better than the one I have* — and it answers it
 at a cost that gets a whole query set finished. Absolute labels and nDCG come later, and **only
@@ -278,7 +278,7 @@ headline. Three things every row carries:
   normal approximation because at 10/10 the latter gives an interval of *zero width*: an exact
   claim from ten samples.
 - **A two-sided sign test.** Ties and `neither` are dropped rather than split between the
-  sides; splitting them would manufacture evidence from judgements that deliberately expressed
+  sides; splitting them would manufacture evidence from judgments that deliberately expressed
   none.
 - **The counts**, including how many pairings were excluded and why.
 
@@ -289,7 +289,7 @@ where most pairings were excluded is a finding about the run and a rate computed
 remainder without saying so is not.
 
 `build_report` refuses more than it reports. Records spanning more than one pair of systems,
-more than one corpus, or more than one query-set provenance are not summarised together.
+more than one corpus, or more than one query-set provenance are not summarized together.
 
 ---
 

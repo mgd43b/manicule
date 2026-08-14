@@ -8,7 +8,7 @@ those facts rather than on a guess made after the structure was thrown away.
 
 **Fragments come from the author or not at all.** A ``HeadingAnchor`` carries a fragment only
 where the page defines one: an ``id=`` on the heading, or the empty anchor element
-immediately before it that older documents use for the same purpose. Synthesising a slug
+immediately before it that older documents use for the same purpose. Synthesizing a slug
 would produce a citation that looks precise and lands at the top of a page manicule does not
 serve, so a heading with no published address gets ``fragment=None`` and cites the document
 (``docs/parsing.md`` §2.5). Where that leaves the path ambiguous — two sections with the same
@@ -87,7 +87,7 @@ _TEXT_NODE = "-text"
 
 @dataclass(frozen=True, slots=True)
 class _Found:
-    """One element the walk recognised, before sections have been worked out."""
+    """One element the walk recognized, before sections have been worked out."""
 
     kind: BlockKind
     text: str
@@ -202,7 +202,7 @@ def recover_cdata(document: str) -> str:
 
     Unterminated sections are left exactly as they are. A document whose CDATA never closes is
     malformed, and guessing where the author meant it to end would invent content; the existing
-    behaviour — the parser's own error recovery — is the honest answer.
+    behavior — the parser's own error recovery — is the honest answer.
     """
     if _CDATA_OPEN not in document:
         return document

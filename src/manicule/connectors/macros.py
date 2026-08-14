@@ -22,8 +22,8 @@ manicule's own words would end up inside a quotation attributed to the source.
 Both body formats are handled here, because both deployments have the problem. Atlassian
 Document Format is a node tree and is edited as one. Storage format is XHTML, and it is read
 with :mod:`html.parser` — a real parser, never a regular expression — which reports the exact
-span of each macro element so the raw source can be spliced without being re-serialised. A
-round trip through any serialiser would rewrite markup that was not part of the edit.
+span of each macro element so the raw source can be spliced without being re-serialized. A
+round trip through any serializer would rewrite markup that was not part of the edit.
 """
 
 from __future__ import annotations
@@ -498,7 +498,7 @@ class _StorageScanner(HTMLParser):
     Storage format is XHTML with ``ac:`` and ``ri:`` prefixes whose namespaces are declared
     nowhere in the fragment, so an XML parser refuses it outright and an HTML parser reads the
     prefixed names as ordinary tags — which is all this needs. It reports *positions*, and the
-    caller splices the original string, so nothing is re-serialised.
+    caller splices the original string, so nothing is re-serialized.
     """
 
     def __init__(self, source: str) -> None:

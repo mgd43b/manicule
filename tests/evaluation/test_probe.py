@@ -85,7 +85,7 @@ def _explain(outcome: ProbeOutcome) -> str:
 async def test_an_embedder_with_no_semantic_content_is_refused(store: SqliteDocStore) -> None:
     """The load-bearing check. A meaningless embedder must be impossible to report as working.
 
-    Its vectors are a hash of the whole string: correctly shaped, correctly normalised,
+    Its vectors are a hash of the whole string: correctly shaped, correctly normalized,
     deterministic, and unrelated to meaning. Nothing about it raises, nothing about it looks
     wrong, and a pipeline built on it returns confident, plausible rankings. The only thing
     that can catch it is a measurement against chance, which is what this asserts.

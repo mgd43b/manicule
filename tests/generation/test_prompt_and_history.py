@@ -5,7 +5,7 @@ from __future__ import annotations
 from manicule.core.anchors import CellAnchor, LineAnchor, PageAnchor
 from manicule.generation.answers import Citation, Verification
 from manicule.generation.budget import TokenEstimator
-from manicule.generation.history import Turn, as_message, fit_history, neutralise_markers
+from manicule.generation.history import Turn, as_message, fit_history, neutralize_markers
 from manicule.generation.markers import ATTEMPT_PREFIX
 from manicule.generation.prompt import (
     CITATION_PROTOCOL,
@@ -74,7 +74,7 @@ def test_an_empty_context_says_so_rather_than_inviting_an_unsourced_answer() -> 
     assert "do not cover it" in messages[-1]["content"]
 
 
-def test_a_location_is_described_in_words_a_reader_would_recognise() -> None:
+def test_a_location_is_described_in_words_a_reader_would_recognize() -> None:
     assert describe_location(PageAnchor(page=4)) == "page 4"
     assert describe_location(CellAnchor(sheet="Sheet1", ref="B4:D12")) == "Sheet1!B4:D12"
     assert (
@@ -99,7 +99,7 @@ def citation(slot: int = 3) -> Citation:
     )
 
 
-def test_markers_in_replayed_history_are_neutralised_never_re_bound() -> None:
+def test_markers_in_replayed_history_are_neutralized_never_re_bound() -> None:
     """Turn 1's slot 3 and turn 4's slot 3 are different documents. Replaying the marker
     verbatim hands the model syntax that binds to something else — and it copies the pattern.
     """
@@ -107,7 +107,7 @@ def test_markers_in_replayed_history_are_neutralised_never_re_bound() -> None:
         role="assistant", content=f"Roll back.{ATTEMPT_PREFIX}:3]]", citations=(citation(),)
     )
 
-    replayed = neutralise_markers(turn)
+    replayed = neutralize_markers(turn)
 
     assert ATTEMPT_PREFIX not in replayed
     assert "[cited: Deploy runbook" in replayed
@@ -116,7 +116,7 @@ def test_markers_in_replayed_history_are_neutralised_never_re_bound() -> None:
 def test_a_marker_whose_citation_was_not_stored_still_becomes_non_bindable() -> None:
     turn = Turn(role="assistant", content=f"Roll back.{ATTEMPT_PREFIX}:7]]")
 
-    assert neutralise_markers(turn) == "Roll back.[cited]"
+    assert neutralize_markers(turn) == "Roll back.[cited]"
 
 
 def test_a_user_turn_containing_marker_syntax_is_escaped_too() -> None:

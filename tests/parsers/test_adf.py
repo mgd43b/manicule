@@ -264,7 +264,7 @@ async def test_a_panel_keeps_its_severity(corpus: Path) -> None:
     """A warning panel is not ordinary prose, and a warning split in half is still a warning.
 
     The severity is metadata rather than a sentence prepended to the text, so the citation
-    quotes the panel and nothing else while the chunker can still keep the parts labelled.
+    quotes the panel and nothing else while the chunker can still keep the parts labeled.
     """
     raw = raw_from(corpus / "adf" / "typical.json", ADF_MEDIA_TYPE)
     panel = next(
@@ -372,10 +372,10 @@ async def test_a_card_is_a_cross_reference_and_can_be_turned_off(corpus: Path) -
     """
     raw = raw_from(corpus / "adf" / "structure.json", ADF_MEDIA_TYPE)
     kept = [block.text for block in await read_blocks(_parser(), raw)]
-    assert "https://example.invalid/neighbouring-page" in kept
+    assert "https://example.invalid/neighboring-page" in kept
 
     dropped = [block.text for block in await read_blocks(_parser(keep_card_links=False), raw)]
-    assert "https://example.invalid/neighbouring-page" not in dropped
+    assert "https://example.invalid/neighboring-page" not in dropped
 
 
 async def test_astral_plane_text_survives_a_heading_and_its_anchor(corpus: Path) -> None:

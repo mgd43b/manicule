@@ -17,10 +17,10 @@ by its own title and URL; what it does not get is a document identity that survi
 **The security consequence of not rewriting the page is the main argument for this shape.** A
 converter that emitted new files would have to decide where they go, and the page's own metadata
 is the obvious thing to name them after — at which point a page id of ``../../../etc/cron.d/x``
-is a write primitive, and the defence is a validation somebody has to keep correct for ever.
+is a write primitive, and the defense is a validation somebody has to keep correct for ever.
 Here the output path is :func:`.sidecar.manifest_path_for` of the file that was walked to, and no
 value read out of a document reaches it. Traversal is not refused; it is unrepresentable. It is
-also why nothing is materialised on disk for the derived body: there is no derived-artifact
+also why nothing is materialized on disk for the derived body: there is no derived-artifact
 directory to place, name, exclude from discovery or garbage-collect, because the extraction is
 cheap, deterministic and done in memory at the moment it is needed.
 
@@ -154,7 +154,7 @@ def write_sidecars(
         force: Replace manifests that already exist. Off by default: a manifest already there
             was most likely written by hand or by another tool, and silently replacing somebody's
             metadata is not a conversion, it is a loss.
-        profiles: The exporter conventions to recognise, in precedence order. The same value the
+        profiles: The exporter conventions to recognize, in precedence order. The same value the
             connector is configured with, so a page this run adapted is a page that run will
             adapt — a conversion written under one profile set and ingested under another would
             put manifests on disk for pages the connector then declined to read.
@@ -296,7 +296,7 @@ def _walk(directory: Path, *, root: Path) -> Iterator[Path]:
 
     A manifest is not filtered here and does not need to be: it is ``<page>.source.json``, whose
     suffix is ``.json``, so the extension test below has already excluded it. An
-    :func:`.sidecar.is_manifest` call as well would read as a second defence and be dead code —
+    :func:`.sidecar.is_manifest` call as well would read as a second defense and be dead code —
     unreachable, unexercised, and quietly wrong the day the extension test changed.
     """
     try:

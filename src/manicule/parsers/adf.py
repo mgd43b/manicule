@@ -60,7 +60,7 @@ _NOT_IN_ANCHOR = re.compile(r"[^\w-]+", re.UNICODE)
 
 @dataclass(frozen=True, slots=True)
 class _Found:
-    """One node the walk recognised, before sections have been worked out."""
+    """One node the walk recognized, before sections have been worked out."""
 
     kind: BlockKind
     text: str

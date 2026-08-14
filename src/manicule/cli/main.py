@@ -55,7 +55,7 @@ RESET_NEEDS_CONFIRMATION = (
 """Why ``reset-index`` refuses without ``--yes``.
 
 A constant rather than a literal at the raise site, so a test can assert that the refusal
-names the flag without reading it back out of a rendered terminal box — which wraps, colours
+names the flag without reading it back out of a rendered terminal box — which wraps, colors
 and elides differently on every machine.
 """
 
@@ -218,7 +218,7 @@ WORKSPACE_NAMED_TWICE = (
 """Why two *different* workspaces in one invocation is refused rather than resolved.
 
 A constant rather than a literal at the raise site, so a test can assert the refusal names both
-values without reading them back out of a rendered terminal box, which wraps, colours and
+values without reading them back out of a rendered terminal box, which wraps, colors and
 elides differently on every machine.
 
 **This is the one place the shared options behave differently, and the difference is the
@@ -836,7 +836,7 @@ def document_reindex(
     document with no retained bytes is named rather than failing the sweep.
 
     `--stale-glossary` is the rung below it and the cheaper repair. Detection is a stage of its
-    own — its grammar, its evidence weights and its normalisation change without moving any
+    own — its grammar, its evidence weights and its normalization change without moving any
     parse, chunk or embedding fingerprint — so a corrected detector reaches an existing corpus
     through this and through nothing else. It reads the chunks already stored, runs no parser,
     fetches nothing and produces no vector, so it costs no GPU time at all.
@@ -1330,7 +1330,7 @@ def init(
     ] = False,
 ) -> None:
     """Write a starting configuration, choosing what this machine can actually run."""
-    emit("init", lambda service: service.initialise(force=force))
+    emit("init", lambda service: service.initialize(force=force))
 
 
 @app.command()

@@ -112,7 +112,7 @@ async def test_the_subject_is_the_title_and_the_first_element_of_the_heading_pat
 async def test_a_quoted_reply_chain_is_kept_rather_than_trimmed(
     parser: MailParser, corpus: Path
 ) -> None:
-    """Trimming is a retrieval optimisation with a real cost, and not a parsing decision.
+    """Trimming is a retrieval optimization with a real cost, and not a parsing decision.
 
     The quoted passage is frequently the only statement of the thing being replied to, so a
     parser that dropped it would index an answer whose question exists nowhere in the corpus.

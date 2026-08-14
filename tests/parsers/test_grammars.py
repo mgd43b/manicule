@@ -35,7 +35,7 @@ UNREACHABLE_MANIFEST = "http://127.0.0.1:9/manicule-tests-must-not-download.json
 """Discard port on the loopback interface. A fetch attempted through this refuses at once
 rather than hanging, so a test that starts downloading fails rather than stalling CI."""
 
-PERMISSIVE_LICENCES = frozenset({"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC"})
+PERMISSIVE_LICENSES = frozenset({"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC"})
 
 
 @pytest.fixture(autouse=True)
@@ -73,7 +73,7 @@ def test_a_language_key_is_checked_against_the_manifest_rather_than_at_first_use
 
 
 def test_the_key_for_c_sharp_is_csharp_and_the_error_says_so() -> None:
-    """The one naming trap in the pack, and the only defence is the message.
+    """The one naming trap in the pack, and the only defense is the message.
 
     ``c_sharp`` is a plausible spelling that is simply not a key, and it fails at lookup with
     nothing to go on unless the error offers the near misses.
@@ -285,7 +285,7 @@ hierarchy and would have let this one through as an unhandled crash.
 def test_a_dropped_transfer_is_retried_with_backoff_and_the_seed_succeeds(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The failure that blocked the repository, and the behaviour that unblocks it.
+    """The failure that blocked the repository, and the behavior that unblocks it.
 
     The stand-in fails twice the way the real host does and then *actually writes the library*,
     copied out of this machine's cache — so what is asserted at the end is the real
@@ -650,11 +650,11 @@ def _must_not_fetch(languages: Sequence[str], **_: object) -> tuple[str, ...]:
     raise AssertionError(msg)
 
 
-def test_the_grammar_pack_is_still_distributed_under_a_permissive_licence() -> None:
+def test_the_grammar_pack_is_still_distributed_under_a_permissive_license() -> None:
     """Upstream's stated policy is permissive-only; this asserts it rather than trusting it.
 
     It is the strongest assertion the installed artifact supports. **The wheel enumerates no
-    per-grammar licences** — the manifest carries a group and a size per language and nothing
+    per-grammar licenses** — the manifest carries a group and a size per language and nothing
     else, and the CycloneDX SBOM beside it describes the Rust build dependencies of the
     native extension rather than the 371 grammars. A per-grammar audit therefore cannot be
     written against what is installed; it belongs with the offline bundle, which is where the
@@ -662,4 +662,4 @@ def test_the_grammar_pack_is_still_distributed_under_a_permissive_licence() -> N
     """
     declared = metadata("tree-sitter-language-pack")["License-Expression"]
 
-    assert declared in PERMISSIVE_LICENCES
+    assert declared in PERMISSIVE_LICENSES

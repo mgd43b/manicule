@@ -298,8 +298,8 @@ async def test_a_lexical_leg_that_matched_nothing_still_pays_the_agreement_penal
     component. A nonsense query matches no keywords, so it paid no agreement penalty at all while
     a real question that matched some paid one in full.
 
-    A query of pure punctuation tokenises to nothing for FTS5 and matches lexically zero times,
-    while the dense leg still returns its nearest neighbours: exactly the shape that used to be
+    A query of pure punctuation tokenizes to nothing for FTS5 and matches lexically zero times,
+    while the dense leg still returns its nearest neighbors: exactly the shape that used to be
     excused.
     """
     chunks = await _corpus(store)
@@ -429,7 +429,7 @@ async def test_the_composition_root_assembles_a_working_retriever(
     assert retriever.cache_available
 
 
-async def test_the_composition_root_honours_the_cache_switch(
+async def test_the_composition_root_honors_the_cache_switch(
     store: SqliteDocStore, tmp_path: Path
 ) -> None:
     """An evaluation run turns the cache off by configuration, never by a code path."""
@@ -565,13 +565,13 @@ async def test_a_membership_change_is_not_served_from_the_cache(store: SqliteDoc
     }, "the second search was served a ranking computed before the document was added"
 
 
-async def test_a_cache_hit_still_honours_the_collection_filter(store: SqliteDocStore) -> None:
+async def test_a_cache_hit_still_honors_the_collection_filter(store: SqliteDocStore) -> None:
     """The second half of the same defect, and the half nobody looks at twice.
 
     `_from_cache` rehydrates through `join_filter(query.filter)`, which carries
     `collection_ids` — to a store that refuses the field. So a fix applied only to the live
     path leaves a cached path that either raises on the second identical query or, worse,
-    serves rows the filter was written to exclude. A restriction honoured the first time and
+    serves rows the filter was written to exclude. A restriction honored the first time and
     dropped the second is worse than one that never worked: the first query is the one anybody
     checks.
 

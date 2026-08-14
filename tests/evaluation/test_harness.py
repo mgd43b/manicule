@@ -115,7 +115,7 @@ async def test_a_side_that_retrieves_at_chance_stops_the_run_before_anything_is_
     """The first of the three places the rule is enforced, and the one that matters most.
 
     Nothing is judged, nothing is written, and the file does not exist. A harness that recorded
-    first and filtered later would leave judgements about noise on disk, indistinguishable from
+    first and filtered later would leave judgments about noise on disk, indistinguishable from
     real ones to anything that read the file afterwards.
     """
     chunks = await build_corpus(store)
@@ -210,7 +210,7 @@ async def test_both_sides_may_not_share_a_label(tmp_path: Path) -> None:
         corpus_version=CorpusVersion(label="fixture", digest="sha256:aaa", document_count=400),
     )
 
-    with pytest.raises(ValueError, match="labelled"):
+    with pytest.raises(ValueError, match="labeled"):
         PreferenceHarness(
             left=left,
             right=same,
@@ -271,10 +271,10 @@ async def test_a_person_judges_through_two_text_streams(tmp_path: Path) -> None:
     )
 
     rendered = output.getvalue()
-    assert "unrecognised choice 'z'" in rendered
+    assert "unrecognized choice 'z'" in rendered
     assert "alpha" not in rendered, "a judge must not see either configuration label"
     assert "beta" not in rendered, "a judge must not see either configuration label"
-    # a, then a retry, then a tie, then a skip, then quit: two judgements recorded.
+    # a, then a retry, then a tie, then a skip, then quit: two judgments recorded.
     assert [record.query_id for record in records] == ["p0", "p1"]
     assert records[1].preference is Preference.TIE
 

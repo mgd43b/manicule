@@ -56,7 +56,7 @@ from manicule.generation.verification import CitationVerifier, DocumentLookup, l
 PERSIST_DEADLINE_S = 10.0
 """How long the shielded write of a partial answer may take.
 
-A cancelled request that can outlive its own shutdown indefinitely is a worse failure than a
+A canceled request that can outlive its own shutdown indefinitely is a worse failure than a
 lost partial answer.
 """
 
@@ -460,7 +460,7 @@ class Answerer:
 
         A list rather than a generator for the same reason the binder returns one: this is
         consumed from inside another async generator, and a nested one abandoned by an
-        unwinding loop keeps its cleanup until something finalises it.
+        unwinding loop keeps its cleanup until something finalizes it.
         """
         produced: list[AnswerEvent] = []
         if token.text:
@@ -615,7 +615,7 @@ class Answerer:
 
         The real exposure is narrower and is a **second** cancellation: a shutdown escalation
         arriving while the write is in flight. That is what the shield is for. It carries a
-        deadline for the same reason a cancelled request must not outlive its own shutdown,
+        deadline for the same reason a canceled request must not outlive its own shutdown,
         and it never restarts the request or issues another provider call — it writes what is
         already in hand and returns.
         """
@@ -664,7 +664,7 @@ async def answering(
 
     :func:`~manicule.core.protocols.generating`'s sibling one layer up, and it exists because
     of the same fact about async generators: an abandoned one stays suspended at its ``yield``
-    and its ``finally`` does not run until something finalises it. That ``finally`` is where
+    and its ``finally`` does not run until something finalizes it. That ``finally`` is where
     the partial answer is written down, so **a client disconnect that abandons the stream is
     exactly the case where persistence would silently not happen** — the answer that most
     needs to be ratable is the one that would exist nowhere.

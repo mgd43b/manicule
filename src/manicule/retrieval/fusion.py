@@ -8,7 +8,7 @@ unbounded, corpus-relative one whose sign is negative and whose better values ar
 negative. No scaling makes them commensurable across corpora. Discarding the magnitudes and
 keeping the order is not an approximation — it is the point.
 
-So there is no score weighting, no per-leg weighting and no normalisation step, and adding one
+So there is no score weighting, no per-leg weighting and no normalization step, and adding one
 is not a tuning knob. Multiplying each rank term by the item's own score is the shape that
 looks harmless and fights itself: with a lexical score derived from ``bm25()`` by taking its
 absolute value and inverting, the best lexical hit gets the *smallest* weight, the rows arrive

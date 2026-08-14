@@ -8,7 +8,7 @@ from counting lines.
 **This parser is the ``"*"`` tail of every fallback chain** (``docs/parsing.md`` §6.2), so it
 is handed every document nothing else claimed — including the ones that are not text at all.
 It therefore declines non-text bytes rather than decoding them. Without that refusal a shipped
-global tail would index every unrecognised binary as mojibake, so a JPEG would become a page
+global tail would index every unrecognized binary as mojibake, so a JPEG would become a page
 of replacement characters that matches queries by accident and cites an image, and
 ``unsupported_media_type`` would become unreachable because some parser would always claim
 every document.

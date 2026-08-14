@@ -1,6 +1,6 @@
 """What the application service needs, stated as protocols rather than as imports.
 
-The service is the layer both surfaces call, and it is the only layer with any behaviour in
+The service is the layer both surfaces call, and it is the only layer with any behavior in
 it. Writing it against protocols buys the two properties that make that worth doing:
 
 **The service imports no database, no model runtime and no web framework.** Those arrive
@@ -34,8 +34,8 @@ if TYPE_CHECKING:
     from manicule.core.content import Chunk, Document, DocumentStatus
     from manicule.core.embedding import IndexFingerprints
     from manicule.core.fingerprints import GlossaryFingerprint
-    from manicule.core.organisation import Collection as DocumentCollection
-    from manicule.core.organisation import CollectionRule, Restoration, Tag, TrashEntry
+    from manicule.core.organization import Collection as DocumentCollection
+    from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
     from manicule.core.protocols import Connector
     from manicule.core.retrieval import Filter, Query
     from manicule.generation.history import Turn
@@ -275,7 +275,7 @@ class Maintenance(Protocol):
 
 
 @runtime_checkable
-class Organising(Protocol):
+class Organizing(Protocol):
     """Collections, tags and the trash, for one workspace.
 
     Separate from :class:`DocumentSurface` rather than folded into it, because the two are
@@ -495,7 +495,7 @@ class Backend(Protocol):
 
     async def maintenance(self) -> Maintenance: ...
 
-    async def organisation(self) -> Organising: ...
+    async def organization(self) -> Organizing: ...
 
     async def conversations(self) -> Conversing: ...
 
@@ -516,7 +516,7 @@ __all__ = [
     "Ingesting",
     "Keys",
     "Maintenance",
-    "Organising",
+    "Organizing",
     "Retrieving",
     "Telemetry",
 ]

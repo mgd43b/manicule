@@ -6,7 +6,7 @@ Two kinds of assertion, matching ``tests/api/test_routes.py``:
 rather than from a list in somebody's head. ``layout`` is the one area with no page of its own,
 and that is asserted as a property of the templates rather than waved away.
 
-**Behaviour that has to hold for every page.** The policy header, the escaping environment, the
+**Behavior that has to hold for every page.** The policy header, the escaping environment, the
 status a failure carries, and what a refusal looks like to a browser. Each is checked over the
 whole set, because a per-page test proves a property of the page somebody wrote a test for.
 """

@@ -65,7 +65,7 @@ def test_the_chunk_token_count_is_not_used_for_context_fitting() -> None:
     assert ContextTokenCounter().count_chunk(lying) > lying.token_count
 
 
-def test_counts_are_memoised_by_a_content_derived_id() -> None:
+def test_counts_are_memoized_by_a_content_derived_id() -> None:
     """Chunk ids come from content, so the cache is exact and can never go stale."""
     counter = ContextTokenCounter()
     chunk = make_chunk(DOCUMENT, 0, "authentication tokens")

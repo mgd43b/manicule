@@ -3,8 +3,8 @@
 ``Parser.parse`` returns an ``AsyncIterator``, and every parser here implements it as an
 async generator. A generator abandoned part-way stays suspended holding whatever it had open
 at the ``yield`` — a document handle, a native text page, a decompression stream — and
-CPython finalises it later, through the event loop that created it. When that loop has
-already closed, the finalisation runs against a torn-down runtime, and the symptom is not a
+CPython finalizes it later, through the event loop that created it. When that loop has
+already closed, the finalization runs against a torn-down runtime, and the symptom is not a
 warning: it is a crash inside the interpreter's allocator, on a stack naming no library
 anybody here wrote.
 

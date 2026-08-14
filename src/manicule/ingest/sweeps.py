@@ -98,7 +98,7 @@ async def sweep_vectors(
     Args:
         store: Where the tombstones and the soft-deleted documents are.
         vectors: The store to remove from.
-        batch: Tombstones retired per pass, so one sweep cannot monopolise the writer.
+        batch: Tombstones retired per pass, so one sweep cannot monopolize the writer.
         soft_delete_grace_s: How long a soft-deleted document's chunks survive.
         gate: Asked, at the moment the sweep fires, whether it may run.
 

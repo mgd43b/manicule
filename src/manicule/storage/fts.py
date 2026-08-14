@@ -8,7 +8,7 @@ of "the two copies disagree" bug that cannot occur.
 
 **Triggers, not application code.** A trigger runs inside the same transaction as the row
 change and cannot be bypassed by a migration, a repair path, or a write someone forgot about.
-Application-level synchronisation covers only the write paths its author remembered.
+Application-level synchronization covers only the write paths its author remembered.
 """
 
 from __future__ import annotations

@@ -15,7 +15,7 @@ That is the property here, and it is asserted out of the workflow file CI actual
 than a copy kept beside it — a second copy would drift, which is the defect under test.
 
 **What this does not catch, said plainly.** It does not check that the exclusions are the *right*
-ones; that is a judgement recorded in the comment beside them. And a format step added to a
+ones; that is a judgment recorded in the comment beside them. And a format step added to a
 *different* workflow file with its own path list is invisible here — this reads ``ci.yml``,
 which is where the check lives today.
 """
@@ -34,7 +34,7 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 TOOLS = REPO_ROOT / "tools"
 
 # Deliberately not anchored on ``uv run``. A step invoking ruff directly is the same second
-# scope wearing different clothes, and a pattern that only recognised the current spelling
+# scope wearing different clothes, and a pattern that only recognized the current spelling
 # would report "no format step" — or worse, miss a second one — instead of checking it.
 RUFF_FORMAT = re.compile(r"^\s*run:\s*(?:uv run )?ruff format (?P<args>.+)$", re.MULTILINE)
 RUFF_CHECK = re.compile(r"^\s*run:\s*(?:uv run )?ruff check (?P<args>.+)$", re.MULTILINE)

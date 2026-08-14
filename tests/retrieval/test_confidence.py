@@ -38,12 +38,12 @@ def passage(document: object, position: int, **scores: float) -> Candidate:
     return Candidate(chunk=chunk, score=1.0, scores=dict(scores))
 
 
-def test_the_weights_sum_to_one_and_are_never_renormalised() -> None:
+def test_the_weights_sum_to_one_and_are_never_renormalized() -> None:
     assert sum(WEIGHTS.values()) == 1.0
 
 
 def test_a_pipeline_with_no_reranker_cannot_reach_high() -> None:
-    """Intended behaviour, not an artefact.
+    """Intended behavior, not an artifact.
 
     ``fast`` is the profile that skips the verification step; it must not be able to claim it
     verified. Arithmetically its ceiling is 0.70, which is below the ``high`` band, and that is
@@ -68,7 +68,7 @@ def test_turning_the_reranker_off_never_raises_the_reported_confidence() -> None
 
     Substituting the retrieval average into the reranker's slot when none ran makes retrieval
     count for 0.70 instead of 0.40 — so the weaker pipeline claims more, for identical
-    retrieval. Renormalising the remaining weights has the same effect by a more respectable
+    retrieval. Renormalizing the remaining weights has the same effect by a more respectable
     route.
     """
     passages = [
@@ -292,7 +292,7 @@ def test_the_scalar_is_never_reported_alone() -> None:
 
 
 def test_the_fused_score_and_bm25_are_not_admissible() -> None:
-    """A rank artefact bounded by ``2/61`` and a corpus-relative unbounded number have no
+    """A rank artifact bounded by ``2/61`` and a corpus-relative unbounded number have no
     absolute meaning to combine with anything."""
     with_noise = score_confidence(
         [passage(FIRST, 0, dense=0.5, lexical=1.0, rrf=0.03, bm25=97.0)], rerank_stage=None
@@ -365,7 +365,7 @@ def test_filler_behind_a_correct_hit_does_not_lower_confidence() -> None:
 
     An average said otherwise, and the context is *guaranteed* to contain filler — the pipeline
     fills to ``final_top_k`` whether or not the corpus holds that many relevant passages, so a
-    narrow question was penalised precisely for being narrow.
+    narrow question was penalized precisely for being narrow.
     """
     alone = score_confidence(_context(GLOSSARY_HIT), legs=("dense",), rerank_stage=None)
     padded = score_confidence(
@@ -581,7 +581,7 @@ def test_the_diagnostic_agrees_with_the_score_it_explains() -> None:
 def test_the_diagnostic_never_carries_passage_text() -> None:
     """Diagnostics travel into logs, bug reports and screenshots; corpus text must not.
 
-    Asserted over the serialised form rather than the attributes, because the risk is what gets
+    Asserted over the serialized form rather than the attributes, because the risk is what gets
     written out — a field added later that happens to hold text would pass an attribute check
     and still leak.
     """
@@ -589,12 +589,12 @@ def test_the_diagnostic_never_carries_passage_text() -> None:
     chunk = make_chunk(FIRST, 0, body)
     candidate = Candidate(chunk=chunk, score=1.0, scores={"dense": GLOSSARY_HIT})
 
-    serialised = explain_confidence(
+    serialized = explain_confidence(
         [candidate], legs=("dense",), rerank_stage=None
     ).model_dump_json()
 
-    assert body not in serialised
-    assert chunk.id in serialised, "the chunk id is how an entitled reader finds the passage"
+    assert body not in serialized
+    assert chunk.id in serialized, "the chunk id is how an entitled reader finds the passage"
 
 
 def test_the_diagnostic_shows_duplicate_evidence_being_refused() -> None:

@@ -231,7 +231,7 @@ def _path_matches(cookie_path: str, request_path: str) -> bool:
 
     A segment boundary rather than a string prefix, so a cookie scoped to ``/conf`` is not sent to
     ``/confluence``. That distinction is the whole of the context-path case, and a prefix test
-    would import a neighbouring application's cookies on any instance that hosts two.
+    would import a neighboring application's cookies on any instance that hosts two.
     """
     scope = cookie_path or "/"
     if not scope.startswith("/"):
@@ -253,7 +253,7 @@ def read_state_file(path: Path, *, allow_insecure: bool = False) -> str:
 
     The check is skipped where POSIX modes do not mean what they say. On Windows the bits a stat
     reports are not the access control the platform enforces, so refusing on them would be
-    theatre, and the residual risk is documented instead.
+    theater, and the residual risk is documented instead.
 
     **The file is never written to.** It is the caller's, it may be shared with other tooling, and
     a conversion that rewrote it would be a surprise in somebody else's workflow.

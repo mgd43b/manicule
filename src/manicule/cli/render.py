@@ -51,7 +51,7 @@ def console(*, stderr: bool = False) -> Console:
 
     **Automatic highlighting is off, and that is a correctness setting rather than a taste
     one.** Rich's highlighter styles what it takes for numbers, paths, URLs and options by
-    inserting escape sequences *inside* the token — so with colour enabled a version prints as
+    inserting escape sequences *inside* the token — so with color enabled a version prints as
     ``\x1b[1;36m0.1\x1b[0m.\x1b[1;36m0\x1b[0m`` and a document id, a fingerprint or an
     anchor comes out of a pipe in pieces. This output is mostly identifiers, and an identifier
     nobody can copy is not one. Everything that *is* styled here is styled deliberately, with
@@ -91,7 +91,7 @@ def render_answer(
 ) -> None:
     """The answer, then its citations, then what was true of the run.
 
-    Citations are listed in full rather than summarised. A citation is the product here — an
+    Citations are listed in full rather than summarized. A citation is the product here — an
     answer whose sources are collapsed into "3 sources" is an answer nobody can check.
 
     ``text_already_shown`` is for the caller that streamed the tokens as they arrived. The
@@ -234,7 +234,7 @@ def _render_confidence_reason(out: Console, band: str | None, reason: str | None
     three plausible-looking excerpts in the other. The band gates it because a reason nobody
     needed, printed every time, is how a reader learns to skip the last line.
 
-    Both commands now, which is the point: the number is the same judgement whether it is
+    Both commands now, which is the point: the number is the same judgment whether it is
     printed under passages or under an answer, and it was legible in one place only.
     """
     if reason and band in UNCONVINCED_BANDS:
@@ -303,10 +303,10 @@ def render_document_deleted(out: Console, payload: r.DocumentDeleted) -> None:
 
 
 def render_document_reindexed(out: Console, payload: r.DocumentReindexed) -> None:
-    """One document's outcome, with the detail coloured by whether it is a problem.
+    """One document's outcome, with the detail colored by whether it is a problem.
 
     ``superseded`` is dim rather than yellow for the same reason the sweep's list of them is:
-    it is the only one of the four statuses that needs nothing done about it, and colouring it
+    it is the only one of the four statuses that needs nothing done about it, and coloring it
     like an unrepairable document would send somebody looking for a fault that is not there.
     """
     out.print(
@@ -372,7 +372,7 @@ def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
         out.print(f"[red]{escape(line)}[/red]")
     # Dim rather than yellow, and after both: this is the one list here that is not a call to
     # action. The document is current because something else made it current, and an operator
-    # who reads these in colour order should reach it last and stop.
+    # who reads these in color order should reach it last and stop.
     for line in payload.superseded_documents:
         out.print(f"[dim]{escape(line)}[/dim]")
     if payload.dry_run and payload.selected:
@@ -538,7 +538,7 @@ def render_sidecar(out: Console, payload: r.SidecarReport) -> None:
     """What a conversion did, and every page it did nothing for.
 
     Skipped pages are printed rather than counted. "Considered 40, wrote 0" is equally the shape
-    of a wrong directory, a page format this does not recognise, and a corpus already converted —
+    of a wrong directory, a page format this does not recognize, and a corpus already converted —
     and which of the three it is decides the operator's next move entirely.
     """
     out.print(
@@ -984,9 +984,9 @@ key — visible as ``unknown`` — rather than a branch somebody forgot to add.
 def _anchor_summary(anchor: Mapping[str, object]) -> str:
     """One line describing a location, without inventing precision it does not have."""
     kind = anchor.get("kind")
-    summarise = _ANCHOR_SUMMARIES.get(str(kind)) if kind is not None else None
-    if summarise is not None:
-        return summarise(anchor)
+    summarize = _ANCHOR_SUMMARIES.get(str(kind)) if kind is not None else None
+    if summarize is not None:
+        return summarize(anchor)
     return str(kind or "unknown")
 
 

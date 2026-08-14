@@ -110,7 +110,7 @@ def test_the_page_uses_the_redaction_that_already_exists() -> None:
 
     Every one of these is what makes the anonymous view safe, and a page that reimplemented any
     of them would be the second path this module's docstring exists to refuse. They are
-    exercised for their own behaviour in ``tests/api/test_sharing.py``; what is asserted here is
+    exercised for their own behavior in ``tests/api/test_sharing.py``; what is asserted here is
     that they are the functions the page's data came through.
     """
     from manicule.core.anchors import PageAnchor  # noqa: PLC0415 - only this test builds one

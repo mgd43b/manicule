@@ -154,7 +154,7 @@ async def test_a_compact_object_becomes_one_block_because_a_line_range_has_no_co
     """Every key on one line means one block, not one block per key.
 
     A block per key would give them all the same ``LineAnchor`` while claiming different text,
-    so each would resolve to the whole line — a citation quoting its neighbours.
+    so each would resolve to the whole line — a citation quoting its neighbors.
     """
     blocks = await _blocks(parser, _raw(corpus, "compact.json"))
     assert len(blocks) == 1
@@ -376,8 +376,8 @@ async def test_a_block_stream_stopped_after_one_block_is_not_left_suspended(
 ) -> None:
     """A consumer that stops early must not strand the generator.
 
-    A suspended generator is finalised later, through the loop that created it; when that loop
-    has closed the finalisation runs against a torn-down runtime and crashes the interpreter
+    A suspended generator is finalized later, through the loop that created it; when that loop
+    has closed the finalization runs against a torn-down runtime and crashes the interpreter
     rather than warning.
     """
     stream = parser.parse(_raw(corpus, "structured-large.yaml"))

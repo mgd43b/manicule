@@ -97,7 +97,7 @@ companies. Those are filtered out before anything is stored, by domain, path, `s
 expiry, using the browser's own rules: a host-only cookie must match the host exactly, a domain
 cookie matches on a label boundary (`.example.test` covers `wiki.example.test` and not
 `notexample.test`), and a path matches on a segment boundary, which is what makes an instance
-under a context path such as `/confluence` work without also importing a neighbouring
+under a context path such as `/confluence` work without also importing a neighboring
 application's cookies.
 
 **A driven Chromium may be refused by conditional access.** It is a new device to a policy that
@@ -294,7 +294,7 @@ everything that space ever contributed.
 - **Pagination is cursor-based, not offset.** Follow `_links.next`; the `start` parameter
   no longer works reliably for search.
 - **Cursors contain `+`, which must be escaped as `%2B`** before being sent back. Naive URL
-  handling silently breaks pagination partway through a sync — an unrecognised cursor comes
+  handling silently breaks pagination partway through a sync — an unrecognized cursor comes
   back as results rather than as an error, so some pages are simply never seen.
 
   **The exception is exactly one parameter wide.** The rest of the link is form-encoded, so a
@@ -529,10 +529,10 @@ the page id regardless.
 
 ## 9. Two operational realities to document
 
-**Rate limits.** Cloud throttles. Back off on 429 and honour `Retry-After`; a full first
+**Rate limits.** Cloud throttles. Back off on 429 and honor `Retry-After`; a full first
 sync of a large space will hit it.
 
-Both forms of `Retry-After` are honoured — a delay in seconds and an HTTP-date. A client that
+Both forms of `Retry-After` are honored — a delay in seconds and an HTTP-date. A client that
 reads only the first waits zero seconds for the second and retries straight back into the same
 limit, which turns a throttled sync into a throttled sync that is also a hot loop. A pause
 longer than `max_retry_after_seconds` (default 120) stops the run instead of being slept
@@ -562,7 +562,7 @@ Concretely, and in the terms someone deciding this needs:
 
 ## 10. Not yet verified against a live instance
 
-The connector is built and tested against recorded behaviour rather than a real Confluence:
+The connector is built and tested against recorded behavior rather than a real Confluence:
 there are no credentials in this repository, and the suites drive a synthetic instance that
 reproduces the traps above (a cursor containing `+`, a version disagreement, a macro cycle, a
 429 with `Retry-After`, a page deleted between syncs). Where a real instance could still
@@ -709,7 +709,7 @@ connector.**
 ### 12.3 Identity is the page id, never the path
 
 The difference from the filesystem connector, where identity *is* the resolved path. A mirroring
-tool that renames a directory, or organises by space this year and by page tree next year, has not
+tool that renames a directory, or organizes by space this year and by page tree next year, has not
 created new pages — but a connector keyed on the path would report every document deleted and every
 document new, dangling every citation into the previous corpus. So `DocRef.source_id` is the page
 id and the directory travels in `DocRef.metadata`, which is what that field is for.
@@ -722,7 +722,7 @@ identity comes from a stable key, never from a position.
 They are the same threats, because a manifest is a file in the corpus and anyone who can get a
 directory indexed can write one.
 
-- **The manifest never authorises a read.** The body is found by *looking* — it is the file beside
+- **The manifest never authorizes a read.** The body is found by *looking* — it is the file beside
   the manifest. A declared `body_file` is compared against what was found, never followed, so
   `../../../../etc/passwd` is a name matching nothing in the directory and at no point a path
   anything opens. Exactly one candidate is the body; several with no declaration is a refusal
@@ -775,6 +775,6 @@ What remains is narrow and true:
   Separate from the first because "we did not understand this" and "we do not have this" are
   different claims, and only the second is data loss.
 
-The general lesson: **a diagnostic is a claim about behaviour, and it goes stale exactly when the
-behaviour improves** — which is the moment nobody is looking at it. `parsing.md` §2.4 carries the
+The general lesson: **a diagnostic is a claim about behavior, and it goes stale exactly when the
+behavior improves** — which is the moment nobody is looking at it. `parsing.md` §2.4 carries the
 anchor row, with the media type that gives it meaning.

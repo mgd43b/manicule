@@ -104,7 +104,7 @@ the only placement that covers every connection the pool will ever open. A test 
 `PRAGMA foreign_keys` returns `1` on a freshly-checked-out connection.
 
 `busy_timeout` matters because `aiosqlite` runs each connection on its own thread, so
-"async SQLAlchemy" does not serialise writers for you. Without it, concurrent ingest and a
+"async SQLAlchemy" does not serialize writers for you. Without it, concurrent ingest and a
 web request produce `SQLITE_BUSY` immediately rather than after a wait. WAL permits many
 readers with one writer; manicule keeps a single write path and lets readers run concurrently.
 
@@ -145,7 +145,7 @@ platform provides, and a build without FTS5 fails at the first query rather than
   happen to share its content.
 
   > **Prior art.** OpenDocuments builds chunk IDs as `${documentId}_chunk_${i}` and then
-  > parses them back out with `/^(.+)_chunk_(\d+)$/` to find neighbours, and deletes FTS rows
+  > parses them back out with `/^(.+)_chunk_(\d+)$/` to find neighbors, and deletes FTS rows
   > with `LIKE 'docid_chunk_%'`. Position is load-bearing inside the identifier, so
   > re-chunking a document silently re-points every stored citation at different text, and
   > any document ID containing `_chunk_` breaks the parse.
@@ -221,7 +221,7 @@ reads.
 
 Sixteen carry over from the shape `PLAN.md` §2 names. Four are added, each with a job that
 one of the sixteen cannot do. `alembic_version` and the FTS5 shadow tables also exist and
-are managed, not modelled.
+are managed, not modeled.
 
 ### 4.1 The four additions
 
@@ -299,7 +299,7 @@ same "settle it before you index" class as vector dimensionality and chunk size.
 The cost is real and small. The same source synced into two workspaces produces two documents,
 two chunk sets and two sets of vectors, which is what isolation *means*. It does not duplicate
 the corpus: retained bytes are content-addressed (§7), so both workspaces reference one blob.
-The partial unique index below is then a second line of defence rather than the mechanism.
+The partial unique index below is then a second line of defense rather than the mechanism.
 
 **`source` is the configured instance, not the connector type.** `[connectors.team-handbook]`
 stores `source = "team-handbook"`; the `confluence-snapshot` implementation it names is not
@@ -417,7 +417,7 @@ supplies them, the pipeline writes the canonical values into those two columns. 
 surface already reads them, so one write makes the command line, the MCP tool, the HTTP payload,
 the browser page and the slot label the model itself is shown all correct at once — including a
 surface added later that nobody remembers to teach. The local identity is not lost: `source_id` is
-still the artefact the connector fetched by, `content_hash` still digests those bytes, and the
+still the artifact the connector fetched by, `content_hash` still digests those bytes, and the
 snapshot's location is in the record.
 
 **The record itself lives in `documents.metadata`, under `source_provenance`. It is not a column,
@@ -543,10 +543,10 @@ single SQLite transaction.
 
 **The fingerprints are `Text` holding canonical bytes, not `JSON` holding a dict.** §6.3
 compares them for byte equality, and a `JSON` column cannot support that: SQLAlchemy's default
-serialiser does not sort keys, so the stored bytes depend on the insertion order of the dict
+serializer does not sort keys, so the stored bytes depend on the insertion order of the dict
 that was passed in. Verified — the same fingerprint built in two field orders produces two
 different stored values, which would either false-mismatch or silently rely on
-re-canonicalising at every read. Storing the canonical bytes makes the comparison literal.
+re-canonicalizing at every read. Storing the canonical bytes makes the comparison literal.
 SQLite's `json_extract` still works on that text, so `doctor`'s field-by-field diff loses
 nothing.
 
@@ -561,12 +561,12 @@ fp8 = hashlib.sha256(canonical(fp)).hexdigest()[:8]   # the §6.5 table-name suf
 ```
 
 `sort_keys` makes it order-independent; `separators` pins whitespace rather than describing it;
-`ensure_ascii` keeps the output pure ASCII so encoding and Unicode normalisation never enter a
+`ensure_ascii` keeps the output pure ASCII so encoding and Unicode normalization never enter a
 comparison; `allow_nan=False` rejects the two values that are not JSON.
 
 **Fingerprint values are `str | int | bool | None`, or nested containers of those — never
 floats**, enforced at construction. A float's text form depends on how it was computed:
-`0.1 + 0.2` serialises as `0.30000000000000004` and `0.3` as `0.3`, so the same intended
+`0.1 + 0.2` serializes as `0.30000000000000004` and `0.3` as `0.3`, so the same intended
 setting arriving by two routes yields two different table names and a spurious refusal.
 Anything fractional is carried as a string.
 
@@ -700,7 +700,7 @@ END;
 ```
 
 A trigger runs inside the same transaction as the row change and cannot be bypassed by a
-migration, a `doctor` repair, or a hand-written fix. Application-level synchronisation covers
+migration, a `doctor` repair, or a hand-written fix. Application-level synchronization covers
 only the write paths someone remembered.
 
 **One dependency, verified rather than assumed.** Hard-deleting a document reaches `chunks`
@@ -777,7 +777,7 @@ chunk containing `authentication`.
 
 **No `tokenchars`.** A technical corpus is full of `snake_case`, `X-Forwarded-For` and `3.12`,
 and adding `_`/`-`/`.` as token characters keeps those whole — at the cost of `foo_bar` no
-longer matching a query for `bar`. Splitting favours recall, and code identifiers are served
+longer matching a query for `bar`. Splitting favors recall, and code identifiers are served
 by the dense leg and by tree-sitter symbols (`PLAN.md` §5) rather than by BM25. Recorded so
 the trade is visible if lexical code search turns out to matter.
 
@@ -833,7 +833,7 @@ A stored vector may be reused **if and only if all three hold**:
    rather than describing it is deliberate — a prose list is a second definition, and the one
    that goes stale is always the prose.
 2. **The same embedding input, for that document** — the exact post-middleware `embed_text`,
-   every code point of it, under the document that owns it. Never Unicode-normalised, and never
+   every code point of it, under the document that owns it. Never Unicode-normalized, and never
    the chunk id, the display text, the content hash or the parse fingerprint.
 3. **A readable stored vector actually exists for that identity** — established by reading the
    row, not by believing what it says about itself.
@@ -854,9 +854,9 @@ as long as the index lives.
 canonical JSON array of five values — a version tag, the document id, the fingerprint's
 canonical form, the sorted middleware declarations, and the exact `embed_text`. The array is
 what makes the encoding injective: no run of one field can be read as the start of the next, so
-two different inputs cannot serialise to one string. `ensure_ascii` escapes every code point,
+two different inputs cannot serialize to one string. `ensure_ascii` escapes every code point,
 which also means a lone surrogate — which a parser can produce and a `str` can hold — encodes
-rather than raising. **The text is never Unicode-normalised**: NFC and NFD of one word tokenise
+rather than raising. **The text is never Unicode-normalized**: NFC and NFD of one word tokenize
 differently and embed differently, so they are two inputs, and a digest that merged them would
 reuse a vector for text the model never saw.
 
@@ -915,7 +915,7 @@ protocol bought self-sufficiency with duplication.
 **No `workspace_id` column.** Workspace lives on `documents`, and the join above applies it.
 Promoting it into Lance would make it a value that can disagree with SQLite.
 
-**Vectors are L2-normalised and the metric is cosine**, so `score = 1 - _distance` is an
+**Vectors are L2-normalized and the metric is cosine**, so `score = 1 - _distance` is an
 actual cosine similarity in `[-1, 1]`. `PLAN.md` §8 has confidence scoring, and a confidence
 derived from an arbitrary monotone transform of an L2 distance is a number with no meaning
 outside its own ranking.
@@ -979,7 +979,7 @@ path, which is right if the vectors really do differ.
 `weights_ref` is out on the same measurement and needs the same care. A backend rarely runs the
 canonical repository's own files — `BAAI/bge-m3` publishes no safetensors, so MLX executes a
 community conversion — and recording which one ran is what makes an index diagnosable. The one
-re-encoding that *does* move the vectors is quantisation, and that is refused at load rather
+re-encoding that *does* move the vectors is quantization, and that is refused at load rather
 than absorbed here: 4-bit `bge-m3` sits at cosine 0.92–0.97 to the same model in fp16
 ([`embeddings.md`](embeddings.md) §1.0).
 
@@ -1085,7 +1085,7 @@ repair is targeted instead of total.
 **`documents.parse_fp` is the third, and the only one with no row in `index_state`.** It
 carries the canonical `ParseFingerprint` ([`parsing.md`](parsing.md) §3.0) of the parser run
 that produced this document's stored text and anchors — its registered name, the version of
-manicule's own extraction rules for it, and the version of every library whose behaviour
+manicule's own extraction rules for it, and the version of every library whose behavior
 decides the output. The asymmetry with the other two is not an omission:
 
 - Chunking and embedding are one process applied to a whole corpus, so "what this index was
@@ -1308,7 +1308,7 @@ Stated here rather than tracked elsewhere, on the same principle as the permissi
 warning in `docs/connectors/confluence.md` §9: this is a consequence of a design decision, and
 it should ship with the design rather than be discovered by whoever finds the directory.
 
-**Before retention, `<data_dir>` held derived artefacts** — extracted text, vectors, metadata.
+**Before retention, `<data_dir>` held derived artifacts** — extracted text, vectors, metadata.
 Recovering the source documents from it would have been lossy and partial.
 
 **With retention it holds the corpus itself.** Every PDF, every attachment, every page body,
@@ -1603,7 +1603,7 @@ so this is the difference between a diagnostic and a decoration.
 
 ---
 
-## 11. Organisation on top of the corpus
+## 11. Organization on top of the corpus
 
 Six of the twenty tables exist to let a person impose structure on a corpus rather than to
 index one: `collections`, `collection_documents`, `tags`, `document_tags`, `document_versions`
@@ -1622,7 +1622,7 @@ result with an entirely ordinary explanation, and a `chunk_relations` edge acros
 makes a lookup from one tenant's chunk hand back another tenant's chunk id.
 
 Membership writes are therefore **all or nothing**. A batch naming an id this handle cannot see
-is refused whole, rather than applied to the ids it recognised. "Added thirty-nine of forty" is
+is refused whole, rather than applied to the ids it recognized. "Added thirty-nine of forty" is
 a success report about a failure, and the dropped id — a typo, or another tenant's — is the one
 that mattered.
 
@@ -1631,11 +1631,11 @@ deleting a tag takes its applications; neither touches a document. That is a pro
 each foreign key points, and one pointed a table further would take a corpus with it while the
 schema still looked plausible, so it is asserted in the conformance suites rather than reviewed.
 
-### 11.2 Collections: membership is evaluated, never materialised
+### 11.2 Collections: membership is evaluated, never materialized
 
 A collection has manual members and, optionally, an `auto_rules` rule. Membership is the union,
 computed at read time, so "everything from the runbooks space" keeps meaning that as the corpus
-grows. Materialising the rule's answer would make the collection a snapshot with a name that
+grows. Materializing the rule's answer would make the collection a snapshot with a name that
 promises otherwise, and nothing would report that it had gone stale.
 
 **The rule carries no workspace, and cannot.** It is stored and re-executed later by whichever
@@ -1651,7 +1651,7 @@ giving two answers.
 
 ### 11.3 Resolving `collection_ids` and `tag_ids` — and the inversion it avoids
 
-Neither store honours those two `Filter` fields; both refuse them, because neither the lexical
+Neither store honors those two `Filter` fields; both refuse them, because neither the lexical
 statement nor the vector predicate has a join to reach them. `resolve_filter` is the step that
 turns them into `document_ids` first, and it returns `Filter | None`.
 
@@ -1675,7 +1675,7 @@ orders of magnitude below this ceiling.
 
 ### 11.4 Tag and collection names
 
-Normalised to NFKC with whitespace collapsed. Without NFKC, `café` typed on two keyboards is
+Normalized to NFKC with whitespace collapsed. Without NFKC, `café` typed on two keyboards is
 two rows — a precomposed `é` against `e` plus a combining acute — identical on screen and
 splitting every filter that uses the label.
 
@@ -1756,7 +1756,7 @@ precisely because lookups are `WHERE source = ? OR target = ?` and a composite p
 leading with `source` cannot serve the second half — so a mirror row would double the table to
 answer a question the schema already answers, and would create a pair that can drift. Direction
 survives the round trip, because for a parent link the two directions mean opposite things and
-a set of neighbours cannot recover which.
+a set of neighbors cannot recover which.
 
 `relation_type` stays plain `TEXT` with no `CHECK`, and the vocabulary is closed in Python
 instead. That is the right side of §3.4's trade rather than an exception to it: a misspelled
@@ -1811,7 +1811,7 @@ one.
 | `<data_dir>` is `0700`/`0600`; `doctor` fails on a looser mode; backup refuses a world-readable target | §7.1 |
 | Deletion from derived stores is always deferred to a sweep | §8.2 |
 | Soft delete is idempotent and never restarts the grace period | §8.2 |
-| Organisation is five protocols implemented by one class | §11 |
+| Organization is five protocols implemented by one class | §11 |
 | Collection membership is evaluated at read time; a stored rule cannot name a workspace | §11.2 |
 | Resolving an empty collection refuses the query rather than widening it to the workspace | §11.3 |
 | A version row is the state a document *left*, written only when `content_hash` changes | §11.5 |

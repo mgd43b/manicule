@@ -1,6 +1,6 @@
 """What the hub module says while it works, and what it declines to say.
 
-Both behaviours here exist because a model fetch is the one operation in manicule that can
+Both behaviors here exist because a model fetch is the one operation in manicule that can
 take minutes, and the only one whose progress a third-party library reports on its behalf.
 """
 

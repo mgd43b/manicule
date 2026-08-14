@@ -346,7 +346,7 @@ def _xlsx_regions(raw: RawDocument, config: SpreadsheetConfig) -> list[_Region]:
 
     regions: list[_Region] = []
     # Closed here rather than left to the collector: the workbook holds a Rust-side structure,
-    # and every region is materialised before this returns, so there is nothing to keep it open
+    # and every region is materialized before this returns, so there is nothing to keep it open
     # for. Nothing is held across a yield — the caller iterates regions, not sheets.
     with workbook:
         for index, metadata in enumerate(workbook.sheets_metadata, start=1):

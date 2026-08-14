@@ -13,7 +13,7 @@ verified, and that is exactly what an unguarded link check becomes the day its i
 matching.
 
 So the *report* is the gate rather than the exit status. That has a second property worth as
-much as the first: the report is an artefact only a real run can produce. A setup step that
+much as the first: the report is an artifact only a real run can produce. A setup step that
 failed and was somehow not fatal — a `continue-on-error` added in good faith, an install that
 wrote a broken binary — leaves no report, and no report is a failure here. The check cannot be
 disabled by breaking it; breaking it is loud.

@@ -12,7 +12,7 @@ fixture in this repository it is allowed to skip.
 
 **The six assertions run over a declared subset**, because one of them cannot be run over
 everything. Assertion 3 asks that no location's resolved text *contains* another block's
-text, which is what catches an anchor confused with its neighbour. One fixture in the corpus
+text, which is what catches an anchor confused with its neighbor. One fixture in the corpus
 repeats wording on purpose — two DOCX sections with the same heading text — and the assertion
 cannot tell that apart from a wrong anchor. It is named in :attr:`Corpus.ambiguous` **with the
 reason and with the test that covers it instead**, and a fixture may not be listed there

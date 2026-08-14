@@ -48,7 +48,7 @@ class FeedbackReason(StrEnum):
     guard, held behind a precision-and-recall measurement nobody has the labels for.
 
     A human reading the answer *can* see it. So this is the only detector this project has for
-    its one uncaught citation failure, and the reports it produces are the labelled set that
+    its one uncaught citation failure, and the reports it produces are the labeled set that
     would let the guard be measured for recall as well as precision.
     """
 

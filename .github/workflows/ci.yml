@@ -68,7 +68,7 @@ jobs:
   # the floor under all of it is those 67s plus the single longest test — a 25s parser corpus
   # round-trip — which no number of shards divides.
   #
-  # Those are measured on this runner rather than modelled: the two ends are the real 390s
+  # Those are measured on this runner rather than modeled: the two ends are the real 390s
   # unsharded leg and the real 174s three-shard one, and the curve is fitted to them. Worth
   # saying because a laptop does not predict them — collection there costs a few seconds rather
   # than 34, which makes local timings far too optimistic about what another shard would buy.
@@ -97,7 +97,7 @@ jobs:
       - run: uv sync --all-groups --all-extras --python ${{ matrix.python }}
       # tree-sitter grammars are fetched from a release bundle rather than shipped in the
       # wheel, so a fresh runner has none. The code parser's suite skips precisely when a
-      # grammar is absent — which is the right behaviour for a developer's machine and the
+      # grammar is absent — which is the right behavior for a developer's machine and the
       # wrong outcome for CI, where it would mean the parser is never exercised and the
       # suite still reports green. Pre-seeding is the same step an operator runs, so this
       # also checks that `prefetch` works on a machine that has never had a grammar.
@@ -161,7 +161,7 @@ jobs:
       # are duration-aware; the difference is that the default cuts the collection order at
       # duration boundaries, so a single 25s test straddling a cut skews the shard it lands in,
       # while `least_duration` packs largest-first into the emptiest shard and is what actually
-      # minimises the slowest one — and the slowest shard is the wall clock. It keeps each
+      # minimizes the slowest one — and the slowest shard is the wall clock. It keeps each
       # shard's tests in collection order, so module-scoped fixtures still behave; they are just
       # set up in more than one shard now.
       #
@@ -216,7 +216,7 @@ jobs:
   # tolerance.
   #
   # **Grammars and the offline bundle.** The same shape of claim: the grammar pack resolves its
-  # cache through `platformdirs`, which honours `XDG_CACHE_HOME` on Linux and `~/Library/Caches`
+  # cache through `platformdirs`, which honors `XDG_CACHE_HOME` on Linux and `~/Library/Caches`
   # on macOS, and a bundle is valid for exactly one operating system and architecture. Both are
   # properties that a green ubuntu job says nothing about.
   embeddings:
@@ -268,7 +268,7 @@ jobs:
 
       # The grammar suites run here too, and macOS is not an arbitrary second platform for
       # them — it is the platform where this exact area has already produced a silent failure.
-      # The grammar pack resolves its cache through `platformdirs`, which honours
+      # The grammar pack resolves its cache through `platformdirs`, which honors
       # `XDG_CACHE_HOME` on Linux and uses `~/Library/Caches` on macOS, so a cache redirect
       # that looked fine on the ubuntu matrix hid every grammar here and the suite passed by
       # skipping. The offline bundle is also platform-specific by construction — a bundle is
@@ -323,7 +323,7 @@ jobs:
       # the ubuntu matrix that is every one of them, so without this step the tests that hold
       # the most dangerous credential manicule stores would run on a developer's machine and
       # nowhere else. They are here for the same reason the grammar suites are: this is the
-      # platform where the behaviour exists, and a suite that passes by skipping is a suite
+      # platform where the behavior exists, and a suite that passes by skipping is a suite
       # that is not being run.
       #
       # `REQUIRE_KEYCHAIN` turns this suite's Keychain skips into failures, exactly as
@@ -410,7 +410,7 @@ jobs:
       # another language set, and both are things this must not build an image from — the
       # Dockerfile looks for a directory named after the release it installs, so an older one
       # would be ignored anyway. A prefix match would only make the cache report hits it cannot
-      # honour.
+      # honor.
       - name: stage the grammar pack the image is built from
         env:
           # On a restored cache nothing should be downloaded, and this is what makes that a
@@ -549,7 +549,7 @@ jobs:
       # that will not execute or reports something else is a checker this job must not use.
       #
       # `--format json --output` alongside `--verbose`, so the log keeps every line a human
-      # reads *and* the run leaves an artefact the next step can hold to account. Neither is a
+      # reads *and* the run leaves an artifact the next step can hold to account. Neither is a
       # substitute for the other: the console cannot be asserted on, and the report is not
       # something anybody scrolls.
       - name: lychee
@@ -577,7 +577,7 @@ jobs:
       # cancellation: a lychee that exited non-zero still gets its broken links named here rather
       # than left in the log, and a lychee that never ran leaves no report, which is a failure.
       # That is the property worth more than the cache — a link check that could not run cannot
-      # report success, because success is asserted from an artefact only a real run produces.
+      # report success, because success is asserted from an artifact only a real run produces.
       - name: the link check actually checked links
         if: ${{ !cancelled() }}
         run: python3 tools/check_link_report.py lychee-report.json

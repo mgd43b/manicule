@@ -4,7 +4,7 @@
 Run this on a machine that *has* network access and the same platform as the target. It
 pre-seeds the declared language set, copies each grammar library into a bundle directory,
 records the pack release, the platform and a SHA-256 per library, and asserts that the pack's
-licence is one manicule may redistribute.
+license is one manicule may redistribute.
 
     python tools/build_grammar_bundle.py --output dist/grammars
 
@@ -23,14 +23,14 @@ dependency and no environment variable is needed at all. That package is built r
 published, because a bundle is valid for exactly one platform and one pack release — which is
 also why its version carries both: ``1.14.3+macos.arm64`` says, in ``pip list``, exactly what
 the thing on this machine is good for. :func:`package_version` writes that string, separators
-already normalised the way PEP 440 will normalise them, so the file and the installed
+already normalized the way PEP 440 will normalize them, so the file and the installed
 distribution report the same version on every platform rather than on the one it was written on.
 
 **The metadata is written here rather than by whoever consumes the output.** It was not, once,
 and the deployment that needed it supplied a ``pyproject.toml`` of its own — which meant the
 one file describing which release and which platform a bundle is for was maintained somewhere
 that could not see either. ``artifacts`` in that metadata is the load-bearing line: the payload
-is compiled shared libraries, hatchling honours a ``.gitignore`` next to the project it builds,
+is compiled shared libraries, hatchling honors a ``.gitignore`` next to the project it builds,
 and ``*.so`` is about the most commonly ignored pattern there is. Without it such a build
 succeeds, installs, and lands a manifest describing libraries that are not in the wheel.
 
@@ -85,7 +85,7 @@ build-backend = "hatchling.build"
 name = "{distribution}"
 version = "{version}"
 description = "{description}"
-license = "{licence}"
+license = "{license}"
 requires-python = ">=3.12"
 
 # No dependencies, deliberately. This is data — compiled grammar libraries and a manifest —
@@ -96,7 +96,7 @@ requires-python = ">=3.12"
 [tool.hatch.build.targets.wheel]
 packages = ["src/{module}"]
 # The load-bearing line. Every byte of the payload is a compiled shared library, hatchling
-# honours a `.gitignore` beside this file, and `*.so` is one of the most commonly ignored
+# honors a `.gitignore` beside this file, and `*.so` is one of the most commonly ignored
 # patterns in existence. Without this the build still succeeds and still installs — and the
 # wheel carries a manifest describing libraries that are not in it, which surfaces on the
 # air-gapped host as a bundle that is present and empty.
@@ -118,7 +118,7 @@ def package_version(pack_version: str, platform: str) -> str:
     what they have. A local segment is the right home for it: it is never published to an
     index, which is the correct treatment for a distribution built per platform.
 
-    **Separators are normalised here rather than left to the installer**, and that is not
+    **Separators are normalized here rather than left to the installer**, and that is not
     tidiness. PEP 440 folds both ``-`` and ``_`` in a local segment to ``.``, so writing
     ``linux-x86_64`` produces a file that says one version and an installed distribution that
     reports another — the artifact describing something the machine does not have. It is
@@ -140,11 +140,11 @@ def package_metadata(bundle: grammar_bundle.GrammarBundle) -> str:
             f"{grammars.PACK_DISTRIBUTION} {bundle.pack_version}, {bundle.platform}, "
             f"{len(bundle.languages)} languages."
         ),
-        # The licence the bundle asserted at build time, not a constant. `check_licence` has
+        # The license the bundle asserted at build time, not a constant. `check_license` has
         # already refused anything copyleft or unassessed, so what reaches here is a term
         # manicule may redistribute — and recording it in the metadata is what carries that
         # assertion to the machine the wheel is installed on.
-        licence=bundle.licence,
+        license=bundle.license,
     )
 
 
@@ -213,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"bundle:   {bundle.root}")
     print(f"pack:     tree-sitter-language-pack {bundle.pack_version}")
     print(f"platform: {bundle.platform}")
-    print(f"licence:  {bundle.licence} (asserted redistributable)")
+    print(f"license:  {bundle.license} (asserted redistributable)")
     print(f"size:     {total / 1_000_000:.1f} MB across {len(bundle.languages)} languages")
     for language in bundle.languages:
         entry = bundle.grammars[language]

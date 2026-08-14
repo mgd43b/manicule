@@ -13,7 +13,7 @@ design. A binder scanning for ``[1]`` eats the answer. ``[[3]]`` collides with w
 syntax, and ``[^3]`` is a Markdown footnote reference a quoted passage can legitimately
 contain. ``[[cite:N]]`` has no plausible collision in prose or code, is cheap to detect on a
 character stream, and — the reason for the ``cite:`` prefix rather than a bare ``[[3]]`` — a
-malformed attempt is still *recognisable as an attempt*, so it can be counted rather than
+malformed attempt is still *recognizable as an attempt*, so it can be counted rather than
 mistaken for prose.
 
 **The scanner is not Markdown-aware, deliberately.** Being Markdown-aware means parsing a
@@ -32,7 +32,7 @@ MARKER_OPEN = "[["
 MARKER_CLOSE = "]]"
 MARKER_KEYWORD = "cite"
 ATTEMPT_PREFIX = f"{MARKER_OPEN}{MARKER_KEYWORD}"
-"""What makes something *recognisable as an attempt* even when it is malformed.
+"""What makes something *recognizable as an attempt* even when it is malformed.
 
 The scanner and :func:`escape_markers` are both defined against this one constant, so a
 passage cannot contain something the escaper leaves alone and the scanner then binds.
@@ -51,7 +51,7 @@ _SLOT_LIST = re.compile(r"^\s*:\s*(\d+)(?:\s*,\s*(\d+))*\s*$", re.ASCII)
 """The payload of a well-formed marker: a colon and one or more slot numbers.
 
 Whitespace is tolerated on both sides of the colon and around the separators, which is the
-one normalisation the binder performs — of syntax it defined itself. ``[[cite: 3]]`` and
+one normalization the binder performs — of syntax it defined itself. ``[[cite: 3]]`` and
 ``[[cite:3 ]]`` mean what they obviously mean, and rendering them as ``[[cite:3]]`` is not an
 edit to the answer in any sense a reader could observe.
 """
@@ -59,11 +59,11 @@ edit to the answer in any sense a reader could observe.
 _SLOT = re.compile(r"\d+", re.ASCII)
 
 _ESCAPE = re.compile(re.escape(ATTEMPT_PREFIX), re.IGNORECASE)
-"""What :func:`escape_markers` neutralises in a passage body."""
+"""What :func:`escape_markers` neutralizes in a passage body."""
 
 
 def escape_markers(text: str) -> str:
-    """Neutralise marker syntax inside text that will be shown to a model.
+    """Neutralize marker syntax inside text that will be shown to a model.
 
     Not hypothetical: manicule's own documentation describes this syntax, and manicule's own
     documentation is exactly the sort of thing somebody indexes. A passage containing a
@@ -71,7 +71,7 @@ def escape_markers(text: str) -> str:
     passage, so it would even *verify* — producing a citation nobody asked for.
 
     The escape separates the two opening brackets, which is the minimum that stops the
-    scanner recognising an attempt while leaving the text legible to the model. Like
+    scanner recognizing an attempt while leaving the text legible to the model. Like
     redaction, it is applied to **a copy on its way into a prompt**: the stored passage, the
     chunk text a citation quotes, and the bytes verification runs against are all untouched.
     """

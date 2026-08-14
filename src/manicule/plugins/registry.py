@@ -171,7 +171,7 @@ class ComponentRegistry:
         Raises:
             ValueError: ``key`` has no name, or a parser declared no media types.
             DuplicateComponentError: Another plugin already claimed that kind and name.
-                Silent shadowing would make behaviour depend on installation order.
+                Silent shadowing would make behavior depend on installation order.
         """
         if key.name is None:
             msg = f"cannot register an unnamed component of kind {key.kind.value!r}"

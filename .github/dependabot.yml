@@ -1,13 +1,13 @@
 # Dependency update automation.
 #
-# The organising idea is that not every bump costs the same. Most of them risk a regression,
+# The organizing idea is that not every bump costs the same. Most of them risk a regression,
 # which CI catches. A few of them change what is *in the index* — the stored vectors, the
 # chunk boundaries, or the text a document was reduced to — and the cost of accepting one is
 # re-ingesting the corpus, which no test can pay on a maintainer's behalf. Those are grouped
 # under an `index-affecting-` prefix so the pull request title says so before it is opened.
 #
-# What Dependabot does not do is check licences. This project is GPL-3.0-or-later and has
-# rejected dependencies on licence grounds; a bump that changes a dependency's licence is a
+# What Dependabot does not do is check licenses. This project is GPL-3.0-or-later and has
+# rejected dependencies on license grounds; a bump that changes a dependency's license is a
 # real event and nothing here will catch it. CONTRIBUTING.md, "Reviewing a dependency
 # update", says what to do about that.
 
@@ -56,7 +56,7 @@ updates:
     # Security updates are deliberately left alone by everything above. They are not subject
     # to `open-pull-requests-limit`, they do not wait for Monday, and `groups` defaults to
     # `applies-to: version-updates`, so an advisory produces its own pull request the day it
-    # lands rather than joining a batch. That is the intended behaviour and the reason no
+    # lands rather than joining a batch. That is the intended behavior and the reason no
     # group below sets `applies-to`.
     #
     # `commit-message` is deliberately unset on both blocks. Its default is to follow the
@@ -119,7 +119,7 @@ updates:
       # different meanings on different architectures, so a patch release can move vectors
       # without changing an API. `tokenizers` is worse than it looks — `tokenizer_id` is an
       # identity field of *both* fingerprints, so a vocabulary change invalidates the chunk
-      # boundaries as well as the vectors. `numpy` is here because pooling and normalisation
+      # boundaries as well as the vectors. `numpy` is here because pooling and normalization
       # are done in manicule's own numpy rather than taken from a backend's convenience
       # output, which puts it in the path that decides what a vector is.
       #
@@ -188,7 +188,7 @@ updates:
       # `lxml` is here rather than in `runtime` because it is what `python-docx` and
       # `python-pptx` read OOXML *with*: the XML parse is the extraction step, and neither
       # library would notice it changing. `ruamel*` is a wildcard because the declared name
-      # is `ruamel.yaml` and the resolved name is `ruamel-yaml` — package names normalise
+      # is `ruamel.yaml` and the resolved name is `ruamel-yaml` — package names normalize
       # under PEP 503, and a literal `ruamel.yaml` pattern would match neither the lockfile
       # entry nor the accelerator `ruamel-yaml-clib` beneath it.
       index-affecting-extraction:

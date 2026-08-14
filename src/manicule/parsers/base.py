@@ -84,7 +84,7 @@ class SlugAllocator:
         return base if count == 0 else f"{base}-{count}"
 
     def reserve(self, fragment: str) -> None:
-        """Record a fragment the source supplied, so a synthesised one cannot collide."""
+        """Record a fragment the source supplied, so a synthesized one cannot collide."""
         self._seen[fragment] = self._seen.get(fragment, 0) + 1
 
 

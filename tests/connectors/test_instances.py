@@ -140,7 +140,7 @@ async def test_one_instance_resolves_to_one_object(settings: Settings) -> None:
     """Per-instance, not per-call: asking twice must not build twice.
 
     A connector holds a watermark across a run, and two objects for one source would each
-    advance their own — so the memoisation is load-bearing rather than an optimisation.
+    advance their own — so the memoization is load-bearing rather than an optimization.
     """
     container = _container(settings, handbook=_rooted("/corpus/handbook"))
 

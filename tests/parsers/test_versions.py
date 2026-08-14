@@ -149,7 +149,7 @@ def test_a_missing_distribution_raises_rather_than_defaulting(
     """A version that falls back to a constant is the constant this table replaced.
 
     Exercised through :func:`parse_fingerprint` rather than through ``importlib`` on its own,
-    because what is being asserted is this module's behaviour: a lookup that quietly returned
+    because what is being asserted is this module's behavior: a lookup that quietly returned
     a default would produce a fingerprint that never moves, which is worse than no fingerprint
     at all. ``parse_fingerprint`` is cached, so the cache is cleared around the substitution.
     """

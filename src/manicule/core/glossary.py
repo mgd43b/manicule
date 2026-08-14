@@ -6,8 +6,8 @@ and nothing here imports a database, a model or a tokenizer — the whole featur
 deterministic by construction, and a module that could reach a generative model would make
 that claim unverifiable.
 
-**Normalisation is defined once, here.** ``NOW``, ``now``, ``N.O.W.`` and ``(NOW)`` are the
-same key; a store that normalised on write and a query path that normalised differently on
+**Normalization is defined once, here.** ``NOW``, ``now``, ``N.O.W.`` and ``(NOW)`` are the
+same key; a store that normalized on write and a query path that normalized differently on
 read would produce a lookup that silently missed, which is indistinguishable from a corpus
 with no glossary in it.
 """
@@ -33,7 +33,7 @@ _STRIPPABLE: Final = "()[]{}<>\"'“”‘’.,;:!?…"  # noqa: RUF001 - the cu
 """Punctuation removed from either end of a surface form before it becomes a key.
 
 Kept as one constant because query-time and ingest-time stripping must agree exactly. A
-trailing question mark is the specific case that matters: ``What is NOW?`` tokenises to
+trailing question mark is the specific case that matters: ``What is NOW?`` tokenizes to
 ``NOW?`` and would otherwise never match anything.
 """
 
@@ -41,11 +41,11 @@ _INTERNAL_DOTS: Final = re.compile(r"(?<=\w)\.(?=\w)")
 """``N.O.W.`` and ``NOW`` are the same term written two ways."""
 
 
-def normalise_acronym(surface: str) -> str:
+def normalize_acronym(surface: str) -> str:
     """The lookup key for a surface form.
 
     Case-folded to upper, stripped of surrounding punctuation, internal dots removed, and
-    NFKC-normalised so that a full-width or ligatured variant does not become a second term.
+    NFKC-normalized so that a full-width or ligatured variant does not become a second term.
 
     Returns the empty string for anything that cannot be a key, which callers test rather than
     guessing from length: an empty key that reached a store would match every row whose column
@@ -66,11 +66,11 @@ def normalise_acronym(surface: str) -> str:
     return upper
 
 
-def normalise_expansion(expansion: str) -> str:
+def normalize_expansion(expansion: str) -> str:
     """A comparison key for two expansions, so trivial differences are not conflicts.
 
     Case and internal whitespace only. Word order, wording and punctuation are **not**
-    normalised away: "Network Operations Workspace" and "Workspace, Network Operations" are two
+    normalized away: "Network Operations Workspace" and "Workspace, Network Operations" are two
     claims about what a term means, and deciding they are one is exactly the silent choice this
     feature is forbidden to make.
     """
@@ -78,7 +78,7 @@ def normalise_expansion(expansion: str) -> str:
 
 
 class DefinitionForm(StrEnum):
-    """The written shape a definition was recognised in.
+    """The written shape a definition was recognized in.
 
     Recorded rather than discarded because it is half of the confidence: a two-column table row
     inside a page titled "Glossary" is a definition, and the same two strings either side of a
@@ -118,11 +118,11 @@ class GlossaryEntry(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    acronym: str = Field(min_length=MIN_ACRONYM_LENGTH, description="The normalised lookup key.")
+    acronym: str = Field(min_length=MIN_ACRONYM_LENGTH, description="The normalized lookup key.")
     display: str = Field(
         min_length=1,
         description="The canonical form as the source wrote it — ``NOW``, not ``now``. What a "
-        "reader is shown, so a citation quotes the document rather than our normalisation.",
+        "reader is shown, so a citation quotes the document rather than our normalization.",
     )
     expansion: str = Field(min_length=1)
     document_id: str = Field(min_length=1)
@@ -146,13 +146,13 @@ class GlossaryEntry(BaseModel):
     )
     aliases: tuple[str, ...] = Field(
         default=(),
-        description="Other normalised keys that resolve to this entry — a dotted spelling, a "
+        description="Other normalized keys that resolve to this entry — a dotted spelling, a "
         "second short form the source gave. The acronym itself is not repeated here.",
     )
 
     @property
     def keys(self) -> tuple[str, ...]:
-        """Every normalised key that should find this entry."""
+        """Every normalized key that should find this entry."""
         return (self.acronym, *self.aliases)
 
 
@@ -180,7 +180,7 @@ class GlossaryMatch(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     surface: str = Field(min_length=1, description="The token as the query wrote it.")
-    key: str = Field(min_length=1, description="The normalised key it resolved through.")
+    key: str = Field(min_length=1, description="The normalized key it resolved through.")
     reason: MatchReason
     entry: GlossaryEntry
 
@@ -205,7 +205,7 @@ class ExpansionConflict(BaseModel):
         """The distinct expansions in play, in the order they were found."""
         seen: dict[str, str] = {}
         for entry in self.entries:
-            seen.setdefault(normalise_expansion(entry.expansion), entry.expansion)
+            seen.setdefault(normalize_expansion(entry.expansion), entry.expansion)
         return tuple(seen.values())
 
 
@@ -248,6 +248,6 @@ __all__ = [
     "GlossaryMatch",
     "MatchReason",
     "QueryExpansion",
-    "normalise_acronym",
-    "normalise_expansion",
+    "normalize_acronym",
+    "normalize_expansion",
 ]

@@ -2,10 +2,10 @@
 
 The trap in ``docs/connectors/confluence.md`` §2: a search cursor contains ``+``, every
 form-decoding query parser reads that as a space, and the re-encoded cursor is one the server
-does not recognise. Nothing raises. Pagination restarts or stops, and some pages of a space
+does not recognize. Nothing raises. Pagination restarts or stops, and some pages of a space
 are simply never seen.
 
-So the fixtures put a ``+`` in every cursor, and the synthetic instance answers an unrecognised
+So the fixtures put a ``+`` in every cursor, and the synthetic instance answers an unrecognized
 one with the *first* page rather than an error — which is what makes the real failure invisible.
 A suite that walked two pages of a well-behaved cursor would certify nothing at all.
 """

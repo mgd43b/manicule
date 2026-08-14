@@ -1,7 +1,7 @@
 """PDF fixtures.
 
 The rotated and cropped pages are the point of this file. The transform from pdfium's raw
-user-space rectangles to normalised page coordinates cannot fail loudly — it produces
+user-space rectangles to normalized page coordinates cannot fail loudly — it produces
 rectangles that are plausible, on the right page, and in the wrong place — so it is only
 caught by a page where the right answer and the naive answer differ, which is exactly a page
 that is rotated or cropped. On a square unrotated page the two agree.
@@ -77,7 +77,7 @@ def _reshape(
     """
     # pypdfium2 ships no type information for its page geometry setters, so every call below
     # is partially unknown to the checker. The suppression is on the block rather than on each
-    # line because the cause is one fact about upstream, not four separate judgements.
+    # line because the cause is one fact about upstream, not four separate judgments.
     document = pdfium.PdfDocument(data)
     try:
         page = document[0]

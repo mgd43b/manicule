@@ -1,6 +1,6 @@
 """What the command line does that the service does not: parsing, piping and exit status.
 
-Only the adapter's own behaviour is asserted here. Anything about *what an operation means*
+Only the adapter's own behavior is asserted here. Anything about *what an operation means*
 belongs to :mod:`tests.app.test_service`, and asserting it twice would make the command line a
 second place a rule lives — which is the thing this design exists to prevent.
 """
@@ -143,7 +143,7 @@ def test_reset_index_refuses_without_an_explicit_confirmation(
     same refusal whether a person or a cron job typed it.
 
     Asserted against the message and the backend, never against the rendered box. Terminal
-    width, colour and elision differ by machine, and a test that reads them is testing the
+    width, color and elision differ by machine, and a test that reads them is testing the
     terminal.
     """
     assert "--yes" in cli.RESET_NEEDS_CONFIRMATION
@@ -612,7 +612,7 @@ def test_the_streaming_flag_is_cleared_between_invocations(bound: ApplicationSer
     assert cli.STATE.text_already_streamed is False
 
 
-# --- values survive a colouring terminal ---------------------------------------------------
+# --- values survive a coloring terminal ---------------------------------------------------
 
 
 def _laid_bare(text: str) -> str:
@@ -625,7 +625,7 @@ def _laid_bare(text: str) -> str:
     return re.sub(r"[\s\u2502\u2500]", "", without_escapes)
 
 
-def test_an_identifier_is_not_mangled_when_the_terminal_wants_colour(
+def test_an_identifier_is_not_mangled_when_the_terminal_wants_color(
     monkeypatch: pytest.MonkeyPatch, bound: ApplicationService
 ) -> None:
     """Rich's automatic highlighter puts escape codes *inside* a token.
@@ -1012,7 +1012,7 @@ JSON_LANDMARKS: frozenset[tuple[str, ...]] = frozenset(
 
 Not the obvious ones only. ``completion`` and ``stop`` reach an envelope without going through
 ``emit`` at all, and ``auth create-key`` and ``config set`` live two levels down on
-sub-applications — so a walk that only descended one level, or only recognised ``emit``, would
+sub-applications — so a walk that only descended one level, or only recognized ``emit``, would
 still return the large majority of commands and look perfectly healthy.
 """
 
@@ -1146,7 +1146,7 @@ def test_the_derivation_covers_every_command_the_interface_offers() -> None:
     emitting = _data_emitting_commands()
     assert len(emitting) >= MINIMUM_DATA_EMITTING_COMMANDS, (
         f"the derivation found {len(emitting)} data-emitting command(s), below the floor of "
-        f"{MINIMUM_DATA_EMITTING_COMMANDS}. It is walking the wrong tree, or recognising none "
+        f"{MINIMUM_DATA_EMITTING_COMMANDS}. It is walking the wrong tree, or recognizing none "
         f"of the calls that produce an envelope."
     )
     missing = sorted(JSON_LANDMARKS - set(emitting))
@@ -1173,7 +1173,7 @@ without a sample here fails rather than being quietly skipped by every test belo
 
 
 def test_every_shared_option_has_a_way_to_be_typed() -> None:
-    """The parametrisation below is only as complete as this mapping.
+    """The parametrization below is only as complete as this mapping.
 
     A shared option with no entry would be silently absent from every assertion in this
     section, which is the failure mode where coverage is reported for an option nothing typed.
@@ -1346,7 +1346,7 @@ ESCAPE = "\x1b"
 """The first byte of every ANSI sequence Rich emits.
 
 Asserted against the characters that were actually printed. The mistake this replaces is
-asserting that colour was *configured* off — a check that passes while the library it is about
+asserting that color was *configured* off — a check that passes while the library it is about
 carries on writing escapes, because the setting was read at import and the test never looked at
 the output.
 """
@@ -1358,23 +1358,23 @@ The parameters are the point. ``\\x1b[1m`` is bold and ``\\x1b[32m`` is green, a
 difference decides whether the control below can fail.
 """
 
-COLOUR_PARAMETERS = frozenset(
+COLOR_PARAMETERS = frozenset(
     [*(str(code) for code in range(30, 38)), *(str(code) for code in range(90, 98)), "38"]
 )
-"""SGR parameters that set a foreground colour: the 8, the bright 8, and 256/true-colour.
+"""SGR parameters that set a foreground color: the 8, the bright 8, and 256/true-color.
 
 Backgrounds are not listed because this output sets none, and a set naming codes nothing emits
 would be a guess about what to expect.
 """
 
 
-def _colours(text: str) -> set[str]:
-    """The foreground colours actually present in some output.
+def _colors(text: str) -> set[str]:
+    """The foreground colors actually present in some output.
 
     Separate from "are there escapes at all", and the separation is the whole reason this
-    exists. Rich's ``no_color`` strips **colour** and keeps everything else, so a run with
-    colour genuinely turned off still emits ``\\x1b[1m`` for bold — and a control asserting
-    only that *an* escape appeared would pass while reporting on a stream that had no colour in
+    exists. Rich's ``no_color`` strips **color** and keeps everything else, so a run with
+    color genuinely turned off still emits ``\\x1b[1m`` for bold — and a control asserting
+    only that *an* escape appeared would pass while reporting on a stream that had no color in
     it. That is the shape of vacuous check this control was written to prevent, so it must not
     be the shape of the control.
     """
@@ -1382,17 +1382,17 @@ def _colours(text: str) -> set[str]:
         parameter
         for sequence in SGR.findall(text)
         for parameter in sequence.split(";")
-        if parameter in COLOUR_PARAMETERS
+        if parameter in COLOR_PARAMETERS
     }
 
 
-def test_a_colouring_terminal_puts_no_escape_sequences_in_the_json(
+def test_a_coloring_terminal_puts_no_escape_sequences_in_the_json(
     monkeypatch: pytest.MonkeyPatch, bound: ApplicationService
 ) -> None:
     """``manicule doctor --json | jq`` has to work from an interactive shell.
 
     ``FORCE_COLOR`` is the environment a terminal actually presents, and it is the one where
-    this fails: Rich decides to colour, and a single escape sequence anywhere in the stream
+    this fails: Rich decides to color, and a single escape sequence anywhere in the stream
     makes the whole document unparseable — for ``jq``, and for every JSON library there is.
 
     The output is captured and read. Nothing here asserts that a flag was set, because the
@@ -1406,7 +1406,7 @@ def test_a_colouring_terminal_puts_no_escape_sequences_in_the_json(
     assert json.loads(result.stdout)["op"] == "doctor"
 
 
-def test_the_same_terminal_does_colour_the_human_output(
+def test_the_same_terminal_does_color_the_human_output(
     monkeypatch: pytest.MonkeyPatch, bound: ApplicationService
 ) -> None:
     """The positive control, and without it the test above proves nothing.
@@ -1414,16 +1414,16 @@ def test_the_same_terminal_does_colour_the_human_output(
     ``FORCE_COLOR`` has to actually reach Rich for the absence of escapes under ``--json`` to
     mean anything. If it did not — a typo in the variable, a console built before the
     environment was set — the assertion above would hold on a stream that was never going to be
-    coloured, and would go on holding after somebody reintroduced a banner.
+    colored, and would go on holding after somebody reintroduced a banner.
 
-    **Asserted on colour rather than on escapes**, which the first version of this control got
-    wrong. Rich's ``no_color`` strips colour and leaves bold, so a console built with colour
+    **Asserted on color rather than on escapes**, which the first version of this control got
+    wrong. Rich's ``no_color`` strips color and leaves bold, so a console built with color
     genuinely disabled still writes ``\\x1b[1m`` — and "an escape appeared" passed on output
-    with no colour in it. The control could not fail for the reason it existed to detect, which
-    is the same defect it was guarding the neighbouring test against.
+    with no color in it. The control could not fail for the reason it existed to detect, which
+    is the same defect it was guarding the neighboring test against.
 
-    The colour environment is the fixture's, not the caller's. This test failed under
-    ``TERM=dumb`` before ``colour_environment`` existed, because ``TERM`` declares what the
+    The color environment is the fixture's, not the caller's. This test failed under
+    ``TERM=dumb`` before ``color_environment`` existed, because ``TERM`` declares what the
     stream can *render* and overrides ``FORCE_COLOR``, which only declares that it is a
     terminal.
     """
@@ -1431,8 +1431,8 @@ def test_the_same_terminal_does_colour_the_human_output(
     monkeypatch.setenv("FORCE_COLOR", "1")
     result = run(["doctor"])
     assert result.exit_code == 0
-    assert _colours(result.stdout), (
-        f"no foreground colour reached stdout, so the no-escapes assertion under --json is "
+    assert _colors(result.stdout), (
+        f"no foreground color reached stdout, so the no-escapes assertion under --json is "
         f"vacuous. Sequences present: {sorted(set(SGR.findall(result.stdout)))}"
     )
 
@@ -1761,7 +1761,7 @@ def test_naming_two_different_workspaces_is_refused_rather_than_resolved(
 def test_the_refusal_names_both_workspaces_so_the_typo_is_visible() -> None:
     """ "You gave it twice" without the values sends somebody to re-read their own shell history.
 
-    Asserted against the message constant rather than the rendered box, which wraps, colours
+    Asserted against the message constant rather than the rendered box, which wraps, colors
     and elides differently on every machine.
     """
     message = cli.WORKSPACE_NAMED_TWICE.format(before="tenant-a", after="tenant-b")
@@ -1800,10 +1800,10 @@ def test_recording_a_workspace_keeps_any_other_override_already_set() -> None:
         cli.STATE.overrides = was
 
 
-# --- what the colour variables mean, pinned rather than assumed --------------------------------
+# --- what the color variables mean, pinned rather than assumed --------------------------------
 
 
-COLOUR_ENVIRONMENTS: tuple[tuple[str, dict[str, str], bool], ...] = (
+COLOR_ENVIRONMENTS: tuple[tuple[str, dict[str, str], bool], ...] = (
     ("forced", {"FORCE_COLOR": "1"}, True),
     ("forced, and NO_COLOR set", {"FORCE_COLOR": "1", "NO_COLOR": "1"}, False),
     ("forced, on a dumb terminal", {"FORCE_COLOR": "1", "TERM": "dumb"}, False),
@@ -1811,35 +1811,35 @@ COLOUR_ENVIRONMENTS: tuple[tuple[str, dict[str, str], bool], ...] = (
     ("NO_COLOR alone", {"NO_COLOR": "1"}, False),
     ("nothing set", {}, False),
 )
-"""Each colour environment, and whether manicule's human output should carry colour in it.
+"""Each color environment, and whether manicule's human output should carry color in it.
 
-Read from the behaviour of Rich 14 rather than from a rule manicule imposes, because manicule
-imposes none: :func:`manicule.cli.render.console` passes no colour arguments at all, so both
-conventions are honoured by the library and this table is what that delegation *means*.
+Read from the behavior of Rich 14 rather than from a rule manicule imposes, because manicule
+imposes none: :func:`manicule.cli.render.console` passes no color arguments at all, so both
+conventions are honored by the library and this table is what that delegation *means*.
 
 Two entries are the ones worth having. ``FORCE_COLOR`` with ``NO_COLOR`` is the combination
 bug3 asked about, and the answer is that ``NO_COLOR`` wins — though not by overriding, which is
 why the question is worth answering precisely: they are separate mechanisms, ``FORCE_COLOR``
-saying the stream is a terminal and ``NO_COLOR`` stripping the colour back out of what is
+saying the stream is a terminal and ``NO_COLOR`` stripping the color back out of what is
 written to it. ``FORCE_COLOR`` on a dumb terminal is the one that actually broke the suite, and
-it is not a colour switch at all: ``TERM=dumb`` says the stream cannot render ANSI, and Rich
+it is not a color switch at all: ``TERM=dumb`` says the stream cannot render ANSI, and Rich
 believes the capability over the request.
 """
 
 
-@pytest.mark.parametrize(("label", "environment", "coloured"), COLOUR_ENVIRONMENTS)
-def test_the_human_output_honours_both_colour_conventions(
+@pytest.mark.parametrize(("label", "environment", "colored"), COLOR_ENVIRONMENTS)
+def test_the_human_output_honors_both_color_conventions(
     monkeypatch: pytest.MonkeyPatch,
     bound: ApplicationService,
     *,
     label: str,
     environment: dict[str, str],
-    coloured: bool,
+    colored: bool,
 ) -> None:
     """The precedence, pinned by what comes out rather than documented and hoped for.
 
-    manicule delegates this entirely — it builds a console with no colour arguments — so what
-    is pinned here is a dependency's behaviour, deliberately. A Rich upgrade that changed any
+    manicule delegates this entirely — it builds a console with no color arguments — so what
+    is pinned here is a dependency's behavior, deliberately. A Rich upgrade that changed any
     row would change what an operator's ``NO_COLOR`` does, silently and without any manicule
     code being touched. This is the test that would say so.
     """
@@ -1850,30 +1850,30 @@ def test_the_human_output_honours_both_colour_conventions(
     result = run(["doctor"])
 
     assert result.exit_code == 0
-    assert bool(_colours(result.stdout)) is coloured, (
-        f"with {label}, colour was expected {'present' if coloured else 'absent'} and was not. "
+    assert bool(_colors(result.stdout)) is colored, (
+        f"with {label}, color was expected {'present' if colored else 'absent'} and was not. "
         f"Sequences present: {sorted(set(SGR.findall(result.stdout)))}"
     )
 
 
-@pytest.mark.parametrize(("label", "environment", "coloured"), COLOUR_ENVIRONMENTS)
-def test_json_carries_no_ansi_in_any_colour_environment(
+@pytest.mark.parametrize(("label", "environment", "colored"), COLOR_ENVIRONMENTS)
+def test_json_carries_no_ansi_in_any_color_environment(
     monkeypatch: pytest.MonkeyPatch,
     bound: ApplicationService,
     *,
     label: str,
     environment: dict[str, str],
-    coloured: bool,
+    colored: bool,
 ) -> None:
     """The property the whole section exists to protect, across every environment above.
 
-    ``--json`` is not a colour setting and must not behave like one: the envelope goes to
-    stdout through ``sys.stdout.write`` rather than through Rich, so no colour variable can put
-    a byte in it. Asserted for the coloured rows especially — those are the ones where a
+    ``--json`` is not a color setting and must not behave like one: the envelope goes to
+    stdout through ``sys.stdout.write`` rather than through Rich, so no color variable can put
+    a byte in it. Asserted for the colored rows especially — those are the ones where a
     regression would actually show, and the ones a developer on a ``TERM=dumb`` terminal would
     never reproduce.
     """
-    del bound, coloured
+    del bound, colored
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
 
@@ -1884,17 +1884,17 @@ def test_json_carries_no_ansi_in_any_colour_environment(
     assert json.loads(result.stdout)["op"] == "doctor"
 
 
-# --- the colour isolation, checked against what Rich actually reads ---------------------------
+# --- the color isolation, checked against what Rich actually reads ---------------------------
 
 
 SIZE_AND_JUPYTER: dict[str, str] = {
-    "COLUMNS": "terminal width, not colour. Pinned per case by the tests that assert layout; a "
+    "COLUMNS": "terminal width, not color. Pinned per case by the tests that assert layout; a "
     "width chosen here would quietly become the one every such assertion was written against.",
     "LINES": "terminal height, and nothing this surface prints depends on it.",
     "JUPYTER_COLUMNS": "size, and only consulted when Rich believes it is inside Jupyter.",
     "JUPYTER_LINES": "size, and only consulted when Rich believes it is inside Jupyter.",
 }
-"""Variables Rich reads that the colour fixture deliberately leaves alone, and why for each.
+"""Variables Rich reads that the color fixture deliberately leaves alone, and why for each.
 
 A reason apiece rather than a bare list, because "this one does not matter" is a claim. The
 alternative — clearing everything Rich reads — would make this fixture decide the terminal
@@ -1913,7 +1913,7 @@ def _variables_rich_reads() -> set[str]:
     """Every environment variable Rich's console module consults, read from its source.
 
     A third-party library's source, deliberately. What decides whether this suite's output is
-    coloured is not manicule's code — ``render.console`` passes no colour arguments — so the
+    colored is not manicule's code — ``render.console`` passes no color arguments — so the
     only honest place to derive the list is the library that does decide.
     """
     import rich.console  # noqa: PLC0415 - only this derivation reads Rich's source
@@ -1922,11 +1922,11 @@ def _variables_rich_reads() -> set[str]:
     return set(re.findall(r"environ(?:\.get)?\(\s*[\"']([A-Z_0-9]+)[\"']", source))
 
 
-def test_the_colour_isolation_accounts_for_every_variable_rich_reads() -> None:
+def test_the_color_isolation_accounts_for_every_variable_rich_reads() -> None:
     """The guard that would have caught both misses, instead of a person catching one of them.
 
     The fixture's list has been wrong twice. ``TERM`` was absent, which is the bug that started
-    this — and it is not a colour switch, so no amount of thinking about colour would have
+    this — and it is not a color switch, so no amount of thinking about color would have
     surfaced it. Then the first version of the fix added ``TERM`` and still missed
     ``TTY_COMPATIBLE``, which Rich checks *before* ``FORCE_COLOR``: ``TTY_COMPATIBLE=0``
     reproduced the original failure exactly, through a fixture written to prevent it.
@@ -1942,19 +1942,19 @@ def test_the_colour_isolation_accounts_for_every_variable_rich_reads() -> None:
     assert len(read) >= RICH_ENVIRONMENT_FLOOR, (
         f"the scan found {len(read)} environment variable(s) in Rich's console module, below "
         f"the floor of {RICH_ENVIRONMENT_FLOOR}. It is reading the wrong file, or Rich has "
-        f"restructured and this derivation no longer sees what decides colour."
+        f"restructured and this derivation no longer sees what decides color."
     )
     for landmark in ("FORCE_COLOR", "NO_COLOR", "TERM", "TTY_COMPATIBLE"):
         assert landmark in read, (
             f"the scan did not find {landmark}, which Rich certainly reads. Whatever it "
-            f"parsed, it was not the module that decides whether output is coloured."
+            f"parsed, it was not the module that decides whether output is colored."
         )
 
     classified = CLEARED_TERMINAL_VARIABLES | {"TERM"} | set(SIZE_AND_JUPYTER)
     unaccounted = sorted(read - classified)
     assert unaccounted == [], (
-        f"Rich reads {unaccounted}, which the colour fixture neither controls nor excuses. If "
-        f"it can change whether output is a terminal or is coloured, add it to "
+        f"Rich reads {unaccounted}, which the color fixture neither controls nor excuses. If "
+        f"it can change whether output is a terminal or is colored, add it to "
         f"CLEARED_TERMINAL_VARIABLES in tests/conftest.py; if it cannot, add it to "
         f"SIZE_AND_JUPYTER here with the reason. Leaving it unclassified is how this suite "
         f"went back to depending on the caller's shell twice already."

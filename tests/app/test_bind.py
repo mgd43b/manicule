@@ -59,7 +59,7 @@ def test_the_settings_default_is_itself_loopback() -> None:
 
 
 @pytest.mark.parametrize("host", sorted(EVERY_INTERFACE))
-def test_every_host_meaning_all_interfaces_is_recognised_as_such(host: str) -> None:
+def test_every_host_meaning_all_interfaces_is_recognized_as_such(host: str) -> None:
     """Including the empty string, which is what a blank config value looks like."""
     assert is_every_interface(host)
     assert not is_loopback(host)

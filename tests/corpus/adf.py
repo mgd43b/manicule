@@ -26,7 +26,7 @@ another's. That is a requirement rather than tidiness: the discrimination assert
 (``docs/parsing.md`` §3.3) compares each block's text against every other anchor's resolved
 text, and two blocks that read identically cannot be told apart by anything, a person reading
 the citation included. In ADF a heading's text is exactly its title, so **no heading title is
-repeated in this corpus and none of them recurs in a neighbouring sentence** — the duplicate
+repeated in this corpus and none of them recurs in a neighboring sentence** — the duplicate
 titles that exercise Confluence's ``-1`` anchor suffix are asserted directly in
 ``tests/parsers/test_adf.py`` instead, where the two sections can be told apart by the
 fragments rather than by their text.
@@ -173,7 +173,7 @@ _STRUCTURE = _document(
             }
         ],
     },
-    {"type": "blockCard", "attrs": {"url": "https://example.invalid/neighbouring-page"}},
+    {"type": "blockCard", "attrs": {"url": "https://example.invalid/neighboring-page"}},
 )
 
 _PREAMBLE = _document(

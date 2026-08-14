@@ -367,7 +367,7 @@ async def test_a_directory_that_came_back_wider_than_it_was_asked_for_is_refused
     """``mkdir(mode=0o700)`` is a request, and a default POSIX ACL can answer it with more.
 
     Simulated rather than staged: a default ACL needs ``setfacl`` and a filesystem mounted to
-    honour it, neither of which a suite can assume. What is exercised for real is the
+    honor it, neither of which a suite can assume. What is exercised for real is the
     consequence — the mode is *checked after* creation rather than asserted before it, so even
     a directory manicule created itself can be refused, and is then removed again.
     """

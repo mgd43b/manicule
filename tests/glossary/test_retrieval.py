@@ -268,14 +268,14 @@ async def test_the_promoted_passage_still_carries_the_description_it_was_trimmed
     [corpus.QUERY_STYLIZED, corpus.QUERY_STYLIZED_LOWER],
     ids=["as-written", "lower-case"],
 )
-async def test_a_stylized_term_resolves_through_its_normalised_key(
+async def test_a_stylized_term_resolves_through_its_normalized_key(
     store: SqliteDocStore, indexed: list[Chunk], text: str
 ) -> None:
     """Requirement 4, end to end and through storage rather than in the detector alone.
 
-    Both spellings reach the same entry: the key is normalised, so ``relay`` finds it, and the
+    Both spellings reach the same entry: the key is normalized, so ``relay`` finds it, and the
     display is not, so what comes back is the document's own ``ReLAY``. The lower-case form also
-    proves the key survived a database round trip — a store that normalised on write and read
+    proves the key survived a database round trip — a store that normalized on write and read
     back differently would fail here and nowhere else.
     """
     retriever = await _with_glossary(store, indexed)

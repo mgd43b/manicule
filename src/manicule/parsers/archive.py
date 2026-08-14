@@ -23,7 +23,7 @@ uncompressed bytes. The important one is how the first is enforced.
 and it is used here only as a cheap pre-filter. It is not even allowed to bound the read:
 :mod:`zipfile` truncates a member's decompressed stream at whatever size the header declares,
 so a bomb that declares a kilobyte and expands to megabytes comes back either truncated or as
-``Bad CRC-32`` — a defence that depends on an implementation detail of one interpreter and
+``Bad CRC-32`` — a defense that depends on an implementation detail of one interpreter and
 reports an attack as a corrupt file. The reader below sets its **own** ceiling instead and
 counts every byte it takes, so the thing that stops a bomb is the counter, and the header
 certifies nothing.
@@ -88,7 +88,7 @@ _DOCUMENT_MIMETYPE = "mimetype"
 
 _READ_CHUNK = 64 * 1024
 """How much of a member is decompressed per call. Small enough that a bomb is stopped after
-one chunk past the budget rather than after materialising the whole thing."""
+one chunk past the budget rather than after materializing the whole thing."""
 
 _NO_DECLARED_CEILING = 1 << 62
 """What the reader tells :mod:`zipfile` a member's size is.
@@ -174,7 +174,7 @@ class ArchiveParser:
         The archive is held open by a ``with`` that **encloses every** ``yield``. A consumer
         that stops after one member throws ``GeneratorExit`` in at the suspension point, and
         only a ``finally`` runs after that — so a close placed after the loop would leave a
-        ``ZipFile`` and its decompression stream suspended, to be finalised later from a loop
+        ``ZipFile`` and its decompression stream suspended, to be finalized later from a loop
         that may already have gone. That is a crash inside the allocator rather than a warning.
 
         Raises:
@@ -218,7 +218,7 @@ class ArchiveParser:
                         info.filename,
                         depth,
                         f"archive member name escapes the archive root: "
-                        f"{info.filename!r}. Names are normalised and never rewritten into a "
+                        f"{info.filename!r}. Names are normalized and never rewritten into a "
                         f"plausible one, so this member is reported rather than extracted.",
                         DocumentStatus.FAILED,
                         # Unique by position in the central directory. A constant placeholder
@@ -434,7 +434,7 @@ def _document_container(entries: list[zipfile.ZipInfo]) -> str | None:
 def _is_symlink(info: zipfile.ZipInfo) -> bool:
     """Whether a member is a Unix symlink, recorded in the external attributes.
 
-    :mod:`zipfile` does not follow one today. The defence is against an extraction path being
+    :mod:`zipfile` does not follow one today. The defense is against an extraction path being
     added later without remembering that an archive can name a file outside itself.
     """
     return (info.external_attr >> 16) & _UNIX_FILE_TYPE == _SYMLINK_MODE
@@ -454,7 +454,7 @@ def _unique(path: str, ordinal: int, seen: set[str]) -> str:
     """``path``, qualified by its position in the archive if that name is already taken.
 
     A zip may hold two entries with the same name — appending to an archive produces exactly
-    that, and so does a crafted one — and after normalisation ``a/b.txt`` and ``./a/b.txt``
+    that, and so does a crafted one — and after normalization ``a/b.txt`` and ``./a/b.txt``
     are also the same name. Storage reconciles members by ``source_id``, which is derived from
     this, so a collision is not an error anybody sees: the second member overwrites the first,
     and the archive quietly contributes fewer documents than it contains.
@@ -482,7 +482,7 @@ def _refusal(
 ) -> MemberFailure:
     """A member that will not become a document, addressed so a person can find it.
 
-    The address is built from the *normalised* path where there is one. A member rejected for
+    The address is built from the *normalized* path where there is one. A member rejected for
     escaping the archive root has no usable path by definition, so the caller supplies one
     that is unique within the archive and its real name goes in metadata — putting
     ``../../etc/passwd`` into a ``uri`` would reproduce the attack in the index and in every

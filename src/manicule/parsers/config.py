@@ -29,7 +29,7 @@ Two consequences worth knowing before adding to this file.
   crash during discovery instead of a clear refusal at construction. Where a version is part
   of an anchor's identity — see :func:`html_text_version` — it is a function, called when the
   parser that depends on it is built.
-- **Configuration models are data, not behaviour**, with one deliberate exception:
+- **Configuration models are data, not behavior**, with one deliberate exception:
   :class:`WordConfig` carries the two small style-matching helpers, because they are pure
   functions of the configured values and belong with the fields they interpret rather than
   with the reader that calls them.
@@ -90,7 +90,7 @@ __all__ = [
 #
 # What routes to each parser. Declared narrowly and by name: no parser claims a wildcard, so
 # the global fallback tail is a configuration decision rather than a parser winning documents
-# a specialised one was installed to handle.
+# a specialized one was installed to handle.
 
 PDF_MEDIA_TYPES = frozenset({"application/pdf"})
 
@@ -176,7 +176,7 @@ format is JSON-shaped but is a document tree, and indexing it as a configuration
 cite key paths where a reader expects sections."""
 
 ARCHIVE_MEDIA_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
-"""Declared narrowly, which is half of the defence in ``docs/parsing.md`` §9.4. The other half
+"""Declared narrowly, which is half of the defense in ``docs/parsing.md`` §9.4. The other half
 is media type resolution running before parser dispatch, so a ``.docx`` with a correct
 extension or a correct declared type never reaches the archive parser at all."""
 
@@ -336,7 +336,7 @@ class ADFConfig(BaseModel):
 _HEADING_STYLE = re.compile(r"^heading([1-9])$")
 """Word's built-in heading styles, matched against a style key with spacing and case removed.
 
-The style **id** is matched first because Word localises style names but not ids: a document
+The style **id** is matched first because Word localizes style names but not ids: a document
 authored in German carries ``Heading1`` as the id and ``Überschrift 1`` as the name, and a
 parser matching only the name finds no headings at all in it.
 """
@@ -355,7 +355,7 @@ class WordConfig(BaseModel):
     extra_heading_styles: dict[str, int] = Field(
         default_factory=dict[str, int],
         description="Style name or id to heading level, for templates that define their own "
-        "heading styles. Word's built-in Heading 1-9 are always recognised; a house template "
+        "heading styles. Word's built-in Heading 1-9 are always recognized; a house template "
         "calling its top level 'Chapter Title' has no heading structure without this.",
     )
     list_style_prefixes: tuple[str, ...] = Field(

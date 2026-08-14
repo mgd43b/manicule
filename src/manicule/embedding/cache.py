@@ -42,7 +42,7 @@ class EmbeddingCache:
     """A bounded least-recently-used memo, keyed on identity rather than on a name.
 
     Not thread-safe and deliberately not locked: it is reached from one embedder, whose
-    forward passes are serialised anyway, and a lock here would cost more than the lookup.
+    forward passes are serialized anyway, and a lock here would cost more than the lookup.
     """
 
     def __init__(self, capacity: int) -> None:
@@ -64,7 +64,7 @@ class EmbeddingCache:
         """The cache key for one text under one embedder.
 
         :meth:`~manicule.core.fingerprints.Fingerprint.canonical` and not ``model_id``: it is
-        the same serialisation the index is written against, so anything that would make a
+        the same serialization the index is written against, so anything that would make a
         vector inadmissible also makes it unreachable.
         """
         return (fingerprint.canonical(), text)

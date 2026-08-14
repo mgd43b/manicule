@@ -302,8 +302,8 @@ async def test_the_diagram_source_survives_character_for_character(tmp_path: Pat
     """Clause 5, and the one clause a "close enough" implementation cannot fake.
 
     The body crosses four transformations between the file and the chunk — CDATA recovery, the
-    extraction's serialisation, the parser's own re-parse, and text extraction — and every one of
-    them is a place an escape can be doubled or a newline normalised.
+    extraction's serialization, the parser's own re-parse, and text extraction — and every one of
+    them is a place an escape can be doubled or a newline normalized.
     """
     store = await ingest(await _corpus(tmp_path))
 
@@ -347,7 +347,7 @@ async def test_the_identity_is_the_configured_instance_and_the_page_id(tmp_path:
 async def test_moving_the_file_does_not_create_a_second_document(tmp_path: Path) -> None:
     """Clause 8, and the reason identity had to move off the path at all.
 
-    A mirror reorganised from by-space to by-tree is the ordinary case, not a pathological one.
+    A mirror reorganized from by-space to by-tree is the ordinary case, not a pathological one.
     Keyed on the path it is a corpus of new documents beside a corpus of orphans, and the
     curated collections and tags hanging off the old rows go with them.
     """
@@ -355,7 +355,7 @@ async def test_moving_the_file_does_not_create_a_second_document(tmp_path: Path)
     store = await ingest(root)
     before = only(store).id
 
-    moved = root / "reorganised" / "runbooks"
+    moved = root / "reorganized" / "runbooks"
     moved.mkdir(parents=True)
     for name in ("1002.html", "1002.html.source.json"):
         (root / "pages" / name).rename(moved / name)
@@ -364,7 +364,7 @@ async def test_moving_the_file_does_not_create_a_second_document(tmp_path: Path)
     assert only(store).id == before, "the page acquired a second document by being moved"
     assert only(store).provenance is not None
     assert only(store).provenance.snapshot is not None  # pyright: ignore[reportOptionalMemberAccess]
-    assert only(store).provenance.snapshot.path == "reorganised/runbooks/1002.html"  # pyright: ignore[reportOptionalMemberAccess]
+    assert only(store).provenance.snapshot.path == "reorganized/runbooks/1002.html"  # pyright: ignore[reportOptionalMemberAccess]
 
 
 async def _corpus(tmp_path: Path) -> Path:
@@ -569,7 +569,7 @@ async def test_the_record_names_what_was_extracted_from_what(tmp_path: Path) -> 
 async def test_two_files_claiming_one_page_id_are_both_refused_it(tmp_path: Path) -> None:
     """Neither wins, and the reason names the other file.
 
-    ``documents`` is UNIQUE on ``(workspace, source, source_id)``, so honouring both would mean
+    ``documents`` is UNIQUE on ``(workspace, source, source_id)``, so honoring both would mean
     whichever synced second overwriting the first with nothing raised. Keeping the *first* would
     be worse than keeping neither: which page owns the id would depend on walk order, so renaming
     a directory would silently move one page's content onto another page's identity.
@@ -1031,7 +1031,7 @@ async def test_the_conversion_refuses_to_write_two_manifests_claiming_one_page(
         assert "overwrite" in outcome.skipped_reason
 
 
-def test_a_page_that_already_has_a_manifest_is_not_reported_as_unrecognised(
+def test_a_page_that_already_has_a_manifest_is_not_reported_as_unrecognized(
     tmp_path: Path,
 ) -> None:
     """The defect running the command twice exposed.
@@ -1445,11 +1445,11 @@ async def test_a_page_whose_identity_is_available_but_not_applied_says_so(
     This page is adapted, parsed as storage format and cited by its own title and address —
     everything §5 asks for. What it does not have is an identity that survives being moved,
     because identity has to be known at discovery and discovery does not read documents. §3's
-    "moving or reorganising the snapshot file must not create a second document" therefore does
+    "moving or reorganizing the snapshot file must not create a second document" therefore does
     *not* hold for it.
 
     A generic skip reason would not tell anybody that: it would say the file was fine, which it
-    is, and leave the second document unexplained the day somebody reorganises the directory. The
+    is, and leave the second document unexplained the day somebody reorganizes the directory. The
     outcome names the condition and the step that resolves it.
     """
     root = tmp_path / "corpus"

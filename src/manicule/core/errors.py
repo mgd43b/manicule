@@ -265,7 +265,7 @@ class TokenStateError(ManiculeError):
     token states under ``last_hidden_state`` for some architectures and the *already pooled*
     vector under the same name for others, and an ONNX export names its 3-D output whatever
     the exporter felt like. Pooling a 2-D array does not fail — it reduces over the batch
-    axis instead of the sequence axis and produces one plausible, normalised, entirely wrong
+    axis instead of the sequence axis and produces one plausible, normalized, entirely wrong
     vector per input.
 
     Fatal, never a warning. Nothing downstream can tell a wrongly pooled vector from a right

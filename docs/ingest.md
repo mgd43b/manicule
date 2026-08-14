@@ -18,13 +18,13 @@ failure is not an exception.**
 
 ---
 
-## 1. Division of labour
+## 1. Division of labor
 
 | Concern | Owned by | This document |
 |---|---|---|
 | Parser semantics, fallback outcomes, `Document.status` | `parsing.md` §6 | Runs the chain; enforces the limits it names |
 | Chunk budget, `ChunkFingerprint` | `parsing.md` §1 | Checks it once, before any work |
-| Write order, crash windows, invariants | `storage.md` §8 | Honours it; adds lease recovery |
+| Write order, crash windows, invariants | `storage.md` §8 | Honors it; adds lease recovery |
 | `EmbedFingerprint`, the refusal | `storage.md` §6.3 | Runs it once, before any embedding |
 | Retained bytes, blob ordering | `storage.md` §7 | Writes them; re-parses from them |
 | Deletion sweep, soft-delete grace | `storage.md` §8.2 | Drives `reconcile`; schedules the sweep |
@@ -37,7 +37,7 @@ one of them, that is a bug in this document.
 
 ## 2. The shape
 
-**The unit of work is one document. A batch is a scheduling artefact with no semantics of its
+**The unit of work is one document. A batch is a scheduling artifact with no semantics of its
 own.** This is what makes "one bad document never aborts a batch" a structural property rather
 than a promise: there is no batch-level transaction to abort, and no batch-level state a
 document can corrupt.
@@ -250,7 +250,7 @@ where text can still reach the embedder — `after:parse`, `before:chunk`, `afte
 
 `before:embed` is the most direct case of the four and the easiest to overlook: it operates on
 chunks that are about to be embedded, so a rewrite there reaches `embed_text` with nothing
-downstream to normalise it away.
+downstream to normalize it away.
 
 ### 3.3.1 `text` is immutable after parse — forbidden, not fingerprinted
 
@@ -298,7 +298,7 @@ already guarantees.
 
 ### 3.4 PII redaction, decided
 
-`PLAN.md` defect #5 says pick one behaviour. **Redaction happens at the generation boundary,
+`PLAN.md` defect #5 says pick one behavior. **Redaction happens at the generation boundary,
 not at ingest**, and the reason is a consequence of retained original bytes rather than a
 preference.
 
@@ -386,7 +386,7 @@ thousand pages, that difference is the whole sync.
 
 **A connector that supplies no `version_token` falls straight to level 2**, which means every
 sync fetches every document and the saving comes only from skipping parse, chunk and embed.
-That is correct rather than degraded — it is the best available behaviour when the source
+That is correct rather than degraded — it is the best available behavior when the source
 offers no change signal — but it is a materially different cost profile, so `doctor` reports
 which connectors are running without a token rather than leaving a slow sync unexplained.
 
@@ -547,7 +547,7 @@ parse_memory_limit   default: 1 GiB per worker
 
 - **`spawn`, not `fork`.** `fork` in a process that has loaded MLX and opened SQLite copies
   both into a child that must not touch either. `spawn` costs interpreter startup once per
-  worker, amortised over the run.
+  worker, amortized over the run.
 - **Workers are recycled after `max_documents_per_worker` (default 500)** to bound the effect
   of leaks in native parser libraries, which is a category of bug no amount of care in
   manicule prevents.
@@ -690,10 +690,10 @@ thing: when it refuses, it prints the count of documents that *would* have been 
 |---|---|---|
 | discover / fetch | Remote rate limits | `fetch_concurrency = 8`, per connector |
 | parse / chunk | CPU cores | `parse_workers = min(4, cpu_count - 1)` |
-| embed | **Memory and one accelerator** | serialised; one batch at a time |
-| store | SQLite single writer | serialised |
+| embed | **Memory and one accelerator** | serialized; one batch at a time |
+| store | SQLite single writer | serialized |
 
-**Embedding is serialised, and this is the difference an in-process embedder makes.** With a
+**Embedding is serialized, and this is the difference an in-process embedder makes.** With a
 model server, concurrency is a connection-pool question and more requests mean more throughput
 up to the server's limit. With MLX in-process there is one model, one unified-memory pool, and
 one GPU; issuing two batches concurrently produces contention rather than throughput. So embed
@@ -737,7 +737,7 @@ bug and is actually missing backpressure.
 
 They are easy to confuse because they are all "the lock", and confusing them is how a
 lost-update bug ships: for a while this document said a concurrent sync and a corpus-wide
-re-parse were serialised *because* they shared the embed stage's lock, which is a statement
+re-parse were serialized *because* they shared the embed stage's lock, which is a statement
 about the model being read as a statement about the database.
 
 | What | Mechanism | Scope | Excludes |
@@ -764,7 +764,7 @@ finished with.
 pipeline object: it holds inside one event loop in one process, and a second process opened on
 the same data directory takes no part in it. That is §6.5's job, and §6.5 is now taken by every
 writer (§8.6). The invariant in the last row still needs neither, and that is the point of
-defence in depth: the process lock is the one that can be absent because somebody ran a writer
+defense in depth: the process lock is the one that can be absent because somebody ran a writer
 against a directory a *third-party* tool was also writing, and the compare-and-swap is what
 holds when it is.
 
@@ -1035,7 +1035,7 @@ directory rather than about a parser.
 changed.** A changed fingerprint does not produce misses. It refuses the run before discovery
 (§7) and prints what a rebuild would cost, and the vectors live in a table named after the
 fingerprint (`storage.md` §6.5) so a new one never meets the old rows at all. A counter for it
-could only ever read zero, and a number that cannot move is a worse artefact than a sentence
+could only ever read zero, and a number that cannot move is a worse artifact than a sentence
 saying why — this repository has shipped a byte cap that bounded nothing and an interval that
 scheduled nothing, and both read as working features.
 
@@ -1096,7 +1096,7 @@ to empty itself.
 **Concurrency.** Running the sweep while a connector syncs is expected, and §8.4 is the whole
 picture. The short version: the sweep runs through the pipeline the runtime already built, so
 it shares the embed stage's lock (§6.6) with any sync beside it and the two never reach the
-model at once — **which serialises the model and nothing else**. What keeps the two from
+model at once — **which serializes the model and nothing else**. What keeps the two from
 writing over each other on the *same* page is the per-document mutation lock within a process,
 and the compare-and-swap at the commit (§8.5) everywhere, including where no lock is held.
 
@@ -1130,13 +1130,13 @@ behind a coupling nobody could see — so parsing and detection are independentl
 | Field | What it covers | Why |
 |---|---|---|
 | `detector` | which detection strategy ran, or `disabled` | two strategies would otherwise be indistinguishable from one typo fix |
-| `rules` | a SHA-256 over `ingest/glossary.py` and `core/glossary.py` | the grammar, the persistence threshold, the evidence weights, the boundary model **and** the normalisation that turns a surface into a key |
+| `rules` | a SHA-256 over `ingest/glossary.py` and `core/glossary.py` | the grammar, the persistence threshold, the evidence weights, the boundary model **and** the normalization that turns a surface into a key |
 | `libraries` | `name@version` for everything outside this repository that decides a stored entry | a digest catches a rule *we* change and cannot catch one changing underneath an unchanged file |
 | `middleware` | `name@version` for every configured hook | detection reads `Chunk.text` boundaries and `heading_path`, neither of which any middleware declaration covers |
 
 **`libraries` is derived from the sources' own imports, not from a list.** `pydantic` validates
 `GlossaryEntry`'s field constraints, so it decides which rows may be persisted at all.
-`unicodedata` is the sharper one: `normalise_acronym` NFKC-folds a surface into the stored
+`unicodedata` is the sharper one: `normalize_acronym` NFKC-folds a surface into the stored
 *lookup key*, and #121 put NFKC into `initial_skeleton` as well — so the character database
 version decides what a term is filed under.
 
@@ -1146,10 +1146,10 @@ two failures with the same shape. `re` compiles every written form, `str.isupper
 the shape gate, and `str.casefold` decides whether two aliases are one. None has a distribution.
 
 `python@3.13` rather than `python@3.13.11` is deliberate. CPython's policy is that a patch
-release fixes bugs without changing documented behaviour, so re-staling a corpus on one would
+release fixes bugs without changing documented behavior, so re-staling a corpus on one would
 invalidate for a change that is not supposed to exist — and two machines a patch apart would
 disagree about a restored index for a reason nobody could act on. **The accepted risk is a
-behaviour change that ships in a patch release anyway.**
+behavior change that ships in a patch release anyway.**
 
 **What the derivation does not see** is written down in `glossary_lineage.DERIVED_FROM`, in the
 style `NOT_DIGESTED` uses, because a derived mechanism fails silently when its derivation has a
@@ -1183,8 +1183,20 @@ The trade is stated rather than hidden: a digest over bytes cannot tell a rule f
 paragraph explaining it, so a comment-only edit makes the corpus stale. That is the direction
 worth being wrong in. Over-invalidation costs one pass over stored text with no GPU in it;
 under-invalidation costs a definition served from rules that no longer exist, silently. A
-normalised digest that skipped comments would fail the other way, and its failure would be the
+normalized digest that skipped comments would fail the other way, and its failure would be the
 kind nobody notices.
+
+**That has now happened once, deliberately, and it is worth naming rather than leaving to be
+discovered from a count.** The American-English sweep renamed `normalise_acronym` and
+`normalise_expansion` to `normalize_acronym` and `normalize_expansion` and respelled prose in
+both digested files. No detection rule changed — the same input yields the same entries — but
+the bytes moved, so `rules` went from `sha256:35aaf33f…` to `sha256:e6867497…` and every
+document indexed before it is now selectable by `document reindex --stale-glossary`. **That is
+the mechanism working, not a regression**: a digest that could tell a rename from a rule change
+would be the normalized digest this section just refused. The repair is the cheapest one in the
+system — a pass over stored text, no connector, no parser, no embedder, no GPU, no network —
+and at the time it landed nothing real was indexed, so it cost nothing at all. An operator with
+a live corpus pays one sweep they can watch finish.
 
 The one thing still maintained by hand is the *list* of digested files, and forgetting it is
 made as loud as it can be made: `detector_imports()` reads what those files actually import out
@@ -1253,8 +1265,8 @@ They are not interchangeable, and the price of each is the reason:
 |---|---|---|---|
 | `documents.parse_fp` | a parser's rules or one of its libraries changes | `document reindex --stale` | a parse from retained bytes, then an embed of whatever moved |
 | `index_state.chunk_fingerprint` | the chunker, its budget, its tokenizer or a grammar changes | a re-index; the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything |
-| `index_state.embed_fingerprint` | the model, its dimension or its normalisation changes | `ingest.reindex.re_embed` | an embedding pass, no parsing |
-| `documents.glossary_fp` | any detection or normalisation rule changes, or a dependency of one does | `document reindex --stale-glossary` | a pass over stored text; **no GPU at all** |
+| `index_state.embed_fingerprint` | the model, its dimension or its normalization changes | `ingest.reindex.re_embed` | an embedding pass, no parsing |
+| `documents.glossary_fp` | any detection or normalization rule changes, or a dependency of one does | `document reindex --stale-glossary` | a pass over stored text; **no GPU at all** |
 
 Two properties follow from the table that are easy to get wrong in either direction.
 
@@ -1270,9 +1282,9 @@ every document in a corpus look like it needs its bytes read again.
 
 **What requires a detector-version bump: nothing does, and that is the design.** The fingerprint
 is a digest of `ingest/glossary.py` and `core/glossary.py` plus the versions of what they import,
-so any edit to a rule, a threshold, an evidence weight, a written form or the normalisation moves
+so any edit to a rule, a threshold, an evidence weight, a written form or the normalization moves
 it without anybody deciding to. #121 is the demonstration: it changed sentence-final punctuation
-handling and NFKC-normalised `initial_skeleton`, needed no manual bump, and every document it
+handling and NFKC-normalized `initial_skeleton`, needed no manual bump, and every document it
 affects became selectable on the next survey.
 
 **Migration policy for the first release.** Every existing row arrives with `glossary_fp IS
@@ -1499,7 +1511,7 @@ re-enumerates fully. That is a connector property, not a pipeline one, and it is
    is close to done and finishing it is cheaper than redoing it.
 3. Kill parse workers still running at the deadline. Their documents stay non-terminal and are
    swept by §6.4.
-4. **Do not advance the watermark.** A cancelled run is an incomplete run.
+4. **Do not advance the watermark.** A canceled run is an incomplete run.
 5. **Do not run reconciliation.** §11.1's first guard, in its most likely form.
 
 A second `Ctrl-C` skips step 2. The recovery path is the same either way, which is what makes

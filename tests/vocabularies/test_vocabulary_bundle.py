@@ -21,8 +21,8 @@ them. So:
   its own socket cut before doing anything, so neither is assumed.
 
 **The in-process tests clear ``tiktoken``'s encoding registry first, and that is not a
-detail.** ``tiktoken.get_encoding`` memoises every encoding it has ever built in a module
-global, so a suite that has already assembled one context would hand the memoised vocabulary
+detail.** ``tiktoken.get_encoding`` memoizes every encoding it has ever built in a module
+global, so a suite that has already assembled one context would hand the memoized vocabulary
 back without touching the cache — and every assertion here would pass against a warm process
 while proving nothing whatsoever about a cold host.
 
@@ -337,7 +337,7 @@ def test_the_file_list_for_an_encoding_is_learned_once_and_not_re_probed(
 
     Learning that an encoding needs no *second* file means letting the constructor ask for
     one, and a constructor allowed to get that far builds a 200 000-entry BPE table. The list
-    is a property of the installed library rather than of the disk, so it is memoised — and
+    is a property of the installed library rather than of the disk, so it is memoized — and
     the assertion is that the constructor is never run again, because a timing comparison
     would be a flake and a cache that is merely fast is not the claim.
 
@@ -480,7 +480,7 @@ def test_the_bundle_records_the_url_and_the_digest_tiktoken_declares(
     """Provenance a redistributor can read, and a digest that is upstream's rather than ours.
 
     The URL is recorded because manicule does not publish these files and cannot state their
-    licence terms — so whoever carries a bundle should be able to see exactly what is in it.
+    license terms — so whoever carries a bundle should be able to see exactly what is in it.
     The digest is recorded because a bundle is copied between machines by hand, and "the same
     bundle" has to mean the same bytes; taking it from ``tiktoken``'s own declaration rather
     than from whatever was downloaded is what makes it an assertion instead of a checksum.

@@ -13,7 +13,7 @@ The root passed on the command line is a place to start walking, never part of a
 
 Where a :mod:`.sidecar` manifest declares a ``source_id``, **that** is the identity instead, and
 the path becomes merely where the copy sits. This is the difference between a mirror and a
-directory: a mirrored page reorganised from by-space to by-tree has not become a different page,
+directory: a mirrored page reorganized from by-space to by-tree has not become a different page,
 but a connector keyed on the path reports every document deleted and every document new — and the
 curated collections and tags hanging off the old rows go with them. It is the rule
 :class:`~manicule.connectors.confluence_snapshot.ConfluenceSnapshotConnector` was written with,
@@ -87,7 +87,7 @@ if TYPE_CHECKING:
     from manicule.core.sources import SourceId
 
 OCTET_STREAM: Final = "application/octet-stream"
-"""What an unrecognised file is. Refused later by the parser chain, and visibly so."""
+"""What an unrecognized file is. Refused later by the parser chain, and visibly so."""
 
 ADAPTABLE_SUFFIXES: Final[frozenset[str]] = frozenset({".htm", ".html"})
 """Suffixes that may turn out to be an enriched export rather than an ordinary page.
@@ -111,7 +111,7 @@ DUPLICATE_IDENTITY: Final = "duplicate_source_identity"
 """``DocRef`` and document-metadata key naming the other files that claimed one identity.
 
 Present exactly when a declared identity was refused for being claimed twice. The refusal is the
-point: ``documents`` is UNIQUE on ``(workspace_id, source, source_id)``, so honouring both would
+point: ``documents`` is UNIQUE on ``(workspace_id, source, source_id)``, so honoring both would
 mean the second file's ingest silently overwriting the first's document — two pages in the
 corpus, one row, and nothing raised.
 """
@@ -247,7 +247,7 @@ def version_token(path: Path, *, adapter: str = "", location: str = "") -> str |
             document cannot move without becoming a different one, so its location is already in
             its identity and repeating it would achieve nothing. A page-keyed document can move,
             and a rename preserves both size and modification time — so without this a mirror
-            reorganised into new directories reports every page unchanged, skips before fetching,
+            reorganized into new directories reports every page unchanged, skips before fetching,
             and leaves every stored snapshot path naming a file that is no longer there. The
             document would be correct in every respect a reader sees and wrong in the one an
             audit needs. Found by moving one.
@@ -290,7 +290,7 @@ class FilesystemConnector:
             name: The source name. Part of every document's identity.
             include_hidden: Whether to walk dot-files and dot-directories.
             max_bytes: Refuse a file larger than this at discovery, before it is read.
-            profiles: The enriched-document conventions to recognise, in precedence order. An
+            profiles: The enriched-document conventions to recognize, in precedence order. An
                 empty sequence turns adaptation off entirely, which is a real and exercised
                 configuration rather than a degenerate one: a corpus of ordinary HTML pays
                 nothing for a feature it does not use, and turning it off is how an operator
@@ -324,7 +324,7 @@ class FilesystemConnector:
 
     @property
     def profiles(self) -> tuple[EnrichedProfile, ...]:
-        """The enriched-document conventions this connector recognises, in precedence order.
+        """The enriched-document conventions this connector recognizes, in precedence order.
 
         Public for the same reason :attr:`root` is: it is part of what this source *is* rather
         than an implementation detail, and "which profiles is this connector actually using" is
@@ -638,7 +638,7 @@ class FilesystemConnector:
     def _identities(self) -> Iterator[tuple[Path, SourceId, str]]:
         """Every file under the root, with the identity it is stored under and any conflict.
 
-        Two passes over one materialised walk rather than one streaming pass, because a duplicate
+        Two passes over one materialized walk rather than one streaming pass, because a duplicate
         cannot be detected until the second file claiming an identity has been seen — and by then
         a streaming ``discover`` has already yielded the first under the identity it is about to
         lose. Yielding it and correcting later is not available: the pipeline has stored a
@@ -751,7 +751,7 @@ def _conflict(identity: str, others: Sequence[Path], *, path: Path, root: Path) 
     named = ", ".join(sorted(_relative(other, root=root) for other in others if other != path))
     return (
         f"declares source_id {identity!r}, which {named} also declares. Two files cannot be one "
-        f"document — documents is UNIQUE on (workspace, source, source_id), so honouring both "
+        f"document — documents is UNIQUE on (workspace, source, source_id), so honoring both "
         f"would mean whichever synced second silently overwriting the first. Both are indexed "
         f"under their paths until one of the manifests is corrected"
     )

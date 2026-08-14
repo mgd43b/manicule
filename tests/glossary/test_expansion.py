@@ -128,7 +128,7 @@ async def test_a_definitional_question_fires_whatever_the_case(text: str) -> Non
 
 async def test_a_term_that_is_not_an_english_word_fires_without_any_framing() -> None:
     result, _ = await expand(
-        "show me the isotope dashboards", entry("ISOTOPE", "Index Storage Optimisation Endpoint")
+        "show me the isotope dashboards", entry("ISOTOPE", "Index Storage Optimization Endpoint")
     )
 
     assert result.fired
@@ -316,7 +316,7 @@ async def test_a_conflict_is_reported_when_the_query_did_ask_about_the_term() ->
 async def test_a_conflict_is_reported_when_only_one_documents_spelling_matches() -> None:
     """Any of the disagreeing entries may admit the occurrence.
 
-    They share a normalised key and can write the display form differently, so testing only
+    They share a normalized key and can write the display form differently, so testing only
     the first would make a conflict's visibility depend on which document happened to be
     indexed first.
     """
@@ -335,7 +335,7 @@ async def test_a_conflict_is_reported_when_only_one_documents_spelling_matches()
 async def test_only_so_many_terms_expand_in_one_query() -> None:
     result, _ = await expand(
         "compare ISOTOPE, KRYPTON, LANTERN and MISTRAL",
-        entry("ISOTOPE", "Index Storage Optimisation Tooling Endpoint"),
+        entry("ISOTOPE", "Index Storage Optimization Tooling Endpoint"),
         entry("KRYPTON", "Key Rotation Yield Protocol Token Notary", chunk="chunk-2"),
         entry("LANTERN", "Ledger And Node Telemetry Export Runner Node", chunk="chunk-3"),
         entry("MISTRAL", "Metrics Ingest Stream Transfer And Load", chunk="chunk-4"),

@@ -2,7 +2,7 @@
 
 What running manicule puts on disk, who can read it, how to copy it safely, and what a network
 bind will cost you when there is something to bind. Written for the person who has to answer
-"where did the documents go and who else can see them" — not for the person choosing a colour
+"where did the documents go and who else can see them" — not for the person choosing a color
 scheme.
 
 Two facts decide most of this document, and both are consequences of decisions taken
@@ -351,7 +351,7 @@ the system temporary directory — which, after this default, takes somebody hav
 there.
 
 manicule does not redistribute these files and will not: OpenAI publishes them with no SPDX
-licence expression, so manicule cannot state the terms under which it would be handing them
+license expression, so manicule cannot state the terms under which it would be handing them
 on. The bundle manifest records the URL every file came from, so whoever carries one can see
 exactly what is in it.
 
@@ -376,7 +376,7 @@ instead of whichever revision a GitHub repository is serving today.
 
 manicule is **GPL-3.0-or-later**, and that reaches an image built from it. Publishing an image
 to a registry others can pull is distribution: the corresponding source has to be available on
-the same terms, including any changes made to it, and the licence text has to travel with it.
+the same terms, including any changes made to it, and the license text has to travel with it.
 Building an image for your own machines is not distribution and none of this applies. See
 [`LICENSE`](../LICENSE), and take advice before publishing an image containing modifications
 you intend to keep private.

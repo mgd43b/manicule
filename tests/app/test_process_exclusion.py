@@ -191,7 +191,7 @@ def test_a_writer_that_exited_normally_leaves_the_directory_available(data_dir: 
 
 
 @pytest.mark.parametrize("sent", [signal.SIGINT, signal.SIGTERM])
-def test_a_signalled_writer_gives_the_directory_up_once_it_has_stopped(
+def test_a_signaled_writer_gives_the_directory_up_once_it_has_stopped(
     data_dir: Path, *, sent: signal.Signals
 ) -> None:
     """``Ctrl-C`` and a supervisor's ``SIGTERM``, which are the two ways a server is stopped.
@@ -322,8 +322,8 @@ def test_every_command_line_operation_is_classified_as_a_reader_or_a_writer() ->
 def test_an_operation_nobody_classified_takes_the_lock_rather_than_going_without() -> None:
     """The default, pinned. Forgetting has to fail closed.
 
-    The test above makes forgetting a red build, which is the first line of defence. This is the
-    second: on the day somebody adds a command and skips the test, the behaviour they get is a
+    The test above makes forgetting a red build, which is the first line of defense. This is the
+    second: on the day somebody adds a command and skips the test, the behavior they get is a
     refusal they can read rather than a race they cannot.
     """
     assert writes("an_operation_that_does_not_exist_yet")
@@ -393,7 +393,7 @@ def test_a_refused_writer_creates_no_database_and_runs_no_migration(
     assert outcome.returncode == 3, outcome.stderr
     assert outcome.stdout.strip() == "refused"
     assert sorted(p.name for p in data_dir.iterdir()) == before == [LOCK_FILENAME], (
-        "a refused process left something behind, so it had already begun initialising storage "
+        "a refused process left something behind, so it had already begun initializing storage "
         "by the time it found out it was not allowed to"
     )
 
@@ -426,7 +426,7 @@ def test_taking_the_same_directory_twice_in_one_process_is_still_refused(data_di
     ``flock`` is held per open file description, so two ``open`` calls in one process are two
     descriptions and the second is refused. Worth pinning: were it re-entrant, a runtime that
     took the lock twice would look fine here and let a second *process* in, because the
-    behaviour under test would be about descriptions rather than about processes.
+    behavior under test would be about descriptions rather than about processes.
     """
     with InstanceLock(data_dir), pytest.raises(InstanceLockedError):
         InstanceLock(data_dir).acquire()
@@ -511,7 +511,7 @@ which is the entire failure mode this file exists to prevent.
 """
 
 
-def _normalised(name: str) -> str:
+def _normalized(name: str) -> str:
     """One spelling for a command path and for an operation name.
 
     ``document reindex`` and ``document_reindex`` are the same thing said by two surfaces, and
@@ -530,7 +530,7 @@ def _cli_commands() -> set[str]:
         found: list[str] = []
         for command in app.registered_commands:
             name = command.name or (command.callback.__name__ if command.callback else "")
-            found.append(_normalised(f"{prefix}{name}"))
+            found.append(_normalized(f"{prefix}{name}"))
         for group in app.registered_groups:
             inner = group.typer_instance
             if inner is not None:
@@ -556,12 +556,12 @@ def test_every_command_is_accounted_for_by_the_classification_or_named_as_an_exc
     commands = _cli_commands()
     assert len(commands) > 30, "the walk must find the real surface, or this proves nothing"
 
-    classified = {_normalised(op) for op in WRITERS | READ_ONLY_OPS}
+    classified = {_normalized(op) for op in WRITERS | READ_ONLY_OPS}
     # `index` emits `index_path` when given a path and `index_status` when not; `backup` emits
     # `restore` for `--restore`. Each is one command over two operations, so its own name
     # matches neither — and both operations are classified individually above.
     aliases = {"index", "backup"}
-    exceptions = {_normalised(name) for name in NO_RUNTIME_COMMANDS}
+    exceptions = {_normalized(name) for name in NO_RUNTIME_COMMANDS}
     unaccounted = commands - classified - exceptions - aliases
     assert not unaccounted, (
         f"these commands are neither classified nor named as exceptions: {sorted(unaccounted)}. "

@@ -13,7 +13,7 @@ became a prose block, went into the vector, and was quotable in a citation as th
 had said it. The engine name of a diagram, the language of a code block and — the case that
 makes this more than untidy — the **JQL query** of a Jira macro were all indexed as things the
 document says. This parser consumes parameters as configuration and never as text, with one
-exception drawn as an explicit table rather than applied as a judgement: :data:`RENDERED_PARAMETERS`
+exception drawn as an explicit table rather than applied as a judgment: :data:`RENDERED_PARAMETERS`
 names which macro's which parameter Confluence actually draws on the page. Anything not in it stays
 configuration, so a macro nobody has enumerated fails in the harmless direction.
 
@@ -39,7 +39,7 @@ and list items and not merely at the top level.
 
 Anchors follow the same rule as the HTML parser: a fragment comes from the author or not at all
 (``docs/parsing.md`` §2.5). Storage format publishes them in two ways — an ``id`` on the heading
-and the ``anchor`` macro placed before it — and Confluence's own rendered ids are synthesised at
+and the ``anchor`` macro placed before it — and Confluence's own rendered ids are synthesized at
 render time from the heading text, which is a guess this parser does not make.
 """
 
@@ -118,7 +118,7 @@ searches for them, so they are content that happens to be *carried* as a paramet
 ``engine`` and ``jqlQuery`` are rendered nowhere — they change what the macro does.
 
 **An enumeration rather than a rule applied per macro, and it fails safe.** "Is this rendered?"
-answered by judgement gets answered differently by the next person, and it fails in the direction
+answered by judgment gets answered differently by the next person, and it fails in the direction
 that puts a JQL query or a user's name in a citation. A table fails the other way: a macro nobody
 has added an entry for keeps its parameters out of the index, which is the harmless mistake.
 
@@ -165,7 +165,7 @@ INTERPRETED_MACROS: frozenset[str] = (
 """Every macro name this parser reads as something other than an opaque placeholder.
 
 **Derived from the dispatch tables rather than written out beside them**, so the declaration
-cannot come to disagree with the behaviour. One caller needs it and is in another package: the
+cannot come to disagree with the behavior. One caller needs it and is in another package: the
 snapshot connector records which of a page's macros will not be understood, and a second, hand-kept
 list of that answer would go stale the first time a macro was taught here and not there — which is
 the same reasoning that makes the connector import its media type from the registration module
@@ -202,7 +202,7 @@ _INDENT = "  "
 
 @dataclass(frozen=True, slots=True)
 class _Found:
-    """One element the walk recognised, before sections have been worked out."""
+    """One element the walk recognized, before sections have been worked out."""
 
     kind: BlockKind
     text: str
@@ -295,7 +295,7 @@ _EMPTY_ELEMENT = re.compile(
 def close_empty_elements(document: str) -> str:
     """Rewrite ``<ri:page …/>`` as ``<ri:page …></ri:page>`` before an HTML engine sees it.
 
-    **HTML does not honour self-closing syntax on unknown elements, and storage format is full of
+    **HTML does not honor self-closing syntax on unknown elements, and storage format is full of
     them.** ``<ri:user ri:account-id="…"/>`` is a complete element in XML; to an HTML5 tokenizer
     the trailing slash is meaningless, so the element is left *open* and every following sibling
     becomes its child. A link written the way Confluence writes them —
@@ -307,7 +307,7 @@ def close_empty_elements(document: str) -> str:
     is not lost, but the sentence reads as the wrong words, which is the failure mode this
     project exists to avoid: plausible, and wrong.
 
-    Normalising here rather than compensating at each lookup keeps the tree shaped the way the
+    Normalizing here rather than compensating at each lookup keeps the tree shaped the way the
     author wrote it, so there is one place this quirk is known about instead of one per element.
     Only ``ac:`` and ``ri:`` elements are touched: an HTML void element such as ``<br/>`` is
     already handled correctly, and rewriting it would be the bug rather than the fix.
@@ -698,7 +698,7 @@ def _unsupported_macro(node: LexborNode, name: str, config: ConfluenceConfig) ->
     ``expand`` macro's ``title`` is the clickable label Confluence draws on the page: a reader
     sees it, quotes it and searches for it, so it is content by the same test a panel's title is.
     Emitting only the placeholder discarded it silently — the macro being unsupported is a
-    statement about its *behaviour*, never a licence to drop the words it renders.
+    statement about its *behavior*, never a license to drop the words it renders.
     """
     generated = name in _TOC_MACROS
     prose, structured = ([], []) if generated else _body_blocks(node, config)
@@ -794,7 +794,7 @@ def _body_blocks(node: LexborNode, config: ConfluenceConfig) -> tuple[list[str],
     """A macro's rich-text body, split into what it says and what it contains.
 
     The prose belongs to the carrying block; anything structured — a nested panel, a code macro,
-    a table — is its own block, because the properties that make it worth recognising are lost
+    a table — is its own block, because the properties that make it worth recognizing are lost
     the moment it is flattened into the text around it.
     """
     prose: list[str] = []

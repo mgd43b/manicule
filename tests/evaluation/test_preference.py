@@ -135,7 +135,7 @@ def test_a_record_may_not_be_built_for_a_side_that_was_at_chance() -> None:
     """The second of the three places the chance-level rule is enforced.
 
     The harness refuses to run one, and this refuses to construct one — so a record written by
-    some other path still cannot exist. A stored judgement outlives the knowledge that the
+    some other path still cannot exist. A stored judgment outlives the knowledge that the
     system producing it was noise.
     """
     with pytest.raises(ValueError, match="at chance"):
@@ -185,6 +185,6 @@ def test_a_line_this_build_cannot_read_is_refused_rather_than_skipped(tmp_path: 
 
 
 def test_a_naive_timestamp_is_refused() -> None:
-    """A judgement whose time has no defined meaning cannot be placed against a corpus version."""
+    """A judgment whose time has no defined meaning cannot be placed against a corpus version."""
     with pytest.raises(ValueError, match="timezone-aware"):
         a_record(recorded_at=datetime.now(UTC).replace(tzinfo=None))

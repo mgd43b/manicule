@@ -103,7 +103,7 @@ def item_prefix(tag: str, marker: str) -> str:
     competing with the ``: `` that says what the next line is. A second ``<dd>`` under one ``<dt>``
     is rendered like the first, and detection reads only the first because the line above the
     second is itself a ``: `` line, which is not a term — the conservative outcome, and choosing
-    between two definitions is the judgement that feature is forbidden to make.
+    between two definitions is the judgment that feature is forbidden to make.
     """
     if tag == "dt":
         return ""

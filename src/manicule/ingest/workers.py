@@ -29,7 +29,7 @@ transactional happens in the parent, which is what keeps the write ordering in
 
 ``spawn``, never ``fork``: forking a process that has loaded a model runtime and opened SQLite
 copies both into a child that must not touch either. ``spawn`` costs interpreter startup once
-per worker, amortised over the run.
+per worker, amortized over the run.
 """
 
 from __future__ import annotations
@@ -458,7 +458,7 @@ class WorkerPool:
         except BaseException:
             # Cancellation and interpreter shutdown are *not* one document's problem, and
             # swallowing them would make Ctrl-C wait for a corpus. The worker still has to go:
-            # a cancelled await leaves one whose state nobody knows, and replacing it is
+            # a canceled await leaves one whose state nobody knows, and replacing it is
             # cheaper than reasoning about what it was in the middle of.
             await self._replace(worker)
             raise
@@ -612,9 +612,9 @@ def _exchange(
     has to happen *while* the parser is running: by the time a runaway returns, it has already
     allocated.
 
-    **Every kill is gated on the worker still being ours.** The thread cannot be cancelled, so
-    when the awaiting task is cancelled the pool retires this worker and reaps it — and a
-    reaped pid is released to the operating system for reuse. Signalling a bare integer after
+    **Every kill is gated on the worker still being ours.** The thread cannot be canceled, so
+    when the awaiting task is canceled the pool retires this worker and reaps it — and a
+    reaped pid is released to the operating system for reuse. Signaling a bare integer after
     that point sends ``SIGKILL`` to whatever process now holds it, and the likeliest victim is
     one of this pool's own replacements. Asking the ``Process`` object rather than trusting the
     number is what makes that impossible.

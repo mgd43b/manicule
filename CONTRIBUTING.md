@@ -242,9 +242,9 @@ library that decides stored text means adding it to `manicule.parsers.versions.P
 to the `index-affecting-extraction` patterns; `tests/parsers/test_versions.py` fails if the
 two disagree.
 
-**Nothing here checks licences, and this project has rejected dependencies over them.**
+**Nothing here checks licenses, and this project has rejected dependencies over them.**
 manicule is GPL-3.0-or-later. Dependabot reports versions; it says nothing about the terms
-a new version ships under, and a relicence lands in a routine-looking bump. So the licence
+a new version ships under, and a relicense lands in a routine-looking bump. So the license
 is checked by a person, at selection time, and again if a bump crosses a major version.
 
 The two decisions on record show why it is not a lookup ([`docs/parsing.md`](docs/parsing.md)
@@ -252,7 +252,7 @@ The two decisions on record show why it is not a lookup ([`docs/parsing.md`](doc
 
 - **`extract-msg` is GPL-3.0 and became admissible** when this project relicensed. GPL-3.0
   inside a GPL-3.0 work carries no additional obligation.
-- **PyMuPDF is AGPL-3.0 and stayed rejected**, relicence or not. GPLv3 §13 permits the
+- **PyMuPDF is AGPL-3.0 and stayed rejected**, relicense or not. GPLv3 §13 permits the
   combination, but the AGPL portion keeps its network clause — so the obligation lands on
   anyone who *runs* manicule rather than on us. A condition we would be imposing on
   operators is not ours to accept on their behalf, and `pypdfium2` is permissive and

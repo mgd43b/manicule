@@ -107,7 +107,7 @@ async def test_a_body_older_than_discovery_reported_is_fetched_again() -> None:
     """The known staleness bug, and the cheapest answer to it.
 
     Nothing about a stale body looks wrong, so the only signal is the version search reported
-    a moment earlier. One retry clears a caching artefact.
+    a moment earlier. One retry clears a caching artifact.
     """
     instance = FakeConfluence(
         pages=[

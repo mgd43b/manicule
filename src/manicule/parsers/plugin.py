@@ -78,7 +78,7 @@ PARSERS: tuple[_Registration, ...] = (
         factory="MarkdownParser",
         config_model=parser_config.MarkdownConfig,
         media_types=parser_config.MARKDOWN_MEDIA_TYPES,
-        summary="Heading anchors with synthesised fragments, from markdown-it token maps.",
+        summary="Heading anchors with synthesized fragments, from markdown-it token maps.",
     ),
     _Registration(
         name="html",
@@ -118,7 +118,7 @@ PARSERS: tuple[_Registration, ...] = (
         factory="SlidesParser",
         config_model=parser_config.SlidesConfig,
         media_types=parser_config.SLIDES_MEDIA_TYPES,
-        summary="Slide numbers and shape geometry as normalised rectangles.",
+        summary="Slide numbers and shape geometry as normalized rectangles.",
     ),
     _Registration(
         name="spreadsheet",
