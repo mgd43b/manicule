@@ -66,17 +66,18 @@ def _build_mlx(context: BuildContext) -> Embedder:
     # Deferred: this is where MLX and Metal are loaded.
     from manicule.embedding.runtimes.mlx_backend import MEGABYTE, MlxEmbedder  # noqa: PLC0415
 
-    card, config = _card(context)
-    if not isinstance(config, MlxEmbedderConfig):
-        # The registry validates against the model this component registered, so this is the
-        # factory being called from outside the container. Falling back to the shared model's
-        # defaults would silently drop the cache bound, which is the one setting here that
-        # stops a run from taking the machine down.
+    if not isinstance(context.config, MlxEmbedderConfig):
+        # Checked before anything is read, because the registry validates against the model a
+        # component registered and so this is the factory being called from outside the
+        # container. Falling back to the shared model's defaults would silently drop the cache
+        # bound, which is the one setting here that stops a run from taking the machine down.
         msg = (
-            f"the mlx embedder was built with {type(config).__name__} where it declares "
-            f"{MlxEmbedderConfig.__name__}. Its cache bound would not be applied."
+            f"the mlx embedder was built with {type(context.config).__name__} where it "
+            f"declares {MlxEmbedderConfig.__name__}. Its cache bound would not be applied."
         )
         raise ConfigError(msg)
+    config = context.config
+    card, _ = _card(context)
     embedding = context.settings.embedding
     return MlxEmbedder(
         card,
