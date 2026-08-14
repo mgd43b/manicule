@@ -52,9 +52,10 @@ class EmbedderConfig(BaseModel):
 class MlxEmbedderConfig(EmbedderConfig):
     """:class:`EmbedderConfig`, plus the one setting that is MLX's alone.
 
-    Separate from the shared model because ``extra="forbid"`` is doing real work: a cache
-    limit written under ``[embedders.onnx]`` names a mechanism onnxruntime does not have, and
-    silently accepting it would leave an operator believing they had bounded something.
+    Separate from the shared model because ``extra="forbid"`` is doing real work: a cache limit
+    written under ``[plugins.config."embedder.onnx"]`` names a mechanism onnxruntime does not
+    have, and silently accepting it would leave an operator believing they had bounded
+    something.
     """
 
     cache_limit_mb: int = Field(

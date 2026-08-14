@@ -221,7 +221,7 @@ async def test_metrics_omit_the_allocator_before_it_has_been_touched(tmp_path: P
 
 
 def test_the_cache_bound_is_configured_where_only_mlx_can_read_it() -> None:
-    """``[embedders.onnx]`` has no such mechanism, so naming one there is refused.
+    """``[plugins.config."embedder.onnx"]`` has no such mechanism, so naming it there is refused.
 
     Accepting it would leave an operator believing they had bounded something.
     """
@@ -246,3 +246,104 @@ def test_the_mlx_factory_refuses_configuration_that_would_drop_the_bound() -> No
 
     with pytest.raises(ConfigError, match="cache bound would not be applied"):
         _build_mlx(Context())  # pyright: ignore[reportArgumentType] - the point
+
+
+# --- the qualification harness's verdict, on injected measurements -------------------------
+#
+# The harness's own arithmetic decides whether the defect is caught, so it is worth checking
+# against curves whose shape is known rather than only against a real run. Fakes are the right
+# instrument here for the same reason they are wrong for the bound itself: this is arithmetic,
+# not Metal.
+
+
+def _namespace(**overrides: object) -> Any:
+    from argparse import Namespace  # noqa: PLC0415 - only this section needs it
+
+    defaults: dict[str, object] = {
+        "settle_passes": 10,
+        "growth_bound_gib": 1.0,
+        "peak_ceiling_gib": 6.0,
+        "passes": 120,
+    }
+    return Namespace(**(defaults | overrides))
+
+
+def _samples(footprints: list[int]) -> list[dict[str, Any]]:
+    return [
+        {
+            "index": index,
+            "footprint_bytes": value,
+            "resident_bytes": 1,
+            "mlx_active_bytes": 1,
+            "mlx_cache_bytes": 1,
+            "mlx_peak_bytes": 1,
+            "seconds": 0.0,
+        }
+        for index, value in enumerate(footprints)
+    ]
+
+
+def _judge(footprints: list[int], **overrides: object) -> dict[str, Any]:
+    from tools.qualify_mlx_memory import _report  # noqa: PLC0415 - a CI script, not runtime
+
+    return _report(
+        _namespace(**overrides),
+        _samples(footprints),
+        baseline=1,
+        loaded={},
+        aborted=None,
+        exit_code=0,
+    )
+
+
+GIB = 1024**3
+
+
+def test_the_harness_passes_a_flat_curve() -> None:
+    report = _judge([3 * GIB] * 40)
+
+    assert report["passed"], report["failures"]
+
+
+def test_the_harness_fails_a_curve_that_keeps_climbing() -> None:
+    """The retention signature: a footprint that never settles."""
+    report = _judge([(2 * GIB) + index * GIB // 4 for index in range(40)])
+
+    assert not report["passed"]
+    assert any("grew" in failure for failure in report["failures"])
+    assert any("ceiling" in failure for failure in report["failures"])
+
+
+def test_one_reclaimed_sample_does_not_decide_the_verdict() -> None:
+    """macOS reclaims under pressure from other processes, and it did during this work.
+
+    A single sample far below its neighbors landing on an endpoint would swing an
+    endpoint-to-endpoint difference by gigabytes, in whichever direction happened to be
+    convenient — reporting a plateau for a climbing run, which is the one wrong answer that
+    matters. The comparison is a median over a window so that it cannot.
+    """
+    climbing = [(2 * GIB) + index * GIB // 4 for index in range(40)]
+    climbing[-1] = GIB // 10  # the excursion, on the endpoint that would hide the growth
+
+    report = _judge(climbing)
+
+    assert not report["passed"]
+    assert any("grew" in failure for failure in report["failures"])
+
+
+def test_the_shortest_judgeable_run_is_judged_rather_than_refused() -> None:
+    """Exactly two windows after the settle passes is enough, and was once rejected as too few.
+
+    An off-by-one here fails a run that measured everything it was asked to, which reads as a
+    memory regression rather than as a harness bug.
+    """
+    shortest = 10 + 2 * 5
+
+    report = _judge([3 * GIB] * shortest)
+
+    assert report["passed"], report["failures"]
+    assert not any("too few" in failure for failure in report["failures"])
+    assert _judge([3 * GIB] * (shortest - 1))["failures"] == [
+        "only 19 passes were measured, too few to judge growth after 10 settle passes at a "
+        "window of 5"
+    ]

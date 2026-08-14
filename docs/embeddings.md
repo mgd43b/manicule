@@ -191,9 +191,9 @@ cache_limit_mb = 2048          # ceiling on MLX's retained Metal buffers (§3.5)
 ```
 
 `cache_limit_mb` is the only setting here that is one backend's alone, and it is on the MLX
-model rather than the shared one so that writing it under `embedder.onnx` is *refused*.
-onnxruntime has no such allocator, and quietly accepting the setting would leave an operator
-believing they had bounded something.
+config model rather than the shared one so that writing it under
+`[plugins.config."embedder.onnx"]` is *refused*. onnxruntime has no such allocator, and quietly
+accepting the setting would leave an operator believing they had bounded something.
 
 A model outside the known-good set is accepted, and everything that decides vector-space
 compatibility is read from **its own repository** rather than from a table — which is stronger

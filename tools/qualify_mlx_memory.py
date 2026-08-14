@@ -308,7 +308,7 @@ def _report(
     settle = arguments.settle_passes
     growth: int | None = None
     peak: int | None = None
-    if len(measured) > settle + 2 * _WINDOW:
+    if len(measured) >= settle + 2 * _WINDOW:
         after_settle = measured[settle:]
         # Medians of the first and last windows rather than the two endpoint samples. macOS
         # reclaims under pressure from *other* processes, and a run that shares a machine
