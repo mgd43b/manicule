@@ -133,11 +133,12 @@ DERIVED_FROM: Final[dict[str, str]] = {
         "it, and a rule arriving through one would otherwise be a rule nothing covered."
     ),
     "one level of imports, not their imports": (
-        "the digested files' own imports are read; what *those* modules import is not. That is "
-        "closed rather than open, and NOT_DIGESTED is where: anything the walk finds under "
-        "`manicule` is either digested — in which case its imports are walked too — or named "
-        "there with the reason it cannot change what gets stored. A dependency reached through "
-        "a module in that map is covered by the argument for excluding the module."
+        "the digested files' own imports are read; what *those* modules import is not. For "
+        "`manicule` modules that is closed rather than open, and NOT_DIGESTED is where: anything "
+        "the walk finds is either digested — in which case its own imports are walked too — or "
+        "named there with the reason it cannot change what gets stored. For a third-party "
+        "module it is closed by the entry below instead, since a distribution's dependencies "
+        "move with the version recorded for it."
     ),
     "static imports only": (
         "`importlib.import_module('x')` and `__import__('x')` are function calls, so the walk "
@@ -147,9 +148,10 @@ DERIVED_FROM: Final[dict[str, str]] = {
         "which turns the thing this cannot see into the thing it is not allowed to do."
     ),
     "a distribution's own pins": (
-        "`pydantic@2.13.4` is recorded and `pydantic-core` is not. Pydantic pins its core "
-        "exactly, so the recorded version implies it; a dependency that did not pin its own "
-        "would be a gap, and would be a gap in that dependency rather than in this."
+        "pydantic's version is recorded and pydantic-core's is not — no version is written down "
+        "here, because one in a comment is one that goes stale on the next upgrade. Pydantic "
+        "pins its core exactly, so the recorded version implies it; a distribution that did not "
+        "pin its own would be a gap, and would be a gap in that distribution rather than here."
     ),
 }
 """What :func:`libraries` and :func:`detector_imports` actually read, and what they do not.

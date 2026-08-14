@@ -210,7 +210,17 @@ def test_the_detector_may_not_import_dynamically() -> None:
     A limit nobody can act on is worth less than a rule, so it is a rule. If detection ever
     genuinely needs a dynamic import, this fails and whoever wrote it has to decide how the
     fingerprint covers it — which is the conversation that would otherwise not happen.
+
+    **Matched on the name being called rather than on how it was reached**, because the obvious
+    version of this had the same blind spot as the derivation it defends: checking `ast.Attribute`
+    for `import_module` misses `from importlib import import_module` followed by a bare call, and
+    the guard would then be silent about exactly the thing it exists to make loud.
     """
+    # Matched on the *name being called*, however it was bound. An earlier version of this
+    # checked `ast.Name` for `__import__` and `ast.Attribute` for `import_module`, which let
+    # `from importlib import import_module` followed by a bare `import_module("x")` through —
+    # a guard with the same blind spot as the thing it guards is worth less than none.
+    dynamic = {"__import__", "import_module"}
     offenders: list[str] = []
     for package, name in SOURCES:
         tree = ast.parse(_source_path(package, name).read_bytes())
@@ -218,10 +228,15 @@ def test_the_detector_may_not_import_dynamically() -> None:
             if not isinstance(node, ast.Call):
                 continue
             called = node.func
-            if isinstance(called, ast.Name) and called.id == "__import__":
-                offenders.append(f"{package}.{name}: __import__(...)")
-            elif isinstance(called, ast.Attribute) and called.attr == "import_module":
-                offenders.append(f"{package}.{name}: import_module(...)")
+            invoked = (
+                called.id
+                if isinstance(called, ast.Name)
+                else called.attr
+                if isinstance(called, ast.Attribute)
+                else ""
+            )
+            if invoked in dynamic:
+                offenders.append(f"{package}.{name}: {invoked}(...)")
 
     assert not offenders, (
         f"{offenders} imports dynamically, which the fingerprint's derivation cannot follow. "
