@@ -220,6 +220,9 @@ BINDERS: Mapping[str, Binder] = {
         role=args.text("role"),
         expires_days=args.optional_count("expires_days"),
     ),
+    # `role` is `text` rather than `optional_text` deliberately: the command line declares a
+    # default of "member", so it always sends a string, and a reader that accepted nothing
+    # would let a caller mint a key with no role at all.
     "auth_revoke_key": lambda service, args, report: service.api_key_revoke(
         args.text("name_or_id")
     ),
@@ -227,7 +230,7 @@ BINDERS: Mapping[str, Binder] = {
         args.text("collection_id"), args.texts("document_ids")
     ),
     "collection_create": lambda service, args, report: service.collection_create(
-        args.text("name"), description=args.text("description")
+        args.text("name"), description=args.optional_text("description")
     ),
     "collection_delete": lambda service, args, report: service.collection_delete(
         args.text("collection_id")
