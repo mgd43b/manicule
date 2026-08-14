@@ -29,11 +29,10 @@ traceback frame or a logged configuration object carries the wrapper rather than
 from __future__ import annotations
 
 import base64
-import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol
 
 from pydantic import SecretStr
 
@@ -157,6 +156,14 @@ class BrowserSession:
     can read — the instance decides when the session dies and announces it only by answering the
     next request with a sign-in page. An age manicule measures itself is the only thing that can
     turn "this is too old to try" into a refusal *before* a sync starts.
+
+    **There is no serialization on this class, and its absence is the design.** ``to_json`` and
+    ``from_json`` existed so that a session could be written into a keychain item and read back;
+    nothing persists a session now, so a method that turns one into a string would be a loaded
+    gun in a module whose whole claim is that the value never leaves memory. The one place
+    cookies are deliberately unwrapped is
+    :meth:`~manicule.app.control.Handover.to_line`, which writes them to a ``0600`` socket and
+    is named for exactly that.
     """
 
     base_url: str
@@ -168,64 +175,6 @@ class BrowserSession:
 
     captured_at: datetime
     cookies: Mapping[str, SecretStr] = field(default_factory=dict[str, SecretStr])
-
-    def to_json(self) -> str:
-        """The record as the one string a keychain item holds.
-
-        Serialized by hand rather than through pydantic's JSON mode, which would render every
-        secret as asterisks — correct for a log and useless for storage. Writing it out here is
-        the one place the values are deliberately unwrapped, which is where a reader looks for
-        that.
-        """
-        return json.dumps(
-            {
-                "base_url": self.base_url,
-                "account": self.account,
-                "captured_at": self.captured_at.isoformat(),
-                "cookies": {
-                    name: secret.get_secret_value() for name, secret in self.cookies.items()
-                },
-            },
-            sort_keys=True,
-        )
-
-    @classmethod
-    def from_json(cls, raw: str) -> BrowserSession:
-        """Rebuild a record written by :meth:`to_json`.
-
-        Raises:
-            ValueError: The stored item is not a session record. A keychain outlives the
-                versions of the software that wrote to it, so this reads what it is given
-                rather than assuming its own format.
-        """
-        record = _object(json.loads(raw))
-        cookies = _object(record.get("cookies"))
-        if not cookies:
-            msg = "the stored session carries no cookies"
-            raise ValueError(msg)
-        captured = _text(record.get("captured_at"))
-        if not captured:
-            msg = "the stored session has no capture time"
-            raise ValueError(msg)
-        when = datetime.fromisoformat(captured)
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=UTC)
-        return cls(
-            base_url=_text(record.get("base_url")),
-            account=_text(record.get("account")),
-            captured_at=when,
-            cookies={name: SecretStr(_text(value)) for name, value in cookies.items()},
-        )
-
-
-def _object(value: object) -> Mapping[str, object]:
-    """Narrow a decoded JSON value to an object. JSON keys are strings by construction."""
-    return cast("Mapping[str, object]", value) if isinstance(value, dict) else {}
-
-
-def _text(value: object) -> str:
-    """A decoded JSON value as a string, treating anything else as absent."""
-    return value if isinstance(value, str) else ""
 
 
 def _utcnow() -> datetime:
@@ -300,7 +249,7 @@ def token_credential(config: ConfluenceConfig) -> Credential:
     if method is AuthMethod.BROWSER_SESSION:
         msg = (
             "this Confluence connector authenticates with a browser session, which is held in "
-            "the keychain rather than in configuration. Build it with "
+            "the running server's memory rather than in configuration. Build it with "
             "manicule.connectors.credentials.credential_for(), which the plugin factory calls "
             "before constructing the connector."
         )
@@ -324,7 +273,6 @@ def token_credential(config: ConfluenceConfig) -> Credential:
 def credential_for(
     config: ConfluenceConfig,
     *,
-    environ: Mapping[str, str] | None = None,
     store: SessionStore | None = None,
     now: Callable[[], datetime] = _utcnow,
 ) -> Credential:
@@ -339,12 +287,15 @@ def credential_for(
     Args:
         config: The connector's settings, already through
             :func:`~manicule.connectors.config.resolve_credentials`.
-        environ: Consulted for ``session_env``. ``None`` reads the process environment.
-        store: Where captured sessions live. ``None`` uses the platform's keychain.
+        store: Where captured sessions live. ``None`` uses this process's own vault, which for
+            a served manicule is the one ``connector login`` hands sessions to.
         now: The clock the age check reads.
 
     Raises:
-        ConfigError: No session has been captured for this instance.
+        ConfigError: No session has been captured for this instance in this process's lifetime.
+            The message names the two commands that fix it, because after a restart this is the
+            expected state rather than a fault — a session lives in the server's memory, so
+            stopping the server is what ends it.
         SessionExpiredError: A session was captured and is older than this connector will use.
     """
     if config.auth_method is not AuthMethod.BROWSER_SESSION:
@@ -352,13 +303,16 @@ def credential_for(
 
     from manicule.connectors.sessions import load_session  # noqa: PLC0415 - see module docstring
 
-    session = load_session(config, environ=environ, store=store, now=now())
+    session = load_session(config, store=store)
     if session is None:
         msg = (
-            f"no Confluence browser session is stored for {config.base_url}. Sign in to it in "
-            f"your browser, then run `manicule connector login <name>` and paste the session "
-            f"cookies when it asks; manicule never asks for the password and never sees it. On "
-            f"a machine with no macOS Keychain, put the same cookies in ${config.session_env}."
+            f"no Confluence browser session is held for {config.base_url}. Sessions live in the "
+            f"running manicule server's memory and nowhere else — no keychain, no file, no "
+            f"environment variable — so there is none until somebody signs in, and there is "
+            f"none again after the server restarts. That is the expected path rather than a "
+            f"fault. Start a server with `manicule serve` if one is not running, then run "
+            f"`manicule connector login <name> --browser`; manicule never asks for the password "
+            f"and never sees it."
         )
         raise ConfigError(msg)
     credential = BrowserSessionCredential(

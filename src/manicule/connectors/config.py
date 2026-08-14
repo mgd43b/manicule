@@ -236,16 +236,19 @@ class ConfluenceConfig(BaseModel):
     rather than being thought about. ``--timeout`` overrides it per run, which is what somebody
     reaches for when a conditional-access check turns out to need longer than the default."""
 
-    session_env: str = Field(
-        default="CONFLUENCE_SESSION_COOKIE",
-        min_length=1,
-        description="Environment variable consulted for a browser session on a machine with no "
-        "macOS Keychain. The variable holds the cookies exactly as they would be pasted.",
-    )
-    """The credential is never read from configuration. ``extra='forbid'`` on this model means
-    a ``session_cookie`` key in ``config.toml`` is a startup error rather than a working
-    setting, and that is deliberate: a session cookie is the sync account's whole identity, and
-    a configuration file is a file that ends up in version control eventually."""
+    # There is no `session_env`, and its absence is deliberate. It named an environment
+    # variable a browser session could be read from, for the platforms that had no macOS
+    # Keychain — which is to say it offered a live corporate credential written into a shell's
+    # history, visible in every process listing that inherited it, as the *recommended* answer
+    # for Linux and containers. Sessions are now held in the running server's memory, which is
+    # an answer that is the same on every platform, so the variable is deleted rather than kept
+    # as a fallback. `extra="forbid"` means a configuration still setting it is refused loudly
+    # instead of silently ignored, which is the choice #98 made for `schedule_s`.
+    #
+    # The credential is never read from configuration either. `extra="forbid"` means a
+    # `session_cookie` key in `config.toml` is a startup error rather than a working setting,
+    # and that is deliberate: a session cookie is the sync account's whole identity, and a
+    # configuration file is a file that ends up in version control eventually.
 
     email: str = Field(
         default="",

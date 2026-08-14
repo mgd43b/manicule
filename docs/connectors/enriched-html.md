@@ -542,5 +542,8 @@ The third exists because the second cannot cover a path nobody predicted — the
 table and fails the by-name walk; a route added at a guessed path under an unrelated *name* does
 the reverse. Both were confirmed by adding such a route and watching each test fail.
 
-There is no unattended scheduler to exclude it from: manicule has none, and `schedule_s` was
-removed in #98 precisely because a setting nothing reads is a promise nothing keeps.
+There **is** an unattended scheduler now — `manicule serve` runs one, and `schedule_s` came back
+with it (`docs/deployment.md` §6.2) — and `connector sidecar` is still not on it. The scheduler
+runs syncs, which is the operation configuration describes; generating manifests writes into the
+corpus *directory* rather than into the index, and that stays on the surface where a person is
+present.

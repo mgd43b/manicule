@@ -19,9 +19,11 @@ from typer._click.exceptions import NoSuchOption, UsageError
 from typer.testing import CliRunner
 
 import manicule.cli.main as cli
+from manicule.app import commands
 from manicule.app import results as r
+from manicule.app.commands import Command
 from manicule.app.dispatch import run_op
-from manicule.app.results import succeeded
+from manicule.app.results import Envelope, succeeded
 from manicule.app.service import ApplicationService
 from manicule.cli import render
 from manicule.cli.shell import SHELLS, completion_script
@@ -41,8 +43,6 @@ from tests.conftest import CLEARED_TERMINAL_VARIABLES
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
-    from manicule.app.results import Envelope
-
 
 @pytest.fixture
 def service() -> ApplicationService:
@@ -55,15 +55,30 @@ def service() -> ApplicationService:
 def _bind(monkeypatch: pytest.MonkeyPatch, service: ApplicationService) -> None:
     """Point the command line at an already-built service.
 
-    One function is substituted — the one that would otherwise read the suite machine's
-    configuration and open a database. Everything above it, including argument parsing,
-    dispatch, rendering and the exit status, is the real thing.
+    Two functions are substituted, one per path: :func:`~manicule.cli.main._execute` runs a read
+    in this process, and :func:`~manicule.cli.main._dispatch` decides where a write runs and
+    would otherwise look for a server. Both are the seam where the suite machine's configuration
+    would be read and a database opened. Everything above them — argument parsing, the binder
+    table, rendering and the exit status — is the real thing.
+
+    The write path is bound to ``commands.run``, which is **the same call the server makes when
+    a proxied command reaches it**. That is deliberate rather than convenient: these tests then
+    exercise the operation exactly as a served one runs it, and
+    ``tests/app/test_proxy.py`` asserts the two agree by running both.
     """
 
     async def execute(op: str, call: Any) -> Envelope:
         return await run_op(op, service.workspace, lambda: call(service))
 
+    async def dispatch(command: Command) -> Envelope:
+        return await run_op(
+            command.op,
+            service.workspace,
+            lambda: commands.run(service, command, commands.silent),
+        )
+
     monkeypatch.setattr(cli, "_execute", execute)
+    monkeypatch.setattr(cli, "_dispatch", dispatch)
 
 
 @pytest.fixture
@@ -858,12 +873,17 @@ MINIMUM_CLI_MODULES = 5
 Present to catch a scan reading the wrong directory, not to track the package's size.
 """
 
-OP_TAKING_CALLS: frozenset[str] = frozenset({"emit", "run_op", "succeeded", "failed"})
+OP_TAKING_CALLS: frozenset[str] = frozenset({"emit", "run_op", "succeeded", "failed", "Command"})
 """Functions whose **first positional argument** is an operation name.
 
-``Envelope(op=...)`` is the fifth shape and is a keyword rather than a positional, which is
+``Envelope(op=...)`` is the sixth shape and is a keyword rather than a positional, which is
 why it is handled separately below. It is also the one a scan written from a quick reading of
 ``main.py`` misses, because ``completion`` is the only operation that uses it.
+
+``Command`` is how every operation that *writes* names itself now: the command line builds one
+and hands it to :func:`~manicule.cli.main.submit`, which either runs it here or sends it to a
+server. It is a constructor rather than a function and the scan does not care — what it reads
+is the first positional literal, and for a command that is the op.
 """
 
 
@@ -2070,3 +2090,94 @@ def test_connector_sidecar_reports_which_profiles_ran(
     rendered = _unwrapped(result.output)
     assert "standalone-storage" in rendered
     assert "no configured source" in rendered
+
+
+# --- every write command, with only what it requires ---------------------------------------
+
+
+MINIMAL: dict[str, list[str]] = {
+    "auth_create_key": ["auth", "create-key", "ci"],
+    "auth_revoke_key": ["auth", "revoke-key", "ci"],
+    "collection_add": ["collection", "add", "col-1", "doc-1"],
+    "collection_create": ["collection", "create", "runbooks"],
+    "collection_delete": ["collection", "delete", "col-1"],
+    "collection_orphans": ["collection", "orphans"],
+    "collection_remove": ["collection", "remove", "col-1", "doc-1"],
+    "collection_rename": ["collection", "rename", "col-1", "runbooks"],
+    "collection_update": ["collection", "update", "col-1", "for on call"],
+    "config_set": ["config", "set", "rag.profile", "fast"],
+    "connector_sidecar": ["connector", "sidecar", "."],
+    "connector_sync": ["connector", "sync", "handbook"],
+    "document_delete": ["document", "delete", "doc-1"],
+    "document_redetect_glossary": ["document", "reindex", "--stale-glossary"],
+    "document_reindex": ["document", "reindex", "doc-1"],
+    "document_reindex_stale": ["document", "reindex", "--stale"],
+    "import": ["import", "archive.tar.gz"],
+    "index_path": ["index", "."],
+    "init": ["init"],
+    "plugin_add": ["plugin", "add", "pdf"],
+    "plugin_remove": ["plugin", "remove", "pdf"],
+    "reset_index": ["reset-index", "--yes"],
+    "restore": ["backup", "--restore", "backup.tar.gz"],
+    "upgrade": ["upgrade"],
+    "workspace_switch": ["workspace", "switch", "other"],
+}
+"""How to invoke each write command with **nothing optional given**.
+
+This table exists because an omitted option is the one input the binders never saw. Every other
+test in this suite passes the flags it is interested in, so ``--description`` was always
+supplied — and ``collection_create`` read it with ``text`` rather than ``optional_text``, so
+``manicule collection create runbooks`` failed with "takes a string" against a value the command
+line itself declares as optional. Copilot found it by reading; nothing here would have.
+"""
+
+
+def test_every_write_command_runs_with_only_its_required_arguments(
+    bound: ApplicationService,
+) -> None:
+    """No write command refuses its own defaults.
+
+    The failure being caught is narrow and easy to reintroduce: a binder reading an argument
+    with ``text`` or ``count`` when the command line declares it optional and therefore sends
+    ``None``. That is a ``ValueError`` from the reader, which becomes a failure envelope naming
+    the argument — so the assertion is on the envelope's error rather than only on the exit
+    status, because several of these commands fail for legitimate reasons against a fake backend
+    (no such collection, no such archive) and those are not what this is about.
+    """
+    del bound
+    offenders: list[str] = []
+    for op, argv in sorted(MINIMAL.items()):
+        result = run(["--json", *argv])
+        if result.exit_code == 0:
+            continue
+        try:
+            envelope = Envelope.model_validate_json(result.stdout)
+        except ValueError:  # pragma: no cover - a usage error exits before an envelope
+            offenders.append(f"{op}: exited {result.exit_code} with no envelope: {result.output}")
+            continue
+        # Parsed into the contract's own model rather than read out of a dictionary, so what is
+        # being inspected is the documented shape rather than whatever keys happened to be
+        # present — and so a change to the envelope reaches this test as a type error.
+        message = envelope.error.message if envelope.error is not None else ""
+        if "and it takes" in message:
+            offenders.append(f"manicule {' '.join(argv)} -> {message}")
+
+    assert offenders == [], (
+        "a write command refused an argument its own command line declares as optional:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_the_minimal_invocations_cover_every_binder() -> None:
+    """The accounting, so a binder added tomorrow is exercised rather than merely written.
+
+    Without this the table above is a list somebody remembered to extend, which is the same
+    failure mode as the classification tables in ``tests/app/test_process_exclusion.py`` and is
+    answered the same way.
+    """
+    from manicule.app.commands import BINDERS  # noqa: PLC0415
+
+    assert sorted(MINIMAL) == sorted(BINDERS), (
+        "every operation that can be written as a Command needs a minimal invocation here, and "
+        "every invocation here needs an operation"
+    )

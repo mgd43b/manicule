@@ -318,23 +318,13 @@ jobs:
           TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
         run: uv run pytest tests/vocabularies -q -rs
 
-      # The Confluence browser-session store is the macOS Keychain, reached through
-      # `/usr/bin/security`, and its tests skip themselves anywhere that command is absent. On
-      # the ubuntu matrix that is every one of them, so without this step the tests that hold
-      # the most dangerous credential manicule stores would run on a developer's machine and
-      # nowhere else. They are here for the same reason the grammar suites are: this is the
-      # platform where the behavior exists, and a suite that passes by skipping is a suite
-      # that is not being run.
-      #
-      # `REQUIRE_KEYCHAIN` turns this suite's Keychain skips into failures, exactly as
-      # `REQUIRE_GRAMMAR_BUNDLE` does above and for the same reason: without it a runner with no
-      # `/usr/bin/security` would skip the cases and leave the job green, which is
-      # indistinguishable from having run them. The whole file is named rather than a
-      # keyword-selected subset — the Keychain cases are the reason, and the rest costs seconds.
-      - name: pytest (the Keychain is only here)
-        env:
-          REQUIRE_KEYCHAIN: "1"
-        run: uv run pytest tests/connectors/test_browser_sso.py -q -rs
+      # There was a macOS-only step here, and it is gone with the thing it was for. The
+      # Confluence browser-session store used to be the macOS Keychain, reached through
+      # `/usr/bin/security`, so its tests skipped themselves on the ubuntu matrix and
+      # `REQUIRE_KEYCHAIN` existed to turn those skips into failures on the one runner where the
+      # behavior existed. Sessions now live in the running server's memory, which is the same
+      # code on every platform and needs no platform-specific job to be exercised. The suite
+      # runs everywhere, so there is nothing here to arm.
 
   # The image build, which is also the image's test.
   #

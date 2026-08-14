@@ -12,13 +12,16 @@ import asyncio
 from typing import TYPE_CHECKING, Any, cast
 
 from manicule.app.bind import is_loopback
+from manicule.app.control import ControlServer, ProtocolError, socket_path
 from manicule.app.daemon import Running, read_pidfile, stop_server, write_pidfile
 from manicule.app.dispatch import error_info
 from manicule.app.results import Envelope, ServerAddress, failed, succeeded
 from manicule.app.runtime import Runtime
+from manicule.app.served import ControlHandler, Scheduler, Serving
 from manicule.app.service import ApplicationService
 from manicule.cli import render
 from manicule.config.loader import load_settings
+from manicule.connectors.sessions import SESSIONS
 from manicule.core.errors import ManiculeError
 from manicule.mcp.serve import address_for, serve
 
@@ -129,22 +132,48 @@ async def _serve(
             host=address.host,
             port=address.port,
         )
+        # The control socket and the scheduler are what make this process *the writer* rather
+        # than a process that happens to serve a protocol. They are started after the lock is
+        # held and after the address is announced, and closed on every path out — including the
+        # one where the transport raises — which is what the context manager is for.
         try:
-            if api:
-                from manicule.api.serve import serve as serve_api  # noqa: PLC0415 - heavy
+            async with _writing(service):
+                if api:
+                    from manicule.api.serve import serve as serve_api  # noqa: PLC0415 - heavy
 
-                await serve_api(service, host=host, port=port, allow_public=allow_public, web=web)
-            else:
-                await serve(
-                    service,
-                    transport=transport,
-                    host=host,
-                    port=port,
-                    allow_public=allow_public,
-                )
+                    await serve_api(
+                        service, host=host, port=port, allow_public=allow_public, web=web
+                    )
+                else:
+                    await serve(
+                        service,
+                        transport=transport,
+                        host=host,
+                        port=port,
+                        allow_public=allow_public,
+                    )
+        except ProtocolError as exc:
+            # A control socket that will not bind is a refusal rather than a crash: the
+            # commonest cause is a second server, and the second commonest is a runtime
+            # directory somebody else owns. Both are things an operator fixes.
+            _report(failed("start", service.workspace, error_info(exc)), json_output)
+            return 1
         finally:
             pid.unlink(missing_ok=True)
     return 0
+
+
+def _writing(service: ApplicationService) -> Serving:
+    """The control socket and the scheduler for this service, not yet started.
+
+    Assembled in one place so that ``what a served manicule adds`` is one expression a reader
+    can take in, rather than four statements interleaved with the transport's own setup.
+    """
+    handler = ControlHandler(service, SESSIONS)
+    return Serving(
+        server=ControlServer(socket_path(service.settings.data_dir), handler),
+        scheduler=Scheduler(service, Scheduler.configure(service)),
+    )
 
 
 def _api_address(
@@ -180,6 +209,17 @@ def stop_running(overrides: Mapping[str, Any], *, workspace: str) -> Envelope:
         running = stop_server(settings.data_dir)
     except (ManiculeError, TimeoutError, OSError) as exc:
         return failed("stop", settings.workspace, error_info(exc))
+    # The control socket, on the same principle `stop_server` removes the pid file: the process
+    # is confirmed gone, so nothing is behind it.
+    #
+    # It has to happen **here** rather than as the server unwinds, and the reason is uvicorn's:
+    # it handles the signal, shuts down cleanly, then restores the default handler and re-raises
+    # — so the process dies without unwinding the `async with` that would have tidied up. The
+    # stdio transport does unwind and does tidy up, which is exactly the sort of difference
+    # nobody would predict from reading either side. A socket left behind by a crash, a
+    # `SIGKILL` or a power cut is still possible and is not a problem: it is a file with nothing
+    # behind it, and `ControlServer.start` clears one.
+    socket_path(settings.data_dir).unlink(missing_ok=True)
     return succeeded(
         "stop",
         settings.workspace,

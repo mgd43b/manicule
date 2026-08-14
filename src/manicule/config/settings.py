@@ -930,14 +930,16 @@ class RagSettings(Section):
 class ConnectorSettings(Section):
     """One configured source.
 
-    **There is no ``schedule_s``, and its absence is deliberate.** The field existed, was
-    reported by ``connector list``, and was read by nothing: there is no scheduler in manicule
-    and no code path that polled on an interval. A setting that does nothing is a promise the
-    software does not keep, and this one would have been cited as evidence that scheduling
-    existed. It is removed rather than documented as unimplemented, so a configuration that sets
-    it is refused loudly by ``extra="forbid"`` instead of silently doing nothing — which is the
-    same choice :class:`Section` makes about every other misspelled key. Sync is what an operator
-    or their own cron runs.
+    **``schedule_s`` is back, and what changed is that there is now a scheduler.** #98 deleted
+    the field because it configured something that did not exist: it was reported by
+    ``connector list`` and read by nothing, so it was a promise the software did not keep and
+    would have been cited as evidence that scheduling worked. It was removed rather than
+    documented as unimplemented, which is why a configuration carrying it has been refused
+    loudly ever since instead of silently ignored.
+
+    :class:`~manicule.app.served.Scheduler` is what makes it true. A served manicule reads this
+    field, and nothing else does — an unserved installation has no process to run a schedule in,
+    which is the same reason write commands need a server at all.
     """
 
     type: str = Field(min_length=1, description="Registered connector implementation.")
@@ -947,6 +949,27 @@ class ConnectorSettings(Section):
         "sync rather than skipping it quietly, so a disabled source that somebody tries to run "
         "says so.",
     )
+    schedule_s: float | None = Field(
+        default=None,
+        gt=0,
+        description="Seconds between automatic syncs of this source, run by `manicule serve`. "
+        "None is the default and means this source syncs only when somebody asks for it.",
+    )
+    """How often a served manicule syncs this source on its own.
+
+    **Per source rather than one global interval**, because the sources in one installation are
+    not alike: a handbook that changes weekly and a runbook directory that changes hourly want
+    different answers, and a single number would be tuned for whichever one somebody noticed.
+
+    **``enabled = false`` is honored here too**, and it has to be: a schedule is exactly the
+    place a disabled source would come back to life without anybody typing anything. A disabled
+    source is never scheduled, whatever this says.
+
+    **The first sync happens after one interval, not at startup.** A server that swept every
+    scheduled source the moment it started would turn a restart — which is how a session is
+    re-taken, and therefore something an operator does deliberately and often — into a full
+    corpus sync nobody asked for.
+    """
     options: dict[str, JsonValue] = Field(
         default_factory=dict, description="Validated against the connector's own config model."
     )

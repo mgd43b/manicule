@@ -129,7 +129,7 @@ alongside it.
 
 | Surface | Started by | Shape |
 |---|---|---|
-| **Command line** | `manicule <command>` | 19 commands; `--json` anywhere data is emitted |
+| **Command line** | `manicule <command>` | 20 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 11 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
 | **Browser** | the same process, at `/ui` | 12 areas of server-rendered HTML, 11 of them in the navigation |
 | **MCP** | `manicule start --mcp-only` | 19 tools over stdio, which opens no socket |
@@ -139,7 +139,7 @@ them to it: for the same operation and the same arguments the CLI under `--json`
 and the HTTP route return **byte-identical** envelopes, and the browser page is asserted to
 show what that envelope said rather than anything it worked out for itself.
 
-**The command line** is nineteen commands; `manicule --help` lists them. Under `--json` the
+**The command line** is twenty commands; `manicule --help` lists them. Under `--json` the
 result envelope is the whole of stdout — no prose, no progress, nothing else — and a failure is
 that same envelope with `"ok": false`, a typed `error` and a non-zero exit status. So `jq` reads
 well-formed JSON whether the command succeeded or not.
@@ -200,6 +200,41 @@ server for you alone. What it writes:
 
 The server is also reachable as `python -m manicule.mcp`, for a client that would rather name an
 interpreter and a module than trust a console script to be on the PATH it happens to have.
+
+## Running it as a server
+
+```console
+$ manicule serve                    # holds the data directory, runs the schedule, keeps sessions
+```
+
+One process owns the data directory at a time. `manicule serve` is that process for as long as
+it runs, and three things follow:
+
+- **Write commands go to it.** `connector sync`, `index`, `document reindex` and the repair
+  verbs detect the running server and forward to it over a `0600` Unix domain socket, streaming
+  progress back. You get the same result, the same output and the same exit status you would
+  have got locally, because it is the same operation. With no server they refuse and say to
+  start one — they never start one for you.
+- **Reads never need it.** `search`, `ask`, `doctor` and `document list` take no lock and work
+  whether or not a server is running.
+- **Confluence sessions live in its memory and nowhere else** — no keychain, no file, no
+  environment variable, so nothing prompts for a password and nothing is left on disk. They are
+  gone when it stops, which is the right lifetime now that
+  `manicule connector login --browser` makes signing in again a few seconds of clicking. **No
+  server, no sync.**
+
+Per-source schedules are configuration:
+
+```toml
+[connectors.handbook]
+type = "confluence"
+schedule_s = 3600      # a served manicule syncs this hourly, with nothing typed
+```
+
+There is no HTTP route that starts a sync, deliberately, and adding one is not on the roadmap:
+an unattended caller could hold the accelerator for an hour. A server acting on its own
+configuration is a different thing from a caller telling it to. `docs/deployment.md` §6 has the
+whole of it.
 
 ## In a container
 

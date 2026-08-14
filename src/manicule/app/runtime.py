@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.protocols import Connector, Parser, VectorStore
     from manicule.ingest.middleware import MiddlewareRunner
-    from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport
+    from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
     from manicule.ingest.ports import IngestStore
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
@@ -709,7 +709,13 @@ class _Ingestion:
         self._runtime = runtime
 
     async def index_path(
-        self, path: Path, *, name: str, limit: int | None = None, force: bool = False
+        self,
+        path: Path,
+        *,
+        name: str,
+        limit: int | None = None,
+        force: bool = False,
+        watching: Watching | None = None,
     ) -> RunReport:
         """Walk a path and ingest what is under it.
 
@@ -722,11 +728,16 @@ class _Ingestion:
         connector = FilesystemConnector(path, name=name)
         pipeline = await self._runtime.pipeline()
         if force:
-            return await self._forced(connector, pipeline, limit=limit)
-        return await pipeline.run(connector, limit=limit)
+            return await self._forced(connector, pipeline, limit=limit, watching=watching)
+        return await pipeline.run(connector, limit=limit, watching=watching)
 
     async def _forced(
-        self, connector: Connector, pipeline: IngestPipeline, *, limit: int | None
+        self,
+        connector: Connector,
+        pipeline: IngestPipeline,
+        *,
+        limit: int | None,
+        watching: Watching | None = None,
     ) -> RunReport:
         """Re-ingest every discovered document, skipping change detection.
 
@@ -751,6 +762,11 @@ class _Ingestion:
                 )
                 for position, outcome in enumerate(outcomes):
                     report.record(outcome, expanded=position > 0)
+                if watching is not None:
+                    watching(
+                        f"{connector.name}: {report.indexed} of "
+                        f"{report.discovered} discovered documents indexed"
+                    )
                 if limit is not None and report.discovered >= limit:
                     break
         except Exception as exc:  # noqa: BLE001 - an enumeration failure is not a crash
@@ -761,9 +777,13 @@ class _Ingestion:
                 await closer()
         return report
 
-    async def sync(self, connector: str, *, limit: int | None = None) -> RunReport:
+    async def sync(
+        self, connector: str, *, limit: int | None = None, watching: Watching | None = None
+    ) -> RunReport:
         pipeline = await self._runtime.pipeline()
-        return await pipeline.run(await self._runtime.connector(connector), limit=limit)
+        return await pipeline.run(
+            await self._runtime.connector(connector), limit=limit, watching=watching
+        )
 
     async def connector(self, name: str) -> Connector:
         """The connector :meth:`sync` would run, handed back instead of run.

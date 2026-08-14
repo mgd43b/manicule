@@ -23,7 +23,7 @@ import manicule.cli.main as cli
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings, Settings
 from manicule.connectors import sessions
-from manicule.connectors.sessions import MemoryStore
+from manicule.connectors.sessions import SessionVault
 from manicule.core.errors import ConfigError, UnknownEntityError
 from tests.app.fakes import FakeBackend
 
@@ -65,13 +65,15 @@ async def test_forgetting_removes_the_stored_session(
     configured: ApplicationService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A stored corporate session with no way to remove it would be a wart of its own."""
-    store = MemoryStore()
+    store = SessionVault()
     monkeypatch.setattr(sessions, "default_store", lambda: store)
     from datetime import UTC, datetime  # noqa: PLC0415
 
     from manicule.connectors.credentials import BrowserSession  # noqa: PLC0415
 
-    store.save(BrowserSession(base_url=SITE, account="sync.user", captured_at=datetime.now(tz=UTC)))
+    await store.save(
+        BrowserSession(base_url=SITE, account="sync.user", captured_at=datetime.now(tz=UTC))
+    )
     outcome = await configured.connector_login("wiki", forget=True)
 
     assert outcome.forgotten is True
@@ -83,7 +85,7 @@ async def test_what_is_reported_carries_no_part_of_the_credential(
 ) -> None:
     """The payload is rendered, logged and returned as JSON by ``--json``. None of those is a
     place for a live session against a corporate system."""
-    store = MemoryStore()
+    store = SessionVault()
     monkeypatch.setattr(sessions, "default_store", lambda: store)
     outcome = await configured.connector_login("wiki", forget=True)
 
