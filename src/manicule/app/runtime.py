@@ -764,8 +764,8 @@ class _Ingestion:
                     report.record(outcome, expanded=position > 0)
                 if watching is not None:
                     watching(
-                        f"{connector.name}: {report.indexed} indexed, "
-                        f"{report.skipped} unchanged, {report.failed} failed"
+                        f"{connector.name}: {report.indexed} of "
+                        f"{report.discovered} discovered documents indexed"
                     )
                 if limit is not None and report.discovered >= limit:
                     break

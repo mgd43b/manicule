@@ -1,0 +1,250 @@
+"""Syncs that happen because configuration said so, and the ones that must not.
+
+**No test here sleeps for a schedule to come round.** A scheduler test written with real time
+either takes as long as the interval or shortens the interval until it is racing the machine,
+and both pass on an idle laptop and fail on a loaded runner. The clock is a parameter
+(:class:`Clock` below), so a tick is something a test *causes* and then waits for, and every
+assertion is about an arrival rather than an elapsed time.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING
+
+import pytest
+
+from manicule.app.served import Scheduler
+from manicule.app.service import ApplicationService
+from manicule.config.settings import ConnectorSettings
+from tests.app.fakes import FakeBackend, FakeIngestion
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+
+class Clock:
+    """A stand-in for :func:`asyncio.sleep` that a test advances by hand.
+
+    Each waiter announces the interval it asked for and then blocks until the test releases it.
+    ``arrived`` is what makes the waiting itself an assertion: a loop that never reached its
+    sleep never asked for one.
+    """
+
+    def __init__(self) -> None:
+        self.asked: list[float] = []
+        self.arrived = asyncio.Event()
+        self._release = asyncio.Event()
+
+    async def sleep(self, seconds: float) -> None:
+        self.asked.append(seconds)
+        self.arrived.set()
+        await self._release.wait()
+        # One release per round: cleared here so the next loop iteration blocks again rather
+        # than spinning, which is what makes "exactly one tick" a thing a test can ask for.
+        self._release.clear()
+
+    async def tick(self) -> None:
+        """Let a waiting loop run once, and return only when it is asleep again.
+
+        **The waiting is the assertion.** Returning once the loop is back at its next sleep
+        means the sync it ran has finished, so a test can assert about it on the next line
+        without polling and without a sleep of its own — and a loop that never came back fails
+        on the timeout rather than by an assertion about an empty list that had not filled yet.
+        """
+        self.arrived.clear()
+        self._release.set()
+        await asyncio.wait_for(self.arrived.wait(), timeout=5)
+
+
+def service_with(
+    sources: Mapping[str, ConnectorSettings],
+) -> tuple[ApplicationService, FakeIngestion]:
+    """A service over a fake backend, with the fake that records what got synced.
+
+    Handed back together rather than reached through the service afterwards, so no test has to
+    open a private attribute to find out whether the thing it is testing happened.
+    """
+    backend = FakeBackend()
+    service = ApplicationService(backend)
+    service.settings.connectors.clear()
+    service.settings.connectors.update(sources)
+    return service, backend.ingestion_
+
+
+def source(*, schedule_s: float | None = None, enabled: bool = True) -> ConnectorSettings:
+    return ConnectorSettings.model_validate(
+        {
+            "type": "filesystem",
+            "enabled": enabled,
+            "schedule_s": schedule_s,
+            "options": {"root": "."},
+        }
+    )
+
+
+# --- what gets scheduled --------------------------------------------------------------------------
+
+
+def test_a_source_with_no_schedule_is_not_scheduled() -> None:
+    """The default, and the behavior every existing installation keeps.
+
+    ``schedule_s`` is absent from every configuration written before this existed, so the
+    absence has to mean "syncs when somebody asks" rather than "syncs on some default".
+    """
+    service, _ = service_with({"handbook": source(), "runbooks": source(schedule_s=600)})
+
+    assert Scheduler.configure(service) == {"runbooks": 600}
+
+
+def test_a_disabled_source_is_never_scheduled_whatever_its_schedule_says() -> None:
+    """A schedule is exactly where a disabled source would come back to life unobserved.
+
+    ``connector sync`` refuses a disabled source loudly, and #98 made it do so because an
+    operator who turned a source off and checked was being told it was off by the same program
+    that would then sync it. A scheduler that ran one anyway would reintroduce that in the one
+    place nobody is watching — and this is the assertion that says so.
+    """
+    service, _ = service_with(
+        {
+            "handbook": source(schedule_s=600, enabled=False),
+            "runbooks": source(schedule_s=900, enabled=True),
+        }
+    )
+
+    assert Scheduler.configure(service) == {"runbooks": 900}
+
+
+def test_each_source_keeps_its_own_interval() -> None:
+    """One number for the whole installation would be tuned for whichever source got noticed."""
+    service, _ = service_with(
+        {"handbook": source(schedule_s=3600), "runbooks": source(schedule_s=600)}
+    )
+
+    assert Scheduler.configure(service) == {"handbook": 3600, "runbooks": 600}
+
+
+# --- what it does ---------------------------------------------------------------------------------
+
+
+async def test_a_scheduled_sync_runs_without_a_command_being_typed() -> None:
+    """The whole point, asserted through the service the command line would have called.
+
+    #98 removed ``schedule_s`` because nothing read it. This is the test that would have failed
+    then and passes now, and it is deliberately about the *sync happening* rather than about the
+    setting being present.
+    """
+    service, ingestion = service_with({"handbook": source(schedule_s=600)})
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        assert ingestion.synced == [], "a source was synced before its first interval elapsed"
+        await clock.tick()
+        assert ingestion.synced == ["handbook"]
+    finally:
+        await scheduler.aclose()
+
+    assert clock.asked[0] == 600, "the loop waited for something other than its interval"
+    assert scheduler.scheduled["handbook"].runs == 1
+
+
+async def test_nothing_is_synced_at_startup() -> None:
+    """A restart is how a session is re-taken, so it is something an operator does often.
+
+    A server that swept every scheduled source the moment it started would turn each of those
+    into a full corpus sync nobody asked for — on the exact command somebody runs when they are
+    already waiting to get back to work.
+    """
+    service, ingestion = service_with({"handbook": source(schedule_s=600)})
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+    finally:
+        await scheduler.aclose()
+
+    assert ingestion.synced == []
+
+
+async def test_a_disabled_source_is_not_synced_even_with_the_scheduler_running() -> None:
+    """The configuration test above says it is not scheduled; this says it is not synced.
+
+    Two assertions rather than one, because "the list is right" and "nothing ran" fail
+    separately: a scheduler that ignored its own configuration and swept every configured source
+    would pass the first and not the second.
+    """
+    service, ingestion = service_with(
+        {"off": source(schedule_s=600, enabled=False), "on": source(schedule_s=600)}
+    )
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        assert ingestion.synced == ["on"]
+    finally:
+        await scheduler.aclose()
+
+    assert "off" not in ingestion.synced
+
+
+async def test_a_failing_sync_does_not_stop_the_schedule() -> None:
+    """The commonest failures here are transient or need a person, and neither is a reason to
+    stop trying: an instance that was down at ten past may be up at twenty past.
+
+    A loop that exited on the first refusal would need a server restart to resume and would give
+    no sign it had stopped, which is the worst of both.
+    """
+    service, _ = service_with({"nowhere": source(schedule_s=600)})
+    clock = Clock()
+    # The source is scheduled and not configured for the sync to find, so every run refuses.
+    service.settings.connectors.pop("nowhere")
+    scheduler = Scheduler(service, {"nowhere": 600}, sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        assert scheduler.scheduled["nowhere"].failures == 1
+        await clock.tick()
+        assert scheduler.scheduled["nowhere"].failures == 2, (
+            "the loop stopped after its first refusal"
+        )
+    finally:
+        await scheduler.aclose()
+
+    assert scheduler.scheduled["nowhere"].runs == 0
+
+
+async def test_stopping_the_scheduler_leaves_no_task_running() -> None:
+    """A server that stopped and left a loop syncing would be a second writer with no lock."""
+    service, _ = service_with(
+        {"handbook": source(schedule_s=600), "runbooks": source(schedule_s=60)}
+    )
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    before = {task.get_name() for task in asyncio.all_tasks()}
+    scheduler.start()
+    await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+    await scheduler.aclose()
+
+    after = {task.get_name() for task in asyncio.all_tasks()}
+    assert not {name for name in after - before if name.startswith("schedule:")}
+
+
+@pytest.mark.parametrize("interval", [0, -1, -600])
+def test_an_interval_of_zero_or_less_is_refused_at_configuration(interval: int) -> None:
+    """A loop with no wait in it is not a schedule, and clamping would pick a number nobody
+    wrote — the two candidates being "never" and "constantly"."""
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    with pytest.raises(ValidationError, match="schedule_s"):
+        ConnectorSettings.model_validate({"type": "filesystem", "schedule_s": interval})

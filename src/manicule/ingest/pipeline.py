@@ -832,8 +832,8 @@ class IngestPipeline:
                 # five hundred members is one thing that happened to somebody watching, and
                 # five hundred lines of it is not progress.
                 run.watching(
-                    f"{run.connector.name}: {run.report.indexed} indexed, "
-                    f"{run.report.skipped} unchanged, {run.report.failed} failed"
+                    f"{run.connector.name}: {run.report.indexed} of "
+                    f"{run.report.discovered} discovered documents indexed"
                 )
 
     async def _stop_within_grace(self, run: _Sync, stages: asyncio.Task[None]) -> None:
