@@ -28,7 +28,7 @@ does not survive the object is not the guarantee that was wanted.
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -38,11 +38,17 @@ from unittest.mock import patch
 from manicule.connectors import sessions
 
 __all__ = [
+    "JOURNAL_SLOT",
+    "POINTER_SLOTS",
     "STDIN_BUFFER_BYTES",
     "Call",
     "FakeKeychain",
     "Fault",
     "SimulatedTermination",
+    "chunk_account",
+    "generation_account",
+    "journal_account",
+    "pointer_account",
 ]
 
 STDIN_BUFFER_BYTES: Final = 128
@@ -54,7 +60,7 @@ _NOT_FOUND: Final = 44
 _DUPLICATE: Final = 45
 """``security``'s exit status for adding an item that already exists without ``-U``."""
 
-_POINTER_TAILS: Final = ("p0", "p1")
+POINTER_SLOTS: Final = ("p0", "p1")
 """What the store is expected to call its two commit slots.
 
 Named here rather than imported so that this file describes what it *observes* rather than
@@ -63,8 +69,31 @@ store writes`` is what keeps the two in step, and it does so by running a save a
 what actually arrived.
 """
 
-_JOURNAL_TAIL: Final = "staged"
-"""What the store is expected to call its record of staged generations. See :data:`_POINTER_TAILS`."""
+JOURNAL_SLOT: Final = "staged"
+"""What the store is expected to call its journal of staged generations.
+
+Named here rather than imported, for the reason given in :data:`POINTER_SLOTS`.
+"""
+
+
+def chunk_account(site: str, index: int) -> str:
+    """Where a record written before generations existed keeps one of its pieces."""
+    return f"{site}#{index}"
+
+
+def generation_account(site: str, generation: str, index: int) -> str:
+    """Where one generation of a session keeps one of its pieces."""
+    return f"{site}#{generation}#{index}"
+
+
+def pointer_account(site: str, slot: str) -> str:
+    """Where one of the two commit slots lives."""
+    return f"{site}#{slot}"
+
+
+def journal_account(site: str) -> str:
+    """Where the record of staged generations lives."""
+    return f"{site}#{JOURNAL_SLOT}"
 
 
 class SimulatedTermination(BaseException):
@@ -95,7 +124,7 @@ class Call:
 
     @property
     def tail(self) -> str:
-        """The part of the account name after the last ``#``, which says what kind of record it is."""
+        """The account name after its last ``#``, which is what says the kind of record."""
         return self.account.rpartition("#")[2]
 
     @property
@@ -105,11 +134,11 @@ class Call:
 
     @property
     def is_pointer(self) -> bool:
-        return self.tail in _POINTER_TAILS
+        return self.tail in POINTER_SLOTS
 
     @property
     def is_journal(self) -> bool:
-        return self.tail == _JOURNAL_TAIL
+        return self.tail == JOURNAL_SLOT
 
 
 @dataclass
@@ -141,9 +170,9 @@ class _Trigger:
 class FakeKeychain:
     """A keychain that remembers what it was told and breaks exactly where it was asked to."""
 
-    items: dict[tuple[str, str], str] = field(default_factory=dict)
-    calls: list[Call] = field(default_factory=list)
-    secrets_seen: list[str] = field(default_factory=list)
+    items: dict[tuple[str, str], str] = field(default_factory=dict[tuple[str, str], str])
+    calls: list[Call] = field(default_factory=list[Call])
+    secrets_seen: list[str] = field(default_factory=list[str])
     _trigger: _Trigger | None = None
 
     # --- arming a failure -----------------------------------------------------------------
@@ -163,6 +192,15 @@ class FakeKeychain:
     def fail_on_delete(self, *, fault: Fault = Fault.FAIL) -> None:
         """Break the first delete, which is how cleanup fails after a successful commit."""
         self._arm("delete-generic-password", "any", 1, fault, None)
+
+    def truncate_pointer_write(self, *, keep: int) -> None:
+        """Let the commit land while storing only ``keep`` characters of it.
+
+        A commit stored short parses as nothing at all, so the slot reads back as empty and the
+        replacement is published to nobody. Only reading through the ordinary path after the
+        commit notices, which is what makes this the case that confirmation step exists for.
+        """
+        self._arm("add-generic-password", "pointer", 1, None, keep)
 
     def truncate_chunk_write(self, nth: int, *, keep: int) -> None:
         """Let the ``nth`` chunk write succeed while storing only ``keep`` characters of it.
@@ -196,7 +234,7 @@ class FakeKeychain:
     # --- what the store sees --------------------------------------------------------------
 
     @contextmanager
-    def installed(self) -> Iterator[FakeKeychain]:
+    def installed(self) -> Generator[FakeKeychain]:
         """Put this fake where :mod:`manicule.connectors.sessions` reaches for ``security``.
 
         ``available()`` is forced true as well, so these cases run on Linux. The Keychain is
@@ -258,11 +296,15 @@ class FakeKeychain:
             return _completed(command, 0)
         if call.subcommand == "find-generic-password":
             if key not in self.items:
-                return _completed(command, _NOT_FOUND, stderr="The specified item could not be found")
+                return _completed(
+                    command, _NOT_FOUND, stderr="The specified item could not be found"
+                )
             return _completed(command, 0, stdout=f"{self.items[key]}\n")
         if call.subcommand == "delete-generic-password":
             if key not in self.items:
-                return _completed(command, _NOT_FOUND, stderr="The specified item could not be found")
+                return _completed(
+                    command, _NOT_FOUND, stderr="The specified item could not be found"
+                )
             del self.items[key]
             return _completed(command, 0)
         message = f"the store invoked a subcommand this fake does not emulate: {call.subcommand}"
@@ -305,7 +347,7 @@ def _stored(stdin: str, keep: int | None) -> str:
     real command compares them and this one takes the first. The 128-byte ceiling is the
     measured truncation, and ``keep`` is a test asking for a smaller one.
     """
-    value = stdin.split("\n")[0]
+    value = stdin.split("\n", maxsplit=1)[0]
     limit = STDIN_BUFFER_BYTES if keep is None else keep
     return value.encode()[:limit].decode(errors="ignore")
 
@@ -313,4 +355,6 @@ def _stored(stdin: str, keep: int | None) -> str:
 def _completed(
     command: list[str], status: int, *, stdout: str = "", stderr: str = ""
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(args=command, returncode=status, stdout=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(
+        args=command, returncode=status, stdout=stdout, stderr=stderr
+    )

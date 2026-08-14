@@ -130,6 +130,11 @@ single sign-on issues cookies of its own besides Confluence's, so the record is 
 done. Passing the secret as a command-line argument would avoid the chunking and put a live
 corporate session into a process listing.
 
+Writing a credential in pieces is also what makes *replacing* one dangerous, because there is a
+window in which some of the pieces are the old session and some are the new.
+[§1.1d](#11d-how-a-session-is-stored-and-what-happens-if-the-machine-stops-mid-replacement) is
+how that window is closed and exactly what it is and is not guaranteed to survive.
+
 **Capture proves the session before storing it.** A cookie copied short, copied from the wrong
 tab, or copied from a session that had already timed out is indistinguishable from a working one
 until something uses it — and otherwise the first thing to use it would be the first page of the
@@ -181,13 +186,19 @@ $ manicule connector login wiki --forget      # remove the stored session
 $ manicule connector login wiki --browser     # take a new one
 ```
 
-`--forget` removes the keychain entry for that instance. It does not sign you out of Confluence
-itself, which is your browser's business and your identity provider's.
+`--forget` removes everything that instance's session occupies: the record that is current, a
+record left behind by a replacement that was interrupted, both commit slots, and a record written
+by a version of manicule that predates them (§1.1d). It removes nothing belonging to any other
+instance. It does not sign you out of Confluence itself, which is your browser's business and
+your identity provider's.
 
 **A failed login never costs you a working session.** Verification happens before the store is
 touched, so a timeout, a closed window, a dead cookie or a state file for the wrong site leaves
-whatever was stored exactly as it was. There is no delete-then-write window because the write is
-the last thing that happens and it happens only on success.
+whatever was stored exactly as it was: the write is the last thing that happens and it happens
+only on success.
+
+That covers a login that fails. §1.1d covers a *write* that fails, which is a different problem
+and used to have a different answer.
 
 ### 1.1c When it does not work
 
@@ -202,6 +213,54 @@ the last thing that happens and it happens only on success.
 | a sign-in page was stored as content | it cannot be — §1.3 | nothing; the refusal is the design |
 | `... was captured N hours ago` | the session aged past `session_max_age_hours` | sign in again; nothing is lost, the watermark did not advance |
 | the tenant refuses the browser | conditional access does not recognize a driven Chromium | use the paste path, which uses your own browser |
+
+### 1.1d How a session is stored, and what happens if the machine stops mid-replacement
+
+This section exists because the answer used to be "you lose the session you had". The store
+deleted the old record before writing the replacement, so a `security` invocation that failed on
+the fourth of twenty-three pieces — or a laptop that slept, or a `^C` — left the instance with no
+credential, having started with a working one. Verifying the new cookies first, which manicule
+does, protects you from a bad *cookie*; it does nothing about a bad *write*.
+
+**A replacement is now written somewhere nothing is reading, and published by one small write.**
+Four kinds of record live under the keychain service `manicule: confluence session`, each named
+after your instance's base URL:
+
+| Record | Account name | What it holds |
+|---|---|---|
+| Session pieces | `<base_url>#<generation>#<n>` | the session itself, in 120-byte pieces |
+| Commit slots | `<base_url>#p0`, `<base_url>#p1` | which generation is current, its size and a checksum |
+| Journal | `<base_url>#staged` | generations written but not yet cleared up |
+| Legacy | `<base_url>#<n>` | a session stored by a version before all of this |
+
+A replacement notes the generation it is about to write, writes it under a fresh random name,
+reads it back and compares it byte for byte, and only then writes the commit slot that is *not*
+currently in force. **That write is the commit point.** Everything before it is invisible to a
+reader; everything after it is tidying up.
+
+**What you get if the machine stops.** Stop it anywhere before the commit — any piece, the
+read-back, the commit slot itself — and the session you had is still there, complete, and the
+next sync uses it. Stop it after the commit and the new session is there, complete. There is no
+third outcome: a reader never sees pieces of two sessions spliced together, never a half-written
+one, and never a session that was not read back and checked. A generation left behind by an
+interrupted replacement is harmless — nothing points at it — and `--forget` still removes it.
+
+**What this does not claim.** macOS does not document `security`'s update of a single item as
+atomic, and manicule does not assume it is. That is what the second commit slot is for: an
+interrupted commit can damage at most the slot being written, and the other slot still holds the
+commit before it, checksum and all. If the current generation is ever unreadable, manicule falls
+back to that previous commit only when its own checksum still matches — a verified older session
+or an error, never a guess. If neither can be verified, `connector login` says the stored session
+is incomplete rather than reporting that none exists, because those are different problems.
+
+**Upgrading.** A session stored by an earlier version keeps working and is read as it was
+written. Your next successful `connector login` writes the new format and removes the old record
+*after* the new one is in force, so an upgrade cannot cost you a session either. Clearing up is
+the only step allowed to fail quietly: if it does, the session you just captured is in use and a
+warning tells you to run `--forget` to clear what was left over.
+
+**Two logins at once** is not something manicule serializes. Both write their own generation, so
+neither can corrupt the other; the last one to commit wins and the other is silently superseded.
 
 ### 1.2 The credential is checked before the connector is constructed
 
