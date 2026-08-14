@@ -148,14 +148,19 @@ well-formed JSON whether the command succeeded or not.
 streaming, conversations and shareable links, collections, tags, admin, plugins, auth, a
 workbench, a websocket channel and an MCP endpoint — plus an embeddable chat widget at
 `/widget`. `manicule start --transport http` serves them on `127.0.0.1:8765`, and only there
-unless three separate things say otherwise. It prints where it is listening, including the two
-paths below:
+unless three separate things say otherwise. It prints where it is listening, and every path on
+it that you might want next:
 
 ```
 HTTP API on http://127.0.0.1:8765 (this machine only)
-browser surface  http://127.0.0.1:8765/ui
-API documentation http://127.0.0.1:8765/api/docs
+browser surface    http://127.0.0.1:8765/ui
+MCP endpoint       http://127.0.0.1:8765/mcp/
+API documentation  http://127.0.0.1:8765/api/docs
 ```
+
+**The address itself works.** `/` redirects to the browser surface — temporarily, so no browser
+caches it — and when there is no browser surface to redirect to, it says so and names what this
+process *is* serving. `docs/surfaces.md` §6.3.
 
 **MCP is served from that same process and port**, at `/mcp/`, and it carries the **read-only
 tools only** — the write tools are not registered on it rather than refused, so there is no
@@ -170,7 +175,8 @@ in its navigation: a dashboard; chat with streaming citations, confidence and fe
 documents, their chunks, the trash and restore; collections and tags; connectors; plugins;
 workspaces; health; an admin dashboard; your own API keys; and settings. Command palette on
 `Ctrl`/`Cmd`+`K`, keyboard navigation, dark mode. `manicule start --no-web` prints `browser
-surface off (--no-web)`, keeps the API, and answers 404 for every `/ui` path.
+surface    off (--no-web)`, keeps the API, and answers 404 for every `/ui` path — and `/` lists
+the surfaces that are still there rather than redirecting to one that is not.
 
 ![The manicule browser surface: a search for "how are citations verified" over this repository's own docs, showing ten ranked passages, the confidence band with the sentence explaining it, and each hit labeled with the document and the heading path the passage came from](docs/images/browser-search.png)
 

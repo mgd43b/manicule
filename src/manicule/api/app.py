@@ -53,7 +53,7 @@ from fastapi import FastAPI, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from manicule.api.envelopes import AUTH_ERRORS, malformed, refusal
@@ -73,6 +73,7 @@ from manicule.api.routes import (
 from manicule.api.routes import health as health_routes
 from manicule.api.security import resolve
 from manicule.api.widget import router as widget_router
+from manicule.app import frontdoor
 from manicule.app.bind import is_loopback
 from manicule.config.settings import AuthMode
 from manicule.core.errors import PolicyError
@@ -125,7 +126,7 @@ asserted by driving it rather than by reading the schema. A group an OpenAPI-dri
 see is exactly the one it would quietly report as present.
 """
 
-MCP_PATH = "/mcp"
+MCP_PATH = frontdoor.MCP
 """Where MCP answers on this application, and it is a path rather than a second port.
 
 One port means one bind decision, one address in a plist, one thing for an operator to
@@ -137,6 +138,10 @@ added in a hurry for a client that could not spawn a process.
 The trailing slash matters to clients: the mount answers at ``/mcp/``, and Starlette redirects
 ``/mcp`` to it. Both are documented in ``docs/surfaces.md`` §6.1 so nobody has to discover it
 from a 307.
+
+Assigned from :data:`manicule.app.frontdoor.MCP` rather than written out, because the front door
+and the startup banner both print this path and neither may import this module — the MCP server's
+own transport must not load FastAPI. One constant, three readers, no drift.
 """
 
 SECURITY_HEADERS = {
@@ -155,6 +160,44 @@ SECURITY_HEADERS = {
 In middleware rather than per route, because a header applied per route is a header missing
 from the route somebody added last.
 """
+
+
+async def open_the_browser_surface(request: Request) -> RedirectResponse:
+    """``GET /`` when the browser surface is mounted: go there.
+
+    A redirect rather than the dashboard served at two paths, so the address bar ends up
+    somewhere real — bookmarkable, linkable, reloadable — instead of on a URL that only works
+    for as long as ``/`` keeps rendering a copy of it.
+
+    Relative, deliberately. An absolute ``Location`` would have to be built from the ``Host``
+    header, which is a value the client chose; a relative one names this server's own path and
+    cannot be pointed at somebody else's. The status is
+    :data:`~manicule.app.frontdoor.TEMPORARY_REDIRECT` and the reason is written there.
+    """
+    return RedirectResponse(
+        url=frontdoor.to_the_browser_surface(request.url.query),
+        status_code=frontdoor.TEMPORARY_REDIRECT,
+    )
+
+
+async def say_what_is_served(request: Request) -> PlainTextResponse:
+    """``GET /`` under ``--no-web``: name the surfaces that *are* here.
+
+    Not a redirect, because there is nothing to redirect to. Sending somebody to a browser
+    surface an operator switched off would be worse than the 404 this replaces: it would spend
+    a second request to arrive at the same answer, having claimed the thing was somewhere.
+    """
+    return PlainTextResponse(frontdoor.without_the_browser_surface(_origin(request)))
+
+
+def _origin(request: Request) -> str:
+    """The address this request arrived on, with no trailing slash.
+
+    Read off the request rather than off the bind, so what a person is shown is the address they
+    are actually using — through a proxy, over a forwarded port, or at a name that resolves to
+    this host. The bind knows where the socket is; only the request knows how it was reached.
+    """
+    return str(request.base_url).rstrip("/")
 
 
 def frame_policy(origins: tuple[str, ...]) -> str:
@@ -347,6 +390,17 @@ def build_app(
         routers.append(web_router)
     for router in routers:
         app.include_router(router)
+    # The front door (#145). Registered here rather than in a router because which handler it is
+    # depends on `web`, and a router carrying two versions of one path would have to decide
+    # between them at request time — the decision is made once, at assembly, like every other
+    # decision this function makes.
+    app.add_api_route(
+        "/",
+        open_the_browser_surface if web else say_what_is_served,
+        methods=["GET"],
+        name="front_door",
+        summary="The browser surface, or — when it is not served — what this process is serving.",
+    )
     # Mounted last, so nothing this application declares can be shadowed by the sub-application's
     # catch-all. A mount matches every path beneath its prefix, and the prefix is its own —
     # `/mcp` names no route group above and never will, because a group that collided with it
@@ -426,4 +480,6 @@ __all__ = [
     "TITLE",
     "build_app",
     "frame_policy",
+    "open_the_browser_surface",
+    "say_what_is_served",
 ]
