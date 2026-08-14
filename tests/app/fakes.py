@@ -823,11 +823,22 @@ class FakeIngestion:
             watching(f"{path}: 1 indexed, 0 unchanged, 0 failed")
         return self.report
 
+    failure: Exception | None = None
+    """What the next sync raises instead of reporting, or ``None`` to report the run.
+
+    A field rather than a subclass per failure, because what a caller does with a refusal depends
+    on the refusal's *type* — the scheduler tells "nobody has signed in" from "the instance is
+    down" that way — and a test of that has to be able to choose which one arrives. Recorded
+    before it is raised, so ``synced`` still says the sync was attempted.
+    """
+
     async def sync(
         self, connector: str, *, limit: int | None = None, watching: Watching | None = None
     ) -> RunReport:
         del limit
         self.synced.append(connector)
+        if self.failure is not None:
+            raise self.failure
         if watching is not None:
             watching(f"{connector}: 1 indexed, 0 unchanged, 0 failed")
         return self.report

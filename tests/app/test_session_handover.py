@@ -22,8 +22,9 @@ from manicule.app import control
 from manicule.app.served import ControlHandler
 from manicule.app.service import ApplicationService
 from manicule.cli import proxy
+from manicule.config.settings import ConnectorSettings
 from manicule.connectors.credentials import BrowserSession, credential_for
-from manicule.connectors.sessions import SessionVault, load_session
+from manicule.connectors.sessions import SESSIONS, SessionVault, load_session
 from manicule.core.errors import ConfigError
 from tests.app.fakes import FakeBackend
 from tests.connectors import support
@@ -31,6 +32,7 @@ from tests.connectors import support
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from manicule.app.results import Check
     from manicule.connectors.config import ConfluenceConfig
 
 SITE = "https://wiki.example.test"
@@ -49,7 +51,12 @@ def socket_for() -> Iterator[Callable[[], Path]]:
     made: list[Path] = []
 
     def build() -> Path:
-        path = control.socket_path(Path(f"/manicule-suite/{uuid.uuid4()}"))
+        # The data directory is recorded as well as the socket, because `socket_path` is a digest
+        # and cannot be inverted — and one test has to point a service's `data_dir` at whatever
+        # produced the socket it is driving.
+        directory = Path(f"/manicule-suite/{uuid.uuid4()}")
+        _SUITE_DIRECTORIES.append(directory)
+        path = control.socket_path(directory)
         made.append(path)
         return path
 
@@ -405,6 +412,201 @@ async def test_no_session_value_reaches_a_report_a_person_reads(
     assert SENTINEL not in payload.model_dump_json()
     assert SENTINEL not in captured.get()
     assert "server" in payload.stored_in, "the report says where the session actually went"
+
+
+async def test_no_session_value_reaches_a_tool_result_on_the_network_surface() -> None:
+    """The MCP endpoint mounted on the HTTP port, which is a surface that did not exist before.
+
+    #139 asserted this over the control socket's reply, the vault's rendering, a traceback and a
+    refusal. None of those statements carries to a *served* MCP tool, because a tool's result is
+    built by a different path — so ``doctor``, which is the tool that has anything to do with
+    sessions at all, is called for real and its whole envelope is searched.
+
+    ``doctor`` deliberately rather than ``search``: it is the read-only tool that now reports
+    whether a session is held, so it is the one with a reason to be near the value. A tool with no
+    connection to sessions would be a weaker place to look.
+    """
+    from tests.api.live import mounted  # noqa: PLC0415 - a socket-shaped fixture
+    from tests.api.support import backend_with_a_document  # noqa: PLC0415
+
+    backend, _ = backend_with_a_document()
+    backend.settings.connectors["handbook"] = _confluence_source()
+    await SESSIONS.save(a_session())
+    try:
+        async with mounted(backend) as client:
+            answered = (await client.call_tool("doctor", {})).structured_content or {}
+    finally:
+        await SESSIONS.forget(SITE)
+
+    assert answered["ok"] is True, answered
+    assert SENTINEL not in json.dumps(answered)
+    # And the check did run against the held session, so the search above looked somewhere the
+    # value could have been rather than at an envelope that never mentioned sessions.
+    checks = {check["name"]: check for check in answered["data"]["checks"]}
+    assert checks["sessions"]["state"] == "ok", checks["sessions"]
+    assert "sync.user" in checks["sessions"]["detail"], checks["sessions"]
+
+
+async def test_no_session_value_reaches_an_http_response() -> None:
+    """The other surface on the same port, checked the same way and for the same reason.
+
+    The browser surface renders ``doctor`` as a page and the JSON API returns it as an envelope.
+    Both are new places for a credential to appear that #139's assertions say nothing about, and
+    a page is the one somebody screenshots.
+    """
+    from tests.api.support import backend_with_a_document, client_for  # noqa: PLC0415
+
+    backend, _ = backend_with_a_document()
+    backend.settings.connectors["handbook"] = _confluence_source()
+    await SESSIONS.save(a_session())
+    try:
+        with client_for(backend) as client:
+            api = client.get("/api/v1/health")
+            page = client.get("/ui/health")
+    finally:
+        await SESSIONS.forget(SITE)
+
+    assert SENTINEL not in api.text
+    assert SENTINEL not in page.text
+
+
+def _confluence_source() -> ConnectorSettings:
+    """A Confluence source that authenticates with a browser session, so the check has work."""
+    return ConnectorSettings.model_validate(
+        {
+            "type": "confluence",
+            "options": {"base_url": SITE, "deployment": "server", "auth": "browser_session"},
+        }
+    )
+
+
+# --- what an operator is told after a restart ----------------------------------------------------
+
+
+async def test_doctor_reports_the_session_the_server_holds(
+    socket_for: Callable[[], Path],
+) -> None:
+    """A ``doctor`` typed at a terminal reads the *server's* sessions, not its own.
+
+    The whole difficulty of this check in one test: the process running ``doctor`` holds nothing
+    and never will, so an answer taken from its own vault would say "no session" for ever. The
+    question goes over the control socket to the process that has the answer, and the account it
+    names is proof it went there rather than being inferred.
+    """
+    path = socket_for()
+    vault = SessionVault()
+    await vault.save(a_session(account="sync.user"))
+    server = a_server(path, vault)
+    await server.start()
+    try:
+        check = await _sessions_check(path, held_here=False)
+    finally:
+        await server.aclose()
+
+    assert check.state == "ok", check.detail
+    assert "sync.user" in check.detail, check.detail
+    assert check.facts["read_from"] == "the running server, over its control socket"
+
+
+async def test_doctor_reports_a_server_that_has_no_session_and_names_the_way_back(
+    socket_for: Callable[[], Path],
+) -> None:
+    """The state a restart leaves, which is the whole reason this check exists.
+
+    Three things have to be in the sentence, and each is a different mistake to avoid. It must
+    name the **source**, because an operator with four of them has to know which. It must say the
+    instance was **not contacted**, because otherwise this is indistinguishable from an outage.
+    And it must name the **command**, because "sign in again" is not an instruction.
+    """
+    path = socket_for()
+    server = a_server(path, SessionVault())
+    await server.start()
+    try:
+        check = await _sessions_check(path, held_here=False)
+    finally:
+        await server.aclose()
+
+    assert check.state == "degraded"
+    assert "'handbook'" in check.detail, check.detail
+    assert "nothing has been asked of it" in check.detail, check.detail
+    assert check.remedy == "manicule connector login handbook --browser"
+    assert check.facts["missing"] == ["handbook"]
+
+
+async def test_doctor_says_when_there_is_no_server_at_all_rather_than_no_session(
+    socket_for: Callable[[], Path],
+) -> None:
+    """The two states an operator would otherwise conflate, and they have different remedies.
+
+    No server means nothing is scheduled and nothing holds a credential; the fix is
+    ``manicule serve``. A server with no session means the schedule is running and failing; the
+    fix is a browser. Telling somebody to sign in when there is no server to sign in *to* sends
+    them to a refusal.
+    """
+    path = socket_for()
+    assert not path.exists(), "this test needs a socket nothing is listening on"
+
+    check = await _sessions_check(path, held_here=False)
+
+    assert check.state == "degraded"
+    assert check.facts["server"] is False
+    assert check.remedy == "manicule serve"
+    assert "manicule serve" in check.detail
+
+
+async def test_doctor_inside_the_server_reads_the_vault_in_front_of_it() -> None:
+    """The other vantage point: ``doctor`` over MCP or an HTTP route runs *in* the server.
+
+    There the vault is the one the syncs read, so it is read directly rather than asked for over
+    a socket the process would be connecting to itself on. The two are told apart by which vault
+    holds something, which needs no flag: nothing but a server ever holds a session.
+    """
+    await SESSIONS.save(a_session(account="held.here"))
+    try:
+        check = await _sessions_check(None, held_here=True)
+    finally:
+        await SESSIONS.forget(SITE)
+
+    assert check.state == "ok"
+    assert "held.here" in check.detail
+    assert check.facts["read_from"] == "this process, which holds them"
+
+
+async def _sessions_check(path: Path | None, *, held_here: bool) -> Check:
+    """Run ``doctor`` and hand back its ``sessions`` check.
+
+    ``path`` names the socket the check should consult, which is normally derived from the data
+    directory. It is steered here by pointing the settings at the directory that socket was
+    derived from, rather than by patching the function that derives it — a test that replaced the
+    derivation would not be testing the derivation.
+    """
+    del held_here  # the vault decides; this parameter documents which case the caller set up
+    backend = FakeBackend()
+    service = ApplicationService(backend)
+    service.settings.connectors.clear()
+    service.settings.connectors["handbook"] = _confluence_source()
+    if path is not None:
+        service.settings.data_dir = _directory_for(path)
+    diagnosis = await service.doctor()
+    return next(check for check in diagnosis.checks if check.name == "sessions")
+
+
+def _directory_for(path: Path) -> Path:
+    """The data directory whose socket is ``path``, recovered from the fixture that made it.
+
+    ``socket_path`` is a digest, so it cannot be inverted. The fixture builds sockets from
+    ``/manicule-suite/<uuid>``, and this reconstructs that: the same input gives the same digest,
+    which is the whole property the naming relies on.
+    """
+    for candidate in _SUITE_DIRECTORIES:
+        if control.socket_path(candidate) == path:
+            return candidate
+    msg = f"no suite data directory produces {path}"  # pragma: no cover - the fixture records all
+    raise AssertionError(msg)
+
+
+_SUITE_DIRECTORIES: list[Path] = []
+"""Every data directory the ``socket_for`` fixture has invented, so a path can be traced back."""
 
 
 def test_no_session_value_survives_a_traceback_through_the_vault() -> None:
