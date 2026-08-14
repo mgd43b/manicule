@@ -1976,10 +1976,11 @@ class ApplicationService:
         # Only documents carrying **no record at all**. One that carries a stated refusal is a
         # different finding with a different repair — the source declared something a citation
         # will not render — and re-fetching it would produce the same refusal again.
+        sources = set(live)
         missing = [
             document
             for document in documents
-            if document.source in set(live) and document.provenance is None
+            if document.source in sources and document.provenance is None
         ]
         if not missing:
             return r.Check(

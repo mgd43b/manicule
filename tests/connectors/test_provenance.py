@@ -239,7 +239,7 @@ async def test_the_fallback_body_supplies_the_timestamp_that_goes_with_its_own_b
     storage_when = "2026-07-01T08:00:00.000+01:00"
     # Atlassian Document Format stays stale and storage format is current, so storage is the
     # body that is kept. With *both* stale the connector keeps the Atlassian one — which is the
-    # neighbouring case, and is covered above by the version it cites.
+    # neighboring case, and is covered above by the version it cites.
     instance = _cloud(pages=[_page(version=5, served_version=4, when=storage_when)])
     record = _source(await _record(instance))
 
@@ -492,3 +492,43 @@ async def test_a_ref_rebuilt_elsewhere_still_produces_a_usable_record() -> None:
     assert record.source_id == PAGE_ID
     assert record.version == "3"
     assert record.modified_at == datetime.fromisoformat(MODIFIED)
+
+
+async def test_an_attachment_content_type_is_never_a_guess_from_the_filename() -> None:
+    """The publisher's record may not carry manicule's inference, and this is the one path
+    where a media type can *become* one.
+
+    An attachment's type is the source's ``metadata.mediaType``, then the download's own
+    ``Content-Type``. Past those two the connector falls back to the filename extension so the
+    bytes can still be routed to a parser — a sound guess, and manicule's, not Confluence's.
+    Recording it here would put an inference inside a claim attributed to the source, which is
+    the single rule this whole record is built on.
+
+    So the document is still routed by the guess and the record still says nothing.
+    """
+    instance = _cloud(
+        attachments=[
+            FakeAttachment(
+                id="att-9",
+                title="notes.md",
+                space="ENG",
+                page_id=PAGE_ID,
+                page_title="Retry Policy",
+                media_type="",
+                content=b"# notes",
+            )
+        ]
+    )
+    connector = await connected(
+        instance, cloud_config(base_url=instance.base_url, page_size=10, include_attachments=True)
+    )
+    try:
+        found = await drain(connector.discover(None))
+        ref = next(document.ref for document in found if document.source_id == "att-9")
+        raw = await connector.fetch(ref)
+    finally:
+        await connector.teardown()
+
+    record = _source(Provenance.from_metadata(raw.metadata))
+    assert raw.media_type == "text/markdown", "the guess still routes the bytes"
+    assert record.content_type == "", "and stays out of the source's own account"

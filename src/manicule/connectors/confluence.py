@@ -680,16 +680,23 @@ class ConfluenceConnector:
         version = _int(ref.metadata.get(VERSION))
         if version is not None:
             metadata[VERSION_TOKEN] = str(version)
-        media_type = declared or downloaded.media_type or _from_name(_str(metadata.get("title")))
+        # Two of these three came from the source and the third did not, and only the first two
+        # may reach the record. `metadata.mediaType` is Confluence's own declaration and the
+        # download's `Content-Type` is the response's; the filename extension is manicule's
+        # inference, sound enough to route bytes by and not something the publisher said.
+        stated = declared or downloaded.media_type
+        media_type = stated or _from_name(_str(metadata.get("title")))
         metadata[PROVENANCE_KEY] = _record(
             what=f"attachment {ref.source_id}",
             title=_str(metadata.get("title")),
             canonical_uri=ref.uri,
             source_id=ref.source_id,
             version=str(version) if version is not None else "",
+            # The search result carries no creation date for an attachment, and there is no
+            # second response to ask. Absent rather than borrowed from the page holding it.
             created_at=None,
             modified_at=cql.parse_when(metadata.get(MODIFIED_AT)),
-            content_type=media_type,
+            content_type=stated,
             # Space and the page holding it. The attachment's own filename is left off for the
             # same reason a page's own title is: the chunker appends it.
             section_path=_str_values(ref, ANCESTORS),

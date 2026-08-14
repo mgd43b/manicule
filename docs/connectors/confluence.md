@@ -551,6 +551,13 @@ page that has a diagram somewhere on it rather than to the diagram. Its modifica
 from the search result that discovered it, which is the only response that ever describes an
 attachment: the download is bytes.
 
+Its `content_type` is the narrower of two answers, and the difference is the rule above holding
+under pressure. §6 reads an attachment's media type as Confluence's `metadata.mediaType`, then
+the download's `Content-Type`, then the **filename extension** — and the third is manicule's
+inference, sound enough to route bytes by and not something the publisher said. So the document
+is still routed by the guess and the record still says nothing: `content_type` is empty when both
+source signals were silent.
+
 **Scoping metadata is not provenance.** `root_page_ids` and `ancestor_ids` (§2.1) explain why
 manicule selected a document. They stay in the connector's own keys, because inside a source
 record they would read as something Confluence said about the page.
