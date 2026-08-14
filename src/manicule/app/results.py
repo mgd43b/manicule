@@ -194,6 +194,13 @@ class SourceReference(Payload):
         default="", description="The identifier the publisher assigns and does not recycle."
     )
     version: str = Field(default="", description="The source's own version, compared as a string.")
+    content_type: str = Field(
+        default="",
+        description="The media type the **source** published, which is not always the media "
+        "type this installation stored. A page served as one thing and mirrored to a file "
+        "whose suffix says another has two answers, and the document's own ``media_type`` is "
+        "the local one; this is the publisher's.",
+    )
     modified_at: str | None = Field(
         default=None,
         description="When the document was last edited **at its source**. Never this "

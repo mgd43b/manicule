@@ -76,6 +76,22 @@ class FakePage:
     space: str
     version: int = 1
     when: str = "2026-08-09T14:30:00.000+01:00"
+    """When the current version was made — the page's last modification.
+
+    Served as ``version.when`` by Server and Data Center's v1 content endpoint and as
+    ``version.createdAt`` by Cloud's v2 page endpoint. One fact, two spellings, and a fixture
+    that offered only one of them could not tell a connector that reads only one from a
+    connector that reads both.
+    """
+
+    created: str = ""
+    """When the page first existed, served as Cloud's top-level ``createdAt``.
+
+    Empty by default and absent from the response when empty, because that is the shape Server
+    and Data Center have without a ``history`` expansion — and "the API did not say" is the case
+    a provenance record has to get right rather than fill in.
+    """
+
     adf: Mapping[str, object] = field(default_factory=lambda: paragraph("body text"))
     storage: str = "<p>body text</p>"
     ancestors: tuple[str, ...] = ()
@@ -513,13 +529,19 @@ class FakeConfluence:
         body: dict[str, object] = (
             {"atlas_doc_format": {"value": json.dumps(page.adf)}} if page.adf_available else {}
         )
+        # Cloud's v2 page carries two timestamps at two levels: the page's own `createdAt`, and
+        # the current version's `createdAt`, which is when the page was last edited. Omitted
+        # rather than nulled when the fixture has none, because a key present and null and a key
+        # absent reach a client as different facts.
+        page_created: dict[str, object] = {"createdAt": page.created} if page.created else {}
         return httpx.Response(
             200,
             json={
                 "id": page.id,
                 "title": page.title,
                 "status": "current",
-                "version": {"number": version},
+                "version": {"number": version, "createdAt": page.when},
+                **page_created,
                 "body": body,
                 "_links": {
                     "base": self.base_url,

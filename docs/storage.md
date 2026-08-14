@@ -405,6 +405,19 @@ file, may supply the document's own title, canonical URI, immutable source ident
 created and modified times, content type and place in its source's hierarchy, alongside where the
 local snapshot sits and when it was taken.
 
+**Four connectors write one.** The sidecar and enriched-export paths read it from a manifest or
+from the exported markup; the offline Confluence snapshot reads it from a page manifest; the live
+Confluence connector reads it from the API responses that carried the body
+([`connectors/confluence.md`](connectors/confluence.md) §2.2). A network fetch supplies only the
+publication half — there is no local snapshot to describe, so `snapshot` is absent and
+`retrieved_at` with it, which is the honest record rather than an incomplete one.
+
+**A record whose fields came from more than one place is the failure this whole model exists to
+prevent**, and it is worth stating as a rule rather than leaving to each connector: every field
+is read from a source response or left empty. Filling `modified_at` from a filesystem timestamp,
+an ingest clock or `indexed_at` produces a claim that reads as the publisher's and is not, and no
+surface downstream can tell the difference.
+
 **Both identities are kept and neither is representable as the other.** That is enforced by the
 shape rather than by convention: `SourceMetadata` has nowhere to put a local path and
 `LocalSnapshot` has nowhere to put a canonical URI, on the same principle as

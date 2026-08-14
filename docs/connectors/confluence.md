@@ -497,6 +497,98 @@ silently records a position past every page it never received.
 
 Use `--limit` to try a connector out. Use `root_page_ids` to say what a source *is*.
 
+## 2.2 What the page says about itself
+
+Every successfully fetched page and attachment carries a validated
+`Provenance(source=SourceMetadata(...))` under `source_provenance`
+([`storage.md`](../storage.md) §4.2.1). That is what lets a citation record the page id, the
+version actually retrieved, the source's own modification time and the hierarchy as one
+claim-level reference, instead of a title and a URI reassembled from ordinary document fields.
+
+**Every field is read out of a source response. None is inferred, and the table says which
+response.** A record assembled partly from what manicule worked out would read, at every
+surface, as the publisher's own account of the document — which is the one failure worth
+designing against here, because nothing downstream can tell the two apart.
+
+| Field | Cloud | Server / Data Center |
+|---|---|---|
+| `title` | `GET /api/v2/pages/{id}` → `title` | `GET /rest/api/content/{id}` → `title` |
+| `canonical_uri` | `_links.webui` resolved against `_links.base` | same |
+| `source_id` | the content id | same |
+| `version` | `version.number` **of the body that was retained** | same |
+| `modified_at` | `version.createdAt` | `version.when` |
+| `created_at` | the page's own top-level `createdAt` | **absent** — it is under `history`, which this connector does not expand |
+| `content_type` | the media type the body was routed as | same |
+| `section_path` | space key + ancestor titles, own title excluded | same |
+
+Two of those rows are the ones a shared parser would get wrong. `modified_at` is spelled
+differently by the two deployments, and reading only one spelling produces a record with **no**
+modification time on the other — a hole rather than an error, on whichever deployment nobody
+happened to try. And Cloud carries `createdAt` at *two* levels: the version's, which is when the
+page was last edited, and the page's, which is when it first existed. Collapsing them makes an
+old page look freshly revised.
+
+**A timestamp without a UTC offset is discarded rather than read as UTC.** A naive timestamp is
+not a moment; read as UTC it is wrong by the instance's offset, and the symptom is a citation
+that is quietly wrong by hours in the field used to decide which of two versions is newer.
+
+**Absent stays absent.** No field is ever filled from this run's clock, from the file's
+modification time or from `indexed_at`. The three timestamps are three separate questions —
+`modified_at` is the source's, `retrieved_at` is a local snapshot's, `indexed_at` is this
+installation's — and a network fetch has no local snapshot at all, so this connector writes only
+the first.
+
+**A version disagreement cites the bytes that were kept.** When the stale-body defense (§4) ends
+up retaining an older body, the record states *that* body's version and *that* response's
+timestamp; the `version_disagreement` diagnostic survives beside it. A record naming the version
+manicule asked for would describe a revision this index does not hold, in the one field a reader
+would use to check.
+
+**An attachment is cited as itself.** It gets its own content id, its own version, its own
+address and its own media type. The page it hangs off survives as a *relationship* — in
+`parent_page_id` and in the hierarchy — because a reference to the page would send a reader to a
+page that has a diagram somewhere on it rather than to the diagram. Its modification time comes
+from the search result that discovered it, which is the only response that ever describes an
+attachment: the download is bytes.
+
+**Scoping metadata is not provenance.** `root_page_ids` and `ancestor_ids` (§2.1) explain why
+manicule selected a document. They stay in the connector's own keys, because inside a source
+record they would read as something Confluence said about the page.
+
+**A record the citation interface refuses is stored as a stated reason, not as silence.** A page
+whose title carries a control character is still fetched, still indexed and still searchable;
+what it loses is the canonical record, and `unavailable_reason` says so. Absent and refused are
+different facts, and only the second is something an operator can act on.
+
+### Documents indexed before any of this existed
+
+Adding provenance to newly fetched pages does not reach a page nobody has edited since. Those
+documents are detected and counted by `manicule doctor`, under the `wiki-provenance` check.
+
+**Six of the seven fields could be recovered locally. The seventh cannot, and it is the one that
+matters.** A document ingested before this change still holds its page id, its canonical URI, its
+fetched version, its media type and its hierarchy. It has never held `modified_at` — that was
+stored nowhere — and inventing it from a filesystem or database timestamp is exactly what the
+rest of this section forbids. A partial record written with the timestamp left null would be
+indistinguishable, at every surface, from a page whose source genuinely reported no modification
+time. That is worse than the gap, because it is a gap presenting as an answer.
+
+**So these pages have to be fetched again, and a routine incremental sync will not do it.** An
+unchanged page is unreachable twice over: the watermark means discovery never enumerates it, and
+the version-token comparison (§2) means it would skip without a fetch even if it were. `manicule
+reindex` does not help either — it re-parses retained bytes and touches no network.
+
+**The migration is therefore a full resync of the source, performed deliberately.** `doctor`
+reports the count and the affected sources and changes nothing; `doctor --fix` does not arm it
+either, which is a limit rather than an omission — that flag seeds grammars and vocabularies,
+which are local, cheap and idempotent, and re-crawling somebody else's wiki is none of those.
+Hiding a recrawl behind a health command is the same defect as hiding one behind an incremental
+sync.
+
+Re-fetching preserves identity: a page is keyed on its content id, so enrichment updates the
+existing document rather than creating a second one. It is safe to interrupt and safe to repeat —
+whatever was not reached still carries no record, and the next `doctor` counts exactly those.
+
 ## 3. Deletions — the part most implementations miss
 
 CQL returns what exists. A page deleted since the last sync simply stops appearing, so a
