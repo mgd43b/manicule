@@ -1,10 +1,23 @@
-"""discover → fetch → parse → chunk → embed → store, one document at a time.
+"""discover → fetch → parse → chunk → embed → store, several documents at a time.
 
 **The unit of work is one document. A batch is a scheduling artifact with no semantics of its
 own.** That is what makes "one bad document never aborts a batch" a structural property rather
 than a promise: there is no batch-level transaction to abort, and no batch-level state a
 document can corrupt. Every failure this module catches is attributed to a document, recorded,
 and left behind.
+
+**A run is three stages joined by bounded hand-offs**, and every bound comes from configuration
+rather than from how many tasks happen to exist. Discovery fills a hand-off; ``fetch_concurrency``
+fetch workers drain it and fill the next; ``parse_workers + 1`` ingest workers drain that one and
+carry a document the rest of the way. Nothing anywhere gathers a task per document, because a
+task per document is the same thing as no bound at all — see :meth:`IngestPipeline.run` and
+``docs/ingest.md`` §8.3.
+
+**What concurrency is not allowed to touch is the write sequence.** One document's record,
+chunks, glossary and vectors are published under the keyed lock in :meth:`IngestPipeline._mutating`
+and guarded by the compare-and-swap in :meth:`IngestPipeline._commit`, exactly as they were when
+one document went through at a time. Running several documents at once makes those guards more
+reachable, not less needed, so the concurrency is between documents and never inside one.
 
 Two rules govern what gets written, and both exist because of failures that are otherwise
 invisible.
@@ -31,6 +44,7 @@ the commit point.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -58,7 +72,8 @@ from manicule.ingest.glossary import detect_entries
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.ports import GlossaryWriter
 from manicule.ingest.refusals import require_measured
-from manicule.ingest.workers import AttemptResult
+from manicule.ingest.stages import Conveyor, CountedLock, Gauge, StageReport
+from manicule.ingest.workers import AttemptResult, default_worker_count
 from manicule.parsers.chain import (
     Attempt,
     ChainResult,
@@ -76,7 +91,7 @@ if TYPE_CHECKING:
     from manicule.core.content import Chunk, Metadata
     from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
     from manicule.core.protocols import Chunker, Connector, Embedder, VectorStore
-    from manicule.core.sources import DiscoveredDoc, DocRef
+    from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.ports import IngestStore
     from manicule.ingest.workers import ParseRunner
@@ -255,6 +270,30 @@ class RunReport:
     by_status: dict[str, int] = field(default_factory=dict[str, int])
     error: str = ""
 
+    limited: bool = False
+    """Whether ``--limit`` stopped discovery before the source was exhausted.
+
+    **A limited run is bounded, not clean, and not an error.** Nothing went wrong and every
+    accepted document was carried to a terminal outcome, so ``error`` stays empty and the
+    counters mean what they say — but discovery stopped early, so the position the connector
+    reports describes an enumeration that was never finished. Reporting it as clean is how a
+    ``--limit 10`` on a corpus of ten thousand silently skips the other nine thousand nine
+    hundred and ninety on every subsequent sync.
+    """
+
+    unrecorded: int = 0
+    """Accepted documents that reached no durable record at all.
+
+    Exactly one shape produces this: a fetch that failed for a document the index had never
+    seen, so there is no row to write the failure against and nothing to re-query. Every other
+    failure stores something — ``failed`` with a stage, or an ``indexed`` document keeping the
+    content it had — and is therefore findable afterwards.
+
+    It is counted because it is the one outcome a watermark must not be advanced past. The
+    document exists at the source, was enumerated once, and is in no index; if the position
+    moves beyond it, no later sync enumerates it again and nothing anywhere reports a problem.
+    """
+
     glossary_failures: list[str] = field(default_factory=list[str])
     """One line per document whose definitions the detector could not read.
 
@@ -265,20 +304,45 @@ class RunReport:
     stopped detecting anything and said nothing about it.
     """
 
+    stages: StageReport = field(default_factory=StageReport)
+    """What the stages did: queue depths, stage occupancy, and peak retained bodies.
+
+    Counts only, never content. It is what makes "the bound held" checkable by a test and by
+    ``doctor`` (``docs/ingest.md`` §14) rather than a claim about code somebody has read.
+    """
+
     @property
     def indexed(self) -> int:
         return self.by_status.get(DocumentStatus.INDEXED.value, 0)
 
     @property
     def clean(self) -> bool:
-        """Whether the run finished. Only a clean run advances a watermark."""
+        """Whether the run finished without an enumeration failure."""
         return not self.error
+
+    @property
+    def complete(self) -> bool:
+        """Whether this run enumerated the whole source and landed everything it accepted.
+
+        **The watermark gate, and it is three conditions rather than one.** A clean run is only
+        the first: a run stopped by ``--limit`` enumerated a prefix, and a run that lost a
+        document to a fetch failure before the index had ever seen it left something behind that
+        the position would hide forever. Each of the three is a way for the connector's reported
+        position to describe more than what actually landed, and the watermark is a promise that
+        it does not.
+        """
+        return self.clean and not self.limited and self.unrecorded == 0
 
     def record(self, outcome: DocumentOutcome, *, expanded: bool = False) -> None:
         if expanded:
             self.expanded += 1
         else:
             self.discovered += 1
+            if not outcome.document_id:
+                # No row anywhere: a fetch that failed for a document nothing had stored. The
+                # only outcome with nothing to find afterwards, and therefore the only one that
+                # holds the watermark back.
+                self.unrecorded += 1
         if outcome.glossary_detail:
             self.glossary_failures.append(
                 f"{outcome.document_id or outcome.source_id}: {outcome.glossary_detail}"
@@ -292,6 +356,17 @@ class RunReport:
         key = outcome.status.value
         self.by_status[key] = self.by_status.get(key, 0) + 1
 
+    def settle(self) -> None:
+        """Put the order-sensitive parts into an order that does not depend on who finished first.
+
+        Counters do not care in what order they were incremented, but ``glossary_failures`` is a
+        list, and under concurrency the order documents complete in is not the order they were
+        discovered in. Two identical runs would then produce two different reports, which makes
+        a diagnostic impossible to diff and a test pass or fail on scheduling. Sorted, because
+        each line begins with the document id and a document id is derived rather than assigned.
+        """
+        self.glossary_failures.sort()
+
     def as_metadata(self) -> Metadata:
         return {
             "last_run": {
@@ -301,9 +376,54 @@ class RunReport:
                 "skipped_hash": self.skipped_hash,
                 "by_status": dict(self.by_status),
                 "error": self.error,
+                "limited": self.limited,
+                "unrecorded": self.unrecorded,
                 "glossary_failures": list(self.glossary_failures),
+                "stages": self.stages.as_metadata(),
             }
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _Fetched:
+    """What crosses the hand-off between the fetch stage and the ingest stage.
+
+    The bytes, and the two things the fetch stage already read that the ingest stage would
+    otherwise read again: what the source said about this document, and what the index holds for
+    it. Re-reading the stored document on the far side would be a second round trip *and* a
+    second snapshot, and the two snapshots disagreeing is the shape of a lost update.
+    """
+
+    raw: RawDocument
+    discovered: DiscoveredDoc
+    existing: Document | None
+
+
+@dataclass
+class _Sync:
+    """One run's moving parts, in one object rather than eight arguments down five methods.
+
+    Internal, and deliberately not the report: the report is what a caller reads afterwards,
+    and this is what the stages write to each other while they work.
+    """
+
+    connector: Connector
+    report: RunReport
+    limit: int | None
+    watermark: Watermark | None
+    refs: Conveyor[DiscoveredDoc]
+    """Discovery to fetch. Carries references, so its depth costs metadata rather than bodies."""
+
+    bodies: Conveyor[_Fetched]
+    """Fetch to ingest. Carries bytes, so its depth is what bounds a run's memory."""
+
+    accepted: int = 0
+    """Top-level documents handed to the fetch stage. What ``--limit`` bounds, counted where
+    the bound is applied rather than derived afterwards from what finished."""
+
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    """Set on cancellation. Discovery is the only stage that reads it, because stopping
+    discovery is what brings every stage behind it down in order."""
 
 
 class IngestPipeline:
@@ -323,6 +443,9 @@ class IngestPipeline:
         workspace: str = "default",
         blobs: BlobSink | None = None,
         fetch_concurrency: int = 8,
+        parse_workers: int = 0,
+        queue_depth_factor: int = 2,
+        shutdown_grace_s: float = 30.0,
         max_fetch_bytes: int = 256 * 1024 * 1024,
         target_batch_tokens: int = 16_384,
         max_embed_batch: int = 64,
@@ -367,8 +490,32 @@ class IngestPipeline:
                 enabled=detect_glossary, middleware=middleware.chain()
             ).canonical()
         )
-        self._fetching = asyncio.Semaphore(max(1, fetch_concurrency))
-        self._embedding = asyncio.Lock()
+        # --- how many of each stage a run may occupy, all derived here and nowhere else ------
+        #
+        # Read once, at construction, so that every bound in one run comes from one reading of
+        # one configuration. Deriving a queue size at the moment it is needed is how a hand-off
+        # ends up sized against a number that has since moved.
+        self._fetch_workers = max(1, fetch_concurrency)
+        # One more than the parse pool, so a document waiting for the embedding lock does not
+        # leave a parse worker idle behind it. Not two more: past the pool size the extra
+        # workers only queue for the same accelerator, and each of them is holding a fetched
+        # body in memory while it waits.
+        self._parse_workers = parse_workers if parse_workers > 0 else default_worker_count()
+        self._ingest_workers = self._parse_workers + 1
+        # `docs/ingest.md` §8.3: twice the consumer's parallelism. Deep enough that a consumer
+        # never idles waiting for the stage in front of it to produce one more item, shallow
+        # enough that "how much is in memory" stays a small multiple of the worker count.
+        self._queue_depth_factor = max(1, queue_depth_factor)
+        self._shutdown_grace_s = max(0.0, shutdown_grace_s)
+        # Retained for callers of `ingest` and `ingest_raw` that are not a staged run. The staged
+        # run bounds fetches structurally, by running exactly this many fetch workers, so inside
+        # it this semaphore is never contended — which is the right relationship between a
+        # structural bound and the check that it holds.
+        self._fetching = asyncio.Semaphore(self._fetch_workers)
+        self._embedding = CountedLock("embed")
+        self._parsing = Gauge("parse")
+        self._fetches = Gauge("fetch")
+        self._bodies = Gauge("bodies")
         self._mutations: dict[str, tuple[asyncio.Lock, int]] = {}
 
     # --- the two locks, and what each one is for ------------------------------------------
@@ -423,47 +570,259 @@ class IngestPipeline:
         """
         return self._glossary_lineage
 
-    # --- a run ---------------------------------------------------------------------------
+    # --- a run: three stages, two bounded hand-offs -----------------------------------------
 
     async def run(self, connector: Connector, *, limit: int | None = None) -> RunReport:
         """Ingest everything a connector reports as changed since its watermark.
 
-        The watermark advances only on a clean run, which is the whole of resumability: an
-        interrupted sync re-enumerates from the last good point, change detection makes
-        re-enumeration cheap, and the recovery sweep requeues anything caught in flight. There
-        is no checkpoint file, no resume token, and nothing to corrupt. Resume is: run it
-        again.
+        **Three stages, joined by two bounded hand-offs, and every bound derived from
+        configuration:**
+
+        .. code-block:: text
+
+            discover
+               │  fetch hand-off, depth = queue_depth_factor x fetch_concurrency
+               ▼
+            fetch x fetch_concurrency          change detection, then the network
+               │  parse hand-off, depth = queue_depth_factor x ingest workers
+               ▼
+            ingest x (parse_workers + 1)       parse in the pool, chunk, embed under
+                                               one lock, commit under the document's
+
+        Discovery is the only stage with nothing in front of it, so it is where backpressure
+        has to arrive. It does: putting a document into a full hand-off waits, and every stage
+        downstream propagates that wait upward, so a slow embedder eventually stops the source
+        being paged. That is a correctness requirement rather than a memory one — a connector
+        that races ahead of durable progress exhausts its pagination cursors and fails a sync
+        that had nothing wrong with it (``docs/ingest.md`` §8.3).
+
+        **What the concurrency does not change.** Each document still travels the same path it
+        did one at a time, and the per-document lock still spans its record, chunks, glossary
+        and vectors. Two documents may be in the ingest stage at once; one document is never in
+        two places.
+
+        **``limit`` bounds acceptance, not completion.** Discovery stops after handing ``limit``
+        top-level documents downstream, and everything already accepted is carried to a terminal
+        outcome before this returns. Members found inside a container do not count against it —
+        one archive of five hundred files must not exhaust a limit of ten. A run stopped this
+        way is *bounded*: no error, and no watermark.
+
+        **Cancellation.** ``Ctrl-C`` stops discovery, gives what is already accepted
+        ``shutdown_grace_s`` to reach a terminal outcome, then cancels the stages and re-raises.
+        No watermark is written on either path and no task outlives this call. A second
+        ``Ctrl-C`` inside the grace window skips the wait, which is what makes the impatient
+        case safe rather than different (``docs/ingest.md`` §13.3).
         """
-        report = RunReport(connector=connector.name)
-        watermark = await self._store.get_watermark(connector.name)
-        stream = connector.discover(watermark)
+        run = _Sync(
+            connector=connector,
+            report=RunReport(connector=connector.name),
+            limit=limit,
+            watermark=await self._store.get_watermark(connector.name),
+            refs=Conveyor(
+                name="fetch",
+                capacity=self._queue_depth_factor * self._fetch_workers,
+                consumers=self._fetch_workers,
+            ),
+            bodies=Conveyor(
+                name="parse",
+                capacity=self._queue_depth_factor * self._ingest_workers,
+                consumers=self._ingest_workers,
+                producers=self._fetch_workers,
+            ),
+        )
+        # Peaks only. The active counts belong to whoever is inside the stage right now, and a
+        # second operation sharing this pipeline is one of them.
+        for gauge in (self._fetches, self._parsing, self._bodies, self._embedding.gauge):
+            gauge.rebase()
+
+        stages = asyncio.create_task(self._drive(run), name=f"ingest:{connector.name}")
+        try:
+            # Shielded so that a cancellation arriving here does not tear the stages down before
+            # anything has had a chance to finish the document it is holding. The stages are
+            # still a child task of this call and are joined on every path below, so nothing
+            # survives this method.
+            await asyncio.shield(stages)
+        except asyncio.CancelledError:
+            await self._stop_within_grace(run, stages)
+            raise
+        except ExceptionGroup as failures:
+            # A stage failed for a reason that is not a document's: the document store went
+            # away, or this module has a defect. The task group has already stopped and joined
+            # the other stages, so what is left is to say so and leave the watermark alone.
+            # Documents that were mid-write when it happened are in a non-terminal status, which
+            # is what the recovery sweep (`docs/ingest.md` §6.4) exists to finish.
+            run.report.error = _first_failure(failures)
+        except BaseException:
+            stages.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stages
+            raise
+
+        run.report.stages = self._stage_report(run)
+        run.report.settle()
+        if run.report.complete:
+            await self._advance_watermark(connector)
+        await self._store.record_connector_metadata(connector.name, run.report.as_metadata())
+        return run.report
+
+    async def _drive(self, run: _Sync) -> None:
+        """Start every stage, and return when discovery is spent and every acceptance is done.
+
+        One :class:`asyncio.TaskGroup`, so the stages are children of this call: it returns only
+        when all of them have, and cancelling it cancels and joins all of them. There is no
+        detached task and nothing to leak.
+
+        A stage task raising cancels its siblings, and that is deliberate rather than tolerated:
+        everything a document can do is already an outcome by the time it reaches here, so what
+        is left to raise is the store or a defect, and neither is survivable by carrying on.
+        """
+        refs, bodies = run.refs, run.bodies
+        async with asyncio.TaskGroup() as stages:
+            stages.create_task(self._discover_into(run, refs), name="discover")
+            for worker in range(self._fetch_workers):
+                stages.create_task(self._fetch_into(run, refs, bodies), name=f"fetch-{worker}")
+            for worker in range(self._ingest_workers):
+                stages.create_task(self._ingest_from(run, bodies), name=f"ingest-{worker}")
+
+    async def _discover_into(self, run: _Sync, refs: Conveyor[DiscoveredDoc]) -> None:
+        """Pull the source, hand each document to the fetch stage, and stop when told to.
+
+        The three ways it ends are all recorded, because each means something different to the
+        watermark: exhausted (may advance), stopped at ``limit`` (bounded, may not), and raised
+        (unclean, may not).
+        """
+        stream = run.connector.discover(run.watermark)
         try:
             async for discovered in stream:
-                for position, outcome in enumerate(await self.ingest(connector, discovered)):
-                    # The first outcome is the discovered document; anything after it came out
-                    # of the inside of it.
-                    report.record(outcome, expanded=position > 0)
-                if limit is not None and report.discovered >= limit:
+                if run.stop.is_set():
+                    break
+                # Before the counter, so a document is counted as accepted only once it is
+                # somewhere a worker will find it. The wait inside `put` is the backpressure.
+                await refs.put(discovered)
+                run.accepted += 1
+                if run.limit is not None and run.accepted >= run.limit:
+                    run.report.limited = True
                     break
         except Exception as exc:  # noqa: BLE001 - an enumeration failure is not a crash
-            report.error = f"{type(exc).__name__}: {exc}"
+            run.report.error = f"{type(exc).__name__}: {exc}"
         finally:
             closer = getattr(stream, "aclose", None)
             if closer is not None:
                 await closer()
-        if report.clean:
-            await self._advance_watermark(connector)
-        await self._store.record_connector_metadata(connector.name, report.as_metadata())
-        return report
+            # However discovery ended, the stage in front of it has to be told, or every fetch
+            # worker waits for an item that is never coming and the run never returns.
+            await refs.finish()
+
+    async def _fetch_into(
+        self, run: _Sync, refs: Conveyor[DiscoveredDoc], bodies: Conveyor[_Fetched]
+    ) -> None:
+        """One fetch worker: change detection, then the network, then the next stage.
+
+        Level-1 change detection lives here rather than in discovery because it is what avoids
+        the fetch, and it costs a store read that has no business blocking the source's paging.
+        A document that skips never reaches the parse hand-off at all, which is why an unchanged
+        corpus flows through this stage at the speed of the store rather than of the model.
+        """
+        try:
+            while (discovered := await refs.take()) is not None:
+                accepted = await self._accept(run.connector, discovered)
+                if isinstance(accepted, DocumentOutcome):
+                    run.report.record(accepted)
+                    continue
+                # Entered here and left in the ingest stage, because what is being counted is
+                # how many fetched bodies are held in memory at once — which spans the queue
+                # they wait in as well as the worker that has one. A block cannot express that,
+                # so the pair is written out.
+                self._bodies.enter()
+                await bodies.put(accepted)
+        finally:
+            await bodies.finish()
+
+    async def _ingest_from(self, run: _Sync, bodies: Conveyor[_Fetched]) -> None:
+        """One ingest worker: parse, chunk, embed and commit one document, then the next.
+
+        The stage that holds a document's whole write sequence, unchanged from when there was
+        one of these. What bounds it is how many of these workers exist, and what serializes the
+        parts that must not overlap is the parse pool, the embedding lock and the per-document
+        lock — each of which was already the bound for the resource it names.
+
+        **Nothing broad is caught here, and that is the same decision the sequential loop made.**
+        Everything a *document* can do — a parser that raises, a hook that misbehaves, a model
+        that refuses, a vector store that will not take an upsert — is already turned into a
+        recorded outcome inside :meth:`ingest_raw`, and those documents fail alone. What is left
+        to escape is the document store itself going away, and a run that carried on through
+        that would report every remaining document as failed, finish clean, and advance a
+        watermark past a corpus it never wrote. So it propagates, the task group stops the other
+        stages, and :meth:`run` records it as the run's error.
+        """
+        while (fetched := await bodies.take()) is not None:
+            try:
+                outcomes = await self.ingest_raw(
+                    fetched.raw,
+                    source=run.connector.name,
+                    version_token=fetched.discovered.version_token,
+                    title=fetched.discovered.title,
+                    existing=fetched.existing,
+                )
+            finally:
+                # The other half of the pair entered in the fetch stage: this body is no longer
+                # held. In a `finally`, so a document that failed still releases its accounting —
+                # the deadlock this whole design has to avoid is a permit that a failure keeps.
+                self._bodies.leave()
+            for position, outcome in enumerate(outcomes):
+                # The first outcome is the discovered document; anything after it came out of
+                # the inside of it.
+                run.report.record(outcome, expanded=position > 0)
+
+    async def _stop_within_grace(self, run: _Sync, stages: asyncio.Task[None]) -> None:
+        """Stop pulling the source, let what is accepted finish, cancel the rest at the deadline.
+
+        ``docs/ingest.md`` §13.3, made true. Stopping discovery is enough to bring the whole run
+        down on its own: the fetch hand-off closes, its workers exit on the end-of-stream and
+        close the parse hand-off behind them, and the ingest workers finish what is queued. So
+        the grace window is a bound on *that*, not a separate drain protocol.
+
+        **A second cancellation skips the wait**, because the wait is itself cancellable — which
+        is the documented behavior and the reason the impatient case is safe rather than
+        different. Either way the recovery sweep is what finishes the story for a document left
+        in flight, and no watermark is written.
+        """
+        run.stop.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(stages), self._shutdown_grace_s)
+        except (TimeoutError, asyncio.CancelledError):
+            stages.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stages
+
+    def _stage_report(self, run: _Sync) -> StageReport:
+        """What the stages did, read out of the gauges and the hand-offs once, at the end."""
+        return StageReport(
+            accepted=run.accepted,
+            fetch_queue=run.refs.report(),
+            parse_queue=run.bodies.report(),
+            peak_fetches=self._fetches.peak,
+            peak_parses=self._parsing.peak,
+            peak_embeds=self._embedding.gauge.peak,
+            peak_bodies=self._bodies.peak,
+        )
 
     async def _advance_watermark(self, connector: Connector) -> None:
-        """Record how far a clean run got, if the connector can say.
+        """Record how far a complete run got, if the connector can say.
 
-        **Only on a clean run**, and that is the whole of resumability. An interrupted sync
+        **Only on a complete run**, and that is the whole of resumability. An interrupted sync
         re-enumerates from the last good point; change detection (§4) makes re-enumeration
         cheap, because already-ingested documents skip at level 1 without a fetch; and the
         recovery sweep requeues anything caught in flight. So resume is: run it again. There is
         no checkpoint file, no resume token, and nothing to corrupt.
+
+        **Complete is three conditions, and concurrency is why saying so matters.** The position
+        a connector reports is one value describing a whole enumeration, so it cannot be advanced
+        partly — which means it must not be advanced at all unless the enumeration finished *and*
+        everything it produced landed. Completion order under a staged run is not discovery
+        order, so "the last document finished" says nothing; :attr:`RunReport.complete` is the
+        condition, and it is checked after every accepted document has reached a terminal
+        outcome rather than as they go.
 
         ``Connector.watermark`` is the other half of ``discover``, which consumes a position and
         for a while had nowhere to produce the next one. A connector with no change signal
@@ -492,10 +851,40 @@ class IngestPipeline:
     ) -> list[DocumentOutcome]:
         """One discovered document, from the change check to the commit.
 
+        The two stages a run pipelines, run back to back instead. **One implementation, so the
+        direct path and the staged path cannot come to disagree** about when a document skips,
+        when it is fetched, or what an outcome for it looks like — which is exactly the drift a
+        second copy of change detection would produce, and it would produce it silently.
+
         Returns a list because a container is several documents: the archive itself, then
         every member it expanded into. Never raises for anything a document did. A connector
         that cannot fetch it, a parser that hangs, a hook that misbehaves and a model that
         refuses are all recorded against that document and returned.
+        """
+        accepted = await self._accept(connector, discovered)
+        if isinstance(accepted, DocumentOutcome):
+            return [accepted]
+        return await self.ingest_raw(
+            accepted.raw,
+            source=connector.name,
+            version_token=discovered.version_token,
+            title=discovered.title,
+            existing=accepted.existing,
+        )
+
+    async def _accept(
+        self, connector: Connector, discovered: DiscoveredDoc
+    ) -> DocumentOutcome | _Fetched:
+        """Decide whether a discovered document is worth fetching, and fetch it if it is.
+
+        The first stage's whole job, and the reason it is a stage of its own: level-1 change
+        detection is what avoids the fetch, so it belongs on the same side of the hand-off as
+        the fetch rather than in discovery, where it would make a store read block the source
+        being paged.
+
+        Returns:
+            The bytes and the change-detection context, or the outcome for a document that
+            never needed them — one that skipped, and one whose fetch failed.
         """
         source = connector.name
         source_id = discovered.source_id
@@ -503,32 +892,22 @@ class IngestPipeline:
 
         if self._unchanged_by_token(existing, discovered):
             await self._store.record_seen(existing.id)  # pyright: ignore[reportOptionalMemberAccess]
-            return [
-                DocumentOutcome(
-                    source_id=source_id,
-                    status=existing.status,  # pyright: ignore[reportOptionalMemberAccess]
-                    document_id=existing.id,  # pyright: ignore[reportOptionalMemberAccess]
-                    skipped="version",
-                )
-            ]
+            return DocumentOutcome(
+                source_id=source_id,
+                status=existing.status,  # pyright: ignore[reportOptionalMemberAccess]
+                document_id=existing.id,  # pyright: ignore[reportOptionalMemberAccess]
+                skipped="version",
+            )
 
         await self._advance(existing, DocumentStatus.FETCHING)
         try:
             raw = await self._fetch(connector, discovered.ref)
         except Exception as exc:  # noqa: BLE001 - one source's failure is one document's
-            return [
-                await self._fail(
-                    existing, source, source_id, PipelineStage.FETCH, f"{type(exc).__name__}: {exc}"
-                )
-            ]
+            return await self._fail(
+                existing, source, source_id, PipelineStage.FETCH, f"{type(exc).__name__}: {exc}"
+            )
 
-        return await self.ingest_raw(
-            raw,
-            source=source,
-            version_token=discovered.version_token,
-            title=discovered.title,
-            existing=existing,
-        )
+        return _Fetched(raw=raw, discovered=discovered, existing=existing)
 
     async def ingest_raw(
         self,
@@ -810,7 +1189,8 @@ class IngestPipeline:
 
     async def _fetch(self, connector: Connector, ref: DocRef) -> RawDocument:
         async with self._fetching:
-            raw = await connector.fetch(ref)
+            with self._fetches.holding():
+                raw = await connector.fetch(ref)
         size = len(raw.as_bytes())
         if size > self._max_fetch_bytes:
             msg = (
@@ -831,7 +1211,11 @@ class IngestPipeline:
         captured: list[AttemptResult] = []
 
         async def attempt(name: str, document: RawDocument) -> tuple[list[object], Attempt]:
-            result = await self._runner.run_attempt(name, document)
+            # Counted around the runner rather than around the document, because the pool's
+            # parallelism is per attempt: this is the number that says whether one connector
+            # sync is using more than one parse worker.
+            with self._parsing.holding():
+                result = await self._runner.run_attempt(name, document)
             captured.append(result)
             return result.blocks, result.attempt  # pyright: ignore[reportReturnType]
 
@@ -1598,6 +1982,31 @@ class IngestPipeline:
             document_id=document.id,
             detail=detail,
         )
+
+
+def _first_failure(failures: BaseExceptionGroup[Exception]) -> str:
+    """One line for what stopped the stages, from however many of them noticed.
+
+    Several ingest workers meeting the same dead store produce several identical exceptions, and
+    a report that concatenated them would say the same sentence four times and bury how many
+    stages were affected. The first is named because it is the one that happened; the count is
+    kept because "four stages" and "one stage" are different diagnoses.
+    """
+    flattened = _leaves(failures)
+    first = flattened[0]
+    detail = f"{type(first).__name__}: {first}"
+    return detail if len(flattened) == 1 else f"{detail} (and {len(flattened) - 1} more)"
+
+
+def _leaves(failures: BaseExceptionGroup[Exception]) -> list[Exception]:
+    """Every exception in a group, however deeply the task group nested them."""
+    found: list[Exception] = []
+    for failure in failures.exceptions:
+        if isinstance(failure, BaseExceptionGroup):
+            found.extend(_leaves(failure))
+        else:
+            found.append(failure)
+    return found
 
 
 def _writer_of(store: object) -> GlossaryWriter | None:

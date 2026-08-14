@@ -601,6 +601,14 @@ class Runtime:
             workspace=settings.workspace,
             blobs=await self.blobs(),
             fetch_concurrency=settings.ingest.fetch_concurrency,
+            # The three that size the staged run, and all three were configurable and inert
+            # until they arrived here. `parse_workers` is passed rather than read off the pool
+            # because the pipeline sizes its own hand-offs from it and a `ParseRunner` is a
+            # protocol with no size on it — reading one structurally would be a guess about the
+            # implementation rather than a reading of the configuration.
+            parse_workers=pool.size,
+            queue_depth_factor=settings.ingest.queue_depth_factor,
+            shutdown_grace_s=settings.ingest.shutdown_grace_s,
             max_fetch_bytes=settings.ingest.max_fetch_bytes,
             target_batch_tokens=settings.ingest.target_batch_tokens,
             max_embed_batch=settings.ingest.max_embed_batch,
