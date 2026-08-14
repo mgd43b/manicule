@@ -416,10 +416,10 @@ def build_server(service: ApplicationService) -> FastMCP:
         Cheaper and more predictable than ``ask`` when you want the source material rather
         than prose about it, and the right tool when you intend to read the passages yourself.
 
-        **Name the scope on every call.** Nothing is remembered between calls, so a `search`
-        with no `collections` searches the whole workspace however the last one was scoped.
-        `data.collections` repeats the scope this search ran under — read it rather than
-        assuming the argument arrived.
+        **Name the scope on every call.** Scope comes from this call's `collections` and from
+        nothing else: there is no session, so omitting it searches the **whole workspace** no
+        matter how the previous call was scoped. `data.collections` repeats the scope this
+        search ran under — read it rather than assuming the argument arrived.
 
         **This returns the top `limit` passages of one ranking, which is not a census of the
         corpus.** An empty or weak result means the top of that ranking held nothing, not that

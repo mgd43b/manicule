@@ -400,9 +400,10 @@ the same clause `collection_documents` pages, rather than issuing a second count
 the same reason: a number that disagrees with the list it claims to count is worse than a slower
 number.
 
-**Why every query repeats its scope.** There is no session. A `search` with no `collections`
-searches the whole workspace however the previous call was scoped, so the scope travels on each
-call and comes back in `data.collections` — which is what lets a caller check that the argument
+**Why every query repeats its scope.** There is no session, and scope is read from the call's
+own `collections` argument and nowhere else — so a `search` that omits it searches the **whole
+workspace**, no matter how the previous call was scoped. The scope therefore travels on each
+call, and comes back in `data.collections`, which is what lets a caller check that the argument
 arrived rather than assuming it. A name that is not a collection here is refused with
 `UnknownEntityError` and **no search runs**: a restriction that silently vanished would return the
 whole workspace, ranked and plausible, which is the one failure mode worse than an error.
