@@ -211,47 +211,73 @@ def test_the_detector_may_not_import_dynamically() -> None:
     genuinely needs a dynamic import, this fails and whoever wrote it has to decide how the
     fingerprint covers it — which is the conversation that would otherwise not happen.
 
-    **Matched on the name being called rather than on how it was reached**, because the obvious
-    version of this had the same blind spot as the derivation it defends: checking `ast.Attribute`
-    for `import_module` misses `from importlib import import_module` followed by a bare call, and
-    the guard would then be silent about exactly the thing it exists to make loud. All four
-    spellings are caught — bare, attribute, `builtins.__import__`, and the rebound name.
+    **One rule: a call is refused when the name at the call site is `import_module` or
+    `__import__`, plain name or attribute.** Stated rather than enumerated, because a list of
+    example spellings reads as a specification and drifts from the code the first time either
+    moves. The obvious version of this matched `ast.Attribute` for `import_module` and
+    `ast.Name` for `__import__`, which had the same blind spot as the derivation it defends:
+    `from importlib import import_module` then a bare call walked past it, and the guard was
+    silent about exactly the thing it exists to make loud.
 
-    **It is over-broad by the same rule, and that is the trade rather than an oversight.** Any
-    `.import_module(...)` is flagged whether or not it is importlib's. Narrowing it would mean
+    **The same rule makes it over-broad, and that is the trade rather than an oversight.** An
+    unrelated `whatever.import_module(...)` is flagged too, because the rule reads the call site
+    and not what the name resolves to. Narrowing it would mean
     resolving the binding — machinery whose only purpose is to grant an exemption, in two files
     that today import nothing but `re`, `unicodedata`, `typing`, `enum` and ``pydantic``. A false
     positive here is one loud failure landing on whoever wrote the line, with an assertion
     message telling them what to decide; a false negative is a dependency deciding stored entries
     with no version recorded anywhere, in silence. Those are not symmetrical, and the guard is
     aimed at the second.
+
+    **And it is not a total prohibition**, which the test below pins rather than leaves to this
+    paragraph. See :func:`test_the_prohibition_is_narrower_than_it_sounds`.
     """
-    # Matched on the *name being called*, however it was bound. An earlier version of this
-    # checked `ast.Name` for `__import__` and `ast.Attribute` for `import_module`, which let
-    # `from importlib import import_module` followed by a bare `import_module("x")` through —
-    # a guard with the same blind spot as the thing it guards is worth less than none.
-    dynamic = {"__import__", "import_module"}
-    offenders: list[str] = []
-    for package, name in SOURCES:
-        tree = ast.parse(_source_path(package, name).read_bytes())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            called = node.func
-            invoked = (
-                called.id
-                if isinstance(called, ast.Name)
-                else called.attr
-                if isinstance(called, ast.Attribute)
-                else ""
-            )
-            if invoked in dynamic:
-                offenders.append(f"{package}.{name}: {invoked}(...)")
+    offenders = [
+        f"{package}.{name}: {call}(...)"
+        for package, name in SOURCES
+        for call in _dynamic_import_offenders(_source_path(package, name).read_bytes())
+    ]
 
     assert not offenders, (
         f"{offenders} imports dynamically, which the fingerprint's derivation cannot follow. "
         f"The dependency would decide stored entries with no version recorded anywhere. Import "
         f"it statically, or decide how libraries() is to cover it and say so in DERIVED_FROM."
+    )
+
+
+@pytest.mark.parametrize(
+    ("route", "source"),
+    [
+        ("a rebound name", "import importlib\nf = importlib.import_module\nf('x')"),
+        ("getattr", "import importlib\ngetattr(importlib, 'import_module')('x')"),
+        ("eval", "eval(\"__import__('x')\")"),
+    ],
+)
+def test_the_prohibition_is_narrower_than_it_sounds(*, route: str, source: str) -> None:
+    """The limit of the guard above, pinned so the claim beside it cannot quietly become false.
+
+    A prohibition that *sounds* total while being evadable is the defect this whole module exists
+    to name, one level up: a check narrower than its claim. So the claim is narrowed instead, and
+    the three routes it does not close are asserted to be open rather than described as open —
+    because a limit stated only in prose is one nobody notices going stale.
+
+    Closing them needs value-flow analysis, which an AST walk is not. What the guard buys is
+    raising the cost of the mistake from accidental to deliberate: every spelling somebody writes
+    without meaning to hide anything is refused, and somebody determined to route around a test
+    can route around a test.
+
+    **This failing is good news and the message says so.** If the guard is ever strengthened, this
+    goes red and tells whoever did it to narrow `DERIVED_FROM` less — naming the entry by looking
+    it up rather than by quoting it, because a message that hard-codes the key sends the next
+    reader to a heading that has since been reworded. Which is the same defect as the one this
+    file is about, in an error string.
+    """
+    entry = next((key for key in DERIVED_FROM if key.startswith("static imports only")), "")
+    assert entry, "the DERIVED_FROM entry this test is the counterpart to has been renamed"
+
+    assert not _dynamic_import_offenders(source), (
+        f"the guard now catches {route}, which is better than it was — update the {entry!r} "
+        f"entry in DERIVED_FROM, which currently says this route is open, then delete this case."
     )
 
 
@@ -310,6 +336,35 @@ def test_each_detection_rule_is_independently_represented_in_the_digest(
     assert hashlib.sha256(moved).hexdigest() != hashlib.sha256(original).hexdigest(), (
         f"editing the {form} rule alone left the fingerprint where it was"
     )
+
+
+def _dynamic_import_offenders(source: str | bytes) -> list[str]:
+    """Which dynamic-import calls a source makes, by the name it invoked.
+
+    Matched on the *name being called*, however it was bound. The obvious version — `ast.Name`
+    for `__import__` and `ast.Attribute` for `import_module` — has the same blind spot as the
+    derivation it defends: `from importlib import import_module` then a bare call walks past it,
+    and a guard blind to what it guards against is worth less than none.
+
+    One function so the prohibition and the test pinning its limit read the same matcher. Two
+    copies would let the limit test go on passing about code the guard no longer runs.
+    """
+    dynamic = {"__import__", "import_module"}
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        called = node.func
+        invoked = (
+            called.id
+            if isinstance(called, ast.Name)
+            else called.attr
+            if isinstance(called, ast.Attribute)
+            else ""
+        )
+        if invoked in dynamic:
+            found.append(invoked)
+    return found
 
 
 def _source_path(package: str, name: str) -> Path:

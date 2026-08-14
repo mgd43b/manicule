@@ -140,12 +140,22 @@ DERIVED_FROM: Final[dict[str, str]] = {
         "module it is closed by the entry below instead, since a distribution's dependencies "
         "move with the version recorded for it."
     ),
-    "static imports only": (
+    "static imports only, and the guard against that is not total either": (
         "`importlib.import_module('x')` and `__import__('x')` are function calls, so the walk "
-        "cannot resolve them and would miss the dependency in silence. That is the one blind "
-        "spot with no reasoning behind it, so it is not left as one: "
-        "`tests/glossary/test_lineage.py` fails if a digested source contains either form, "
-        "which turns the thing this cannot see into the thing it is not allowed to do."
+        "cannot resolve them and would miss the dependency in silence. "
+        "`tests/glossary/test_lineage.py` refuses them by one rule, stated rather than "
+        "enumerated because a list of examples reads as a specification and then drifts from "
+        "the code: **a call is refused when the name at the call site is `import_module` or "
+        "`__import__`, whether that name is a plain name or an attribute.** So "
+        "`__import__(...)`, `builtins.__import__(...)`, `importlib.import_module(...)` and a "
+        "bare `import_module(...)` bound by `from importlib import import_module` are all "
+        "refused — and so is an unrelated `whatever.import_module(...)`, which is the "
+        "over-breadth the rule buys its simplicity with. What escapes is anything whose call "
+        "site names something else: `f = importlib.import_module` then `f('x')`, "
+        "`getattr(importlib, 'import_module')('x')`, or a call built in `eval`. Closing those "
+        "needs value-flow analysis, which an AST walk is not, so the honest claim is narrower "
+        "than a prohibition: it raises the cost of this mistake from accidental to deliberate, "
+        "and a test cannot do more than that."
     ),
     "a distribution's own pins": (
         "pydantic's version is recorded and pydantic-core's is not — no version is written down "
