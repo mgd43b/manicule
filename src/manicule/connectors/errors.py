@@ -14,7 +14,7 @@ returns what it has: it raises, and the pipeline discards the prefix.
 
 from __future__ import annotations
 
-from manicule.core.errors import ManiculeError
+from manicule.core.errors import ConfigError, ManiculeError
 
 __all__ = [
     "AttachmentTooLargeError",
@@ -25,6 +25,7 @@ __all__ = [
     "RateLimitedError",
     "RemoteError",
     "SessionExpiredError",
+    "SessionMissingError",
     "UntrustedLinkError",
 ]
 
@@ -121,4 +122,27 @@ class SessionExpiredError(ConnectorError):
     browser — and there is no interval a sync can usefully wait; the cursor it is holding
     would expire first (:class:`CursorExpiredError`). Stopping leaves the watermark
     unadvanced, so a re-run after a fresh sign-in resumes rather than starting over.
+    """
+
+
+class SessionMissingError(ConfigError):
+    """Nobody has signed in to this instance in this process's lifetime.
+
+    Distinct from :class:`SessionExpiredError`, and the distinction is the point rather than a
+    taxonomy. An expired session was captured and has aged out; **this one was never captured at
+    all**, which after a restart is the ordinary state and not a fault — sessions live in the
+    server's memory, so a crash, a logout or a reboot ends every one of them.
+
+    A :class:`~manicule.core.errors.ConfigError` rather than a
+    :class:`ConnectorError`, because that is what this was before it had a name of its own and
+    because it is genuinely about the arrangement rather than about the source: nothing was asked
+    of Confluence and Confluence said nothing. Every existing ``except ConfigError`` therefore
+    still catches it.
+
+    **What the separate class buys is the one thing a log line could not.** The scheduler's loop
+    reports every refusal the same way, so "no session" and "the instance was unreachable" read
+    identically at three in the morning — one needs a person at a browser and the other needs
+    nothing at all. :class:`~manicule.app.served.Scheduler` matches on this type, records it as
+    its own state, and says which of the two it was. Matching on the message text would be a
+    guard that breaks when somebody improves the wording.
     """

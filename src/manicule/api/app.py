@@ -1,4 +1,4 @@
-"""Assembling the HTTP application: eleven route groups over one application service.
+"""Assembling the HTTP application: twelve route groups over one application service.
 
 The service is passed in rather than built here, exactly as :func:`manicule.mcp.server.build_server`
 takes one. That is what lets the suites drive the **real** routing, the real dependency
@@ -29,6 +29,19 @@ it is checked here — before routing — because a rule applied per route is a 
 the route somebody added last. The question only arose with the browser surface: the shipped
 posture is loopback with no credential at all, which is precisely the ambient authority a page
 on another origin can spend on the user's behalf.
+
+**MCP is mounted here too, at** :data:`MCP_PATH`, **and it carries the read-only tools only.**
+One process, one port, one bind decision and one address for an operator to remember — a second
+port would double what has to be got right and would need its own answer to every question this
+module already answers once. Mounting it on *this* application is what makes those answers apply
+to it: the middleware above wraps the whole ASGI stack, so the cross-site refusal, the security
+headers and the principal resolution reach ``/mcp`` without being restated there.
+
+What does **not** carry over is the tool surface, and that is the point of it being read-only.
+``tests/api/test_routes.py`` asserts by name that the destructive operations have no route here;
+a mount that offered ``document_delete`` over the same socket would have made that assertion
+true and meaningless on the same day. :mod:`manicule.mcp.serve` decides which tools a transport
+carries, and this asks it rather than deciding again.
 """
 
 from __future__ import annotations
@@ -64,6 +77,7 @@ from manicule.app.bind import is_loopback
 from manicule.config.settings import AuthMode
 from manicule.core.errors import PolicyError
 from manicule.core.version import CORE_VERSION
+from manicule.mcp.serve import surface as mcp_surface
 
 NOT_FOUND = 404
 
@@ -99,11 +113,30 @@ ROUTE_GROUPS = (
     "auth",
     "workbench",
     "websocket-chat",
+    "mcp",
 )
-"""The eleven groups this surface offers, named as data as well as mounted.
+"""The twelve groups this surface offers, named as data as well as mounted.
 
 Here so that "the API offers exactly these" is a test rather than a count somebody keeps in
 their head — the same reason ``manicule.mcp.server`` lists its tool names.
+
+``mcp`` and ``websocket-chat`` are the two that no OpenAPI document describes, so each is
+asserted by driving it rather than by reading the schema. A group an OpenAPI-driven check cannot
+see is exactly the one it would quietly report as present.
+"""
+
+MCP_PATH = "/mcp"
+"""Where MCP answers on this application, and it is a path rather than a second port.
+
+One port means one bind decision, one address in a plist, one thing for an operator to
+remember and one place a firewall rule applies. A second port would need its own answer to
+every question ``manicule.app.bind`` answers here, and the commonest way that goes wrong is
+that it gets a *different* answer — usually the lax one, because the second port is the one
+added in a hurry for a client that could not spawn a process.
+
+The trailing slash matters to clients: the mount answers at ``/mcp/``, and Starlette redirects
+``/mcp`` to it. Both are documented in ``docs/surfaces.md`` §6.1 so nobody has to discover it
+from a 307.
 """
 
 SECURITY_HEADERS = {
@@ -172,6 +205,33 @@ def build_app(
     settings = service.settings
     _require_auth_for_wide_bind(service, bind)
 
+    # Built before the application, because the application needs its lifespan. FastMCP's ASGI
+    # app owns a session manager that has to be started and stopped, and a mount does not run a
+    # sub-application's lifespan — so an app assembled without this line serves an MCP endpoint
+    # that answers every request with "session manager not initialized". Passing it here is what
+    # makes shutting the HTTP server down also close the MCP sessions, which is the last step of
+    # the order `manicule.cli.serving` keeps.
+    mcp = mcp_surface(service, transport="http").server.http_app(
+        path="/",
+        # **Nothing about one call outlives it, and both flags say that in a different way.**
+        #
+        # `stateless_http` builds the protocol session per request and tears it down with the
+        # response, so there is no session identifier, no server-side session table and no
+        # per-connection state of any kind. That is the honest shape for this surface: it is
+        # read-only, it starts nothing long-running, and it sends no server-initiated messages,
+        # so a session would be bookkeeping with nothing in it. It is also the answer to "can
+        # one client see another's state" — there is no state to see, rather than a table with
+        # a lock on it.
+        #
+        # `json_response` answers a call with one JSON body instead of an event stream carrying
+        # one event. Same reason, and it matters twice over at shutdown: an event stream is a
+        # connection a client may hold open indefinitely, which is what
+        # `manicule.api.serve.DRAIN_SECONDS` exists to bound, and a half-read one is a resource
+        # nobody closed. A request/response surface has neither problem.
+        stateless_http=True,
+        json_response=True,
+    )
+
     app = FastAPI(
         title=TITLE,
         version=CORE_VERSION,
@@ -181,6 +241,7 @@ def build_app(
         docs_url="/api/docs",
         openapi_url="/api/openapi.json",
         redoc_url=None,
+        lifespan=mcp.lifespan,
     )
     app.state.service = service
     app.state.proxy_policy = ProxyPolicy.of(settings)
@@ -286,6 +347,11 @@ def build_app(
         routers.append(web_router)
     for router in routers:
         app.include_router(router)
+    # Mounted last, so nothing this application declares can be shadowed by the sub-application's
+    # catch-all. A mount matches every path beneath its prefix, and the prefix is its own —
+    # `/mcp` names no route group above and never will, because a group that collided with it
+    # would be unreachable rather than merely confusing.
+    app.mount(MCP_PATH, mcp)
     return app
 
 
@@ -352,4 +418,12 @@ def _require_auth_for_wide_bind(service: ApplicationService, bind: Bind | None) 
     raise PolicyError(msg)
 
 
-__all__ = ["DESCRIPTION", "ROUTE_GROUPS", "SECURITY_HEADERS", "TITLE", "build_app", "frame_policy"]
+__all__ = [
+    "DESCRIPTION",
+    "MCP_PATH",
+    "ROUTE_GROUPS",
+    "SECURITY_HEADERS",
+    "TITLE",
+    "build_app",
+    "frame_policy",
+]

@@ -33,7 +33,7 @@ per data directory. The pid file stays where #126 put it; it answers a different
 
 .. code-block:: text
 
-    client → server   one line: an Invoke, a Handover or a Forget
+    client → server   one line: an Invoke, a Handover, a Forget or a Held
     server → client   zero or more Progress lines, then exactly one Result line, then EOF
 
 A connection *is* a request, so there is no request id, no multiplexing and no session state to
@@ -77,15 +77,18 @@ if TYPE_CHECKING:
 __all__ = [
     "MAX_FRAME_BYTES",
     "SOCKET_MODE",
+    "AlreadyServingError",
     "ControlServer",
     "Forget",
     "Handover",
+    "Held",
     "Invoke",
     "Progress",
     "ProtocolError",
     "Request",
     "Response",
     "Result",
+    "SocketUnusableError",
     "connect",
     "is_serving",
     "read_request",
@@ -126,6 +129,30 @@ class ProtocolError(ManiculeError):
 
     A :class:`~manicule.core.errors.ManiculeError` so that it reaches a caller as an envelope
     like every other outcome, rather than as a traceback out of a stream reader.
+    """
+
+
+class AlreadyServingError(ProtocolError):
+    """Something is listening where this server was about to.
+
+    **A temporary condition**, and its own class so that a supervisor can be told so. The thing
+    on the other end is a process; it will stop, or somebody will stop it, and the next attempt
+    then succeeds with nothing changed. See :data:`~manicule.cli.serving.EX_TEMPFAIL`.
+    """
+
+
+class SocketUnusableError(ProtocolError):
+    """The runtime directory or the socket is not this user's, or is not private to them.
+
+    **A permanent condition**, and the distinction from :class:`AlreadyServingError` is the whole
+    reason both exist. A directory somebody else owns, a symbolic link where a directory belongs,
+    or a mode granting group or other does not resolve by waiting: it needs somebody to change
+    something. Retrying it every thirty seconds for ever is a supervisor doing the wrong thing
+    confidently, and the exit status is how it is told which of the two it is looking at — see
+    :data:`~manicule.cli.serving.EX_CONFIG`.
+
+    Raised by :func:`_require_private` alone, which is the one place any of those three is
+    decided, so the classification cannot come apart from the check.
     """
 
 
@@ -189,26 +216,28 @@ def _require_private(path: Path, *, what: str) -> None:
     """Refuse a path this user does not own, or that anybody else can reach.
 
     Raises:
-        ProtocolError: It is not ours, or its mode grants anything to group or other.
+        SocketUnusableError: It is not ours, or its mode grants anything to group or other.
+            Permanent, every one of them: each needs somebody to change something rather than
+            somebody to wait.
     """
     try:
         info = path.lstat()
     except OSError as exc:
         msg = f"{what} at {path} could not be read: {exc}"
-        raise ProtocolError(msg) from exc
+        raise SocketUnusableError(msg) from exc
     if stat.S_ISLNK(info.st_mode):
         msg = (
             f"{what} at {path} is a symbolic link. It is refused rather than followed, because "
             f"what it points at is decided by whoever made the link."
         )
-        raise ProtocolError(msg)
+        raise SocketUnusableError(msg)
     if info.st_uid != os.getuid():
         msg = (
             f"{what} at {path} belongs to uid {info.st_uid} and this process is uid "
             f"{os.getuid()}. Refused rather than used: the permissions on it are somebody "
             f"else's to change."
         )
-        raise ProtocolError(msg)
+        raise SocketUnusableError(msg)
     granted = stat.S_IMODE(info.st_mode)
     if granted & 0o077:
         msg = (
@@ -216,7 +245,7 @@ def _require_private(path: Path, *, what: str) -> None:
             f"than its owner. The control socket carries write commands and a live session, so "
             f"it is refused rather than narrowed under you."
         )
-        raise ProtocolError(msg)
+        raise SocketUnusableError(msg)
 
 
 # --- what crosses it --------------------------------------------------------------------------
@@ -306,6 +335,34 @@ class Forget(BaseModel):
         return _line(self.model_dump(mode="json"))
 
 
+class Held(BaseModel):
+    """Which instances are you holding a session for?
+
+    The one question about a credential that a process which is *not* the server needs an answer
+    to, and the one it cannot answer for itself: sessions live in the server's memory, so a
+    ``manicule doctor`` typed at a terminal is looking at an empty vault whatever the server has.
+    Reporting that emptiness as "there is no session" would be a diagnostic that is always
+    alarming and never informative.
+
+    **The reply carries no session value, no length and no digest of one** — only the instance
+    and the account, which are exactly the two fields
+    :meth:`~manicule.app.served.ControlHandler._accept` already answers a hand-off with. A
+    credential does not become safe to echo by being asked for a second time.
+
+    A frame of its own rather than an :class:`Invoke`, because the accept list an ``Invoke``
+    names (:data:`~manicule.app.commands.BINDERS`) is the operations that can be *described as
+    data and run*, and this runs nothing. It is a question about the process, in the same family
+    as the two frames that put a credential there and take it away again.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["held"] = "held"
+
+    def to_line(self) -> bytes:
+        return _line(self.model_dump(mode="json"))
+
+
 class Progress(BaseModel):
     """Something happened that is worth saying before the operation is over.
 
@@ -339,13 +396,14 @@ class Result(BaseModel):
         return _line(self.model_dump(mode="json"))
 
 
-type Request = Invoke | Handover | Forget
+type Request = Invoke | Handover | Forget | Held
 type Response = Progress | Result
 
-_REQUESTS: Mapping[str, type[Invoke] | type[Handover] | type[Forget]] = {
+_REQUESTS: Mapping[str, type[Invoke] | type[Handover] | type[Forget] | type[Held]] = {
     "invoke": Invoke,
     "handover": Handover,
     "forget": Forget,
+    "held": Held,
 }
 
 
@@ -514,8 +572,9 @@ class ControlServer:
         the file is a leftover, and an accepted one means somebody is serving.
 
         Raises:
-            ProtocolError: Something answered. Starting anyway would bind over a live server's
-                path and leave it listening on a socket nothing can reach.
+            AlreadyServingError: Something answered. Starting anyway would bind over a live
+                server's path and leave it listening on a socket nothing can reach. Temporary:
+                that process will stop, or somebody will stop it.
         """
         if not self._path.exists():
             return
@@ -525,7 +584,7 @@ class ControlServer:
                 f"directory: it holds the writer lock, the schedule and any captured session, "
                 f"and a second would take none of them over. Stop it with `manicule stop`."
             )
-            raise ProtocolError(msg)
+            raise AlreadyServingError(msg)
         self._path.unlink(missing_ok=True)
 
     async def aclose(self) -> None:

@@ -726,9 +726,15 @@ def test_forgetting_a_session_says_whether_there_was_one() -> None:
 def test_the_vault_offers_no_way_to_read_a_session_it_was_not_asked_for() -> None:
     """A diagnostic wants to know *whether* there is a session, never what it is.
 
-    ``len`` is the whole of the introspection, deliberately. This is now the only place a live
-    corporate credential exists in the running system, so an accessor that handed back the
-    collection would be the one line a future report, dump or ``doctor`` check would reach for.
+    ``len`` and ``holding`` are the whole of the introspection, deliberately, and the second was
+    added rather than assumed: this is the only place a live corporate credential exists in the
+    running system, so an accessor that handed back the collection would be the one line a future
+    report, dump or ``doctor`` check would reach for.
+
+    ``holding`` reports the instance and the account and stops there — the two fields a hand-off
+    is already acknowledged with. The assertion below is over its **whole rendering**, not over
+    the fields somebody remembered to look at, so an implementation that returned the sessions
+    themselves fails here rather than at the surface that eventually printed them.
     """
     vault = SessionVault()
     asyncio.run(
@@ -744,12 +750,16 @@ def test_the_vault_offers_no_way_to_read_a_session_it_was_not_asked_for() -> Non
 
     assert len(vault) == 1
     public = {name for name in dir(vault) if not name.startswith("_")}
-    assert public == {"describe", "forget", "load", "save"}, (
+    assert public == {"describe", "forget", "holding", "load", "save"}, (
         f"the vault grew a public member: {sorted(public)}. Every one of them is a route to a "
         f"live session, so a new one is a decision rather than a convenience."
     )
     assert "TOP-SECRET-SESSION" not in repr(vault)
     assert "TOP-SECRET-SESSION" not in vault.describe()
+    assert "TOP-SECRET-SESSION" not in repr(vault.holding())
+    assert list(vault.holding().values()) == [SESSION_ACCOUNT], (
+        "holding() reports the account and nothing that could be unwrapped into a credential"
+    )
 
 
 def test_a_session_is_gone_when_the_process_that_held_it_is() -> None:

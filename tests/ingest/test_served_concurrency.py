@@ -7,6 +7,16 @@ keyed per-document lock, the embedding partition in #120 and the glossary lineag
 were built for. #138 proved each of those under staged concurrency *within* one run. This proves
 each again with two runs, started by two different things, overlapping.
 
+**And a third thing, now that one process serves MCP as well: a client reading.** Each of the
+four is proven a third time with an MCP client on the network surface issuing searches
+throughout — see :class:`Reading` and the section at the end. That interleaving is different in
+kind from the other two rather than more of the same: the reads go through the *same event loop*
+and the same ``ApplicationService`` as the syncs, so a guard that held only because the two
+writers were the only things scheduled would come apart here. The reads are also the case where
+a regression would be least visible, because nothing about a search reports that a write went
+wrong beside it — which is why the assertion is always the guard's own, with the reader's answer
+count beside it to show it was genuinely running.
+
 **Nothing here is a fake pipeline.** The guards under test are in the pipeline, so an ingestion
 port that recorded calls would prove nothing about them: :class:`PipelineIngestion` drives the
 real one, and the scheduler and the socket reach it through the real
@@ -22,10 +32,12 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, override
 
 import pytest
+from fastmcp import Client
 
 from manicule.app import control
 from manicule.app.served import ControlHandler, Scheduler
@@ -38,6 +50,7 @@ from manicule.core.sources import DocRef
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
 from manicule.ingest.workers import InProcessRunner
+from tests.api.live import serving
 from tests.app.fakes import FakeBackend
 from tests.fakes import MEDIA_TYPE, HashEmbedder
 from tests.ingest import fakes
@@ -265,6 +278,84 @@ def corpus(count: int, *, prefix: str) -> dict[str, str]:
         f"{prefix}-{number:03d}": f"line one of {number}\nline two of {number}"
         for number in range(count)
     }
+
+
+class Reading:
+    """An MCP client on the network surface, searching in a loop until the block ends.
+
+    The third interleaving. It is a *client* over a real socket rather than a call into the
+    service, because that is what makes it a third scheduling participant: the request arrives on
+    the transport, is handled in the same event loop the two writers are running in, and answers
+    through the same ``ApplicationService`` they are writing through.
+
+    ``answered`` is asserted by every test that uses this, and the reason is the reason every
+    negative assertion needs a control: a reader that failed to connect, or that stopped after
+    its first search, would make "the guard held with a reader running" a statement about no
+    reader at all — and the guard assertions would all still pass.
+    """
+
+    def __init__(self, backend: FakeBackend) -> None:
+        self._backend = backend
+        self._stack = AsyncExitStack()
+        self._task: asyncio.Task[None] | None = None
+        self._answers = asyncio.Semaphore(0)
+        self.answered = 0
+        self.refused: list[str] = []
+        """Any envelope that came back ``ok: false``, so a silent failure is not silent."""
+
+    async def __aenter__(self) -> Reading:
+        live = await self._stack.enter_async_context(serving(self._backend, web=False))
+        client = await self._stack.enter_async_context(live.mcp())
+        # One search before the writers start, so "the reader was connected" is established
+        # rather than hoped for — a connection that failed later is a different fact from one
+        # that never worked.
+        await self._search(client)
+        # That first answer is proof of a connection rather than proof of overlap, so it is
+        # consumed here: everything `answered_while` counts afterwards happened during the run.
+        await self._answers.acquire()
+        self._task = asyncio.create_task(self._loop(client), name="mcp-reader")
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        del exc
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+        await self._stack.aclose()
+
+    async def answered_while(self, count: int, *, patience_s: float = 30.0) -> None:
+        """Return once ``count`` more searches have been answered since this was last called.
+
+        **This is where the overlap becomes an assertion rather than a hope.** Called at a point
+        where the writers are known to be mid-run — parked in a gate, or with both syncs in
+        flight — it returns only when the reader has been answered *during* that, and fails
+        saying how many it managed if it never was. Waiting a fixed time and looking afterwards
+        would pass against a server that answered nothing until the writes had finished.
+        """
+        try:
+            async with asyncio.timeout(patience_s):
+                for _ in range(count):
+                    await self._answers.acquire()
+        except TimeoutError:
+            msg = (
+                f"waited for {count} search(es) to be answered while the writers were running; "
+                f"{self.answered} have been answered in total, and {self.refused} were refused"
+            )
+            raise AssertionError(msg) from None
+
+    async def _loop(self, client: Client[Any]) -> None:
+        while True:
+            await self._search(client)
+
+    async def _search(self, client: Client[Any]) -> None:
+        envelope = (
+            await client.call_tool("search", {"query": "retry", "limit": 1})
+        ).structured_content or {}
+        if envelope.get("ok"):
+            self.answered += 1
+            self._answers.release()
+        else:
+            self.refused.append(str(envelope.get("error")))
 
 
 # --- progress, from the real pipeline ---------------------------------------------------------
@@ -606,3 +697,221 @@ async def test_glossary_lineage_is_written_inside_the_guarded_sequence_across_tw
     for document in store.documents.values():
         assert store.glossary[document.id], "a document stating a definition recorded none"
         assert store.glossary_lineage_by_id[document.id] == ingestion.pipeline.glossary_lineage
+
+
+# --- the same four, with an MCP client reading throughout -----------------------------------------
+
+
+async def test_one_document_is_never_written_twice_while_an_mcp_client_reads(
+    socket_for: Callable[[], Path],
+) -> None:
+    """The keyed per-document lock, with a third participant in the loop.
+
+    The corpus is one document and the two runs carry different bytes for it, exactly as the
+    two-writer version above — so every arrival at the capacity-one gate is an arrival at *that*
+    document's write sequence. What is added is a client searching the whole time, which is the
+    scheduling pressure a served manicule actually has and the two-writer test does not.
+    """
+    inside = fakes.Gate(capacity=1, opened=True)
+    fetched = fakes.Gate()
+
+    class Watching(fakes.PassThrough):
+        name = "watching"
+
+        @override
+        async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+            del document
+            async with inside.holding():
+                await asyncio.sleep(0)
+            return chunks
+
+    service, _, _ = served(
+        {
+            "scheduled": GatedConnector(
+                {"the-one-page": "as the schedule found it"}, name="handbook", gate=fetched
+            ),
+            "proxied": GatedConnector(
+                {"the-one-page": "as the command line found it"}, name="handbook", gate=fetched
+            ),
+        },
+        middleware=(Watching(),),
+    )
+
+    async with (
+        Reading(_backend(service)) as reader,
+        Overlap(service, socket_for(), release=_open_both(fetched, inside)) as both,
+    ):
+        both.start_scheduled()
+        both.start_proxied()
+        await fetched.wait_for(2)
+        # Both writers are parked between fetch and the write sequence. Anything the reader
+        # is answered now is answered *during* the interleaving under test.
+        await reader.answered_while(2)
+        fetched.open()
+        answered = await both.proxied_result()
+        await both.scheduled_finished()
+
+    assert answered["ok"] is True
+    assert inside.entries == 2, "the two runs did not both reach the write sequence"
+    assert inside.peak == 1, "one document was inside its write sequence twice at once"
+    _reader_was_running(reader)
+
+
+async def test_a_stale_guarded_write_still_loses_while_an_mcp_client_reads(
+    socket_for: Callable[[], Path],
+) -> None:
+    """#119's compare-and-swap, with a reader in the loop.
+
+    The same two of the guard's three points as the two-writer version: the record write's
+    ``expected`` and the ``indexed`` write's. The third — the guarded publish at the head of
+    ``_commit`` — is unreachable from inside one process and has no test here either, which that
+    version's docstring says at length and this one does not repeat.
+    """
+    connector = fakes.ObservedConnector({"page": "first version\nsecond line"}, name="handbook")
+    service, ingestion, store = served(
+        {"scheduled": connector, "proxied": connector}, fetch_concurrency=2, parse_workers=2
+    )
+
+    async with (
+        Reading(_backend(service)) as reader,
+        Overlap(service, socket_for()) as both,
+    ):
+        both.start_scheduled()
+        await both.scheduled_finished()
+        stored = await store.find_document("handbook", "page")
+        assert stored is not None
+        stale = stored.revision
+
+        connector.documents["page"] = "newer version from the source\nsecond line"
+        both.start_proxied()
+        await reader.answered_while(2)
+        assert (await both.proxied_result())["ok"] is True
+
+        outcomes = await ingestion.pipeline.ingest_raw(
+            RawDocument(
+                source_id="page",
+                uri="memory://page",
+                media_type=MEDIA_TYPE,
+                content="a re-parse of the old bytes",
+            ),
+            source="handbook",
+            force=True,
+            expected=stale,
+        )
+
+    assert outcomes[0].superseded, "the stale write was not refused"
+    current = await store.find_document("handbook", "page")
+    assert current is not None
+    assert current.content_hash == content_hash("newer version from the source\nsecond line")
+    _reader_was_running(reader)
+
+
+async def test_the_embedder_is_never_re_entered_while_an_mcp_client_reads(
+    socket_for: Callable[[], Path],
+) -> None:
+    """#120's partition, with the reader adding work to the loop that is not embedding.
+
+    The reader is the interesting part rather than a bystander: it is scheduled between the
+    embedder's awaits, which is precisely the window a lock that yielded without excluding would
+    let a second caller into. :class:`~tests.ingest.fakes.GatedEmbedder` raises on re-entry, so
+    one overlap fails the run rather than being averaged away.
+    """
+    embedder = fakes.GatedEmbedder()
+    service, _, store = served(
+        {
+            "scheduled": fakes.ObservedConnector(corpus(20, prefix="sched"), name="scheduled"),
+            "proxied": fakes.ObservedConnector(corpus(20, prefix="prox"), name="proxied"),
+        },
+        embedder=embedder,
+        fetch_concurrency=4,
+        parse_workers=3,
+    )
+
+    async with (
+        Reading(_backend(service)) as reader,
+        Overlap(service, socket_for(), release=embedder.gate.open) as both,
+    ):
+        both.start_scheduled()
+        both.start_proxied()
+        await embedder.gate.wait_for(1)
+        # One caller is held inside the model, with twenty more documents behind it on each
+        # side. A search answered here is answered while the embedder is occupied.
+        await reader.answered_while(2)
+        embedder.gate.open()
+        answered = await both.proxied_result()
+        await both.scheduled_finished()
+
+    assert answered["ok"] is True
+    assert len(store.documents) == 40, "both runs did not finish, so overlap was never offered"
+    assert embedder.gate.entries > 2, "the embedder was entered too few times to prove anything"
+    assert embedder.overlaps == 0, "the embedding lock had one holder at a time"
+    _reader_was_running(reader)
+
+
+async def test_glossary_lineage_stays_inside_the_guarded_sequence_while_an_mcp_client_reads(
+    socket_for: Callable[[], Path],
+) -> None:
+    """#122's write, with a reader in the loop.
+
+    A document with entries and no recorded detector is the state versioning them exists to make
+    unreachable. Entries and the claim about what produced them are one transaction, and three
+    participants in one loop is where a write that had drifted outside the guarded sequence would
+    show it.
+    """
+    store = fakes.MemoryGlossaryStore()
+    definitions = {
+        f"page-{n}": f"NOW - Network Operations Workspace {n}\nThe scheduler restarts nightly."
+        for n in range(10)
+    }
+    service, ingestion, _ = served(
+        {
+            "scheduled": fakes.ObservedConnector(dict(definitions), name="scheduled"),
+            "proxied": fakes.ObservedConnector(dict(definitions), name="proxied"),
+        },
+        store=store,
+        fetch_concurrency=4,
+        parse_workers=2,
+    )
+
+    async with (
+        Reading(_backend(service)) as reader,
+        Overlap(service, socket_for()) as both,
+    ):
+        both.start_scheduled()
+        both.start_proxied()
+        await reader.answered_while(2)
+        answered = await both.proxied_result()
+        await both.scheduled_finished()
+
+    assert answered["ok"] is True
+    assert ingestion.pipeline.glossary_lineage is not None
+    for document in store.documents.values():
+        assert store.glossary[document.id], "a document stating a definition recorded none"
+        assert store.glossary_lineage_by_id[document.id] == ingestion.pipeline.glossary_lineage
+    _reader_was_running(reader)
+
+
+def _backend(service: ApplicationService) -> FakeBackend:
+    """The fake this service was built over, for the reader to be served from.
+
+    Through the public accessor rather than the attribute the helper set, because ``backend`` is
+    what the service itself offers and a test reaching past it would be reading a different
+    object from the one under test.
+    """
+    backend = service.backend
+    assert isinstance(backend, FakeBackend)
+    return backend
+
+
+def _reader_was_running(reader: Reading) -> None:
+    """The control every one of the four needs.
+
+    Without it, a reader that failed to connect makes "the guard held with a client reading" a
+    statement about no client at all — and every guard assertion beside it would still be green,
+    because they are statements about the writers.
+    """
+    assert reader.refused == [], f"the reader's searches were refused: {reader.refused}"
+    assert reader.answered > 1, (
+        f"the reader answered {reader.answered} search(es), which is not enough to have been "
+        f"running alongside the writes rather than only before them"
+    )

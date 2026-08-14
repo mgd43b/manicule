@@ -1447,7 +1447,7 @@ def completion(
 def start(
     *,
     mcp_only: Annotated[
-        bool, typer.Option("--mcp-only", help="Serve MCP and nothing else.")
+        bool, typer.Option("--mcp-only", help="Serve MCP alone, without the API or the UI.")
     ] = False,
     transport: Annotated[str, typer.Option(help="stdio or http.")] = "stdio",
     host: Annotated[str | None, typer.Option(help="Bind address. Loopback unless widened.")] = None,
@@ -1461,18 +1461,24 @@ def start(
     ] = False,
     no_web: Annotated[bool, typer.Option("--no-web", help="Do not serve the web UI.")] = False,
 ) -> None:
-    """Serve manicule: the HTTP API over a socket, or MCP.
+    """Serve manicule: the HTTP API, the browser surface and MCP together, or MCP alone.
 
     ``stdio`` is the default and opens no socket at all — and it is always MCP, because the
-    HTTP API has no stdio form. ``--transport http`` serves the **HTTP API**; add
-    ``--mcp-only`` to serve the MCP protocol over that socket instead.
+    HTTP API has no stdio form. ``--transport http`` serves the **HTTP API, the browser surface
+    and MCP** on one port, with MCP at ``/mcp/``; add ``--mcp-only`` to serve MCP alone there.
+
+    **MCP over a socket carries the read-only tools only**, whichever of those two modes you
+    are in. Indexing, deleting, syncing, writing configuration and enabling a plugin are not
+    registered on it — over stdio they are unreachable from a network by construction, and a
+    socket has to replace that property rather than assume it. They stay on this command line,
+    on stdio, and on the control socket a served manicule answers write commands on.
 
     Either way the address goes through one bind policy: loopback unless a non-loopback host
     is configured **and** ``--allow-public-bind`` is passed **and** authentication is on. Any
     one missing is a refusal naming which.
 
     ``--no-web`` leaves the browser surface unmounted, so every ``/ui`` path answers 404 and
-    the process serves only the JSON API. It applies to ``--transport http`` without
+    the process serves the JSON API and MCP. It applies to ``--transport http`` without
     ``--mcp-only``, which is the only mode that has a browser surface to suppress.
     """
     from manicule.cli.serving import serve_forever  # noqa: PLC0415 - only this command serves

@@ -17,6 +17,7 @@ import pytest
 from manicule.app.served import Scheduler
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
+from manicule.connectors.errors import ConnectorError, SessionMissingError
 from tests.app.fakes import FakeBackend, FakeIngestion
 
 if TYPE_CHECKING:
@@ -221,6 +222,104 @@ async def test_a_failing_sync_does_not_stop_the_schedule() -> None:
         await scheduler.aclose()
 
     assert scheduler.scheduled["nowhere"].runs == 0
+
+
+async def test_a_missing_session_is_reported_as_itself_rather_than_as_a_failed_sync(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The failure a restart causes, and the one most likely to be misread at three in the morning.
+
+    A session lives in the server's memory, so launchd restarting the process ends it and the
+    next scheduled sync cannot authenticate. Reported like every other refusal it reads exactly
+    like the instance being unreachable — and the two need opposite things: one needs a person at
+    a browser and the other needs nothing at all.
+
+    So three things are asserted, and each is a different way of being told. The sentence says
+    the *server* holds no session; it says the instance was not contacted, which is what
+    distinguishes this from an outage; and it names the command that fixes it, with the source's
+    own name in it rather than a placeholder somebody has to substitute.
+    """
+    service, ingestion = service_with({"handbook": source(schedule_s=600)})
+    ingestion.failure = SessionMissingError("no Confluence browser session is held for the site")
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    said = capsys.readouterr().err
+    assert "holds no Confluence session" in said, said
+    assert "has not been contacted" in said, (
+        f"the message does not rule out an outage at the instance, which is the other thing this "
+        f"could be:\n{said}"
+    )
+    assert "manicule connector login handbook --browser" in said, said
+
+
+async def test_the_source_waiting_to_be_signed_in_to_is_a_state_and_not_only_a_log_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recorded on the schedule, so the server can be asked rather than have its log read.
+
+    A counter would say "it failed nine times"; what an operator needs is "it is still waiting",
+    which is a state and stays true until somebody signs in. Cleared by a run that succeeds, and
+    that half is asserted too — a flag nothing clears is a flag that means "at some point".
+    """
+    service, ingestion = service_with({"handbook": source(schedule_s=600)})
+    ingestion.failure = SessionMissingError("no Confluence browser session is held")
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        record = scheduler.scheduled["handbook"]
+        assert record.awaiting_sign_in is True
+        assert record.failures == 1, "it is a failure as well as a state"
+
+        ingestion.failure = None
+        await clock.tick()
+        assert record.awaiting_sign_in is False, "a run that worked left the flag raised"
+        assert record.runs == 1
+    finally:
+        await scheduler.aclose()
+    capsys.readouterr()
+
+
+async def test_an_unreachable_instance_is_not_reported_as_a_missing_session(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The control, without which "it says the right thing" is "it says that about everything".
+
+    A connector error is what an instance that is down produces. It has to keep the ordinary
+    reporting and must not raise :attr:`~manicule.app.served.ScheduledSource.awaiting_sign_in`,
+    because sending somebody to open a browser over a network outage is worse than saying
+    nothing: they do it, it works, and the sync fails again for the reason nobody looked at.
+    """
+    service, ingestion = service_with({"handbook": source(schedule_s=600)})
+    ingestion.failure = ConnectorError("the instance answered 503")
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert scheduler.scheduled["handbook"].awaiting_sign_in is False
+    assert scheduler.scheduled["handbook"].failures == 1
+    said = capsys.readouterr().err
+    assert "503" in said, said
+    assert "connector login" not in said, (
+        f"an instance that is down sent the operator to a browser:\n{said}"
+    )
 
 
 async def test_stopping_the_scheduler_leaves_no_task_running() -> None:

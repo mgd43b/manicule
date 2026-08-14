@@ -215,8 +215,12 @@ knowing:
 is still the ordinary way to run it. `manicule start --transport http` serves the HTTP API
 ([#11](https://github.com/mgd43b/manicule/issues/11)) on `security.transport.port`, 8765 by
 default, **and the browser surface at `/ui`**
-([#12](https://github.com/mgd43b/manicule/issues/12)) on the same socket. There is no separate
-UI server and no second port.
+([#12](https://github.com/mgd43b/manicule/issues/12)) **and MCP at `/mcp/`** on the same socket.
+There is no separate UI server, no separate MCP server and no second port.
+
+MCP served that way carries the **read-only tools only** — every mutating tool is absent from it
+rather than refused on it, for the reason `docs/surfaces.md` §6.1 gives. Over stdio, where one
+client talks to one process down a pipe, the whole surface is offered.
 
 The browser surface is for the loopback, single-operator installation. A browser cannot attach a
 header to a page load and this build has no session cookie, so with `security.auth.mode` set to
@@ -467,6 +471,92 @@ a stopped loop.
 
 `schedule_s` existed before and was deleted in #98, because it configured a scheduler that did
 not exist and would have been cited as evidence that one did. It is back because one does.
+
+### 6.3 Running it under launchd
+
+`tools/launchd/com.manicule.server.plist` is a template. Four paths in it contain `REPLACE` —
+the `manicule` executable, the two log files and the working directory — so `grep REPLACE` on
+your copy is how you know you have finished editing it. Copy, edit, check, load:
+
+```bash
+mkdir -p ~/Library/Logs/manicule
+cp tools/launchd/com.manicule.server.plist ~/Library/LaunchAgents/
+$EDITOR ~/Library/LaunchAgents/com.manicule.server.plist   # `which manicule` gives the first
+grep REPLACE ~/Library/LaunchAgents/com.manicule.server.plist   # silence means it is finished
+plutil -lint ~/Library/LaunchAgents/com.manicule.server.plist   # and that it is still a plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.manicule.server.plist
+```
+
+An **absolute** path to `manicule` matters more than it looks: launchd does not read your
+shell's profile, so `PATH` is the system default and a bare `manicule` is a job that fails to
+start with nothing useful in the log. So does `WorkingDirectory` — launchd's default is `/`, and
+a relative `[connectors.<name>] root` would resolve against the root of the disk.
+
+`launchctl print gui/$(id -u)/com.manicule.server` says whether it is running and what it last
+exited with. To stop it: `launchctl bootout gui/$(id -u)/com.manicule.server`.
+
+**A user agent, not a system daemon.** manicule installs per user with no privileged component:
+the data directory is in your home, the sessions are yours, and the control socket is `0600`
+owned by you. A root daemon would put a verbatim copy of everything you indexed (§1.1) behind an
+account you do not log in as.
+
+**Restarting does not fight the lock, and a refusal says which kind it is.** The data directory
+has one writer (§2), so during a restart the outgoing process may still hold it when the incoming
+one starts. That is not a fault and it fixes itself. A wrong setting is a fault and does not. So
+`manicule serve` exits with one of two statuses:
+
+| Status | Meaning | What is in the way | What to do |
+|---|---|---|---|
+| **75** `EX_TEMPFAIL` | try again later | another manicule holds the data directory, or something answers on the control socket | nothing — it clears when that process goes |
+| **78** `EX_CONFIG` | somebody has to fix it | a bind this configuration forbids, a plugin that will not import, a data directory that cannot be opened, a runtime directory another account owns or others can read | read the message; it names the setting or the path |
+
+**launchd restarts the job either way, and it is worth being exact about that** because the
+opposite is widely assumed. `launchd.plist(5)`'s `KeepAlive` conditions are `SuccessfulExit`,
+`PathState`, `OtherJobEnabled` and `Crashed` — **none of them keys on an exit status** — so there
+is no way to tell launchd "stop retrying this one". What bounds the loop is `ThrottleInterval`:
+one attempt every thirty seconds rather than a spin, for both.
+
+The status is therefore a *diagnostic*. `launchctl print gui/$(id -u)/com.manicule.server` reports
+the last exit status, so a service that keeps coming back tells you in one line whether it is
+waiting for a process to let go (75, and it will stop on its own) or waiting for you (78, and it
+will not). A repeating 78 with no repair is a server that will never come up; the log line beside
+it names the setting.
+
+A claim you will find repeated elsewhere — that launchd declines to restart a job exiting
+`EX_CONFIG` — is not in the manual page, and nothing here depends on it.
+
+The lock itself needs no cleanup. It is an `flock` held by an open file description, so the
+kernel releases it however the process died — including `SIGKILL` and a power cut. The lock
+*file* is left behind and is a diagnostic rather than a lock; nothing has to delete it.
+
+**A restart signs you out, and that is the design rather than a bug.** A Confluence session lives
+in the server's memory and nowhere else, so a crash, a logout or a reboot ends it. What manicule
+guarantees is that you find out in the two places you would look rather than from a sync that
+quietly stopped working:
+
+- **The scheduler says so, in its own sentence.** A scheduled sync of a source with no session
+  does not report a failure that reads like the instance being down. It says the server holds no
+  session, that the instance has not been contacted, that this is expected after a restart, and
+  it names `manicule connector login <name> --browser`.
+- **`doctor` reports it.** The `sessions` check asks the running server — over the control
+  socket, because a `doctor` typed at a terminal is a different process and holds no sessions —
+  and reports `degraded` naming the source and the same command. It also tells the two apart:
+  no server at all is its own state with its own remedy.
+
+So the morning after a reboot, `manicule doctor` is enough:
+
+```text
+sessions   degraded   the manicule server holds no Confluence session for 'handbook', so the
+                      next scheduled sync of that source stops without contacting the instance.
+                      … Sign in again with `manicule connector login handbook --browser`.
+```
+
+**Stopping it.** `launchctl bootout` sends `SIGTERM`, and manicule handles it itself rather than
+letting the HTTP server handle it: the scheduler stops first so no new sync starts, whatever was
+syncing drains its ingest stages within `ingest.shutdown_grace_s`, the control socket waits for
+the write commands already in flight, and the MCP sessions and the HTTP server close last. A
+second `SIGTERM` — or a second `Ctrl-C` — stops waiting. `docs/surfaces.md` §6.2 has the order
+and why it is that order.
 
 ## 7. Still open
 

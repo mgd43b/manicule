@@ -1368,6 +1368,7 @@ class ApplicationService:
         checks.append(await self._index_check())
         checks.append(await self._glossary_check())
         checks.append(await self._connectors_check())
+        checks.append(await self._sessions_check())
         checks.append(await self._document_identity_check())
         checks.append(await self._document_content_check())
         checks.append(await self._wiki_provenance_check())
@@ -1660,6 +1661,162 @@ class ApplicationService:
             # permissions check sets both and this is the other check with a command to give.
             remedy=f"manicule document list --source {first}",
         )
+
+    async def _sessions_check(self) -> r.Check:
+        """Whether the server holds a Confluence session for every source that needs one.
+
+        **The check a restart makes necessary.** A session lives in the server's memory and
+        nowhere else, so launchd restarting the process — a crash, a logout, a reboot — ends every
+        one of them, and the next scheduled sync fails to authenticate at whatever hour the
+        schedule comes round. Before this, the only trace of that was a line on the server's
+        stderr; ``doctor`` reported a healthy installation, because from every angle it looked at,
+        it was one.
+
+        **It asks the server rather than answering for itself, and that is the whole difficulty.**
+        ``manicule doctor`` runs in the process somebody typed it in — the operation is read-only,
+        so it takes no lock and is not proxied — and that process holds no sessions and never
+        will. Reading its own vault would report "no session" always: alarming, never
+        informative, and quickly ignored. So the question goes over the control socket to the
+        process that has the answer.
+
+        Except when this *is* that process. Served manicule answers ``doctor`` over MCP and over
+        the HTTP route, and there the vault in front of it is the one the syncs read, so it is
+        read directly. The two are told apart by which vault holds something, which needs no flag
+        and no second source of truth: nothing but a server ever holds a session, so a non-empty
+        vault means this process is the server. A *server holding none* — the case this check is
+        for — falls through to the socket and is answered, correctly, by itself.
+
+        Four states, and none of them is ``failing``: nothing is broken, and a corpus that syncs
+        by token or by filesystem is unaffected. A session that has to be re-taken is a thing to
+        do rather than a fault to repair, which is the reading
+        :meth:`_connectors_check` applies for the same reason.
+        """
+        from manicule.connectors.config import (  # noqa: PLC0415 - no HTTP stack at import
+            CONNECTOR_NAME,
+            AuthMethod,
+            ConfluenceConfig,
+        )
+        from manicule.connectors.sessions import default_store, instance_key  # noqa: PLC0415
+
+        wanted: dict[str, str] = {}
+        for name, configured in sorted(self.settings.connectors.items()):
+            if configured.type != CONNECTOR_NAME or not configured.enabled:
+                continue
+            try:
+                config = ConfluenceConfig.model_validate(configured.options)
+            except ValidationError:
+                # Configuration that will not validate is `_configuration_check`'s finding and
+                # not this one's. Reporting it twice, in different words, sends an operator to
+                # fix a session for a source whose real problem is a setting.
+                continue
+            if config.auth_method is AuthMethod.BROWSER_SESSION:
+                wanted[name] = instance_key(config.base_url)
+        if not wanted:
+            return r.Check(
+                name="sessions",
+                state="ok",
+                detail="no configured source authenticates with a Confluence browser session",
+                facts={"sources": []},
+            )
+
+        held = default_store().holding()
+        where = "this process, which holds them"
+        if not held:
+            asked = await self._sessions_from_the_server()
+            if asked is None:
+                return r.Check(
+                    name="sessions",
+                    state="degraded",
+                    detail=(
+                        f"{_listed(wanted)} authenticate(s) with a Confluence browser session, "
+                        f"and no manicule server is running to hold one. Nothing is synced on a "
+                        f"schedule while there is no server. Start one with `manicule serve`, "
+                        f"then sign in with "
+                        f"`manicule connector login {sorted(wanted)[0]} --browser`."
+                    ),
+                    facts=cast(
+                        "dict[str, JsonValue]",
+                        {"sources": sorted(wanted), "held": [], "server": False},
+                    ),
+                    remedy="manicule serve",
+                )
+            held, where = asked, "the running server, over its control socket"
+
+        missing = sorted(name for name, key in wanted.items() if key not in held)
+        facts = cast(
+            "dict[str, JsonValue]",
+            {
+                "sources": sorted(wanted),
+                # The instances a session is held for, and never a cookie: this is the fact a
+                # machine reading `--json` wants, and the account is in `detail` for the person
+                # who wants to know *whose* session is signed in.
+                "held": sorted(held),
+                "missing": missing,
+                "server": True,
+                "read_from": where,
+            },
+        )
+        if missing:
+            first = missing[0]
+            return r.Check(
+                name="sessions",
+                state="degraded",
+                detail=(
+                    f"the manicule server holds no Confluence session for {_listed(missing)}, so "
+                    f"the next scheduled sync of {'it' if len(missing) == 1 else 'each'} stops "
+                    f"without contacting the instance. This is what a restart looks like — "
+                    f"sessions live in the "
+                    f"server's memory and do not survive one — rather than a fault, and it is "
+                    f"not an outage at the instance: nothing has been asked of it. Sign in again "
+                    f"with `manicule connector login {first} --browser`; manicule never asks for "
+                    f"the password and never sees it."
+                ),
+                facts=facts,
+                remedy=f"manicule connector login {first} --browser",
+            )
+        signed_in = ", ".join(
+            f"{name} as {held[key] or 'an unnamed account'}" for name, key in sorted(wanted.items())
+        )
+        return r.Check(
+            name="sessions",
+            state="ok",
+            detail=f"a Confluence session is held for {signed_in}, read from {where}",
+            facts=facts,
+        )
+
+    async def _sessions_from_the_server(self) -> dict[str, str] | None:
+        """What the running server says it is holding, or ``None`` when there is no server.
+
+        Every failure reaching a socket reads as "no server", and that is deliberate rather than
+        swallowed: a socket that is there and unusable, a server one version behind that does not
+        know the frame, a connection that dies — the operator's next step in all of them is the
+        same as for a server that is not running, and ``manicule connector sync`` already reports
+        the unusable-socket case in its own words with its own remedy. A diagnostic producing
+        four sentences here would be four sentences for one thing to do.
+        """
+        from manicule.app import control  # noqa: PLC0415 - only this check crosses the socket
+
+        try:
+            path = control.socket_path(self.settings.data_dir)
+            if not control.is_serving(path):
+                return None
+            answered = await control.connect(path, control.Held(), on_progress=_ignored)
+        except (ManiculeError, ValueError, OSError):
+            return None
+        data = answered.get("data")
+        if not answered.get("ok") or not isinstance(data, dict):
+            return None
+        rows = data.get("held")
+        if not isinstance(rows, list):
+            return None
+        held: dict[str, str] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            base_url = row.get("base_url")
+            if isinstance(base_url, str):
+                held[base_url] = _text(row.get("account"))
+        return held
 
     async def _document_identity_check(self) -> r.Check:
         """Documents keyed on where they sit while the file beside them declares a page id.
@@ -4511,6 +4668,25 @@ def _millis(started: float) -> int:
 
 def _severity(state: r.CheckState) -> int:
     return {"ok": 0, "degraded": 1, "failing": 2, "unknown": 1}.get(state, 1)
+
+
+def _listed(names: Iterable[str]) -> str:
+    """Source names in a sentence, sorted, quoted, comma separated.
+
+    Sorted so that a diagnostic reads the same twice running, which matters when somebody is
+    comparing two ``doctor`` outputs to see what changed.
+    """
+    return ", ".join(repr(name) for name in sorted(names))
+
+
+def _ignored(message: str) -> None:
+    """A progress callback for a request that cannot report any.
+
+    Named rather than written as a lambda at the call site, because a lambda that discards its
+    argument reads as an oversight and this is a statement: a ``Held`` frame is answered from a
+    dictionary, so there is nothing for the server to say on the way.
+    """
+    del message
 
 
 def _parse_value(value: str) -> JsonValue:

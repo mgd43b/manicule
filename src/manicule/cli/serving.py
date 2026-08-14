@@ -1,34 +1,98 @@
 """Starting and stopping the server from the command line.
 
-Two things happen here that do not happen anywhere else, and both are worth keeping in one
-place: the bind decision is *printed before it is used*, so an operator sees where a process
-is about to listen rather than finding out from a port scan; and the running process records
-itself, so ``stop`` has something to stop.
+Three things happen here that do not happen anywhere else, and each is worth keeping in one
+place: the bind decision is *printed before it is used*, so an operator sees where a process is
+about to listen rather than finding out from a port scan; the running process records itself, so
+``stop`` has something to stop; and **this is where the shutdown order lives**.
+
+**The order, once, in one function.** A served manicule is four things running at the same time
+and they have to stop in a stated sequence, because each step's work is what the next step must
+not interrupt:
+
+1. **The scheduler**, so no new sync starts. Canceling a loop cancels the sync it was inside.
+2. **The ingest stages** of whatever was running, which drain within ``ingest.shutdown_grace_s``
+   (#138). Not a separate call: it is what a canceled run does, and it is listed because a
+   reader has to know that step 1 is not instantaneous and why waiting is correct.
+3. **The control socket**, whose ``aclose`` waits for the write commands already in flight
+   (#139) — each one an operator typed and is watching.
+4. **The MCP sessions and the HTTP server**, together and last, because one lifespan owns both:
+   shutting the transport down runs the application's lifespan, which closes the MCP session
+   manager. Bounded by :data:`~manicule.api.serve.DRAIN_SECONDS`, because an attached MCP client
+   holding a stream open is entitled to keep holding it.
+
+Steps 1 to 3 are :meth:`~manicule.app.served.Serving.aclose`. Step 4 is here, after it, which is
+why the transport is a task this function stops rather than a call it awaits.
+
+**A second interrupt cancels the wait.** The first asks for all of the above; the second says the
+operator is no longer willing to wait for it, and it takes effect on whichever step is in
+progress.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import signal
 from typing import TYPE_CHECKING, Any, cast
 
 from manicule.app.bind import is_loopback
-from manicule.app.control import ControlServer, ProtocolError, socket_path
+from manicule.app.control import AlreadyServingError, ControlServer, ProtocolError, socket_path
 from manicule.app.daemon import Running, read_pidfile, stop_server, write_pidfile
 from manicule.app.dispatch import error_info
 from manicule.app.results import Envelope, ServerAddress, failed, succeeded
 from manicule.app.runtime import Runtime
-from manicule.app.served import ControlHandler, Scheduler, Serving
+from manicule.app.served import ControlHandler, Scheduler, Serving, announce
 from manicule.app.service import ApplicationService
 from manicule.cli import render
 from manicule.config.loader import load_settings
 from manicule.connectors.sessions import SESSIONS
-from manicule.core.errors import ManiculeError
+from manicule.core.errors import InstanceLockedError, ManiculeError
 from manicule.mcp.serve import address_for, serve
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Awaitable, Callable, Generator, Mapping
 
     from manicule.mcp.serve import Transport
+
+EX_TEMPFAIL = 75
+"""The exit status for a refusal that will clear on its own: **try again later**.
+
+``EX_TEMPFAIL`` from ``sysexits.h``, whose stated meaning is exactly this one. Two conditions
+earn it, and both are somebody else's process being where this one wants to be:
+
+* :class:`~manicule.core.errors.InstanceLockedError` — another manicule holds the data
+  directory. During an ordinary restart the outgoing process may still hold it for a moment.
+* :class:`~manicule.app.control.AlreadyServingError` — something answers on the control socket.
+
+Neither needs anybody to change anything. The process on the other side stops, or an operator
+stops it, and the next attempt succeeds with nothing edited.
+"""
+
+EX_CONFIG = 78
+"""The exit status for a refusal that will be identical next time: **somebody has to fix it**.
+
+``EX_CONFIG`` from ``sysexits.h``. Everything that is not one of :data:`EX_TEMPFAIL`'s two
+conditions: a bind this configuration forbids, a plugin that will not import, a data directory
+that cannot be opened, and :class:`~manicule.app.control.SocketUnusableError` — a runtime
+directory owned by somebody else or readable by them. Waiting changes none of it.
+
+**What a supervisor does with these two, said exactly, because the tempting claim is false.**
+``launchd`` has no ``KeepAlive`` condition that keys on an exit status: ``launchd.plist(5)``
+offers ``SuccessfulExit``, ``PathState``, ``OtherJobEnabled`` and ``Crashed``, and that is the
+whole list. With ``KeepAlive`` true it restarts the job whichever of these it exited with, and
+``ThrottleInterval`` is what keeps that to one attempt every thirty seconds rather than a spin.
+
+So the status is a **diagnostic rather than a lever**, and that is what it is for: ``launchctl
+print`` reports the last exit status, so an operator looking at a service that keeps coming back
+can tell in one line whether it is waiting for a process to let go or waiting for them.
+``docs/deployment.md`` §6.3 says which to do about each. A widely repeated claim that ``launchd``
+declines to restart a job exiting ``EX_CONFIG`` is **not** documented in the manual page on any
+machine this was written against, so nothing here depends on it.
+
+Separate from :data:`EX_TEMPFAIL` rather than folded into one non-zero status, because
+"the previous server has not finished letting go" and "the runtime directory belongs to another
+account" produce the same restart loop and need opposite responses.
+"""
 
 
 def serve_forever(
@@ -48,10 +112,16 @@ def serve_forever(
     not asked for three separate times — happens here, before a socket exists, and is
     reported the same way every other failure is.
 
-    ``--transport http`` serves the **HTTP API**; ``--mcp-only`` serves the MCP protocol over
-    the same transport instead. ``stdio`` is MCP whatever else was asked for, because the HTTP
-    API has no stdio form — and it is the default, so the ordinary way of running manicule
-    still opens no socket at all.
+    ``--transport http`` serves the **HTTP API, the browser surface and MCP together**, on one
+    port; ``--mcp-only`` serves MCP alone over that socket. ``stdio`` is MCP whatever else was
+    asked for, because the HTTP API has no stdio form — and it is the default, so the ordinary
+    way of running manicule still opens no socket at all.
+
+    Returns:
+        ``0`` on a clean stop; :data:`EX_TEMPFAIL` for a refusal that will clear on its own —
+        another process holds the data directory or answers on the control socket;
+        :data:`EX_CONFIG` for one that will not, which is every other refusal; ``2`` for a
+        transport that does not exist; and ``130`` for ``Ctrl-C`` on the stdio path.
     """
     if transport not in {"stdio", "http"}:
         out = render.console(stderr=True)
@@ -93,9 +163,18 @@ async def _serve(
     try:
         runtime = Runtime.open(**overrides)
         runtime.acquire()
-    except (ManiculeError, ValueError, OSError) as exc:
+    except InstanceLockedError as exc:
+        # Named ahead of the general clause and given its own status, because this is the one
+        # refusal that fixes itself: the process holding the directory is on its way out, or an
+        # operator will stop it, and the next attempt succeeds with nothing changed. See
+        # :data:`EX_TEMPFAIL`.
         _report(failed("start", "unknown", error_info(exc)), json_output)
-        return 1
+        return EX_TEMPFAIL
+    except (ManiculeError, ValueError, OSError) as exc:
+        # Configuration that will not load, a plugin that will not import, a data directory that
+        # cannot be opened. None of them is different thirty seconds later.
+        _report(failed("start", "unknown", error_info(exc)), json_output)
+        return EX_CONFIG
     async with runtime:
         service = ApplicationService(runtime)
         api = transport == "http" and not mcp_only
@@ -112,8 +191,11 @@ async def _serve(
                 )
             )
         except ManiculeError as exc:
+            # The bind policy's refusal, and it is the clearest permanent one there is: a
+            # non-loopback host without the flag or without authentication is refused by
+            # configuration, and configuration is identical on the next attempt.
             _report(failed("start", service.workspace, error_info(exc)), json_output)
-            return 1
+            return EX_CONFIG
         # Announced before the socket exists, and to stderr when the transport is stdio —
         # where stdout is the protocol channel and a banner on it is a corrupt message.
         #
@@ -135,32 +217,193 @@ async def _serve(
         # The control socket and the scheduler are what make this process *the writer* rather
         # than a process that happens to serve a protocol. They are started after the lock is
         # held and after the address is announced, and closed on every path out — including the
-        # one where the transport raises — which is what the context manager is for.
+        # one where the transport raises.
         try:
-            async with _writing(service):
-                if api:
-                    from manicule.api.serve import serve as serve_api  # noqa: PLC0415 - heavy
-
-                    await serve_api(
-                        service, host=host, port=port, allow_public=allow_public, web=web
-                    )
-                else:
-                    await serve(
-                        service,
-                        transport=transport,
-                        host=host,
-                        port=port,
-                        allow_public=allow_public,
-                    )
-        except ProtocolError as exc:
-            # A control socket that will not bind is a refusal rather than a crash: the
-            # commonest cause is a second server, and the second commonest is a runtime
-            # directory somebody else owns. Both are things an operator fixes.
+            if api:
+                await serve_over_a_socket(
+                    service, host=host, port=port, allow_public=allow_public, web=web
+                )
+            else:
+                await _serve_a_protocol(
+                    service,
+                    transport=transport,
+                    host=host,
+                    port=port,
+                    allow_public=allow_public,
+                )
+        except AlreadyServingError as exc:
+            # Something answers on the control socket. Rare once the lock has been taken — the
+            # outgoing server closes its socket *before* `async with runtime` releases the lock,
+            # so a process holding the lock cannot find a live socket left by the one it replaced
+            # — and it is still the temporary kind when it happens, because what is there is a
+            # process rather than a permission.
             _report(failed("start", service.workspace, error_info(exc)), json_output)
-            return 1
+            return EX_TEMPFAIL
+        except ProtocolError as exc:
+            # Everything else the control socket refuses for: a runtime directory that is not
+            # ours, a symbolic link where a directory belongs, a mode granting group or other.
+            # `SocketUnusableError` names them and none resolves by waiting, so this is the
+            # status that says a person has to act rather than a supervisor.
+            _report(failed("start", service.workspace, error_info(exc)), json_output)
+            return EX_CONFIG
         finally:
             pid.unlink(missing_ok=True)
     return 0
+
+
+async def _serve_a_protocol(
+    service: ApplicationService,
+    *,
+    transport: Transport,
+    host: str | None,
+    port: int | None,
+    allow_public: bool,
+) -> None:
+    """Serve MCP alone — over stdio, or over a socket with ``--mcp-only``.
+
+    Signals are left exactly as they were, which is the difference from
+    :func:`serve_over_a_socket` and is deliberate rather than an omission. Nothing on this path
+    captures them: ``Ctrl-C`` raises ``KeyboardInterrupt`` out of the transport, the ``async
+    with`` unwinds in order on the way past, and ``manicule serve`` over stdio therefore behaves
+    exactly as it did before any of this existed — which matters, because that is the path an
+    editor spawns and the one nobody is watching.
+    """
+    async with _writing(service):
+        await serve(service, transport=transport, host=host, port=port, allow_public=allow_public)
+
+
+async def serve_over_a_socket(
+    service: ApplicationService,
+    *,
+    host: str | None,
+    port: int | None,
+    allow_public: bool,
+    web: bool,
+) -> None:
+    """Serve the HTTP API, the browser surface and MCP from one process, and stop them in order.
+
+    Public because it *is* the shutdown order this module's docstring describes, and an order
+    nothing outside the module can name is an order nothing outside the module can check.
+
+    The transport runs as a *task* rather than as an awaited call, because the shutdown has four
+    steps and the transport is the last of them: something has to be able to close the scheduler
+    and the control socket while the server is still answering, and then close the server.
+
+    The signal handlers are installed here, over the whole arrangement, for the reason
+    :class:`~manicule.api.serve.Server` gives: uvicorn's own handlers end the process at step
+    four before steps one to three have happened.
+    """
+    from manicule.api.serve import server_for  # noqa: PLC0415 - heavy, and only this path serves
+
+    transport = server_for(service, host=host, port=port, allow_public=allow_public, web=web)
+    stop = asyncio.Event()
+    impatient = asyncio.Event()
+
+    def asked_to_stop() -> None:
+        """The first signal asks; the second says the operator has stopped waiting.
+
+        The second sets ``force_exit``, which is uvicorn's own word for "close the connections
+        rather than waiting for them", and releases whatever step is currently waiting.
+        """
+        if stop.is_set():
+            transport.force_exit = True
+            impatient.set()
+            return
+        stop.set()
+
+    # **The handlers go on before anything is started**, and the order is load-bearing rather
+    # than tidy. `_writing` binds the control socket, and the socket appearing is what tells
+    # everything else — `manicule stop`, a proxied command, a supervisor's readiness check — that
+    # this process is up. A `SIGTERM` arriving between the socket being bound and the handler
+    # being installed reaches the *default* handler, which kills the process where it stands: the
+    # scheduler is not stopped, the socket file is left behind, and the exit status says the job
+    # crashed rather than that it was asked to stop. Small window, ordinary cause — a supervisor
+    # restarting a server it has only just started — and it was found by a test, not by reading.
+    with _signals(asked_to_stop):
+        async with _writing(service) as writing:
+            running = asyncio.create_task(transport.serve(), name="transport")
+            await _first_of(stop, running)
+            # Steps 1 to 3, and the second interrupt cancels the *wait* rather than the work:
+            # what is abandoned is this process's patience, and the ingest stages still get their
+            # own bounded drain because that bound is inside them.
+            await bounded_by(writing.aclose(), impatient)
+            # Step 4. `should_exit` is the field uvicorn's own handler sets, so what happens next
+            # is uvicorn's shutdown and not a reimplementation of it.
+            announce("closing the HTTP server and any MCP sessions on it")
+            transport.should_exit = True
+            await running
+
+
+async def _first_of(stop: asyncio.Event, running: asyncio.Task[None]) -> None:
+    """Return when the server is asked to stop, or when the transport ends on its own.
+
+    Both are ordinary. A transport that ends by itself is a port that could not be bound or a
+    server that finished; either way the shutdown below still runs, and running it against a
+    transport that has already stopped costs one assignment and one already-finished await.
+    """
+    waiting = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait((waiting, running), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiting.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiting
+
+
+async def bounded_by(work: Awaitable[None], impatient: asyncio.Event) -> None:
+    """Await ``work``, unless the operator interrupts a second time.
+
+    Public because it *is* the "a second interrupt cancels the wait" promise, and a promise a
+    test can only reach through a private name is one nobody outside this module can check.
+
+    The work is *canceled* on the second interrupt rather than left running, because the thing
+    being waited on is a drain and a drain nobody is waiting for is a process that will not exit.
+    Cancelation is safe at every point in it: the scheduler's own docstring says so of a sync,
+    and a control connection cut off mid-answer is a client that already knows the server is
+    going away.
+    """
+    running = asyncio.ensure_future(work)
+    waiting = asyncio.ensure_future(impatient.wait())
+    try:
+        await asyncio.wait((running, waiting), return_when=asyncio.FIRST_COMPLETED)
+        if running.done():
+            await running
+            return
+        running.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await running
+    finally:
+        waiting.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiting
+
+
+@contextlib.contextmanager
+def _signals(handler: Callable[[], None]) -> Generator[None]:
+    """Take ``SIGINT`` and ``SIGTERM`` for the length of the block, and give them back after.
+
+    Restoring matters as much as installing: this process may go on to report a failure and exit
+    through ordinary paths, and a handler left behind would swallow the ``Ctrl-C`` of whatever
+    ran next.
+
+    A platform with no ``add_signal_handler`` — Windows, for the ``SIGTERM`` half — is left
+    alone rather than worked around. There is no supervisor there for this to be about, and a
+    ``KeyboardInterrupt`` still unwinds everything the ``async with`` above holds.
+    """
+    loop = asyncio.get_running_loop()
+    taken: list[signal.Signals] = []
+    for number in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(number, handler)
+        except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover - not POSIX
+            continue
+        taken.append(number)
+    try:
+        yield
+    finally:
+        for number in taken:
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(number)
 
 
 def _writing(service: ApplicationService) -> Serving:
@@ -212,13 +455,17 @@ def stop_running(overrides: Mapping[str, Any], *, workspace: str) -> Envelope:
     # The control socket, on the same principle `stop_server` removes the pid file: the process
     # is confirmed gone, so nothing is behind it.
     #
-    # It has to happen **here** rather than as the server unwinds, and the reason is uvicorn's:
-    # it handles the signal, shuts down cleanly, then restores the default handler and re-raises
-    # — so the process dies without unwinding the `async with` that would have tidied up. The
-    # stdio transport does unwind and does tidy up, which is exactly the sort of difference
-    # nobody would predict from reading either side. A socket left behind by a crash, a
-    # `SIGKILL` or a power cut is still possible and is not a problem: it is a file with nothing
-    # behind it, and `ControlServer.start` clears one.
+    # **The server now removes it itself**, on every path including a supervisor's `SIGTERM`:
+    # `serve_over_a_socket` owns the signals, so `ControlServer.aclose` runs and unlinks the
+    # path. This line therefore removes a file that is usually already gone, and it stays for the
+    # cases where it is not — a `SIGKILL`, a power cut, or an older server on the far side of an
+    # upgrade. It used to be load-bearing for the ordinary stop as well, because uvicorn's own
+    # signal handling ended the process before the `async with` unwound; that is what
+    # `manicule.api.serve.Server` exists to prevent, and `tests/app/test_shutdown.py` asserts the
+    # socket is gone before this ever runs.
+    #
+    # A socket left behind by a crash, a `SIGKILL` or a power cut is not a problem either way: it
+    # is a file with nothing behind it, and `ControlServer.start` clears one.
     socket_path(settings.data_dir).unlink(missing_ok=True)
     return succeeded(
         "stop",
@@ -274,4 +521,12 @@ def _report(
         render.render_error(out, envelope.op, envelope.error)
 
 
-__all__ = ["running_address", "serve_forever", "stop_running"]
+__all__ = [
+    "EX_CONFIG",
+    "EX_TEMPFAIL",
+    "bounded_by",
+    "running_address",
+    "serve_forever",
+    "serve_over_a_socket",
+    "stop_running",
+]

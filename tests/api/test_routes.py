@@ -2,9 +2,11 @@
 
 Two kinds of assertion live here.
 
-**Coverage.** Every one of the eleven route groups is mounted and answers, checked from the
+**Coverage.** Every one of the twelve route groups is mounted and answers, checked from the
 generated OpenAPI document rather than from a list somebody keeps in their head — a route
-registered on a router that was never included is in the file and not in the interface.
+registered on a router that was never included is in the file and not in the interface. Two of
+the twelve describe themselves in no schema and are driven instead: the websocket, and the MCP
+endpoint.
 
 **Absence.** Destructive operations exist on the command line and are deliberately not
 reachable here. Absence is the easiest property to lose by accident and the hardest to notice,
@@ -12,6 +14,11 @@ so each one is asserted against the **route table** — see :data:`ABSENT` — r
 sending the request and accepting a 404 or a 405. Those two statuses are what an absent
 operation returns and also what several present ones return, so the probe could not tell the
 two apart, and for one entry it was not telling them apart.
+
+**And the same absence over MCP**, which is now served from the same process on the same port —
+see :data:`ABSENT_TOOLS`. It is here rather than in ``tests/mcp/`` because it is one boundary
+rather than two: these are the operations this process will not let a network reach, and a list
+of them kept in two files is a list that gets extended in one.
 """
 
 from __future__ import annotations
@@ -19,13 +26,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from fastmcp.exceptions import ToolError
 
-from manicule.api.app import ROUTE_GROUPS
+from manicule.api.app import MCP_PATH, ROUTE_GROUPS
+from manicule.mcp.server import TOOL_NAMES
+from tests.api.live import mounted
 from tests.api.support import app_for, backend_with_a_document, client_for, envelope
 from tests.routing_support import Reach, classify, walk_routes
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from mcp.types import Tool
+
+    from tests.app.fakes import FakeBackend
 
 NOT_FOUND = 404
 UNPROCESSABLE = 422
@@ -47,11 +61,16 @@ def _operations() -> Iterator[tuple[str, str]]:
 
 
 def test_every_route_group_is_mounted() -> None:
-    """Eleven groups, each with at least one route that answers.
+    """Twelve groups, each with at least one route that answers.
 
     Checked against the OpenAPI document, which is built from the routes that were actually
     included — so a router written and never mounted fails here rather than being discovered
     by a client.
+
+    Two of the twelve are not in that document and are named here as the exceptions rather than
+    left out of the comparison: a websocket is not describable by OpenAPI, and ``/mcp`` is a
+    mounted ASGI application rather than a route. Each has its own test below, because a group
+    an OpenAPI-driven check cannot see is exactly the one it would report as present.
     """
     paths = set(_paths())
     expected = {
@@ -66,7 +85,7 @@ def test_every_route_group_is_mounted() -> None:
         "auth": "/auth/session",
         "workbench": "/api/v1/workbench",
     }
-    assert set(expected) | {"websocket-chat"} == set(ROUTE_GROUPS)
+    assert set(expected) | {"websocket-chat", "mcp"} == set(ROUTE_GROUPS)
     missing = sorted(group for group, path in expected.items() if path not in paths)
     assert missing == [], f"route groups with no mounted route: {missing}"
 
@@ -81,6 +100,27 @@ def test_the_websocket_channel_is_mounted() -> None:
     with client_for(backend) as client, client.websocket_connect("/api/v1/chat/ws") as socket:
         socket.send_text('{"question": "does the client retry"}')
         assert socket.receive_json()["event"]
+
+
+def test_the_mcp_endpoint_is_mounted() -> None:
+    """The other group no schema describes, asserted by asking it for something.
+
+    A bare ``GET`` rather than a protocol exchange, which the tool assertions below do: all this
+    has to establish is that *something is mounted there*, and the cheapest honest way to
+    establish that is a request that reaches the mount rather than the 404 handler.
+
+    The status is deliberately not pinned. MCP's HTTP transport answers a bare ``GET`` with
+    whatever it thinks of a request carrying no session and no ``Accept: text/event-stream`` —
+    405 today — and that is a fact about the library. What this asserts is that the request did
+    not fall through to this application, which is what an unmounted path does.
+    """
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client:
+        response = client.get(f"{MCP_PATH}/")
+    assert response.status_code != NOT_FOUND, (
+        f"{MCP_PATH}/ answered 404, so nothing is mounted there and every tool assertion below "
+        f"is a statement about a surface that is not being served"
+    )
 
 
 @pytest.mark.parametrize(
@@ -438,3 +478,157 @@ def test_enabling_a_plugin_never_installs_one() -> None:
     body = envelope(response)
     assert body["ok"] is False
     assert body["error"]["type"] == "UnknownEntityError"
+
+
+# --- the same boundary, on the MCP endpoint mounted at the same address ------------------------
+
+ABSENT_TOOLS: tuple[tuple[str, str], ...] = (
+    ("index_path", "an ingest path that walks any directory this process can read"),
+    ("document_delete", "removing a document, with `hard` there is no restore from"),
+    ("document_reindex", "a re-parse that holds the embedder for as long as the document takes"),
+    ("connector_sync", "starting a sync, which #113 refused a route for on the same grounds"),
+    ("config_set", "rewriting the configuration file the server is running from"),
+    ("workspace_switch", "changing which tenant the next start serves"),
+    ("plugin_add", "enabling code that runs with this process's full authority"),
+    ("plugin_remove", "disabling it again, which is the same authority in reverse"),
+    ("collection_create", "creating a grouping"),
+    ("collection_rename", "renaming one"),
+    ("collection_update", "overwriting a description the call does not carry"),
+    ("collection_delete", "deleting a grouping"),
+    ("collection_add", "changing what a grouping holds"),
+    ("collection_remove", "changing what a grouping holds"),
+    ("ask", "it persists a turn given a conversation, and calls a model that may be elsewhere"),
+)
+"""Every mutating tool, named with what it would let an unattended caller do from the network.
+
+The MCP twin of :data:`ABSENT`, kept in the same file because it is the same boundary: these two
+lists are the whole of what this process refuses to let a network reach, and splitting them
+across two files is how one of them gets extended and the other does not.
+
+**Named rather than derived, deliberately.** ``manicule.mcp.server`` derives the offered set from
+each registration's ``readOnlyHint`` — that is the mechanism, and a test that re-derived it would
+assert the mechanism against itself and pass however the mechanism was wrong. So the expectation
+here is written out, and :func:`test_the_absent_tools_and_the_offered_ones_are_the_whole_surface`
+holds the list to being complete rather than merely true.
+
+It is the same set as ``tests/mcp/test_annotations.py``'s ``MUTATIONS``, arrived at from the
+other end: that one asserts each of these reports itself as writing, and this one asserts each is
+therefore not served over a socket. Two files, one classification, and the pair is what makes the
+classification worth having.
+"""
+
+MINIMUM_TOOLS = 8
+"""A floor on how many tools the network surface must offer, for the reason MINIMUM_ROUTES exists.
+
+Every assertion in :func:`test_a_mutating_tool_is_absent_from_the_network_mcp_surface` is a
+statement about the published list, so a surface that published **nothing** would satisfy all
+fifteen of them — and a mount that failed to start, a lifespan that was not run or a filter that
+excluded everything all produce exactly that. Far below the real count on purpose: this is here
+to catch a collapse, not to track the size of the surface.
+"""
+
+
+async def _network_tools(backend: FakeBackend) -> dict[str, Tool]:
+    """``tools/list`` as a client of the mounted endpoint receives it.
+
+    Over the protocol rather than off ``manicule.mcp.server``'s registrar, because what is under
+    test is what a caller on the socket can reach. A surface computed correctly and mounted
+    wrongly is the failure this is for, and reading the registrar would report it as fine.
+    """
+    async with mounted(backend) as client:
+        return {tool.name: tool for tool in await client.list_tools()}
+
+
+@pytest.mark.parametrize(("name", "why"), ABSENT_TOOLS)
+async def test_a_mutating_tool_is_absent_from_the_network_mcp_surface(name: str, why: str) -> None:
+    """Not published, and — the next test — not callable either.
+
+    Absence rather than refusal is the whole property. A tool that was published and then said no
+    would put the decision in a check, and a check is something a caller can be granted an
+    exception to by a setting, a middleware or a header. There is no handler behind these names.
+    """
+    backend, _ = backend_with_a_document()
+    published = await _network_tools(backend)
+    assert name not in published, (
+        f"{name} is published on the MCP endpoint served over the network. It is deliberately "
+        f"absent because it is {why} — see manicule.mcp.serve.NETWORK_SURFACE_IS_READ_ONLY."
+    )
+
+
+async def test_calling_an_absent_tool_over_the_socket_finds_no_tool() -> None:
+    """The second half: the name is not a handler that refuses, it is not a handler.
+
+    Asserted on the *kind* of failure rather than only on there being one, because "the tool
+    exists and declined" and "there is no such tool" are the two answers this boundary is the
+    difference between — and only the second is a property nothing can grant an exception to.
+    """
+    backend, document = backend_with_a_document()
+    async with mounted(backend) as client:
+        with pytest.raises(ToolError, match="Unknown tool"):
+            await client.call_tool("document_delete", {"document_id": document.id})
+    assert backend.store.deleted == [], "the call reached a handler after all"
+
+
+async def test_every_read_only_tool_is_offered_on_the_network_mcp_surface() -> None:
+    """The mirror, without which every absence above passes on an empty surface.
+
+    The expectation is ``TOOL_NAMES`` minus the list above rather than a second literal, because
+    *that* subtraction is the claim: the two lists together are the surface, so a tool added
+    tomorrow lands in one of them or fails the test after this one.
+    """
+    backend, _ = backend_with_a_document()
+    published = await _network_tools(backend)
+    expected = sorted(set(TOOL_NAMES) - {name for name, _ in ABSENT_TOOLS})
+    assert sorted(published) == expected
+    assert len(published) >= MINIMUM_TOOLS, (
+        f"the network MCP surface published {len(published)} tool(s), below the floor of "
+        f"{MINIMUM_TOOLS}. Every absence assertion above is a statement about the published "
+        f"list, so a surface that published nothing would pass all of them."
+    )
+
+
+async def test_the_absent_tools_and_the_offered_ones_are_the_whole_surface() -> None:
+    """No tool is in neither list, so :data:`ABSENT_TOOLS` cannot go stale quietly.
+
+    The same guard ``tests/mcp/test_annotations.py`` puts on its own classification, applied to
+    this one. Without it, adding a mutating tool and forgetting to name it above leaves every
+    assertion here green — each is a statement about the tools it names, and an unnamed one is
+    named nowhere.
+    """
+    backend, _ = backend_with_a_document()
+    published = set(await _network_tools(backend))
+    absent = {name for name, _ in ABSENT_TOOLS}
+    assert published | absent == set(TOOL_NAMES)
+    assert published & absent == set()
+
+
+async def test_every_published_tool_says_it_reads() -> None:
+    """The surface and the classification agree, checked over the protocol at the far end.
+
+    ``manicule.mcp.server`` builds the read-only surface *from* these hints, so this is the round
+    trip: what a client is told about a tool it can reach on the socket is that the tool reads.
+    A published tool answering ``readOnlyHint: false`` would mean the filter and the annotation
+    had come apart between the registration and the wire.
+    """
+    backend, _ = backend_with_a_document()
+    for name, tool in (await _network_tools(backend)).items():
+        assert tool.annotations is not None, f"{name} publishes no annotations"
+        assert tool.annotations.readOnlyHint is True, f"{name} is served on a socket and writes"
+
+
+async def test_the_instructions_tell_a_client_the_write_tools_are_not_here() -> None:
+    """So that "I cannot do that" is available before a turn is spent discovering it.
+
+    Read off the initialization result rather than off the constant, because instructions the
+    server computes and does not send buy nothing.
+    """
+    backend, _ = backend_with_a_document()
+    async with mounted(backend) as client:
+        result = client.initialize_result
+    assert result is not None, "the client never completed initialization"
+    instructions = result.instructions or ""
+    assert "read-only" in instructions, instructions
+    assert "manicule serve" in instructions, instructions
+    assert "## Scope every question to a collection" in instructions, (
+        "the read-only notice replaced the ordinary instructions instead of being added to them"
+    )
