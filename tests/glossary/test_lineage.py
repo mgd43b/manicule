@@ -214,7 +214,17 @@ def test_the_detector_may_not_import_dynamically() -> None:
     **Matched on the name being called rather than on how it was reached**, because the obvious
     version of this had the same blind spot as the derivation it defends: checking `ast.Attribute`
     for `import_module` misses `from importlib import import_module` followed by a bare call, and
-    the guard would then be silent about exactly the thing it exists to make loud.
+    the guard would then be silent about exactly the thing it exists to make loud. All four
+    spellings are caught — bare, attribute, `builtins.__import__`, and the rebound name.
+
+    **It is over-broad by the same rule, and that is the trade rather than an oversight.** Any
+    `.import_module(...)` is flagged whether or not it is importlib's. Narrowing it would mean
+    resolving the binding — machinery whose only purpose is to grant an exemption, in two files
+    that today import nothing but `re`, `unicodedata`, `typing`, `enum` and ``pydantic``. A false
+    positive here is one loud failure landing on whoever wrote the line, with an assertion
+    message telling them what to decide; a false negative is a dependency deciding stored entries
+    with no version recorded anywhere, in silence. Those are not symmetrical, and the guard is
+    aimed at the second.
     """
     # Matched on the *name being called*, however it was bound. An earlier version of this
     # checked `ast.Name` for `__import__` and `ast.Attribute` for `import_module`, which let
