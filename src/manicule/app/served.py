@@ -104,7 +104,7 @@ class ControlHandler:
         that echoed any part of it would put the credential into a second place — a terminal's
         scrollback — for no purpose at all.
         """
-        from datetime import datetime  # noqa: PLC0415 - only this method parses a timestamp
+        from datetime import UTC, datetime  # noqa: PLC0415 - only this method parses a stamp
 
         try:
             captured_at = datetime.fromisoformat(request.captured_at)
@@ -115,6 +115,14 @@ class ControlHandler:
                 f"the session handed over for {request.base_url} carried a capture time this "
                 f"version cannot read ({exc}). Nothing has been stored.",
             )
+        if captured_at.tzinfo is None:
+            # A frame carrying a time with no offset is read as UTC rather than refused, which
+            # is what `BrowserSession.from_json` did for the record this replaces. It matters
+            # more here than it did there: `session_max_age_hours` compares this against an
+            # aware `now()`, so a naive value is a `TypeError` out of `authorize()` on the first
+            # request of the next sync — a crash, at the far end of the system, for a field
+            # nobody would think to look at.
+            captured_at = captured_at.replace(tzinfo=UTC)
         if not request.cookies:
             return _failed(
                 "connector_login",

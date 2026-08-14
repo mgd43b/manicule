@@ -205,6 +205,43 @@ async def test_a_handover_with_no_cookies_is_refused_rather_than_held(
     assert vault.load(SITE) is None
 
 
+async def test_a_capture_time_with_no_offset_is_read_as_utc(
+    socket_for: Callable[[], Path],
+) -> None:
+    """A frame carrying a naive timestamp must not become a crash at the far end of the system.
+
+    ``BrowserSession.from_json`` normalized this and went with the keychain; the socket is now
+    where a hand-built or older frame arrives. It matters more here than it did there:
+    ``session_max_age_hours`` compares the capture time against an aware ``now()``, so a naive
+    value is a ``TypeError`` out of ``authorize()`` on the first request of the next sync —
+    a crash a long way from the field that caused it.
+    """
+    path = socket_for()
+    vault = SessionVault()
+    server = a_server(path, vault)
+    await server.start()
+    try:
+        answered = await control.connect(
+            path,
+            control.Handover(
+                base_url=SITE,
+                account="sync.user",
+                captured_at="2026-08-14T10:00:00",
+                cookies={"JSESSIONID": SecretStr(SENTINEL)},
+            ),
+            on_progress=lambda _: None,
+        )
+    finally:
+        await server.aclose()
+
+    assert answered["ok"] is True
+    held = vault.load(SITE)
+    assert held is not None
+    assert held.captured_at == datetime(2026, 8, 14, 10, 0, tzinfo=UTC)
+    # The check that would have raised: an age comparison against an aware clock.
+    credential_for(sso_config(session_max_age_hours=100000.0), store=vault).authorize()
+
+
 async def test_the_capture_time_the_client_proved_is_the_one_the_server_measures_from(
     socket_for: Callable[[], Path],
 ) -> None:

@@ -581,11 +581,17 @@ class ControlServer:
             return
 
         pending: list[str] = []
+        # Per connection rather than on the server. Two proxied commands can be in flight at
+        # once — a sync and a reindex, say — and a shared event would let one command's flush
+        # clear the signal the other's report had just raised, so the second would sit unsent
+        # until something else happened to wake it.
+        reported = asyncio.Event()
 
         def report(message: str) -> None:
             pending.append(message)
+            reported.set()
 
-        envelope = await self._run(request, report, writer, pending)
+        envelope = await self._run(request, report, writer, pending, reported)
         await self._write(writer, Result(envelope=envelope))
 
     async def _run(
@@ -594,26 +600,36 @@ class ControlServer:
         report: Callable[[str], None],
         writer: asyncio.StreamWriter,
         pending: list[str],
+        reported: asyncio.Event,
     ) -> dict[str, JsonValue]:
         """Run the handler while draining whatever it reports, and never lose the result.
 
-        The handler's ``report`` appends to a list rather than writing to the socket, so that
-        reporting progress cannot block a pipeline stage or raise into it. This flushes that
-        list on a short tick — which is the only place progress becomes bytes, and the only
-        place a dead client is discovered.
+        The handler's ``report`` appends to a list and sets an event, so that reporting progress
+        cannot block a pipeline stage or raise into it. This waits on that event — it is the only
+        place progress becomes bytes, and the only place a dead client is discovered.
+
+        **Woken rather than polled.** An earlier version looped on a 50 ms timeout, which is
+        72,000 wakeups across an hour-long sync to deliver perhaps a few hundred lines, and it
+        put up to 50 ms of latency on each one. Waiting on either the report or the work finishing
+        costs nothing while a sync is quiet and delivers immediately when it is not.
         """
         work = asyncio.ensure_future(self._handler.handle(request, report))
         try:
-            while not work.done():
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(asyncio.shield(work), _PROGRESS_TICK_S)
+            while True:
+                waking = asyncio.ensure_future(reported.wait())
+                done, _ = await asyncio.wait((work, waking), return_when=asyncio.FIRST_COMPLETED)
+                reported.clear()
+                waking.cancel()
                 await self._flush(writer, pending)
-            await self._flush(writer, pending)
-            return await work
+                if work in done:
+                    # Flushed once more, because the handler may have reported between the last
+                    # flush and returning — and that report is the last thing it said.
+                    await self._flush(writer, pending)
+                    return await work
         finally:
             if not work.done():  # pragma: no cover - only on cancellation of the connection
                 work.cancel()
-                with contextlib.suppress(BaseException):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await work
 
     async def _flush(self, writer: asyncio.StreamWriter, pending: list[str]) -> None:
@@ -659,15 +675,6 @@ class ControlServer:
                 f"was refused unread."
             )
             raise ProtocolError(msg) from exc
-
-
-_PROGRESS_TICK_S = 0.05
-"""How often a running operation's reported progress is turned into frames.
-
-Short enough that a person sees a long sync moving, long enough that a fast operation sends one
-flush rather than a hundred. It bounds *latency* rather than rate: nothing is dropped, and an
-operation that reports nothing sends nothing.
-"""
 
 
 def _protocol_failure(exc: ProtocolError) -> dict[str, JsonValue]:

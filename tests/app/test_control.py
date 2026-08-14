@@ -315,6 +315,71 @@ async def test_progress_arrives_before_the_result_rather_than_with_it(
     assert envelope["ok"] is True
 
 
+async def test_a_second_command_is_answered_while_the_first_is_still_running(
+    socket_for: Callable[[], Path],
+) -> None:
+    """A server answers more than one command at a time, and each gets its own progress.
+
+    One connection is parked mid-operation and a second runs to completion underneath it. Both
+    halves matter: a server that serialized connections would make every proxied command wait
+    behind whatever sync happened to be running, and a server that crossed their streams would
+    show one command's progress to the other.
+
+    **It does not isolate the progress signal's scoping**, and the name is careful not to claim
+    it does. That signal is per connection rather than per server, which is the right shape —
+    but each connection also has its own ``pending`` list, so a shared event would cost spurious
+    wakeups rather than lost lines, and there is no interleaving in which this test could tell
+    the two apart. Verified by making it shared and watching this stay green.
+    """
+    path = socket_for()
+    first = Echo(progress=("alpha one", "alpha two"))
+    first.hold = True
+    handler = _Routing({"alpha": first, "beta": Echo(progress=("beta one",))})
+    server = await serving(path, handler)
+
+    alpha: list[str] = []
+    beta: list[str] = []
+    both = asyncio.Event()
+
+    def note_alpha(message: str) -> None:
+        alpha.append(message)
+        if len(alpha) == 2:
+            both.set()
+
+    try:
+        held = asyncio.create_task(
+            control.connect(path, control.Invoke(op="alpha"), on_progress=note_alpha)
+        )
+        await asyncio.wait_for(both.wait(), timeout=5)
+        # The first command is parked with its progress delivered. The second runs to completion
+        # underneath it, and must get its own.
+        answered = await asyncio.wait_for(
+            control.connect(path, control.Invoke(op="beta"), on_progress=beta.append), timeout=5
+        )
+        assert answered["ok"] is True
+        assert beta == ["beta one"], beta
+        assert not held.done(), "the parked command finished early, so nothing overlapped"
+        first.released.set()
+        await asyncio.wait_for(held, timeout=5)
+    finally:
+        first.released.set()
+        await server.aclose()
+
+    assert alpha == ["alpha one", "alpha two"], alpha
+
+
+class _Routing:
+    """Hands each request to the handler registered under its operation."""
+
+    def __init__(self, handlers: dict[str, Echo]) -> None:
+        self.handlers = handlers
+
+    async def handle(
+        self, request: control.Request, report: Callable[[str], None]
+    ) -> dict[str, JsonValue]:
+        return await self.handlers[getattr(request, "op", "")].handle(request, report)
+
+
 async def test_a_failure_envelope_crosses_unchanged(socket_for: Callable[[], Path]) -> None:
     """A refusal is a result, not an exception, so it travels the same way a success does."""
     path = socket_for()

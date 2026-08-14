@@ -155,7 +155,11 @@ async def forward(path: Path, command: Command, *, workspace: str) -> Envelope:
         answered = await control.connect(
             path, command.invoke(workspace), on_progress=_show_progress
         )
-    except (ManiculeError, OSError) as exc:
+    except (ManiculeError, ValueError, OSError) as exc:
+        # ``ValueError`` covers pydantic's ``ValidationError``, which is what a *response* frame
+        # this version does not understand raises out of ``read_response``. Without it a server
+        # one version ahead of its client reaches the terminal as a traceback rather than as the
+        # failure envelope every other outcome arrives in.
         return failed(command.op, workspace, error_info(exc))
     try:
         return Envelope.model_validate(answered)
