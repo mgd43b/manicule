@@ -576,9 +576,16 @@ class ConfluenceConnector:
 
         The previous version enumerated first and then filtered, which meant a connector scoped
         to two spaces still paged through every space the account could see — proportional to
-        the account's entitlements rather than to its configuration, and on a broadly entitled
-        service account that is the difference between two requests and dozens. It also read
-        the whole catalog into memory to answer a question about two keys.
+        the account's entitlements rather than to its configuration. Measured on an account
+        entitled to 500 spaces and configured for two: six requests carrying 500 space records,
+        against two requests carrying two. **On a small catalog the direct lookups cost one
+        request more** — two of them against a single catalog page — and that is the right trade
+        anyway, because the cost that matters grows with somebody else's wiki rather than with
+        this configuration.
+
+        Looked up one at a time rather than concurrently, deliberately: an allowlist is
+        typically a handful of keys, and firing them at a rate-limited instance in parallel
+        trades a bounded wait for a burst the retry logic would then have to absorb.
 
         Checked every run rather than cached either way: a space created since the last sync is
         picked up without a configuration change, and a space this account has *lost* is
@@ -604,10 +611,14 @@ class ConfluenceConnector:
                 raise ConnectorError(msg)
             return list(visible.values())
 
-        chosen: list[str] = []
+        # Deduplicated on what the *source* calls each space rather than on what configuration
+        # spelled, because `ENG` and `eng` are one space and would otherwise be enumerated
+        # twice — every document in it discovered twice, and a second round trip to find that
+        # out. Order is the configured order, which is the order somebody reading a log expects.
+        chosen: dict[str, None] = {}
         for key in self._config.spaces:
-            chosen.append(await self._space(key.strip()))
-        return chosen
+            chosen[await self._space(key.strip())] = None
+        return list(chosen)
 
     async def _space(self, key: str) -> str:
         """One configured space, confirmed against the source, in the source's own spelling.

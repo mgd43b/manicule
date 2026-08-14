@@ -21,7 +21,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from manicule.connectors import ConnectorError
+from manicule.connectors import ConnectorError, SessionExpiredError
 from manicule.connectors.confluence import ANCESTORS
 from manicule.core.provenance import Provenance
 from manicule.parsers.config import CONFLUENCE_MEDIA_TYPE
@@ -504,7 +504,9 @@ async def test_a_credential_failure_is_not_reported_as_an_unknown_space() -> Non
     instance.sign_out("/rest/api/space/")
     connector = await connected(instance, server_config(SERVER, spaces=("ENG",), page_size=10))
     try:
-        with pytest.raises(ConnectorError) as raised:
+        # The type, not merely the absence of the wrong words: a negative assertion passes for
+        # any message at all, including one that stopped naming the space by accident.
+        with pytest.raises(SessionExpiredError) as raised:
             await drain(connector.discover(None))
     finally:
         await connector.teardown()
@@ -526,3 +528,24 @@ async def test_discovery_and_reconciliation_validate_the_same_spaces() -> None:
     listings, direct = _space_requests(instance)
     assert listings == []
     assert [request.url.path.rsplit("/", 1)[-1] for request in direct] == ["ENG", "ENG"]
+
+
+async def test_a_key_configured_twice_is_one_space_and_one_lookup() -> None:
+    """``ENG`` and ``eng`` are one space, and enumerating it twice yields every page twice.
+
+    Deduplicated on what the source calls it rather than on what configuration spelled, because
+    the two spellings only become one after the lookup has answered.
+    """
+    instance = _server(spaces={"ENG": "Engineering"})
+    connector = await connected(
+        instance, server_config(SERVER, spaces=("ENG", "eng"), page_size=10)
+    )
+    try:
+        found = ids(await drain(connector.discover(None)))
+    finally:
+        await connector.teardown()
+
+    assert sorted(found) == [ROOT, CHILD, "100300"], "each page once"
+    assert len(found) == len(set(found))
+    searches = [query for query in _queries(instance) if "space =" in query]
+    assert len(searches) == 1, searches
