@@ -827,8 +827,11 @@ its breadcrumb, so two documents rarely produce the same embedding input at all.
 A stored vector may be reused **if and only if all three hold**:
 
 1. **The same complete embedding fingerprint** — `EmbedFingerprint.canonical()`, which is
-   manicule's own definition of vector-space compatibility: model id, revision, dimension,
-   pooling, normalization, tokenizer.
+   manicule's own definition of vector-space compatibility. The fields are
+   `EmbedFingerprint.IDENTITY_FIELDS` and are named here as it names them: `model_id`,
+   `revision`, `dimension`, `pooling`, `normalized`, `tokenizer_id`. Deferring to that tuple
+   rather than describing it is deliberate — a prose list is a second definition, and the one
+   that goes stale is always the prose.
 2. **The same embedding input, for that document** — the exact post-middleware `embed_text`,
    every code point of it, under the document that owns it. Never Unicode-normalised, and never
    the chunk id, the display text, the content hash or the parse fingerprint.
@@ -839,7 +842,7 @@ A stored vector may be reused **if and only if all three hold**:
 for this problem by different authors, and *both* state only the first two. A row whose recorded
 identity says "current" while its vector is missing, unreadable, or of the wrong dimension
 satisfies both documents and is refused here — because a claim that a vector exists is not a
-vector existing, which is the defect this repository has removed in five other places. The
+vector existing, which is the shape of defect this repository keeps finding. The
 identity recorded in a row is also cross-checked against one derived from the `chunk_json`
 beside it; a row that says two different things about what it embedded is rebuilt rather than
 believed.
