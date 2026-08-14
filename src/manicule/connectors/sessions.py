@@ -189,8 +189,11 @@ class _Commit:
     """Which commit this is. The higher of the two slots is the current session."""
 
     generation: str
-    digest: str
     length: int
+    digest: str
+    """Declared in the order :meth:`encode` writes them. ``length`` and ``digest`` are both
+    strings of digits on the wire and a transposed pair would survive :meth:`decode`, so the
+    two orders are kept in step by eye rather than by anything that would catch it."""
 
     def encode(self) -> str:
         """The one line a pointer slot holds. Space-separated, and never containing a newline.
@@ -542,6 +545,12 @@ class KeychainStore:
         dropped are abandoned replacements, and dropping them without deleting them is what
         would leave cookies in the keychain that nothing can find.
 
+        "Abandoned" here means "not referenced by a commit", which a *second writer's* in-flight
+        generation also is. Pruning can therefore delete chunks another process is part-way
+        through staging, and that process then fails its own read-back comparison and stores
+        nothing. It is a failed save rather than a corrupt one, and it needs a journal already
+        at :data:`MAX_STAGED` — that is, eight replacements interrupted before this one.
+
         Returns:
             The generations the journal now names, including ``generation``.
         """
@@ -661,6 +670,12 @@ class KeychainStore:
 
         The same reasoning as :meth:`_assemble`: chunks are written from zero upward, so a run
         of them has no holes and stopping at a gap has not left anything behind.
+
+        The exception is a delete run that itself failed part-way, which leaves a gap at the
+        front and a tail behind it that no later walk can reach. That tail is unreferenced
+        secret material, never a credential, and reaching it would mean reading the whole
+        :data:`MAX_CHUNKS` range on every cleanup — 256 subprocesses to recover from a keychain
+        that is already failing individual deletes. The cost is not paid; the limit is stated.
         """
         removed = False
         for account in accounts:
