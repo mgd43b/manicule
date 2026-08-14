@@ -440,12 +440,31 @@ class PlaywrightProvider:
         config: ConfluenceConfig,
         deadline: float,
     ) -> Sequence[CandidateCookie]:
-        """Poll the jar until its cookies authenticate, the browser closes, or time runs out."""
+        """Poll the jar until its cookies authenticate, the browser closes, or time runs out.
+
+        Three ways this ends badly and each says something different, because each has a
+        different next action. The one worth the extra state is the last:
+
+        *The window was closed.* Re-run and leave it open.
+
+        *Time ran out with cookies for this instance in the jar.* Sign-in was under way and did
+            not finish. A longer ``--timeout`` is the answer.
+
+        *Time ran out having never seen a cookie for this instance at all.* Sign-in never reached
+            Confluence, so waiting longer will not help — the browser was refused before it got
+            there (a conditional-access policy declining a driven Chromium is the usual cause) or
+            ``base_url`` names a host the sign-in never lands on. Telling this person to raise
+            the timeout sends them to wait five more minutes for the same nothing.
+
+        Distinguishing the last two costs one boolean, and the signal is already in hand: whether
+        :func:`origin_cookies` ever returned anything.
+        """
         import asyncio  # noqa: PLC0415 - kept beside its only use
 
         from manicule.connectors.sessions import cookies_authenticate  # noqa: PLC0415
 
         loop = asyncio.get_running_loop()
+        reached_confluence = False
         while True:
             if not browser.is_connected():
                 msg = (
@@ -456,16 +475,37 @@ class PlaywrightProvider:
                 raise ConfigError(msg)
             candidates = _cookies_of(await context.cookies())
             relevant = origin_cookies(candidates, base_url=config.base_url)
-            if relevant and await cookies_authenticate(config, relevant):
-                return candidates
+            if relevant:
+                reached_confluence = True
+                if await cookies_authenticate(config, relevant):
+                    return candidates
             if loop.time() >= deadline:
-                msg = (
-                    "sign-in did not complete within the timeout. Nothing has been stored and "
-                    "any previously stored session is untouched. Re-run with a longer "
-                    "--timeout if the identity provider needs more steps than that allows."
-                )
-                raise ConfigError(msg)
+                raise ConfigError(_gave_up(config, reached_confluence=reached_confluence))
             await asyncio.sleep(self._poll)
+
+
+def _gave_up(config: ConfluenceConfig, *, reached_confluence: bool) -> str:
+    """What to say when the timeout expires, which depends on how far sign-in got.
+
+    Two sentences rather than one, because "wait longer" is right for one of these and actively
+    wrong for the other — and the person who was refused by a conditional-access policy is the
+    one least able to tell which they are in, since both look like a browser that sat there.
+    """
+    untouched = "Nothing has been stored and any previously stored session is untouched."
+    if reached_confluence:
+        return (
+            f"sign-in did not finish before the timeout, though the browser did reach "
+            f"{config.base_url}. {untouched} Re-run with a longer --timeout if the identity "
+            f"provider needs more steps than that allowed."
+        )
+    return (
+        f"the browser never received a cookie from {config.base_url} before the timeout, so "
+        f"sign-in did not reach Confluence at all. {untouched} A longer --timeout will not help. "
+        f"The two usual causes are a conditional-access policy declining a browser it does not "
+        f"recognize — in which case sign in with your own browser and use `manicule connector "
+        f"login <name>` without --browser — and a base_url that names a different host from the "
+        f"one sign-in lands on."
+    )
 
 
 def _async_playwright() -> Callable[[], AsyncContextManager[Playwright]]:

@@ -10,7 +10,7 @@ about the code rather than a promise: there is no parameter that could carry one
 that would accept one.
 
 **A browser is now driven, and this paragraph used to say the opposite.** It said that Playwright
-was the ergonomic answer, that the licence (Apache-2.0) was not the objection, and that the
+was the ergonomic answer, that the license (Apache-2.0) was not the objection, and that the
 objection was this: a driven browser is a browser manicule controls the DOM of, and the person is
 asked to type a corporate password into it, so "manicule never sees the password" would become a
 promise about restraint instead of a fact about capability.

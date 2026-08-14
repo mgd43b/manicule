@@ -42,55 +42,54 @@ buy nothing, so the row is gone rather than half-built. Per-user visibility is
 
 Self-hosted Confluence fronted by an identity provider commonly has personal access tokens
 disabled by policy, and then the only credential its users can obtain is the session their
-browser already holds. There are three ways to hand one over, and the differences between them
-are security differences rather than convenience ones.
+browser already holds.
 
-```console
-$ manicule connector login wiki --browser        # opens a browser; you sign in there
-$ manicule connector login wiki --browser-state ./storage-state.json
-$ manicule connector login wiki                  # paste the Cookie header
-```
-
-**manicule never asks for the password and has nowhere to put one.** No password, no one-time
-code and no device approval passes through manicule on any of the three, and that much is a
-property of the code rather than a promise about it: there is no parameter that could carry one
-and no branch that would accept one.
-
-**The three differ in what "manicule cannot see your password" means.** This is the one thing to
-read before choosing:
-
-| | What manicule does | The guarantee |
-|---|---|---|
-| paste (default) | asks for a `Cookie` header you copied | **cannot** see the page you typed into — there is no browser |
-| `--browser-state` | reads a file another tool wrote | **cannot**, for the same reason |
-| `--browser` | opens a browser at your Confluence URL | **does not** — it reads no page content, and a test enforces that over the module's source |
-
-Earlier releases refused to drive a browser at all, and the reason was exactly the row above: a
-driven browser is one manicule controls the DOM of, and you are asked to type a corporate
-password into it. That argument was not wrong. What overruled it is that for a token-less
-instance the paste was not the safer of two options — it was the *only* option, and it asks
-somebody to open developer tools and hand-carry a live session cookie into a terminal every time
-their session expires.
-
-So `--browser` exists, the weakening is real, and it is bounded by three things rather than by
-intent: the browser is opened and then observed **only** through its cookie jar and whether the
-window is still open; nothing is typed, clicked or filled for you; and
-`tests/connectors/test_browser_login.py` fails if an accessor that reads page content appears in
-`connectors/browser.py`.
-
-**The paste path is not deprecated and is not a fallback.** It keeps the stronger guarantee and
-needs nothing installed. If that guarantee is what you want, use it.
-
-**The browser is an optional extra**, because it downloads one:
+**Sign in with `--browser`.** It opens a browser at your Confluence, you sign in the way you
+sign in to everything else — SSO, MFA, a passkey, whatever your provider asks — and it works:
 
 ```console
 $ pip install 'manicule[browser-auth]'
 $ playwright install chromium
+
+$ manicule connector login wiki --browser
+$ manicule connector sync wiki
 ```
 
-Without them `--browser` fails immediately naming both commands. It does **not** quietly fall
-back to asking for a Cookie header — someone who asked for a browser and got a paste prompt
-would reasonably conclude the feature is broken.
+That is the whole of it. There is nothing to configure, no cookie to find and no file to
+produce.
+
+**manicule never asks for your password and has nowhere to put one.** No password, no one-time
+code and no device approval passes through manicule, and that is a property of the code rather
+than a promise about it: there is no parameter that could carry one and no branch that would
+accept one.
+
+**What the browser path does and does not guarantee.** manicule opens the browser, so it *could*
+in principle read the page you type into. It does not, and that is enforced rather than intended:
+the browser is watched only through its cookie jar and whether the window is still open, nothing
+is typed, clicked or filled for you, and `tests/connectors/test_browser_login.py` fails if an
+accessor that reads page content appears in `connectors/browser.py`. Earlier releases refused to
+drive a browser at all so that the guarantee could be about capability — manicule *cannot* see it
+— rather than about behaviour. That is a real difference and it is stated here rather than
+smoothed over; what it is not is a reason to prefer the harder path.
+
+**The two fallbacks, for when `--browser` cannot be used:**
+
+```console
+$ manicule connector login wiki --browser-state ./storage-state.json
+$ manicule connector login wiki                  # paste the Cookie header
+```
+
+`--browser-state` imports a Playwright state file, for a machine that cannot open a window — a
+remote shell, a container — but can receive a file from one that can ([§1.1a](#11a-importing-a-browser-state-file)).
+
+The paste path needs nothing installed and uses your own browser, which makes it the answer when
+a conditional-access policy declines a driven Chromium — a real case, and the reason it is kept
+working rather than removed. It asks you to open developer tools and copy a live session cookie,
+which is why it is not the one to reach for first.
+
+Without the extra, `--browser` fails immediately naming both installation commands. It does
+**not** quietly fall back to the paste prompt: someone who asked for a browser and got asked for
+a cookie header would reasonably conclude the feature is broken.
 
 **Only your Confluence's cookies are taken.** Signing in through an identity provider means
 visiting it, and it sets cookies of its own — frequently an account you use at several
@@ -188,12 +187,13 @@ the last thing that happens and it happens only on success.
 |---|---|---|
 | `browser sign-in needs Playwright` | the extra is not installed | run both commands it names — the package and `playwright install chromium` are two steps |
 | `the browser would not start` | the package is installed, the browser is not | `playwright install chromium` |
-| `sign-in did not complete within the timeout` | five minutes elapsed | `--timeout 600`, or set `browser_timeout_seconds`. Conditional access with a device-approval step is the usual reason |
+| `sign-in did not finish ... though the browser did reach <url>` | sign-in was under way and ran out of time | `--timeout 600`, or set `browser_timeout_seconds`. A device-approval step is the usual reason |
+| `the browser never received a cookie from <url>` | sign-in never reached Confluence at all | **a longer timeout will not help.** Either conditional access declined the browser — use the paste path, which uses your own — or `base_url` names a different host from the one sign-in lands on |
 | `the browser was closed before sign-in finished` | the window was shut | re-run and leave it open until Confluence itself has loaded |
-| `the browser finished with no cookies for <url>` | sign-in never reached Confluence, or `base_url` is wrong | check `base_url` names the site root **including any context path** |
+| `the browser finished with no cookies for <url>` | the same as above, seen one layer up | check `base_url` names the site root **including any context path** |
 | a sign-in page was stored as content | it cannot be — §1.3 | nothing; the refusal is the design |
 | `... was captured N hours ago` | the session aged past `session_max_age_hours` | sign in again; nothing is lost, the watermark did not advance |
-| the tenant refuses the browser | conditional access does not recognise a driven Chromium | use the paste path, which uses your own browser |
+| the tenant refuses the browser | conditional access does not recognize a driven Chromium | use the paste path, which uses your own browser |
 
 ### 1.2 The credential is checked before the connector is constructed
 
