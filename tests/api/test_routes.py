@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from manicule.api.app import ROUTE_GROUPS
+from manicule.api.app import MCP_PATH, ROUTE_GROUPS
 from tests.api.support import app_for, backend_with_a_document, client_for, envelope
 from tests.routing_support import Reach, classify, walk_routes
 
@@ -47,11 +47,16 @@ def _operations() -> Iterator[tuple[str, str]]:
 
 
 def test_every_route_group_is_mounted() -> None:
-    """Eleven groups, each with at least one route that answers.
+    """Twelve groups, each with at least one route that answers.
 
     Checked against the OpenAPI document, which is built from the routes that were actually
     included — so a router written and never mounted fails here rather than being discovered
     by a client.
+
+    Two of the twelve are not in that document and are named here as the exceptions rather than
+    left out of the comparison: a websocket is not describable by OpenAPI, and ``/mcp`` is a
+    mounted ASGI application rather than a route. Each has its own test below, because a group
+    an OpenAPI-driven check cannot see is exactly the one it would report as present.
     """
     paths = set(_paths())
     expected = {
@@ -66,7 +71,7 @@ def test_every_route_group_is_mounted() -> None:
         "auth": "/auth/session",
         "workbench": "/api/v1/workbench",
     }
-    assert set(expected) | {"websocket-chat"} == set(ROUTE_GROUPS)
+    assert set(expected) | {"websocket-chat", "mcp"} == set(ROUTE_GROUPS)
     missing = sorted(group for group, path in expected.items() if path not in paths)
     assert missing == [], f"route groups with no mounted route: {missing}"
 
@@ -81,6 +86,28 @@ def test_the_websocket_channel_is_mounted() -> None:
     with client_for(backend) as client, client.websocket_connect("/api/v1/chat/ws") as socket:
         socket.send_text('{"question": "does the client retry"}')
         assert socket.receive_json()["event"]
+
+
+def test_the_mcp_endpoint_is_mounted() -> None:
+    """The other group no schema describes, asserted by asking it for something.
+
+    A bare ``GET`` rather than a protocol exchange, which lives in
+    ``tests/api/test_mcp_surface.py``: all this has to establish is that *something is mounted
+    there*, and the cheapest honest way to establish that is a request that reaches the mount
+    rather than the 404 handler.
+
+    The status is deliberately not pinned. MCP's HTTP transport answers a bare ``GET`` with
+    whatever it thinks of a request carrying no session and no ``Accept: text/event-stream`` —
+    405 today — and that is a fact about the library. What this asserts is that the request did
+    not fall through to this application, which is what an unmounted path does.
+    """
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client:
+        response = client.get(f"{MCP_PATH}/")
+    assert response.status_code != NOT_FOUND, (
+        f"{MCP_PATH}/ answered 404, so nothing is mounted there and every MCP assertion in "
+        f"tests/api/test_mcp_surface.py is a statement about an absent surface"
+    )
 
 
 @pytest.mark.parametrize(

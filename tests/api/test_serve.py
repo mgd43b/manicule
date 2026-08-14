@@ -35,10 +35,15 @@ def test_the_default_address_is_loopback() -> None:
 
 
 def test_the_address_reports_the_route_groups_rather_than_a_tool_count() -> None:
-    """The field counts what the surface offers, and this surface offers groups."""
+    """The field counts what the surface offers, and this surface offers groups.
+
+    Twelve since MCP was mounted on this application: it is a group this surface offers, so it
+    is counted like the other eleven. The literal is kept beside the length rather than replaced
+    by it, because ``len(ROUTE_GROUPS) == len(ROUTE_GROUPS)`` would pass against an empty tuple.
+    """
     backend, _ = backend_with_a_document()
     _, address = address_for(ApplicationService(backend))
-    assert address.tools == len(ROUTE_GROUPS) == 11
+    assert address.tools == len(ROUTE_GROUPS) == 12
 
 
 def test_a_wide_host_is_refused_without_the_explicit_flag() -> None:
