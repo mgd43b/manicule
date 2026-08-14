@@ -69,7 +69,7 @@ the browser is watched only through its cookie jar and whether the window is sti
 is typed, clicked or filled for you, and `tests/connectors/test_browser_login.py` fails if an
 accessor that reads page content appears in `connectors/browser.py`. Earlier releases refused to
 drive a browser at all so that the guarantee could be about capability — manicule *cannot* see it
-— rather than about behaviour. That is a real difference and it is stated here rather than
+— rather than about behavior. That is a real difference and it is stated here rather than
 smoothed over; what it is not is a reason to prefer the harder path.
 
 **The two fallbacks, for when `--browser` cannot be used:**
