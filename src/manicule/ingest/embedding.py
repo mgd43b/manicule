@@ -258,8 +258,11 @@ async def embed_or_reuse(
 ) -> tuple[list[Vector], EmbeddingWork]:
     """Embed only the chunks whose embedding input the index does not already hold a vector for.
 
-    **The reuse condition is three-part and every part is load-bearing**: the same embedding
-    fingerprint, the same embedding input, *and* a readable stored vector for that identity.
+    **The reuse condition is three-part and every part is load-bearing** (``docs/storage.md``
+    §6.2 states it as numbered clauses): the same embedding fingerprint, the same embedding
+    input for that document, *and* a readable stored vector for that identity. The third is
+    manicule's own — both written specifications for this problem state only the first two, and
+    a row claiming to be current with a missing vector satisfies both of them.
     The first two are answered by
     :func:`~manicule.core.embedding.embedding_input_identity`; the third is answered by
     reading the row, because identity metadata claiming a vector exists is not a vector
