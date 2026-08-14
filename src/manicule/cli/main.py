@@ -33,7 +33,7 @@ import typer
 from typer.core import TyperGroup, TyperOption
 
 from manicule.app import results as r
-from manicule.app.dispatch import error_info, run_op
+from manicule.app.dispatch import error_info, run_op, writes
 from manicule.app.results import Envelope, failed
 from manicule.app.runtime import Runtime
 from manicule.app.service import DEFAULT_SOURCE, DEFAULT_SWEEP_BATCH, ApplicationService
@@ -404,17 +404,28 @@ def main_callback(
 
 
 async def _execute(op: str, call: Callable[[ApplicationService], Awaitable[Payload]]) -> Envelope:
-    """Open a runtime, run one operation, close it. Never leaks an exception a caller owns."""
+    """Open a runtime, run one operation, close it. Never leaks an exception a caller owns.
+
+    **The operation decides whether this process takes the data directory.**
+    :func:`~manicule.app.dispatch.writes` answers from the operation's name and defaults to
+    "yes", so a command added later takes the lock without anybody remembering to ask for it.
+    Nothing here is optional or per-command: every command on this surface arrives through this
+    function, which is the whole reason the decision is made here rather than in each of them.
+
+    The ``async with`` is inside the ``try`` because the lock is taken by ``__aenter__``.
+    Another process holding the directory is exactly as much an outcome a caller can act on as
+    configuration that will not load, and it gets the same envelope rather than a traceback.
+    """
     try:
-        runtime = Runtime.open(**STATE.overrides)
+        runtime = Runtime.open(writer=writes(op), **STATE.overrides)
+        async with runtime:
+            service = ApplicationService(runtime)
+            return await run_op(op, service.workspace, lambda: call(service))
     except (ManiculeError, ValueError, OSError) as exc:
         # Configuration that will not load is the one failure that happens before there is a
         # workspace to report, and it is also the commonest. It gets the same envelope as
         # everything else rather than a traceback.
         return failed(op, STATE.workspace or UNKNOWN_WORKSPACE, error_info(exc))
-    async with runtime:
-        service = ApplicationService(runtime)
-        return await run_op(op, service.workspace, lambda: call(service))
 
 
 def emit(op: str, call: Callable[[ApplicationService], Awaitable[Payload]]) -> None:

@@ -34,6 +34,7 @@ from manicule.container.container import Container, build_container
 from manicule.core.content import RawDocument
 from manicule.core.errors import ManiculeError, PolicyError, UnknownEntityError
 from manicule.core.lifecycle import HealthState
+from manicule.ingest.recovery import InstanceLock
 from manicule.plugins.manifest import ComponentKind
 
 if TYPE_CHECKING:
@@ -125,28 +126,73 @@ class _Lazy:
 class Runtime:
     """A whole manicule, assembled from configuration and what plugins registered."""
 
-    def __init__(self, settings: Settings, *, discovery: Discovery | None = None) -> None:
+    def __init__(
+        self, settings: Settings, *, discovery: Discovery | None = None, writer: bool = True
+    ) -> None:
         self._settings = settings
         self._container = build_container(settings, discovery=discovery)
         self._slots: dict[str, _Lazy] = {}
         self._engine: AsyncEngine | None = None
         self._migrated = False
+        self._writer = writer
+        self._lock: InstanceLock | None = None
 
     # --- lifecycle --------------------------------------------------------------------------
 
     @classmethod
-    def open(cls, **overrides: Any) -> Runtime:  # noqa: ANN401 - mirrors Settings' own fields
+    def open(cls, *, writer: bool = True, **overrides: Any) -> Runtime:  # noqa: ANN401 - mirrors Settings
         """Load configuration, verify it against what is installed, and return the runtime.
+
+        Args:
+            writer: Whether this process may mutate the data directory. **The default, and it
+                is the default deliberately**: a caller that has not thought about it gets the
+                exclusion rather than silently going without, and the cost of being wrong that
+                way round is a refusal an operator can read. ``docs/ingest.md`` 8.6 has the
+                classification and :func:`~manicule.app.dispatch.writes` applies it.
+            **overrides: Settings fields.
 
         Raises:
             ConfigError: The configuration is malformed.
             PolicyError: It is individually valid and jointly unrunnable, or it names a
                 component nothing installed provides. Everything wrong is listed at once.
         """
-        return cls(load_settings(**overrides))
+        return cls(load_settings(**overrides), writer=writer)
 
     async def __aenter__(self) -> Self:
+        """Take the data directory, if this runtime is one that writes.
+
+        **Here rather than at the first write, and that ordering is the whole point.** The lock
+        has to be held before recovery, before the schema migration and before anything opens
+        the database — a lock acquired after recovery has already requeued another process's
+        in-flight documents has protected nothing that mattered. This is the earliest moment
+        that exists: the runtime is constructed and nothing has been resolved yet.
+
+        There is no check-then-acquire gap because there is no check. The lock is taken
+        unconditionally for a writer, and `flock` either grants it or does not.
+
+        Raises:
+            InstanceLockedError: Another process holds this data directory.
+        """
+        self.acquire()
         return self
+
+    def acquire(self) -> None:
+        """Take the data directory now rather than when the runtime is entered. Idempotent.
+
+        For the callers that are servers. A long-lived process wants the refusal *before* it
+        starts announcing itself — before a port is bound, before a banner is printed — and it
+        wants it as its own one-line report rather than as a traceback out of an ``async with``
+        whose body is a hundred lines of serving. Calling this first gets that; entering the
+        runtime afterwards finds the lock already held and does nothing.
+
+        A reader takes nothing here and nothing later, which is what makes this safe to call
+        unconditionally: whether it locks is the runtime's decision, not the caller's.
+
+        Raises:
+            InstanceLockedError: Another process holds this data directory.
+        """
+        if self._writer and self._lock is None:
+            self._lock = InstanceLock(self._settings.data_dir).acquire()
 
     async def __aexit__(
         self,
@@ -172,9 +218,18 @@ class Runtime:
                 raise
             pending.add_note(f"shutting down also failed: {during_teardown}")
         finally:
-            if self._engine is not None:
-                await self._engine.dispose()
-                self._engine = None
+            try:
+                if self._engine is not None:
+                    await self._engine.dispose()
+                    self._engine = None
+            finally:
+                # Released last, after the container and after the engine, so the lock outlives
+                # every storage operation it was taken to exclude. Giving it up first would
+                # open the directory to a second writer while this one was still flushing —
+                # which is the window the lock exists to close, moved to the end of the run.
+                if self._lock is not None:
+                    self._lock.release()
+                    self._lock = None
 
     # --- what the service is given ----------------------------------------------------------
 
@@ -298,7 +353,6 @@ class Runtime:
         # Imported here, not at module scope: Alembic is not a cheap import and a process
         # that never opens the index should not pay for it.
         from manicule.app.ports import DocumentSurface as Surface  # noqa: PLC0415
-        from manicule.storage.migrator import upgrade  # noqa: PLC0415
 
         store = await self._container.aget(keys.DOC_STORE)
         # Checked rather than cast. The container types this by `DocStore`, and the surface
@@ -318,15 +372,66 @@ class Runtime:
             )
             raise AssemblyError(msg)
         self._engine = engine
-        if not self._migrated:
-            # Before the first read, always. A query against an un-migrated database fails in
-            # whatever way SQLite happens to fail, at whichever statement happens to run first.
-            await upgrade(engine)
-            self._migrated = True
-        ensure = getattr(store, "ensure_workspace", None)
-        if ensure is not None:
-            await ensure()
+        await self._initialise_storage(store, engine)
         return store
+
+    async def _initialise_storage(self, store: object, engine: AsyncEngine) -> None:
+        """Migrate the schema and make sure this workspace has a row. Both are writes.
+
+        **This is the boundary a reader can cross**, and naming it is most of what makes the
+        reader classification honest. A command that only reads still has to meet a database
+        that is at the right revision and a workspace row that exists, and on a directory that
+        has never been used neither is true — so the first ``manicule search`` after an upgrade
+        performs a migration, which is emphatically a write.
+
+        So a reader does it **under the writer's lock**, and only when there is something to
+        do. On an established directory both steps are no-ops, the check costs two statements,
+        and no lock is taken at all — which is what keeps `doctor` and `search` runnable while
+        a sweep holds the directory. On a directory that needs initialising, a reader takes the
+        lock for exactly the length of the initialisation and gives it back; if a writer holds
+        it, the reader is refused with the same message a second writer gets, which is the
+        honest answer because it genuinely cannot proceed.
+
+        A writer is already holding the lock from :meth:`__aenter__` and simply proceeds.
+        """
+        from manicule.storage.migrator import upgrade  # noqa: PLC0415 - Alembic is not cheap
+
+        ensure = getattr(store, "ensure_workspace", None)
+        if self._writer:
+            if not self._migrated:
+                # Before the first read, always. A query against an un-migrated database fails
+                # in whatever way SQLite happens to fail, at whichever statement happens to run
+                # first.
+                await upgrade(engine)
+                self._migrated = True
+            if ensure is not None:
+                await ensure()
+            return
+        if not self._migrated:
+            if await self._storage_needs_initialising(engine):
+                with InstanceLock(self._settings.data_dir):
+                    await upgrade(engine)
+            self._migrated = True
+        if ensure is not None:
+            # Outside the lock, and the docstring above says why: one guarded insert of a row
+            # nobody else is inserting, which no concurrent writer can be harmed by.
+            await ensure()
+
+    async def _storage_needs_initialising(self, engine: AsyncEngine) -> bool:
+        """Whether the schema is behind head. A read, and the only thing that decides the lock.
+
+        Deliberately narrower than "would the initialisation write anything". Creating a
+        workspace row is a write too, but it is one statement guarded by its own transaction
+        and it cannot corrupt anything a concurrent writer is doing; a migration rebuilds
+        tables. Taking an exclusive lock to insert a row nobody else is inserting would refuse
+        a reader for no gain, which is the failure mode this whole classification exists to
+        avoid.
+        """
+        from manicule.storage.migrator import current_revision, head_revision  # noqa: PLC0415
+
+        async with engine.connect() as connection:
+            at = await connection.run_sync(current_revision)
+        return at != head_revision()
 
     async def _build_vectors(self) -> VectorStore:
         return await self._container.aget(keys.VECTOR_STORE)

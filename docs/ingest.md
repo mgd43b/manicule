@@ -585,15 +585,23 @@ rather than hoped for: **an exclusive lock on `<data_dir>/manicule.lock`, held f
 lifetime.** A second instance fails to start with the holder's PID, rather than starting and
 requeueing the first instance's in-flight documents out from under it.
 
-**That is the design, and nothing acquires it yet.** `ingest.recovery.InstanceLock` implements
-the whole of it — an exclusive `flock`, the holder's PID in the refusal, released on exit — and
-has tests of its own, and no code in `src/` constructs one. No command takes it, so the file is
-never created and two processes opened on one data directory are today stopped by nothing. It
-is stated here rather than left to be found because other guarantees are written as though it
-holds: §8.4 names it as the outermost of four exclusions, and every sentence in this document
-about "a single writer" is for now a description of how manicule is *used* rather than of what
-it refuses. The document-revision guard in §8.5 is deliberately not built on it, and holds
-whether it is taken or not.
+**It is acquired.** `ingest.recovery.InstanceLock` implements it — an exclusive `flock`, the
+holder's PID in the refusal, released on exit — and `Runtime.__aenter__` takes it for every
+process that writes. It said "designed, and nothing acquires it" here until recently, which is
+why §8.6 exists: the classification of who takes it is the part that has to be got right and
+kept right, not the lock.
+
+**`flock`, and the file is a note rather than a lock.** The kernel releases it when the holding
+process goes, however it went — so a `SIGKILL`, a power cut or an `OOM` kill all leave the
+directory immediately available to the next writer, with the file still sitting there holding a
+dead process's number. That number exists so the refusal can name a holder. **Deleting the file
+is not the remedy for anything**: it does not release a lock, because the lock is not in the
+file, and doing it while a process is running deletes the note without touching the exclusion —
+after which two writers see an empty directory and both proceed. If a writer is refused and you
+believe nothing is running, the answer is to find the process the message names.
+
+The document-revision guard in §8.5 is deliberately not built on this and holds whether it is
+taken or not. §8.4 is why both exist.
 
 ### 6.6 Embed is in-process, and that is a deliberate asymmetry
 
@@ -736,7 +744,7 @@ about the model being read as a statement about the database.
 |---|---|---|---|
 | Model / accelerator | `asyncio.Lock` on the pipeline | one process, **all** documents | two batches inside the embedder at once |
 | Per-document mutation | keyed `asyncio.Lock`, one entry per document id | one process, **one** document | two operations writing one document's record, chunks and vectors at once |
-| Data directory | `flock` on `manicule.lock` (§6.5) | one machine, all processes | a second instance starting at all |
+| Data directory | `flock` on `manicule.lock` (§6.5, §8.6) | one machine, all processes | a second *writer* starting at all |
 | Document revision | compare-and-swap at the commit (§8.5) | durable; no process, no lock | a commit derived from a document that has since moved |
 
 **The model lock says nothing about the database.** Two operations can queue politely for the
@@ -754,8 +762,11 @@ finished with.
 
 **The mutation lock is not durable and is not the guard.** It is an `asyncio.Lock` on a
 pipeline object: it holds inside one event loop in one process, and a second process opened on
-the same data directory takes no part in it. That is §6.5's job — and §6.5 is not wired up.
-Which is why the invariant is the one in the last row, which needs neither.
+the same data directory takes no part in it. That is §6.5's job, and §6.5 is now taken by every
+writer (§8.6). The invariant in the last row still needs neither, and that is the point of
+defence in depth: the process lock is the one that can be absent because somebody ran a writer
+against a directory a *third-party* tool was also writing, and the compare-and-swap is what
+holds when it is.
 
 ### 8.5 Optimistic commit: an operation may not commit on a document that moved
 
@@ -805,7 +816,55 @@ is wrong.
 concurrently. The commit guard detects it and refuses, but between the second check and the
 third there is a window in which the other process's chunks can be replaced by ours before our
 commit refuses — leaving derived rows a later repair has to fix. The exclusion for that is
-§6.5, which is a lock nothing currently takes.
+§6.5, and it is now taken by every writer (§8.6), so reaching this window means something is
+writing the directory that is not a manicule writer process.
+
+### 8.6 Who takes the data directory, and who does not
+
+**The guarantee.** One writer process per resolved data directory, at a time. A second writer
+does not wait, queue or retry: it fails before it has opened the database, naming the lock
+path, the holder's process id where the file can supply one, and what to do instead.
+
+**Writers take it for their whole life**, from before the schema migration and before the
+recovery sweep to after the engine is disposed. `Runtime.__aenter__` is where it happens, which
+is the earliest moment a runtime exists — a lock taken after recovery has requeued another
+process's in-flight documents has protected nothing that mattered. Servers, watch mode and the
+REPL call `Runtime.acquire()` on the way in so the refusal arrives before a port is bound
+rather than out of the middle of a serving loop.
+
+**Readers take nothing.** `search`, `ask`, `doctor`, every listing and every `--json` read run
+normally while a sweep or a sync holds the directory, which is the point: a lock that stopped
+`doctor` running during the operation somebody wanted diagnosed would be worse than no lock.
+`manicule.app.dispatch.READ_ONLY_OPS` is the list and `writes()` applies it.
+
+**The default is "writer".** An operation not in that list takes the lock. That is the safe
+direction — the unsafe one is a command added in a hurry that indexes beside a running sweep —
+and `tests/app/test_process_exclusion.py` enumerates the command line's own operations and
+fails if any is classified as neither, so the decision is made rather than inherited.
+
+**Three boundaries where a reader is not purely a reader**, audited rather than assumed:
+
+| What | Which way it falls | Why |
+|---|---|---|
+| The schema migration | Reader takes the lock **for the migration only** | It rebuilds tables. A reader meeting a database behind head has to migrate it; it does so under the lock and gives it straight back. On a directory already at head nothing is taken, which is the ordinary case. |
+| The workspace row | Reader, unlocked | One guarded `INSERT` of a row nobody else is inserting. Taking an exclusive lock for it would refuse readers for no gain. |
+| `query_logs` | Reader, unlocked | `ask` and `search` record one row per retrieval. It is observability, it is already written so that losing the SQLite writer cannot fail the query, and making a read conditional on a write is the failure that code exists to avoid. |
+
+`backup` and `export` are readers, and the cost is worth stating: they copy a directory that
+another process may be writing, so a copy taken during active indexing is a copy of something
+moving. That was true before this lock existed and is not fixed by it. Making them writers
+would mean no backup could be taken while a server was up, which is when somebody most wants
+one; a consistent copy under load needs a snapshot, not a lock.
+
+**Shutdown.** The lock is released after the container and after the engine, so it outlives
+every storage operation it was taken to exclude. `Ctrl-C` and `SIGTERM` reach the runtime's
+`__aexit__` and release it there. Anything more abrupt is the kernel's job and needs nothing
+from manicule — see §6.5 on why deleting the file is not a remedy.
+
+**How this relates to the other two guards.** The process lock excludes a second *process*.
+Storage transactions exclude a second *statement*. The document compare-and-swap (§8.5)
+excludes a commit derived from a document that has since moved. They are three different
+scopes; none replaces either of the others, and this one is the outermost.
 
 ## 9. Storing
 
@@ -1330,7 +1389,7 @@ every document that has no retained bytes, and the lock file's holder.
 | Proposed-deletion refusals awaiting confirmation | §11.1 guard 2 having fired |
 | Documents with `original_ref IS NULL`, by reason | The set for which rung 4 is the only repair |
 | Queue depth and embed throughput during a run | Where the bottleneck actually is |
-| `manicule.lock` holder | A second instance having been attempted (§6.5) — nothing writes this file yet |
+| `manicule.lock` holder | A second writer having been attempted (§6.5) |
 
 ---
 
@@ -1349,7 +1408,7 @@ Calls made in the absence of a stated position.
 | Parse in `spawn`ed worker subprocesses; embed deliberately not (chunk moved to the parent, §2) | §6 |
 | Memory bounding is platform-split: `RLIMIT_AS` on Linux, RSS polling on macOS | §6.2 |
 | Crash recovery is a startup sweep on `status` + `updated_at`, no new schema | §6.4 |
-| One instance per data directory, by a lock file — decided, and not yet acquired anywhere | §6.5 |
+| One writer per data directory, by a lock file every writer acquires; readers take nothing | §6.5, §8.6 |
 | Every refusal runs once per run, before discovery, plus a budget/context cross-check | §7 |
 | Embed batch size derived from both fingerprints, not a constant | §8.2 |
 | Bounded queues, so backpressure reaches discovery and cursors do not expire | §8.3 |

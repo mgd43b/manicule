@@ -49,7 +49,10 @@ async def _watch(path: Path, *, source: str, reindex: bool, overrides: dict[str,
 
     out = render.console()
     try:
+        # Watch mode indexes whatever changes, indefinitely. It is a writer for its whole
+        # life, and the refusal belongs on the way in rather than at the first change.
         runtime = Runtime.open(**overrides)
+        runtime.acquire()
     except (ManiculeError, ValueError, OSError) as exc:
         render.render_error(render.console(stderr=True), "index_path", error_info(exc))
         return 1

@@ -104,4 +104,71 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
     return succeeded(op, workspace, payload)
 
 
-__all__ = ["error_info", "run_op"]
+READ_ONLY_OPS: frozenset[str] = frozenset(
+    {
+        # Retrieval. Both of these *do* write one row — `query_logs`, through
+        # `_record_query` — and that is the single deliberate exception to the classification
+        # rather than an oversight. The write is observability, it is wrapped so that losing
+        # the SQLite writer cannot fail the query, and `docs/ingest.md` 8.6 says so: a read
+        # made conditional on a write is the failure that code exists to avoid, and refusing
+        # a search because an index is being rebuilt would be the same failure one level up.
+        "ask",
+        "search",
+        # Reads of what is stored.
+        "document_list",
+        "document_get",
+        "index_status",
+        "stats",
+        "collection_list",
+        "collection_documents",
+        "collection_counts",
+        "collection_orphans",
+        "connector_list",
+        "workspace_list",
+        "auth_list_keys",
+        # Reads of configuration and of what is installed. These touch no data directory at
+        # all; they are named rather than left to the default because the default is "writer",
+        # and a command that takes an exclusive lock to print a setting would be absurd.
+        "config_get",
+        "plugin_list",
+        # The diagnostic, and it is the one this classification most has to get right: a lock
+        # that stops `doctor` running during the operation somebody wants diagnosed is worse
+        # than no lock. It reads; `--fix` writes grammars and vocabularies into the *cache*
+        # directory rather than the data directory, so even that stays on this side.
+        "doctor",
+        # Copies *out*. Both read the data directory and write somewhere else, so neither
+        # needs the writer's exclusion — and making them writers would mean no backup could be
+        # taken while a server was up, which is when somebody most wants one. The cost is
+        # named in `docs/ingest.md` 8.6: a copy taken during active indexing is a copy of a
+        # moving directory, which was true before this lock existed and is not fixed by it.
+        "backup",
+        "export",
+    }
+)
+"""Operations that do not take the data directory's writer lock.
+
+**The default is the other one.** :func:`writes` answers "yes" for any operation not named
+here, so an operation added tomorrow and forgotten today is one that takes the lock — refused
+while another writer runs, which is the safe direction to be wrong in. The unsafe direction is
+a new command that quietly indexes beside a running sweep, and no list anybody maintains by
+hand would reliably catch it.
+
+Forgetting is nonetheless caught rather than merely survived:
+``tests/app/test_process_exclusion.py`` enumerates every operation the command line can emit
+and fails if one is in neither set, so the decision has to be made rather than defaulted into.
+"""
+
+
+def writes(op: str) -> bool:
+    """Whether ``op`` needs the exclusive lock on its data directory.
+
+    Args:
+        op: The operation's name, as it appears on the envelope.
+
+    Returns:
+        ``True`` unless the operation is named in :data:`READ_ONLY_OPS`.
+    """
+    return op not in READ_ONLY_OPS
+
+
+__all__ = ["READ_ONLY_OPS", "error_info", "run_op", "writes"]

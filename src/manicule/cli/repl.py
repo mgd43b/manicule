@@ -75,7 +75,11 @@ async def _loop(
             out.file.flush()
 
     try:
+        # A REPL can run any operation, including every writer, so it holds the directory
+        # for its whole session. Taken here so the refusal is the rendered error below
+        # rather than a traceback out of the loop.
         runtime = Runtime.open(**overrides)
+        runtime.acquire()
     except (ManiculeError, ValueError, OSError) as exc:
         from manicule.app.dispatch import error_info  # noqa: PLC0415 - only the failure path
 
