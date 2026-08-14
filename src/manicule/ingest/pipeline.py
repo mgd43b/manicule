@@ -421,6 +421,16 @@ class _Sync:
     """Top-level documents handed to the fetch stage. What ``--limit`` bounds, counted where
     the bound is applied rather than derived afterwards from what finished."""
 
+    bodies_held: Gauge = field(default_factory=lambda: Gauge("bodies"))
+    """Fetched bodies in memory: queued, and held by an ingest worker.
+
+    **Per run rather than on the pipeline**, unlike the parse and embed gauges. Those count
+    process-wide resources — one pool, one accelerator — and a second operation sharing this
+    pipeline genuinely is inside them. A body belongs to the run that fetched it, and a run that
+    was canceled with items still queued would otherwise leave a count nothing will ever release,
+    inflating every later run's report by a number that only ever grows.
+    """
+
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     """Set on cancellation. Discovery is the only stage that reads it, because stopping
     discovery is what brings every stage behind it down in order."""
@@ -515,7 +525,6 @@ class IngestPipeline:
         self._embedding = CountedLock("embed")
         self._parsing = Gauge("parse")
         self._fetches = Gauge("fetch")
-        self._bodies = Gauge("bodies")
         self._mutations: dict[str, tuple[asyncio.Lock, int]] = {}
 
     # --- the two locks, and what each one is for ------------------------------------------
@@ -632,7 +641,7 @@ class IngestPipeline:
         )
         # Peaks only. The active counts belong to whoever is inside the stage right now, and a
         # second operation sharing this pipeline is one of them.
-        for gauge in (self._fetches, self._parsing, self._bodies, self._embedding.gauge):
+        for gauge in (self._fetches, self._parsing, self._embedding.gauge):
             gauge.rebase()
 
         stages = asyncio.create_task(self._drive(run), name=f"ingest:{connector.name}")
@@ -733,14 +742,8 @@ class IngestPipeline:
                 # how many fetched bodies are held in memory at once — which spans the queue
                 # they wait in as well as the worker that has one. A block cannot express that,
                 # so the pair is written out.
-                self._bodies.enter()
-                try:
-                    await bodies.put(accepted)
-                except BaseException:
-                    # A put that never landed is a body nothing downstream will release, so the
-                    # accounting is undone here rather than left for a stage that never sees it.
-                    self._bodies.leave()
-                    raise
+                run.bodies_held.enter()
+                await bodies.put(accepted)
         finally:
             bodies.finish()
 
@@ -774,7 +777,7 @@ class IngestPipeline:
                 # The other half of the pair entered in the fetch stage: this body is no longer
                 # held. In a `finally`, so a document that failed still releases its accounting —
                 # the deadlock this whole design has to avoid is a permit that a failure keeps.
-                self._bodies.leave()
+                run.bodies_held.leave()
             for position, outcome in enumerate(outcomes):
                 # The first outcome is the discovered document; anything after it came out of
                 # the inside of it.
@@ -810,7 +813,7 @@ class IngestPipeline:
             peak_fetches=self._fetches.peak,
             peak_parses=self._parsing.peak,
             peak_embeds=self._embedding.gauge.peak,
-            peak_bodies=self._bodies.peak,
+            peak_bodies=run.bodies_held.peak,
         )
 
     async def _advance_watermark(self, connector: Connector) -> None:

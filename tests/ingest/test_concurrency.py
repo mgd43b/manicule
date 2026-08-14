@@ -719,6 +719,46 @@ async def test_a_graceful_stop_carries_what_was_already_accepted_to_a_terminal_o
     assert store.watermarks == {}
 
 
+async def test_a_canceled_run_stops_pulling_the_source_even_while_it_drains() -> None:
+    """The grace window finishes accepted work; it is not a licence to keep reading the source.
+
+    Without this, ``Ctrl-C`` on a large sync would keep enumerating and keep fetching for the
+    whole grace window — a canceled command still hammering a rate-limited API, which is the
+    opposite of what a person pressing ``Ctrl-C`` is asking for.
+
+    **The sequence is what makes it airtight.** The stages are wedged behind a parked embedder
+    with discovery blocked inside a ``put``, so nothing more can be produced until room appears.
+    The cancellation goes in first and the gate opens second, so room appears *after* the stop —
+    and every document produced from then on is one the stop failed to prevent.
+    """
+    embedder = fakes.GatedEmbedder()
+    pipeline, _, _ = build(
+        embedder=embedder,
+        fetch_concurrency=2,
+        parse_workers=1,
+        queue_depth_factor=1,
+        shutdown_grace_s=30.0,
+    )
+    connector = _Positioned(corpus(40))
+
+    run = asyncio.create_task(pipeline.run(connector))
+    await embedder.gate.wait_for(1)
+    for _ in range(BLOCKED_YIELDS):
+        await connector.yielded.acquire()
+    run.cancel()
+    embedder.gate.open()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    # One more than the wedged count: discovery was suspended inside the ninth `put`, and it
+    # reads the stop at the top of the loop, so the tenth document is produced by the source and
+    # then dropped rather than never produced. Abandoning one enumerated document costs nothing —
+    # no watermark was written, so the next sync sees it again.
+    assert connector.yields <= BLOCKED_YIELDS + 1, (
+        f"the source was paged {connector.yields} times after the run was canceled"
+    )
+
+
 async def test_a_second_cancellation_inside_the_grace_window_stops_waiting() -> None:
     """The impatient case is safe rather than different, and the recovery path is the same.
 
