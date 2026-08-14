@@ -423,7 +423,7 @@ async def test_a_stale_guarded_write_loses_to_a_scheduled_sync_that_moved_the_do
     ``tests/ingest/test_reindex.py``. That point catches a document moving *between* the record
     write and the commit, and :meth:`~manicule.ingest.pipeline.IngestPipeline._mutating` makes
     that unreachable from inside this process: its own docstring says reaching it means a second
-    process is writing the data directory without the instance lock. It is defence in depth
+    process is writing the data directory without the instance lock. It is defense in depth
     against a state this process cannot produce, so it has no test, and that is a gap in the
     suite rather than in the guard.
     """
