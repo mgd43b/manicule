@@ -465,6 +465,45 @@ async def test_a_commit_that_fails_does_not_strand_a_place_in_the_stages() -> No
     )
 
 
+async def test_a_connector_whose_cleanup_raises_ends_the_run_instead_of_hanging_it() -> None:
+    """Closing somebody else's async generator is the one thing discovery does that can fail.
+
+    A connector's own ``finally`` is code this repository did not write, and it runs while
+    discovery is holding the only thing that tells the fetch stage no more is coming. Raising
+    there skips that, so every fetch worker is left waiting for an item that will never arrive.
+
+    **What makes the run return anyway is the task group**, not the ordering inside the
+    ``finally``. Discovery raising is a stage failure, so the group cancels the workers where
+    they are blocked and the command ends with the failure recorded. That is worth pinning
+    precisely because it is not obvious: the sibling case one stage later — a fetch worker
+    exiting *normally* without closing the parse hand-off — has no exception to trigger the
+    cancellation, and it hangs.
+
+    ``--limit`` is what reaches this path: discovery breaks with the generator still suspended,
+    so the close is a real ``aclose`` rather than an exhausted iterator running its own
+    ``finally``. The deadline is the assertion.
+    """
+
+    class BadCleanup(_Positioned):
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            try:
+                async for found in super().discover(watermark):
+                    yield found
+            finally:
+                msg = "the connector's cursor teardown raised"
+                raise RuntimeError(msg)
+
+    pipeline, store, _ = build(fetch_concurrency=2, parse_workers=1, queue_depth_factor=1)
+
+    async with asyncio.timeout(20):
+        report = await pipeline.run(BadCleanup(corpus(20)), limit=2)
+
+    assert not report.clean
+    assert "cursor teardown" in report.error
+    assert store.watermarks == {}
+
+
 async def test_a_dead_document_store_ends_the_run_rather_than_being_absorbed() -> None:
     """The one failure that is *not* one document's, and it must not be counted as one.
 

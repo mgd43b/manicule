@@ -105,13 +105,21 @@ class Conveyor[T]:
             raise ValueError(msg)
         self.name = name
         self.capacity = capacity
-        self.depth = 0
         self.peak_depth = 0
         self.blocked_puts = 0
         self._items: asyncio.Queue[T | _EndOfStream] = asyncio.Queue()
         self._room = asyncio.Semaphore(capacity)
         self._consumers = consumers
         self._producers = producers
+        # Items waiting, kept apart from `self._items.qsize()` because that also counts the
+        # end-of-stream sentinels once they have gone out, and a depth that jumped by the
+        # consumer count at teardown would be a diagnostic reporting a queue that never existed.
+        self._depth = 0
+
+    @property
+    def depth(self) -> int:
+        """How many items are waiting right now. Read-only: :meth:`put` and :meth:`take` own it."""
+        return self._depth
 
     async def put(self, item: T) -> None:
         """Hand an item on, waiting while the next stage is full.
@@ -121,8 +129,8 @@ class Conveyor[T]:
         if self._room.locked():
             self.blocked_puts += 1
         await self._room.acquire()
-        self.depth += 1
-        self.peak_depth = max(self.peak_depth, self.depth)
+        self._depth += 1
+        self.peak_depth = max(self.peak_depth, self._depth)
         self._items.put_nowait(item)
 
     async def take(self) -> T | None:
@@ -136,7 +144,7 @@ class Conveyor[T]:
         item = await self._items.get()
         if isinstance(item, _EndOfStream):
             return None
-        self.depth -= 1
+        self._depth -= 1
         self._room.release()
         return item
 
@@ -209,6 +217,13 @@ class Gauge:
         Called at the start of a run so its report is about that run. The active count is
         deliberately left alone: a second operation sharing this pipeline is *inside* the stage,
         and zeroing it would make the gauge go negative when that operation leaves.
+
+        **Two runs overlapping on one pipeline would rebase each other's peaks**, and each would
+        report the other's high-water mark rather than its own. Nothing does that today — a sync
+        is awaited from one place, and the data directory admits one writer — and a gauge per run
+        would be the fix if anything ever did. The alternative for the two stages that share a
+        pool and an accelerator is worse: those peaks are about a process-wide resource, so a
+        per-run reading of them would be a smaller number and a false one.
         """
         self.peak = self.active
 

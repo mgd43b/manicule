@@ -334,6 +334,15 @@ class RunReport:
         return self.clean and not self.limited and self.unrecorded == 0
 
     def record(self, outcome: DocumentOutcome, *, expanded: bool = False) -> None:
+        """Count one outcome. Called from every fetch and ingest worker of a staged run.
+
+        **Nothing in here awaits, and that is what makes it safe from all of them.** A coroutine
+        is only descheduled at an ``await``, so every read-modify-write below completes before
+        another worker can run — which is the same reason the refcount in
+        :meth:`IngestPipeline._mutating` needs no lock of its own. Adding an ``await`` here would
+        silently start losing counts under concurrency, and a lost count in a report is a run
+        that says it did less work than it did.
+        """
         if expanded:
             self.expanded += 1
         else:
