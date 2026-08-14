@@ -292,15 +292,19 @@ def credential_for(
         now: The clock the age check reads.
 
     Raises:
-        ConfigError: No session has been captured for this instance in this process's lifetime.
-            The message names the two commands that fix it, because after a restart this is the
-            expected state rather than a fault — a session lives in the server's memory, so
-            stopping the server is what ends it.
+        SessionMissingError: No session has been captured for this instance in this process's
+            lifetime. The message names the two commands that fix it, because after a restart
+            this is the expected state rather than a fault — a session lives in the server's
+            memory, so stopping the server is what ends it. It is a
+            :class:`~manicule.core.errors.ConfigError`, so a caller catching that still catches
+            this; what its own name buys is the scheduler being able to tell "nobody has signed
+            in" from "the instance was unreachable".
         SessionExpiredError: A session was captured and is older than this connector will use.
     """
     if config.auth_method is not AuthMethod.BROWSER_SESSION:
         return token_credential(config)
 
+    from manicule.connectors.errors import SessionMissingError  # noqa: PLC0415 - one raise site
     from manicule.connectors.sessions import load_session  # noqa: PLC0415 - see module docstring
 
     session = load_session(config, store=store)
@@ -314,7 +318,7 @@ def credential_for(
             f"`manicule connector login <name> --browser`; manicule never asks for the password "
             f"and never sees it."
         )
-        raise ConfigError(msg)
+        raise SessionMissingError(msg)
     credential = BrowserSessionCredential(
         session=session,
         max_age=timedelta(hours=config.session_max_age_hours),

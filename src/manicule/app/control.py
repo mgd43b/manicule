@@ -33,7 +33,7 @@ per data directory. The pid file stays where #126 put it; it answers a different
 
 .. code-block:: text
 
-    client → server   one line: an Invoke, a Handover or a Forget
+    client → server   one line: an Invoke, a Handover, a Forget or a Held
     server → client   zero or more Progress lines, then exactly one Result line, then EOF
 
 A connection *is* a request, so there is no request id, no multiplexing and no session state to
@@ -80,6 +80,7 @@ __all__ = [
     "ControlServer",
     "Forget",
     "Handover",
+    "Held",
     "Invoke",
     "Progress",
     "ProtocolError",
@@ -306,6 +307,34 @@ class Forget(BaseModel):
         return _line(self.model_dump(mode="json"))
 
 
+class Held(BaseModel):
+    """Which instances are you holding a session for?
+
+    The one question about a credential that a process which is *not* the server needs an answer
+    to, and the one it cannot answer for itself: sessions live in the server's memory, so a
+    ``manicule doctor`` typed at a terminal is looking at an empty vault whatever the server has.
+    Reporting that emptiness as "there is no session" would be a diagnostic that is always
+    alarming and never informative.
+
+    **The reply carries no session value, no length and no digest of one** — only the instance
+    and the account, which are exactly the two fields
+    :meth:`~manicule.app.served.ControlHandler._accept` already answers a hand-off with. A
+    credential does not become safe to echo by being asked for a second time.
+
+    A frame of its own rather than an :class:`Invoke`, because the accept list an ``Invoke``
+    names (:data:`~manicule.app.commands.BINDERS`) is the operations that can be *described as
+    data and run*, and this runs nothing. It is a question about the process, in the same family
+    as the two frames that put a credential there and take it away again.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["held"] = "held"
+
+    def to_line(self) -> bytes:
+        return _line(self.model_dump(mode="json"))
+
+
 class Progress(BaseModel):
     """Something happened that is worth saying before the operation is over.
 
@@ -339,13 +368,14 @@ class Result(BaseModel):
         return _line(self.model_dump(mode="json"))
 
 
-type Request = Invoke | Handover | Forget
+type Request = Invoke | Handover | Forget | Held
 type Response = Progress | Result
 
-_REQUESTS: Mapping[str, type[Invoke] | type[Handover] | type[Forget]] = {
+_REQUESTS: Mapping[str, type[Invoke] | type[Handover] | type[Forget] | type[Held]] = {
     "invoke": Invoke,
     "handover": Handover,
     "forget": Forget,
+    "held": Held,
 }
 
 

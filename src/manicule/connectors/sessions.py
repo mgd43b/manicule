@@ -89,6 +89,7 @@ __all__ = [
     "capture_cookies",
     "cookies_authenticate",
     "default_store",
+    "instance_key",
     "load_session",
     "parse_cookies",
 ]
@@ -126,6 +127,19 @@ class SessionStore(Protocol):
         """Where this keeps things, for a message that tells somebody what just happened."""
         ...
 
+    def holding(self) -> dict[str, str]:
+        """Which instances this holds a session for, keyed by :func:`instance_key`.
+
+        On the protocol rather than on :class:`SessionVault` alone, so that ``doctor``'s session
+        check asks *a store* rather than asking whichever object it can prove is the real one.
+        The command-line store answers ``{}`` and means it — a short-lived process holds no
+        session, which is the property ``tests/app/test_session_handover.py`` already asserts
+        about its ``load``.
+
+        Values are accounts and never credentials; see :meth:`SessionVault.holding`.
+        """
+        ...
+
 
 class SessionVault:
     """Captured sessions, held in this process's memory and written nowhere.
@@ -151,13 +165,13 @@ class SessionVault:
         return "the running server's memory, which does not survive it"
 
     def load(self, base_url: str) -> BrowserSession | None:
-        return self._sessions.get(_account(base_url))
+        return self._sessions.get(instance_key(base_url))
 
     async def save(self, session: BrowserSession) -> None:
-        self._sessions[_account(session.base_url)] = session
+        self._sessions[instance_key(session.base_url)] = session
 
     async def forget(self, base_url: str) -> bool:
-        return self._sessions.pop(_account(base_url), None) is not None
+        return self._sessions.pop(instance_key(base_url), None) is not None
 
     def __len__(self) -> int:
         """How many instances this holds a session for. For a diagnostic that must not read one.
@@ -167,6 +181,24 @@ class SessionVault:
         use for, and "what is it" is a question nothing outside this module has.
         """
         return len(self._sessions)
+
+    def holding(self) -> dict[str, str]:
+        """Which instances this holds a session for, and whose account each one is.
+
+        The listing :meth:`__len__` deliberately is not, added when ``doctor`` grew a check that
+        has to name the source an operator must sign in to again — a count answers "is anything
+        held" and not "is *handbook* held", and the second is the question somebody has at three
+        in the morning.
+
+        **Two fields, and neither is the credential.** The instance is already in configuration
+        and the account is already echoed by a hand-off's acknowledgment, so this discloses
+        nothing that was not disclosed; the cookies are not reachable from what it returns, which
+        is what keeps :meth:`__len__`'s reason intact rather than merely narrowed.
+
+        Keyed by the normalized base URL, because that is what this is keyed by — a listing that
+        reported the spelling somebody typed would not match what :meth:`load` looks up.
+        """
+        return {base_url: session.account for base_url, session in self._sessions.items()}
 
 
 SESSIONS = SessionVault()
@@ -433,6 +465,10 @@ class _Discarding:
         del base_url
         return False
 
+    def holding(self) -> dict[str, str]:
+        """Nothing, because :meth:`save` kept nothing. Never consulted; present to be a store."""
+        return {}
+
 
 def _named(payload: Mapping[str, object]) -> str:
     """Who a ``user/current`` response says it is, under whichever key this version uses."""
@@ -443,10 +479,15 @@ def _named(payload: Mapping[str, object]) -> str:
     return ""
 
 
-def _account(base_url: str) -> str:
+def instance_key(base_url: str) -> str:
     """The key a site's session is filed under.
 
     Normalized so that ``https://wiki.example.com`` and ``https://wiki.example.com/`` are one
     entry rather than two, one of which would be found and the other silently not.
+
+    Public, and named for a URL rather than for an account, because :meth:`SessionVault.holding`
+    reports these keys and a caller comparing a configured ``base_url`` against them has to
+    normalize it the same way. A second normalizer written at that call site would agree until
+    somebody configured a trailing slash — which is precisely the case this exists for.
     """
     return base_url.strip().rstrip("/")

@@ -203,6 +203,16 @@ class HandoverStore:
         del base_url
         return None
 
+    def holding(self) -> dict[str, str]:
+        """Nothing, for the same reason :meth:`load` answers ``None``.
+
+        Not a stub and not a gap in what this can see: a command-line process holds no session,
+        so an empty answer is the true one. ``doctor``'s session check reads an empty store as
+        "ask the server" rather than as "there is none", which is what keeps this honest instead
+        of merely quiet.
+        """
+        return {}
+
     async def save(self, session: BrowserSession) -> None:
         """Hand a verified session to the server.
 

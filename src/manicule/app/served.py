@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 from manicule.app import commands, control
 from manicule.app.dispatch import run_op
 from manicule.connectors.credentials import BrowserSession
+from manicule.connectors.errors import SessionMissingError
 from manicule.core.errors import ManiculeError
 
 if TYPE_CHECKING:
@@ -49,7 +50,7 @@ __all__ = ["ControlHandler", "ScheduledSource", "Scheduler", "Serving"]
 class ControlHandler:
     """Runs what arrives on the control socket, and nothing else.
 
-    Three request kinds, three things it can do, and the list is closed:
+    Four request kinds, four things it can do, and the list is closed:
 
     ``Invoke``
         Run one operation through :func:`~manicule.app.commands.run`, which is the same function
@@ -60,6 +61,9 @@ class ControlHandler:
         this process.
     ``Forget``
         Drop one.
+    ``Held``
+        Say which instances it is holding a session for, and for whose account. The answer
+        carries no session value — see :class:`~manicule.app.control.Held`.
 
     **It returns envelopes and does not raise for anything a caller could act on**, because the
     thing on the other end of the socket is a person's terminal and a traceback is not a result.
@@ -78,6 +82,8 @@ class ControlHandler:
             return await self._invoke(request, report)
         if isinstance(request, control.Handover):
             return await self._accept(request)
+        if isinstance(request, control.Held):
+            return self._held()
         return await self._forget(request)
 
     async def _invoke(
@@ -152,6 +158,28 @@ class ControlHandler:
             {"base_url": request.base_url, "forgotten": forgotten},
         )
 
+    def _held(self) -> dict[str, JsonValue]:
+        """Which instances this process holds a session for, and for whose account.
+
+        Synchronous, and the only handler that is: it reads a dictionary. Declared ``def`` rather
+        than ``async def`` returning immediately, because a coroutine that never awaits is a
+        claim about needing the event loop that this does not make.
+
+        The reply is a list of two-field objects rather than a mapping, so a base URL containing
+        anything awkward is a value rather than a key — and so the shape has somewhere to grow if
+        a capture time is ever wanted here, which a mapping would not.
+        """
+        return _succeeded(
+            "connector_login",
+            self._service.workspace,
+            {
+                "held": [
+                    {"base_url": base_url, "account": account}
+                    for base_url, account in sorted(self._vault.holding().items())
+                ]
+            },
+        )
+
 
 def _succeeded(op: str, workspace: str, data: dict[str, JsonValue]) -> dict[str, JsonValue]:
     """A hand-off result, in the envelope shape every surface uses.
@@ -201,6 +229,22 @@ class ScheduledSource:
     interval_s: float
     runs: int = 0
     failures: int = 0
+    awaiting_sign_in: bool = False
+    """Whether the last run failed because nobody has signed in to this source's instance.
+
+    A field rather than a fourth counter, because it is a *state* and not an event: it is true
+    from the first failure until a run succeeds, which is exactly how long somebody needs to open
+    a browser. A count would say "it failed nine times" where what an operator needs is "it is
+    still waiting".
+
+    Separate from ``failures`` rather than replacing it, because the run did fail and the
+    counters should agree with each other. What this adds is *which kind* — a restart lost the
+    session and a person has to sign in, as against an instance that was unreachable and will
+    probably be reachable at twenty past. Both are refusals; only one of them needs anybody.
+
+    Cleared by a run that succeeds. Nothing else clears it: a failure of a different kind on a
+    source that is also waiting to be signed in to leaves it set, because it is still true.
+    """
 
 
 class Scheduler:
@@ -226,6 +270,16 @@ class Scheduler:
     and tries again, because the commonest failures here are transient or fixable elsewhere: an
     instance that was down, a session that expired and needs a person. A loop that exited on the
     first of those would need a restart to resume and would give no sign it had stopped.
+
+    **One refusal is reported as itself, and it is the one a restart causes.** A session lives in
+    this process's memory, so launchd restarting the server — a crash, a logout, a reboot — ends
+    every one of them and the next scheduled sync cannot authenticate. Reported like any other
+    failure that reads, at three in the morning, exactly like an instance that is down; and the
+    two need opposite things, one a person at a browser and the other nothing at all. So
+    :class:`~manicule.connectors.errors.SessionMissingError` is matched on its type, announced in
+    its own sentence naming the command that fixes it, and recorded as
+    :attr:`ScheduledSource.awaiting_sign_in` so that the state is inspectable rather than only
+    printed.
     """
 
     def __init__(
@@ -289,6 +343,22 @@ class Scheduler:
                 await self._service.connector_sync(name)
             except asyncio.CancelledError:
                 raise
+            except SessionMissingError as exc:
+                # Ahead of the general clause, and it is a `ConfigError` so the general clause
+                # would otherwise swallow it. Nothing has been asked of the instance and nothing
+                # is wrong with it: nobody has signed in since this process started, which after
+                # a restart is the ordinary state. It is announced as itself so that the log line
+                # an operator finds says which of the two refusals it was.
+                record.failures += 1
+                record.awaiting_sign_in = True
+                _announce(
+                    f"scheduled sync of {name!r} did not run: this server holds no Confluence "
+                    f"session, so it cannot authenticate. Sessions live in the server's memory "
+                    f"and a restart ends them, so this is expected after one rather than a "
+                    f"fault, and the instance itself has not been contacted. Sign in again with "
+                    f"`manicule connector login {name} --browser`; the schedule keeps trying "
+                    f"every {interval_s:g}s until you do. Details: {exc}"
+                )
             except (ManiculeError, ValueError, OSError) as exc:
                 # The outcomes a caller could act on, which here means the operator reading the
                 # server's output. Recorded and carried on, because a source that was
@@ -298,6 +368,7 @@ class Scheduler:
                 _announce(f"scheduled sync of {name!r} failed: {exc}")
             else:
                 record.runs += 1
+                record.awaiting_sign_in = False
 
 
 def _announce(message: str) -> None:

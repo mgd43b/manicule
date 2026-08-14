@@ -207,6 +207,14 @@ the tools a socket may carry: that set is *derived* from each registration's ``r
 """
 
 
+type Tool = Callable[..., Awaitable[dict[str, Any]]]
+"""What every tool in this module is: a coroutine function returning an envelope as JSON.
+
+Named because the registrar's decorator takes one and hands one back, and the signature written
+out twice does not fit a line and does not read when it does.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class Surface:
     """One built server, and the names of the tools it actually carries.
@@ -251,9 +259,7 @@ class _Registrar:
         self.carried: set[str] = set()
         """The ones this surface actually offers. Equal to :attr:`named` unless read-only."""
 
-    def tool(
-        self, annotations: ToolAnnotations
-    ) -> Callable[[Callable[..., Awaitable[dict[str, Any]]]], Callable[..., Awaitable[dict[str, Any]]]]:
+    def tool(self, annotations: ToolAnnotations) -> Callable[[Tool], Tool]:
         """Register one tool, unless this surface reads only and that one does not.
 
         The function is handed straight back either way, exactly as ``@mcp.tool`` does, so the
@@ -267,9 +273,7 @@ class _Registrar:
         the direction the code fails in if that ever stops being true.
         """
 
-        def register(
-            function: Callable[..., Awaitable[dict[str, Any]]],
-        ) -> Callable[..., Awaitable[dict[str, Any]]]:
+        def register(function: Tool) -> Tool:
             self.named[function.__name__] = annotations
             if self._read_only and annotations.readOnlyHint is not True:
                 return function
@@ -871,11 +875,22 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
             *collections,
         )
     }
-    # `register.named` as well as the function objects: the first is what every registration
-    # recorded on its way through, the second is what this function can see. They differ only if
-    # a tool was registered and then dropped from the tuple above, which is the drift this pair
-    # exists to catch — and on the read-only surface it is the *only* thing that can catch it,
-    # since the tool itself is deliberately not on the server to be listed.
+    _check_wiring(register, declared, read_only=read_only)
+    return Surface(server=mcp, tools=tuple(sorted(register.carried)))
+
+
+def _check_wiring(register: _Registrar, declared: set[str], *, read_only: bool) -> None:
+    """The two startup failures, out of :func:`build_surface` so that it stays readable.
+
+    Raises:
+        AssertionError: A tool is registered and unlisted, or listed and unregistered, or the
+            read-only surface carries one that does not report itself read-only.
+    """
+    # `register.named` as well as `declared`: the first is what every registration recorded on
+    # its way through, the second is what `build_surface` can see. They differ only if a tool was
+    # registered and then dropped from that tuple, which is the drift this pair exists to catch —
+    # and on the read-only surface it is the *only* thing that can catch it, since the tool
+    # itself is deliberately not on the server to be listed.
     if declared != set(TOOL_NAMES) or set(register.named) != set(TOOL_NAMES):
         found = declared | set(register.named)
         missing = sorted(set(TOOL_NAMES) - found)
@@ -885,19 +900,18 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
             f"{extra or 'none'}. Listed but not registered: {missing or 'none'}."
         )
         raise AssertionError(msg)
-    carried_but_writes = sorted(
-        name
-        for name in register.carried
-        if register.named[name].readOnlyHint is not True and read_only
+    if not read_only:
+        return
+    writes = sorted(
+        name for name in register.carried if register.named[name].readOnlyHint is not True
     )
-    if carried_but_writes:  # pragma: no cover - `_Registrar.tool` is what makes this unreachable
+    if writes:  # pragma: no cover - `_Registrar.tool` is what makes this unreachable
         msg = (
-            f"the read-only MCP surface carries tool(s) that do not report themselves read-only: "
-            f"{carried_but_writes}. That surface is served over a socket, so this would be a "
+            f"the read-only MCP surface carries tool(s) that do not report themselves "
+            f"read-only: {writes}. That surface is served over a socket, so each one would be a "
             f"write operation reachable from the network."
         )
         raise AssertionError(msg)
-    return Surface(server=mcp, tools=tuple(sorted(register.carried)))
 
 
 __all__ = [
