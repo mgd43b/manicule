@@ -38,6 +38,13 @@ these facts under their own names — page ID, space key, ancestors — and each
 these fields spelled locally. A field named after any one product would either go unused by the
 others or drag its vocabulary into the core, and the core is what every surface renders.
 
+**Every field is read from a source response, or left empty.** That is a rule about producers
+rather than a property this module can enforce, so it is stated here where the model is: a record
+whose ``modified_at`` came from a filesystem timestamp, an ingest clock or ``indexed_at`` is a
+claim that reads as the publisher's and is not, and no surface downstream can tell the two apart.
+A field the source did not supply is absent. :class:`SourceMetadata` makes every field optional
+for exactly this reason — so that a producer which knows six of them can say six.
+
 **Where the record lives.** In ``documents.metadata``, under :data:`PROVENANCE_KEY`, read back
 through :attr:`manicule.core.content.Document.provenance`. Not a column: ``docs/storage.md``
 §6.4 earns ``parse_fp`` its column on the grounds that *change detection reads it* and so it
@@ -149,7 +156,13 @@ def _require_printable(value: str, *, field: str) -> None:
 
     Raises:
         ValueError: Naming the field and the offending code point, because "invalid title" does
-            not tell whoever wrote the manifest which character to remove.
+            not tell whoever declared the value which character to remove. **The message names
+            no manifest**, and used to: it ended "Remove it from the manifest", which was true
+            of the only producer that existed when it was written and is now wrong for half of
+            them. A live wiki connector's records come out of API responses, and an operator
+            told to edit a manifest goes looking for a file that is not there — a diagnostic
+            that costs more time than no diagnostic. The value's *origin* is the caller's to
+            name; this function knows the field and the character and says those.
     """
     if len(value) > MAX_FIELD_CHARS:
         msg = f"{field} is {len(value)} characters, over the {MAX_FIELD_CHARS}-character limit"
@@ -158,7 +171,7 @@ def _require_printable(value: str, *, field: str) -> None:
         if unicodedata.category(character) == "Cc":
             msg = (
                 f"{field} contains the control character U+{ord(character):04X}, which cannot "
-                f"appear in a citation. Remove it from the manifest."
+                f"appear in a citation"
             )
             raise ValueError(msg)
 

@@ -1370,6 +1370,7 @@ class ApplicationService:
         checks.append(await self._connectors_check())
         checks.append(await self._document_identity_check())
         checks.append(await self._document_content_check())
+        checks.append(await self._wiki_provenance_check())
         checks.append(await self._grammar_check(fix=fix))
         checks.append(await self._vocabulary_check(fix=fix))
         # No `fix`. The other two repairs move megabytes and finish while somebody is looking
@@ -1909,6 +1910,121 @@ class ApplicationService:
                 },
             ),
             remedy=f"manicule connector sync {sources[0]}",
+        )
+
+    async def _wiki_provenance_check(self) -> r.Check:
+        """Live-wiki documents indexed before the connector recorded what the source said.
+
+        **What is missing is one field, and it is the one that cannot be recovered locally.** A
+        document ingested before this connector wrote provenance still holds its page id, its
+        canonical URI, its fetched version, its media type and its hierarchy — six of the seven
+        fields, all of them already in the row. It does not hold ``modified_at``, which was never
+        stored anywhere, and which is precisely the field a durable citation needs and a local
+        clock must never supply. So the record is not reconstructed here: a partial one, written
+        with the timestamp left null, is indistinguishable at every surface from a page whose
+        source genuinely reported no modification time. That is a worse outcome than the gap,
+        because it is a gap that claims to be an answer.
+
+        **A refetch is therefore required, and a routine sync will not perform one.** An
+        unchanged page is unreachable twice over: the watermark means discovery never enumerates
+        it, and the version-token comparison means it would skip without a fetch even if it were
+        enumerated. ``manicule reindex`` cannot help either — it re-parses retained bytes and
+        touches no network. So the honest instruction is a full resync of the source, and this
+        check says that rather than implying something cheaper exists.
+
+        **It reports and changes nothing.** ``doctor --fix`` seeds grammars and vocabularies:
+        local, cheap, idempotent. Re-fetching a remote wiki is none of those, and arming it from
+        a health command is exactly the recrawl-behind-a-routine-operation this repository's
+        connector documentation warns against. The count is what an operator needs to decide;
+        the decision stays theirs.
+
+        ``degraded`` rather than ``failing``: every one of these documents is indexed,
+        searchable and correctly cited from its ordinary fields. What they cannot do is carry a
+        claim-level source citation.
+        """
+        # Local, like every other reference to this module in this file: it is the registered
+        # name of the live connector, and importing it eagerly would pull connector
+        # configuration into a process that may never sync anything.
+        from manicule.connectors.config import CONNECTOR_NAME  # noqa: PLC0415
+
+        live = sorted(
+            name
+            for name, connector in self.settings.connectors.items()
+            if connector.type == CONNECTOR_NAME
+        )
+        if not live:
+            # Plainly, and with no mention of records or migrations. Somebody running `doctor`
+            # on an installation that has never pointed at a wiki is not an audience for either.
+            return r.Check(
+                name="wiki-provenance",
+                state="ok",
+                detail="no live Confluence source is configured",
+            )
+        try:
+            store = await self._backend.documents()
+            documents = await store.list_documents(limit=_IDENTITY_SCAN)
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            return r.Check(
+                name="wiki-provenance",
+                state="unknown",
+                detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        # The same bound the identity and content checks read, reported the same way. A count
+        # that stopped early and did not say so is a clean bill of health over one per cent of a
+        # corpus, and both states report it because bounded is bounded either way.
+        truncated = len(documents) >= _IDENTITY_SCAN
+        bound = f" among the first {_IDENTITY_SCAN} documents examined" if truncated else ""
+        # Only documents carrying **no record at all**. One that carries a stated refusal is a
+        # different finding with a different repair — the source declared something a citation
+        # will not render — and re-fetching it would produce the same refusal again.
+        sources = set(live)
+        missing = [
+            document
+            for document in documents
+            if document.source in sources and document.provenance is None
+        ]
+        if not missing:
+            return r.Check(
+                name="wiki-provenance",
+                state="ok",
+                detail=(
+                    f"every live Confluence document carries an authoritative source record{bound}"
+                ),
+                facts=cast(
+                    "dict[str, JsonValue]",
+                    {"sources": live, "examined": len(documents), "truncated": truncated},
+                ),
+            )
+        affected = sorted({document.source for document in missing})
+        return r.Check(
+            name="wiki-provenance",
+            state="degraded",
+            detail=(
+                f"{len(missing)} document(s) from {', '.join(affected)} were indexed before this "
+                f"connector recorded what the source said about them{bound}. They are searchable "
+                f"and correctly cited from their own fields; what they cannot supply is a "
+                f"claim-level citation carrying the page's version and modification time. The "
+                f"modification time was never stored locally and must not be invented, so these "
+                f"pages have to be fetched again. **A routine incremental sync will not do it**: "
+                f"the stored watermark means discovery does not enumerate a page nobody has "
+                f"edited, and its version token is unchanged, so it would skip without a fetch "
+                f"even if it were enumerated. Re-sync {affected[0]} in full."
+            ),
+            facts=cast(
+                "dict[str, JsonValue]",
+                {
+                    "missing_provenance": len(missing),
+                    "sources": affected,
+                    "examined": len(documents),
+                    "truncated": truncated,
+                    "documents": [
+                        {"source": document.source, "source_id": document.source_id}
+                        for document in missing[:_IDENTITY_SAMPLE]
+                    ],
+                },
+            ),
+            remedy=f"resync {affected[0]} in full — see docs/connectors/confluence.md §2.2",
         )
 
     async def _index_check(self) -> r.Check:
@@ -4208,6 +4324,7 @@ def source_reference(document: Document | None) -> r.SourceReference | None:
         canonical_uri=published.canonical_uri if published else "",
         source_id=published.source_id if published else "",
         version=published.version if published else "",
+        content_type=published.content_type if published else "",
         modified_at=(
             published.modified_at.isoformat() if published and published.modified_at else None
         ),

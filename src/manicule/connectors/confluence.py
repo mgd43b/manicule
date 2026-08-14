@@ -54,12 +54,14 @@ from manicule.connectors.macros import (
 from manicule.connectors.subtree import CONTENT_PATH, SEARCH_PATH, Subtree
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.lifecycle import HealthReport, Metric
+from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
 from manicule.parsers.config import CONFLUENCE_MEDIA_TYPE
 
 __all__ = [
     "ADF_BODY",
     "ANCESTOR_IDS",
+    "MODIFIED_AT",
     "ROOT_PAGE_IDS",
     "SCOPE",
     "STORAGE_BODY",
@@ -155,6 +157,18 @@ is not part of its address, which stays the canonical URL. Absent entirely when 
 configured, so its presence means "this source is subtree-scoped" rather than "somebody wrote a
 default down"."""
 
+MODIFIED_AT = "source_modified_at"
+"""Ref metadata carrying an attachment's modification time, verbatim, from discovery.
+
+**Attachments only, and the asymmetry is deliberate.** A page's body response states when the
+retained version was made, so the fetch reads it there and nothing needs carrying. An
+attachment's fetch is a byte download that describes nothing, so the search result that found it
+is the only source response that ever says — and it is still a source response.
+
+Not set for pages, because a page would then carry two timestamps from two responses that
+disagree exactly when the stale-body fallback fires. A second value nobody reads is a value
+somebody eventually reads by mistake."""
+
 SCOPE = "scope"
 """Watermark metadata key holding the scope a stored position was recorded within.
 
@@ -172,7 +186,14 @@ had. Written out so that the backward-compatible reading is a value rather than 
 
 @dataclass(frozen=True, slots=True)
 class _Body:
-    """One page's content as the source returned it."""
+    """One page's content as the source returned it.
+
+    The timestamps belong here rather than being read again somewhere else, and that placement
+    is the whole of the stale-body defense as it applies to provenance. ``_page_body`` may
+    answer from either of two endpoints, and the one it returns is the one whose bytes are
+    kept — so a modification time carried on this object is necessarily the modification time
+    of the body that was retained, and cannot come from a response that was discarded.
+    """
 
     page_id: str
     title: str
@@ -184,6 +205,14 @@ class _Body:
     ancestor_ids: tuple[str, ...] = ()
     webui: str = ""
     base: str = ""
+
+    modified_at: datetime | None = None
+    """When the source says this version was made. ``None`` when the response did not say, or
+    said something without a UTC offset — never a substitute drawn from anywhere else."""
+
+    created_at: datetime | None = None
+    """When the source says the page was created, on the deployments whose response carries it.
+    Absent is the ordinary answer, and absent is what is recorded."""
 
 
 class ConfluenceConnector:
@@ -474,6 +503,10 @@ class ConfluenceConnector:
                 base, _str(_obj(container.get("_links")).get("webui"))
             )
             metadata[DOWNLOAD] = _join(base, _str(links.get("download")))
+            # The only response that will ever describe this attachment: the download is bytes.
+            when = _str(_version_when(result))
+            if when:
+                metadata[MODIFIED_AT] = when
             media_type = _attachment_media_type(result)
             size = _int(_obj(result.get("extensions")).get("fileSize"))
             if media_type is not None:
@@ -628,6 +661,17 @@ class ConfluenceConnector:
         A PDF attached to a page is a PDF: it gets its own document, its own parser and its own
         anchors. What it keeps is its parent, in metadata and in the breadcrumb, so a citation
         resolves to both the file and the page it hangs off.
+
+        **Its provenance is its own, and that is not a detail.** The attachment has a content id
+        of its own, a version of its own and an address of its own, and citing the page instead
+        would say that a reader following the reference arrives at the diagram — when what they
+        would actually arrive at is a page that happens to have a diagram attached somewhere on
+        it. The parent survives, in ``parent_page_id`` and in the breadcrumb, as a relationship
+        rather than as an identity.
+
+        The timestamp comes from the search result that discovered it, because the download is
+        bytes and carries no version metadata at all. That is still a source response, and it is
+        the only one that describes this attachment.
         """
         url = _str(ref.metadata.get(DOWNLOAD)) or ref.uri
         downloaded = await self._client.download(url, max_bytes=self._config.max_attachment_bytes)
@@ -636,10 +680,31 @@ class ConfluenceConnector:
         version = _int(ref.metadata.get(VERSION))
         if version is not None:
             metadata[VERSION_TOKEN] = str(version)
+        # Two of these three came from the source and the third did not, and only the first two
+        # may reach the record. `metadata.mediaType` is Confluence's own declaration and the
+        # download's `Content-Type` is the response's; the filename extension is manicule's
+        # inference, sound enough to route bytes by and not something the publisher said.
+        stated = declared or downloaded.media_type
+        media_type = stated or _from_name(_str(metadata.get("title")))
+        metadata[PROVENANCE_KEY] = _record(
+            what=f"attachment {ref.source_id}",
+            title=_str(metadata.get("title")),
+            canonical_uri=ref.uri,
+            source_id=ref.source_id,
+            version=str(version) if version is not None else "",
+            # The search result carries no creation date for an attachment, and there is no
+            # second response to ask. Absent rather than borrowed from the page holding it.
+            created_at=None,
+            modified_at=cql.parse_when(metadata.get(MODIFIED_AT)),
+            content_type=stated,
+            # Space and the page holding it. The attachment's own filename is left off for the
+            # same reason a page's own title is: the chunker appends it.
+            section_path=_str_values(ref, ANCESTORS),
+        ).as_metadata_value()
         return RawDocument(
             source_id=ref.source_id,
             uri=ref.uri,
-            media_type=declared or downloaded.media_type or _from_name(_str(metadata.get("title"))),
+            media_type=media_type,
             content=downloaded.content,
             metadata=metadata,
         )
@@ -714,12 +779,31 @@ class ConfluenceConnector:
         if expected is not None and body.version != expected:
             metadata["version_disagreement"] = {"discovered": expected, "fetched": body.version}
 
+        uri = _join(body.base, body.webui) or ref.uri
+        media_type = self._page_media_type() if body.body_format == ADF_BODY else STORAGE_MEDIA_TYPE
+        metadata[PROVENANCE_KEY] = _record(
+            what=f"page {ref.source_id}",
+            title=body.title,
+            canonical_uri=uri,
+            source_id=ref.source_id,
+            # The version of the bytes above, which after the stale-body fallback is not always
+            # the version discovery expected. The disagreement is recorded beside this and the
+            # expected version is never what a citation quotes: a record naming the version
+            # manicule asked for would describe a page this index does not hold.
+            version=str(body.version),
+            created_at=body.created_at,
+            modified_at=body.modified_at,
+            content_type=media_type,
+            # The space and the pages above this one, and not this page's own title — the
+            # chunker appends that itself. The same hierarchy the breadcrumb is built from,
+            # asked about by a second name.
+            section_path=tuple(part for part in ancestors if isinstance(part, str)),
+        ).as_metadata_value()
+
         return RawDocument(
             source_id=ref.source_id,
-            uri=_join(body.base, body.webui) or ref.uri,
-            media_type=(
-                self._page_media_type() if body.body_format == ADF_BODY else STORAGE_MEDIA_TYPE
-            ),
+            uri=uri,
+            media_type=media_type,
             content=content,
             metadata=metadata,
         )
@@ -811,14 +895,21 @@ class ConfluenceConnector:
             )
             raise BodyUnavailableError(msg)
         links = _obj(payload.get("_links"))
+        version = _obj(payload.get("version"))
         return _Body(
             page_id=page_id,
             title=_str(payload.get("title")),
-            version=_int(_obj(payload.get("version")).get("number")) or 0,
+            version=_int(version.get("number")) or 0,
             body=value,
             body_format=ADF_BODY,
             webui=_str(links.get("webui")),
             base=_str(links.get("base")) or self._config.base_url,
+            # Cloud's v2 page: the current version's own `createdAt` is when the page was last
+            # edited, and the page's top-level `createdAt` is when it first existed. Two fields
+            # with one name at two levels, which is exactly the pair a single careless read
+            # would collapse into a page that looks freshly revised because it is old.
+            modified_at=cql.parse_when(version.get("createdAt")),
+            created_at=cql.parse_when(payload.get("createdAt")),
         )
 
     async def _storage_body(self, page_id: str) -> _Body:
@@ -827,10 +918,11 @@ class ConfluenceConnector:
         body = _obj(_obj(payload.get("body")).get(STORAGE_BODY))
         links = _obj(payload.get("_links"))
         space_key = _str(_obj(payload.get("space")).get("key"))
+        version = _obj(payload.get("version"))
         return _Body(
             page_id=page_id,
             title=_str(payload.get("title")),
-            version=_int(_obj(payload.get("version")).get("number")) or 0,
+            version=_int(version.get("number")) or 0,
             body=_str(body.get("value")),
             body_format=STORAGE_BODY,
             space_key=space_key,
@@ -838,6 +930,12 @@ class ConfluenceConnector:
             ancestor_ids=subtree.ancestor_ids(payload),
             webui=_str(links.get("webui")),
             base=_str(links.get("base")) or self._config.base_url,
+            # Server and Data Center spell the same fact `version.when`. There is no creation
+            # date in this response: it lives under `history`, which this request does not
+            # expand, so `created_at` stays absent rather than being sourced from anywhere
+            # else. Widening the expansion to fill it would cost every page a larger response
+            # for a field no citation currently renders.
+            modified_at=cql.parse_when(version.get("when")),
         )
 
     # --- macro resolution ----------------------------------------------------------------
@@ -894,6 +992,78 @@ class ConfluenceConnector:
         payload = await self._client.get_json(self._client.url(SEARCH_PATH), params)
         results = _results(payload)
         return _str(results[0].get("id")) if results else ""
+
+
+# --- the authoritative record ----------------------------------------------------------------
+
+
+def _record(
+    *,
+    what: str,
+    title: str,
+    canonical_uri: str,
+    source_id: str,
+    version: str,
+    created_at: datetime | None,
+    modified_at: datetime | None,
+    content_type: str,
+    section_path: tuple[str, ...],
+) -> Provenance:
+    """One document's authoritative source record, or the stated reason it has none.
+
+    **Every argument comes from a source response and none is inferred here.** That is the whole
+    contract this function exists to hold: a record assembled partly from what manicule worked
+    out is a claim that reads as the publisher's and is not. There is deliberately no clock in
+    this function, no filesystem, and no access to the stored document — so the three timestamps
+    that must never be confused (``modified_at``, ``retrieved_at``, ``indexed_at``) cannot be,
+    because two of them are not reachable from here.
+
+    ``created_at`` and ``modified_at`` arrive already parsed and already offset-aware, or
+    ``None``. :func:`manicule.connectors.cql.parse_when` returns ``None`` for a naive timestamp
+    rather than guessing a zone, so a response that omitted the offset produces an absent field
+    and never a moment that is wrong by the instance's offset.
+
+    Args:
+        what: How to name this document if the record is refused. Read in a diagnostic, so it
+            is an id and a kind rather than a title, which is content.
+        title: The page or attachment title, as the source published it.
+        canonical_uri: Where a reader opens it, resolved against the link base the source gave.
+        source_id: The Confluence content id. Identity, unchanged by a rename or a move.
+        version: The version of the bytes actually retained.
+        created_at: When the source says it was created, on deployments that say.
+        modified_at: When the source says this version was made.
+        content_type: What this connector routed the bytes as.
+        section_path: Space key and ancestor titles, coarsest first, own title excluded.
+
+    Returns:
+        A record carrying the source metadata, or one carrying only a reason — never nothing.
+        A page whose title holds a control character, or whose link base resolved to something
+        outside ``http``/``https``, is a page that still gets indexed and still gets a citation;
+        what it does not get is a silent absence that looks identical to a connector which was
+        never taught to record provenance at all.
+    """
+    try:
+        source = SourceMetadata(
+            title=title,
+            canonical_uri=canonical_uri,
+            source_id=source_id,
+            version=version,
+            created_at=created_at,
+            modified_at=modified_at,
+            content_type=content_type,
+            section_path=tuple(part for part in section_path if part.strip()),
+        )
+    except ValueError as exc:
+        return Provenance(
+            unavailable_reason=f"{what}: the source declared metadata this index will not cite "
+            f"({_collapsed(exc)})"
+        )
+    return Provenance(source=source)
+
+
+def _collapsed(exc: ValueError) -> str:
+    """A pydantic validation error as one line, for a diagnostic somebody reads in a log."""
+    return " ".join(str(exc).split())
 
 
 # --- decoding helpers ----------------------------------------------------------------------

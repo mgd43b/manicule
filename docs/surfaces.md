@@ -507,9 +507,14 @@ summary — and `null` on all four unless the document carries authoritative sou
 ([`storage.md`](storage.md) §4.2.1): a locally mirrored page with a sidecar manifest, or any
 connector supplying the same record.
 
-`title`, `canonical_uri`, `source_id`, `version`, `modified_at` and `section_path` describe the
-**publication**. `snapshot_path`, `snapshot_checksum` and `retrieved_at` describe **this
-installation's copy**. `indexed_at` is neither: it is when manicule indexed that copy. A reader
+`title`, `canonical_uri`, `source_id`, `version`, `content_type`, `modified_at` and
+`section_path` describe the **publication**. `snapshot_path`, `snapshot_checksum` and
+`retrieved_at` describe **this installation's copy**. `indexed_at` is neither: it is when
+manicule indexed that copy.
+
+`content_type` is the media type the **source** published, which is not always the one this
+installation stored — a page served as one thing and mirrored to a file whose suffix says
+another has two answers, and `DocumentSummary.media_type` is the local one. A reader
 being pointed at the document needs the first group; an audit of what was actually read needs the
 second; reproducing a result months later needs both — so the citation carries both rather than
 choosing. `unavailable_reason` is present when a record was attempted and refused, because a
