@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, override
 
 import pytest
 
+from manicule.core.content import DocumentStatus
 from manicule.core.errors import PolicyError
 from manicule.core.glossary import DefinitionForm, GlossaryEntry
 from manicule.ingest import reindex
@@ -32,6 +33,7 @@ from manicule.ingest.reindex import (
 )
 from manicule.storage.docstore import SqliteDocStore
 from tests.glossary import system
+from tests.storage_helpers import make_document
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -460,10 +462,10 @@ async def test_a_detector_failure_keeps_the_last_servable_rows_and_the_stale_lin
     )
 
 
-async def test_a_document_re_ingested_underneath_the_sweep_costs_one_line_not_the_run(
+async def test_a_newer_sync_supersedes_a_recompute_rather_than_failing_it(
     store: SqliteDocStore,
 ) -> None:
-    """The race this sweep has and the parse sweep does not.
+    """The race this sweep has and the parse sweep does not, counted as what it is.
 
     An entry's ``chunk_id`` is a foreign key. This reads a document's chunks and then writes rows
     citing them, and a sync re-ingesting the same document in between replaces exactly those
@@ -471,9 +473,19 @@ async def test_a_document_re_ingested_underneath_the_sweep_costs_one_line_not_th
     its embedding lock; this one takes no lock at all, because never reaching the model is the
     whole point of it.
 
-    Reproduced by replacing the chunks between the read and the write, which is what a concurrent
-    sync does. The sweep has to finish: the other documents are repaired, the raced one is named,
-    and it is still selected afterwards so the next run picks it up.
+    **A supersession is neither a failure nor a repair**, which is the reading #119 established
+    one rung up and which this counted as a failure until the specification asked for the number
+    separately. The corpus holds the *newer* chunks and the newer sync wrote its own glossary
+    from them; nothing needs doing about it, and putting it in front of an operator as a defect
+    would be reporting ordinary concurrency as a fault.
+
+    It is told apart positively rather than from the exception's type — the chunk ids are read
+    again, and ids that have moved are what a sync leaves behind — because matching an error
+    message or importing SQLAlchemy into ``manicule.ingest`` would tie this to one store and the
+    import boundary forbids the second outright.
+
+    The sweep has to finish either way: the other document is repaired, the raced one is named,
+    and it is still selected afterwards so the next run picks it up against current chunks.
     """
     raced, _ = await indexed_under_old_rules(store, "glossary-a", f"NOW — {EXPANSION}", [])
     await indexed_under_old_rules(store, "glossary-b", f"NOW — {EXPANSION}", [])
@@ -497,12 +509,70 @@ async def test_a_document_re_ingested_underneath_the_sweep_costs_one_line_not_th
         report = await sweep(store)
 
     assert seen == [raced.id], "the fixture must actually race, or it tests nothing"
-    assert report.failed == 1
-    assert raced.id in report.failures[0]
+    assert report.superseded == 1
+    assert report.failed == 0, "ordinary concurrency is not a defect to investigate"
+    assert raced.id in report.superseded_documents[0]
+    assert "newer revision was committed" in report.superseded_documents[0]
     assert report.redetected == 1, "the document beside it was repaired regardless"
     assert await store.glossary_lineage(raced.id) == SUPERSEDED, (
         "a raced document must stay selected rather than be recorded as repaired"
     )
+
+
+async def test_a_document_whose_chunks_are_gone_is_refused_rather_than_stamped(
+    store: SqliteDocStore,
+) -> None:
+    """Fabricating a current fingerprint from nothing is worse than refusing.
+
+    Detecting over an empty chunk list returns no entries, which is a perfectly well-formed
+    derived result — so an ``indexed`` document whose chunks have gone used to be recorded as
+    current on the strength of having read nothing, and left the selection for ever. A
+    missing-chunks problem thereby became an invisible empty-glossary one, and the only signal
+    that anything was wrong disappeared with it.
+
+    This is a real state rather than a contrived one: ``storage.md`` §8.2 says a document
+    restored after the soft-delete grace period comes back holding no chunks, because the sweep
+    took them. The repair it needs is a rung up, and the line has to name it — an operator told
+    "unrepairable" and nothing else has been given a word, not an instruction.
+    """
+    document = make_document(source="fs", source_id="restored", status=DocumentStatus.INDEXED)
+    await store.upsert_document(document)
+    await store.replace_chunks(document.id, [])
+    assert document.expects_chunks, "an indexed document is supposed to have chunks"
+
+    report = await sweep(store)
+
+    assert (report.unrepairable, report.redetected, report.failed) == (1, 0, 0)
+    assert document.id in report.unrepairable_documents[0]
+    assert "reindex --stale" in report.unrepairable_documents[0], (
+        "naming the document without naming the repair gives an operator a word, not a command"
+    )
+    assert await store.glossary_lineage(document.id) is None, (
+        "a fingerprint recorded here would be a claim that a detector read this document, and "
+        "it would take it out of the selection permanently"
+    )
+
+
+async def test_a_document_that_is_chunkless_by_design_still_records_its_empty_result(
+    store: SqliteDocStore,
+) -> None:
+    """The control, and the reason the discriminator is ``expects_chunks`` rather than ``chunks``.
+
+    A document whose parser produced no extractable text genuinely states no definitions. That is
+    a derived result and recording it is correct — refusing it instead would leave every scanned
+    PDF in a corpus permanently selected, reported as needing a repair that would do nothing.
+    """
+    document = make_document(
+        source="fs", source_id="scanned", status=DocumentStatus.NO_EXTRACTABLE_TEXT
+    )
+    await store.upsert_document(document)
+    await store.replace_chunks(document.id, [])
+    assert not document.expects_chunks
+
+    report = await sweep(store)
+
+    assert (report.redetected, report.unchanged, report.unrepairable) == (1, 1, 0)
+    assert await store.glossary_lineage(document.id) == glossary_fingerprint().canonical()
 
 
 async def test_a_second_run_selects_nothing(store: SqliteDocStore) -> None:

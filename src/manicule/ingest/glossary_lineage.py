@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import sys
 from functools import cache
 from importlib.resources import files
 from typing import TYPE_CHECKING, Final
@@ -56,6 +57,7 @@ __all__ = [
     "SOURCES",
     "detector_imports",
     "glossary_fingerprint",
+    "libraries",
     "rules_digest",
 ]
 
@@ -159,6 +161,54 @@ def rules_digest() -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
+@cache
+def libraries() -> tuple[str, ...]:
+    """``name@version`` for everything outside this repository that decides a stored entry.
+
+    **Derived from the sources' own imports, not from a list somebody maintains**, which is the
+    same argument as :func:`rules_digest` one level out. A digest catches a rule *this* repository
+    changes; it cannot catch a rule changing underneath an unchanged file, and that is exactly
+    what a dependency upgrade is.
+
+    Two kinds are recorded and neither was, until the specification asked:
+
+    **Distributions the digested sources import.** ``manicule.core.glossary`` imports
+    ``pydantic``, which validates :class:`~manicule.core.glossary.GlossaryEntry`'s field
+    constraints and therefore decides which rows may be persisted at all. Found by reading the
+    imports rather than by naming it, so a second one added to the detector tomorrow is recorded
+    without anybody remembering — the failure mode ``ParserVersions.distributions`` documents.
+
+    **The Unicode database.** :func:`~manicule.core.glossary.normalise_acronym` NFKC-normalises,
+    so the version of the character database decides a stored *lookup key*; #121 put NFKC into
+    :func:`~manicule.ingest.glossary.initial_skeleton` as well. It moves with the interpreter and
+    has no distribution to look up, so it is the one input the derivation above cannot see and
+    the one entry here that is named. Recorded as ``unicodedata@<unidata_version>`` so that it
+    reads like the rest.
+
+    Sorted, so the value is a set of facts rather than an import order.
+
+    Raises:
+        PackageNotFoundError: A distribution the detector imports is not installed, which means
+            the detector could not have run. Answering with a partial set would be a fingerprint
+            that claims fewer inputs than it has.
+    """
+    import unicodedata  # noqa: PLC0415 - see above; read for its data version, not its functions
+    from importlib.metadata import packages_distributions, version  # noqa: PLC0415
+
+    installed = packages_distributions()
+    named = {
+        distribution
+        for module in _third_party_imports()
+        for distribution in installed.get(module, [module])
+    }
+    return tuple(
+        sorted(
+            [f"unicodedata@{unicodedata.unidata_version}"]
+            + [f"{name}@{version(name)}" for name in named]
+        )
+    )
+
+
 def glossary_fingerprint(
     *, enabled: bool = True, middleware: Sequence[str] = ()
 ) -> GlossaryFingerprint:
@@ -166,8 +216,8 @@ def glossary_fingerprint(
 
     Args:
         enabled: Whether ``rag.glossary.detect_on_ingest`` is on. When it is not, the answer is
-            :meth:`~manicule.core.fingerprints.GlossaryFingerprint.disabled` and neither the
-            digest nor the middleware is read — they describe work that did not happen.
+            :meth:`~manicule.core.fingerprints.GlossaryFingerprint.disabled` and none of the
+            other three is read — they describe work that did not happen.
         middleware: ``name@version`` for every configured hook, from
             :meth:`~manicule.ingest.middleware.MiddlewareRunner.chain`. Sorted and
             de-duplicated here rather than at the call site, so the identity does not depend on
@@ -178,6 +228,7 @@ def glossary_fingerprint(
     return GlossaryFingerprint(
         detector=DETECTOR,
         rules=rules_digest(),
+        libraries=libraries(),
         middleware=tuple(sorted(set(middleware))),
     )
 
@@ -195,20 +246,46 @@ def detector_imports() -> frozenset[str]:
     reported at the module that was named — ``from manicule.core.glossary import X`` is
     ``manicule.core.glossary``, not ``manicule.core``.
     """
+    found = {name for name in _imported_modules() if name.startswith("manicule")}
+    digested = {f"{package}.{name.removesuffix('.py')}" for package, name in SOURCES}
+    return frozenset(found - digested)
+
+
+def _imported_modules() -> frozenset[str]:
+    """Every module the digested sources import, at full dotted name.
+
+    One scan, two readers: :func:`detector_imports` keeps the ``manicule`` ones and asks whether
+    the digest covers them, and :func:`_third_party_imports` keeps the rest and asks what version
+    they are. Written once because the two questions are the same question about different halves
+    of one import list, and a second walk would be a second chance to read a syntax tree
+    differently.
+    """
     found: set[str] = set()
     for package, name in SOURCES:
         tree = ast.parse(_read(package, name))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 # `level` is the number of leading dots; zero is an absolute import.
-                root = package if node.level else (node.module or "")
-                if node.level and node.module:
-                    root = f"{package}.{node.module}"
-                if root.startswith("manicule"):
-                    found.add(root)
+                if node.level:
+                    found.add(f"{package}.{node.module}" if node.module else package)
+                elif node.module:
+                    found.add(node.module)
             elif isinstance(node, ast.Import):
-                found.update(
-                    alias.name for alias in node.names if alias.name.startswith("manicule")
-                )
-    digested = {f"{package}.{name.removesuffix('.py')}" for package, name in SOURCES}
-    return frozenset(found - digested)
+                found.update(alias.name for alias in node.names)
+    return frozenset(found)
+
+
+def _third_party_imports() -> frozenset[str]:
+    """Top-level modules the digested sources import from outside the standard library.
+
+    ``sys.stdlib_module_names`` is the interpreter's own answer to "is this the standard
+    library", which is the right authority: a hand-kept exclusion list would be one more thing to
+    forget, and forgetting one here means recording a version for something that has none rather
+    than missing one that matters. ``__future__`` is in that set, as are ``re`` and
+    ``unicodedata`` — the last of which is why :func:`libraries` records a data version by hand.
+    """
+    return frozenset(
+        name.split(".")[0]
+        for name in _imported_modules()
+        if not name.startswith("manicule") and name.split(".")[0] not in sys.stdlib_module_names
+    )

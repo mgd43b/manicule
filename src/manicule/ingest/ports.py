@@ -193,13 +193,15 @@ class IngestStore(Protocol):
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
         glossary_fp_other_than: str | None = None,
+        glossary_fp_unrecorded: bool = False,
     ) -> int:
         """How many documents match. A count, so a diagnostic need not page a corpus.
 
         ``glossary_fp_other_than`` is here rather than only on :meth:`select_documents`
         because ``doctor`` asks the question and wants the number: an operator is told how many
         documents disagree with the installed detector, and reading them out to count them
-        would make a health check proportional to the corpus.
+        would make a health check proportional to the corpus. ``glossary_fp_unrecorded`` is the
+        ``NULL`` half of that, which is a one-time migration rather than ordinary staleness.
         """
         ...
 

@@ -400,10 +400,24 @@ def render_stale_glossary(out: Console, payload: r.StaleGlossaryReport) -> None:
         table.add_row("  unchanged", str(payload.unchanged))
         table.add_row("  changed", str(payload.changed))
         table.add_row("entries", f"{payload.entries_before} -> {payload.entries_after}")
+    table.add_row("superseded", str(payload.superseded))
+    table.add_row("unrepairable", str(payload.unrepairable))
     table.add_row("failed", str(payload.failed))
     out.print(table)
+    # Named individually, unlike the counts, and in increasing order of how much somebody has to
+    # do about them: a supersession is dim because nothing needs doing, an unrepairable document
+    # is yellow because it needs a command, and a failure is red because it is a defect.
+    for line in payload.superseded_documents:
+        out.print(f"[dim]{escape(line)}[/dim]")
+    for line in payload.unrepairable_documents:
+        out.print(f"[yellow]{escape(line)}[/yellow]")
     for line in payload.failures:
         out.print(f"[red]{escape(line)}[/red]")
+    if payload.unrepairable:
+        out.print(
+            "\n[dim]a document whose chunks are gone needs them rebuilt from retained bytes "
+            "first: [/dim]manicule document reindex --stale"
+        )
     if payload.dry_run and payload.selected:
         out.print("\n[dim]next: [/dim]manicule document reindex --stale-glossary")
 

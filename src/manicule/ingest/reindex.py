@@ -808,6 +808,28 @@ class GlossarySweep:
     superseded rules.
     """
 
+    unrepairable: int = 0
+    unrepairable_documents: list[str] = field(default_factory=list[str])
+    """Documents whose glossary cannot be computed because their chunks are gone.
+
+    **A count of its own rather than more failures**, because the two send an operator to
+    different places. A failure is a bug in this repository and clears when it is fixed; this is
+    a document whose *inputs* are missing, and the remedy is a rung further up — a re-parse from
+    retained bytes. Merging them would hide a corpus-sized "run ``--stale`` first" inside a
+    number that reads as "the detector is broken".
+    """
+
+    superseded: int = 0
+    superseded_documents: list[str] = field(default_factory=list[str])
+    """Documents a newer sync overtook mid-recompute, so the write was declined.
+
+    **Neither a failure nor a repair**, which is why it is neither of the counts above it, and
+    it is the same reading :attr:`StaleSweep.superseded` applies one rung up. A connector sync
+    committed newer chunks while this was reading older ones; the corpus holds the newer state
+    and this sweep did not touch it. Nothing needs doing about one — the document is simply
+    selected again next time, against chunks that are now current.
+    """
+
 
 def _entry_shape(
     entry: GlossaryEntry,
@@ -852,13 +874,75 @@ def _entry_shape(
     )
 
 
+NO_STORED_CHUNKS = (
+    "no stored chunks, and this document's status says it should have some. Its glossary "
+    "cannot be recomputed from nothing: repair the chunks first with `document reindex "
+    "--stale` or `document reindex <id>`, which reads the retained bytes, and run this again"
+)
+"""Why a document's glossary cannot be recomputed, worded once.
+
+**The alternative is what this replaces, and it was worse than doing nothing.** Detecting over
+an empty chunk list returns no entries, which is a perfectly well-formed derived result — so
+the document was stamped with a current fingerprint on the strength of having read nothing, and
+left the selection permanently. A missing-chunks problem thereby became an invisible
+empty-glossary one, and the only signal that anything was wrong was gone.
+
+Chunkless *by design* is a different state and is not this: a document that yielded no
+extractable text really does state no definitions, and recording that is correct.
+:attr:`~manicule.core.content.Document.expects_chunks` is the discriminator, and
+:func:`re_embed` already uses it for exactly this distinction one rung up.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class GlossaryOutcome:
+    """What became of one document's glossary, in the four shapes this can take.
+
+    A type rather than the ``tuple | str`` this used to be, because the union had two shapes and
+    the sweep now has to tell four things apart — and "a string means something went wrong" is
+    the kind of encoding that quietly acquires a fifth meaning.
+    """
+
+    entries_before: int = 0
+    entries_after: int = 0
+    moved: bool = False
+    """Whether the entry set differs. Meaningless unless :attr:`repaired`."""
+
+    failure: str = ""
+    """Why the detector could not read this document. Nothing was written."""
+
+    unrepairable: str = ""
+    """Why this document's glossary cannot be computed at all, and what would fix it.
+
+    Distinct from :attr:`failure` because the remedy is: a failure is a bug here and will clear
+    when it is fixed, and this is a document whose *inputs* are missing and needs a repair at a
+    higher rung. Reporting them as one number would put a corpus's worth of "run --stale" into
+    the list an operator reads as "the detector is broken".
+    """
+
+    superseded: str = ""
+    """What overtook this document while its glossary was being recomputed.
+
+    **Neither a failure nor a repair**, on exactly the reading #119 established for the parse
+    sweep: a sync committed newer chunks while this was reading older ones, the write was
+    refused, and the corpus holds the *newer* state. Nothing needs doing about one. Counting it
+    as a failure — which this did until the specification asked for the count separately — puts
+    an expected outcome of ordinary concurrency in front of an operator as a defect.
+    """
+
+    @property
+    def repaired(self) -> bool:
+        """Whether entries were rewritten and the lineage advanced."""
+        return not (self.failure or self.unrepairable or self.superseded)
+
+
 async def redetect_glossary(
     document: Document,
     *,
     store: IngestStore,
     glossary: GlossaryStore,
     fingerprint: GlossaryFingerprint,
-) -> tuple[int, int, bool] | str:
+) -> GlossaryOutcome:
     """Recompute one document's entries from its stored chunks. Rung 0.
 
     **The cost boundary is the signature.** A store to read chunks through, a place to put
@@ -870,41 +954,74 @@ async def redetect_glossary(
     asserts it of this signature rather than of one run, because a run only shows what that run
     did.
 
-    A document with no stored chunks is not an error and not unrepairable: it states no
-    definitions, that is a derived result, and it is recorded as one. The verb that repairs a
-    document with no chunks is ``--re-parse``, and it is a different problem.
+    **A document whose chunks are missing is refused rather than stamped**, and the distinction
+    it turns on is not "has no chunks". Detecting over an empty list returns no entries, which is
+    a well-formed derived result — so an ``indexed`` document whose chunks have gone (a restore
+    after the soft-delete sweep took them, ``storage.md`` §8.2) used to be recorded as current on
+    the strength of having read nothing, and left the selection for ever. That converts a
+    missing-chunks problem into an invisible empty-glossary one.
+    :attr:`~manicule.core.content.Document.expects_chunks` separates the two, and
+    :func:`re_embed` already uses it for the same distinction one rung up: a document that is
+    chunkless *by design* really does state no definitions, and recording that is right.
 
     **The write is inside the failure handling as well as the detection**, and that is not
     defensive breadth. There is a real race: an entry's ``chunk_id`` is a foreign key, this reads
     the chunks and then writes rows citing them, and a sync re-ingesting the same document in
     between replaces exactly those chunks — so the insert fails with ``FOREIGN KEY constraint
     failed``. Unlike the parse sweep, this one takes no lock and shares none, because never
-    reaching the model is the whole point of it. Left uncaught, one concurrently-synced document
-    aborts a corpus-wide repair partway through; caught, it is one line in the report and one
-    document still selected next time.
+    reaching the model is the whole point of it.
+
+    **That race is a supersession, not a failure, and it is told apart positively rather than
+    from the exception's type.** Reading the error would mean matching a message or importing
+    SQLAlchemy into ``manicule.ingest``, which the import boundary forbids and which would tie
+    this to one store. So the chunks are read again: if the ids this was about to cite are no
+    longer the document's, a sync committed newer ones underneath and the corpus now holds the
+    *newer* state — nothing needs doing. If they are unchanged, the write failed for some other
+    reason and that is a failure. One extra query, and only on the path that already went wrong.
 
     Returns:
-        How many entries the document had, how many it has, and whether the set moved — or a
-        one-line reason when the repair did not complete, in which case **nothing was written**
-        for this document, so the previous entries are still servable and the stale lineage is
-        still stale.
+        A :class:`GlossaryOutcome`. In every shape but the repaired one **nothing was written**,
+        so the previous entries are still servable and the stale lineage is still stale — which
+        is what keeps the document selected and retryable.
     """
     # Imported here rather than at module scope, which keeps `manicule.ingest.reindex` free of
     # the detector for every caller that only re-parses or re-embeds — this module is imported
     # by the app runtime to answer a plan, and a plan reads rows.
     from manicule.ingest.glossary import detect_entries  # noqa: PLC0415
 
-    before = await glossary.glossary_entries(document.id)
+    named = f"{document.id} ({document.uri})"
+    # The refusal is decided before the previous entries are read, so a corpus of documents this
+    # cannot repair costs one query each rather than two. It also reads in the order the
+    # reasoning runs: whether there is anything to detect over, and only then what is there now.
     chunks = await store.document_chunks(document.id)
+    if not chunks and document.expects_chunks:
+        return GlossaryOutcome(unrepairable=f"{named}: {NO_STORED_CHUNKS}")
+    before = await glossary.glossary_entries(document.id)
     try:
         entries = detect_entries(chunks, title=document.title, media_type=document.media_type)
+    except Exception as exc:  # noqa: BLE001 - a detector bug costs this document and no other
+        return GlossaryOutcome(failure=f"{named}: {type(exc).__name__}: {exc}")
+    try:
         await glossary.replace_glossary_entries(
             document.id, entries, fingerprint=fingerprint.canonical()
         )
     except Exception as exc:  # noqa: BLE001 - one document's repair, never the sweep's
-        return f"{document.id} ({document.uri}): {type(exc).__name__}: {exc}"
-    moved = {_entry_shape(entry) for entry in before} != {_entry_shape(entry) for entry in entries}
-    return len(before), len(entries), moved
+        if {chunk.id for chunk in await store.document_chunks(document.id)} != {
+            chunk.id for chunk in chunks
+        }:
+            return GlossaryOutcome(
+                superseded=(
+                    f"{named}: a newer revision was committed while its glossary was being "
+                    f"recomputed, so nothing from the older one was written"
+                )
+            )
+        return GlossaryOutcome(failure=f"{named}: {type(exc).__name__}: {exc}")
+    return GlossaryOutcome(
+        entries_before=len(before),
+        entries_after=len(entries),
+        moved={_entry_shape(entry) for entry in before}
+        != {_entry_shape(entry) for entry in entries},
+    )
 
 
 async def plan_stale_glossary(
@@ -985,22 +1102,31 @@ async def redetect_stale_glossary(
             return sweep
         for document in page:
             sweep.selected += 1
-            counted = await redetect_glossary(
+            outcome = await redetect_glossary(
                 document, store=store, glossary=glossary, fingerprint=fingerprint
             )
-            if isinstance(counted, str):
-                # Nothing was written, so this document is still in the selection and has to
-                # keep its place in the cursor. Advancing past it is what makes the loop
-                # terminate on a corpus where nothing can be repaired at all.
-                sweep.failed += 1
-                sweep.failures.append(counted)
+            if not outcome.repaired:
+                # Nothing was written in any of the three unrepaired shapes, so this document is
+                # still in the selection and has to keep its place in the cursor. Advancing past
+                # everything this pass did not remove from the set is what makes the loop
+                # terminate on a corpus where nothing can be repaired at all — and it is right
+                # for a supersession too, which will be selected again on the next run against
+                # the chunks that overtook it.
                 left_behind += 1
+                if outcome.unrepairable:
+                    sweep.unrepairable += 1
+                    sweep.unrepairable_documents.append(outcome.unrepairable)
+                elif outcome.superseded:
+                    sweep.superseded += 1
+                    sweep.superseded_documents.append(outcome.superseded)
+                else:
+                    sweep.failed += 1
+                    sweep.failures.append(outcome.failure)
                 continue
-            before, after, moved = counted
             sweep.redetected += 1
-            sweep.entries_before += before
-            sweep.entries_after += after
-            if moved:
+            sweep.entries_before += outcome.entries_before
+            sweep.entries_after += outcome.entries_after
+            if outcome.moved:
                 sweep.changed += 1
             else:
                 sweep.unchanged += 1
@@ -1016,6 +1142,8 @@ __all__ = [
     "DEFAULT_SWEEP_BATCH",
     "DETECTION_IS_OFF",
     "NO_RETAINED_BYTES",
+    "NO_STORED_CHUNKS",
+    "GlossaryOutcome",
     "GlossarySweep",
     "ReindexReport",
     "StaleSweep",

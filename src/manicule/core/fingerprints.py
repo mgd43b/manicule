@@ -327,7 +327,7 @@ class GlossaryFingerprint(Fingerprint):
     look correct on every fixture that happens to contain a definition.
     """
 
-    IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = ("detector", "rules", "middleware")
+    IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = ("detector", "rules", "libraries", "middleware")
 
     detector: str = Field(
         min_length=1,
@@ -343,6 +343,21 @@ class GlossaryFingerprint(Fingerprint):
         "the thresholds, the evidence weights, the boundary model and the normalisation that "
         "turns a surface form into a key. Empty when detection is disabled, because none of "
         "them ran.",
+    )
+    libraries: tuple[str, ...] = Field(
+        default=(),
+        description="Sorted ``name@version`` for everything outside this repository that "
+        "decides a stored entry. A digest of our own sources catches a rule *we* change; it "
+        "cannot catch a rule changing underneath an unchanged file, which is what a dependency "
+        "upgrade is. Two reach here: ``pydantic``, which validates "
+        ":class:`~manicule.core.glossary.GlossaryEntry`'s constraints and so decides which rows "
+        "may be persisted at all, and ``unicodedata``, whose character-database version decides "
+        "what :func:`~manicule.core.glossary.normalise_acronym` NFKC-folds a surface into — a "
+        "stored *lookup key*, moving with the interpreter rather than with any distribution. "
+        "Derived from the digested sources' own imports rather than listed, so the one thing "
+        "``ParserVersions.distributions`` documents going wrong — a dependency added and not "
+        "recorded — cannot happen here. Empty is a real answer for a detector that imports "
+        "nothing but the standard library.",
     )
     middleware: tuple[str, ...] = Field(
         default=(),
@@ -360,10 +375,11 @@ class GlossaryFingerprint(Fingerprint):
     def disabled(cls) -> GlossaryFingerprint:
         """What a document records when detection was switched off.
 
-        Carries nothing but the state itself. Rules and middleware are omitted rather than
-        recorded-and-ignored, because neither ran: folding them in would churn the lineage of
-        documents nobody detected anything for every time an unrelated hook was configured,
-        and would make two disabled states compare unequal for a reason that had no effect.
+        Carries nothing but the state itself. Rules, libraries and middleware are omitted rather
+        than recorded-and-ignored, because none of them ran: folding them in would churn the
+        lineage of documents nobody detected anything for every time an unrelated hook was
+        configured or a dependency moved, and would make two disabled states compare unequal for
+        a reason that had no effect.
         """
         return cls(detector=DETECTION_DISABLED)
 
@@ -376,8 +392,8 @@ class GlossaryFingerprint(Fingerprint):
     def describe(self) -> str:
         if not self.detects:
             return "glossary detection disabled"
-        hooks = ", ".join(self.middleware) if self.middleware else "no middleware"
-        return f"{self.detector} rules {self.rules} ({hooks})"
+        listed = ", ".join((*self.libraries, *self.middleware)) or "no libraries, no middleware"
+        return f"{self.detector} rules {self.rules} ({listed})"
 
 
 __all__ = [

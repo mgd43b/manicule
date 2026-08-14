@@ -15,7 +15,12 @@ is mechanical rather than a habit.
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import sys
+from importlib import import_module
+from importlib.metadata import version
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -27,6 +32,7 @@ from manicule.ingest.glossary_lineage import (
     SOURCES,
     detector_imports,
     glossary_fingerprint,
+    libraries,
     rules_digest,
 )
 from manicule.ingest.middleware import MiddlewareRunner, chain, declarations
@@ -130,6 +136,131 @@ def test_a_comment_only_edit_also_moves_it_and_that_is_the_direction_chosen() ->
     assert made.hexdigest() != other.hexdigest()
 
 
+def test_a_dependency_that_decides_a_stored_entry_is_recorded_with_its_version() -> None:
+    """A digest catches a rule *this* repository changes, and cannot catch one moving underneath.
+
+    That is exactly what a dependency upgrade is, and the detector has two.
+
+    ``unicodedata`` is the sharper of them and is the reason this was found at all.
+    :func:`~manicule.core.glossary.normalise_acronym` NFKC-folds a surface into the stored
+    *lookup key*, and #121 put NFKC into :func:`~manicule.ingest.glossary.initial_skeleton` as
+    well — so the version of the character database decides what a term is filed under, it moves
+    with the interpreter rather than with any distribution, and nothing in a source digest sees
+    it move.
+
+    ``pydantic`` validates :class:`~manicule.core.glossary.GlossaryEntry`'s field constraints, so
+    it decides which rows may be persisted at all.
+    """
+    import unicodedata  # noqa: PLC0415 - read for its data version, as the fingerprint does
+
+    recorded = dict(entry.split("@", 1) for entry in libraries())
+
+    assert recorded["unicodedata"] == unicodedata.unidata_version
+    assert recorded["pydantic"] == version("pydantic")
+    assert glossary_fingerprint().libraries == libraries()
+
+
+def test_the_dependencies_are_read_off_the_imports_rather_than_listed() -> None:
+    """Derived, so a dependency added to the detector tomorrow is recorded by nobody's memory.
+
+    This is the failure ``ParserVersions.distributions`` documents, happening to somebody: a
+    library reaches a fingerprint's inputs and the hand-kept list beside it does not move. There
+    is no list here to fail to update — the digested sources' own imports are the list.
+
+    Asserted against a second reading of the same syntax trees rather than against a name. The
+    claim that supports is narrow and worth stating as such: it is not that two independent
+    algorithms agree — this one is deliberately the same algorithm — it is that **no name is
+    written down on either side**, so a `libraries()` quietly replaced by a hard-coded tuple
+    fails here the moment the imports and the tuple part company. The test above names
+    ``pydantic``, and that one would not.
+    """
+    third_party = {
+        name
+        for name in _imported_top_level()
+        if name not in sys.stdlib_module_names and not name.startswith("manicule")
+    }
+
+    recorded = {entry.split("@", 1)[0] for entry in libraries()}
+
+    assert third_party, "the fixture assumes the detector imports something outside stdlib"
+    assert third_party <= recorded, f"{sorted(third_party - recorded)} reached no fingerprint"
+
+
+@pytest.mark.parametrize(
+    ("form", "rule"),
+    [
+        ("table", b"_TABLE_RE: Final = re.compile("),
+        ("heading", b"_HEADING_RE: Final = re.compile("),
+        ("list", b"_LIST_MARKER_RE: Final = re.compile("),
+        ("acronym", b"_UPPERCASE_SHARE: Final = 0.6"),
+        ("bracket", b"_BRACKETS: Final[Mapping[str, str]] = {"),
+        ("dash", b"_DASH_RE: Final = re.compile("),
+        ("colon", b"_COLON_RE: Final = re.compile("),
+        ("parenthetical", b"_PARENTHETICAL_RE: Final = re.compile("),
+        ("definition list", b"_DEFINITION_MARKER_RE: Final = re.compile("),
+        ("normalisation", b"_STRIPPABLE: Final = "),
+    ],
+)
+def test_each_detection_rule_is_independently_represented_in_the_digest(
+    *, form: str, rule: bytes
+) -> None:
+    """Every rule moves the fingerprint on its own, not only in aggregate.
+
+    A digest over whole files could in principle be satisfied by covering one rule and no other —
+    it would still move whenever anything changed, and nobody reading the number could tell which
+    of them it was covering. So each rule is located in the digested bytes and shown to move the
+    digest by itself.
+
+    Two of these are not written forms and are here for that reason. ``acronym`` is the shape
+    gate and ``bracket`` is the boundary model: both decide what is stored without being a syntax
+    an author types, and both are exactly what a list of "supported forms" would leave out.
+    ``normalisation`` is in the *other* file, so a parametrisation that only ever read the
+    detector would fail on it.
+
+    **The locator failing is itself the point.** Rename a rule and this reports that the test is
+    stale rather than passing over a constant that no longer exists — checked by pointing it at
+    ``_UPPERCASE_SHARE: Final = 0.7``, which produced
+    ``AssertionError: the acronym rule has moved or been renamed; this test is stale``.
+    """
+    original = _digested_bytes()
+    assert rule in original, f"the {form} rule has moved or been renamed; this test is stale"
+
+    moved = original.replace(rule, rule + b" ")
+    assert hashlib.sha256(moved).hexdigest() != hashlib.sha256(original).hexdigest(), (
+        f"editing the {form} rule alone left the fingerprint where it was"
+    )
+
+
+def _source_path(package: str, name: str) -> Path:
+    return Path(import_module(package).__file__ or "").parent / name
+
+
+def _digested_bytes() -> bytes:
+    """The detector's sources as the fingerprint reads them, concatenated."""
+    return b"".join(
+        _source_path(package, name).read_bytes().replace(b"\r\n", b"\n")
+        for package, name in SOURCES
+    )
+
+
+def _imported_top_level() -> set[str]:
+    """Top-level module names the digested sources import, read here rather than imported.
+
+    Deliberately not calling the module under test, so that what the assertion compares is a
+    reading of the *files* against a reading of the *fingerprint* — with no name written down on
+    either side of it.
+    """
+    found: set[str] = set()
+    for package, name in SOURCES:
+        tree = ast.parse(_source_path(package, name).read_bytes())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                found.add(node.module.split(".")[0])
+            elif isinstance(node, ast.Import):
+                found.update(alias.name.split(".")[0] for alias in node.names)
+    return found
+
+
 def test_the_whole_middleware_chain_is_folded_in_and_not_the_declared_subset() -> None:
     """``mutates_embedded_text`` is the wrong filter here, and using it would look right.
 
@@ -215,7 +346,7 @@ def test_detection_switched_off_is_a_value_rather_than_an_absence() -> None:
 
     assert off.detector == DETECTION_DISABLED
     assert not off.detects
-    assert off.canonical() == '{"detector":"disabled","middleware":[],"rules":""}'
+    assert off.canonical() == ('{"detector":"disabled","libraries":[],"middleware":[],"rules":""}')
     assert off.describe() == "glossary detection disabled"
 
 
@@ -229,6 +360,9 @@ def test_the_disabled_fingerprint_carries_neither_rules_nor_middleware() -> None
 
     assert glossary_fingerprint(enabled=False, middleware=chain([hook])) == (
         glossary_fingerprint(enabled=False)
+    )
+    assert glossary_fingerprint(enabled=False).libraries == (), (
+        "a dependency version describes work that did not happen either"
     )
 
 

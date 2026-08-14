@@ -456,6 +456,7 @@ class SqliteDocStore(
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
         glossary_fp_other_than: str | None = None,
+        glossary_fp_unrecorded: bool = False,
     ) -> int:
         """How many live documents match, counted in the database.
 
@@ -463,6 +464,12 @@ class SqliteDocStore(
         entries the installed detector did not produce — over the indexed column alone, so the
         check costs one count rather than a walk of the corpus, and reads no glossary text to
         do it.
+
+        ``glossary_fp_unrecorded`` narrows that to the ``NULL`` half, and the two are worth
+        telling apart because they are two different sentences to an operator. "Your detector
+        changed" is routine and clears itself; "this index predates glossary lineage" is a
+        one-time migration and is what somebody upgrading needs to be told, once, rather than
+        having it folded into a number that looks like ordinary staleness.
         """
         statement = (
             select(func.count())
@@ -478,6 +485,8 @@ class SqliteDocStore(
             statement = statement.where(models.Document.status.in_(list(statuses)))
         if glossary_fp_other_than is not None:
             statement = statement.where(_glossary_is_not(glossary_fp_other_than))
+        if glossary_fp_unrecorded:
+            statement = statement.where(models.Document.glossary_fp.is_(None))
         async with self._sessions() as session:
             return (await session.execute(statement)).scalar_one()
 
