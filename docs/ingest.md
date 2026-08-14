@@ -1155,8 +1155,15 @@ behaviour change that ships in a patch release anyway.**
 style `NOT_DIGESTED` uses, because a derived mechanism fails silently when its derivation has a
 hole. Imports at any nesting are covered — inside a function, under `if TYPE_CHECKING`, in a
 `try/except ImportError` — since the walk reads the whole syntax tree. What it cannot follow is a
-*dynamic* import, and rather than leave that as a limit it is a rule: the suite fails if a
-digested source calls `importlib.import_module` or `__import__`.
+*dynamic* import, and the suite refuses one: it fails if a digested source calls
+`importlib.import_module` or `__import__`, however that name was bound.
+
+**That refusal is not total, and the constant says so rather than sounding like a prohibition.**
+It matches the name being called, so it catches the four spellings somebody writes without
+meaning to hide anything. It does not catch a rebound name, a `getattr`, or a call built in
+`eval` — closing those needs value-flow analysis, which an AST walk is not. What it buys is
+raising the cost of the mistake from accidental to deliberate, and the three open routes are
+asserted open by a test, so the claim cannot quietly go stale in either direction.
 
 **It is derived, not maintained.** `ParserVersions.rules` is a number somebody has to remember
 to move, and its own table records two parsers bumped for changes they did not make, by
