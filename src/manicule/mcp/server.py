@@ -41,6 +41,7 @@ mechanism ``tests/mcp/test_annotations.py`` already holds the hints to.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
@@ -204,6 +205,23 @@ than a count somebody keeps in their head.
 the tools a socket may carry: that set is *derived* from each registration's ``readOnlyHint`` by
 :class:`_Registrar`, so there is nothing to keep in step and nothing to fall out of step with.
 """
+
+
+@dataclass(frozen=True, slots=True)
+class Surface:
+    """One built server, and the names of the tools it actually carries.
+
+    The two together because a caller almost always wants both and there is no way to ask a
+    ``FastMCP`` for the second without awaiting: ``list_tools`` is a coroutine, and the two
+    callers that need the count — the startup banner and the mount — are ordinary synchronous
+    assembly. A count kept as a constant beside :data:`TOOL_NAMES` would be a second statement
+    of something already decided at the registrations, which is what
+    :class:`_Registrar` exists to avoid.
+    """
+
+    server: FastMCP
+    tools: tuple[str, ...]
+    """Sorted, so two surfaces compare as sets do and a diff of them reads."""
 
 
 class _Registrar:
@@ -438,7 +456,17 @@ def _register_collections(
 
 
 def build_server(service: ApplicationService, *, read_only: bool = False) -> FastMCP:
-    """Register the tools this surface offers against ``service`` and return the server.
+    """The server :func:`build_surface` builds, for the callers that want nothing else.
+
+    Most of them: every suite that drives a client, and both transports. Kept as its own name
+    because ``build_surface(...).server`` at forty call sites would be noise standing in for a
+    fact only two of them need.
+    """
+    return build_surface(service, read_only=read_only).server
+
+
+def build_surface(service: ApplicationService, *, read_only: bool = False) -> Surface:
+    """Register the tools this surface offers against ``service`` and return it.
 
     Takes the service rather than building one, so the suites drive the real FastMCP tool
     manager against a fake backend — which is what makes the parity test meaningful. A server
@@ -869,7 +897,7 @@ def build_server(service: ApplicationService, *, read_only: bool = False) -> Fas
             f"write operation reachable from the network."
         )
         raise AssertionError(msg)
-    return mcp
+    return Surface(server=mcp, tools=tuple(sorted(register.carried)))
 
 
 __all__ = [
@@ -878,6 +906,8 @@ __all__ = [
     "READ_ONLY_NOTICE",
     "SERVER_NAME",
     "TOOL_NAMES",
+    "Surface",
     "build_server",
+    "build_surface",
     "hints",
 ]
