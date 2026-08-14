@@ -625,6 +625,7 @@ async def test_the_instructions_tell_a_client_the_write_tools_are_not_here() -> 
     backend, _ = backend_with_a_document()
     async with mounted(backend) as client:
         result = client.initialize_result
+    assert result is not None, "the client never completed initialization"
     instructions = result.instructions or ""
     assert "read-only" in instructions, instructions
     assert "manicule serve" in instructions, instructions

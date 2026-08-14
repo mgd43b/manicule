@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx2
 from fastmcp import Client
@@ -28,16 +28,17 @@ from manicule.api.app import MCP_PATH, build_app
 from manicule.app.service import ApplicationService
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from fastapi import FastAPI
+    from mcp.shared._httpx_utils import McpHttpClientFactory
 
     from manicule.api.serve import Server
     from tests.app.fakes import FakeBackend
 
 
 @contextlib.asynccontextmanager
-async def mounted(backend: FakeBackend, *, web: bool = True) -> AsyncIterator[Client]:
+async def mounted(backend: FakeBackend, *, web: bool = True) -> AsyncGenerator[Client[Any]]:
     """An MCP client speaking to the mount, through the application and not through a socket.
 
     For the assertions that are about *what the surface offers* rather than about connections:
@@ -54,13 +55,23 @@ async def mounted(backend: FakeBackend, *, web: bool = True) -> AsyncIterator[Cl
 
     app = build_app(ApplicationService(backend), web=web)
 
-    def through_the_app(**arguments: object) -> httpx.AsyncClient:
+    def through_the_app(**arguments: Any) -> httpx.AsyncClient:
+        """The client fastmcp would have built, pointed at the application instead of a socket.
+
+        ``**arguments`` rather than the three parameters the library's ``McpHttpClientFactory``
+        declares, because the two disagree: the declared type names ``headers``, ``timeout`` and
+        ``auth``, and the call site also passes ``follow_redirects``. Writing the declared
+        signature out therefore type-checks and then fails at run time — which is how this
+        comment came to be here. Everything given is passed on; only ``transport`` is dropped,
+        because supplying one is the entire point.
+        """
         arguments.pop("transport", None)
-        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), **arguments)  # type: ignore[arg-type]
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), **arguments)
 
     async with app.router.lifespan_context(app):
         transport = StreamableHttpTransport(
-            f"http://testserver{MCP_PATH}/", httpx_client_factory=through_the_app
+            f"http://testserver{MCP_PATH}/",
+            httpx_client_factory=cast("McpHttpClientFactory", through_the_app),
         )
         async with Client(transport) as client:
             yield client
@@ -101,13 +112,13 @@ class Live:
         """An ordinary HTTP client for the JSON API and the browser surface."""
         return httpx2.AsyncClient(base_url=self.base_url, timeout=30.0)
 
-    def mcp(self) -> Client:
+    def mcp(self) -> Client[Any]:
         """A fresh MCP client. Each call is a **separate** client with its own session."""
         return Client(StreamableHttpTransport(self.mcp_url))
 
 
 @contextlib.asynccontextmanager
-async def serving(backend: FakeBackend, *, web: bool = True) -> AsyncIterator[Live]:
+async def serving(backend: FakeBackend, *, web: bool = True) -> AsyncGenerator[Live]:
     """Run the production application over ``backend`` until the block ends.
 
     Port 0, so the kernel picks one nobody else is using. A fixed port in a suite is a suite that
