@@ -411,6 +411,15 @@ class Serving:
 
     server: control.ControlServer
     scheduler: Scheduler
+    _closed: bool = False
+    """Whether :meth:`aclose` has run. Set once, checked once, and it is not a nicety.
+
+    The shutdown sequence closes this explicitly — it has to, because the transport is closed
+    *after* it and a context manager's exit runs last — and then the ``async with`` around it
+    exits and closes it again. Both calls are harmless to the objects underneath, and the second
+    one's *announcements* are not: an operator reading "stopping the scheduler" twice has every
+    reason to think something restarted.
+    """
 
     async def astart(self) -> None:
         """Bind the socket, then begin the schedule.
@@ -435,6 +444,9 @@ class Serving:
         — and it is exactly the interval in which somebody reaches for ``kill -9`` and gets the
         half-written index :data:`~manicule.app.daemon.STOP_GRACE_S` refuses to produce.
         """
+        if self._closed:
+            return
+        self._closed = True
         announce("stopping the scheduler, so no further sync starts")
         with contextlib.suppress(Exception):
             await self.scheduler.aclose()

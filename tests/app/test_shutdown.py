@@ -337,6 +337,48 @@ def test_a_sigterm_closes_the_four_things_in_the_stated_order(tmp_path: Path) ->
     )
 
 
+def test_the_signal_handlers_are_installed_before_anything_is_started() -> None:
+    """The window a supervisor restarting a just-started server lands in.
+
+    ``_writing`` binds the control socket, and the socket appearing is what tells everything
+    else — ``manicule stop``, a proxied command, a supervisor — that this process is up. A
+    ``SIGTERM`` between that and the handler being installed reaches the *default* handler, which
+    kills the process where it stands: nothing is closed, the socket file is left behind, and the
+    exit status says the job crashed rather than that it was asked to stop.
+
+    **Asserted structurally, and that is a deliberate choice rather than the easy one.** The
+    behavioral form is :func:`test_a_sigterm_closes_the_four_things_in_the_stated_order`, and it
+    found this — but only under load, because whether the signal lands inside the window depends
+    on the machine. A test that reproduces a race sometimes is a test that reports the fix
+    sometimes. This one reads the nesting, which is the thing that closes the window, and is red
+    the moment it is inverted.
+    """
+    import ast  # noqa: PLC0415 - only this assertion parses a function
+    import inspect  # noqa: PLC0415
+    import textwrap  # noqa: PLC0415
+
+    source = textwrap.dedent(inspect.getsource(cli_serving.serve_over_a_socket))
+    body = ast.parse(source).body[0]
+    assert isinstance(body, ast.AsyncFunctionDef)
+
+    outermost = next(node for node in body.body if isinstance(node, (ast.With, ast.AsyncWith)))
+    assert isinstance(outermost, ast.With), (
+        "the outermost context manager is an `async with`, so the signal handlers are not the "
+        "first thing installed"
+    )
+    called = {
+        node.func.id
+        for item in outermost.items
+        if isinstance(node := item.context_expr, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert called == {"_signals"}, (
+        f"the outermost context manager is {sorted(called)} rather than the signal handlers. "
+        f"Anything started outside them can be killed by a signal the process meant to handle."
+    )
+    inner = [node for node in ast.walk(outermost) if isinstance(node, ast.AsyncWith)]
+    assert inner, "nothing is started inside the signal handlers, so they guard nothing"
+
+
 def test_a_sigterm_leaves_a_clean_exit_and_no_socket_behind(tmp_path: Path) -> None:
     """The tidiness, separately, because it is a different failure from the order.
 

@@ -195,7 +195,7 @@ async def _serve(
         # one where the transport raises.
         try:
             if api:
-                await _serve_over_a_socket(
+                await serve_over_a_socket(
                     service, host=host, port=port, allow_public=allow_public, web=web
                 )
             else:
@@ -232,7 +232,7 @@ async def _serve_a_protocol(
     """Serve MCP alone — over stdio, or over a socket with ``--mcp-only``.
 
     Signals are left exactly as they were, which is the difference from
-    :func:`_serve_over_a_socket` and is deliberate rather than an omission. Nothing on this path
+    :func:`serve_over_a_socket` and is deliberate rather than an omission. Nothing on this path
     captures them: ``Ctrl-C`` raises ``KeyboardInterrupt`` out of the transport, the ``async
     with`` unwinds in order on the way past, and ``manicule serve`` over stdio therefore behaves
     exactly as it did before any of this existed — which matters, because that is the path an
@@ -242,7 +242,7 @@ async def _serve_a_protocol(
         await serve(service, transport=transport, host=host, port=port, allow_public=allow_public)
 
 
-async def _serve_over_a_socket(
+async def serve_over_a_socket(
     service: ApplicationService,
     *,
     host: str | None,
@@ -251,6 +251,9 @@ async def _serve_over_a_socket(
     web: bool,
 ) -> None:
     """Serve the HTTP API, the browser surface and MCP from one process, and stop them in order.
+
+    Public because it *is* the shutdown order this module's docstring describes, and an order
+    nothing outside the module can name is an order nothing outside the module can check.
 
     The transport runs as a *task* rather than as an awaited call, because the shutdown has four
     steps and the transport is the last of them: something has to be able to close the scheduler
@@ -278,8 +281,16 @@ async def _serve_over_a_socket(
             return
         stop.set()
 
-    async with _writing(service) as writing:
-        with _signals(asked_to_stop):
+    # **The handlers go on before anything is started**, and the order is load-bearing rather
+    # than tidy. `_writing` binds the control socket, and the socket appearing is what tells
+    # everything else — `manicule stop`, a proxied command, a supervisor's readiness check — that
+    # this process is up. A `SIGTERM` arriving between the socket being bound and the handler
+    # being installed reaches the *default* handler, which kills the process where it stands: the
+    # scheduler is not stopped, the socket file is left behind, and the exit status says the job
+    # crashed rather than that it was asked to stop. Small window, ordinary cause — a supervisor
+    # restarting a server it has only just started — and it was found by a test, not by reading.
+    with _signals(asked_to_stop):
+        async with _writing(service) as writing:
             running = asyncio.create_task(transport.serve(), name="transport")
             await _first_of(stop, running)
             # Steps 1 to 3, and the second interrupt cancels the *wait* rather than the work:
@@ -415,7 +426,7 @@ def stop_running(overrides: Mapping[str, Any], *, workspace: str) -> Envelope:
     # is confirmed gone, so nothing is behind it.
     #
     # **The server now removes it itself**, on every path including a supervisor's `SIGTERM`:
-    # `_serve_over_a_socket` owns the signals, so `ControlServer.aclose` runs and unlinks the
+    # `serve_over_a_socket` owns the signals, so `ControlServer.aclose` runs and unlinks the
     # path. This line therefore removes a file that is usually already gone, and it stays for the
     # cases where it is not — a `SIGKILL`, a power cut, or an older server on the far side of an
     # upgrade. It used to be load-bearing for the ordinary stop as well, because uvicorn's own
@@ -480,4 +491,11 @@ def _report(
         render.render_error(out, envelope.op, envelope.error)
 
 
-__all__ = ["EX_TEMPFAIL", "bounded_by", "running_address", "serve_forever", "stop_running"]
+__all__ = [
+    "EX_TEMPFAIL",
+    "bounded_by",
+    "running_address",
+    "serve_forever",
+    "serve_over_a_socket",
+    "stop_running",
+]

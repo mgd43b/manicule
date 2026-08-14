@@ -129,7 +129,7 @@ class Server(uvicorn.Server):
     in-flight commands are cut off and the socket file is left behind.
 
     So the handlers are installed one level up, by the code that also owns the order
-    (:func:`~manicule.cli.serving._serve`), and stopping this server is
+    (:func:`~manicule.cli.serving.serve_over_a_socket`), and stopping this server is
     ``should_exit = True`` — the same field uvicorn's own handler sets.
 
     **Nothing else is changed**, deliberately: this is not a reimplementation of the server, and
