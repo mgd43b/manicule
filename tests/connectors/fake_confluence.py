@@ -66,6 +66,12 @@ _TYPES = re.compile(r"type\s*(?:=\s*(\w+)|in\s*\(([^)]*)\))")
 _ANCESTOR = re.compile(r"ancestor\s*(?:=\s*(\d+)|in\s*\(([^)]*)\))")
 _ID = re.compile(r"(?<![\w.])id\s*(?:=\s*(\d+)|in\s*\(([^)]*)\))")
 
+_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
+"""One CQL string literal, escaping included. Blanked before the field check below."""
+
+_STATUS_FIELD = re.compile(r"(?<![\w.])status\s*(?:=|!=|<|>|\bin\b|\bnot\b)", re.IGNORECASE)
+"""``status`` used as a field in a comparison, which is what Data Center refuses."""
+
 
 @dataclass(slots=True)
 class FakePage:
@@ -253,6 +259,21 @@ class FakeConfluence:
         first without producing the second.
         """
 
+        self.rejects_status_field = False
+        """Whether a CQL query containing ``status`` is answered with an HTTP 400.
+
+        **What the standard Data Center content-search resource does**, and the reason this
+        connector's query builders take the decision as a required argument. Off by default so
+        that Cloud fixtures behave as Cloud does; a Server or Data Center fixture turns it on
+        and every query the connector sends is then checked, not only the ones a test thought
+        to look at.
+
+        This is the guard that makes a *forgotten* call site loud. There are eight places a
+        content or title query is built, and a test that asserted on the CQL of the two it
+        happened to exercise would pass while reconciliation or an include macro failed against
+        a real instance weeks later.
+        """
+
         self.ancestor_predicate = "applied"
         """How this instance treats CQL's ``ancestor`` field: the deployment question that
         cannot be settled from this repository.
@@ -366,6 +387,8 @@ class FakeConfluence:
     def _route(self, request: httpx.Request, path: str) -> httpx.Response:  # noqa: PLR0911
         if path == "/rest/api/space":
             return self._spaces(request)
+        if path.startswith("/rest/api/space/"):
+            return self._one_space(path)
         if path == "/rest/api/user/current":
             return httpx.Response(200, json={"type": "known", "username": self.user})
         if path == "/rest/api/content/search":
@@ -389,8 +412,40 @@ class FakeConfluence:
         ]
         return self._paged(request, rows, "/rest/api/space")
 
+    def _one_space(self, path: str) -> httpx.Response:
+        """``/rest/api/space/{key}`` — the direct lookup a configured allowlist uses.
+
+        Matched **case-insensitively and answered with the instance's own spelling**, because
+        that is what Confluence does and it is the reason the connector reads the key back out
+        of the response rather than reusing the one it asked with. A fake that echoed the
+        request would agree with an implementation that assumed configuration was canonical.
+        """
+        # Not unquoted again: httpx has already decoded `.url.path`, and a second pass
+        # would turn a key containing a literal `%` into a different key — which would
+        # make an encoding test pass while the encoding was wrong.
+        requested = path.removeprefix("/rest/api/space/")
+        for key, name in self.spaces.items():
+            if key.casefold() == requested.casefold():
+                return httpx.Response(
+                    200, json={"key": key, "name": name, "type": "global", "id": abs(hash(key))}
+                )
+        return httpx.Response(404, json={"message": f"no space with key {requested}"})
+
     def _search(self, request: httpx.Request) -> httpx.Response:
         query = request.url.params.get("cql", "")
+        if self.rejects_status_field and _mentions_status_field(query):
+            # The shape Data Center actually fails in: a parse error naming the field, before
+            # any content is considered. Not a 404 and not an empty result set — this failure
+            # announces itself, which is the one mercy in it.
+            return httpx.Response(
+                400,
+                json={
+                    "statusCode": 400,
+                    "message": (
+                        "Could not parse cql : Unsupported CQL field 'status' for this resource"
+                    ),
+                },
+            )
         expanded = request.url.params.get("expand", "")
         rows = [self._result(item, expanded) for item in self._matching(query)]
         return self._paged(request, rows, "/rest/api/content/search")
@@ -642,6 +697,22 @@ class FakeConfluence:
             # The cursor itself is written unencoded, exactly as Confluence writes it.
             payload["_links"]["next"] = f"{path}?{kept}&cursor={issued}"
         return httpx.Response(200, json=payload)
+
+
+def _mentions_status_field(query: str) -> bool:
+    """Whether ``query`` uses ``status`` as a **field**, rather than merely containing the word.
+
+    Data Center rejects the field, not the seven letters wherever they fall. A page called
+    "Build status" reaches CQL as a quoted literal and is ordinary data — a fake that answered
+    400 for it would invent a failure the product does not have, and the next person to see it
+    would spend an afternoon on a bug that exists only in this file.
+
+    So the literals are blanked first, and what is left has to look like a field in a comparison:
+    the bare word followed by an operator. ``_QUOTED`` handles the escaping :func:`cql.quote`
+    produces, which is the same reason the connector escapes at all.
+    """
+    bare = _QUOTED.sub('""', query)
+    return _STATUS_FIELD.search(bare) is not None
 
 
 def _listed(match: re.Match[str] | None) -> set[str]:

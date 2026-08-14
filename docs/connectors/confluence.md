@@ -267,20 +267,35 @@ would parse, chunk, embed and serve.
 
 ## 2. Discovery and change detection
 
-**Full sync** — enumerate once, per space:
+**Full sync** — enumerate once, per space. The CQL differs by deployment, and the blocks below
+are **executed** by `tests/connectors/test_cql_contract.py`, which builds each query through the
+real builders and compares it to what is written here. There is no second copy of these strings
+to drift against this one.
 
-```
-GET /wiki/rest/api/content/search
-    ?cql=type in (page, attachment) AND space = "ENG" AND status = current
-         order by lastmodified asc
-    &expand=version,ancestors,space,container
-    &limit=100
+<!-- cql:cloud:full -->
+```cql
+type in (page, attachment) AND space = "ENG" AND status = current order by lastmodified asc
 ```
 
-**Incremental** — a per-space watermark of the last successful sync:
-
+<!-- cql:server:full -->
+```cql
+type in (page, attachment) AND space = "ENG" order by lastmodified asc
 ```
-?cql=... AND lastmodified >= "2026/08/09 14:25"
+
+Sent to `GET /wiki/rest/api/content/search` with
+`&expand=version,ancestors,space,container&limit=100`.
+
+**Incremental** — a per-space watermark of the last successful sync, which adds one clause to
+whichever of those two the deployment uses:
+
+<!-- cql:cloud:incremental -->
+```cql
+type in (page, attachment) AND space = "ENG" AND status = current AND lastmodified >= "2026/08/09 14:25" order by lastmodified asc
+```
+
+<!-- cql:server:incremental -->
+```cql
+type in (page, attachment) AND space = "ENG" AND lastmodified >= "2026/08/09 14:25" order by lastmodified asc
 ```
 
 `lastmodified` is a first-class CQL field and is sortable, so the source does the filtering
@@ -291,9 +306,25 @@ Five things about that query are load-bearing.
 - **One query covers pages and attachments.** `type in (page, attachment)` makes attachments
   watermark-aware and reconcilable on the same terms as pages, instead of a per-page call to
   the attachment endpoint that no watermark can narrow.
-- **`status = current` is explicit.** Reconciliation (§3) depends on a deleted page *not*
-  being returned. A query that included trashed content would report every deleted page as
-  still present, and deletion detection would run, succeed, and find nothing, forever.
+- **`status = current` is written on Cloud and omitted on Server and Data Center**, and that
+  is a difference in the products rather than a preference. Cloud's search accepts the field,
+  and reconciliation (§3) depends on it: a query that included trashed content would report
+  every deleted page as still present, and deletion detection would run, succeed, and find
+  nothing, forever. The standard Data Center content-search resource **rejects** `status`
+  outright — an HTTP 400 naming the field — and returns current content by default.
+
+  **The decision is read from the declared `deployment` and from nothing else.** Not the URL
+  shape, not the hostname, not the context path, not the credential kind, and above all not
+  from sending the query to find out: a retry that strips the clause after a 400 would double
+  every enumeration's cost on one deployment and mask the day the other changed its mind.
+  `ConfluenceConfig.current_only` is the one property that answers it, and all eight query
+  sites read it — whole-space discovery, incremental discovery, page-tree discovery,
+  attachment discovery, reconciliation, subtree membership, attachment reconciliation, and
+  the title lookup an include macro resolves through.
+
+  The builders take `current_only` as a **required keyword argument with no default**. A
+  default would be one deployment's answer silently applied to the other, which is precisely
+  how a builder acquires seven callers and six correct ones.
 - **Every value is a quoted, escaped CQL literal.** A space key or page title containing a
   quote would otherwise end the literal and continue as query syntax — the same hazard as SQL
   injection, and against a search endpoint the result is not an error but results.
@@ -308,12 +339,36 @@ Five things about that query are load-bearing.
   version comparison the pipeline was going to make anyway, and missing a page costs a
   document that stays wrong until something unrelated touches it.
 
-**The space list is enumerated and checked each run.** With no allowlist, every visible space
-is synced, so one created since the last run needs no configuration change. With an allowlist,
-each key is checked against what is visible and an unknown one is a refusal — CQL answers a
-query for a space that does not exist with an empty result set, so a typo would otherwise be a
-sync that runs, succeeds, indexes nothing, and leaves reconciliation proposing the deletion of
+**The space list is checked each run, and the two cases ask the source two different questions.**
+
+- **No allowlist** — every visible space is enumerated through the paginated
+  `/rest/api/space`, so a space created since the last run needs no configuration change. An
+  account that can see none at all is a refusal.
+- **An allowlist** — each configured key is confirmed with one direct
+  `GET /rest/api/space/{key}`, and the catalog is never listed. An allowlist is a scope
+  boundary, and reading the whole catalog to answer a question about two keys is that boundary
+  being ignored for convenience.
+
+Either way an unknown key is a refusal before any content query goes out: CQL answers a query
+for a space that does not exist with an empty result set, so a typo would otherwise be a sync
+that runs, succeeds, indexes nothing, and leaves reconciliation proposing the deletion of
 everything that space ever contributed.
+
+**Three details of the direct lookup are load-bearing.**
+
+- **The key is one URL-encoded path segment.** A key containing `/` or `?` interpolated raw
+  would address a different resource, and the connector would report on whatever answered.
+- **The spelling that comes back is the one used.** Confluence space keys are case-insensitive
+  to look up and have one canonical casing, and that casing goes into every subsequent CQL
+  literal — so the response's key is read rather than the configured string echoed.
+- **The refusal does not list what *is* visible.** Enumerating unrelated spaces to improve an
+  error message is the request this path exists to stop making. A credential or permission
+  failure is also left to surface as itself rather than being folded into "unknown space":
+  "your token expired" and "that key is wrong" need different repairs.
+
+The cost difference is the point. On an account entitled to 500 spaces and configured for two,
+the catalog walk was six requests carrying 500 space records; the direct lookups are two
+requests carrying two. It scales with the configuration instead of with the account.
 
 **Three traps in pagination, all verified:**
 
@@ -419,14 +474,20 @@ what it asked for.
 
 ### How descendants are resolved, and what bounds it
 
-Confluence's own `ancestor` predicate, which matches at any depth:
+Confluence's own `ancestor` predicate, which matches at any depth. Executed by the same test as
+§2's blocks:
 
+<!-- cql:cloud:subtree -->
+```cql
+type = page AND space = "ENG" AND status = current AND (ancestor = 100100 OR id = 100100) order by lastmodified asc
 ```
-?cql=type = page AND space = "ENG" AND status = current
-     AND (ancestor = 100100 OR id = 100100)
-     order by lastmodified asc
-    &expand=version,ancestors,space,container
+
+<!-- cql:server:subtree -->
+```cql
+type = page AND space = "ENG" AND (ancestor = 100100 OR id = 100100) order by lastmodified asc
 ```
+
+Sent with `&expand=version,ancestors,space,container`.
 
 **There is no client-side walk**, and therefore no queue of page ids, no cycle detection, no
 depth ceiling, and no second enumeration a moved page can fall between. A tree forty levels
@@ -880,7 +941,8 @@ differ, it is here — check these first when one is available:
 
 | Assumption | What to check | If it is wrong |
 |---|---|---|
-| `status = current` is accepted by CQL on both deployments | A search returns results rather than a 400 | Deletion detection is the thing at risk: without it, trashed pages may still be returned |
+| **Omitting `status = current` on Server/Data Center returns *current* content only** — especially after a page is trashed | Trash a page, re-run discovery and reconciliation, and confirm it stops being returned | Deletion detection is what is at risk. If a Data Center search returns trashed content by default, reconciliation sees a deleted page as still present and the index serves it forever. This row replaces the one that assumed `status` was accepted on both deployments: it is not — the standard Data Center content-search resource rejects it — and the synthetic suite proves this client sends the right query, not what that product does with it |
+| `GET /rest/api/space/{key}` exists and answers for a single space on both deployments | Configure an explicit `spaces` allowlist and run a sync | A configured allowlist refuses every key as missing. Loud rather than quiet, but it would make explicit scoping unusable on that deployment |
 | **`ancestor` is accepted and matches descendants at any depth** | Scope one source to a page tree three levels deep and check the grandchildren arrive | A 400 is the loud outcome and needs nothing. The two quiet ones are guarded: a predicate that is accepted and ignored refuses on the first page outside the tree, and one that matches nothing refuses on the `child/page` cross-check |
 | **`ancestor in (a, b)` and `id in (a, b)` are accepted, and parenthesized `OR` between them is** | Configure two roots in one space | Fall back to one query per root; the scope is unchanged and the request count rises by the number of roots |
 | **A bare numeric literal is accepted where `ancestor` and `id` want a content id** | Any scoped run | Quote them. The ids are checked to be digits before they reach a query, so quoting would be a formatting change rather than a safety one |

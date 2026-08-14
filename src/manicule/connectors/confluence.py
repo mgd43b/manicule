@@ -33,6 +33,7 @@ from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
+from urllib.parse import quote
 
 from pydantic import JsonValue
 
@@ -400,14 +401,14 @@ class ConfluenceConnector:
         """
         if scope is None:
             types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
-            query = cql.content_query(space, types=types, since=since)
+            query = self._content_query(space, types=types, since=since)
             async for result, base in self._search(query, expand=_SEARCH_EXPAND):
                 found = self._discovered(result, space=space, base=base)
                 if found is not None:
                     yield found, cql.parse_when(_version_when(result))
             return
 
-        pages = cql.content_query(space, types=(PAGE,), since=since, subtree=scope.clause(space))
+        pages = self._content_query(space, types=(PAGE,), since=since, subtree=scope.clause(space))
         async for result, base in self._search(pages, expand=_SEARCH_EXPAND):
             page_id = _str(result.get("id"))
             roots = scope.covering_roots(space, page_id, subtree.ancestor_ids(result))
@@ -424,7 +425,7 @@ class ConfluenceConnector:
         # attachment can be added to a page that has not itself changed since the watermark,
         # and its container would then be a page this run has never seen.
         members = await scope.members(space)
-        attachments = cql.content_query(space, types=(ATTACHMENT,), since=since)
+        attachments = self._content_query(space, types=(ATTACHMENT,), since=since)
         async for result, base in self._search(attachments, expand=_SEARCH_EXPAND):
             container = _str(_obj(result.get("container")).get("id"))
             roots = members.get(container, ())
@@ -433,6 +434,36 @@ class ConfluenceConnector:
             found = self._discovered(result, space=space, base=base, roots=roots)
             if found is not None:
                 yield found, cql.parse_when(_version_when(result))
+
+    def _content_query(
+        self,
+        space: str,
+        *,
+        types: Sequence[str] = (PAGE,),
+        since: str | None = None,
+        ordered: bool = True,
+        subtree: str = "",
+    ) -> str:
+        """Every content query this connector sends, so the deployment is read once.
+
+        :func:`~manicule.connectors.cql.content_query` requires ``current_only`` and has no
+        default, which makes forgetting it a type error. This makes *remembering* it a single
+        line instead of five: every call site in this class routes through here, so the answer
+        to "does this deployment accept ``status``" is looked up in one place and cannot be
+        right in four queries and wrong in the fifth.
+
+        :class:`~manicule.connectors.subtree.Subtree` builds the one query that is not here, and
+        reads the same :attr:`~manicule.connectors.config.ConfluenceConfig.current_only`
+        property to do it.
+        """
+        return cql.content_query(
+            space,
+            current_only=self._config.current_only,
+            types=types,
+            since=since,
+            ordered=ordered,
+            subtree=subtree,
+        )
 
     async def _search(
         self, query: str, *, expand: str = ""
@@ -536,24 +567,40 @@ class ConfluenceConnector:
         return self._config.deployment is Deployment.CLOUD
 
     async def _spaces(self) -> list[str]:
-        """The spaces to sync: the configured allowlist, checked, or everything visible.
+        """The spaces to sync: the configured allowlist, checked one by one, or everything visible.
 
-        Enumerated per run rather than cached, so a space created since the last sync is picked
-        up without a configuration change — and so that a space the account has *lost* access
-        to is reported instead of silently contributing nothing.
+        **The two cases ask the source two different questions, and that is the point.** An
+        allowlist is a scope boundary, so each configured key is looked up directly and nothing
+        else is asked about. Only an unscoped source enumerates the catalog, because only an
+        unscoped source has a use for it.
 
-        **A configured key that no visible space has is a refusal.** CQL answers a query for a
-        space that does not exist with an empty result set, exactly as it answers a query for a
-        space with nothing in it, so a typo in an allowlist is a sync that runs, succeeds, and
-        indexes nothing — and then reconciliation proposes deleting everything that space ever
-        contributed. One extra enumeration per run buys the difference between those two.
+        The previous version enumerated first and then filtered, which meant a connector scoped
+        to two spaces still paged through every space the account could see — proportional to
+        the account's entitlements rather than to its configuration. Measured on an account
+        entitled to 500 spaces and configured for two: six requests carrying 500 space records,
+        against two requests carrying two. **On a small catalog the direct lookups cost one
+        request more** — two of them against a single catalog page — and that is the right trade
+        anyway, because the cost that matters grows with somebody else's wiki rather than with
+        this configuration.
+
+        Looked up one at a time rather than concurrently, deliberately: an allowlist is
+        typically a handful of keys, and firing them at a rate-limited instance in parallel
+        trades a bounded wait for a burst the retry logic would then have to absorb.
+
+        Checked every run rather than cached either way: a space created since the last sync is
+        picked up without a configuration change, and a space this account has *lost* is
+        reported instead of silently contributing nothing.
 
         Raises:
-            ConnectorError: A configured space is not visible to this account, or the account
-                can see no spaces at all.
+            ConnectorError: A configured space is missing or invisible, or an unscoped account
+                can see no spaces at all. Both before any content query goes out — CQL answers
+                a query for a space that does not exist with an empty result set, exactly as it
+                answers one for a space with nothing in it, so a typo would otherwise be a sync
+                that runs, succeeds, indexes nothing, and leaves reconciliation proposing the
+                deletion of everything that space ever contributed.
         """
-        visible = await self._visible_spaces()
         if not self._config.spaces:
+            visible = await self._visible_spaces()
             if not visible:
                 msg = (
                     f"this account can see no spaces at {self._config.base_url}. A sync would "
@@ -564,26 +611,63 @@ class ConfluenceConnector:
                 raise ConnectorError(msg)
             return list(visible.values())
 
-        chosen: list[str] = []
-        missing: list[str] = []
+        # Deduplicated on what the *source* calls each space rather than on what configuration
+        # spelled, because `ENG` and `eng` are one space and would otherwise be enumerated
+        # twice — every document in it discovered twice, and a second round trip to find that
+        # out. Order is the configured order, which is the order somebody reading a log expects.
+        chosen: dict[str, None] = {}
         for key in self._config.spaces:
-            found = visible.get(key.strip().casefold())
-            if found is None:
-                missing.append(key)
-            else:
-                chosen.append(found)
-        if missing:
-            available = ", ".join(sorted(visible.values())) or "none"
+            chosen[await self._space(key.strip())] = None
+        return list(chosen)
+
+    async def _space(self, key: str) -> str:
+        """One configured space, confirmed against the source, in the source's own spelling.
+
+        Returns the key **as the instance reports it** rather than as configuration spelled it.
+        Confluence space keys are case-insensitive to look up and have one canonical casing, and
+        that casing is what goes into every subsequent CQL literal — so echoing the configured
+        string back would build queries against a spelling the source does not use.
+
+        Raises:
+            ConnectorError: The space is missing, or this account cannot see it — Confluence
+                answers both with 404 and there is no way here to tell them apart, so the
+                message says both. A credential or permission failure is *not* caught: it
+                surfaces as itself, because "your token expired" and "that space is not there"
+                need different repairs and collapsing them into the second sends somebody
+                looking for a typo in a key that was always right.
+        """
+        # `quote` rather than interpolation, and the whole key is one path segment: a key
+        # containing `/` or `?` would otherwise address a different resource entirely.
+        url = f"{self._client.url(_SPACE_PATH)}/{quote(key, safe='')}"
+        try:
+            payload = await self._client.get_json(url, [])
+        except NotFoundError as exc:
             msg = (
-                f"configured space(s) {', '.join(sorted(missing))} are not visible to this "
-                f"account. Visible: {available}. A query for a space that is not there returns "
-                f"nothing rather than an error, so this would be a sync that appears to work."
+                f"configured space {key!r} is not there — either no space has that key, or "
+                f"this account cannot see it, and Confluence answers both the same way. A "
+                f"query for a space that is not there returns nothing rather than an error, so "
+                f"this would otherwise be a sync that appears to work and a reconciliation "
+                f"that proposes deleting everything the space ever contributed."
+            )
+            raise ConnectorError(msg) from exc
+        # Deliberately not accompanied by a list of what *is* visible. The allowlist is a scope
+        # boundary, and enumerating unrelated spaces to improve an error message is the request
+        # this whole path exists to stop making.
+        found = _str(payload.get("key"))
+        if not found:
+            msg = (
+                f"the source answered for configured space {key!r} without naming a key, so "
+                f"there is no canonical spelling to build a query from."
             )
             raise ConnectorError(msg)
-        return chosen
+        return found
 
     async def _visible_spaces(self) -> dict[str, str]:
-        """Every space key this account can see, folded for comparison to its own spelling."""
+        """Every space key this account can see, folded for comparison to its own spelling.
+
+        Reached only by an unscoped source. A configured allowlist never comes through here —
+        see :meth:`_space`.
+        """
         keys: dict[str, str] = {}
         params = [("limit", str(self._config.page_size))]
         async for payload in self._client.paginate(self._client.url(_SPACE_PATH), params):
@@ -619,7 +703,7 @@ class ConfluenceConnector:
         if scope is None:
             types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
             for space in spaces:
-                query = cql.content_query(space, types=types, ordered=False)
+                query = self._content_query(space, types=types, ordered=False)
                 async for result, _ in self._search(query):
                     source_id = _str(result.get("id"))
                     if source_id:
@@ -635,7 +719,7 @@ class ConfluenceConnector:
                 yield page_id
             if not self._config.include_attachments:
                 continue
-            query = cql.content_query(space, types=(ATTACHMENT,), ordered=False)
+            query = self._content_query(space, types=(ATTACHMENT,), ordered=False)
             async for result, _ in self._search(query, expand="container"):
                 container = _str(_obj(result.get("container")).get("id"))
                 source_id = _str(result.get("id"))
@@ -988,7 +1072,8 @@ class ConfluenceConnector:
         """The id of the page an include macro names by title, or ``""`` if there is none."""
         if not title or not space:
             return ""
-        params = [("cql", cql.title_query(space, title)), ("limit", "1")]
+        query = cql.title_query(space, title, current_only=self._config.current_only)
+        params = [("cql", query), ("limit", "1")]
         payload = await self._client.get_json(self._client.url(SEARCH_PATH), params)
         results = _results(payload)
         return _str(results[0].get("id")) if results else ""

@@ -466,6 +466,28 @@ class ConfluenceConfig(BaseModel):
         return self
 
     @property
+    def current_only(self) -> bool:
+        """Whether this deployment's search accepts ``status = current``.
+
+        **The one place the deployment decides this**, read by every query this connector
+        builds — whole-space discovery, incremental discovery, page-tree discovery, attachment
+        discovery, reconciliation, subtree membership, attachment reconciliation and the title
+        lookup an include macro resolves through. Eight call sites, one answer, so there is no
+        list of places to remember to keep in step.
+
+        Cloud accepts the field and needs it: reconciliation depends on a trashed page not being
+        returned. The standard Data Center content-search resource rejects it and returns
+        current content by default, so the same clause is an HTTP 400 there.
+
+        **Read from the declared deployment and from nothing else.** Not the URL shape, not the
+        hostname, not the context path, not the authentication method, and above all not from
+        catching a 400 and retrying without the clause — a query that is sent to find out
+        whether it is valid has already told a wiki something wrong about what manicule wants,
+        and the retry would mask the day Atlassian changes which deployments accept it.
+        """
+        return self.deployment is Deployment.CLOUD
+
+    @property
     def scope_identity(self) -> str:
         """What this configuration's scope is, in a form a stored watermark can be compared to.
 
