@@ -549,3 +549,34 @@ async def test_a_key_configured_twice_is_one_space_and_one_lookup() -> None:
     assert len(found) == len(set(found))
     searches = [query for query in _queries(instance) if "space =" in query]
     assert len(searches) == 1, searches
+
+
+async def test_a_page_titled_after_the_word_status_is_not_a_false_rejection() -> None:
+    """Data Center rejects the ``status`` **field**, not the seven letters wherever they fall.
+
+    An include macro naming a page called "Build status" puts the word inside a quoted CQL
+    literal, which is ordinary data. A fake that rejected it would invent a failure the product
+    does not have — and the next person would spend an afternoon on a bug that only exists in
+    this file.
+    """
+    instance = _server(
+        pages=[
+            FakePage(
+                id=ROOT,
+                title="Architecture",
+                space="ENG",
+                storage=storage_include("intro", title="Build status"),
+            ),
+            FakePage(id=CHILD, title="Build status", space="ENG", storage="<p>green</p>"),
+        ]
+    )
+    connector = await connected(instance, server_config(SERVER, spaces=("ENG",), page_size=10))
+    try:
+        found = await drain(connector.discover(None))
+        ref = next(document.ref for document in found if document.source_id == ROOT)
+        raw = await connector.fetch(ref)
+    finally:
+        await connector.teardown()
+
+    assert "green" in raw.as_text(), "the include resolved through a title containing the word"
+    assert any('title = "Build status"' in query for query in _queries(instance))
