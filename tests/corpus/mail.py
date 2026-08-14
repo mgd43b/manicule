@@ -5,7 +5,7 @@ so the transfer encodings, boundaries and folded headers are the ones a real mai
 agent produces instead of the ones a fixture author remembered.
 
 The quoted reply chain in the typical message is deliberate. Quoted text is kept — trimming it
-is a retrieval optimisation whose cost is that the quoted passage is frequently the only
+is a retrieval optimization whose cost is that the quoted passage is frequently the only
 statement of the thing being replied to (``docs/parsing.md`` §10) — so it has to be in the
 corpus for that to be tested rather than asserted.
 """
@@ -117,7 +117,7 @@ DIGEST = (
 """A ``multipart/digest``, whose enclosed messages carry no filename and no disposition.
 
 Written out by hand rather than built with :mod:`email`, because what makes it a useful
-fixture is precisely the shape a builder normalises away: each part is a bare
+fixture is precisely the shape a builder normalizes away: each part is a bare
 ``message/rfc822`` with nothing marking it as an attachment. A parser that looks only for a
 disposition or a filename finds nothing to expand and nothing to fail, and the digest indexes
 as a header block with every enclosed message silently absent.
@@ -140,7 +140,7 @@ def build(dest: Path) -> None:
 
 
 def _pinned(message: EmailMessage) -> bytes:
-    """Serialise with fixed MIME boundaries, so two runs produce identical bytes.
+    """Serialize with fixed MIME boundaries, so two runs produce identical bytes.
 
     :mod:`email` mints a random boundary for every multipart part, which would give the same
     fixture a different ``content_hash`` on every build — and a corpus that churns on every

@@ -42,7 +42,7 @@ class BlockKind(StrEnum):
 class PipelineStage(StrEnum):
     """The ingest stages, in order, plus the boundary between them.
 
-    One vocabulary serves three purposes: attributing a failure to a stage, labelling
+    One vocabulary serves three purposes: attributing a failure to a stage, labeling
     metrics, and naming middleware hook points. Three enums that had to agree would
     eventually stop agreeing.
 

@@ -7,8 +7,8 @@ handing back somebody else's under the same name merges two people's sets. Apply
 already exists is the normal case, so :meth:`TagsMixin.ensure_tag` is idempotent and there is
 no strict variant to reach for by mistake.
 
-**Rule-driven membership is evaluated, never materialised.** A collection carrying a
-:class:`~manicule.core.organisation.CollectionRule` reports what the rule selects *now*. The
+**Rule-driven membership is evaluated, never materialized.** A collection carrying a
+:class:`~manicule.core.organization.CollectionRule` reports what the rule selects *now*. The
 clause that expresses the rule is built exactly once, in :func:`rule_clause`, and every reader
 uses it — listing a collection's documents, asking which collections a document is in, and
 resolving a filter — because two spellings of one rule is a corpus that answers the same
@@ -26,7 +26,7 @@ from sqlalchemy import ColumnElement, Select, and_, delete, false, func, or_, se
 from sqlalchemy.exc import IntegrityError
 
 from manicule.core.errors import NameInUseError, UnknownEntityError
-from manicule.core.organisation import Collection, CollectionRule, Tag
+from manicule.core.organization import Collection, CollectionRule, Tag
 from manicule.storage import models
 from manicule.storage.rows import to_document
 from manicule.storage.scoped import WorkspaceScoped
@@ -43,10 +43,10 @@ if TYPE_CHECKING:
 _WHITESPACE = re.compile(r"\s+")
 
 
-def normalise_name(name: str) -> str:
+def normalize_name(name: str) -> str:
     """The stored form of a collection or tag name.
 
-    Unicode-normalised to NFKC, with surrounding whitespace stripped and internal runs
+    Unicode-normalized to NFKC, with surrounding whitespace stripped and internal runs
     collapsed to a single space. Without NFKC the same visible label typed on two keyboards is
     two different rows — a precomposed ``é`` and an ``e`` plus a combining acute are distinct
     byte strings and identical to a reader — and the corpus splits between them with nothing to
@@ -62,7 +62,7 @@ def normalise_name(name: str) -> str:
     label is display text.
 
     Raises:
-        ValueError: The name is empty once normalised. A nameless label cannot be found again.
+        ValueError: The name is empty once normalized. A nameless label cannot be found again.
     """
     collapsed = _WHITESPACE.sub(" ", unicodedata.normalize("NFKC", name)).strip()
     if not collapsed:
@@ -118,7 +118,7 @@ class CollectionsMixin(WorkspaceScoped):
         duplicate rather than an ``IntegrityError`` naming a constraint. A caller cannot act on
         the name of an index.
         """
-        label = normalise_name(name)
+        label = normalize_name(name)
         try:
             async with self._sessions.begin() as session:
                 if await self._collection_named(session, label) is not None:
@@ -143,7 +143,7 @@ class CollectionsMixin(WorkspaceScoped):
 
     async def find_collection(self, name: str) -> Collection | None:
         async with self._sessions() as session:
-            row = await self._collection_named(session, normalise_name(name))
+            row = await self._collection_named(session, normalize_name(name))
             return None if row is None else _to_collection(row)
 
     async def list_collections(self) -> Sequence[Collection]:
@@ -162,7 +162,7 @@ class CollectionsMixin(WorkspaceScoped):
             return [_to_collection(row) for row in rows]
 
     async def rename_collection(self, collection_id: str, name: str) -> Collection:
-        label = normalise_name(name)
+        label = normalize_name(name)
         async with self._sessions.begin() as session:
             row = await self._require_collection(session, collection_id)
             rival = await self._collection_named(session, label)
@@ -402,12 +402,12 @@ class TagsMixin(WorkspaceScoped):
         with that name — so handing it back is the honest answer, where refusing a *collection*
         is, because a collection is a set somebody is building and a tag is a word.
         """
-        label = normalise_name(name)
+        label = normalize_name(name)
         try:
             async with self._sessions.begin() as session:
                 existing = await self._tag_named(session, label)
                 if existing is not None:
-                    # The colour is deliberately not overwritten. Otherwise the last person to
+                    # The color is deliberately not overwritten. Otherwise the last person to
                     # type a tag name decides how it looks for everyone, from a call that reads
                     # like a no-op.
                     return _to_tag(existing)
@@ -433,7 +433,7 @@ class TagsMixin(WorkspaceScoped):
 
     async def find_tag(self, name: str) -> Tag | None:
         async with self._sessions() as session:
-            row = await self._tag_named(session, normalise_name(name))
+            row = await self._tag_named(session, normalize_name(name))
             return None if row is None else _to_tag(row)
 
     async def list_tags(self) -> Sequence[Tag]:
@@ -452,7 +452,7 @@ class TagsMixin(WorkspaceScoped):
             return [_to_tag(row) for row in rows]
 
     async def rename_tag(self, tag_id: str, name: str) -> Tag:
-        label = normalise_name(name)
+        label = normalize_name(name)
         async with self._sessions.begin() as session:
             row = await self._require_tag(session, tag_id)
             rival = await self._tag_named(session, label)
@@ -789,7 +789,7 @@ __all__ = [
     "MAX_RESOLVED_DOCUMENTS",
     "CollectionsMixin",
     "TagsMixin",
-    "normalise_name",
+    "normalize_name",
     "resolve_filter",
     "rule_clause",
 ]

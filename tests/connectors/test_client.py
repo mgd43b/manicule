@@ -58,7 +58,7 @@ async def test_a_throttled_request_waits_exactly_as_long_as_it_was_asked_to() ->
     assert client.throttled == 1
 
 
-async def test_a_retry_after_given_as_a_date_is_honoured_too() -> None:
+async def test_a_retry_after_given_as_a_date_is_honored_too() -> None:
     """Both forms are sent. A client that reads only the number waits zero seconds for the
     other one, and retries in a hot loop against a source that is already saying stop."""
     waits = Waits()

@@ -7,7 +7,7 @@ that measurement, moving a corpus between machines would have to mean re-embeddi
 
 **Outputs are selected by rank, never by name.** ``BAAI/bge-m3``'s export calls its 3-D output
 ``token_embeddings`` and its pooled output ``sentence_embedding``; ``mlx-embeddings`` calls the
-corresponding pair ``last_hidden_state`` and ``text_embeds``. Nothing standardises either set,
+corresponding pair ``last_hidden_state`` and ``text_embeds``. Nothing standardizes either set,
 and reading ``outputs[0]`` is a guess about export order. Rank is the property that is actually
 stable: exactly one output is ``(batch, sequence, dimension)``, and if that is not true this
 export cannot be used as a tier A backend and says so.

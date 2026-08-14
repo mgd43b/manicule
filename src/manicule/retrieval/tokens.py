@@ -123,7 +123,7 @@ class ContextTokenCounter:
         return int(encoded * self.safety_factor) + 1
 
     def count_chunk(self, chunk: Chunk) -> int:
-        """Estimated generator tokens for a chunk's citable text, memoised by chunk id.
+        """Estimated generator tokens for a chunk's citable text, memoized by chunk id.
 
         ``chunk.text`` rather than ``chunk.embed_text``: the breadcrumb exists to make a
         passage findable and never appears in what is quoted, so counting it would reserve

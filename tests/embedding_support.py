@@ -1,7 +1,7 @@
 """Synthetic model repositories, and how the suite finds a real one.
 
 Most of what the embedding stack decides — the reduction, the width, the usable length, which
-artefact runs, what the cache is keyed on — is decided from a handful of small JSON files. A
+artifact runs, what the cache is keyed on — is decided from a handful of small JSON files. A
 model directory can therefore be *built*, which lets those decisions be tested exhaustively,
 offline, in milliseconds, including the cases no published model would ever ship: two pooling
 flags at once, a dimension that disagrees with itself, a missing sequence length.

@@ -24,7 +24,7 @@ comes back, what of that is allowed to reach a user, and what is written down af
 **A model never writes a citation, it selects one. Every citation is verified against the
 retained source bytes before it reaches a reader, and an unverified one is deleted rather
 than shown. Deleting a marker is the only edit anything downstream of the model may make to
-the answer. Redaction is a projection applied on egress and never touches the artefact a
+the answer. Redaction is a projection applied on egress and never touches the artifact a
 citation is verified against. Confidence and citation accounting are two different numbers
 and are never combined into one.**
 
@@ -197,9 +197,9 @@ reference that a quoted passage can legitimately contain.
 
 `[[cite:N]]` has no plausible collision in prose or code, is cheap to detect on a character
 stream, and — the reason for the `cite:` prefix rather than a bare `[[3]]` — a malformed
-attempt is still *recognisable as an attempt*, so it can be counted rather than mistaken for
+attempt is still *recognizable as an attempt*, so it can be counted rather than mistaken for
 prose. Four or five tokens per citation against a 1024-token answer budget is not a cost worth
-optimising.
+optimizing.
 
 Three rules on the binder, all narrow on purpose:
 
@@ -208,8 +208,8 @@ Three rules on the binder, all narrow on purpose:
   where that leads (§3.6).
 - **A marker that does not close within 64 characters is not a marker.** The buffered text is
   released verbatim. Without this bound, one unterminated `[[cite:` stalls the stream forever.
-- **The binder only ever deletes, plus one normalisation of syntax it defined itself.**
-  `[[cite: 3]]` and `[[cite:3 ]]` normalise to `[[cite:3]]`; a marker whose slots all fail
+- **The binder only ever deletes, plus one normalization of syntax it defined itself.**
+  `[[cite: 3]]` and `[[cite:3 ]]` normalize to `[[cite:3]]`; a marker whose slots all fail
   verification is deleted; a marker with slots `3,5` where only 3 verifies becomes
   `[[cite:3]]`. No other character of the answer is touched by anything, ever. Surviving
   markers stay in the stored answer text, so a stored answer still says where its citations
@@ -339,8 +339,8 @@ correctness one, and it is visible in the citation accounting.
 
 A `Citation.quote` is `Chunk.text`, byte for byte. Not `embed_text`, which carries the heading
 breadcrumb (`contracts.md` §2) and is retrieval scaffolding rather than something anyone
-quoted. Not a normalised form — `manicule.testing.normalise` says it itself: "Stored text is
-never normalised… showing a whitespace-flattened, ligature-substituted rendering of a
+quoted. Not a normalized form — `manicule.testing.normalize` says it itself: "Stored text is
+never normalized… showing a whitespace-flattened, ligature-substituted rendering of a
 quotation is a change to the quotation." Not a trimmed form.
 
 `retrieval.md` §7.3 already forbids assembly from trimming a passage to fit, on the grounds
@@ -355,7 +355,7 @@ be mistaken for the passage.
 > object is what is persisted into `messages.sources` and rendered in the source-preview
 > modal. `attachParentContext` goes further and swaps `content` for the enclosing
 > `parentSection`, so on `balanced` and `precise` the "chunk" a user inspects is a different
-> span from the one `chunkId` names. `expandWithSiblings` injects neighbouring chunks that
+> span from the one `chunkId` names. `expandWithSiblings` injects neighboring chunks that
 > were never retrieved on relevance, at a fabricated `score * 0.6`, into the same list. Three
 > independent ways for the displayed source to be something other than the source.
 
@@ -416,12 +416,12 @@ production, or the reverse.
 `manicule.testing.roundtrip._assert_containment` is that predicate today:
 
 ```python
-normalise(item.text) in normalise(text or "")
+normalize(item.text) in normalize(text or "")
 ```
 
-`#7`'s implementation extracts it — `normalise` is already a public module with no test
+`#7`'s implementation extracts it — `normalize` is already a public module with no test
 dependencies — into one shared function that both `_assert_containment` and the runtime
-verifier call. Not a copy. `manicule.testing.normalise` exists precisely because "the usual
+verifier call. Not a copy. `manicule.testing.normalize` exists precisely because "the usual
 repair — loosening the comparison per parser until the suite passes — leaves no assertion at
 all", and a second, runtime-only comparison would be that repair by another route.
 
@@ -533,7 +533,7 @@ manicule happens to be running on.** A profile that fits on the developer's 64 G
 served an eighth of the window on a 16 GB laptop, with no configuration difference between
 them.
 
-**What happens on overflow is version-dependent, and neither behaviour is acceptable to rely
+**What happens on overflow is version-dependent, and neither behavior is acceptable to rely
 on.** Older Ollama truncated the prompt to fit. Current Ollama (tested at 0.32.5) does the
 opposite: it *grows* the context to hold the prompt — a 6743-token prompt against
 `num_ctx=256` was evaluated in full, `prompt_eval_count` reported all 6743, and text at the
@@ -598,7 +598,7 @@ startup, with the alternatives listed." Applied to a generator, in `setup()`:
 
 | Check | On failure |
 |---|---|
-| litellm recognises the composed model string | Refuse, naming the string and the provider prefixes available |
+| litellm recognizes the composed model string | Refuse, naming the string and the provider prefixes available |
 | Credentials for a hosted provider resolve | Refuse, naming the environment variable it looked for |
 | For Ollama: the endpoint answers, and the named model is present | Refuse, listing the models that *are* pulled and printing `ollama pull <model>` |
 | The window cross-check of §4.3 | Refuse, naming both totals and the three fixes |
@@ -677,7 +677,7 @@ know which they got.
 
 **The partial answer is persisted.** Whatever text was produced is written as a `Message`
 carrying its finish reason, so it exists on the server, has an id, can be shared, and — the
-part that matters — **can be given feedback.** §5.3 covers how that survives a cancelled task.
+part that matters — **can be given feedback.** §5.3 covers how that survives a canceled task.
 
 > **Prior art, both halves.** On the streaming path, persistence is gated behind
 > `if (!streamError && fullAnswer)`. A stream dying at 80% leaves the reader looking at 80% of
@@ -736,12 +736,12 @@ import of anything Ollama-shaped anywhere. Ollama is a *runtime* dependency of o
 *configuration*, not an install dependency of manicule, which is what the ticket's comment
 requires and what keeps `uv tool install manicule` a single command.
 
-The floor is not decoration: §4.2, §4.6, §4.8 and §4.10 all rest on behaviours verified against
+The floor is not decoration: §4.2, §4.6, §4.8 and §4.10 all rest on behaviors verified against
 a specific litellm — the `ollama_chat` routing, the retry gate, the `BadRequestError` hierarchy
 and the usage fallbacks. Lowering it means re-verifying those four, not just resolving the
 dependency.
 
-Two behaviours follow. A hosted configuration never probes an Ollama endpoint, never mentions
+Two behaviors follow. A hosted configuration never probes an Ollama endpoint, never mentions
 it in an error, and never reports it in health. And an Ollama configuration whose endpoint is
 absent fails at startup with `ollama serve` and `ollama pull <model>` in the remedy — not at
 the first question a user asks.
@@ -757,7 +757,7 @@ gates a usage-bearing final chunk on it; without it, usage is reachable only thr
 `_hidden_params`, which is a private attribute this design will not build a correctness
 guarantee on. Sending the flag puts the number in the documented place. Two caveats worth
 recording rather than discovering: it is an OpenAI-compatible parameter, so for `ollama_chat`
-litellm drops it before the request and honours it client-side only — which is fine, and is not
+litellm drops it before the request and honors it client-side only — which is fine, and is not
 the same as it being supported end to end; and Ollama's own count arrives regardless, since
 litellm maps `prompt_eval_count` onto `usage.prompt_tokens`.
 
@@ -793,8 +793,8 @@ an async generator — the same situation `Parser.parse` is in, and
 [#35](https://github.com/mgd43b/manicule/pull/35) already established what that costs and what
 it requires. The `parsing()` context manager and `aclose()` helper in
 `manicule.core.protocols` exist because a generator abandoned part-way stays suspended holding
-whatever it had open at the `yield`, and CPython finalises a live async generator through the
-loop that created it — so one still suspended when that loop closes is finalised late, from the
+whatever it had open at the `yield`, and CPython finalizes a live async generator through the
+loop that created it — so one still suspended when that loop closes is finalized late, from the
 wrong loop, and the observable result is a crash inside the interpreter's allocator on a stack
 naming no library anyone here wrote.
 
@@ -825,7 +825,7 @@ They arrive differently and both must release:
 
 - **`aclose()`** — the consumer stopped early, or `generating()`'s `finally` ran. Raises
   `GeneratorExit` at the `yield`.
-- **`asyncio.CancelledError`** — the client disconnected and the task was cancelled. Arrives at
+- **`asyncio.CancelledError`** — the client disconnected and the task was canceled. Arrives at
   whatever `await` the generator is suspended on, which is usually inside the provider read.
 
 One `try`/`finally` covers both. Two rules on what may go in that `finally`:
@@ -869,7 +869,7 @@ supervisor that cancels twice, arriving while the cleanup write is in flight. Th
 `asyncio.shield` is for, and it is why the write is shielded — not because the first
 cancellation would have stopped it.
 
-Two bounds go with it. The shielded write has a **deadline**, because a cancelled request that
+Two bounds go with it. The shielded write has a **deadline**, because a canceled request that
 can outlive its own shutdown indefinitely is a worse failure than a lost partial answer. And it
 may not restart the request or issue another provider call; it writes what is already in hand
 and returns.
@@ -879,8 +879,8 @@ and its citation accounting, so a truncated or abandoned answer is a first-class
 that can be read, shared and rated rather than a gap in the record.
 
 **One thing implementation added, because the paragraph above is not self-executing.** The
-answer wrapper is itself an async generator, so its `finally` runs when something *finalises*
-it — and a cancelled consumer abandons it rather than closing it. A `finally` that only runs at
+answer wrapper is itself an async generator, so its `finally` runs when something *finalizes*
+it — and a canceled consumer abandons it rather than closing it. A `finally` that only runs at
 garbage-collection time is precisely the "persistence that silently did not happen" this
 section exists to prevent, on exactly the answer that most needs to be ratable. So there is an
 `answering()` context manager, `generating()`'s sibling one layer up, and consuming an answer
@@ -894,7 +894,7 @@ with a second bill; it is not a replayable sequence, and nothing pretends otherw
 
 **A slow consumer slows the provider, and that is correct.** The alternative is buffering an
 unbounded amount of generated text in memory to keep the model busy on behalf of a client that
-cannot keep up. Backpressure through to the provider is the behaviour that makes an abandoned
+cannot keep up. Backpressure through to the provider is the behavior that makes an abandoned
 stream cheap and a slow reader harmless.
 
 ---
@@ -981,7 +981,7 @@ not pretend they are a boundary. The residual risk is a wrong answer with a real
 citation attached — which is §3.5's misattribution arriving deliberately, and the same feedback
 category (§12.3) is the only thing that surfaces it.
 
-> **Prior art.** Web-search results are synthesised into `SearchResult`s with
+> **Prior art.** Web-search results are synthesized into `SearchResult`s with
 > `chunkId: \`web_${i}\`` and `documentId: 'web-search'`, then spliced into the same context
 > block as indexed documents and persisted into `messages.sources`. Unvalidated third-party
 > text goes straight above `## Question` in the prompt, is indistinguishable from corpus
@@ -992,7 +992,7 @@ category (§12.3) is the only thing that surfaces it.
 
 ## 7. Egress policy and PII redaction
 
-`PLAN.md` defect #5 said pick one behaviour and build it. [`ingest.md`](ingest.md) §3.4 picked:
+`PLAN.md` defect #5 said pick one behavior and build it. [`ingest.md`](ingest.md) §3.4 picked:
 **redaction happens at the generation boundary, not at ingest**, because retained original
 bytes make ingest-time redaction incoherent — the unredacted source is in the blob store
 regardless, so it protects nothing while permanently degrading retrieval, and re-parsing
@@ -1030,7 +1030,7 @@ crossed the network. The policy that exists to prevent that reported itself sati
 the other way too: an OpenAI-compatible endpoint on `127.0.0.1` was classified cloud, so the
 safe configuration was the one that failed.
 
-Naming this rather than quietly designing around it, because a document that criticises a
+Naming this rather than quietly designing around it, because a document that criticizes a
 pattern its own codebase implements has not finished the argument. Filed as
 [#44](https://github.com/mgd43b/manicule/issues/44), and fixed there: `manicule.config.providers`
 now exposes `Egress` and `egress_for(provider, base_url)`, `Settings.selected_endpoints` resolves
@@ -1121,7 +1121,7 @@ On the three methods:
   mentions are one person. **It must be salted with a per-installation secret that never
   leaves the machine.** An unsalted digest of an email address is reversible by anyone with a
   word list, and a truncated one collides; sending a hash instead of the value would then be a
-  privacy theatre that costs answer quality and buys nothing.
+  privacy theater that costs answer quality and buys nothing.
 - **`remove`** deletes the span. Cheapest to reason about, worst for the model, since it
   removes the evidence that anything was there.
 
@@ -1246,7 +1246,7 @@ The rules:
 - **Turns are dropped in user/assistant pairs.** Keeping an assistant turn whose question is
   gone leaves the model an answer to something it cannot see, which is worse than having
   neither — it invites the model to infer the missing question.
-- **Newest first; oldest dropped.** No summarisation. A rolling summary is a generated artefact
+- **Newest first; oldest dropped.** No summarization. A rolling summary is a generated artifact
   that then gets treated as a record of what was said, and it costs a model call per turn.
 - **The current user turn is never dropped.** It is the question. If it alone does not fit
   `history_tokens` plus the question's own room, that is a refusal with the numbers named, not a
@@ -1267,7 +1267,7 @@ Both budgets, plus the system prompt and the generation reserve, are the §4.3 s
 cross-check. That check is what makes fixed budgets safe: the arithmetic is verified once
 against the real window rather than hoped about per query.
 
-### 8.3 Markers in history are neutralised, never re-bound
+### 8.3 Markers in history are neutralized, never re-bound
 
 **Slot numbers are per-answer.** Turn 1's `[[cite:3]]` referred to turn 1's third passage; turn
 4 has an entirely different context and its slot 3 is a different document. Feeding turn 1's
@@ -1386,7 +1386,7 @@ term in §4.3's cross-check. Deliberately the same number.
 > hardcoded value in place. Two numbers for one quantity, and they disagree by default.
 
 A `FinishReason.LENGTH` therefore means exactly one thing — the answer hit the budget that was
-reserved for it — and the answer is labelled truncated, as the enum's docstring already
+reserved for it — and the answer is labeled truncated, as the enum's docstring already
 requires.
 
 ---
@@ -1419,7 +1419,7 @@ with the generation model.
 > `avgRerank` term falls back to `avgRetrieval` and 70% of the number is one variable counted
 > twice. The scores it averages have been overwritten by RRF (~0.016), multiplied by a metadata
 > boost of up to 1.25, and dragged down by sibling chunks injected at `score * 0.6`. Then the
-> UI discards it: `ChatMessage.tsx` displays `max(...)` of the top-4 source scores relabelled
+> UI discards it: `ChatMessage.tsx` displays `max(...)` of the top-4 source scores relabeled
 > "Evidence match" whenever any source exists, rendered as `Math.round(metricScore * 100)%`
 > **unclamped** — so it can exceed 100%, and under RRF it is normally about 2%. The number
 > persisted to `query_logs` is the engine's; the number the user saw is neither.
@@ -1466,7 +1466,7 @@ and it is only visible because the two numbers stayed separate.
 **no citations**, states that the corpus was not consulted, and has confidence **absent** —
 not 1.0 and not 0.0.
 
-#7 honours all three, and adds the one that only exists at this layer: **a directly-routed
+#7 honors all three, and adds the one that only exists at this layer: **a directly-routed
 answer cannot acquire citations.** With an empty `Context` there are no slots, so every marker
 the model emits fails at level 0 and is deleted. `ungrounded` is *not* set, because it means
 "the context was non-empty and nothing survived", and this context was empty by design.
@@ -1485,14 +1485,14 @@ point is that the obvious implementation is an exfiltration primitive.
 
 > **Prior art, in full, because every part of it matters.** `GET /shared/:token` is registered
 > **before** the auth middleware and before both rate limiters, so it is unauthenticated and
-> un-rate-limited — a test asserts the former as intended behaviour. It resolves the workspace
+> un-rate-limited — a test asserts the former as intended behavior. It resolves the workspace
 > **from the row**, so the token alone is the entire authorization decision. It does
 > `SELECT *`, returning `workspace_id` and the token itself to an anonymous caller, and it has
 > no `deleted_at IS NULL` predicate — uniquely among every query in that file — so soft-deleting
 > a conversation does not revoke its link. There is no unshare endpoint, no `shared = 0` write,
 > no expiry column and no expiry check anywhere in the repository: once shared, permanently
 > public. Messages added after sharing are included automatically, so the link is a live view.
-> And `getMessages` returns `sources` as stored, which is the full serialised `SearchResult[]`
+> And `getMessages` returns `sources` as stored, which is the full serialized `SearchResult[]`
 > **including `content`** — verbatim chunk text from private indexed documents, rendered in the
 > viewer's source-preview modal. Creating one requires only the `ask` scope, so anyone who can
 > chat can publish. It is not a transcript link; it is a public read endpoint over the corpus.
@@ -1504,7 +1504,7 @@ point is that the obvious implementation is an exfiltration primitive.
   argument is not that the token protects the row from someone holding the database — that
   person has the conversation anyway. It is that a share token is a **live credential for an
   unauthenticated URL**, and the database is backed up, exported and imported
-  ([`storage.md`](storage.md) §9, `PLAN.md` §15). Plaintext tokens travel into those artefacts
+  ([`storage.md`](storage.md) §9, `PLAN.md` §15). Plaintext tokens travel into those artifacts
   and out of the access boundary that created them.
 - The public route is rate-limited like every other route, and served with `X-Robots-Tag:
   noindex`. An unauthenticated URL that search engines crawl is a different feature from the one
@@ -1548,7 +1548,7 @@ So the *same message renders differently by audience, and the difference is cont
 never the existence of a citation, never its label, never whether it verified. The anonymous
 viewer is told "this claim was verified against 'Deploy runbook' § Rollback at generation time"
 and cannot read the runbook. That is a weaker guarantee than checking it themselves, and it is
-honestly labelled as an attestation rather than dressed up as a link they could follow.
+honestly labeled as an attestation rather than dressed up as a link they could follow.
 
 Sharing is an explicit act whose confirmation states exactly what becomes public, in those
 terms. And because a document *title* can itself be sensitive, team mode can disable sharing
@@ -1592,7 +1592,7 @@ usable query-log row. Meanwhile a message always exists, including for a partial
 `query_logs.feedback` column loses its job — additive migration, filed as
 [#42](https://github.com/mgd43b/manicule/issues/42) with the sharing columns.
 
-Two small behaviours, both corrections:
+Two small behaviors, both corrections:
 
 - **An unknown or foreign message id is a 404.** Prior art returns `{ saved: true }` without
   checking whether any row matched, so feedback on a mistyped id silently succeeds and is
@@ -1603,11 +1603,11 @@ Two small behaviours, both corrections:
 ### 12.2 What it is for, and what it must never become
 
 **For:** finding queries that fail, so they can be promoted into
-[#15](https://github.com/mgd43b/manicule/issues/15)'s fixed query set as labelled cases; and
+[#15](https://github.com/mgd43b/manicule/issues/15)'s fixed query set as labeled cases; and
 operational alerting on a rising negative rate.
 
 **Never:** an automatic input to retrieval, ranking, caching or prompting. A pipeline whose
-behaviour depends on accumulated user feedback cannot be compared across runs — the same
+behavior depends on accumulated user feedback cannot be compared across runs — the same
 configuration produces different results in week 2 than in week 1 — and that comparison is the
 entire method `retrieval.md` §2.4 and §11.2 exist to protect. Feedback informs a human who
 changes a configuration, or a fixture that a harness measures against. It does not close a loop
@@ -1639,14 +1639,14 @@ it is attached to. No check in this system will ever fire on that, because firin
 deciding entailment.
 
 A human reading the answer *can* see it. So `citation-wrong` is the only detector this project
-has for its one uncaught citation failure, and the reports it produces are the labelled set that
+has for its one uncaught citation failure, and the reports it produces are the labeled set that
 would let the deferred hallucination guard (`retrieval.md` §13) be measured for precision *and*
 recall rather than shipped on faith.
 
 It is also, in the meantime, the first answer-side quality signal the project has at all —
 `retrieval.md` §13 notes that intent classification cannot be evaluated because "#15 does not
 have an answer-quality metric". Citation accounting (§10.2) is objective and needs no labels;
-`citation-wrong` is the labelled complement to it.
+`citation-wrong` is the labeled complement to it.
 
 ---
 
@@ -1705,7 +1705,7 @@ results elsewhere.
 
 ## 15. Apple hardware
 
-The standing rule is `PLAN.md` §7's: **optimise execution for Apple hardware freely; never let
+The standing rule is `PLAN.md` §7's: **optimize execution for Apple hardware freely; never let
 the platform change what ends up in the index.** Generation needs that restated, because the
 naive reading of it is impossible here.
 
@@ -1728,12 +1728,12 @@ Three concrete Apple-specific notes, all throughput:
   pays a multi-second load from disk. For interactive use that is the single largest avoidable
   latency, so `keep_alive` is set (default `10m`) and is a pure throughput knob: it changes
   nothing about any answer.
-- **`num_ctx` costs unified memory, and this is where §4.3's two behaviours converge.** The KV
+- **`num_ctx` costs unified memory, and this is where §4.3's two behaviors converge.** The KV
   cache scales with the window, and §4.3 requires manicule to *demand* a window large enough
   for the profile. On a 16 GB Mac, a 14B model at 4-bit plus a 36k-token KV cache is not a
   configuration that runs well. What makes this Apple-specific rather than general is that
   Ollama's default window is itself tiered by available VRAM — so the same profile is served a
-  different window on a laptop than on a Mac Studio, and the *auto-grow* behaviour on current
+  different window on a laptop than on a Mac Studio, and the *auto-grow* behavior on current
   builds converts a budgeting mistake into a spill to CPU or a failed allocation rather than
   into an error anyone can read. Setting `num_ctx` explicitly is what makes the memory cost
   predictable; the startup refusal is where an impossible combination should be found, and
@@ -1753,7 +1753,7 @@ Three concrete Apple-specific notes, all throughput:
 | **Quote-level citation** — an anchor into a span within a passage | Requires `Anchor` to address a sub-chunk span, which is a ⚠️ locked type, *and* an answer to §7.4's offset problem, since redaction changes lengths. Both, or neither |
 | **Answer cache** | A deployment shape with repeated identical questions at temperature 0, plus a key covering history, egress class, redaction settings, model and prompt (§13) |
 | **History-conditioned query rewriting** | Owned by `retrieval.md` §13. Ships with history joining the L1 cache key in the same commit |
-| **Hallucination guard** | `retrieval.md` §13's measurement: precision *and* recall against a labelled set. §12.3's `citation-wrong` reports are how that set gets built |
+| **Hallucination guard** | `retrieval.md` §13's measurement: precision *and* recall against a labeled set. §12.3's `citation-wrong` reports are how that set gets built |
 | **A second generation model for bulk work** | A bulk generation workload that actually exists. Today the bulk path is embedding, which is local by construction (§4.2) |
 | **Streaming answer edits** (retracting or annotating already-delivered text) | Nothing. It is refused, not deferred (§3.4) |
 
@@ -1765,7 +1765,7 @@ Three concrete Apple-specific notes, all throughput:
 |---|---|
 | The model selects a slot; every citation field is built from `Context`, none from the model | §3.1 |
 | `[[cite:N]]`, chosen against `[1]`, `[[N]]` and `[^N]` for collision with code and prose | §3.2 |
-| The binder only ever deletes, plus normalising syntax it defined itself | §3.2 |
+| The binder only ever deletes, plus normalizing syntax it defined itself | §3.2 |
 | Marker syntax inside a passage is escaped before rendering | §3.2 |
 | Verification is a three-level ladder, and the level reached is reported per citation | §3.3 |
 | **A failed citation is dropped; the answer is never refused, rewritten or trimmed** | §3.4 |
@@ -1802,7 +1802,7 @@ Three concrete Apple-specific notes, all throughput:
 | A source restriction is a floor that a workspace override cannot release | §7.5 |
 | History is whole turns, in pairs, newest first, current turn never dropped | §8.1 |
 | History and context budgets do not lend to each other | §8.2 |
-| Markers in replayed history are neutralised to a non-bindable form, never re-bound | §8.3 |
+| Markers in replayed history are neutralized to a non-bindable form, never re-bound | §8.3 |
 | Drift between estimate and true count is reported, never auto-tuned | §9.3 |
 | `max_tokens` is both the output cap and the reserve — one number | §9.4 |
 | `Confidence` and citation accounting are surfaced side by side and never blended | §10.1 |
@@ -1834,7 +1834,7 @@ Places this design had to decide something no merged document had a position on.
   §7.4 predicted that a profile could exceed a window and required a refusal; nobody had done the
   arithmetic against the defaults that are actually in `manicule.config`.
 - **`SourceRestrictions.local_only`, `SourceRestrictions.cloud_allowed` and
-  `WorkspaceOverride.cloud_allowed` had no defined behaviour.** They are declared in merged
+  `WorkspaceOverride.cloud_allowed` had no defined behavior.** They are declared in merged
   configuration and nothing reads them; §7.5 gives them one.
 - **The `cloud_allowed` policy that *is* enforced was computed from the wrong input.**
   `is_local` classified egress by provider name, so a LAN Ollama satisfied a local-only policy
@@ -1882,7 +1882,7 @@ document implements only the second.
 - **Confidence surfaced to the caller** — §10. #6's number verbatim, beside citation accounting,
   never blended, never written to by generation.
 - **Multi-turn conversation memory** — §8. Whole turns in pairs, a budget that does not lend,
-  and markers neutralised so a replayed answer cannot bind to a new context.
+  and markers neutralized so a replayed answer cannot bind to a new context.
 - **Shared conversation links** — §11. A hashed, expiring, revocable, audited capability over a
   snapshot, showing labels and verification state rather than passage text.
 - **Feedback capture** — §12. Attached to a message, sufficient to reconstruct the run, never an

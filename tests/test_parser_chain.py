@@ -72,7 +72,7 @@ class Declining(Working):
 
 
 class Broken(Working):
-    """Raised something that is not a decline — a bug, not a judgement."""
+    """Raised something that is not a decline — a bug, not a judgment."""
 
     @override
     async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
@@ -191,7 +191,7 @@ async def test_a_container_is_its_own_status_rather_than_an_empty_document() -> 
 
 
 def test_a_named_parser_that_is_not_installed_is_a_startup_error() -> None:
-    """A chain whose behaviour depends on what happens to be installed indexes the same
+    """A chain whose behavior depends on what happens to be installed indexes the same
     document differently on different machines — the same hazard the OCR decision avoids."""
     with pytest.raises(ConfigError, match="docling"):
         ParserChain(parsers={"pdf": Working()}, chains={MEDIA_TYPE: ("pdf", "docling")})

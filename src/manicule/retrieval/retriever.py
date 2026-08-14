@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from manicule.core.glossary import QueryExpansion, normalise_acronym
+from manicule.core.glossary import QueryExpansion, normalize_acronym
 from manicule.core.protocols import CollectionStore, TagStore
 from manicule.core.retrieval import (
     Candidate,
@@ -406,7 +406,7 @@ class Retriever:
         if not (scope.collection_ids or scope.tag_ids):
             return query
 
-        from manicule.storage.organisation import resolve_filter  # noqa: PLC0415 - only here
+        from manicule.storage.organization import resolve_filter  # noqa: PLC0415 - only here
 
         store = self._docstore
         if not isinstance(store, CollectionStore) or not isinstance(store, TagStore):
@@ -418,9 +418,9 @@ class Retriever:
                 f"result would look like an ordinary search."
             )
             # `ValueError`, not the `TypeError` the isinstance test suggests. This is the same
-            # refusal `_require_honourable` makes when a store is handed a field it has no
+            # refusal `_require_honorable` makes when a store is handed a field it has no
             # column for, and it reaches a caller as one kind of thing: a filter that cannot
-            # be honoured here. Splitting it by which layer noticed would make the surfaces
+            # be honored here. Splitting it by which layer noticed would make the surfaces
             # report two different errors for one cause.
             raise ValueError(msg)  # noqa: TRY004
 
@@ -683,7 +683,7 @@ async def build_retriever(container: Container) -> Retriever:
             min_entry_confidence=rag.glossary.min_entry_confidence,
             max_terms=rag.glossary.max_terms,
             homographs=frozenset(
-                key for key in (normalise_acronym(word) for word in rag.glossary.homographs) if key
+                key for key in (normalize_acronym(word) for word in rag.glossary.homographs) if key
             ),
         ),
     )

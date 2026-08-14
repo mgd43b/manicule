@@ -27,9 +27,9 @@ the whole defect under test.
 is the thing being defended against.** A switch armed in two jobs and dropped from one of them
 still passes here: the remaining job satisfies every assertion below. That matters concretely —
 both bundle switches are armed on ubuntu *and* on macOS, and the macOS arming exists because
-the behaviour differs by platform, so losing it would silently stop checking the platform the
+the behavior differs by platform, so losing it would silently stop checking the platform the
 suite was written for. Catching it would need a per-platform expectation table, which would be
-a second list of switches kept here — exactly what the paragraph above refuses. The defence
+a second list of switches kept here — exactly what the paragraph above refuses. The defense
 against that one remains a reviewer reading the diff.
 """
 
@@ -112,7 +112,7 @@ def gates(support: Path) -> set[str]:
     the careless half of the same mistake this module exists to catch.
 
     So a gate is a function that actually calls ``pytest.skip`` or ``pytest.fail``. Those are
-    the ones whose behaviour the switch changes.
+    the ones whose behavior the switch changes.
     """
     source = support.read_text(encoding="utf-8")
     return {
@@ -188,7 +188,7 @@ def test_each_switch_is_armed_for_a_run_that_actually_collects_what_it_governs()
     """#71's defect, as a test: the switch was right and the file list could not reach it.
 
     ``REQUIRE_KEYCHAIN`` was declared, exported, read, and set on the only platform where the
-    behaviour exists — and the job ran a named list of test files that did not include the one
+    behavior exists — and the job ran a named list of test files that did not include the one
     holding the Keychain cases. Every part of the mechanism was correct except the one that
     decided whether the code ran at all, and nothing about the job's output said so.
     """

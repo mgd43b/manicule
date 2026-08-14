@@ -1,19 +1,19 @@
-"""A labelled corpus for measuring the widened initials matcher, positives and negatives alike.
+"""A labeled corpus for measuring the widened initials matcher, positives and negatives alike.
 
-Everything here is invented for this suite. There are no real organisation names, no product
+Everything here is invented for this suite. There are no real organization names, no product
 names taken from anywhere, no URLs and no copied corpus text.
 
 **Separate from :mod:`tests.glossary.corpus` on purpose, and the reason is the same one that put
 the description-bearing entries on a supplement page rather than on the twenty-five entry one.**
 Every cosine recorded in this suite and in ``docs/retrieval.md`` §8 and §14 is a property of those
-exact chunks. A corpus for measuring *detection* needs dozens of labelled lines, and adding them
+exact chunks. A corpus for measuring *detection* needs dozens of labeled lines, and adding them
 there would retire those measurements without failing anything — the quietest way a measured
 constant goes wrong. What this module does reuse is
 :data:`~tests.glossary.corpus.PROSE_ON_THE_GLOSSARY_PAGE`: those three lines are the ticket's own
 negatives, they are already placed correctly, and a second copy of them here would be a fixture
 that could drift out of step with the one the requirement is written against.
 
-**Every line is labelled, including the ones that must produce nothing.** A detection corpus made
+**Every line is labeled, including the ones that must produce nothing.** A detection corpus made
 only of definitions measures recall and calls it precision: a detector that admits everything
 scores perfectly on it. The negative population is therefore the larger half, and it is chosen
 against *this* matcher rather than against the one it replaces — the widening is what has to be
@@ -37,7 +37,7 @@ HANDBOOK_TITLE: Final = "Operations handbook"
 
 
 @dataclass(frozen=True)
-class Labelled:
+class Labeled:
     """One source line and what the detector is required to make of it.
 
     ``acronym`` empty means **no entry at all**, which is a stronger and more useful label than
@@ -57,32 +57,32 @@ class Labelled:
 
 # --- conventional acronyms: ordinary word initials, which already worked -----------------------
 
-CONVENTIONAL: Final[tuple[Labelled, ...]] = (
-    Labelled(
+CONVENTIONAL: Final[tuple[Labeled, ...]] = (
+    Labeled(
         "HALO — Health And Latency Observer",
         "HALO",
         "Health And Latency Observer",
         "conventional",
     ),
-    Labelled(
+    Labeled(
         "PRISM — Pipeline Runtime Inspection And Storage Monitor",
         "PRISM",
         "Pipeline Runtime Inspection And Storage Monitor",
         "conventional",
     ),
-    Labelled(
+    Labeled(
         "ORBIT — Operational Retention Backup Index Tool",
         "ORBIT",
         "Operational Retention Backup Index Tool",
         "conventional",
     ),
-    Labelled(
+    Labeled(
         "VECTOR — Vault Export Control Tooling Or Runner",
         "VECTOR",
         "Vault Export Control Tooling Or Runner",
         "conventional",
     ),
-    Labelled(
+    Labeled(
         "N.O.T.E. — Node Observation Trace Export",
         "NOTE",
         "Node Observation Trace Export",
@@ -98,18 +98,18 @@ fail on it and on nothing else.
 
 # --- camel-cased compound terms ----------------------------------------------------------------
 
-COMPOUND: Final[tuple[Labelled, ...]] = (
-    Labelled("SORT — SecOps Reliability Toolkit", "SORT", "SecOps Reliability Toolkit", "compound"),
-    Labelled(
+COMPOUND: Final[tuple[Labeled, ...]] = (
+    Labeled("SORT — SecOps Reliability Toolkit", "SORT", "SecOps Reliability Toolkit", "compound"),
+    Labeled(
         "HTTP — HyperText Transfer Protocol", "HTTP", "HyperText Transfer Protocol", "compound"
     ),
-    Labelled(
+    Labeled(
         "CIRCA — CloudInfra Retention Capacity Auditor",
         "CIRCA",
         "CloudInfra Retention Capacity Auditor",
         "compound",
     ),
-    Labelled(
+    Labeled(
         "MOSAIC — MicroObject Storage And Index Cache",
         "MOSAIC",
         "MicroObject Storage And Index Cache",
@@ -124,54 +124,54 @@ of these is admitted by the narrow matcher and none is a case that would have pa
 
 # --- stylized mixed-case acronyms ---------------------------------------------------------------
 
-STYLIZED: Final[tuple[Labelled, ...]] = (
-    Labelled("SaFeR — Service Failure Reporter", "SAFER", "Service Failure Reporter", "stylized"),
-    Labelled(
+STYLIZED: Final[tuple[Labeled, ...]] = (
+    Labeled("SaFeR — Service Failure Reporter", "SAFER", "Service Failure Reporter", "stylized"),
+    Labeled(
         "ReCAP — Retention Capacity And Planning",
         "RECAP",
         "Retention Capacity And Planning",
         "stylized",
     ),
-    Labelled("LiNK — Ledger Node Keeper", "LINK", "Ledger Node Keeper", "stylized"),
-    Labelled("AuDiT — Automated Data Trail", "AUDIT", "Automated Data Trail", "stylized"),
+    Labeled("LiNK — Ledger Node Keeper", "LINK", "Ledger Node Keeper", "stylized"),
+    Labeled("AuDiT — Automated Data Trail", "AUDIT", "Automated Data Trail", "stylized"),
 )
 """Terms whose expansion spells the uppercase skeleton of the display rather than the key.
 
 ``SAFER`` is five characters and ``Service Failure Reporter`` supplies three, which is the whole
 convention: the lower-case letters are spelling, not initials. Every skeleton here is exactly
 three or four characters, because :data:`~manicule.ingest.glossary.MIN_SKELETON_LENGTH` refuses
-two and a writer who capitalises five letters has written the key.
+two and a writer who capitalizes five letters has written the key.
 """
 
 # --- definitions carrying a trailing description ------------------------------------------------
 
-DESCRIBED: Final[tuple[Labelled, ...]] = (
-    Labelled(
+DESCRIBED: Final[tuple[Labeled, ...]] = (
+    Labeled(
         "SORT — SecOps Reliability Toolkit, a package that operations teams install on a host.",
         "SORT",
         "SecOps Reliability Toolkit",
         "described",
     ),
-    Labelled(
+    Labeled(
         "SaFeR — Service Failure Reporter, a component that groups related failures together.",
         "SAFER",
         "Service Failure Reporter",
         "described",
     ),
-    Labelled(
+    Labeled(
         "PRISM — Pipeline Runtime Inspection And Storage Monitor; it samples every queue in turn.",
         "PRISM",
         "Pipeline Runtime Inspection And Storage Monitor",
         "described",
     ),
-    Labelled(
+    Labeled(
         "CIRCA — CloudInfra Retention Capacity Auditor. It reports on space that will not be "
         "reclaimed.",
         "CIRCA",
         "CloudInfra Retention Capacity Auditor",
         "described",
     ),
-    Labelled(
+    Labeled(
         "AuDiT — Automated Data Trail, the record of which process wrote which row and when.",
         "AUDIT",
         "Automated Data Trail",
@@ -187,20 +187,20 @@ line and not on a described one would be a bug neither category would catch alon
 
 # --- lines that must produce nothing --------------------------------------------------------------
 
-COMPOUND_NEGATIVES: Final[tuple[Labelled, ...]] = (
-    Labelled(
+COMPOUND_NEGATIVES: Final[tuple[Labeled, ...]] = (
+    Labeled(
         "SORT — Secops Reliability Toolkit, a package that operations teams install on a host.",
         "",
         "",
         "compound-negative",
     ),
-    Labelled(
+    Labeled(
         "SORT — Storage Operations Roster, the rota that names who is on call each week.",
         "",
         "",
         "compound-negative",
     ),
-    Labelled(
+    Labeled(
         "MOSAIC — MicroObject Storage Index, the layer that keeps every small object addressable "
         "across zones.",
         "",
@@ -210,7 +210,7 @@ COMPOUND_NEGATIVES: Final[tuple[Labelled, ...]] = (
 )
 """What limits the compound rule, one line per way it could have been drawn too wide.
 
-The first is the whole justification for the rule being about *capitalisation*: ``Secops`` is the
+The first is the whole justification for the rule being about *capitalization*: ``Secops`` is the
 same letters as ``SecOps`` written without the internal capital, so it is one component, spells
 ``SRT``, and earns no cut. A rule that split on a dictionary of prefixes would take both and could
 not tell a reader why.
@@ -231,15 +231,15 @@ though the widening had nothing to do with it. That confuses two different refus
 population: see :data:`KEPT_WHOLE`.
 """
 
-SKELETON_NEGATIVES: Final[tuple[Labelled, ...]] = (
-    Labelled("WEb - when enabled, the process starts automatically.", "", "", "skeleton-negative"),
-    Labelled(
+SKELETON_NEGATIVES: Final[tuple[Labeled, ...]] = (
+    Labeled("WEb - when enabled, the process starts automatically.", "", "", "skeleton-negative"),
+    Labeled(
         "SaFeR — Service for Escalation Routing, a queue that pages the duty manager.",
         "",
         "",
         "skeleton-negative",
     ),
-    Labelled(
+    Labeled(
         "mDNS — multicast Domain Name System, resolved on the local segment without a server.",
         "",
         "",
@@ -266,42 +266,42 @@ than one, because the skeleton is a public function and a caller reaching it wit
 gate would otherwise be told that ``mDNS`` is a term spelled ``DNS``.
 """
 
-ORDINARY_MENTIONS: Final[tuple[Labelled, ...]] = (
-    *(Labelled(line, "", "", "ordinary") for line in PROSE_ON_THE_GLOSSARY_PAGE),
-    Labelled(
+ORDINARY_MENTIONS: Final[tuple[Labeled, ...]] = (
+    *(Labeled(line, "", "", "ordinary") for line in PROSE_ON_THE_GLOSSARY_PAGE),
+    Labeled(
         "Escalation - once the second alert fires, the duty manager is paged.", "", "", "ordinary"
     ),
-    Labelled(
+    Labeled(
         "SCOPE - if the collection is empty, the query is answered from the whole workspace.",
         "",
         "",
         "ordinary",
     ),
-    Labelled(
+    Labeled(
         "Retention: these records are kept for two years and then exported.", "", "", "ordinary"
     ),
-    Labelled(
+    Labeled(
         "STATUS - there is no supported route from a stalled run back to a queued one.",
         "",
         "",
         "ordinary",
     ),
-    Labelled(
+    Labeled(
         "LIMIT - unless the operator raises it, the ceiling stays where it was set.",
         "",
         "",
         "ordinary",
     ),
-    Labelled(
+    Labeled(
         "ORDER - whenever two runs finish together, the later identifier wins.", "", "", "ordinary"
     ),
-    Labelled(
+    Labeled(
         "SCHEDULE: while the migration is running, the hourly job is suspended.",
         "",
         "",
         "ordinary",
     ),
-    Labelled(
+    Labeled(
         "RESULT - they are written to the same table and read back by identifier.",
         "",
         "",
@@ -362,7 +362,7 @@ fixtures that separate a scanning matcher from this one are ``COMPOUND_NEGATIVES
 and ``SKELETON_NEGATIVES``' second.
 """
 
-LABELLED: Final[tuple[Labelled, ...]] = (
+LABELED: Final[tuple[Labeled, ...]] = (
     *CONVENTIONAL,
     *COMPOUND,
     *STYLIZED,
@@ -371,7 +371,7 @@ LABELLED: Final[tuple[Labelled, ...]] = (
     *SKELETON_NEGATIVES,
     *ORDINARY_MENTIONS,
 )
-"""Every labelled line, positives and negatives together, in category order."""
+"""Every labeled line, positives and negatives together, in category order."""
 
 
 # --- the pages the retrieval half is measured over ------------------------------------------------
@@ -431,8 +431,8 @@ DEFINITIONAL_QUERIES: Final[tuple[tuple[str, str], ...]] = (
 
 The lower-case and mixed-case spellings are here because requirement 1 is that the *key* resolves
 them: ``what is sort?``, ``what does safer stand for?`` and ``What is AuDiT?`` are three
-capitalisations of terms whose display spellings are ``SORT``, ``SaFeR`` and ``AuDiT``, and all
-three have to arrive at the same normalised key. A suite that only asked in the source's own
+capitalizations of terms whose display spellings are ``SORT``, ``SaFeR`` and ``AuDiT``, and all
+three have to arrive at the same normalized key. A suite that only asked in the source's own
 spelling would pass on an implementation that looked terms up by display.
 """
 
@@ -466,8 +466,8 @@ answered by an explicit definition.
 
 
 def glossary_page() -> str:
-    """The labelled lines as one chunk, which is how 512/64 chunking delivers a glossary page."""
-    return f"{GLOSSARY_TITLE}\n\n" + "\n".join(item.line for item in LABELLED)
+    """The labeled lines as one chunk, which is how 512/64 chunking delivers a glossary page."""
+    return f"{GLOSSARY_TITLE}\n\n" + "\n".join(item.line for item in LABELED)
 
 
 def definitions_page() -> str:
@@ -491,7 +491,7 @@ __all__ = [
     "HANDBOOK_TITLE",
     "HOMOGRAPH_USES",
     "KEPT_WHOLE",
-    "LABELLED",
+    "LABELED",
     "NON_DEFINITIONAL_QUERIES",
     "ORDINARY_MENTIONS",
     "SECOND_PAGE_LINES",
@@ -499,7 +499,7 @@ __all__ = [
     "SKELETON_NEGATIVES",
     "STYLIZED",
     "UNSUPPORTED_QUERIES",
-    "Labelled",
+    "Labeled",
     "definitions_page",
     "glossary_page",
     "second_page",

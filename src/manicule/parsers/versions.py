@@ -11,7 +11,7 @@ quietly held two generations of extracted text.
 This is the table that closes it, and three properties of it are load-bearing.
 
 **It answers without importing a parser.** Every value is distribution metadata, which is a
-fact about what is installed rather than about what has been initialised — the same reasoning
+fact about what is installed rather than about what has been initialized — the same reasoning
 :func:`~manicule.parsers.grammars.pack_version` records for the grammar pack. Change
 detection asks this question once per document, and a table that imported ``pypdfium2`` to
 answer it would load a native extension on a corpus that contains no PDFs.
@@ -20,7 +20,7 @@ answer it would load a native extension on a corpus that contains no PDFs.
 the name in ``pyproject.toml`` and ``ruamel-yaml`` is the name it installs under; recording
 one while looking up the other is how a version silently stops moving. :data:`PARSERS` is
 written in canonical form and ``tests/parsers/test_versions.py`` asserts both that
-canonicalising each name is a no-op and that each one resolves to a real version — because a
+canonicalizing each name is a no-op and that each one resolves to a real version — because a
 lookup that quietly returned a default would produce a fingerprint that never changes, which
 is worse than no fingerprint at all.
 
@@ -78,7 +78,7 @@ class ParserVersions:
     """
 
     distributions: tuple[str, ...] = ()
-    """PEP 503 canonical names of the libraries whose behaviour decides text or anchors.
+    """PEP 503 canonical names of the libraries whose behavior decides text or anchors.
 
     Empty where a parser is built on the standard library alone. That is a real answer, not a
     gap: ``adf`` reads JSON, ``archive`` reads zip and tar, ``plaintext`` splits lines, and

@@ -51,7 +51,7 @@ each handled by construction rather than by a check somebody has to keep correct
 and :func:`~manicule.parsers.confluence.close_empty_elements` run over the whole file *before* it
 is parsed, for the same reasons the storage parser runs them over its own input: an HTML engine
 reparses ``<![CDATA[…]]>`` as a bogus comment and deletes the body of every code, ``noformat``
-and Graphviz macro, and it does not honour self-closing syntax on ``<ri:page …/>``, so every
+and Graphviz macro, and it does not honor self-closing syntax on ``<ri:page …/>``, so every
 following sibling becomes that element's child. Cutting the body out of a tree built without them
 would preserve a document that had already lost its macro bodies. Running them first means the
 extracted body carries the recovered text, escaped, and re-running them on it downstream is a
@@ -216,7 +216,7 @@ DEFAULT_LABELS: Final[Mapping[str, str]] = {
     "retrieved": "retrieved_at",
     "exported": "retrieved_at",
 }
-"""Labels the default profile understands, normalised, mapped to the field each fills.
+"""Labels the default profile understands, normalized, mapped to the field each fills.
 
 Several spellings per field because these documents are written by exporters that were not
 coordinating with each other, and "Last modified", "Modified" and "Updated" are the same fact.
@@ -295,7 +295,7 @@ class AdapterOutcome(StrEnum):
     discovery does not read documents; see
     :class:`~manicule.connectors.filesystem.FilesystemConnector`.
 
-    So §3's "moving or reorganising the snapshot file must not create a second document" does not
+    So §3's "moving or reorganizing the snapshot file must not create a second document" does not
     hold for this page, and a user who drops enriched HTML in a directory, moves it later and
     finds two documents has to be able to learn why. A generic skip reason would not tell them:
     it would say the file was fine, which it is, and leave the second document unexplained. The
@@ -384,7 +384,7 @@ class EnrichedProfile(BaseModel):
     )
     labels: Mapping[str, str] = Field(
         default=DEFAULT_LABELS,
-        description="Label spellings this exporter uses, normalised, mapped to the field each "
+        description="Label spellings this exporter uses, normalized, mapped to the field each "
         "fills. Replaces the defaults rather than extending them, so a profile states its whole "
         "vocabulary and a reader does not have to know what it inherited.",
     )
@@ -424,7 +424,7 @@ class EnrichedProfile(BaseModel):
         if not _ATTRIBUTE_SELECTOR.match(selector.strip()):
             msg = (
                 f"{field} {selector!r} does not select on an attribute. An enriched document is "
-                f"recognised by a marker its exporter wrote on purpose, never by an element name "
+                f"recognized by a marker its exporter wrote on purpose, never by an element name "
                 f"— '[data-source-metadata]' and 'main[data-document-representation=\"storage\"]' "
                 f"are markers; 'main' and 'section' are facts about HTML"
             )
@@ -560,7 +560,7 @@ def _adapted(
     source_id = fields.get("source_id", "")
     if not source_id:
         msg = (
-            "declares no page id. That is the identifier an updated snapshot is recognised by, "
+            "declares no page id. That is the identifier an updated snapshot is recognized by, "
             "and without it a re-export is a second document rather than a new version of one"
         )
         raise UnusablePageError(msg, AdapterOutcome.INVALID_METADATA)
@@ -583,7 +583,7 @@ def _adapted(
     # The **outer** HTML of the matched element, not its contents. The wrapper is one unknown
     # element to the storage parser's walk, which recurses through it and reads what is inside —
     # so keeping it costs a container and saves reassembling a fragment from its children, where
-    # a serialisation slip would be a silently truncated page rather than a failure.
+    # a serialization slip would be a silently truncated page rather than a failure.
     extracted = body.html or ""
     encoded = len(extracted.encode("utf-8"))
     if encoded > MAX_BODY_BYTES:
@@ -646,7 +646,7 @@ def _refusal(
 
 
 def _fields(section: LexborNode, *, labels: Mapping[str, str]) -> dict[str, str]:
-    """The labelled values in ``section``, keyed by the field each fills.
+    """The labeled values in ``section``, keyed by the field each fills.
 
     Raises:
         UnusablePageError: One label appeared twice with two different values. Refused rather
@@ -681,7 +681,7 @@ def _fields(section: LexborNode, *, labels: Mapping[str, str]) -> dict[str, str]
 
 
 def _rows(section: LexborNode) -> Iterator[tuple[str, LexborNode, str]]:
-    """``(normalised label, the node holding the value, text to strip)`` for every labelled row.
+    """``(normalized label, the node holding the value, text to strip)`` for every labeled row.
 
     The node rather than its text, because how a value should be read depends on which field it
     fills and only the caller knows that — see :func:`_value`.

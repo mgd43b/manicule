@@ -58,7 +58,7 @@ class _CommitCounter:
 
     The invalidation signal behind the L1 query cache (``docs/retrieval.md`` §10.3), and it
     counts *commits* rather than calls to the write methods someone remembered to instrument.
-    That is the same reasoning that puts FTS5 synchronisation in triggers rather than in
+    That is the same reasoning that puts FTS5 synchronization in triggers rather than in
     application code, and the same reasoning that puts the tenancy guards in this module: a
     per-method bump covers only the write paths its author enumerated, and the one nobody
     enumerated is the one that serves a stale ranking. A transaction that committed on this
@@ -148,10 +148,10 @@ class WorkspaceScoped:
 
     # --- tenancy guards ---------------------------------------------------------------------
 
-    def _require_honourable(
+    def _require_honorable(
         self,
         filter: Filter | None,  # noqa: A002
-        honoured: frozenset[str],
+        honored: frozenset[str],
         operation: str,
     ) -> None:
         """Refuse a filter this query cannot apply in full.
@@ -169,7 +169,7 @@ class WorkspaceScoped:
         **A field this query has no column for.** Silently dropping it returns rows the filter
         was written to exclude — a listing or a search that still looks like it worked. The
         same rule as :func:`~manicule.storage.vectors.predicate_for`, applied here so that
-        "a store honours the whole filter or refuses" holds for both halves of storage.
+        "a store honors the whole filter or refuses" holds for both halves of storage.
 
         Raises:
             CrossWorkspaceCollisionError: The filter names another workspace.
@@ -188,10 +188,10 @@ class WorkspaceScoped:
             )
             raise CrossWorkspaceCollisionError(msg)
 
-        unhonoured = sorted(filter.restricting_fields - honoured)
-        if unhonoured:
+        unhonored = sorted(filter.restricting_fields - honored)
+        if unhonored:
             msg = (
-                f"this store cannot {operation} by {', '.join(unhonoured)}. Resolve those "
+                f"this store cannot {operation} by {', '.join(unhonored)}. Resolve those "
                 f"fields into document_ids first; applying the rest and ignoring them would "
                 f"return rows the filter was written to exclude."
             )

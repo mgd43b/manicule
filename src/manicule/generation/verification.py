@@ -28,7 +28,7 @@ makes per-citation verification affordable on the answer path rather than a thin
 skipped for latency.
 
 **The predicate is not defined here.** It is
-:func:`manicule.testing.normalise.contains_claimed_text`, the same call the parser
+:func:`manicule.testing.normalize.contains_claimed_text`, the same call the parser
 conformance suite makes, because two notions of "this anchor resolves" would drift and the
 drift would show up as citations that pass CI and fail in production.
 """
@@ -49,7 +49,7 @@ from manicule.core.lifecycle import HealthReport
 from manicule.core.protocols import CLOSE_DEADLINE_S, Parser
 from manicule.core.retrieval import Candidate, Context
 from manicule.generation.answers import CitationDrop, DropReason, Verification
-from manicule.testing.normalise import contains_claimed_text, normalise
+from manicule.testing.normalize import contains_claimed_text, normalize
 
 
 @runtime_checkable
@@ -443,7 +443,7 @@ class VerificationRun:
     ) -> None:
         """Give every slot still waiting a verdict.
 
-        Without this a cancelled or failed group leaves a slot waiting for an event nobody
+        Without this a canceled or failed group leaves a slot waiting for an event nobody
         will set, so the awaiting side sits out its whole budget and reports a timeout for a
         defect that is not one.
         """
@@ -493,7 +493,7 @@ class VerificationRun:
             # refuses an empty claim on the level-2 path for exactly this reason, and that
             # guard has to hold at every ceiling, not only the one that happens to call it.
             for slot in slots:
-                if normalise(self._passages[slot - 1].chunk.text):
+                if normalize(self._passages[slot - 1].chunk.text):
                     self._settle(slot, SlotVerdict(Verification.LOCATED, None, document))
                 else:
                     self._settle_remaining(
@@ -593,7 +593,7 @@ class VerificationRun:
         try:
             await asyncio.wait_for(self._ready[slot].wait(), remaining)
         except TimeoutError:
-            # **Recorded**, not synthesised on the fly. Verification that finishes after the
+            # **Recorded**, not synthesized on the fly. Verification that finishes after the
             # first marker timed out would otherwise give a later marker for the same slot a
             # different answer, and the reader would be told the citation was dropped for a
             # slow disk *and* shown it as resolved — with the accounting counting both.
@@ -614,7 +614,7 @@ class VerificationRun:
     async def aclose(self, deadline_s: float = CLOSE_DEADLINE_S) -> None:
         """Cancel any verification still running, settle every slot, and return.
 
-        **Settling here is not belt-and-braces.** Cancelling a task that has not yet had its
+        **Settling here is not belt-and-braces.** Canceling a task that has not yet had its
         first step throws :exc:`asyncio.CancelledError` in *before* the body's ``try`` is
         entered, so `_verify_document`'s ``finally`` never runs and its slots are left with no
         verdict and an event nobody will set — exactly the state that makes a later

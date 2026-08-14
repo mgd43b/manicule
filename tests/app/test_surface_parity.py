@@ -6,7 +6,7 @@ shapes" — the same bytes, because all three go through one builder over one pa
 
 It matters because two of the three are called unattended. A rule implemented in the command
 line is a rule an assistant can walk around; a rule implemented in a route is one the MCP tool
-does not have. The only durable defence is a test that fails the moment they stop being the
+does not have. The only durable defense is a test that fails the moment they stop being the
 same call — so when a third surface arrived, this file grew a third column rather than a
 parallel file with its own idea of what parity means.
 
@@ -59,8 +59,8 @@ def backend() -> FakeBackend:
     # page precisely because this fixture leaves their surface empty; collections deliberately
     # does not join them — a group whose page is never asserted against is a page free to stop
     # showing what the envelope says.
-    made.organisation_.documents[document.id] = document
-    asyncio.run(made.organisation_.create_collection(COLLECTION, description="worked examples"))
+    made.organization_.documents[document.id] = document
+    asyncio.run(made.organization_.create_collection(COLLECTION, description="worked examples"))
     return made
 
 
@@ -90,7 +90,7 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
     """Run a command with the service already built, and parse its ``--json`` output.
 
     One function is substituted — the one that would otherwise read configuration off the
-    machine running the suite. Argument parsing, dispatch, serialisation and the exit status
+    machine running the suite. Argument parsing, dispatch, serialization and the exit status
     are all the real thing, which is what makes the comparison below worth making.
     """
 
@@ -284,7 +284,7 @@ def test_every_tool_describes_itself_and_its_arguments(service: ApplicationServi
 
 
 type Envelopes = dict[str, Any]
-"""One serialised envelope, as any of the three surfaces produced it."""
+"""One serialized envelope, as any of the three surfaces produced it."""
 
 type HttpCall = tuple[str, str, dict[str, Any]] | None
 """A method, a path and request keyword arguments — or ``None`` for an operation with no route."""
@@ -416,7 +416,7 @@ def test_a_tool_and_its_command_produce_the_same_envelope(
     request_: HttpCall,
     page: WebPage,
 ) -> None:
-    """The same operation, every way round, compared as serialised JSON.
+    """The same operation, every way round, compared as serialized JSON.
 
     Comparing the parsed structures rather than the raw text is deliberate: the command line
     pretty-prints and sorts keys and the others do not, and neither of those is part of the
@@ -666,7 +666,7 @@ def sourced() -> ApplicationService:
 
 
 @pytest.mark.parametrize(("tool", "arguments", "argv", "request_", "keys"), SOURCE_PAIRS)
-def test_source_metadata_serialises_identically_on_every_surface(
+def test_source_metadata_serializes_identically_on_every_surface(
     monkeypatch: pytest.MonkeyPatch,
     sourced: ApplicationService,
     *,
@@ -679,7 +679,7 @@ def test_source_metadata_serialises_identically_on_every_surface(
     """One record, four ways out, and the same bytes each time.
 
     The block is nested inside a payload, which is the thing worth checking rather than assuming:
-    a surface that flattened it, dropped it because it was optional, or serialised a
+    a surface that flattened it, dropped it because it was optional, or serialized a
     :class:`~datetime.datetime` its own way would produce a consumer-visible difference that the
     envelope comparison at the top of this file would catch only if some row happened to carry
     one. None did until this fixture.
@@ -713,7 +713,7 @@ def test_source_metadata_serialises_identically_on_every_surface(
 def test_the_canonical_identity_and_the_local_one_are_both_on_the_wire(
     sourced: ApplicationService,
 ) -> None:
-    """Neither identity is dropped in favour of the other on the way out.
+    """Neither identity is dropped in favor of the other on the way out.
 
     ``title`` and ``uri`` on the hit are the canonical ones, because that is what a citation
     should show. The local snapshot is still reachable in the same payload — its path in the
@@ -726,7 +726,7 @@ def test_the_canonical_identity_and_the_local_one_are_both_on_the_wire(
 
     assert hit["title"] == "Retry policy"
     assert hit["provenance"]["snapshot_path"] == "mirror/123456.html"
-    assert summary["source_id"] == "123456.html", "the local artefact it was fetched by"
+    assert summary["source_id"] == "123456.html", "the local artifact it was fetched by"
     assert summary["provenance"]["canonical_uri"].startswith("https://docs.example.test/")
 
 

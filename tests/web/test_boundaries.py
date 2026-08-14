@@ -14,7 +14,7 @@ So this file asserts three things:
 * the paths those operations would have are still absent, now checked under ``/ui`` as well
   and checked against the **route table** rather than against a status code;
 * this package never calls ``config_get`` or ``config_set``, read from the source tree rather
-  than from behaviour, because a call added later would otherwise only fail if somebody wrote a
+  than from behavior, because a call added later would otherwise only fail if somebody wrote a
   test for that page;
 * every request the served script makes is to a route the HTTP API already publishes, so the
   browser surface adds no operation by way of JavaScript either.
@@ -139,7 +139,7 @@ def _modules() -> list[Path]:
 def test_no_module_here_reads_or_writes_configuration() -> None:
     """``config_get`` and ``config_set`` are not called from this package.
 
-    Read from the source rather than inferred from behaviour: a settings page that started
+    Read from the source rather than inferred from behavior: a settings page that started
     calling ``config_get`` would render perfectly, and the only thing that would notice is a
     check like this one. The settings area shows the installation's posture from ``doctor`` and
     the index report instead — live facts about the running system, not the contents of a file.
@@ -203,7 +203,7 @@ def test_the_script_stores_nothing_but_a_theme() -> None:
 
     The widget stores nothing at all because what it holds *is* a credential. This page holds
     none — a key never reaches it, because a page load cannot carry one — so the one thing it
-    persists is a colour scheme, and this is what keeps that true.
+    persists is a color scheme, and this is what keeps that true.
     """
     backend, _ = backend_with_a_document()
     with client_for(backend) as client:
@@ -215,7 +215,7 @@ def test_the_script_stores_nothing_but_a_theme() -> None:
 
 
 def test_the_refusal_page_is_this_surfaces_and_the_decision_is_not() -> None:
-    """Authorisation is decided once, in the API's own module, and rendered twice.
+    """Authorization is decided once, in the API's own module, and rendered twice.
 
     A second implementation of "does this principal clear this floor" for the browser is the
     shape of bug where a rule holds on one surface and not on the one somebody is using.

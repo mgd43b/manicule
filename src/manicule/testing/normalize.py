@@ -1,4 +1,4 @@
-"""The one normaliser both sides of every round-trip comparison pass through.
+"""The one normalizer both sides of every round-trip comparison pass through.
 
 Exact string equality is the wrong assertion. PDF extraction reintroduces ligatures and
 hyphenation, HTML collapses whitespace differently from its source, and DOCX splits a
@@ -6,14 +6,14 @@ sentence across runs. Comparing raw strings would fail parsers that are behaving
 and the usual repair — loosening the comparison per parser until the suite passes — leaves
 no assertion at all.
 
-So there is one normaliser, defined here, used by every check.
+So there is one normalizer, defined here, used by every check.
 
 **Order is load-bearing.** De-hyphenation needs the line breaks that whitespace collapsing
 destroys. Running the steps the other way round silently disables it, and nothing fails to
 say so — the hyphenated words simply stop being joined and every affected comparison starts
 relying on the substring check being lenient.
 
-**Stored text is never normalised.** ``Chunk.text`` is what a user is shown, and showing a
+**Stored text is never normalized.** ``Chunk.text`` is what a user is shown, and showing a
 whitespace-flattened, ligature-substituted rendering of a quotation is a change to the
 quotation. This module exists for comparisons and for nothing else.
 """
@@ -23,11 +23,11 @@ from __future__ import annotations
 import re
 import unicodedata
 
-NORMALISER_VERSION = "1"
+NORMALIZER_VERSION = "1"
 """Bumped when the steps below change.
 
 Recorded in test output rather than in
-:class:`~manicule.core.fingerprints.ChunkFingerprint`. The normaliser cannot move a chunk
+:class:`~manicule.core.fingerprints.ChunkFingerprint`. The normalizer cannot move a chunk
 boundary — it never runs during ingest — so putting it in the fingerprint would force a
 re-chunk and re-embed of an entire corpus in exchange for a change that cannot alter one
 stored byte.
@@ -41,14 +41,14 @@ _LIGATURES = {
     "ﬄ": "ffl",
 }
 """``U+FB00``-``U+FB04``, spelled by codepoint because they are indistinguishable from their
-letter sequences on the page. A normalisation rule an implementer cannot see is not a
+letter sequences on the page. A normalization rule an implementer cannot see is not a
 specification."""
 
 _SOFT_HYPHEN = "­"
 _ZERO_WIDTH_SPACE = "\u200b"
 _NO_BREAK_SPACE = "\u00a0"
 """Spelled by escape rather than typed. A no-break space is indistinguishable from a space
-in a source file, and a normalisation rule nobody can see in the code is not a
+in a source file, and a normalization rule nobody can see in the code is not a
 specification."""
 
 _LIGATURE_TABLE = str.maketrans({**_LIGATURES, _SOFT_HYPHEN: ""})
@@ -63,7 +63,7 @@ _WHITESPACE_RUN = re.compile(rf"[\s{_ZERO_WIDTH_SPACE}{_NO_BREAK_SPACE}]+")
 comparison and break it invisibly."""
 
 
-def normalise(text: str) -> str:
+def normalize(text: str) -> str:
     """Reduce ``text`` to the form both sides of a round-trip comparison are checked in.
 
     The five steps of ``docs/parsing.md`` §3.2, in the order that document fixes:
@@ -107,17 +107,17 @@ def contains_claimed_text(resolved: str | None, claimed: str) -> bool:
         claimed: The text the chunk or block says is at that location.
 
     Returns:
-        Whether ``claimed`` is present in ``resolved``, both under :func:`normalise`.
+        Whether ``claimed`` is present in ``resolved``, both under :func:`normalize`.
     """
     if resolved is None:
         return False
-    claim = normalise(claimed)
+    claim = normalize(claimed)
     if not claim:
         # An empty claim is contained in everything, so without this a whitespace-only chunk
         # reaches the strongest verification level whether or not its anchor points anywhere.
         # Absent evidence is a failure of containment, exactly as ``resolved is None`` is.
         return False
-    return claim in normalise(resolved)
+    return claim in normalize(resolved)
 
 
-__all__ = ["NORMALISER_VERSION", "contains_claimed_text", "normalise"]
+__all__ = ["NORMALIZER_VERSION", "contains_claimed_text", "normalize"]

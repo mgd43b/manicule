@@ -2,7 +2,7 @@
 
 Every handler here has the same three lines: admit the reader, run one or more operations
 through :func:`~manicule.web.rendering.panel`, render. There is no fourth line, and a page that
-grew one would be behaviour living in a surface — the thing ``docs/surfaces.md`` §1 says this
+grew one would be behavior living in a surface — the thing ``docs/surfaces.md`` §1 says this
 layer may not contain.
 
 ## What this surface does not offer, and why the checklist has two holes in it
@@ -121,7 +121,7 @@ async def chat(service: Service, caller: Reader, *, limit: Limit = 50) -> HTMLRe
 
     A member is what ``POST /api/v1/chat`` requires, and this page requires a viewer, because
     the page is a read: it lists conversations. Asking from it is the API's refusal to make,
-    and a page that pre-empted it would be a second authorisation decision.
+    and a page that pre-empted it would be a second authorization decision.
     """
     return render(
         "chat.html",
@@ -216,7 +216,7 @@ async def trash(
     """Longest-deleted first — the order the sweep will take them in.
 
     Declared **above** ``/documents/{document_id}``: Starlette matches in declaration order, so
-    the parameterised route would otherwise swallow ``trash`` as an id.
+    the parameterized route would otherwise swallow ``trash`` as an id.
     """
     entries = await panel(
         "document_trash", service, lambda: service.document_trash(limit=limit, offset=offset)

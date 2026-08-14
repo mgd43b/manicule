@@ -7,7 +7,7 @@ written to.
 
 Two conditions have to be separable, and they are asserted separately and together, because
 the last serious bug in this area came from exercising only one of them. **A cache redirect
-hid the grammars on macOS**: the pack resolves its cache through ``platformdirs``, which honours
+hid the grammars on macOS**: the pack resolves its cache through ``platformdirs``, which honors
 ``XDG_CACHE_HOME`` on Linux and uses ``~/Library/Caches`` on macOS, so a suite that redirected
 the XDG variable proved something on the Linux runner and nothing at all on the platform the
 project targets. So:
@@ -240,7 +240,7 @@ def test_a_bundle_installed_as_a_distribution_needs_no_configuration(
     wrote.
 
     That distinction has already caught a live trap, and the ``.gitignore`` written below is it.
-    Hatchling honours one beside the project it builds, this payload is *entirely* compiled
+    Hatchling honors one beside the project it builds, this payload is *entirely* compiled
     shared libraries, and ``*.so`` is about the most commonly ignored pattern there is — so a
     bundle built inside any checkout that ignores compiled objects loses every library it
     carries. Without ``artifacts`` in the generated metadata the wheel still builds, still
@@ -273,7 +273,7 @@ def test_a_bundle_installed_as_a_distribution_needs_no_configuration(
     # A distribution, not a directory that happens to import: the version answers from
     # installed metadata, which is what `pip list` reads and what an operator asking "which
     # grammars does this machine have" gets told. Asserted against what the builder writes,
-    # which is the comparison that catches a version the installer *normalised* — `linux-x86_64`
+    # which is the comparison that catches a version the installer *normalized* — `linux-x86_64`
     # loses its underscore to PEP 440, and macOS, whose tag has none, never notices.
     assert report["distribution"] == _expected_version()
 
@@ -297,9 +297,9 @@ def test_the_packaging_metadata_describes_the_bundle_it_was_written_beside(
     assert f'version = "{_expected_version()}"' in metadata
     assert grammar_bundle.platform_tag() in metadata
     assert f'name = "{grammar_bundle.BUNDLE_MODULE.replace("_", "-")}"' in metadata
-    # The licence the build asserted, carried to the machine the wheel lands on.
-    assert f'license = "{grammar_bundle.licence_of_installed_pack()}"' in metadata
-    # Neither separator survives PEP 440 normalisation, so a version carrying one describes a
+    # The license the build asserted, carried to the machine the wheel lands on.
+    assert f'license = "{grammar_bundle.license_of_installed_pack()}"' in metadata
+    # Neither separator survives PEP 440 normalization, so a version carrying one describes a
     # distribution that installs under a different name than the file it came from.
     assert "_" not in _expected_version()
 
@@ -325,9 +325,9 @@ def test_the_distribution_version_survives_being_installed_on_every_platform(
     output, which is the one class of defect this subsystem exists to refuse, and it is
     unobservable on macOS because ``macos-arm64`` has no underscore in it. It reached CI once.
 
-    Parametrised over the tags ``platform_tag`` can produce rather than asserted about this
+    Parametrized over the tags ``platform_tag`` can produce rather than asserted about this
     machine, so the Linux answer is checked on a laptop and the macOS answer on a runner. The
-    comparison is against ``packaging``, which is what every installer normalises with.
+    comparison is against ``packaging``, which is what every installer normalizes with.
     """
     from packaging.version import Version  # noqa: PLC0415 - a core dependency, used once here
     from tools.build_grammar_bundle import package_version  # noqa: PLC0415 - a build script
@@ -669,7 +669,7 @@ def test_a_library_edited_without_changing_its_length_is_refused_when_it_is_seed
 
     A bundle is moved between machines by whatever is available — a USB stick, an rsync, an
     image layer — and a flipped byte in a shared library is not a crash, it is undefined
-    behaviour inside a parser. The copy has to read every byte anyway, so hashing it there is
+    behavior inside a parser. The copy has to read every byte anyway, so hashing it there is
     free and is where the check belongs.
     """
     damaged = _copied_bundle(bundle, tmp_path)
@@ -708,15 +708,15 @@ def test_verify_reads_every_byte_where_a_read_only_checks_lengths(
     assert "sha256" in str(raised.value)
 
 
-def test_a_manifest_with_a_licence_nobody_assessed_is_refused_on_read(
+def test_a_manifest_with_a_license_nobody_assessed_is_refused_on_read(
     bundle: grammar_bundle.GrammarBundle, tmp_path: Path
 ) -> None:
-    """A bundle arrives by hand, so its manifest is the only licence statement it carries.
+    """A bundle arrives by hand, so its manifest is the only license statement it carries.
 
     Asserted at build *and* at read, because the two happen on different machines and a
     manifest is a text file somebody can edit between them.
     """
-    edited = _edited_manifest(bundle, tmp_path, licence="GPL-3.0-only")
+    edited = _edited_manifest(bundle, tmp_path, license="GPL-3.0-only")
 
     with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
         grammar_bundle.read(edited)
@@ -798,21 +798,21 @@ def test_a_manifest_listing_no_languages_is_not_an_empty_bundle(
     assert "no languages" in str(raised.value)
 
 
-def test_a_manifest_with_no_licence_at_all_is_refused(
+def test_a_manifest_with_no_license_at_all_is_refused(
     bundle: grammar_bundle.GrammarBundle, tmp_path: Path
 ) -> None:
     """Silence is not permission.
 
-    An empty licence is the state a hand-written manifest arrives in, and treating it as
-    "nothing to check" would make the licence assertion optional for exactly the bundles that
+    An empty license is the state a hand-written manifest arrives in, and treating it as
+    "nothing to check" would make the license assertion optional for exactly the bundles that
     were not built by the tool that asserts it.
     """
-    edited = _edited_manifest(bundle, tmp_path, licence="")
+    edited = _edited_manifest(bundle, tmp_path, license="")
 
     with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
         grammar_bundle.read(edited)
 
-    assert "no grammar licence is declared" in str(raised.value)
+    assert "no grammar license is declared" in str(raised.value)
 
 
 def test_a_grammar_that_cannot_be_loaded_refuses_instead_of_declining(tmp_path: Path) -> None:
@@ -1034,41 +1034,41 @@ def test_building_a_bundle_leaves_the_pack_where_it_found_it(
     assert os.environ[grammars.MANIFEST_URL_ENV] == UNREACHABLE_MANIFEST
 
 
-def test_the_bundle_asserts_the_licence_rather_than_trusting_the_policy(
+def test_the_bundle_asserts_the_license_rather_than_trusting_the_policy(
     bundle: grammar_bundle.GrammarBundle,
 ) -> None:
-    """A bundle is redistributed, so its licence is asserted at the moment it is built.
+    """A bundle is redistributed, so its license is asserted at the moment it is built.
 
     Upstream states that every grammar it carries is permissive and that copyleft is not
     accepted. The installed pack's own expression is the strongest statement the artifact
-    supports — it enumerates no per-grammar licences — and it is checked and recorded rather
+    supports — it enumerates no per-grammar licenses — and it is checked and recorded rather
     than assumed, so a release that changes it fails a build instead of shipping.
     """
-    assert bundle.licence in grammar_bundle.PERMISSIVE_LICENCES
-    assert grammar_bundle.check_licence(grammar_bundle.licence_of_installed_pack())
+    assert bundle.license in grammar_bundle.PERMISSIVE_LICENSES
+    assert grammar_bundle.check_license(grammar_bundle.license_of_installed_pack())
 
 
 @pytest.mark.parametrize("expression", ["GPL-3.0-only", "MIT AND LGPL-2.1", "AGPL-3.0-or-later"])
-def test_a_copyleft_licence_fails_the_build(expression: str) -> None:
+def test_a_copyleft_license_fails_the_build(expression: str) -> None:
     """The guard, disabled, is a bundle nobody may redistribute shipped as if they may.
 
     ``MIT AND LGPL-2.1`` is in the list because a check that only looked at the first term
     would pass it, and a compound expression is exactly how a copyleft component arrives.
     """
     with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
-        grammar_bundle.check_licence(expression)
+        grammar_bundle.check_license(expression)
 
     assert "copyleft" in str(raised.value)
 
 
-def test_a_licence_nobody_has_assessed_fails_with_a_different_message() -> None:
+def test_a_license_nobody_has_assessed_fails_with_a_different_message() -> None:
     """ "Not permitted" and "not yet considered" are different answers.
 
     Collapsing them invites the fix that makes the check pass — adding the term to the list —
-    for a licence that should have been refused.
+    for a license that should have been refused.
     """
     with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
-        grammar_bundle.check_licence("SomeVendor-Proprietary-1.0")
+        grammar_bundle.check_license("SomeVendor-Proprietary-1.0")
 
     message = str(raised.value)
     assert "copyleft" not in message
@@ -1076,10 +1076,10 @@ def test_a_licence_nobody_has_assessed_fails_with_a_different_message() -> None:
 
 
 def test_the_permissive_list_is_accepted_term_by_term() -> None:
-    """Every licence docs/parsing.md §12 assessed, and the operators between them."""
-    for licence in grammar_bundle.PERMISSIVE_LICENCES:
-        assert grammar_bundle.check_licence(licence) == licence
-    assert grammar_bundle.check_licence("Apache-2.0 OR MIT")
+    """Every license docs/parsing.md §12 assessed, and the operators between them."""
+    for expression in grammar_bundle.PERMISSIVE_LICENSES:
+        assert grammar_bundle.check_license(expression) == expression
+    assert grammar_bundle.check_license("Apache-2.0 OR MIT")
 
 
 # --- helpers --------------------------------------------------------------------------------

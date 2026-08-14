@@ -209,7 +209,7 @@ async def test_an_answer_citation_carries_the_documents_source_metadata(
 async def test_an_answer_carries_the_reason_for_its_confidence_as_a_search_does(
     service: ApplicationService, backend: FakeBackend
 ) -> None:
-    """The same judgement, from the same object, and it reached only one of the two commands.
+    """The same judgment, from the same object, and it reached only one of the two commands.
 
     ``search`` has printed the reason since retrieval learned to admit ignorance; ``ask`` had
     the band and not the sentence that makes a small number legible, so an answer over
@@ -897,7 +897,7 @@ async def test_init_pre_seeds_the_vocabularies_and_reports_what_it_did(
     del config_home
     from manicule import vocabularies  # noqa: PLC0415 - a retrieval extra, not core
 
-    report = await ApplicationService(backend).initialise()
+    report = await ApplicationService(backend).initialize()
 
     wanted = vocabularies.required_encodings(backend.settings.rag.context.encoding)
     assert vocabulary_seeds == [wanted]
@@ -923,7 +923,7 @@ async def test_a_vocabulary_pre_seed_that_fails_leaves_init_finished_and_says_so
 
     monkeypatch.setattr(vocabularies, "prefetch", refuse)
 
-    report = await ApplicationService(backend).initialise()
+    report = await ApplicationService(backend).initialize()
 
     assert await asyncio.to_thread(config_home.exists)
     assert any("no route to the blob store" in note for note in report.notes)
@@ -1065,7 +1065,7 @@ async def test_plugin_list_reports_the_components_each_plugin_registers(
 async def test_the_registry_is_not_consulted_unless_installation_is_allowed(
     backend: FakeBackend,
 ) -> None:
-    """A plugin runs with this process's full authority, so browsing a catalogue is opt-in."""
+    """A plugin runs with this process's full authority, so browsing a catalog is opt-in."""
     backend.discovery = discover()
     listed = await ApplicationService(backend).plugin_list(registry=True)
     assert listed.available == ()
@@ -1119,7 +1119,7 @@ async def test_init_writes_a_loopback_bind_explicitly(
 ) -> None:
     """Written out rather than left to the default, so an operator can see it is loopback."""
     del grammar_seeds
-    report = await service.initialise()
+    report = await service.initialize()
     assert report.path == str(config_file())
     assert "127.0.0.1" in await asyncio.to_thread(config_home.read_text, "utf-8")
     assert any("127.0.0.1" in note for note in report.notes)
@@ -1129,10 +1129,10 @@ async def test_init_refuses_to_overwrite_an_existing_configuration(
     service: ApplicationService, config_home: Path, grammar_seeds: list[tuple[str, ...]]
 ) -> None:
     del grammar_seeds
-    await service.initialise()
+    await service.initialize()
     with pytest.raises(ConfigError):
-        await service.initialise()
-    assert (await service.initialise(force=True)).path == str(config_home)
+        await service.initialize()
+    assert (await service.initialize(force=True)).path == str(config_home)
 
 
 async def test_init_pre_seeds_the_declared_grammars_and_reports_what_it_did(
@@ -1151,7 +1151,7 @@ async def test_init_pre_seeds_the_declared_grammars_and_reports_what_it_did(
 
     backend.settings = _empty_grammar_cache(tmp_path / "cache")
 
-    report = await ApplicationService(backend).initialise()
+    report = await ApplicationService(backend).initialize()
 
     assert grammar_seeds == [DECLARED_LANGUAGES]
     assert any("grammars" in note for note in report.notes)
@@ -1177,7 +1177,7 @@ async def test_a_pre_seed_that_fails_leaves_init_finished_and_says_so(
     monkeypatch.setattr(grammars, "prefetch", refuse)
     backend.settings = _empty_grammar_cache(tmp_path / "cache")
 
-    report = await ApplicationService(backend).initialise()
+    report = await ApplicationService(backend).initialize()
 
     assert await asyncio.to_thread(config_home.exists)
     assert any("no route to the grammar release" in note for note in report.notes)
@@ -1269,7 +1269,7 @@ async def test_doctor_names_the_narrow_pre_seed_rather_than_the_suite_s_own(
     """``--full --mlx`` fetches 3.6 GB to seed a backend that loads 1.17 GB of it.
 
     Advice that costs the reader three times what saying nothing would is worse than silence,
-    so the command named is the one that fetches exactly the configured backend's artefact.
+    so the command named is the one that fetches exactly the configured backend's artifact.
     """
     weights_on_disk(False)
     diagnosis = await ApplicationService(backend).doctor()
@@ -1613,7 +1613,7 @@ async def test_the_orphan_sweep_reports_without_deleting_unless_asked(
     that happens by default names what *would* go and moves nothing.
     """
     document = next(iter(backend.store.documents.values()))
-    backend.organisation_.documents[document.id] = document
+    backend.organization_.documents[document.id] = document
 
     reported = await service.collection_orphans()
 
@@ -1632,7 +1632,7 @@ async def test_the_orphan_sweep_trashes_rather_than_destroys(
     decisions, taken at two moments, rather than one flag that means both.
     """
     document = next(iter(backend.store.documents.values()))
-    backend.organisation_.documents[document.id] = document
+    backend.organization_.documents[document.id] = document
 
     swept = await service.collection_orphans(delete=True)
 
@@ -1648,9 +1648,9 @@ async def test_a_document_in_a_collection_is_not_an_orphan(
 ) -> None:
     """The positive control. A sweep that reported everything would pass the tests above."""
     document = next(iter(backend.store.documents.values()))
-    backend.organisation_.documents[document.id] = document
-    collection = await backend.organisation_.create_collection("alpha")
-    await backend.organisation_.add_to_collection(collection.id, [document.id])
+    backend.organization_.documents[document.id] = document
+    collection = await backend.organization_.create_collection("alpha")
+    await backend.organization_.add_to_collection(collection.id, [document.id])
 
     reported = await service.collection_orphans(delete=True)
 
@@ -1668,7 +1668,7 @@ async def test_renaming_reports_the_new_name_and_keeps_the_id(
 
     assert renamed.id == made.id
     assert renamed.name == "alpha runbooks"
-    assert (await backend.organisation_.get_collection(made.id)) is not None
+    assert (await backend.organization_.get_collection(made.id)) is not None
 
 
 async def test_a_search_names_the_collections_it_was_scoped_to(
@@ -2114,7 +2114,7 @@ async def test_ordering_advice_is_refused_for_outcomes_that_converting_earlier_w
     an identity two files claim. Converting those earlier reproduces both — the advice is not
     merely unhelpful there, it is about a different thing.
 
-    Parametrised over the outcomes that are *not* the one this keys on, because the case that
+    Parametrized over the outcomes that are *not* the one this keys on, because the case that
     passes either way is the one that is. The counterpart above pins the positive.
     """
     stranded = _declaring(backend, "1002", source_id="/corpus/pages/1002.html")
@@ -2156,7 +2156,7 @@ async def test_the_conversion_report_carries_a_count_per_outcome(
     """``--json`` has to answer "what kind of nothing" without parsing a sentence.
 
     ``considered`` and ``written`` alone are equally the shape of a wrong directory, an exporter
-    this does not recognise, and a corpus already converted — and which of the three it is decides
+    this does not recognize, and a corpus already converted — and which of the three it is decides
     the operator's next move entirely. The counters sum to ``considered``, so no file falls
     through the report.
     """

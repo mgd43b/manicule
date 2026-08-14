@@ -46,7 +46,7 @@ def test_an_answered_question_is_recorded_too() -> None:
 
 
 def test_query_logs_report_a_chunk_count_rather_than_chunk_ids() -> None:
-    """Corpus structure has no business travelling with a telemetry listing."""
+    """Corpus structure has no business traveling with a telemetry listing."""
     backend, _ = backend_with_a_document()
     with client_for(backend) as client:
         client.get("/api/v1/search", params={"q": "retry"})
@@ -200,7 +200,7 @@ def test_search_quality_says_plainly_that_nothing_has_been_measured() -> None:
     assert page["available"] is False
     assert page["is_evidence"] is False
     assert page["records"] == 0
-    assert "judged" in page["caveat"] or "judgements" in page["caveat"]
+    assert "judged" in page["caveat"] or "judgments" in page["caveat"]
 
 
 def test_plugin_health_reports_nothing_when_nothing_is_installed() -> None:

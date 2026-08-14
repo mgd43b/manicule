@@ -17,7 +17,7 @@ of them.
 
 The break is in the corpus rather than only in a focused test because it is what puts a newline
 *inside* a block's text, and the round-trip assertions are where that has to survive:
-:func:`~manicule.testing.normalise.normalise` reduces it to a space on both sides of every
+:func:`~manicule.testing.normalize.normalize` reduces it to a space on both sides of every
 comparison, so containment and tightness hold across it or the fixture says so.
 
 **Degenerate** — zero bytes, a heading with nothing under it, and a file with no trailing
@@ -32,7 +32,7 @@ another's. That is a requirement rather than tidiness: the discrimination assert
 (``docs/parsing.md`` §3.3) compares each block's text against every other anchor's resolved
 text, and two blocks that read identically cannot be told apart by anything, a person reading
 the citation included. In HTML a heading's text is exactly its title, so a title that also
-occurs in a neighbouring sentence is the same collision — which is why no heading here
+occurs in a neighboring sentence is the same collision — which is why no heading here
 repeats a word of its own body.
 """
 

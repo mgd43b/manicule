@@ -2,11 +2,11 @@
 
 Everything here turns on one asymmetry. A heading's *path* comes from the markup and is
 always available; a heading's *address* comes from an ``id=`` the page publishes, and often
-does not exist. Synthesising the missing one would be easy and would produce a citation that
+does not exist. Synthesizing the missing one would be easy and would produce a citation that
 looks precise and lands at the top of a page manicule does not serve — so the fragment is
 ``None``, and where that leaves two sections indistinguishable the blocks are ``Unlocated``.
 
-:func:`test_synthesising_a_fragment_the_page_never_published_fails_the_round_trip` and
+:func:`test_synthesizing_a_fragment_the_page_never_published_fails_the_round_trip` and
 :func:`test_inventing_an_anchor_for_an_ambiguous_path_fails_the_round_trip` are what make
 those two rules load-bearing rather than stated: each runs the implementation that takes the
 easy option and requires the harness to reject it.
@@ -195,7 +195,7 @@ async def test_a_heading_holding_only_an_anchor_does_not_become_an_empty_path_el
     assert blocks[0].anchor == HeadingAnchor(path=("Page",), fragment=None)
 
 
-async def test_synthesising_a_fragment_the_page_never_published_fails_the_round_trip() -> None:
+async def test_synthesizing_a_fragment_the_page_never_published_fails_the_round_trip() -> None:
     """The rule above is load-bearing: with it removed, the harness goes red.
 
     An invented slug addresses nothing, so resolving it returns no text — which is what an
@@ -647,7 +647,7 @@ async def test_a_cdata_section_reaches_the_document_as_text() -> None:
 
     The second assertion is the sharper one. A test that only checked the body was present would
     pass for a parser that emitted the raw ``]]>`` delimiter along with it, which is what the
-    broken behaviour already does.
+    broken behavior already does.
     """
     blocks = await read_blocks(WebParser(WebConfig()), raw_of(CODE_MACRO, MEDIA_TYPE))
     text = "\n".join(block.text for block in blocks)
@@ -723,7 +723,7 @@ async def test_an_unterminated_cdata_section_is_left_alone() -> None:
     **The assertion is on the rendered string, not on the blocks.** An earlier version checked only
     the first two blocks, which left the unterminated section free to be escaped and appended as a
     third — so the test passed with the "leave it alone" branch removed entirely. Found by removing
-    it. What pins the behaviour is that the marker is still there, untransformed.
+    it. What pins the behavior is that the marker is still there, untransformed.
     """
     document = "<h2>Retry policy</h2><p>x</p><ac:body><![CDATA[never closed"
 
@@ -745,7 +745,7 @@ async def test_ordinary_html_passes_through_the_recovery_unchanged() -> None:
     **Deliberately not asserted on identity.** An earlier version checked
     ``_rendered(document) is document`` to prove the early return was taken — and that assertion
     can never fail, because CPython's ``"".join([x])`` returns ``x`` itself. The early return is a
-    performance detail with no observable behaviour, so there is nothing honest to assert about it;
+    performance detail with no observable behavior, so there is nothing honest to assert about it;
     this asserts the observable property instead.
     """
     plain = "<h1>Retry policy &amp; backoff</h1><p>Use a &lt; b for the bound.</p>"
@@ -769,7 +769,7 @@ async def test_a_cdata_section_that_is_not_a_macro_body_is_recovered_too() -> No
     the same reason it is correct for a macro body: the author put content there and an HTML parser
     would have deleted it.
 
-    Pinned so the next person changing this knows the behaviour was chosen. The alternative — only
+    Pinned so the next person changing this knows the behavior was chosen. The alternative — only
     recovering sections inside `ac:` elements — would make the rule Confluence-specific and would
     silently keep losing content from every other document.
     """

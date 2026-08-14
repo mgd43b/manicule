@@ -47,7 +47,7 @@ from manicule.parsers.confluence import (
 )
 from manicule.parsers.plugin import PARSERS
 from manicule.parsers.web import WebParser, recover_cdata
-from manicule.testing import assert_round_trip, normalise
+from manicule.testing import assert_round_trip, normalize
 from tests.corpus.confluence import (
     ACCOUNT_ID,
     CONTAINER_PRESET,
@@ -619,8 +619,8 @@ async def test_an_unsupported_macro_keeps_the_body_it_carries(corpus: Path) -> N
     )
     assert "Why the threshold is ninety seconds" in joined, (
         "an expand macro's title is the label Confluence draws on the page, so it is content by "
-        "the same test a panel's title is. Being unsupported describes the macro's behaviour and "
-        "is never a licence to drop the words it renders"
+        "the same test a panel's title is. Being unsupported describes the macro's behavior and "
+        "is never a license to drop the words it renders"
     )
 
 
@@ -802,7 +802,7 @@ async def test_an_anchor_still_resolves_to_the_text_the_reassembled_body_claims(
     """Requirement three's last clause, asserted directly rather than through the harness.
 
     The blank lines are added by the *assembly*, and the anchor addresses the source. Resolution
-    normalises whitespace, so the added boundaries do not move what the anchor covers — but that
+    normalizes whitespace, so the added boundaries do not move what the anchor covers — but that
     is the kind of claim that should be run rather than reasoned about.
     """
     raw = raw_from(corpus / "confluence" / "macro-body.storage", MEDIA_TYPE)
@@ -814,7 +814,7 @@ async def test_an_anchor_still_resolves_to_the_text_the_reassembled_body_claims(
 
     assert resolved is not None
     for paragraph in paragraphs(body.text):
-        assert normalise(paragraph) in normalise(resolved)
+        assert normalize(paragraph) in normalize(resolved)
 
 
 # --- inline line breaks ------------------------------------------------------------------------
@@ -990,7 +990,7 @@ async def test_an_anchor_still_resolves_to_the_section_holding_a_break() -> None
 
     assert prose.anchor == HeadingAnchor(path=("Routing",), fragment="routing")
     assert resolved is not None
-    assert normalise(prose.text) in normalise(resolved)
+    assert normalize(prose.text) in normalize(resolved)
 
 
 # --- anchors -------------------------------------------------------------------------------
@@ -1171,7 +1171,7 @@ async def _is_closed(stream: AsyncIterator[object]) -> bool:
 
 @pytest.mark.parametrize("macro", sorted(INTERPRETED_MACROS))
 async def test_every_macro_declared_interpreted_is_actually_read(macro: str) -> None:
-    """The set the snapshot connector filters its diagnostic by, checked against behaviour.
+    """The set the snapshot connector filters its diagnostic by, checked against behavior.
 
     Derived from the dispatch tables, so reading it back would prove only that a set equals
     itself. What matters is the claim it makes to another package — "this one is understood" — and

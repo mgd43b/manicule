@@ -204,7 +204,7 @@ def test_resident_memory_is_readable_for_this_process() -> None:
     assert measured is None or measured > 0
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="the measured Darwin behaviour")
+@pytest.mark.skipif(sys.platform != "darwin", reason="the measured Darwin behavior")
 def test_the_address_space_limit_is_not_available_on_darwin() -> None:
     """Recorded as a test because a design that assumed otherwise would be silently inert.
 

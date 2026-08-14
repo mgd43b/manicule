@@ -29,7 +29,7 @@ type Vector = Sequence[float]
 """A finished embedding.
 
 Deliberately a plain sequence: vectors cross a storage boundary, where a concrete,
-serialisable value is what is wanted. Backends holding native arrays convert at the seam.
+serializable value is what is wanted. Backends holding native arrays convert at the seam.
 """
 
 
@@ -110,7 +110,7 @@ class EmbedFingerprint(Fingerprint):
     same texts through both runtimes and fails if any pair falls outside the tolerance stated
     there. **If parity ever stops holding, this exclusion is the decision to revisit** —
     moving ``backend`` into ``IDENTITY_FIELDS`` makes a runtime change a loud error with a
-    re-embed path, which is the correct behaviour if the vectors really do differ.
+    re-embed path, which is the correct behavior if the vectors really do differ.
 
     **:attr:`weights_ref` is excluded for the same reason and needs the same care.** A
     backend rarely runs the canonical repository's own files: MLX needs safetensors and
@@ -118,7 +118,7 @@ class EmbedFingerprint(Fingerprint):
     from a conversion. Recording which conversion ran is the difference between a diagnosable
     index and a mystery. It stays out of identity because a faithful re-encoding of the same
     weights is the thing parity certifies — and because the one re-encoding that *does* move
-    the vectors, quantisation, is refused at load time rather than absorbed here: 4-bit
+    the vectors, quantization, is refused at load time rather than absorbed here: 4-bit
     ``bge-m3`` sits at cosine 0.92-0.97 to the same model in fp16, which is a different vector
     space wearing the same name.
     """
@@ -140,7 +140,7 @@ class EmbedFingerprint(Fingerprint):
     )
     dimension: int = Field(gt=0, description="Read from the model. Never a literal.")
     pooling: Pooling
-    normalized: bool = Field(description="Whether vectors are L2-normalised on output.")
+    normalized: bool = Field(description="Whether vectors are L2-normalized on output.")
 
     tokenizer_id: str = Field(
         default="",
@@ -169,7 +169,7 @@ class EmbedFingerprint(Fingerprint):
     )
     weights_ref: str = Field(
         default="",
-        description="The artefact whose bytes the backend actually executed, when that is "
+        description="The artifact whose bytes the backend actually executed, when that is "
         "not the model's own repository — for example ``mlx-community/bge-m3-mlx-fp16`` for "
         "``BAAI/bge-m3`` under MLX, which publishes no safetensors. Recorded so that a "
         "vector can be traced to the weights that made it. Excluded from identity — see the "
@@ -214,7 +214,7 @@ EMBEDDING_IDENTITY_VERSION: Final = "1"
 """What :func:`embedding_input_identity` hashes first, so its own rules can change.
 
 A stored identity is compared byte for byte against a freshly derived one. If the derivation
-ever changes — a different digest, a different serialisation, a fourth input — every stored
+ever changes — a different digest, a different serialization, a fourth input — every stored
 identity has to stop matching, or vectors produced under the old rule would be reused under
 the new one. Bumping this is what makes that happen, and it costs exactly one re-embed of the
 corpus, which is the honest price of changing what the identity means.
@@ -258,9 +258,9 @@ def embedding_input_identity(
 
     ``embed_text``
         The exact string handed to the embedder — every code point of it, in order. There is
-        deliberately **no Unicode normalisation**: NFC and NFD forms of one word tokenise
+        deliberately **no Unicode normalization**: NFC and NFD forms of one word tokenize
         differently and produce different vectors, so treating them as one input would reuse a
-        vector for text the model never saw. "Normalised" here means the *serialisation* is
+        vector for text the model never saw. "Normalized" here means the *serialization* is
         canonical, never that the text is.
 
     ``embed``
@@ -272,7 +272,7 @@ def embedding_input_identity(
         ``name@version`` for every middleware declaring ``mutates_embedded_text``
         (:attr:`~manicule.core.fingerprints.ChunkFingerprint.embed_text_middleware`). Sorted
         here rather than trusted to arrive sorted, because a set that differs only in order is
-        the same declaration. Folding it in is defence in depth over
+        the same declaration. Folding it in is defense in depth over
         :func:`~manicule.ingest.refusals.check_before_run`, which refuses a run whose chunk
         fingerprint disagrees with the index — that refusal is per *run*, and the repair verbs
         in :mod:`manicule.ingest.reindex` do not all go through it.

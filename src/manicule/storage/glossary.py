@@ -14,7 +14,7 @@ filtering afterwards. Three restrictions apply and each excludes something diffe
 * **liveness and status**, so a soft-deleted or mid-ingest document contributes no vocabulary
   — its chunks and its vectors need not agree yet, and a definition read out of one would cite
   a passage a search cannot return;
-* the **query's own filter**, resolved through :func:`~manicule.storage.organisation.resolve_filter`
+* the **query's own filter**, resolved through :func:`~manicule.storage.organization.resolve_filter`
   — the same function collection-scoped search resolves through, deliberately, so there is one
   notion of what a collection contains rather than a second one that drifts.
 """
@@ -30,7 +30,7 @@ from manicule.core.glossary import DefinitionForm, GlossaryEntry
 from manicule.core.ids import glossary_entry_id
 from manicule.core.retrieval import Filter
 from manicule.storage import models
-from manicule.storage.organisation import resolve_filter
+from manicule.storage.organization import resolve_filter
 from manicule.storage.scoped import WorkspaceScoped
 
 if TYPE_CHECKING:
@@ -67,7 +67,7 @@ for.
 
 The two fields are **projected out before the guard runs**, exactly as
 :func:`~manicule.retrieval.prefilter.join_filter` projects them out before a query over
-``documents``. That is the difference between "honoured" and "ignored", and it is the whole
+``documents``. That is the difference between "honored" and "ignored", and it is the whole
 reason this is written as a narrower filter rather than as a larger set of excuses: nothing
 here is handed a restriction it then declines to apply.
 """
@@ -78,7 +78,7 @@ def vocabulary_filter(source: Filter) -> Filter:
 
     The same move :func:`~manicule.retrieval.prefilter.join_filter` makes, for the same reason
     and with the same consequence — the guard below then sees a filter every field of which
-    this query really does honour.
+    this query really does honor.
     """
     return Filter(
         workspace_ids=source.workspace_ids,
@@ -255,10 +255,10 @@ class GlossaryMixin(WorkspaceScoped):
 
         Raises:
             CrossWorkspaceCollisionError: The filter names another workspace.
-            ValueError: The filter restricts on a field this lookup cannot honour.
+            ValueError: The filter restricts on a field this lookup cannot honor.
         """
         scoped = vocabulary_filter(filter)
-        self._require_honourable(scoped, VOCABULARY_FILTER_FIELDS, "look glossary terms up")
+        self._require_honorable(scoped, VOCABULARY_FILTER_FIELDS, "look glossary terms up")
         wanted = [key for key in dict.fromkeys(keys) if key]
         if not wanted:
             return []

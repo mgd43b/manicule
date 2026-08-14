@@ -8,7 +8,7 @@ types, sources, settings.
 It deliberately does NOT emit internal structure. Exported symbols, database
 columns and class names are OpenDocuments' implementation, and reproducing those
 would be cloning rather than building something better. `--internals` dumps them
-anyway, as a reference for checking whether a behaviour was considered — never as
+anyway, as a reference for checking whether a behavior was considered — never as
 a specification.
 
 Usage:
@@ -129,19 +129,19 @@ def core_exports(root: Path) -> list[str]:
 
 
 
-# Subsystems whose behaviour is deliberately not ported.
-SKIP = ("web/src/lib/i18n",)  # internationalisation is out of scope
+# Subsystems whose behavior is deliberately not ported.
+SKIP = ("web/src/lib/i18n",)  # internationalization is out of scope
 
 
-def behaviours(root: Path) -> list[str]:
+def behaviors(root: Path) -> list[str]:
     """Every exported symbol in every source file.
 
     The interface extractors above read 46 of ~194 source files. The rest —
     chunking, the RAG engine, the ingest pipeline, connector management — is
-    where the behaviour lives, and where every gap found so far has been.
+    where the behavior lives, and where every gap found so far has been.
 
     This does not capture semantics. It captures existence, so that nothing is
-    invisible: every behaviour gets a row that must be ticked or struck.
+    invisible: every behavior gets a row that must be ticked or struck.
     """
     out = []
     roots = [root / "packages/core/src", root / "packages/server/src",
@@ -178,7 +178,7 @@ INTERNALS = [
     ("Database columns", db_columns, 2),
     ("Plugin interface", plugin_methods, 1),
     ("Core exports", core_exports, 1),
-    ("Exported symbols per module", behaviours, 1),
+    ("Exported symbols per module", behaviors, 1),
 ]
 
 
@@ -196,14 +196,14 @@ def main() -> None:
         print("# OpenDocuments internals — reference only\n")
         print(
             "**This is not a to-do list.** It is OpenDocuments' implementation "
-            "structure, kept so a behaviour can be checked against it — *did they "
+            "structure, kept so a behavior can be checked against it — *did they "
             "handle X, and how?* Reproducing this list would be cloning.\n"
         )
     else:
         print("# Capabilities\n")
         print(
             "What a user can do, extracted from the OpenDocuments source rather than "
-            "summarised. This is the capability floor manicule should meet or "
+            "summarized. This is the capability floor manicule should meet or "
             "deliberately decline.\n"
         )
         print(

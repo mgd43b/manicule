@@ -102,7 +102,7 @@ def test_the_probes_answer_without_an_envelope() -> None:
     """Deliberately the two exceptions to the one-shape rule.
 
     A supervisor reads a status code. A liveness check that has to parse an envelope is one
-    that reports unhealthy when the serialiser changes.
+    that reports unhealthy when the serializer changes.
     """
     backend, _ = backend_with_a_document()
     with client_for(backend) as client:

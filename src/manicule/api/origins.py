@@ -51,7 +51,7 @@ SAME_SITE_VALUES = frozenset({"same-origin", "none"})
 
 ``none`` is a user-initiated navigation — a typed URL or a bookmark — which is the case a
 person reaching a page has. ``same-site`` is deliberately absent: a sibling subdomain is a
-different origin, and on a shared domain it is exactly the neighbour this check is for.
+different origin, and on a shared domain it is exactly the neighbor this check is for.
 """
 
 
@@ -131,7 +131,7 @@ def handshake_permitted(
     The same decision as :func:`permitted`, over the one header a websocket handshake carries.
     ``Sec-Fetch-Site`` is not sent on one, and there is no preflight and no CORS to fall back
     on — a browser makes the connection and the page reads every frame. So the ``Origin``
-    comparison is not a second line of defence here; it is the only one.
+    comparison is not a second line of defense here; it is the only one.
 
     Named separately rather than reached by calling ``permitted("POST", ...)``, because a
     handshake is not a POST and a call site that pretended otherwise would read as a mistake.

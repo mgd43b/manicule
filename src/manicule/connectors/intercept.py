@@ -151,7 +151,7 @@ def signed_out(answer: Answer, *, expected_account: str = "") -> str | None:
 
     Three independent signals, strongest first. Any one is enough, which is the point: an
     instance that omits the headers is caught by its body, and one that serves a body this does
-    not recognise is caught by its headers.
+    not recognize is caught by its headers.
 
     Args:
         answer: What came back. ``body`` may be empty when only headers have arrived.

@@ -14,7 +14,7 @@ Three consequences worth stating, because each is a decision rather than an acci
 0-based, half-open line span; every anchor manicule stores is 1-based and inclusive at both
 ends. The conversion happens here, at the parser boundary, and nowhere else.
 
-**Fragments are synthesised, because Markdown defines none.** A ``.md`` file has no anchor
+**Fragments are synthesized, because Markdown defines none.** A ``.md`` file has no anchor
 scheme of its own, so the GitHub-style slug in :class:`~manicule.parsers.base.SlugAllocator`
 is used — the one every Markdown host derives the same way. Where the source *does* publish
 fragments, as Confluence and HTML authors do, this parser is not the one reading them.
@@ -68,7 +68,7 @@ heading's rendered title is built from these alone."""
 _FRONT_MATTER_FENCE = "---"
 
 _JSX_TAG = re.compile(r"^</?(?P<name>[A-Z][A-Za-z0-9_.]*)(?:\s[^<>]*?)?/?>$")
-"""A JSX component tag alone on a line. Capitalised initial letter is what distinguishes a
+"""A JSX component tag alone on a line. Capitalized initial letter is what distinguishes a
 component from an HTML element in JSX, and it is the rule the MDX compiler itself applies."""
 
 _FENCE_MARKERS = ("```", "~~~")

@@ -47,7 +47,7 @@ caller found first.
 """
 
 
-def _normalise(host: str) -> IPv4Address | IPv6Address | None:
+def _normalize(host: str) -> IPv4Address | IPv6Address | None:
     """One host string as an address, or ``None`` when it is not one.
 
     An IPv4-mapped IPv6 address — what a dual-stack listener reports for an IPv4 client — is
@@ -117,7 +117,7 @@ class ProxyPolicy:
 
     def trusts(self, host: str) -> bool:
         """Whether ``host`` is a peer whose forwarding header would be believed."""
-        parsed = _normalise(host)
+        parsed = _normalize(host)
         if parsed is None:
             return False
         return any(parsed in network for network in self.trusted)
@@ -160,7 +160,7 @@ class ProxyPolicy:
         named anywhere in the header.
         """
         for entry in reversed(self._entries(header)):
-            parsed = _normalise(entry)
+            parsed = _normalize(entry)
             if parsed is None:
                 # Not an address. Skipped rather than returned: a string that is not an
                 # address must never reach a log line or an allowlist looking like one.
@@ -176,8 +176,8 @@ class ProxyPolicy:
 
     @staticmethod
     def _present(peer: str) -> str:
-        """A socket peer, normalised. Unparseable peers are reported as unknown."""
-        parsed = _normalise(peer)
+        """A socket peer, normalized. Unparseable peers are reported as unknown."""
+        parsed = _normalize(peer)
         return str(parsed) if parsed is not None else ""
 
 

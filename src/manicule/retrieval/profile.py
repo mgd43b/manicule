@@ -2,7 +2,7 @@
 
 ``Query.profile`` names one of three cost/quality settings and ``rag.overrides`` adjusts
 individual fields of it. Both are read here rather than in each stage, so that a stage cannot
-resolve them slightly differently from its neighbour and produce a pipeline whose depth
+resolve them slightly differently from its neighbor and produce a pipeline whose depth
 depends on which stage you ask.
 """
 
@@ -43,7 +43,7 @@ def retrieval_depth(profile: ProfileConfig, query: Query) -> int:
 
     Two settings mean "how many candidates come out" and neither document reconciled them, so:
     ``Query.limit`` is what a search call returns to a person, and ``final_top_k`` is what an
-    ask call puts in the model's context. They have different consumers and both are honoured,
+    ask call puts in the model's context. They have different consumers and both are honored,
     which means the pipeline has to run at least as deep as the larger of them.
 
     ``final_top_k`` does not appear here because a profile guarantees it is no larger than

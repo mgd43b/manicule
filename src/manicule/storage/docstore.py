@@ -5,7 +5,7 @@ what gives the two-store consistency problem a single answer — rebuild the der
 rather than a reconciliation nobody can adjudicate.
 
 **One class, six protocols.** ``DocStore`` is documents, chunks, lexical search and sync
-state; the organisation surfaces — collections, tags, versions, the trash, chunk relations —
+state; the organization surfaces — collections, tags, versions, the trash, chunk relations —
 arrive as protocols of their own and are implemented by the mixins in the sibling modules.
 They share :class:`~manicule.storage.scoped.WorkspaceScoped`, so there is one constructor, one
 session factory and one workspace however many contracts this class satisfies. Splitting the
@@ -30,7 +30,7 @@ from manicule.storage import models
 from manicule.storage.fts import SEARCH_SQL, escape_match_query
 from manicule.storage.glossary import GlossaryMixin
 from manicule.storage.history import TrashMixin, VersionsMixin
-from manicule.storage.organisation import CollectionsMixin, TagsMixin
+from manicule.storage.organization import CollectionsMixin, TagsMixin
 from manicule.storage.relations import RelationsMixin
 from manicule.storage.rows import apply_document, from_chunk, to_chunk, to_document
 from manicule.storage.scoped import (
@@ -60,7 +60,7 @@ def _cross_workspace(document_id: str, holder: str, asked: str) -> str:
     """Why an id that resolves to a row is still not this workspace's to touch.
 
     One wording for the two writes that refuse it, so a caller cannot learn the message from the
-    guarded write and fail to recognise it from the unguarded one.
+    guarded write and fail to recognize it from the unguarded one.
     """
     return (
         f"document id {document_id!r} belongs to workspace {holder!r}, not {asked!r}. Ids from "
@@ -92,7 +92,7 @@ LISTABLE_FILTER_FIELDS: Final = frozenset(
         "updated_before",
     }
 )
-""":class:`~manicule.core.retrieval.Filter` fields :meth:`SqliteDocStore.list_documents` honours.
+""":class:`~manicule.core.retrieval.Filter` fields :meth:`SqliteDocStore.list_documents` honors.
 
 Document-level fields only. ``kinds`` and ``langs`` are properties of a chunk and have no
 meaning in a list of documents; ``collection_ids`` and ``tag_ids`` need join tables this query
@@ -102,7 +102,7 @@ filter was written to exclude, and the listing still looks like it worked.
 """
 
 SEARCHABLE_FILTER_FIELDS: Final = LISTABLE_FILTER_FIELDS | {"kinds", "langs"}
-""":class:`~manicule.core.retrieval.Filter` fields :meth:`SqliteDocStore.search_lexical` honours.
+""":class:`~manicule.core.retrieval.Filter` fields :meth:`SqliteDocStore.search_lexical` honors.
 
 The lexical leg is one statement against the authoritative store, so it applies the whole
 filter inline, before ``LIMIT`` (``docs/retrieval.md`` §3.3). Only ``collection_ids`` and
@@ -307,7 +307,7 @@ class SqliteDocStore(
             .limit(limit)
             .offset(offset)
         )
-        self._require_honourable(filter, LISTABLE_FILTER_FIELDS, "list documents")
+        self._require_honorable(filter, LISTABLE_FILTER_FIELDS, "list documents")
         if filter is not None:
             if filter.sources:
                 statement = statement.where(models.Document.source.in_(filter.sources))
@@ -811,7 +811,7 @@ class SqliteDocStore(
         ``k`` live rows, because deferred deletion leaves soft-deleted chunks in the index
         competing for the same slots.
         """
-        self._require_honourable(filter, SEARCHABLE_FILTER_FIELDS, "search")
+        self._require_honorable(filter, SEARCHABLE_FILTER_FIELDS, "search")
         match = escape_match_query(text)
         if not match:
             return []
@@ -945,7 +945,7 @@ class SqliteDocStore(
         does not need the list in memory at once.
 
         **Close it.** This is an async generator holding an open session while suspended, so a
-        consumer that stops early leaves the session open until the generator is finalised —
+        consumer that stops early leaves the session open until the generator is finalized —
         which happens at garbage-collection time, through the event loop's async-generator
         hook, possibly after the loop it belongs to has closed. Wrap consumption in
         :func:`contextlib.aclosing` rather than draining it bare, and the session closes when

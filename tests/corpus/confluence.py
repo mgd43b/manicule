@@ -1,7 +1,7 @@
 """Fixtures for the Confluence storage-format parser, generated rather than committed.
 
 Synthetic throughout. Every page, space key, user and URL here was invented for this
-repository: storage format is the format organisations keep their internal runbooks in, and a
+repository: storage format is the format organizations keep their internal runbooks in, and a
 fixture corpus is published with the project.
 
 The four kinds ``docs/parsing.md`` §3.5 requires, and what each is here to catch:

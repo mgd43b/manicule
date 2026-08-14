@@ -103,7 +103,7 @@ class SystemResult(BaseModel):
 
         Repeats are kept because two chunks of one document are two results: collapsing them
         would make a system that returned five chunks of the same page look like it returned
-        one, which is a judgement about diversity and not this type's to make.
+        one, which is a judgment about diversity and not this type's to make.
         """
         return tuple(item.document_id for item in self.items)
 
@@ -184,7 +184,7 @@ class RetrieverSystem:
 
     **It will not run against a retriever whose cache can hit.** A cached ranking is the same
     sample counted twice at the cache's latency, so a run that quietly served half its queries
-    from memory would report a latency improvement that is an artefact and a quality figure
+    from memory would report a latency improvement that is an artifact and a quality figure
     computed from half as many observations as it claims. The retriever already knows whether a
     hit is possible — configuration alone is not enough, since a store with no generation
     counter disables the cache regardless — so that is what is checked.

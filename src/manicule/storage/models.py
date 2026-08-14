@@ -240,7 +240,7 @@ class Document(Base):
 
     A name rather than a foreign key to :class:`Connector`, because that is what
     :attr:`manicule.core.content.Document.source` carries. Documents therefore outlive the
-    deletion of a connector row, which is the behaviour reconciliation wants anyway.
+    deletion of a connector row, which is the behavior reconciliation wants anyway.
     """
 
     source_id: Mapped[str] = mapped_column(Text, nullable=False)
@@ -433,7 +433,7 @@ class DocumentVersion(Base):
     )
 
 
-# --- organisation ------------------------------------------------------------------------
+# --- organization ------------------------------------------------------------------------
 
 
 class Collection(Base):
@@ -496,9 +496,9 @@ class GlossaryEntry(Base):
     )
 
     acronym: Mapped[str] = mapped_column(Text, nullable=False)
-    """The normalised lookup key, upper case and stripped. Written by
-    :func:`~manicule.core.glossary.normalise_acronym` and read back with keys produced by the
-    same function; a store that normalised differently would miss silently."""
+    """The normalized lookup key, upper case and stripped. Written by
+    :func:`~manicule.core.glossary.normalize_acronym` and read back with keys produced by the
+    same function; a store that normalized differently would miss silently."""
 
     display: Mapped[str] = mapped_column(Text, nullable=False)
     expansion: Mapped[str] = mapped_column(Text, nullable=False)
@@ -584,7 +584,7 @@ class Conversation(Base):
     The argument is not that the hash protects this row from somebody holding the database —
     that person has the conversation anyway. It is that a share token is a live credential
     for an *unauthenticated* URL, and this database is backed up, exported and imported, so a
-    plaintext token travels into artefacts that leave the access boundary that created it.
+    plaintext token travels into artifacts that leave the access boundary that created it.
     The token is shown to its creator once and never stored.
 
     Revocation clears this column rather than flipping :attr:`shared` beside a still-valid
@@ -659,7 +659,7 @@ class Message(Base):
     )
     """The retrieval run behind this answer, when there was one.
 
-    ``SET NULL`` rather than ``CASCADE``: telemetry ageing out must not delete the answer a
+    ``SET NULL`` rather than ``CASCADE``: telemetry aging out must not delete the answer a
     person rated. Feedback that cannot name what produced the answer is a mood rather than a
     datum, so this is worth keeping — but the answer outlives the telemetry.
     """
@@ -800,7 +800,7 @@ class IndexState(Base):
     """One row describing what the derived indexes were built with.
 
     The fingerprints are canonical bytes in a ``TEXT`` column, not a JSON mapping. They are
-    compared for byte equality, and a JSON column round-trips through a serialiser that does
+    compared for byte equality, and a JSON column round-trips through a serializer that does
     not sort keys — so the stored bytes would depend on the insertion order of whatever
     mapping was passed in.
     """
@@ -826,7 +826,7 @@ class IndexState(Base):
 class VectorTombstone(Base):
     """A chunk id deleted from SQLite whose vector has not yet been swept.
 
-    Not an optimisation. Sweeping by comparing every id in the vector store against
+    Not an optimization. Sweeping by comparing every id in the vector store against
     ``chunks`` races with concurrent ingest — an id written after the scan began looks like an
     orphan — and the sweep would delete live vectors. A tombstone list only ever names things
     that were deleted, so it cannot.

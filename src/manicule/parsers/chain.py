@@ -50,7 +50,7 @@ WILDCARD = "*"
 
 Shipping ``["plaintext"]`` here means an unknown text-ish file is indexed with real line
 anchors rather than skipped. It only works because the plaintext parser refuses non-text
-bytes — without that refusal a shipped tail would index every unrecognised binary as
+bytes — without that refusal a shipped tail would index every unrecognized binary as
 mojibake, and ``unsupported_media_type`` would be unreachable because some parser would
 always claim every document.
 """
@@ -137,7 +137,7 @@ class ParserChain:
             available = ", ".join(sorted(self.parsers)) or "none installed"
             msg = (
                 f"parserFallbacks names {', '.join(missing)}, which no installed plugin "
-                f"provides. Available: {available}. A chain whose behaviour depends on what "
+                f"provides. Available: {available}. A chain whose behavior depends on what "
                 f"happens to be installed indexes the same document differently on different "
                 f"machines, so this is a startup error rather than a silent skip."
             )

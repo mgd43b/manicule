@@ -6,7 +6,7 @@ else's.
 
 **What is checked.** The recorded pid must exist *and* be signallable by this user:
 :func:`is_alive` reads ``PermissionError`` as "not ours", so another account's process is
-never signalled. The file lives in the data directory, so a second manicule serving a
+never signaled. The file lives in the data directory, so a second manicule serving a
 different directory has its own.
 
 **What is not.** A pid reused by *this* user, for this data directory, between the server

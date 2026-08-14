@@ -212,7 +212,7 @@ class MemoryVectorStore:
 
     Holds the same three things per row a Lance row holds — the chunk, the vector, and the
     embedding-input identity — and classifies them with the same shared rule, so a pipeline
-    test run against this store measures the reuse behaviour the real one has rather than a
+    test run against this store measures the reuse behavior the real one has rather than a
     convenient approximation of it.
     """
 

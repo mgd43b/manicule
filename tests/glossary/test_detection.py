@@ -12,7 +12,7 @@ import re
 import pytest
 
 from manicule.core.content import Chunk, Document
-from manicule.core.glossary import DefinitionForm, normalise_acronym, normalise_expansion
+from manicule.core.glossary import DefinitionForm, normalize_acronym, normalize_expansion
 from manicule.ingest import glossary as ingest_glossary
 from manicule.ingest.glossary import (
     GLOSSARY_CONTEXT_EVIDENCE,
@@ -48,7 +48,7 @@ WEB_MEDIA_TYPE = "text/html"
 FULL_WIDTH_SAFER = "\uff33a\uff26e\uff32"
 """``SaFeR`` with its three capitals written as full-width forms.
 
-The shape a CJK-locale exporter emits, and the input ``normalise_acronym`` has always collapsed
+The shape a CJK-locale exporter emits, and the input ``normalize_acronym`` has always collapsed
 on purpose. Written as escapes rather than pasted so the codepoints are legible in a diff and the
 linter's ambiguous-character rule can stay on for every other string in this file — a ``noqa``
 here would suppress it for the one line where a confusable character is the entire point.
@@ -120,7 +120,7 @@ def _rendered_rows(media_type: str) -> list[str]:
 def test_every_written_form_the_spec_names_is_detected(text: str, form: DefinitionForm) -> None:
     """``bugs/bug2.md`` §1, one case per bullet.
 
-    Parametrised rather than written as one test with eight assertions, so a form that stops
+    Parametrized rather than written as one test with eight assertions, so a form that stops
     working is named in the failure rather than hidden behind whichever assertion ran first.
     """
     entries = detect_in_chunk(chunk(text))
@@ -168,7 +168,7 @@ def test_a_definition_written_as_a_list_item_is_detected(text: str) -> None:
     ``'- HDR - Hot Draining Router'`` produced ``[]`` while the identical line without its
     marker produced an entry at 0.95.
 
-    Parametrised over the spellings the parsers actually emit — :mod:`~manicule.parsers.
+    Parametrized over the spellings the parsers actually emit — :mod:`~manicule.parsers.
     confluence`, :mod:`~manicule.parsers.web` and :mod:`~manicule.parsers.adf` write ``- `` and
     ``1. `` with two spaces of indent per level, and Markdown passes through whichever of
     ``-``, ``*`` and ``+`` the author typed.
@@ -325,7 +325,7 @@ def test_a_tables_header_and_rule_rows_are_not_definitions() -> None:
     assert [entry.acronym for entry in detect_in_chunk(chunk(text))] == ["NOW"]
 
 
-def test_a_term_written_with_dots_normalises_to_the_same_key() -> None:
+def test_a_term_written_with_dots_normalizes_to_the_same_key() -> None:
     entries = detect_in_chunk(chunk(f"N.O.W. — {EXPANSION}"))
 
     assert [entry.acronym for entry in entries] == ["NOW"]
@@ -384,7 +384,7 @@ def test_a_description_after_a_boundary_is_dropped(boundary: str, text: str) -> 
 def test_a_description_after_a_sentence_boundary_is_dropped() -> None:
     """The case that used to be asserted as a refusal, now asserted as an extraction.
 
-    Named separately from the parametrised sweep because it is the fixture whose expectation
+    Named separately from the parametrized sweep because it is the fixture whose expectation
     this change *inverts*, and a reviewer looking for that should find it by name.
     """
     entries = detect_in_chunk(
@@ -414,11 +414,11 @@ def test_the_trimmed_entry_still_cites_the_chunk_that_states_the_whole_line() ->
     assert entry.expansion != passage.text, "the entry is the term, not the line it came from"
 
 
-def test_a_stylized_spelling_is_displayed_and_a_normalised_key_is_stored() -> None:
+def test_a_stylized_spelling_is_displayed_and_a_normalized_key_is_stored() -> None:
     """Requirement 4, at the point of detection.
 
     ``ReLAY`` is written with deliberate internal case. What is *shown* is the source's own
-    spelling; what is *looked up* is the normalised key, and a reader who types either finds it.
+    spelling; what is *looked up* is the normalized key, and a reader who types either finds it.
     The same line also carries a description, so the two features are proved to compose rather
     than each being proved on a fixture built for it alone.
     """
@@ -437,13 +437,13 @@ def test_a_right_hand_side_with_no_initials_evidence_is_kept_whole() -> None:
     ``central processor`` does not spell ``CPU`` under any reading this module has, so nothing
     here knows where the expansion ends, and guessing at the comma would store a phrase on no
     evidence at all. The whole right-hand side is kept and the length rule still bounds it. This
-    is a limitation being pinned down, not a behaviour being praised.
+    is a limitation being pinned down, not a behavior being praised.
 
     **This case used to be ``HTTP — HyperText Transfer Protocol, used by every browser``, and it
     was moved rather than deleted.** That line is now cut correctly, because ``HyperText`` is a
     compound whose components spell the two ``T``s — see
     ``test_a_compound_word_supplies_initials_its_whole_word_does_not``, which asserts the new
-    behaviour by name. The limitation this test is about is real and still has cases; it just no
+    behavior by name. The limitation this test is about is real and still has cases; it just no
     longer has that one.
     """
     entries = detect_in_chunk(chunk("CPU — central processor, the part that executes instructions"))
@@ -507,7 +507,7 @@ def test_a_bracketed_expansion_takes_the_parenthetical_weight_and_not_the_headin
     accident.
 
     **And 0.85 is the answer the prose form already gives**, which is why this is consistency
-    rather than a new judgement — the third assertion is the same fact written the other way
+    rather than a new judgment — the third assertion is the same fact written the other way
     round, refused today by the identical sum.
     """
     admitted = detect_in_chunk(
@@ -561,7 +561,7 @@ async def test_a_definition_list_is_detected_through_the_real_parser(media_type:
 
     So this asserts through the parser rather than on a hand-written string, which is the whole
     point — the unit test passed throughout and said nothing about whether the form worked.
-    Parametrised over both parsers that render ``<dl>``; ADF has no definition-list node type.
+    Parametrized over both parsers that render ``<dl>``; ADF has no definition-list node type.
     """
     body = (
         "<dl><dt>NOW</dt><dd>Network Operations Workspace</dd>"
@@ -602,7 +602,7 @@ async def test_a_second_definition_under_one_term_is_not_silently_chosen_between
 
     The line above the second ``: `` is itself a ``: `` line, which is not a term, so the shape
     gate refuses it. That is the conservative outcome and it is asserted rather than left to
-    chance: choosing which of two definitions a term has is the judgement this feature is
+    chance: choosing which of two definitions a term has is the judgment this feature is
     forbidden to make.
     """
     raw = raw_of(
@@ -665,8 +665,8 @@ def test_a_comma_inside_a_parenthetical_does_not_end_the_expansion(line: str) ->
        ``initials_of`` keeps only words whose first character is alphabetic, ``(e.g`` begins with
        a bracket and contributes nothing, and the three surviving words spell ``RNE`` exactly.
 
-    So the cut was awarded by an artefact of the initials filter rather than by evidence about
-    where the expansion ends. Parametrised over three separators because the fault is in
+    So the cut was awarded by an artifact of the initials filter rather than by evidence about
+    where the expansion ends. Parametrized over three separators because the fault is in
     ``core_expansion``, which every written form shares — a fix proved on one of them would say
     nothing about the other two.
     """
@@ -734,7 +734,7 @@ def test_a_parenthetical_survives_when_no_prefix_before_it_spells_the_term() -> 
     """**Requirement 4, and the fixture is chosen so that it can fail.**
 
     A naive "cut at the first parenthesis" rule stores ``central processor`` here. This one
-    stores the whole thing, because nothing authorises the cut: ``central processor`` spells
+    stores the whole thing, because nothing authorizes the cut: ``central processor`` spells
     ``CP`` and not ``CPU``, so the bracket is offered and refused, and with no boundary earned
     the right-hand side is taken whole exactly as it was before brackets were read at all.
 
@@ -862,7 +862,7 @@ def test_a_compound_word_supplies_initials_its_whole_word_does_not(
     example of the conservative fallback — no initials evidence, so keep the whole right-hand side
     including ``used by every browser`` — and under component initials it spells ``HTTP`` exactly
     and the description is trimmed. That is the correct expansion of the term, so this is a
-    documented limitation being closed rather than a behaviour changing by accident, and the test
+    documented limitation being closed rather than a behavior changing by accident, and the test
     that pinned the old reading now says so and uses a different term.
     """
     entries = detect_in_chunk(chunk(line))
@@ -1060,8 +1060,8 @@ def test_a_free_subsequence_scan_would_match_and_this_matcher_refuses(
         f"scanning matcher from a boundary-respecting one"
     )
 
-    assert not initials_match(normalise_acronym(term), phrase, display=term)
-    assert core_expansion(normalise_acronym(term), phrase, display=term) == phrase, (
+    assert not initials_match(normalize_acronym(term), phrase, display=term)
+    assert core_expansion(normalize_acronym(term), phrase, display=term) == phrase, (
         "the phrase alone is short enough to keep whole; the refusal under test is of the cut"
     )
     assert detect_in_chunk(chunk(line)) == []
@@ -1084,7 +1084,7 @@ def test_the_widened_matcher_awards_no_cut_inside_the_protected_prose(text: str)
     term, _, right = text.partition(" - ")
     whole = re.sub(r"\s+", " ", right.strip()).rstrip(".").strip()
 
-    core = core_expansion(normalise_acronym(term), right, display=term)
+    core = core_expansion(normalize_acronym(term), right, display=term)
 
     assert core in {"", whole}, f"a prefix of {right!r} was selected as the expansion of {term}"
 
@@ -1105,7 +1105,7 @@ def test_the_widened_matcher_awards_no_cut_inside_the_protected_prose(text: str)
 def test_prose_shaped_like_a_definition_is_refused(text: str) -> None:
     """The gate that does not negotiate.
 
-    Every one of these has exactly the shape of a real definition — a capitalised word, a
+    Every one of these has exactly the shape of a real definition — a capitalized word, a
     separator, a phrase. What refuses them is that the word is not *written* like an
     abbreviation, and no amount of glossary-looking context can buy that off.
     """
@@ -1184,7 +1184,7 @@ measured only against those can be made perfect by refusing everything.
 ``HTTP — HyperText Transfer Protocol`` was a member and is not one any more, and the reason is
 worth recording rather than editing away. Component initials read ``HyperText`` as two words, so
 that pair now *does* spell its term and the case no longer reaches the rule this population
-exists to constrain — the parametrised assertion below caught it, which is what that assertion is
+exists to constrain — the parametrized assertion below caught it, which is what that assertion is
 for. It moved to ``test_a_compound_word_supplies_initials_its_whole_word_does_not``. ``NIC`` and
 ``PSU`` replace it so the population does not quietly shrink by one every time a case graduates.
 """
@@ -1214,7 +1214,7 @@ def test_an_abbreviation_is_never_mistaken_for_the_pronoun_it_casefolds_onto(
 
     Asserted at the level of the predicate as well as through ``core_expansion`` because this is
     where the distinction is drawn, and because ``It`` — sentence-initial, one of two letters
-    upper — has to stay refused: a capitalised pronoun at the start of prose is still a pronoun.
+    upper — has to stay refused: a capitalized pronoun at the start of prose is still a pronoun.
     """
     assert has_a_refused_opening(f"{first_word} something else".strip()) is refused
 
@@ -1248,7 +1248,7 @@ def test_an_expansion_cut_at_a_sentence_end_keeps_none_of_its_punctuation(ending
     can land after any of the three; ``_usable_expansion`` stripped ``.`` alone. The surviving
     ``!`` or ``?`` was then stored as part of the term's meaning and went into query rewrites.
 
-    Parametrised rather than written once with a period, because a period passed before this
+    Parametrized rather than written once with a period, because a period passed before this
     change and would have gone on passing: the case that fails is the ending nobody stripped.
     """
     right = f"Network Operations Visibility Assistant{ending} It correlates operational signals"
@@ -1276,10 +1276,10 @@ def test_two_sentences_are_never_stored_as_one_expansion(ending: str) -> None:
     assert core_expansion("ABCD", f"Alpha Bravo{ending} Charlie Delta") == ""
 
 
-def test_a_stylized_terms_skeleton_is_reachable_from_a_normalised_key() -> None:
+def test_a_stylized_terms_skeleton_is_reachable_from_a_normalized_key() -> None:
     """The skeleton and the key have to be in one normal form, or the pair compares against none.
 
-    ``normalise_acronym`` NFKC-normalises deliberately, so :data:`FULL_WIDTH_SAFER` keys under an
+    ``normalize_acronym`` NFKC-normalizes deliberately, so :data:`FULL_WIDTH_SAFER` keys under an
     ASCII ``SAFER``. Reading the display raw skeletoned it to a full-width ``SFR``, which no
     expansion's initials can ever spell — the second comparison form was not wrong so much as
     unreachable, and the detection was lost silently.
@@ -1290,17 +1290,17 @@ def test_a_stylized_terms_skeleton_is_reachable_from_a_normalised_key() -> None:
     assert initial_skeleton("SaFeR") == "SFR", "the ASCII control moved"
     assert initial_skeleton(FULL_WIDTH_SAFER) == "SFR"
     assert initials_match(
-        normalise_acronym(FULL_WIDTH_SAFER),
+        normalize_acronym(FULL_WIDTH_SAFER),
         "Secure Automated Framework Estimating Risk",
         display=FULL_WIDTH_SAFER,
     )
 
 
-def test_both_comparison_forms_are_normalised_even_when_the_caller_normalised_neither() -> None:
+def test_both_comparison_forms_are_normalized_even_when_the_caller_normalized_neither() -> None:
     """``_phrase_before`` passes the raw surface as the key, so ``term_forms`` cannot assume one.
 
-    Two callers disagree about what they hand this: ``detect`` passes a ``normalise_acronym``
-    key, ``_phrase_before`` passes the parenthesised surface unchanged. Normalising only inside
+    Two callers disagree about what they hand this: ``detect`` passes a ``normalize_acronym``
+    key, ``_phrase_before`` passes the parenthesized surface unchanged. Normalizing only inside
     ``initial_skeleton`` would leave the second building a set with one full-width member and one
     ASCII one — the same defect, one call site along. Asserted on the set itself because that is
     where two normal forms can coexist.
@@ -1369,7 +1369,7 @@ def test_an_expansion_that_is_really_a_sentence_is_refused(expansion: str) -> No
 
     The second case used to read ``Network Operations Workspace. It replaced three
     spreadsheets`` and asserted a refusal. It is now *admitted*, trimmed to the expansion, and
-    that is the required behaviour rather than a regression — a sentence boundary is one of the
+    that is the required behavior rather than a regression — a sentence boundary is one of the
     description boundaries a definition is allowed to be followed by, and the initials of the
     first sentence spell ``NOW``. ``test_a_description_after_a_sentence_boundary_is_dropped``
     covers it. What survives here is the case the guard was always really about: prose with
@@ -1518,7 +1518,7 @@ def test_a_heading_path_naming_a_glossary_is_still_evidence() -> None:
     assert [entry.acronym for entry in entries] == ["FATHOM"]
 
 
-# --- normalisation ----------------------------------------------------------------------------
+# --- normalization ----------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -1535,20 +1535,20 @@ def test_a_heading_path_naming_a_glossary_is_still_evidence() -> None:
         ("supercalifragilistic", ""),
     ],
 )
-def test_a_surface_form_normalises_to_one_key(surface: str, key: str) -> None:
+def test_a_surface_form_normalizes_to_one_key(surface: str, key: str) -> None:
     """Query time and ingest time must agree exactly, so there is one function and one test."""
-    assert normalise_acronym(surface) == key
+    assert normalize_acronym(surface) == key
 
 
 def test_two_expansions_are_the_same_only_when_they_say_the_same_thing() -> None:
     """Case and spacing are noise; word order is a different claim.
 
-    Normalising word order away would silently merge two definitions that disagree, which is
+    Normalizing word order away would silently merge two definitions that disagree, which is
     the one thing this feature must never do quietly.
     """
-    assert normalise_expansion("Network Operations Workspace") == normalise_expansion(
+    assert normalize_expansion("Network Operations Workspace") == normalize_expansion(
         "network   operations workspace."
     )
-    assert normalise_expansion("Network Operations Workspace") != normalise_expansion(
+    assert normalize_expansion("Network Operations Workspace") != normalize_expansion(
         "Workspace, Network Operations"
     )

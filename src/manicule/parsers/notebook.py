@@ -297,7 +297,7 @@ def _placed_items(
             continue
 
         # nbformat 4 defines exactly three cell types, so anything else is a cell this parser
-        # cannot label. It is skipped rather than guessed at: labelling it prose would put an
+        # cannot label. It is skipped rather than guessed at: labeling it prose would put an
         # unknown structure into the index as if its kind were a fact.
         if cell_type == "raw" and config.include_raw_cells:
             text = source.strip()

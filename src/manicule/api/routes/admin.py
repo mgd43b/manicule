@@ -59,7 +59,7 @@ async def query_logs(
     Written by the service on every ``search`` and every ``ask``, so this describes every
     retrieval this installation ran rather than the ones one surface remembered to record.
     The stored chunk ids are reported as a **count**: corpus structure has no business
-    travelling with a telemetry listing.
+    traveling with a telemetry listing.
     """
     del caller
     return await respond(

@@ -5,7 +5,7 @@ somebody's feature branch.
 
 **The share token stops being stored in plaintext.** It is a live bearer credential for an
 unauthenticated URL, and this database is backed up, exported and imported — so a plaintext
-token travels into artefacts that leave the access boundary that created it. Hashed, like
+token travels into artifacts that leave the access boundary that created it. Hashed, like
 ``api_keys.key_hash``, and shown to its creator exactly once. ``share_expires_at`` and
 ``shared_at`` arrive with it: a capability with no expiry accumulates forever and the set of
 live ones becomes unknowable, and a share has to be a *snapshot* rather than a live view of a
@@ -18,7 +18,7 @@ generation failed, and both are ratable while neither has a usable ``query_logs`
 
 **Existing tokens are not migrated, they are revoked.** Hashing a stored plaintext token
 would preserve every link that exists — which is the *opposite* of what this revision is for,
-since those tokens have already travelled wherever the backups went. Rows carrying one are
+since those tokens have already traveled wherever the backups went. Rows carrying one are
 un-shared, and re-sharing is one click. The downgrade cannot restore them either, and says
 so, because a downgrade that invents plaintext tokens would be worse than one that loses
 them.
@@ -135,7 +135,7 @@ def upgrade() -> None:
         batch_op.create_unique_constraint("uq_conversations_share_token_hash", ["share_token_hash"])
 
     # Revoked, not migrated. See the module docstring: every plaintext token that existed has
-    # already travelled wherever this database's backups went.
+    # already traveled wherever this database's backups went.
     op.execute(sa.text("UPDATE conversations SET shared = 0"))
 
     with op.batch_alter_table(

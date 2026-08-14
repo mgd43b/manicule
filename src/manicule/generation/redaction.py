@@ -186,7 +186,7 @@ class Redactor:
         the same address is the same token in every passage and the model can still tell that
         two mentions are one person. That only holds if the digest is keyed. **An unsalted
         digest of an email address is reversible by anyone with a word list**, and a truncated
-        one collides — so sending a hash instead of the value would be privacy theatre that
+        one collides — so sending a hash instead of the value would be privacy theater that
         costs answer quality and buys nothing.
 
         Generated rather than defaulted, because a default salt is no salt at all: every

@@ -78,7 +78,7 @@ def test_a_wiki_link_is_released_without_waiting_for_the_marker_bound() -> None:
         ("[[CITE:2]]", (2,)),
     ],
 )
-def test_the_one_normalisation_is_of_syntax_the_binder_defined_itself(
+def test_the_one_normalization_is_of_syntax_the_binder_defined_itself(
     written: str, slots: tuple[int, ...]
 ) -> None:
     events = scan(written)
@@ -123,7 +123,7 @@ def test_slot_zero_parses_so_that_range_checking_can_reject_it() -> None:
     assert parse_slots(":0") == (0,)
 
 
-def test_escaping_neutralises_exactly_what_the_scanner_would_bind() -> None:
+def test_escaping_neutralizes_exactly_what_the_scanner_would_bind() -> None:
     """manicule's own documentation describes this syntax and is exactly the sort of thing
     somebody indexes. A passage containing a literal marker that the model quoted back would
     otherwise bind — to a real passage, so it would even verify."""

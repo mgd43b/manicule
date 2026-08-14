@@ -17,7 +17,7 @@ would keep passing after the check was deleted.
 satisfy half of these on its own, so each refusal is accompanied by the same call succeeding
 for a document this workspace does own.
 
-The last assertion in the leak tests is over the **serialised envelope**, not over an
+The last assertion in the leak tests is over the **serialized envelope**, not over an
 exception type. A guard that raised the right error while putting the foreign document's title
 into the message would have leaked precisely what it was defending.
 """
@@ -37,7 +37,7 @@ from manicule.core.ids import document_id
 from manicule.core.retrieval import Candidate
 from tests.app.fakes import (
     FakeBackend,
-    LeakyOrganisation,
+    LeakyOrganization,
     LeakyStore,
     make_chunk,
     make_document,
@@ -177,12 +177,12 @@ async def test_ask_refuses_before_the_model_is_called() -> None:
 
 
 @pytest.mark.parametrize("operation", ["document_get", "document_list", "search"])
-async def test_no_byte_of_the_other_workspace_reaches_the_serialised_result(
+async def test_no_byte_of_the_other_workspace_reaches_the_serialized_result(
     operation: str,
 ) -> None:
     """The strongest form of the claim, and the one a hand-edited assertion cannot satisfy.
 
-    The envelope is serialised to JSON and searched for the foreign document's title, its
+    The envelope is serialized to JSON and searched for the foreign document's title, its
     text, its id and its workspace name. An error message that named any of them would fail
     here even though the refusal itself worked — which is the failure mode a test asserting
     only ``pytest.raises`` would miss.
@@ -252,23 +252,23 @@ async def test_a_document_this_workspace_has_never_seen_is_not_reported_as_exist
 # by a deliberately broken store so the surface's own check is what is being observed.
 
 
-def _leaky_organisation() -> tuple[LeakyOrganisation, LeakyStore, str]:
-    """An organisation store and a document store, each holding one of ours and one of theirs."""
+def _leaky_organization() -> tuple[LeakyOrganization, LeakyStore, str]:
+    """An organization store and a document store, each holding one of ours and one of theirs."""
     store = LeakyStore(workspace_id=OURS)
     ours = make_document(OURS, source_id="ours.md", title="Our runbook")
     foreign = make_document(THEIRS, source="hr", source_id="comp.md", title=THEIR_TITLE)
     store.add(ours)
     store.add(foreign, make_chunk(foreign, text=THEIR_TEXT))
 
-    organisation = LeakyOrganisation(workspace_id=OURS)
-    organisation.documents[ours.id] = ours
-    organisation.documents[foreign.id] = foreign
-    return organisation, store, foreign.id
+    organization = LeakyOrganization(workspace_id=OURS)
+    organization.documents[ours.id] = ours
+    organization.documents[foreign.id] = foreign
+    return organization, store, foreign.id
 
 
-def _service_with(organisation: LeakyOrganisation, store: LeakyStore) -> ApplicationService:
+def _service_with(organization: LeakyOrganization, store: LeakyStore) -> ApplicationService:
     return ApplicationService(
-        FakeBackend(settings=Settings(workspace=OURS), store=store, organisation_=organisation)
+        FakeBackend(settings=Settings(workspace=OURS), store=store, organization_=organization)
     )
 
 
@@ -278,16 +278,16 @@ async def test_counting_a_collection_refuses_a_foreign_member_rather_than_counti
     A leaked member would inflate a number rather than print a title, which is the quiet
     version of the same disclosure: it tells a caller how much another tenant has.
     """
-    organisation, store, foreign_id = _leaky_organisation()
-    collection = await organisation.create_collection("mixed")
+    organization, store, foreign_id = _leaky_organization()
+    collection = await organization.create_collection("mixed")
     ours = document_id(OURS, "local", "ours.md")
-    organisation.members[collection.id] = [ours, foreign_id]
-    service = _service_with(organisation, store)
+    organization.members[collection.id] = [ours, foreign_id]
+    service = _service_with(organization, store)
 
     with pytest.raises(CrossWorkspaceError):
         await service.collection_counts(collection.id)
 
-    organisation.members[collection.id] = [ours]
+    organization.members[collection.id] = [ours]
     counted = await service.collection_counts(collection.id)
     assert counted.documents == 1
 
@@ -300,8 +300,8 @@ async def test_the_orphan_sweep_refuses_a_foreign_document_rather_than_trashing_
     property: a guard that raised after the loop had already soft-deleted would have destroyed
     somebody else's corpus and then reported an error about it.
     """
-    organisation, store, foreign_id = _leaky_organisation()
-    service = _service_with(organisation, store)
+    organization, store, foreign_id = _leaky_organization()
+    service = _service_with(organization, store)
 
     with pytest.raises(CrossWorkspaceError):
         await service.collection_orphans(delete=True)
@@ -313,12 +313,12 @@ async def test_a_search_scoped_to_a_collection_that_does_not_exist_is_refused() 
     """Refused, never widened.
 
     An unknown name resolving to "no collections" would leave the filter unrestricted, and an
-    empty field restricts nothing — so a misspelt collection would return the whole workspace,
+    empty field restricts nothing — so a misspelled collection would return the whole workspace,
     ranked and plausible. The refusal is what stops a typo becoming a wider search than the
     one anybody asked for.
     """
-    organisation, store, _ = _leaky_organisation()
-    service = _service_with(organisation, store)
+    organization, store, _ = _leaky_organization()
+    service = _service_with(organization, store)
 
     with pytest.raises(UnknownEntityError):
         await service.search("anything", collections=["no-such-collection"])

@@ -99,7 +99,7 @@ _MAX_SYMBOL_DEPTH = 16
 """How far a split may deepen a key path before it divides by lines instead.
 
 A sixteen-element key path is longer than any citation would display, and a document nested
-deeper than that is a serialised object graph rather than something a person wrote. Splitting
+deeper than that is a serialized object graph rather than something a person wrote. Splitting
 it further would buy a symbol nobody reads at the cost of unbounded recursion on hostile
 input.
 """
@@ -168,7 +168,7 @@ class StructuredParser:
         lines = lines_of(text)
         for span in self._spans(form, text, lines, raw.uri):
             yield ParsedBlock(
-                # ``code`` rather than ``prose``: a serialisation format is not written to be
+                # ``code`` rather than ``prose``: a serialization format is not written to be
                 # read as sentences, and the kind is what stops the chunker overlapping two
                 # blocks — an overlap window copies the previous chunk's text into this one,
                 # which a line span cannot honestly claim (``docs/parsing.md`` §1.5).
@@ -450,7 +450,7 @@ def _toml_key_reader(keys: frozenset[str]) -> Callable[[str], str | None]:
 
 
 def _toml_header_parts(inner: str) -> tuple[str, ...] | None:
-    """Split a dotted TOML name into its parts, honouring quoting.
+    """Split a dotted TOML name into its parts, honoring quoting.
 
     ``None`` when the text is not a well-formed dotted name, which is the answer that keeps a
     line inside a multi-line string from becoming a section boundary.
@@ -487,7 +487,7 @@ def _quoted(part: str) -> str:
 
 
 def _symbol_parts(symbol: str) -> list[str]:
-    """Split a dotted symbol back into its elements, honouring the quoting above."""
+    """Split a dotted symbol back into its elements, honoring the quoting above."""
     parts = _toml_header_parts(symbol)
     return list(parts) if parts is not None else [symbol]
 
@@ -528,7 +528,7 @@ def _partition(
     merging two blocks resolves to every line between the first block's start and the last
     block's end, so a line belonging to no block would appear in the citation and in no
     chunk's text. Only trailing *blank* lines are trimmed, because whitespace is the one thing
-    the round-trip normaliser removes from both sides of that comparison.
+    the round-trip normalizer removes from both sides of that comparison.
     """
     inside = [mark for mark in marks if first <= mark.line <= last]
     if not inside:

@@ -14,7 +14,7 @@ the same place.
 So before any preference is recorded, each side must demonstrate that it retrieves at all.
 
 **How.** A probe is a set of questions whose answer is known by construction — no relevance
-judgements, no labelling session. The default construction uses document titles: searching for
+judgments, no labeling session. The default construction uses document titles: searching for
 a document's title should return that document. That is the least a retrieval system can be
 asked to do, which is exactly the property wanted; a probe that only a good system passes
 would be a quality benchmark, and this is a liveness check.
@@ -102,7 +102,7 @@ TITLE_PAGE = 200
 ARITHMETIC_TOLERANCE = 1e-9
 """How far a recorded figure may sit from its recomputation before the outcome is refused.
 
-Floating-point slack rather than a margin of judgement: the check re-runs the same
+Floating-point slack rather than a margin of judgment: the check re-runs the same
 computations that produced the numbers, so anything larger means they came from somewhere else.
 """
 
@@ -182,7 +182,7 @@ class ProbeOutcome(BaseModel):
                     f"{name} is recorded as {recorded!r} but recomputing it from this outcome's "
                     f"own numbers gives {recomputed!r}. A probe outcome whose arithmetic does "
                     f"not hold was not produced by a probe, and the verdict it carries decides "
-                    f"whether a whole file of judgements counts"
+                    f"whether a whole file of judgments counts"
                 )
                 raise ValueError(msg)
         return self
@@ -192,7 +192,7 @@ class ProbeOutcome(BaseModel):
         """Whether this system retrieves better than guessing would.
 
         ``False`` is not a soft finding. A side that fails this may not have preferences
-        recorded for it, and records already carrying a failure may not be summarised.
+        recorded for it, and records already carrying a failure may not be summarized.
         """
         return self.p_value <= self.alpha
 
@@ -389,7 +389,7 @@ async def probe_from_titles(
     workspace_ids: frozenset[str],
     limit: int = 100,
 ) -> tuple[ProbeItem, ...]:
-    """Derive probe items from the corpus, with no labelling and no authoring.
+    """Derive probe items from the corpus, with no labeling and no authoring.
 
     A document's own title, used as the query, with that document as the known answer. This is
     a deliberately low bar — a title is the most retrievable text a document has — and a low

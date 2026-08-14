@@ -19,7 +19,7 @@ class FinishReason(StrEnum):
     """The model finished its answer."""
 
     LENGTH = "length"
-    """The token budget ran out. The answer is truncated and should be labelled so."""
+    """The token budget ran out. The answer is truncated and should be labeled so."""
 
     CONTENT_FILTER = "content_filter"
     """The provider refused to continue."""

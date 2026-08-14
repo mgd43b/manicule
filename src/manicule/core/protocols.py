@@ -37,7 +37,7 @@ from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, 
 from manicule.core.embedding import EmbedFingerprint, StoredVector, TokenStates, Vector
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.generation import Token
-from manicule.core.organisation import (
+from manicule.core.organization import (
     ChunkEdge,
     ChunkRelationType,
     CitationResolution,
@@ -128,7 +128,7 @@ async def bounded(awaitable: Awaitable[None], deadline_s: float | None) -> None:
     deadline anyway. The same fact the parse workers had to establish: ``wait_for`` cancels the
     await, not the work.
 
-    Past the deadline the task is cancelled and left. Whatever it holds goes to its own pool's
+    Past the deadline the task is canceled and left. Whatever it holds goes to its own pool's
     teardown, which is the trade this bound was always making: a leaked socket is recovered by
     the pool, a shutdown that never returns is recovered by nothing.
 
@@ -167,8 +167,8 @@ async def parsing(parser: Parser, raw: RawDocument) -> AsyncGenerator[AsyncItera
     body — stays suspended, holding whatever it had open at the ``yield``: a document handle,
     a native text page, a decompression stream.
 
-    Nothing collects it promptly. CPython finalises a live async generator through the event
-    loop that created it, so one still suspended when that loop closes is finalised late,
+    Nothing collects it promptly. CPython finalizes a live async generator through the event
+    loop that created it, so one still suspended when that loop closes is finalized late,
     from the wrong loop, after the resources it is about to release have been torn down. The
     observable result is not a warning; it is a crash inside the interpreter's allocator, on
     a stack that names no library anyone here wrote.
@@ -218,7 +218,7 @@ async def aclose[T](stream: AsyncIterator[T], *, timeout: float | None = None) -
     # exactly the shutdown this bound exists to guarantee. The same fact the parse workers had
     # to establish: `wait_for` cancels the await, not the work.
     #
-    # So the close runs as a task, and past the deadline the task is cancelled and **left**.
+    # So the close runs as a task, and past the deadline the task is canceled and **left**.
     # The connection goes to the pool's own teardown, which is the trade this bound was always
     # making: a leaked socket is recovered by the pool, a shutdown that never returns is
     # recovered by nothing.
@@ -323,7 +323,7 @@ class TokenStateEmbedder(Embedder, Protocol):
 
 @runtime_checkable
 class VectorStore(Protocol):
-    """Dense vector storage and nearest-neighbour search."""
+    """Dense vector storage and nearest-neighbor search."""
 
     async def ensure_ready(
         self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
@@ -402,7 +402,7 @@ class VectorStore(Protocol):
 class DocStore(Protocol):
     """Relational storage: documents, chunks, lexical search, sync state.
 
-    Shaped by what ingest and retrieval need. Organisation on top of the corpus arrives as
+    Shaped by what ingest and retrieval need. Organization on top of the corpus arrives as
     protocols of its own — :class:`CollectionStore`, :class:`TagStore`, :class:`VersionStore`,
     :class:`TrashStore` and :class:`ChunkRelationStore` — and **one class may implement
     several**; :class:`manicule.storage.docstore.SqliteDocStore` implements all six. Splitting
@@ -465,7 +465,7 @@ class DocStore(Protocol):
         ...
 
 
-# --- organisation --------------------------------------------------------------------------
+# --- organization --------------------------------------------------------------------------
 #
 # Five protocols rather than five more methods on DocStore, and the split is not cosmetic.
 # Every one of them is workspace-scoped in exactly the way DocStore is: the handle carries the
@@ -478,9 +478,9 @@ class DocStore(Protocol):
 class CollectionStore(Protocol):
     """Named sets of documents: manual membership, rule-driven membership, or both.
 
-    **Membership is evaluated, not materialised.** A collection with a
-    :class:`~manicule.core.organisation.CollectionRule` reports the documents the rule selects
-    *now*, unioned with whatever was added by hand. Materialising the rule's answer at write
+    **Membership is evaluated, not materialized.** A collection with a
+    :class:`~manicule.core.organization.CollectionRule` reports the documents the rule selects
+    *now*, unioned with whatever was added by hand. Materializing the rule's answer at write
     time would make the collection a snapshot with a name that promises otherwise, and there
     would be nothing to notice it had gone stale.
     """
@@ -569,7 +569,7 @@ class TagStore(Protocol):
         to raise on a name that is already taken, which for a label is never the outcome the
         caller wanted — tagging is an operation people repeat.
 
-        An existing tag's colour is left alone. Overwriting it would make the last person to
+        An existing tag's color is left alone. Overwriting it would make the last person to
         type the name the one who decides how it looks everywhere; :meth:`set_tag_color` is
         the deliberate way to change it.
         """
@@ -651,7 +651,7 @@ class VersionStore(Protocol):
         unchanged kept its id, and a chunk whose text changed did not — the id dangles instead
         of re-pointing. Returning the passage that replaced it would be a location that is
         plausible and wrong, which is the one outcome ``docs/contracts.md`` §1 rules out. What
-        this returns instead is the absence, labelled: superseded, deleted, or unknown.
+        this returns instead is the absence, labeled: superseded, deleted, or unknown.
         """
         ...
 
@@ -908,7 +908,7 @@ async def generating(
 
     Two exits have to be covered and they arrive differently. ``aclose()`` — a consumer that
     stopped early, or this ``finally`` — raises :exc:`GeneratorExit` at the ``yield``.
-    :exc:`asyncio.CancelledError` — the client disconnected and the task was cancelled —
+    :exc:`asyncio.CancelledError` — the client disconnected and the task was canceled —
     arrives at whatever ``await`` the generator is suspended on, usually inside the provider
     read. One ``try``/``finally`` in the implementation covers both, and only a ``finally``
     runs after ``GeneratorExit``.
@@ -1020,7 +1020,7 @@ class Middleware(Protocol):
 
     Every hook is **transformational**: it receives a value and returns the value the
     pipeline continues with. There is no in-place mutation contract and no discarded return
-    — a hook that returns a new object has an effect, which is the only behaviour anybody
+    — a hook that returns a new object has an effect, which is the only behavior anybody
     expects from it.
 
     ``before_parse`` may return ``None`` to drop a document, which records it as

@@ -56,7 +56,7 @@ async def chat_stream(
     have returned. A client that reads only that frame has made the non-streaming call.
 
     **Abandonment is not swallowed.** If the caller disconnects, the consuming task is
-    cancelled, the generator is closed, and the answer path's own cleanup releases the open
+    canceled, the generator is closed, and the answer path's own cleanup releases the open
     response to the model. A stream that caught cancellation to "tidy up" would leave a
     provider connection generating tokens nobody will read.
     """

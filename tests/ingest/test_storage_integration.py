@@ -309,7 +309,7 @@ async def test_a_mirrored_page_with_a_manifest_cites_the_page_through_the_real_s
     # The identity, which is now the page's own and no longer where the file happens to sit.
     assert stored.source_id == "123456", (
         "a manifest that declares a source_id declares the document's identity; keying on the "
-        "path instead makes a reorganised mirror a corpus of new documents and orphans the old"
+        "path instead makes a reorganized mirror a corpus of new documents and orphans the old"
     )
     assert stored.id == document_id("default", "local", "123456")
 
@@ -842,7 +842,7 @@ async def test_a_collection_survives_the_page_being_moved(
     """Curation is the thing a path-keyed identity loses, so it is the thing to prove survives.
 
     Collection membership and tags hang off ``documents.id`` with ``ON DELETE CASCADE``. Under
-    path identity a reorganised mirror is a corpus of new documents beside a corpus of orphans,
+    path identity a reorganized mirror is a corpus of new documents beside a corpus of orphans,
     and every hand-curated collection quietly empties — a loss no re-sync repairs because the
     curation is not in the corpus. Under the page's own identity the row is the same row, so the
     membership is still there afterwards. Asserted against the real store because the cascade is
@@ -863,7 +863,7 @@ async def test_a_collection_survives_the_page_being_moved(
     collection = await store.create_collection("runbooks", description="on-call")
     assert await store.add_to_collection(collection.id, [document.id]) == 1
 
-    moved = corpus / "reorganised"
+    moved = corpus / "reorganized"
     moved.mkdir()
     for name in ("1002.html", "1002.html.source.json"):
         (corpus / name).rename(moved / name)
@@ -877,7 +877,7 @@ async def test_a_collection_survives_the_page_being_moved(
     )
     assert after.provenance is not None
     assert after.provenance.snapshot is not None
-    assert after.provenance.snapshot.path == "reorganised/1002.html"
+    assert after.provenance.snapshot.path == "reorganized/1002.html"
     await vectors.teardown()
 
 

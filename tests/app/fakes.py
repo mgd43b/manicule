@@ -23,7 +23,7 @@ from manicule.app.ports import (
     Ingesting,
     Keys,
     Maintenance,
-    Organising,
+    Organizing,
     Retrieving,
     Telemetry,
 )
@@ -36,8 +36,8 @@ from manicule.core.embedding import IndexFingerprints
 from manicule.core.errors import NameInUseError, UnknownEntityError
 from manicule.core.glossary import QueryExpansion
 from manicule.core.ids import chunk_id, content_hash, document_id
-from manicule.core.organisation import Collection as DocumentCollection
-from manicule.core.organisation import CollectionRule, Restoration, Tag, TrashEntry
+from manicule.core.organization import Collection as DocumentCollection
+from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
 from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.core.retrieval import Candidate, Confidence, ConfidenceBand, Context, Query
 from manicule.generation.answers import AnswerEnvelope, AnswerEvent, EventKind
@@ -52,7 +52,7 @@ from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.ingest.pipeline import RunReport
 from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
 from manicule.retrieval.retriever import RetrievalResult
-from manicule.storage.organisation import normalise_name
+from manicule.storage.organization import normalize_name
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Mapping, Sequence
@@ -146,7 +146,7 @@ class FakeStore:
     ) -> Sequence[Document]:
         """A page, filtered the way a correct store filters it.
 
-        Honouring ``document_ids`` and the workspace scope matters here rather than being
+        Honoring ``document_ids`` and the workspace scope matters here rather than being
         pedantry about a fake: a correct store is the control the leaky one is measured
         against, and a control that also leaked would make the experiment meaningless.
         """
@@ -251,10 +251,10 @@ class LeakyStore(FakeStore):
 
 
 @dataclass
-class FakeOrganisation:
+class FakeOrganization:
     """Collections, tags and the trash, held in memory and correctly scoped.
 
-    The control for :class:`LeakyOrganisation`. Every read filters on
+    The control for :class:`LeakyOrganization`. Every read filters on
     :func:`~manicule.app.tenancy.belongs_to`, exactly as the real store's ``WHERE`` clause
     does, so a refusal seen against the leaky one is a refusal the surface produced rather
     than one every store would have provoked.
@@ -278,7 +278,7 @@ class FakeOrganisation:
         description: str | None = None,
         rule: CollectionRule | None = None,
     ) -> DocumentCollection:
-        label = normalise_name(name)
+        label = normalize_name(name)
         if any(item.name == label for item in self.collections.values()):
             msg = f"a collection named {label!r} already exists"
             raise NameInUseError(msg)
@@ -300,14 +300,14 @@ class FakeOrganisation:
         return self.collections.get(collection_id)
 
     async def find_collection(self, name: str) -> DocumentCollection | None:
-        label = normalise_name(name)
+        label = normalize_name(name)
         for item in self.collections.values():
             if item.name == label:
                 return item
         return None
 
     async def rename_collection(self, collection_id: str, name: str) -> DocumentCollection:
-        label = normalise_name(name)
+        label = normalize_name(name)
         existing = self._require_collection(collection_id)
         rival = await self.find_collection(label)
         if rival is not None and rival.id != collection_id:
@@ -328,7 +328,7 @@ class FakeOrganisation:
     async def collections_for(self, document_id: str) -> Sequence[DocumentCollection]:
         """Manual membership only.
 
-        The rule-driven half is deliberately not modelled here. Evaluating a rule against an
+        The rule-driven half is deliberately not modeled here. Evaluating a rule against an
         in-memory dict would be a *second* implementation of ``rule_clause``, and two spellings
         of one rule is the drift that function exists as a single expression to prevent — a
         fake that disagreed with SQL would make these tests agree with the wrong thing. The
@@ -453,7 +453,7 @@ class FakeOrganisation:
         )
 
 
-class LeakyOrganisation(FakeOrganisation):
+class LeakyOrganization(FakeOrganization):
     """Collections and the trash that ignore their workspace scope. **Deliberately broken.**
 
     The same shape of fault as :class:`LeakyStore`, and for the same reason: the surface's own
@@ -994,7 +994,7 @@ class FakeBackend:
     answerer_: FakeAnswerer = field(default_factory=FakeAnswerer)
     ingestion_: FakeIngestion = field(default_factory=FakeIngestion)
     maintenance_: FakeMaintenance = field(default_factory=FakeMaintenance)
-    organisation_: FakeOrganisation = field(default_factory=FakeOrganisation)
+    organization_: FakeOrganization = field(default_factory=FakeOrganization)
     conversations_: FakeConversations = field(default_factory=FakeConversations)
     telemetry_: FakeTelemetry = field(default_factory=FakeTelemetry)
     keys_: FakeKeys = field(default_factory=FakeKeys)
@@ -1020,8 +1020,8 @@ class FakeBackend:
     async def maintenance(self) -> Maintenance:
         return self.maintenance_
 
-    async def organisation(self) -> Organising:
-        return self.organisation_
+    async def organization(self) -> Organizing:
+        return self.organization_
 
     async def conversations(self) -> Conversing:
         return self.conversations_

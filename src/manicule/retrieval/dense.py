@@ -67,7 +67,7 @@ def derive_over_fetch(k: int, live_fraction: float, config: DenseConfig) -> int:
 
 
 class DenseStage:
-    """Nearest-neighbour search, scoped by a join the configuration cannot remove.
+    """Nearest-neighbor search, scoped by a join the configuration cannot remove.
 
     The join is inside this stage rather than beside it because a pipeline that could be
     configured without it is a pipeline that can be configured into a cross-tenant leak, and

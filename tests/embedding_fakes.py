@@ -21,7 +21,7 @@ from manicule.core.embedding import EmbedFingerprint, Vector
 from manicule.embedding.base import PooledEmbedder
 from manicule.embedding.cache import EmbeddingCache
 from manicule.embedding.cards import ModelCard
-from manicule.embedding.pooling import l2_normalise
+from manicule.embedding.pooling import l2_normalize
 
 
 class StubEmbedder(PooledEmbedder):
@@ -103,7 +103,7 @@ class UnmaskedMeanEmbedder(StubEmbedder):
             return []
         ids, _ = self._tokenize(texts)
         states = self._forward(ids, np.ones_like(ids))
-        pooled = l2_normalise(states.mean(axis=1))
+        pooled = l2_normalize(states.mean(axis=1))
         return [row.tolist() for row in pooled]
 
 

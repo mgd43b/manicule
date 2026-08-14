@@ -52,7 +52,7 @@ from manicule.api.routes import (
     chat,
     conversations,
     documents,
-    organisation,
+    organization,
     plugins,
     sockets,
     workbench,
@@ -224,7 +224,7 @@ def build_app(
         return response
 
     async def refuse(request: Request, exc: Exception) -> JSONResponse:
-        """Render an authentication or authorisation refusal as the ordinary envelope."""
+        """Render an authentication or authorization refusal as the ordinary envelope."""
         return refusal(_op_of(request), service.workspace, exc)
 
     async def unreadable(request: Request, exc: Exception) -> JSONResponse:
@@ -266,7 +266,7 @@ def build_app(
         documents.router,
         chat.router,
         conversations.router,
-        organisation.router,
+        organization.router,
         admin.router,
         plugins.router,
         auth.router,

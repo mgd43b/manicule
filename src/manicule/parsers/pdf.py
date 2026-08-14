@@ -1,13 +1,13 @@
 """PDF, through pypdfium2.
 
-The library choice is a licence decision. PyMuPDF is AGPL-3.0, which an MIT project cannot
+The library choice is a license decision. PyMuPDF is AGPL-3.0, which an MIT project cannot
 take however good it is; pypdfium2 is ``Apache-2.0 OR BSD-3-Clause`` and the pdfium it
 bundles is BSD-3-Clause. Its binary wheels ship a ``BUILD_LICENSES/`` directory that must be
 carried through into anything manicule redistributes.
 
 **The expensive mistake available in this file is the coordinate transform**, and it is
 expensive because it does not fail — it produces rectangles that are plausible, on the right
-page, and in the wrong place. :func:`normalise_rect` is where it is prevented; read its
+page, and in the wrong place. :func:`normalize_rect` is where it is prevented; read its
 docstring before touching a coordinate.
 
 The other traps, each of which also produces a wrong citation rather than an error, are
@@ -46,19 +46,19 @@ _BLANK_LINES_END_A_PARAGRAPH = 2
 QUARTER_TURNS = (0, QUARTER_TURN, HALF_TURN, THREE_QUARTER_TURN)
 """The only rotations a page can be displayed at.
 
-pdfium normalises ``/Rotate`` into these four, so a malformed ``/Rotate 45`` arrives here as
-``0``. The guard in :func:`normalise_rect` is defence in depth rather than a live branch: it
+pdfium normalizes ``/Rotate`` into these four, so a malformed ``/Rotate 45`` arrives here as
+``0``. The guard in :func:`normalize_rect` is defense in depth rather than a live branch: it
 costs one comparison and it means a future reader who reaches for the raw dictionary value
 does not silently produce rectangles rotated by a fraction of a turn.
 """
 
 
-def normalise_rect(
+def normalize_rect(
     rect: tuple[float, float, float, float],
     box: tuple[float, float, float, float],
     rotation: int,
 ) -> Rect | None:
-    """Convert a pdfium rectangle into normalised, rotation-and-crop-aware page coordinates.
+    """Convert a pdfium rectangle into normalized, rotation-and-crop-aware page coordinates.
 
     **pdfium reports character and rectangle coordinates in raw PDF user space** — bottom-left
     origin, points, with ``/Rotate`` **not** applied, the CropBox **not** applied, and the
@@ -67,7 +67,7 @@ def normalise_rect(
     ``[50 50 662 842]``, and with a CropBox applied. Content objects stay in user space
     because the page matrix that encodes crop and rotation is only composed in at render time.
 
-    **The page-size call, however, honours both.** It returns ``(792, 612)`` for a
+    **The page-size call, however, honors both.** It returns ``(792, 612)`` for a
     ``/Rotate 90`` letter page and ``(350, 700)`` for a cropped one.
 
     So the two live in different coordinate spaces, and the obvious one-liner —
@@ -91,7 +91,7 @@ def normalise_rect(
         rotation: Degrees clockwise, one of :data:`QUARTER_TURNS`.
 
     Returns:
-        The rectangle in normalised page coordinates, or ``None`` when the page's rotation is
+        The rectangle in normalized page coordinates, or ``None`` when the page's rotation is
         not a quarter turn or the box is degenerate. ``None`` means the block keeps its page
         number and loses its rectangle, which is a coarser citation rather than a wrong one.
     """
@@ -131,10 +131,10 @@ def _to_display(
     return x, height - y
 
 
-def denormalise_rect(
+def denormalize_rect(
     rect: Rect, box: tuple[float, float, float, float], rotation: int
 ) -> tuple[float, float, float, float]:
-    """The inverse of :func:`normalise_rect`, in user space, for resolving an anchor.
+    """The inverse of :func:`normalize_rect`, in user space, for resolving an anchor.
 
     Resolution asks pdfium what text lies inside a region, and pdfium only understands user
     space. Inverting here rather than remembering the original rectangle is deliberate: it
@@ -274,7 +274,7 @@ class PdfParser:
             textpage = raw_page.get_textpage()
             try:
                 pieces = [
-                    _bounded_text(textpage, denormalise_rect(rect, page.box, page.rotation))
+                    _bounded_text(textpage, denormalize_rect(rect, page.box, page.rotation))
                     for rect in anchor.rects
                 ]
             finally:
@@ -357,8 +357,8 @@ def _rects_for(document: pdfium.PdfDocument, page: _Page, start: int, end: int) 
         boxes = [textpage.get_rect(index) for index in range(total)]
     finally:
         textpage.close()
-    normalised = (normalise_rect(box, page.box, page.rotation) for box in boxes)
-    return tuple(rect for rect in normalised if rect is not None)
+    normalized = (normalize_rect(box, page.box, page.rotation) for box in boxes)
+    return tuple(rect for rect in normalized if rect is not None)
 
 
 def _paragraph_ranges(text: str) -> list[tuple[int, int]]:
@@ -449,7 +449,7 @@ __all__ = [
     "QUARTER_TURNS",
     "PdfConfig",
     "PdfParser",
-    "denormalise_rect",
-    "normalise_rect",
+    "denormalize_rect",
+    "normalize_rect",
     "outline_page_paths",
 ]

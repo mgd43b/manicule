@@ -8,7 +8,7 @@ response and sends it back — and that is where the trap is.
 query parser in the standard library — :func:`urllib.parse.parse_qsl`,
 :func:`urllib.parse.unquote_plus`, ``httpx.URL.params`` — decodes ``a+b`` to ``a b``, because
 for form-encoded data that is exactly right. Re-encoding then sends a space where the cursor
-had a plus, the server answers with a cursor it does not recognise, and the failure is not an
+had a plus, the server answers with a cursor it does not recognize, and the failure is not an
 error: pagination stops, or restarts, part-way through a sync. Some pages are simply never
 seen, and nothing anywhere says so.
 
@@ -52,7 +52,7 @@ def split_query(
 
     :func:`urllib.parse.parse_qsl` applies form-encoding rules to everything, where ``+`` is a
     space. A Confluence search cursor contains literal ``+`` characters, so those rules corrupt
-    it — and the corruption is silent, because the server answers an unrecognised cursor with
+    it — and the corruption is silent, because the server answers an unrecognized cursor with
     results rather than an error. Percent-escapes are decoded either way; those are unambiguous.
 
     A pair with no ``=`` keeps an empty value rather than being dropped, so a flag-shaped

@@ -12,7 +12,7 @@ What is built instead:
   The argument for hashing is not that the token protects the row from somebody holding the
   database — that person has the conversation anyway. It is that a share token is a live
   credential for an unauthenticated URL, and the database is backed up, exported and
-  imported, so plaintext tokens travel into artefacts that leave the access boundary that
+  imported, so plaintext tokens travel into artifacts that leave the access boundary that
   created them.
 - **Expiry, by default.** A capability with no expiry accumulates forever and the set of live
   ones becomes unknowable.

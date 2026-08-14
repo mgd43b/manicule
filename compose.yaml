@@ -1,4 +1,4 @@
-# manicule, containerised: one service, one volume, no published ports.
+# manicule, containerized: one service, one volume, no published ports.
 #
 #   docker compose build                                  # ~2.3 GB of model weights, once
 #   docker compose run --rm manicule doctor

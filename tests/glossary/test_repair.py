@@ -3,7 +3,7 @@
 Three of the fixtures here are the repository's own history rather than invented cases. #108,
 #110 and #111 each landed against a corpus that kept what the previous rules produced, and each
 is reproduced by putting that output back into the store under a superseded fingerprint and
-asking the sweep to fix it. Where the old behaviour can be reproduced mechanically it is —
+asking the sweep to fix it. Where the old behavior can be reproduced mechanically it is —
 patching one rule back out is a stronger fixture than a hand-written row, because a
 hand-written row asserts what somebody believed the old detector did.
 
@@ -313,7 +313,7 @@ async def test_a_change_to_a_field_nothing_resolves_through_still_counts_as_chan
     Found by Copilot on this pull request, and it was right: an earlier ``_entry_shape`` omitted
     ``display`` and ``location`` because nothing resolves through them. Both are stored and both
     are shown — ``display`` is the source's own spelling, which a citation quotes *instead of*
-    the normalised key, and ``location`` is where in the document the definition was found. A
+    the normalized key, and ``location`` is where in the document the definition was found. A
     detector change that moved either would have rewritten what a reader is served while the
     sweep reported the document unchanged.
 

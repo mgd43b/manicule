@@ -149,7 +149,7 @@ def test_a_dotenv_file_may_hold_variables_that_are_not_settings(
 ) -> None:
     """A .env file is shared ground: project variables live alongside manicule's.
 
-    Treating every unrecognised line as a misspelled setting would make a normal .env file
+    Treating every unrecognized line as a misspelled setting would make a normal .env file
     unloadable. A misspelled *prefixed* name is still rejected, which is where a typo shows.
     """
     (manicule_environment / ".env").write_text(

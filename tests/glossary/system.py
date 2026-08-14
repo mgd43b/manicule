@@ -126,7 +126,7 @@ async def build_corpus(store: SqliteDocStore, *, workspace_id: str = WORKSPACE) 
 async def entries_by_acronym(
     store: SqliteDocStore, chunks: Sequence[Chunk]
 ) -> dict[str, GlossaryEntry]:
-    """Every definition detected anywhere in ``chunks``, keyed by normalised acronym.
+    """Every definition detected anywhere in ``chunks``, keyed by normalized acronym.
 
     Looked up across every document the fixture produced rather than off one id, so a test does
     not have to know which page a term was defined on — and does not quietly start asserting

@@ -265,7 +265,7 @@ def test_registering_the_built_in_embedders_loads_no_model_runtime() -> None:
     """Discovery runs in every process that starts, and a model runtime is not a cheap import.
 
     numpy, tokenizers and huggingface-hub are tens of megabytes between them, onnxruntime pulls
-    in a native library, and MLX initialises Metal. None of that has any business happening for
+    in a native library, and MLX initializes Metal. None of that has any business happening for
     ``manicule doctor``, or on a machine whose corpus is already indexed and is only being
     searched by a process that never embeds a query.
 

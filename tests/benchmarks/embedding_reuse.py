@@ -20,7 +20,7 @@ of what an accelerator will take, and the constant factor against a real model i
 **``--no-reuse`` is the "before" row**, and it is honest about what it does: it swaps in a
 vector store that reports every chunk absent, which is precisely the path ingest took before
 durable reuse existed — every prepared chunk handed to ``embed_chunks``. It is a reproduction
-of the old behaviour rather than a checkout of the old commit, and this note is here so nobody
+of the old behavior rather than a checkout of the old commit, and this note is here so nobody
 reads the number as the latter.
 
 Everything is synthetic: generated line documents, temporary directories, no network.

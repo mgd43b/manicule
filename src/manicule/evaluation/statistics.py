@@ -19,7 +19,7 @@ binomial coefficient is an arbitrary-precision integer and a probability is a fl
 direct form has to convert one to the other, and past about 1030 trials ``comb(n, n // 2)``
 exceeds the largest representable double and the multiplication raises ``OverflowError``. That
 is not a hypothetical size: the sign test in a report runs over every decided pairing ever
-recorded for a comparison, and a file of judgements is meant to grow — so the direct form is an
+recorded for a comparison, and a file of judgments is meant to grow — so the direct form is an
 implementation that works right up until the evaluation set is large enough to be worth having.
 """
 
@@ -116,13 +116,13 @@ def wilson_interval(successes: int, trials: int, *, z: float = Z_95) -> tuple[fl
         return 0.0, 1.0
     proportion = successes / trials
     denominator = 1.0 + z * z / trials
-    centre = (proportion + z * z / (2 * trials)) / denominator
+    center = (proportion + z * z / (2 * trials)) / denominator
     spread = (
         z
         * math.sqrt(proportion * (1.0 - proportion) / trials + z * z / (4 * trials * trials))
         / denominator
     )
-    return max(0.0, centre - spread), min(1.0, centre + spread)
+    return max(0.0, center - spread), min(1.0, center + spread)
 
 
 def sign_test(left: int, right: int) -> float:
@@ -135,7 +135,7 @@ def sign_test(left: int, right: int) -> float:
     chance" has one.
 
     Ties and "neither" are dropped rather than split between the sides. Splitting them would
-    manufacture evidence from judgements that deliberately expressed none.
+    manufacture evidence from judgments that deliberately expressed none.
     """
     decided = left + right
     if decided == 0:

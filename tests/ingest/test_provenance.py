@@ -2,7 +2,7 @@
 
 **Driven through** :class:`~tests.ingest.fakes.DictConnector`, **not through the connector that
 reads sidecar manifests.** A dictionary is about as far from a filesystem as a source gets, so if
-these pass then the pipeline honours a record from *any* connector — which is the requirement the
+these pass then the pipeline honors a record from *any* connector — which is the requirement the
 interface exists to meet, and the thing a test over a real directory could not establish. The
 sidecar reader has its own suite in ``tests/connectors/test_sidecar.py``.
 
@@ -116,7 +116,7 @@ async def test_the_local_snapshot_identity_survives_being_superseded() -> None:
     _, document = await ingest_once(a_connector(metadata=a_record()))
     record = document.provenance
 
-    assert document.source_id == MIRRORED, "the local artefact this was fetched by"
+    assert document.source_id == MIRRORED, "the local artifact this was fetched by"
     assert document.content_hash, "the digest of the bytes actually read"
     assert record is not None
     assert record.snapshot is not None
@@ -151,7 +151,7 @@ async def test_a_higher_version_under_the_same_source_id_replaces_the_stored_rec
     **This is the test that found a real bug.** ``_store_record`` merged the layers as
     ``{**raw.metadata, **existing.metadata, **result.metadata}``, so a freshly fetched record lost
     to the one already stored. The document would be re-fetched, the new record read and
-    validated, and then discarded in favour of the version it superseded — citing version 7 for
+    validated, and then discarded in favor of the version it superseded — citing version 7 for
     ever while the source was on 8, with nothing anywhere looking wrong. The fix assigns the
     record after the merge, because it is this run's conclusion rather than accumulated state.
 
@@ -191,8 +191,8 @@ async def test_re_ingesting_an_unchanged_document_with_an_unchanged_record_still
 
     Making "has a record" mean "always re-parse" would be a correct-looking change that quietly
     turns every sync of a mirrored corpus into a full re-parse and re-embed. The comparison has to
-    find records *equal* across two runs — which also means the record has to serialise and
-    deserialise stably, because a field that round-tripped to a different value would compare
+    find records *equal* across two runs — which also means the record has to serialize and
+    deserialize stably, because a field that round-tripped to a different value would compare
     unequal every time and produce exactly that runaway.
     """
     connector = a_connector(metadata=a_record())
@@ -434,7 +434,7 @@ async def test_a_re_routed_document_is_not_skipped_on_an_unchanged_version_token
     holding text from a parser nothing routes to any more, for ever, with nothing reported.
 
     Asserted on the fetch rather than on the classifier: whether the pipeline *went and looked*
-    is the observable behaviour, and a test of the private predicate would pass while the
+    is the observable behavior, and a test of the private predicate would pass while the
     document was still being skipped.
     """
     connector = a_connector(metadata=a_record(version="7"))
@@ -492,7 +492,7 @@ async def test_a_connectors_mutable_facts_refresh_rather_than_freezing() -> None
     assert first.metadata["labels"] == ["runbook"]
     assert first.metadata["content_status"] == "current"
 
-    # The page is re-labelled and archived and its version bumps. Its bytes do not move, which is
+    # The page is re-labeled and archived and its version bumps. Its bytes do not move, which is
     # the ordinary shape of a metadata edit.
     connector.metadata[MIRRORED] = {
         **a_record(version="8"),

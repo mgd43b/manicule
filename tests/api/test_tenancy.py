@@ -5,7 +5,7 @@ store that **ignores its workspace scope entirely**, and watch the refusal happe
 against a correct store would pass whether or not any check existed, which is the failure this
 project has been bitten by more than once.
 
-:class:`~tests.app.fakes.LeakyStore` and :class:`~tests.app.fakes.LeakyOrganisation` ignore the
+:class:`~tests.app.fakes.LeakyStore` and :class:`~tests.app.fakes.LeakyOrganization` ignore the
 filter *and* the limit. Ignoring the limit matters: a leaky store that still truncated would
 let the "some of what I asked for came back missing" check catch a foreign document by
 accident, and the identity check — the arithmetic that would still fire if every ``WHERE``
@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 from manicule.core.ids import document_id
 from tests.api.support import backend_with_a_document, client_for, envelope
-from tests.app.fakes import LeakyOrganisation, LeakyStore, make_chunk, make_document
+from tests.app.fakes import LeakyOrganization, LeakyStore, make_chunk, make_document
 
 if TYPE_CHECKING:
     from tests.app.fakes import FakeBackend
@@ -36,12 +36,12 @@ def _leaky(backend: FakeBackend) -> None:
     leaky.documents = dict(backend.store.documents)
     leaky.chunks = dict(backend.store.chunks)
     backend.store = leaky
-    organisation = LeakyOrganisation(workspace_id=backend.settings.workspace)
-    organisation.documents = dict(backend.organisation_.documents)
-    organisation.collections = dict(backend.organisation_.collections)
-    organisation.members = dict(backend.organisation_.members)
-    organisation.trash = dict(backend.organisation_.trash)
-    backend.organisation_ = organisation
+    organization = LeakyOrganization(workspace_id=backend.settings.workspace)
+    organization.documents = dict(backend.organization_.documents)
+    organization.collections = dict(backend.organization_.collections)
+    organization.members = dict(backend.organization_.members)
+    organization.trash = dict(backend.organization_.trash)
+    backend.organization_ = organization
 
 
 def test_a_document_listing_refuses_a_foreign_row_rather_than_filtering_it() -> None:
@@ -116,7 +116,7 @@ def test_a_collection_listing_refuses_a_foreign_document() -> None:
     """
     backend, mine = backend_with_a_document()
     theirs = make_document(OTHER, source_id="secret.md", title="Their private notes")
-    backend.organisation_.documents[theirs.id] = theirs
+    backend.organization_.documents[theirs.id] = theirs
     with client_for(backend) as client:
         created = envelope(client.post("/api/v1/collections", json={"name": "Everything"}))
         collection = str(created["data"]["id"])
@@ -137,7 +137,7 @@ def test_the_trash_refuses_a_foreign_document() -> None:
     """The trash is a listing of documents like any other, and is checked like one."""
     backend, _ = backend_with_a_document()
     theirs = make_document(OTHER, source_id="secret.md", title="Their private notes")
-    backend.organisation_.trash[theirs.id] = theirs
+    backend.organization_.trash[theirs.id] = theirs
     _leaky(backend)
     with client_for(backend) as client:
         response = client.get("/api/v1/documents/trash")
@@ -152,7 +152,7 @@ def test_the_trash_refuses_a_foreign_document() -> None:
 def test_the_trash_against_a_correct_store_lists_this_tenants_document() -> None:
     """The control for the trash."""
     backend, mine = backend_with_a_document()
-    backend.organisation_.trash[mine.id] = mine
+    backend.organization_.trash[mine.id] = mine
     with client_for(backend) as client:
         body = envelope(client.get("/api/v1/documents/trash"))
     assert body["ok"] is True

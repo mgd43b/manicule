@@ -42,7 +42,7 @@ SUBJECTS = (
     "ember indexer",
     "fathom router",
     "glacier archive",
-    "harbour notifier",
+    "harbor notifier",
     "isotope planner",
     "juniper cache",
     "krypton balancer",

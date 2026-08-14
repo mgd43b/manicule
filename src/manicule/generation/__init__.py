@@ -4,7 +4,7 @@ The whole design in five sentences. **A model never writes a citation, it select
 citation is verified against the retained source bytes before it reaches a reader, and an
 unverified one is deleted rather than shown. Deleting a marker is the only edit anything
 downstream of the model may make to the answer. Redaction is a projection applied on egress
-and never touches the artefact a citation is verified against. Confidence and citation
+and never touches the artifact a citation is verified against. Confidence and citation
 accounting are two different numbers and are never combined into one.**
 
 The third is the one that is easy to lose. Once you accept that some citation must sometimes
@@ -47,7 +47,7 @@ from manicule.generation.budget import (
     usable_prompt_tokens,
 )
 from manicule.generation.config import GENERATOR_NAME, GeneratorConfig
-from manicule.generation.history import HistoryPlan, Turn, fit_history, neutralise_markers
+from manicule.generation.history import HistoryPlan, Turn, fit_history, neutralize_markers
 from manicule.generation.markers import (
     ATTEMPT_PREFIX,
     MARKER_MAX_LEN,
@@ -150,7 +150,7 @@ __all__ = [
     "hash_token",
     "is_live",
     "load_documents",
-    "neutralise_markers",
+    "neutralize_markers",
     "new_share",
     "redact_for_anonymous",
     "render_marker",

@@ -58,7 +58,7 @@ def test_an_empty_workspace_set_is_refused_rather_than_read_two_ways() -> None:
 
 
 def test_a_filter_reports_the_fields_it_restricts_on() -> None:
-    """What lets a store refuse the fields it cannot honour instead of dropping them.
+    """What lets a store refuse the fields it cannot honor instead of dropping them.
 
     Compared against each field's declared default, because there is no empty ``Filter`` to
     compare against any more.

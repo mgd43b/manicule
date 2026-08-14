@@ -6,7 +6,7 @@ them. Everything below is shaped by that: it is not a stub that returns whatever
 asks for, it is a server that **behaves badly in the specific ways Confluence does**.
 
 - **Cursors contain ``+``.** The one character that breaks pagination is in every cursor this
-  fake issues, and an unrecognised cursor is answered with **the first page again** rather than
+  fake issues, and an unrecognized cursor is answered with **the first page again** rather than
   an error — which is what makes the failure silent in the first place. A client that corrupts
   a cursor therefore loops over the opening of a space forever instead of raising.
 - **Version disagreement.** A page can be told to serve a body older than the version search
@@ -40,7 +40,7 @@ CLOUD_BASE = "https://example.atlassian.net/wiki"
 SERVER_BASE = "https://wiki.example.com/confluence"
 
 IDENTITY_PROVIDER = "https://idp.example.com"
-"""Where an instance behind single sign-on sends a client it no longer recognises."""
+"""Where an instance behind single sign-on sends a client it no longer recognizes."""
 
 SIGNIN_PAGE = (
     "<!DOCTYPE html><html><head><title>Log in - Confluence</title></head><body>"
@@ -83,7 +83,7 @@ class FakePage:
     """Version the *body* endpoints report, when it disagrees with what search reports."""
 
     stale_once: bool = False
-    """Whether the disagreement clears on a second request, as a caching artefact would."""
+    """Whether the disagreement clears on a second request, as a caching artifact would."""
 
     adf_available: bool = True
     """Whether the Cloud body endpoint returns an Atlassian Document Format body at all.
@@ -434,7 +434,7 @@ class FakeConfluence:
         )
 
     def _served_version(self, page: FakePage) -> int:
-        """The version the body endpoint reports, honouring a configured disagreement."""
+        """The version the body endpoint reports, honoring a configured disagreement."""
         seen = self.body_calls.get(page.id, 0)
         self.body_calls[page.id] = seen + 1
         if page.served_version is None:
@@ -459,7 +459,7 @@ class FakeConfluence:
     ) -> httpx.Response:
         """One page of results, with a cursor that contains the character that breaks clients.
 
-        An unrecognised cursor is answered with the **first** page rather than an error. That
+        An unrecognized cursor is answered with the **first** page rather than an error. That
         is the shape of the real failure: a client that mangles a cursor does not get told, it
         gets plausible results forever.
         """

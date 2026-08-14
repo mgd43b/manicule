@@ -1,4 +1,4 @@
-"""Authentication and authorisation, on the surface an unattended caller reaches.
+"""Authentication and authorization, on the surface an unattended caller reaches.
 
 Two properties, and each needs both halves of a pair to mean anything.
 
@@ -142,7 +142,7 @@ def test_a_revoked_key_stops_working(keyed: tuple[FakeBackend, dict[str, str]]) 
     assert "revoked" not in envelope(after)["error"]["message"].lower()
 
 
-def test_an_unrecognised_key_is_refused(keyed: tuple[FakeBackend, dict[str, str]]) -> None:
+def test_an_unrecognized_key_is_refused(keyed: tuple[FakeBackend, dict[str, str]]) -> None:
     backend, _ = keyed
     with client_for(backend) as client:
         response = client.get("/api/v1/documents", headers={"X-API-Key": "mnk_not_a_key"})

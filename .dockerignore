@@ -18,7 +18,7 @@
 !.ci
 
 # Re-excluded from the directories admitted above. `**` because these appear at any depth,
-# and the negations above would otherwise pull a workspace member's own build artefacts in.
+# and the negations above would otherwise pull a workspace member's own build artifacts in.
 **/__pycache__
 **/*.pyc
 **/*.pyo

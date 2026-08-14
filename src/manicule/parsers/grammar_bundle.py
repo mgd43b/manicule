@@ -69,16 +69,16 @@ __all__ = [
     "COPYLEFT_PREFIXES",
     "LIBRARY_DIR_NAME",
     "MANIFEST_NAME",
-    "PERMISSIVE_LICENCES",
+    "PERMISSIVE_LICENSES",
     "SCHEMA_VERSION",
     "BundledGrammar",
     "GrammarBundle",
     "GrammarBundleError",
     "build",
-    "check_licence",
+    "check_license",
     "describe_search_path",
     "library_suffix",
-    "licence_of_installed_pack",
+    "license_of_installed_pack",
     "locate",
     "platform_tag",
     "read",
@@ -96,9 +96,19 @@ straight to ``configure(PackConfig(cache_dir=...))`` by a read-only deployment t
 copy at all.
 """
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 """The manifest layout. Checked on read, so a bundle from a later manicule is refused with
-both numbers rather than parsed into the wrong shape."""
+both numbers rather than parsed into the wrong shape.
+
+**2 renamed one key: ``licence`` became ``license``.** Nothing else about the layout moved.
+The rename is spelling rather than meaning, but a schema-1 bundle read under schema 2 finds
+no license key, and the refusal that would earn — "no grammar license is declared... a
+manifest without it has been edited or was written by something else" — accuses the operator
+of something they did not do. The bump means the check that fires first is the one that says
+the true thing: this bundle was built by a different manicule, so rebuild it. That is cheap
+here in a way it would not be for a stored corpus — a bundle is already invalid across a
+platform or a grammar-pack release, so rebuilding is the routine it is built for.
+"""
 
 BUNDLE_DIR_ENV: Final = "MANICULE_GRAMMAR_BUNDLE"
 """Environment variable naming a bundle directory.
@@ -127,7 +137,7 @@ rather than publishing one. The module needs one thing — a ``bundle`` director
 ``__init__`` — and nothing here imports it for any other purpose.
 """
 
-PERMISSIVE_LICENCES: Final[frozenset[str]] = frozenset(
+PERMISSIVE_LICENSES: Final[frozenset[str]] = frozenset(
     {
         "0BSD",
         "Apache-2.0",
@@ -141,15 +151,15 @@ PERMISSIVE_LICENCES: Final[frozenset[str]] = frozenset(
         "Zlib",
     }
 )
-"""Licences a bundled grammar may carry. ``docs/parsing.md`` §12's list, as data."""
+"""Licenses a bundled grammar may carry. ``docs/parsing.md`` §12's list, as data."""
 
 COPYLEFT_PREFIXES: Final[tuple[str, ...]] = ("GPL", "AGPL", "LGPL", "MPL", "SSPL", "EUPL", "CDDL")
 """Refused outright, and named separately from "not on the permissive list" so the message
-says *why*. manicule is GPL-3.0-or-later, so a copyleft grammar would not be a licence problem
+says *why*. manicule is GPL-3.0-or-later, so a copyleft grammar would not be a license problem
 for manicule — it would be one for anyone redistributing the bundle, and this bundle exists to
 be redistributed."""
 
-_LICENCE_OPERATORS: Final[frozenset[str]] = frozenset({"AND", "OR", "WITH"})
+_LICENSE_OPERATORS: Final[frozenset[str]] = frozenset({"AND", "OR", "WITH"})
 
 _PLATFORMS: Final[Mapping[str, str]] = {"darwin": "macos", "linux": "linux", "win32": "windows"}
 _MACHINES: Final[Mapping[str, str]] = {
@@ -178,7 +188,7 @@ def platform_tag() -> str:
     Grammar libraries are compiled objects, so a bundle is valid for exactly one operating
     system and architecture. The vocabulary matches the grammar release's own — ``macos-arm64``,
     ``linux-x86_64`` — because a human comparing a bundle against the release it came from
-    should not have to translate. An unrecognised platform still produces a tag rather than an
+    should not have to translate. An unrecognized platform still produces a tag rather than an
     error: both the builder and the reader call this function, so what matters is that the two
     agree, and an exotic platform's bundle is refused on every *other* platform either way.
     """
@@ -216,7 +226,7 @@ class GrammarBundle:
     root: Path
     pack_version: str
     platform: str
-    licence: str
+    license: str
     grammars: Mapping[str, BundledGrammar]
 
     @property
@@ -457,10 +467,10 @@ def read(root: Path) -> GrammarBundle:
         pack_version=str(manifest["pack_version"]),
         platform=here,
         # Checked, not merely recorded. A bundle is redistributed by hand, so the manifest it
-        # arrives with is the only licence statement the receiving machine has, and a manifest
+        # arrives with is the only license statement the receiving machine has, and a manifest
         # is a text file somebody can edit. Re-asserting it here costs a string split and means
         # the terms cannot be widened between the build and the install.
-        licence=check_licence(str(manifest.get("licence", ""))),
+        license=check_license(str(manifest.get("license", ""))),
         grammars=_entries(manifest, manifest_path),
     )
     _check_sizes(bundle)
@@ -536,8 +546,8 @@ def _installed_pack_version() -> str:
     return pack_version()
 
 
-def check_licence(expression: str) -> str:
-    """Assert an SPDX licence expression is one a bundle may redistribute. Returns it.
+def check_license(expression: str) -> str:
+    """Assert an SPDX license expression is one a bundle may redistribute. Returns it.
 
     The upstream pack states that every grammar it carries is permissively licensed and that
     copyleft grammars are not accepted. This asserts the policy rather than trusting it, at the
@@ -553,34 +563,34 @@ def check_licence(expression: str) -> str:
 
     Raises:
         GrammarBundleError: A term is copyleft, or is not on the permissive list. The two are
-            separate messages because they mean different things: the first is a licence
-            manicule refuses to put in a redistributable bundle, the second is a licence nobody
+            separate messages because they mean different things: the first is a license
+            manicule refuses to put in a redistributable bundle, the second is a license nobody
             here has assessed, and "add it to the list" is only the right answer to one of them.
     """
     terms = [term for term in re.split(r"[\s()]+", expression.strip()) if term]
     if not terms:
         msg = (
-            "no grammar licence is declared, so the bundle would be redistributed under "
+            "no grammar license is declared, so the bundle would be redistributed under "
             "unknown terms. A bundle built by tools/build_grammar_bundle.py always records "
             "one; a manifest without it has been edited or was written by something else."
         )
         raise GrammarBundleError(msg)
-    named = [term for term in terms if term.upper() not in _LICENCE_OPERATORS]
+    named = [term for term in terms if term.upper() not in _LICENSE_OPERATORS]
     copyleft = [term for term in named if term.upper().startswith(COPYLEFT_PREFIXES)]
     if copyleft:
         msg = (
-            f"the grammar licence {expression!r} includes the copyleft term(s) {copyleft}. "
+            f"the grammar license {expression!r} includes the copyleft term(s) {copyleft}. "
             f"docs/parsing.md §12 refuses a copyleft grammar bundle: it would put a "
             f"source-distribution obligation on everyone who copies the bundle to an "
             f"air-gapped host, which is an obligation manicule would be imposing rather than "
             f"accepting."
         )
         raise GrammarBundleError(msg)
-    unknown = sorted({term for term in named if term not in PERMISSIVE_LICENCES})
+    unknown = sorted({term for term in named if term not in PERMISSIVE_LICENSES})
     if unknown:
         msg = (
-            f"the grammar licence {expression!r} contains {unknown}, which is not on the list "
-            f"of licences assessed for redistribution ({sorted(PERMISSIVE_LICENCES)}). Assess "
+            f"the grammar license {expression!r} contains {unknown}, which is not on the list "
+            f"of licenses assessed for redistribution ({sorted(PERMISSIVE_LICENSES)}). Assess "
             f"it against docs/parsing.md §12 before adding it, rather than adding it to make "
             f"this pass."
         )
@@ -588,12 +598,12 @@ def check_licence(expression: str) -> str:
     return expression
 
 
-def licence_of_installed_pack() -> str:
-    """The grammar pack's declared SPDX licence expression.
+def license_of_installed_pack() -> str:
+    """The grammar pack's declared SPDX license expression.
 
-    The strongest licence statement the installed artifact supports, and the reason is worth
-    recording where the bundle is built: **the pack enumerates no per-grammar licences.** Its
-    manifest carries a group and a size per language, the wheel carries no licence files for
+    The strongest license statement the installed artifact supports, and the reason is worth
+    recording where the bundle is built: **the pack enumerates no per-grammar licenses.** Its
+    manifest carries a group and a size per language, the wheel carries no license files for
     the grammars, and the SBOM beside it describes the Rust build dependencies of the native
     extension. So the assertion is over the distribution that publishes them under a stated
     permissive-only policy, and the bundle records which expression was asserted so that a
@@ -617,7 +627,7 @@ def build(
 
     ``source`` is a populated pack cache: the machine that builds a bundle is a machine with
     network access, which has already fetched the declared set. Building is therefore a copy, a
-    hash and a licence assertion — never a download, so a build cannot half-succeed against a
+    hash and a license assertion — never a download, so a build cannot half-succeed against a
     flaky mirror and produce a bundle missing a language nobody notices until an air-gapped
     host refuses a document.
 
@@ -639,13 +649,14 @@ def build(
 
     Raises:
         ConfigError: A language is not one manicule declares.
-        GrammarBundleError: The pack's licence is not redistributable, ``source`` holds no
+        GrammarBundleError: The pack's license is not redistributable, ``source`` holds no
             library for a requested language, or the bundle fails to read back.
     """
     from manicule.parsers.grammars import validate_languages  # noqa: PLC0415 - import cycle
 
     wanted = validate_languages(languages)
-    licence = check_licence(licence_of_installed_pack())
+    # Not ``license``: that is a Python builtin, and ruff's A001 refuses to let it be shadowed.
+    declared = check_license(license_of_installed_pack())
     found = _discover_libraries(wanted, source)
 
     library_dir = destination / LIBRARY_DIR_NAME
@@ -666,7 +677,7 @@ def build(
         "schema_version": SCHEMA_VERSION,
         "pack_version": _installed_pack_version(),
         "platform": platform_tag(),
-        "licence": licence,
+        "license": declared,
         "languages": {language: entry.as_json() for language, entry in entries.items()},
     }
     (destination / MANIFEST_NAME).write_text(
@@ -681,7 +692,7 @@ def _discover_libraries(languages: Sequence[str], source: Path) -> dict[str, Pat
     """Ask the pack which file in ``source`` is which language's grammar.
 
     Two passes, because a probe is a directory of symlinks and a pack reconfiguration, and
-    doing 24 of them when 23 are answerable by name is waste rather than rigour. The name is
+    doing 24 of them when 23 are answerable by name is waste rather than rigor. The name is
     still *confirmed* by a probe — an unconfirmed name match is the guess this function exists
     to avoid.
 

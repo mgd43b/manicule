@@ -37,8 +37,8 @@ from manicule.core.glossary import (
     GlossaryMatch,
     MatchReason,
     QueryExpansion,
-    normalise_acronym,
-    normalise_expansion,
+    normalize_acronym,
+    normalize_expansion,
 )
 from manicule.retrieval.homographs import is_common_word
 
@@ -109,7 +109,7 @@ def definitional_frame(text: str, surface: str) -> bool:
 class ExpansionPolicy:
     """What query-time expansion is allowed to do.
 
-    A frozen value rather than a settings object, so that the retriever's behaviour is a
+    A frozen value rather than a settings object, so that the retriever's behavior is a
     function of what it was handed and a test can state a policy in one line.
     """
 
@@ -123,7 +123,7 @@ class ExpansionPolicy:
     is the only remedy available to an operator who cannot re-ingest a corpus."""
 
     homographs: frozenset[str] = field(default_factory=frozenset[str])
-    """Extra terms to treat as ordinary English words, normalised. The words that collide with
+    """Extra terms to treat as ordinary English words, normalized. The words that collide with
     a corpus's terms are a property of that corpus, so this extends the shipped list rather
     than replacing it."""
 
@@ -134,14 +134,14 @@ class ExpansionPolicy:
 
 
 def candidate_surfaces(text: str) -> list[tuple[str, str]]:
-    """``(surface, normalised key)`` for every token of ``text`` that could be a term.
+    """``(surface, normalized key)`` for every token of ``text`` that could be a term.
 
     Order is first appearance and duplicates are dropped by *key*, so ``NOW`` and ``now`` in one
     query resolve once — through the first occurrence, whose case is then what the rules read.
     """
     seen: dict[str, tuple[str, str]] = {}
     for token in _TOKEN_RE.findall(text):
-        key = normalise_acronym(token)
+        key = normalize_acronym(token)
         if key and key not in seen:
             seen[key] = (token, key)
     return list(seen.values())
@@ -155,7 +155,7 @@ def _why_it_fires(
         return MatchReason.EXACT_CASE
     if definitional_frame(text, surface):
         return MatchReason.DEFINITIONAL_FRAME
-    key = normalise_acronym(surface)
+    key = normalize_acronym(surface)
     if not is_common_word(key) and key not in policy.homographs:
         return MatchReason.UNAMBIGUOUS
     return None
@@ -182,7 +182,7 @@ def group_by_key(
 def _distinct_expansions(entries: Sequence[GlossaryEntry]) -> dict[str, list[GlossaryEntry]]:
     distinct: dict[str, list[GlossaryEntry]] = {}
     for entry in entries:
-        distinct.setdefault(normalise_expansion(entry.expansion), []).append(entry)
+        distinct.setdefault(normalize_expansion(entry.expansion), []).append(entry)
     return distinct
 
 

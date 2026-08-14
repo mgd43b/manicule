@@ -25,7 +25,7 @@ version therefore belongs in
 of ``StructuralChunker(version_components=...)``, where a change to it refuses to run against
 a corpus built with the old one.
 
-**Quoted reply chains are kept.** Trimming them is a retrieval optimisation with a real
+**Quoted reply chains are kept.** Trimming them is a retrieval optimization with a real
 downside — the quoted text is frequently the only statement of the thing being replied to —
 and it is not a parsing decision.
 """
@@ -275,7 +275,7 @@ class MailParser:
         if body is not None and body.text:
             if lines:
                 lines.append("")
-            lines.extend(_normalised_lines(body.text))
+            lines.extend(_normalized_lines(body.text))
         return _Canonical(
             lines=tuple(lines), header_height=len(headers), subject=subject, body=body
         )
@@ -403,7 +403,7 @@ def _is_attachment(part: EmailMessage) -> bool:
     wrote, and treating it as the body would make the canonical text depend on what was
     attached to the message.
 
-    **An enclosed message counts, whatever it is labelled.** A ``message/rfc822`` part
+    **An enclosed message counts, whatever it is labeled.** A ``message/rfc822`` part
     frequently carries neither a disposition nor a filename — ``multipart/digest`` never does,
     and inline forwards from several mail clients do not either. Without this it satisfies no
     branch anywhere: :func:`_body_of` skips it because it is not ``text/*``, :func:`_walk`
@@ -423,7 +423,7 @@ def _payload_of(part: EmailMessage) -> bytes:
     """A part's bytes with its transfer encoding removed.
 
     An enclosed message is the exception: its payload is a parsed message rather than an
-    encoded octet stream, so ``get_payload(decode=True)`` returns ``None`` for it. Serialising
+    encoded octet stream, so ``get_payload(decode=True)`` returns ``None`` for it. Serializing
     the enclosed message is what makes it a document the chain can parse — and it has to be
     the *enclosed* message rather than the part, or the member would carry the wrapper's
     headers as well as its own.
@@ -471,7 +471,7 @@ async def _html_to_text(html: str, uri: str) -> str:
     )
     # Drained through ``read_blocks`` rather than a comprehension over ``parse``: a stream
     # abandoned part-way stays suspended holding whatever it had open at the ``yield``, and
-    # CPython finalises it late, from a loop that may already be closed.
+    # CPython finalizes it late, from a loop that may already be closed.
     blocks = await read_blocks(WebParser(WebConfig()), source)
     return "\n\n".join(block.text for block in blocks)
 
@@ -481,7 +481,7 @@ def _unfolded(value: str) -> str:
     return _FOLD.sub(" ", value).strip()
 
 
-def _normalised_lines(text: str) -> list[str]:
+def _normalized_lines(text: str) -> list[str]:
     """Body lines with transport line endings reduced to the one this module counts.
 
     Part of the pinned composition: a message uses CRLF, ``lines_of`` splits on ``\\n``, and a

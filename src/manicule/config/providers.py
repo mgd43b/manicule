@@ -306,7 +306,7 @@ class ProviderSettings(BaseModel):
     extra: dict[str, str] = Field(
         default_factory=dict,
         description="Additional provider parameters passed through untouched, e.g. an "
-        "organisation id or an API version.",
+        "organization id or an API version.",
     )
 
     @property

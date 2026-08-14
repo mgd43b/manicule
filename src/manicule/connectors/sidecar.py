@@ -12,11 +12,11 @@ so every field is validated, and the three that could do real damage are handled
 rather than by inspection:
 
 *The manifest cannot cause a read.*
-    It declares no path that anything opens. manicule records the location of the artefact it
+    It declares no path that anything opens. manicule records the location of the artifact it
     actually walked to; :attr:`SNAPSHOT_PATH` is compared against that and refused on
     disagreement. So a ``../../../../etc/passwd`` in a manifest is a refusal with a reason, and
     at no point is it a filename. This is the difference between validating a path and never
-    dereferencing one, and only the second is a defence — the first is one refactor away from
+    dereferencing one, and only the second is a defense — the first is one refactor away from
     being neither.
 
 *The canonical URI cannot be a scheme a browser executes.*
@@ -38,7 +38,7 @@ as a citation that quietly names a file, which is the bug this module was writte
 
 **Unknown keys are refused rather than ignored**, which is the one decision here that could
 reasonably have gone the other way. The argument for ignoring them is that a mirroring tool may
-add a field manicule does not honour. The argument against, which won: the overwhelmingly more
+add a field manicule does not honor. The argument against, which won: the overwhelmingly more
 likely unknown key is a misspelling of a known one — ``canonical_url`` for ``canonical_uri`` —
 and ignoring it means the manifest silently does nothing, which is indistinguishable from having
 no manifest and is the exact failure being fixed. Refusing is loud, costs nothing, and the
@@ -223,7 +223,7 @@ def provenance_for(
     """The record for ``document``, or ``None`` when it has no manifest.
 
     Args:
-        document: The artefact that was read. Its location is observed, not declared: this is
+        document: The artifact that was read. Its location is observed, not declared: this is
             the path manicule walked to, and it is the only thing the snapshot half is built
             from.
         root: The configured ingestion root. Used to make the recorded path relative and to
@@ -333,7 +333,7 @@ def _check_declarations(parsed: _Manifest, *, snapshot: LocalSnapshot, checksum:
     first already refuses everything the second would.
     """
     declared = parsed.snapshot_path.strip()
-    if declared and _normalised(declared) != _normalised(snapshot.path):
+    if declared and _normalized(declared) != _normalized(snapshot.path):
         msg = (
             f"declares {SNAPSHOT_PATH} {parsed.snapshot_path!r}, but this snapshot was read from "
             f"{snapshot.path!r} under the ingestion root. A manifest describes the file beside "
@@ -350,13 +350,13 @@ def _check_declarations(parsed: _Manifest, *, snapshot: LocalSnapshot, checksum:
         raise _UnusableManifestError(msg)
 
 
-def _normalised(path: str) -> str:
+def _normalized(path: str) -> str:
     """A declared or observed relative path, comparable across the two ways of writing one.
 
     Only separators and redundant ``./`` segments are folded, with :meth:`pathlib.PurePosixPath`
-    doing it — a Windows-flavoured manifest saying ``docs\\page.html`` describes the same file as
+    doing it — a Windows-flavored manifest saying ``docs\\page.html`` describes the same file as
     ``docs/page.html`` and should not be refused for it. **No ``..`` resolution happens here**,
-    which matters: collapsing ``a/../b`` to ``b`` is exactly the normalisation that turns a
+    which matters: collapsing ``a/../b`` to ``b`` is exactly the normalization that turns a
     traversal into something that compares equal to a legitimate path, and there is nothing to
     gain from it because both sides of the comparison are already relative and already clean.
     """

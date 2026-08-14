@@ -94,7 +94,7 @@ class FakeStream:
 
 
 def generator(**overrides: Any) -> tuple[LitellmGenerator, list[dict[str, Any]]]:
-    """A generator whose provider call is captured rather than dialled."""
+    """A generator whose provider call is captured rather than dialed."""
     calls: list[dict[str, Any]] = []
     streams: list[Any] = list(
         overrides.pop("streams", [FakeStream([chunk("hello"), chunk(finish="stop")])])
@@ -497,10 +497,10 @@ async def test_a_generator_whose_profile_does_not_fit_refuses_at_startup() -> No
         await gen.setup()
 
 
-async def test_a_model_the_library_does_not_recognise_is_refused_with_the_prefixes_listed() -> None:
+async def test_a_model_the_library_does_not_recognize_is_refused_with_the_prefixes_listed() -> None:
     gen, _ = generator(settings={"provider": "not-a-provider", "model": "m"})
 
-    with pytest.raises(ConfigError, match="does not recognise"):
+    with pytest.raises(ConfigError, match="does not recognize"):
         await gen.setup()
 
 

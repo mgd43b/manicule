@@ -1,6 +1,6 @@
 """discover → fetch → parse → chunk → embed → store, one document at a time.
 
-**The unit of work is one document. A batch is a scheduling artefact with no semantics of its
+**The unit of work is one document. A batch is a scheduling artifact with no semantics of its
 own.** That is what makes "one bad document never aborts a batch" a structural property rather
 than a promise: there is no batch-level transaction to abort, and no batch-level state a
 document can corrupt. Every failure this module catches is attributed to a document, recorded,
@@ -23,7 +23,7 @@ serve chunks derived from bytes the source no longer has would cite text the doc
 contain, which is the one thing this project will not do. ``failed`` is the case where we do
 not know, and not knowing is the case that must not destroy a working answer.
 
-The write order and its crash windows belong to ``docs/storage.md`` §8.2 and are honoured
+The write order and its crash windows belong to ``docs/storage.md`` §8.2 and are honored
 rather than restated: chunks, then vectors, then ``indexed`` last, in the transaction that is
 the commit point.
 """
@@ -378,7 +378,7 @@ class IngestPipeline:
         """Exclude other work on **this** document for the length of one document's writes.
 
         **Keyed, because the thing that must not interleave is one document's write sequence
-        and nothing wider.** A pipeline-wide lock would serialise a sweep against a sync over
+        and nothing wider.** A pipeline-wide lock would serialize a sweep against a sync over
         entirely unrelated pages, which is a throughput cost paid to fix a correctness problem
         neither of them has. The three writes that publish a document — its record, its chunks
         and glossary, its vectors — are not one statement and cannot be made one, so what makes
@@ -391,7 +391,7 @@ class IngestPipeline:
         and the invariant that survives both being absent is the compare-and-swap at the commit
         — see :meth:`~manicule.ingest.ports.IngestStore.commit_document`.
 
-        **Distinct from** ``self._embedding``, which serialises *the model* across every
+        **Distinct from** ``self._embedding``, which serializes *the model* across every
         document because there is one accelerator. Two documents may be mutated at once and
         must not be embedded at once; one document may be neither. Sharing one lock for both
         would make each of them wrong in the other's direction.
@@ -881,7 +881,7 @@ class IngestPipeline:
             # The lock goes to `embed_or_reuse`, which holds it around the model call and
             # nothing else. Both reads here — this one and the vector store's — are about what
             # the index already holds, and taking the one lock every embedder in the process
-            # shares while they run would serialise a sweep against a concurrent sync on work
+            # shares while they run would serialize a sweep against a concurrent sync on work
             # neither of them needs the model for.
             previous = await self._previous_inputs(document, existing)
             vectors, work = await embed_or_reuse(
@@ -1419,7 +1419,7 @@ class IngestPipeline:
         # `source_id` is still the path this connector fetched by, `content_hash` still digests
         # these bytes, and the snapshot's location is in the record's own snapshot half.
         # `raw.uri` is deliberately left alone upstream of here, so on the **fetch** path a
-        # parser's diagnostics still name the artefact it actually read rather than a web page
+        # parser's diagnostics still name the artifact it actually read rather than a web page
         # nobody can open locally. That is a property of this path only, and the exception is
         # worth stating rather than discovering: `reindex.re_parse` rebuilds a `RawDocument` from
         # `document.uri`, which by then *is* the canonical address — so a re-parse diagnostic

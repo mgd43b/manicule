@@ -22,7 +22,7 @@ calling ``asyncio.run`` around a fixture built in another loop fails inside the 
 than on anything this file is about. The MCP column therefore awaits the tool manager directly
 and the HTTP column drives the production application over an ASGI transport in this loop.
 
-The corpus is synthetic and invented for these tests. Nothing in it names a real organisation,
+The corpus is synthetic and invented for these tests. Nothing in it names a real organization,
 system or document.
 """
 
@@ -295,11 +295,11 @@ async def _run(
 
 
 def _json(payload: SearchResult | AnswerResultPayload) -> dict[str, Any]:
-    """The payload as it is serialised, parsed back. Never the model's attributes.
+    """The payload as it is serialized, parsed back. Never the model's attributes.
 
     The requirement is about what a consumer reads out of JSON, and a boolean that is a boolean
     on the model and a string in the dump would satisfy an attribute assertion while failing the
-    contract. Round-tripping through the serialiser is what makes the type part of the claim.
+    contract. Round-tripping through the serializer is what makes the type part of the claim.
     """
     parsed: dict[str, Any] = json.loads(payload.model_dump_json())
     return parsed
@@ -845,7 +845,7 @@ async def test_surfacing_the_field_changed_no_number(
 
 
 def test_a_payload_written_before_the_field_existed_still_parses() -> None:
-    """Requirement 2: the default is ``false``, so a document stored before it deserialises.
+    """Requirement 2: the default is ``false``, so a document stored before it deserializes.
 
     ``false`` is the honest default rather than a convenient one: a result produced before the
     classification existed made no claim about it, and "no claim" is what an unset boolean has

@@ -41,7 +41,7 @@ class CitationBinder:
     :class:`~manicule.generation.answers.AnswerEvent` values in stream order, so a consumer
     rendering deltas sees each citation at exactly the position its marker occupied.
 
-    Three transformations and no others, all of them deletions or the normalisation of syntax
+    Three transformations and no others, all of them deletions or the normalization of syntax
     the binder defined itself:
 
     - a marker whose slots all fail verification is **deleted**;
@@ -117,7 +117,7 @@ class CitationBinder:
 
         A list rather than an async generator, deliberately. This is consumed from inside
         another async generator, and an abandoned generator's ``finally`` does not run until
-        something finalises it — so a nested one is a resource this layer cannot close on a
+        something finalizes it — so a nested one is a resource this layer cannot close on a
         client disconnect. Returning a list makes the nesting disappear: the only generators
         on the answer path are the two that genuinely have to suspend.
         """

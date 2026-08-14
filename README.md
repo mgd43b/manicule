@@ -1,7 +1,7 @@
 # manicule
 
 [![CI](https://github.com/mgd43b/manicule/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mgd43b/manicule/actions/workflows/ci.yml)
-[![Licence: GPL-3.0-or-later](https://img.shields.io/badge/licence-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
 
 Self-hosted document search and answers. Point it at a directory or a Confluence space, ask
@@ -79,7 +79,7 @@ of a question. Skip `init` and the first `search` refuses rather than fetching �
 missing vocabulary `failing`, in as many words, because no corpus can be searched without one.
 
 **The model weights are the one thing `init` does not fetch, and the first `index` does.** They
-are the big artefact: about **1.1 GB** for `BAAI/bge-m3` on Apple silicon (the MLX conversion,
+are the big artifact: about **1.1 GB** for `BAAI/bge-m3` on Apple silicon (the MLX conversion,
 fp16) and about **2.3 GB** elsewhere (the ONNX export). `init` says so on its way past, and
 `manicule doctor` says so too, because the download itself is quiet — a Hugging Face progress
 bar, and a stretch with no manicule output at all.
@@ -107,7 +107,7 @@ flag — and it does **not** fetch the model weights, which is why the line abov
 **A query never fetches a vocabulary or a grammar.** Those are seeded by a step you can watch
 fail, and a query that finds one missing refuses rather than reaching for the network: `search`
 exits non-zero with `VocabularyUnavailableError` and names the cache it looked in. The model
-weights are the one artefact fetched on demand rather than refused — which is why `init` and
+weights are the one artifact fetched on demand rather than refused — which is why `init` and
 `doctor` both announce them while they are still to come, and why the prefetch line above
 exists.
 
@@ -166,7 +166,7 @@ workspaces; health; an admin dashboard; your own API keys; and settings. Command
 `Ctrl`/`Cmd`+`K`, keyboard navigation, dark mode. `manicule start --no-web` prints `browser
 surface off (--no-web)`, keeps the API, and answers 404 for every `/ui` path.
 
-![The manicule browser surface: a search for "how are citations verified" over this repository's own docs, showing ten ranked passages, the confidence band with the sentence explaining it, and each hit labelled with the document and the heading path the passage came from](docs/images/browser-search.png)
+![The manicule browser surface: a search for "how are citations verified" over this repository's own docs, showing ten ranked passages, the confidence band with the sentence explaining it, and each hit labeled with the document and the heading path the passage came from](docs/images/browser-search.png)
 
 It adds **no build toolchain**: Jinja2 templates, one hand-written stylesheet and one
 hand-written script, so `uv sync` is still the whole install and the container image stays free
@@ -236,7 +236,7 @@ share a data directory.
 [`docs/deployment.md`](docs/deployment.md) covers what the data directory holds, the permissions
 it needs, and what publishing a port will require when there is one.
 
-## The idea it is organised around
+## The idea it is organized around
 
 **A citation carries a correct location, or none at all.**
 
@@ -269,7 +269,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/plugins` | Manifests, compatibility checking, entry-point discovery |
 | `src/manicule/container` | Typed resolution and lifecycle. Assembled at startup, injected |
 | `src/manicule/testing` | Conformance suites every implementation must pass |
-| `src/manicule/app` | The application service. All the behaviour, once, for every surface |
+| `src/manicule/app` | The application service. All the behavior, once, for every surface |
 | `src/manicule/cli` | Nineteen commands over that service, and nothing else |
 | `src/manicule/mcp` | Nineteen MCP tools over that service, and nothing else |
 | `src/manicule/api` | Eleven HTTP route groups over that service, and nothing else |
@@ -321,13 +321,13 @@ uv run pytest
 uv run ruff check . && uv run pyright
 ```
 
-## Licence
+## License
 
 **GPL-3.0-or-later.** See [`LICENSE`](LICENSE).
 
 The embedding runtime decided this. `mlx-embeddings` is GPL-3.0, and running embeddings
 in-process on Apple silicon is what keeps installing manicule a single command with no model
-server to operate alongside it. Changing the licence was chosen over changing the dependency.
+server to operate alongside it. Changing the license was chosen over changing the dependency.
 
 **This reaches plugins.** They load in-process, in the same address space, through
 `importlib.metadata` entry points — not over a socket or a subprocess boundary. A plugin

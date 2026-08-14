@@ -75,7 +75,7 @@ def for_backend(model_id: str, backend: str) -> None:
 
     The declaration is fetched either way — pooling, dimension and sequence length are read
     from the canonical repository whichever runtime executes the weights — and then one
-    runtime's artefact. This is what `manicule doctor` names when it reports that a first
+    runtime's artifact. This is what `manicule doctor` names when it reports that a first
     index has a download in front of it.
     """
     print(f"{model_id} for the {backend} backend:")

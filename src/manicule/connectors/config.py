@@ -108,7 +108,7 @@ class FilesystemConfig(BaseModel):
     )
     enriched_profiles: tuple[EnrichedProfile, ...] = Field(
         default=(DEFAULT_PROFILE,),
-        description="Enriched-export conventions to recognise inside HTML files, in precedence "
+        description="Enriched-export conventions to recognize inside HTML files, in precedence "
         "order. An empty tuple turns adaptation off and indexes every HTML file as HTML.",
     )
     """How a site whose exporter spells the markers differently teaches this connector to read it.
@@ -335,7 +335,7 @@ class ConfluenceConfig(BaseModel):
     max_retry_after_seconds: float = Field(
         default=120.0,
         gt=0.0,
-        description="Longest single pause honoured from a ``Retry-After`` header.",
+        description="Longest single pause honored from a ``Retry-After`` header.",
     )
     """A sync that sleeps for an hour inside one HTTP call is indistinguishable from a hung
     one. Past this the connector gives up and says so, and the run is re-run later against an

@@ -1,6 +1,6 @@
 """PDF parsing, and above all the coordinate transform.
 
-The transform from pdfium's raw user-space rectangles to normalised page coordinates is the
+The transform from pdfium's raw user-space rectangles to normalized page coordinates is the
 most expensive mistake available in this parser, because it cannot fail loudly: the wrong
 answer is a rectangle that is plausible, on the right page, and in the wrong place. So the
 central test here does not check arithmetic against arithmetic. It **renders the page with
@@ -15,7 +15,7 @@ assertion and shows it failing.
 **Why the type suppressions below are file-wide.** Rendering a page and reading its character
 boxes means driving pdfium directly, and ``pypdfium2`` ships no type information for the
 bitmap and text-page APIs. Every call into them is partially unknown to the checker, and the
-cause is a single fact about upstream rather than a judgement call per line — thirty
+cause is a single fact about upstream rather than a judgment call per line — thirty
 suppressions saying the same thing would obscure the two places in this file where a type
 genuinely matters. The parser itself, in ``manicule.parsers.pdf``, is checked in full.
 """
@@ -62,7 +62,7 @@ GEOMETRY_FIXTURES = (
 
 RENDER_SCALE = 4
 """Enough resolution that a 12-point glyph is several pixels across, so the ink bounding box
-is a real measurement rather than a rounding artefact.
+is a real measurement rather than a rounding artifact.
 
 A whole number, which is what pdfium's renderer declares it takes, and which also means the
 bitmap's dimensions are an exact multiple of the page's — the ink box below is converted back
@@ -70,7 +70,7 @@ to page fractions by dividing by the bitmap size, so a fractional scale would in
 rounding step into the very measurement this file exists to trust."""
 
 INK_THRESHOLD = 250
-"""How dark a channel must be to count as ink. Anti-aliasing puts grey around every glyph, so
+"""How dark a channel must be to count as ink. Anti-aliasing puts gray around every glyph, so
 a strict "not pure white" test would grow the measured box by the antialiasing radius."""
 
 BOX_TOLERANCE = 0.02

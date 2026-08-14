@@ -21,7 +21,7 @@ from tests.corpus import build_all
 from tests.storage_helpers import data_dir, engine, store
 
 __all__ = [
-    "colour_environment",
+    "color_environment",
     "corpus",
     "data_dir",
     "engine",
@@ -69,9 +69,9 @@ def grammar_cache() -> None:
     parser would skip or refuse, on a machine where the grammars are sitting right there.
 
     It was invisible for the worst possible reason: the pack resolves its cache through
-    ``platformdirs``, which honours ``XDG_CACHE_HOME`` on Linux and uses
+    ``platformdirs``, which honors ``XDG_CACHE_HOME`` on Linux and uses
     ``~/Library/Caches`` on macOS. The suite therefore passed on a developer's machine and
-    failed on CI, which is exactly the "one corpus, two behaviours" split that
+    failed on CI, which is exactly the "one corpus, two behaviors" split that
     ``manicule.parsers.grammars`` exists to prevent — arriving through the test harness rather
     than through the code.
 
@@ -141,12 +141,12 @@ def corpus(tmp_path_factory: pytest.TempPathFactory) -> Path:
 CLEARED_TERMINAL_VARIABLES: frozenset[str] = frozenset(
     {"NO_COLOR", "FORCE_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE", "COLORTERM"}
 )
-"""Variables that decide whether output is a terminal, and whether it is coloured.
+"""Variables that decide whether output is a terminal, and whether it is colored.
 
 Every one is cleared, so the suite states its own answer instead of inheriting the caller's.
 
 The list is **not** trusted to be complete on its own —
-``tests/app/test_cli.py::test_the_colour_isolation_accounts_for_every_variable_rich_reads``
+``tests/app/test_cli.py::test_the_color_isolation_accounts_for_every_variable_rich_reads``
 checks it against what Rich's source actually consults. That check exists because a
 hand-written list here has already been wrong twice: ``TERM`` was missing, which is the bug
 this fixture was written for, and ``TTY_COMPATIBLE`` was missing from the first version of the
@@ -158,22 +158,22 @@ BASELINE_TERM = "xterm-256color"
 """The terminal the suite says it is running on, whatever the caller's shell says.
 
 Set rather than cleared, because an absent ``TERM`` is not a neutral answer — it is a terminal
-that declares no capability. ``TERM`` is not a colour switch, which is why it was missed: it is
+that declares no capability. ``TERM`` is not a color switch, which is why it was missed: it is
 a *capability*, and ``dumb`` tells Rich the stream cannot render ANSI at all, which beats
 ``FORCE_COLOR`` saying the stream is a terminal.
 """
 
 
 @pytest.fixture(autouse=True)
-def colour_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give every test the same colour environment, rather than the caller's.
+def color_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every test the same color environment, rather than the caller's.
 
-    Whether manicule colours its output is decided entirely by environment variables, so
+    Whether manicule colors its output is decided entirely by environment variables, so
     without this the suite's result depends on the shell that started it. It did: a positive
-    control asserting that human output *is* coloured passed in an ordinary terminal and failed
+    control asserting that human output *is* colored passed in an ordinary terminal and failed
     under ``TERM=dumb``, which is what a shell buffer that cannot render ANSI reports.
 
-    That failure mattered more than a flaky test. The control exists so that the neighbouring
+    That failure mattered more than a flaky test. The control exists so that the neighboring
     assertion — that ``--json`` emits no ANSI — is not vacuous, and a control that inverts with
     the environment is the vacuum wearing a disguise: in a ``TERM=dumb`` shell it fails, the
     obvious repair is to delete it, and the assertion it was protecting quietly stops meaning
@@ -181,7 +181,7 @@ def colour_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
     The baseline is **no opinion, on a capable terminal**: the switches are cleared, so nothing
     is forced either way, and ``TERM`` names a terminal that can render ANSI. A test wanting
-    colour sets ``FORCE_COLOR`` itself and now gets it deterministically; a test wanting none
+    color sets ``FORCE_COLOR`` itself and now gets it deterministically; a test wanting none
     needs nothing, because the runner's stdout is not a terminal.
 
     Size is deliberately left alone. ``COLUMNS`` and ``LINES`` are inherited, and the tests that

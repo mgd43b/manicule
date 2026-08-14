@@ -38,7 +38,7 @@ def test_the_tail_survives_a_sample_size_that_overflows_the_direct_form() -> Non
     Multiplying it by a probability raises ``OverflowError``, which is demonstrated here rather
     than described — so the log-space implementation is a fix for something that happens rather
     than a precaution. The size is not hypothetical: the sign test runs over every decided
-    pairing ever recorded for a comparison, and a file of judgements is meant to grow.
+    pairing ever recorded for a comparison, and a file of judgments is meant to grow.
     """
 
     def directly() -> float:
@@ -111,7 +111,7 @@ def test_a_lopsided_split_is() -> None:
 
 
 def test_ties_are_dropped_rather_than_shared_between_the_sides() -> None:
-    """Splitting them would manufacture evidence from judgements that expressed none."""
+    """Splitting them would manufacture evidence from judgments that expressed none."""
     assert sign_test(0, 0) == 1.0
 
 

@@ -120,7 +120,7 @@ def test_every_envelope_route_returns_the_same_six_keys() -> None:
 
     ``/healthz`` and ``/readyz`` are the two exceptions and are excluded by name: they answer
     a probe rather than a person, and a liveness check that has to parse JSON reports
-    unhealthy when the serialiser changes.
+    unhealthy when the serializer changes.
 
     ``/widget`` and ``/ui`` are excluded because they are documents rather than data — the
     browser surface has its own suites, and a page that returned an envelope would be a page
@@ -339,7 +339,7 @@ def test_no_route_installs_a_plugin() -> None:
 
     The boundary itself holds, and this is about the assertion rather than about the boundary:
     ``plugin_add`` requires an admin principal and has no branch that fetches or executes code,
-    which :func:`test_enabling_a_plugin_never_installs_one` covers from the behavioural side.
+    which :func:`test_enabling_a_plugin_never_installs_one` covers from the behavioral side.
     What was missing was anything that would notice an *install* route being added, so that is
     what this is.
     """

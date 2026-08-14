@@ -43,7 +43,7 @@ class Judge(Protocol):
 
     @property
     def label(self) -> str:
-        """Who or what this is. Recorded on every judgement it makes."""
+        """Who or what this is. Recorded on every judgment it makes."""
         ...
 
     async def judge(self, pairing: Pairing) -> tuple[Preference, str] | None:
@@ -59,7 +59,7 @@ class ScriptedJudge:
     """A judge that replays a decision per query id.
 
     For tests and for re-running a recorded session against a changed pipeline. A query it has
-    no answer for is skipped rather than defaulted: a default would be a judgement nobody made.
+    no answer for is skipped rather than defaulted: a default would be a judgment nobody made.
     """
 
     def __init__(self, decisions: Mapping[str, Preference], *, label: str = "scripted") -> None:
@@ -117,7 +117,7 @@ PROMPT = "[a] A better  [b] B better  [t] tie  [n] neither  [s] skip  [q] quit >
 
 
 def render_pairing(pairing: Pairing, *, shown: int = SHOWN, snippet: int = SNIPPET) -> str:
-    """The two result sets, side by side and unlabelled.
+    """The two result sets, side by side and unlabeled.
 
     Nothing identifying either system appears — not the configuration label, not the latency,
     not the scores. A judge who can tell which list came from the system they built is not
@@ -198,7 +198,7 @@ class StreamJudge:
             verdict = VERDICT_KEYS.get(key)
             if verdict is not None:
                 return verdict, ""
-            self._output.write(f"unrecognised choice {key!r}\n")
+            self._output.write(f"unrecognized choice {key!r}\n")
 
 
 __all__ = [

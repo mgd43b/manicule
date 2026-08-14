@@ -150,7 +150,7 @@ async def current(engine: AsyncEngine) -> str | None:
         return await connection.run_sync(current_revision)
 
 
-async def initialise(data_dir: Path) -> None:
+async def initialize(data_dir: Path) -> None:
     """Create the data directory and bring its database to head.
 
     The one call an application needs at startup.
@@ -172,6 +172,6 @@ __all__ = [
     "current_revision",
     "downgrade",
     "head_revision",
-    "initialise",
+    "initialize",
     "upgrade",
 ]

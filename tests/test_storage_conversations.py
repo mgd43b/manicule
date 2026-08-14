@@ -479,7 +479,7 @@ async def test_a_system_turn_is_never_served_anonymously(
 ) -> None:
     """``role IN ('user', 'assistant')`` is load-bearing **today**.
 
-    Without it a ``system`` row is served — and served *relabelled* ``role='user'``, because
+    Without it a ``system`` row is served — and served *relabeled* ``role='user'``, because
     the projection coerces the role before ``SharedTurn``'s pattern can reject it. A system
     prompt attributed to the person who asked the question is a worse disclosure than the row
     itself.

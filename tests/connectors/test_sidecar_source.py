@@ -335,7 +335,7 @@ async def test_moving_the_page_updates_one_document_rather_than_creating_a_secon
     """Steps 11 and 12, and the reason identity was moved off the path at all.
 
     The manifest travels with the page, because it is what the page's identity is written in.
-    A mirror reorganised from by-space to by-tree moves both, and the corpus must see one page
+    A mirror reorganized from by-space to by-tree moves both, and the corpus must see one page
     that moved rather than one deletion and one arrival.
     """
     root = corpus(tmp_path)
@@ -525,7 +525,7 @@ async def test_a_filesystem_name_that_builds_something_else_is_refused(tmp_path:
 
     Reachable only where something has taken over the ``filesystem`` component name. Refused
     rather than duck-typed: the root and the profiles read off that object decide where this
-    writes and what it recognises.
+    writes and what it recognizes.
 
     **What this asserts is that the message names the class, not that it is spelled a particular
     way.** It used to read ``"builds a object" in ...``, pinning an article that was wrong for
@@ -662,7 +662,7 @@ async def test_a_narrowed_conversion_writes_the_same_manifest_as_a_whole_root_on
 
 
 async def test_a_root_outside_the_configured_root_is_refused(tmp_path: Path) -> None:
-    """Requirement 5. A source name is not a licence to write beside somebody else's files."""
+    """Requirement 5. A source name is not a license to write beside somebody else's files."""
     root = corpus(tmp_path)
     outside = tmp_path / "elsewhere"
     outside.mkdir()
@@ -752,10 +752,10 @@ async def test_a_page_id_that_looks_like_a_path_writes_nowhere_but_beside_the_pa
 ) -> None:
     """Requirement 5's "never derive an output path from document-provided metadata".
 
-    The page declares a traversal as its own id. It is not sanitised and not refused — it is
+    The page declares a traversal as its own id. It is not sanitized and not refused — it is
     simply never used as a path, because the only path that reaches the writer is
     ``manifest_path_for`` of the file the walk reached. The assertion is therefore about where
-    the manifest landed, and the declared value travelling into the manifest *as data* is the
+    the manifest landed, and the declared value traveling into the manifest *as data* is the
     proof that the hostile string was carried rather than dropped.
     """
     root = corpus(tmp_path, body=page("../../../../etc/cron.d/x"))

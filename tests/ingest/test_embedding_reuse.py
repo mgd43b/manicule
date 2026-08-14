@@ -67,7 +67,7 @@ class RebreadcrumbingChunker(fakes.BlockChunker):
     The fixture requirement 7 is about, and it cannot be produced by changing a parser: a chunk
     id is derived from ``text``, so anything that moves the text moves the id and the question
     stops being interesting. Moving the *breadcrumb* leaves every id where it was and changes
-    every embedding input, which is exactly the case an optimisation keyed on the chunk id gets
+    every embedding input, which is exactly the case an optimization keyed on the chunk id gets
     wrong.
     """
 
@@ -325,7 +325,7 @@ async def test_a_chunk_whose_breadcrumb_moved_re_embeds_although_its_id_did_not(
 
     Nothing about any chunk's ``text`` moves here, so every id survives and every citation
     still resolves. Every ``embed_text`` moves, so every stored vector describes a string the
-    corpus no longer contains — and a "reuse when the id survives" optimisation would keep all
+    corpus no longer contains — and a "reuse when the id survives" optimization would keep all
     of them, silently, for ever.
     """
     store, vectors, blobs, embedder = await indexed(
@@ -368,7 +368,7 @@ async def test_a_chunk_that_only_moved_position_reuses_its_vector() -> None:
     """Requirement 8: position is not part of the embedding input.
 
     The ids all change, because a chunk id is derived from position as well as text. Not one
-    embedding input changes. A reuse rule keyed on the id — the naive optimisation in its other
+    embedding input changes. A reuse rule keyed on the id — the naive optimization in its other
     direction — would re-embed the whole document for a reordering that moved no text.
     """
     store, vectors, blobs, embedder = await indexed({"a": "alpha\nbeta\ngamma"})
@@ -514,7 +514,7 @@ async def test_a_second_sweep_makes_no_model_call_and_replaces_no_vector() -> No
 
 
 async def test_reuse_survives_a_corpus_larger_than_the_embedding_cache() -> None:
-    """Requirement 10: the behaviour must not be the LRU's.
+    """Requirement 10: the behavior must not be the LRU's.
 
     ``EmbeddingCache`` is a bounded LRU over exact duplicate text at a default capacity of
     10 000, and a corpus larger than it evicts every entry before anything could be reused —
@@ -632,8 +632,8 @@ def test_the_identity_separates_every_input_it_takes() -> None:
         # A separator that a naive concatenation would let one field impersonate another with.
         ("a", '","'),
         ("alpha", "alpha "),
-        # NFC and NFD of the same word. They tokenise differently and embed differently, so
-        # they are two inputs; a normalising identity would reuse one's vector for the other.
+        # NFC and NFD of the same word. They tokenize differently and embed differently, so
+        # they are two inputs; a normalizing identity would reuse one's vector for the other.
         ("café", "café"),
     ],
 )
@@ -642,7 +642,7 @@ def test_the_identity_never_conflates_two_different_embedding_inputs(left: str, 
 
     The Unicode pair is the case worth stating: a reader who saw "normalized embedding input"
     and reached for :func:`unicodedata.normalize` would make these one input, and the model
-    does not. What is normalised is the *serialisation* the digest is taken over, never the
+    does not. What is normalized is the *serialization* the digest is taken over, never the
     text.
     """
     assert left != right, "the fixture must supply two different strings"

@@ -124,7 +124,7 @@ can actually see it, and never re-derived downstream from prose.
 **Storage is six protocols, not one, and one class implements all six.** `DocStore` was
 deliberately partial in [#1](https://github.com/mgd43b/manicule/issues/1) — documents, chunks,
 lexical search and sync watermarks, the ingest and retrieval critical path — on the stated
-promise that organisation would arrive as protocols of its own.
+promise that organization would arrive as protocols of its own.
 [#10](https://github.com/mgd43b/manicule/issues/10) is that arrival. Splitting them is what
 lets a component declare the narrow surface it needs: a stage that resolves a collection into
 document ids asks for a `CollectionStore` and cannot reach a document's chunks with the handle
@@ -137,7 +137,7 @@ the anchor rule.** `chunks.id` is derived from `(document_id, position, text)`, 
 survives a re-parse unchanged keeps its id and one whose text moved does not — the old id
 *dangles* rather than silently re-pointing at whatever replaced it. A dangling id is opaque and
 there is nothing left to look it up against, so the document comes too. What comes back is the
-absence, labelled: `present`, `superseded`, `deleted`, or `unknown`. Nothing resolves a citation
+absence, labeled: `present`, `superseded`, `deleted`, or `unknown`. Nothing resolves a citation
 into a superseded version to the text that replaced it. That would be §1's forbidden case
 exactly — a location that is plausible and wrong — arriving through the one path built to
 explain why a citation stopped working.
@@ -147,7 +147,7 @@ pooling; tier B returns finished vectors. The distinction exists because a backe
 convenience output cannot be trusted to be the model's own pooling: `mlx-embeddings`
 computes its XLM-RoBERTa `text_embeds` with mean pooling unconditionally, while the chosen
 model pools with CLS, and it binds `last_hidden_state` to the *pooled* vector on some
-architectures and to genuine token states on others. Both produce well-shaped, normalised
+architectures and to genuine token states on others. Both produce well-shaped, normalized
 vectors and raise nothing. Tier B backends are therefore admitted only by measurement, since
 they cannot be verified by inspection. See [`embeddings.md`](embeddings.md) §3.2 and §4.1.
 

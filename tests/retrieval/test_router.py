@@ -6,7 +6,7 @@ import pytest
 
 from manicule.config.settings import RouterSettings
 from manicule.core.errors import ConfigError
-from manicule.retrieval.router import QueryRouter, Route, UtilityKind, normalise
+from manicule.retrieval.router import QueryRouter, Route, UtilityKind, normalize
 
 ALL_KINDS = (UtilityKind.DOCUMENT_COUNT, UtilityKind.DOCUMENT_LIST, UtilityKind.INDEX_STATUS)
 
@@ -100,11 +100,11 @@ def test_the_router_reads_nothing_but_the_text() -> None:
         ("...", ""),
     ],
 )
-def test_normalisation_tolerates_punctuation_without_splitting_words(
+def test_normalization_tolerates_punctuation_without_splitting_words(
     raw: str, expected: str
 ) -> None:
     """Interior punctuation survives, which is what keeps ``yo-yo`` from becoming ``yo``."""
-    assert normalise(raw) == expected
+    assert normalize(raw) == expected
 
 
 def test_a_direct_route_declares_that_it_bypassed_retrieval() -> None:

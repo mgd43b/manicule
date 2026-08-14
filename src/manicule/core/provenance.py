@@ -133,14 +133,14 @@ def _require_printable(value: str, *, field: str) -> None:
     """Refuse ``value`` if it is over-long or holds a control character.
 
     **A check, and only a check.** An earlier version returned ``value.strip()``, which every
-    caller discarded — so the signature advertised a normalisation that never reached a stored
+    caller discarded — so the signature advertised a normalization that never reached a stored
     field, and ``title="  Retry policy  "`` was stored with its padding while the code read as
-    though it had been trimmed. Either normalise or verify; doing one and appearing to do both is
+    though it had been trimmed. Either normalize or verify; doing one and appearing to do both is
     how a reader comes to rely on the half that is not happening.
 
     Control characters in a declared string are not a hypothetical. ``\\x1b`` is the opening
     byte of an ANSI escape sequence, and every one of these fields is printed to a terminal by
-    ``manicule search`` — so a title is a route to repositioning the cursor, recolouring the
+    ``manicule search`` — so a title is a route to repositioning the cursor, recoloring the
     output or clearing the screen of a person reading a citation. The browser surface escapes
     HTML and would not have caught it, because it is not markup.
 
@@ -211,7 +211,7 @@ class SourceMetadata(BaseModel):
     source_id: str = Field(
         default="",
         description="The identifier the publisher assigns, and does not change when the "
-        "document is edited or renamed. What makes an updated snapshot recognisable as the "
+        "document is edited or renamed. What makes an updated snapshot recognizable as the "
         "same document rather than a second one.",
     )
     version: str = Field(
@@ -329,12 +329,12 @@ class LocalSnapshot(BaseModel):
     because nothing downstream could otherwise tell:
 
     :attr:`path` is observed.
-        manicule fills it in from the artefact it actually read, relative to the ingestion
+        manicule fills it in from the artifact it actually read, relative to the ingestion
         root. **A manifest never populates it.** A manifest may *declare* a snapshot path, and
         that declaration is compared against this one and refused if it disagrees — so a
         manifest can contradict what is on disk, and can never relocate it. That is the
         difference between validating a path and not dereferencing one, and only the second is
-        a defence.
+        a defense.
 
     :attr:`retrieved_at` is declared.
         When the mirror was taken is not knowable from the file: a modification time moves when

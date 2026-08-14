@@ -76,7 +76,7 @@ def status_for(envelope: Envelope) -> int:
 
 
 def as_response(envelope: Envelope) -> JSONResponse:
-    """Serialise an envelope, with the status its outcome implies."""
+    """Serialize an envelope, with the status its outcome implies."""
     return JSONResponse(content=envelope.as_json(), status_code=status_for(envelope))
 
 
@@ -86,7 +86,7 @@ async def respond(
     """Run one service call and render it.
 
     The whole of a route's body, in the ordinary case. Anything a route does *besides* calling
-    this is behaviour living in a surface, which is the thing this layer exists not to have.
+    this is behavior living in a surface, which is the thing this layer exists not to have.
     """
     return as_response(await run_op(op, service.workspace, call))
 
@@ -110,7 +110,7 @@ def malformed(op: str, workspace: str, exc: Exception) -> JSONResponse:
 def refusal(op: str, workspace: str, exc: Exception) -> JSONResponse:
     """Render a refusal raised before any service call was made.
 
-    Authentication and authorisation are the two of these, and they are deliberately shaped
+    Authentication and authorization are the two of these, and they are deliberately shaped
     like every other failure — same envelope, same fields — so a client has one thing to parse
     rather than a special case for the two failures it will see most often.
     """

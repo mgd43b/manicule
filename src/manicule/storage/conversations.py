@@ -466,7 +466,7 @@ class SqliteConversationStore:
                             # the comparison already excludes an unset column. Kept, they
                             # would be the redundant predicates a later reader deletes as
                             # noise — and deleting the *comparison* instead is the mistake
-                            # that costs something. The behaviour they described is pinned by
+                            # that costs something. The behavior they described is pinned by
                             # tests either way.
                             models.Conversation.share_expires_at > now,
                             models.Message.created_at <= models.Conversation.shared_at,

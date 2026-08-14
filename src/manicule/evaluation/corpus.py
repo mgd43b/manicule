@@ -54,7 +54,7 @@ DIGEST_PAGE = 500
 """Documents read per round trip when computing a digest.
 
 Large enough that a ten-thousand-document corpus is twenty statements, small enough that no
-single query materialises a corpus-sized result. The digest is computed once per evaluation
+single query materializes a corpus-sized result. The digest is computed once per evaluation
 session, not per query.
 """
 
@@ -62,8 +62,8 @@ session, not per query.
 class CorpusVersion(BaseModel):
     """What was indexed when a result was produced.
 
-    Travels on every result and into every recorded preference, so a stored judgement can be
-    read back years later and still say what it was a judgement about.
+    Travels on every result and into every recorded preference, so a stored judgment can be
+    read back years later and still say what it was a judgment about.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

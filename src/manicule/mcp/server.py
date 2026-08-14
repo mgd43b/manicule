@@ -537,7 +537,7 @@ def build_server(service: ApplicationService) -> FastMCP:
         Args:
             registry: Also fetch the community listing. Only consulted when
                 ``plugins.allow_install`` is on, because a plugin runs with this process's
-                full authority and browsing a catalogue of them is opt-in.
+                full authority and browsing a catalog of them is opt-in.
         """
         return await dispatch("plugin_list", lambda: service.plugin_list(registry=registry))
 

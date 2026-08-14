@@ -19,7 +19,7 @@ its Confluence extraction destroys every table and code block, its connectors re
 entire sources on each sync, and its retrieval quality has never been measured because its
 evaluation harness scores at random chance.
 
-Where the design below says a subsystem carries over, that is a judgement that
+Where the design below says a subsystem carries over, that is a judgment that
 OpenDocuments got it right. Where it does not, the reason is stated.
 
 ---
@@ -111,7 +111,7 @@ re-ingest against a pinned corpus a first-class operation rather than a re-crawl
 
 | Format | OpenDocuments | manicule | |
 |---|---|---|---|
-| **PDF** | `pdf-parse` | **pypdfium2** fast path; **docling** or **marker** optional | **Gain.** Real page and bbox provenance. `pypdfium2` is BSD/Apache. PyMuPDF stays rejected — see the licence note below. **No OCR in v1** — see below |
+| **PDF** | `pdf-parse` | **pypdfium2** fast path; **docling** or **marker** optional | **Gain.** Real page and bbox provenance. `pypdfium2` is BSD/Apache. PyMuPDF stays rejected — see the license note below. **No OCR in v1** — see below |
 | **Code** | pattern-matched functions/classes | **tree-sitter** | **Biggest gain.** Real ASTs, 40+ languages |
 | HTML | `node-html-parser` | **selectolax** structural; **trafilatura** for crawled pages only | Two different jobs — fidelity vs boilerplate removal |
 | DOCX | `mammoth` | **python-docx** | |
@@ -124,10 +124,10 @@ re-ingest against a pinned corpus a first-class operation rather than a re-crawl
 | Structured | custom | stdlib `json`/`tomllib`, **PyYAML** | |
 | Archive | placeholder | **zipfile** + recurse into the parser chain | OpenDocuments never implemented this |
 
-### What the GPL-3.0 relicence changed here, and what it did not
+### What the GPL-3.0 relicense changed here, and what it did not
 
 The project is GPL-3.0-or-later (`LICENSE`), so copyleft dependencies are no longer excluded
-by default. Two parsing decisions were made on licence grounds and they move in opposite
+by default. Two parsing decisions were made on license grounds and they move in opposite
 directions:
 
 - **`extract-msg` (GPL-3.0) is cleanly unblocked.** GPL-3.0 code in a GPL-3.0 project carries
@@ -168,7 +168,7 @@ Only GitHub has a real change token. Each connector below gets proper incrementa
 | **Confluence** | full space walk, `body.storage`, **regex tag strip** | **CQL watermark** (`lastmodified > …`); **ADF** (`atlas_doc_format`) on Cloud, `body.storage` on Server/DC; ingest attachments through the parser chain | httpx against REST v2 |
 | **S3 / GCS** | listing + pageToken | `list_objects_v2` with prefix + continuation; **ETag + LastModified** as change token | `aioboto3`; `obstore`/`fsspec` for one interface over both |
 | **Swagger** | fetch, no change signal | Fetch and hash the spec; chunk **per endpoint** with parameters and schemas | httpx + `openapi-spec-validator` |
-| **Web crawler** | content hash | **Conditional GET** (ETag / If-Modified-Since) plus content hash; honour `robots.txt` | httpx + **protego** + selectolax |
+| **Web crawler** | content hash | **Conditional GET** (ETag / If-Modified-Since) plus content hash; honor `robots.txt` | httpx + **protego** + selectolax |
 | **Web search** | Tavily, query time | unchanged — no sync | httpx |
 
 Plus local filesystem with watch mode (**watchfiles**, Rust-backed) and web upload.
@@ -203,7 +203,7 @@ matters.
 0.1.0 and assigns `last_hidden_state` different meanings on different architectures. So the
 same text, through the same model, under both backends, must produce vectors within a stated
 tolerance — asserted in tests, not assumed. That is the Apple-hardware principle in its
-operative form: **optimise execution for Apple hardware freely; never let the platform change
+operative form: **optimize execution for Apple hardware freely; never let the platform change
 what ends up in the index.** Throughput may vary by machine. Vectors may not.
 
 **The model is switchable, and switching is a priced operation.** There is a known-good set,
@@ -214,7 +214,7 @@ survive it: `chunks.id` derives from content, not from the model.
 **Why pooling is ours.** `mlx-embeddings` offers a convenience field, and on the chosen
 model it is the wrong pooling. `BAAI/bge-m3` pools with **CLS**; the library's XLM-RoBERTa
 implementation computes `text_embeds` with **mean pooling, unconditionally**. Anyone
-trusting the obviously-named field gets correctly-shaped, normalised vectors from the wrong
+trusting the obviously-named field gets correctly-shaped, normalized vectors from the wrong
 reduction, with no error raised.
 
 The same library also gives `last_hidden_state` different meanings on different
@@ -227,7 +227,7 @@ Full detail, with what was measured and what still must be, in
 
 ### Ollama is not an embedding backend
 
-Settled, not a preference. `/api/embed` returns pooled, already-normalised vectors
+Settled, not a preference. `/api/embed` returns pooled, already-normalized vectors
 regardless of input, and **no configuration changes that** — setting `LLAMA_ARG_POOLING`
 reaches the engine and then breaks the endpoint for every input. Without token states
 there is no pooling control, and the failure above becomes unavoidable.
@@ -349,15 +349,15 @@ event bus with webhook dispatch · degraded-mode warnings · update checks.
 
 ## 16. Cross-cutting subsystems
 
-Found in a source audit against the plan — each is real behaviour with no obvious home in
+Found in a source audit against the plan — each is real behavior with no obvious home in
 the sections above.
 
 | | What it does | manicule |
 |---|---|---|
 | **Caching** | `RAGCache` with TTL — L1 query results, L2 embeddings, L3 web-search | Keep. Materially affects perceived latency. Key the embedding cache by model identity so a model change cannot serve stale vectors |
 | **Query routing** | Deterministic classifier so greetings and utility queries never reach the model | Keep. Cheap, and it stops trivial input consuming an LLM call |
-| **Token counting** | tiktoken, lazily initialised | **tiktoken** — same library, Python-native. Drives context-window fitting |
-| **Config loading** | 196 lines resolving provider API keys from `.env` by convention | Keep the behaviour, express it in **pydantic-settings** |
+| **Token counting** | tiktoken, lazily initialized | **tiktoken** — same library, Python-native. Drives context-window fitting |
+| **Config loading** | 196 lines resolving provider API keys from `.env` by convention | Keep the behavior, express it in **pydantic-settings** |
 | **Hardware detection** | CPU and RAM probing to recommend a model during `init` | Keep, and extend — detect Apple Silicon and unified memory to pick the embedding backend |
 | **Plugin compatibility** | `checkCompatibility` against a declared `coreVersion` | Keep. Version mismatch is a loud error, not a runtime surprise |
 | **Community registry** | GitHub-hosted list of community plugins, browsable and installable | Keep. Decide whether install stays admin-only — in OpenDocuments it shells out to a package manager |
@@ -387,7 +387,7 @@ Real, found in the source, worth not reproducing.
    Do not ship the field.
 5. **PII redaction does something other than advertised.** It runs at ingest, permanently
    destroying data in the index, while the docs claim it protects data sent to cloud
-   models. Pick one behaviour, build it, document it.
+   models. Pick one behavior, build it, document it.
 6. **The evaluation harness scores at chance.** Its test embedder is
    `sin(sum of character codes)`. Twelve retrieval features rest on it.
 

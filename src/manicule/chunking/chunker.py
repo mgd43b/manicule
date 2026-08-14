@@ -434,16 +434,16 @@ class StructuralChunker:
         for piece in pieces:
             tokens = self._counter(piece)
             if current and running + tokens > self._text_budget:
-                units.append(self._materialise(joiner.join(current), block, template))
+                units.append(self._materialize(joiner.join(current), block, template))
                 current = []
                 running = 0
             current.append(piece)
             running += tokens
         if current:
-            units.append(self._materialise(joiner.join(current), block, template))
+            units.append(self._materialize(joiner.join(current), block, template))
         return units
 
-    def _materialise(self, text: str, block: ParsedBlock | None, template: _Unit | None) -> _Unit:
+    def _materialize(self, text: str, block: ParsedBlock | None, template: _Unit | None) -> _Unit:
         if block is not None:
             return self._unit(block, text)
         if template is None:  # pragma: no cover - one of the two is always supplied

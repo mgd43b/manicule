@@ -23,8 +23,8 @@ model — would each have moved it with nobody to remember anything.
 affordable in a way it would not be one stage up. A comment-only edit to either file moves it
 and makes the corpus stale. What that costs is a sweep that reads stored chunks, runs regular
 expressions over them and writes rows: no connector, no parser, no embedder, no GPU and no
-network — the cheapest repair in the system. The alternative is a normalised digest that skips
-comments and docstrings, and its failure mode is the one this exists to remove: a normalisation
+network — the cheapest repair in the system. The alternative is a normalized digest that skips
+comments and docstrings, and its failure mode is the one this exists to remove: a normalization
 with a gap in it drops a real change silently, and silence is the defect. Over-invalidation
 announces itself in a sweep an operator can watch finish.
 
@@ -85,8 +85,8 @@ SOURCES: Final[tuple[tuple[str, str], ...]] = (
     what is stored, all of it.
 
 ``manicule.core.glossary``
-    Normalisation, and it is in here for requirement 4 rather than by association.
-    :func:`~manicule.core.glossary.normalise_acronym` decides the lookup key,
+    Normalization, and it is in here for requirement 4 rather than by association.
+    :func:`~manicule.core.glossary.normalize_acronym` decides the lookup key,
     ``MIN_ACRONYM_LENGTH`` and ``MAX_ACRONYM_LENGTH`` decide which surfaces can be terms at
     all, :class:`~manicule.core.glossary.DefinitionForm` names the forms whose weights the
     detector reads, and :class:`~manicule.core.glossary.GlossaryEntry`'s field constraints
@@ -94,7 +94,7 @@ SOURCES: Final[tuple[tuple[str, str], ...]] = (
     the detector.
 
 Read as bytes, in this order, with CRLF folded to LF so that two checkouts of one commit agree.
-Line endings are the one difference between installations that says nothing about behaviour,
+Line endings are the one difference between installations that says nothing about behavior,
 and leaving it in would make a corpus restored onto a differently-configured machine stale for
 a reason nobody could act on.
 """
@@ -110,8 +110,8 @@ NOT_DIGESTED: Final[dict[str, str]] = {
 """``manicule`` modules the digested sources import that are deliberately left out, with why.
 
 An allowlist with reasons attached, checked by a test, rather than a silent filter. Every entry
-here is a judgement that something reachable from the detector cannot change what it stores,
-and a judgement stated in prose can be argued with; an omission cannot.
+here is a judgment that something reachable from the detector cannot change what it stores,
+and a judgment stated in prose can be argued with; an omission cannot.
 
 One more exclusion is worth stating even though it is not reachable from these files and so
 never reaches this map. :func:`~manicule.core.ids.glossary_entry_id` decides a stored row's
@@ -172,7 +172,7 @@ the digest plus these versions is *total* will one day be wrong, and the useful 
 in advance which way.
 
 The interpreter entry in :func:`libraries` carries the other limit, which is granularity rather
-than coverage: the feature version is recorded, so a standard-library behaviour change that ships
+than coverage: the feature version is recorded, so a standard-library behavior change that ships
 in a patch release is not caught. See there for why that trade was taken.
 """
 
@@ -232,7 +232,7 @@ def libraries() -> tuple[str, ...]:
     imports rather than by naming it, so a second one added to the detector tomorrow is recorded
     without anybody remembering — the failure mode ``ParserVersions.distributions`` documents.
 
-    **The Unicode database.** :func:`~manicule.core.glossary.normalise_acronym` NFKC-normalises,
+    **The Unicode database.** :func:`~manicule.core.glossary.normalize_acronym` NFKC-normalizes,
     so the version of the character database decides a stored *lookup key*; #121 put NFKC into
     :func:`~manicule.ingest.glossary.initial_skeleton` as well. It has no distribution to look
     up, so it is named rather than derived.
@@ -245,15 +245,15 @@ def libraries() -> tuple[str, ...]:
 
     :data:`DERIVED_FROM` states what this therefore does *not* catch. The choice worth repeating
     here is the granularity: ``3.13`` rather than ``3.13.11``. CPython's own policy is that a
-    patch release fixes bugs without changing documented behaviour, so re-staling a corpus on one
+    patch release fixes bugs without changing documented behavior, so re-staling a corpus on one
     would be invalidating for a change that is not supposed to exist — and two machines a patch
     apart would disagree about a restored corpus for a reason nobody could act on. **The accepted
-    risk is a behaviour change that ships in a patch release anyway**, which is real, narrow, and
+    risk is a behavior change that ships in a patch release anyway**, which is real, narrow, and
     chosen over churning every corpus on every patch upgrade.
 
     ``unicodedata`` is kept beside it even though CPython moves the two together, so it is
     redundant rather than additive — it costs no extra invalidation and it makes a stale
-    fingerprint legible. ``unicodedata@15.1.0 -> 16.0.0`` says normalisation moved;
+    fingerprint legible. ``unicodedata@15.1.0 -> 16.0.0`` says normalization moved;
     ``python@3.13 -> 3.14`` says the interpreter did, and an operator reading a diff should not
     have to know which release changed which table.
 

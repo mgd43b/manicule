@@ -53,7 +53,7 @@ EXPANSION = "Network Operations Workspace"
 # --- what the fingerprint is made of --------------------------------------------------------
 
 
-def test_the_digest_covers_the_detector_and_the_normalisation_it_resolves_through() -> None:
+def test_the_digest_covers_the_detector_and_the_normalization_it_resolves_through() -> None:
     """Requirement 4 is why there are two files rather than one.
 
     ``manicule.ingest.glossary`` decides which lines are definitions. It does not decide what
@@ -126,7 +126,7 @@ def test_a_comment_only_edit_also_moves_it_and_that_is_the_direction_chosen() ->
     A digest over bytes cannot tell a rule from the paragraph explaining it, so a docstring fix
     makes the corpus stale. That is the deliberate half of the trade: over-invalidation costs a
     sweep that reads chunks and writes rows — no parser, no embedder, no network — and
-    under-invalidation costs a definition served from rules that no longer exist. A normalised
+    under-invalidation costs a definition served from rules that no longer exist. A normalized
     digest that skipped comments would be the other way round, and its failure would be silent.
     """
     made = hashlib.sha256()
@@ -143,7 +143,7 @@ def test_a_dependency_that_decides_a_stored_entry_is_recorded_with_its_version()
     That is exactly what a dependency upgrade is, and the detector has two.
 
     ``unicodedata`` is the sharper of them and is the reason this was found at all.
-    :func:`~manicule.core.glossary.normalise_acronym` NFKC-folds a surface into the stored
+    :func:`~manicule.core.glossary.normalize_acronym` NFKC-folds a surface into the stored
     *lookup key*, and #121 put NFKC into :func:`~manicule.ingest.glossary.initial_skeleton` as
     well — so the version of the character database decides what a term is filed under, it moves
     with the interpreter rather than with any distribution, and nothing in a source digest sees
@@ -305,7 +305,7 @@ def test_every_stated_limit_of_the_derivation_carries_its_reasoning() -> None:
         ("colon", b"_COLON_RE: Final = re.compile("),
         ("parenthetical", b"_PARENTHETICAL_RE: Final = re.compile("),
         ("definition list", b"_DEFINITION_MARKER_RE: Final = re.compile("),
-        ("normalisation", b"_STRIPPABLE: Final = "),
+        ("normalization", b"_STRIPPABLE: Final = "),
     ],
 )
 def test_each_detection_rule_is_independently_represented_in_the_digest(
@@ -321,7 +321,7 @@ def test_each_detection_rule_is_independently_represented_in_the_digest(
     Two of these are not written forms and are here for that reason. ``acronym`` is the shape
     gate and ``bracket`` is the boundary model: both decide what is stored without being a syntax
     an author types, and both are exactly what a list of "supported forms" would leave out.
-    ``normalisation`` is in the *other* file, so a parametrisation that only ever read the
+    ``normalization`` is in the *other* file, so a parametrization that only ever read the
     detector would fail on it.
 
     **The locator failing is itself the point.** Rename a rule and this reports that the test is

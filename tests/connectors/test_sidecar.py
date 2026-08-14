@@ -303,7 +303,7 @@ async def test_a_manifest_may_declare_the_path_it_actually_wrote(tmp_path: Path)
     assert record.snapshot.path == "mirror/123456.html"
 
 
-async def test_a_windows_flavoured_declaration_describes_the_same_file(tmp_path: Path) -> None:
+async def test_a_windows_flavored_declaration_describes_the_same_file(tmp_path: Path) -> None:
     """Separators are folded, so a manifest written on Windows is not refused for saying so."""
     nested = tmp_path / "mirror"
     nested.mkdir()

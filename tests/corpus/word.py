@@ -96,13 +96,13 @@ def _typical(path: Path) -> None:
     document.add_paragraph("Announce the window in the release channel.", style="List Bullet")
     document.add_paragraph("Drain the queue before promoting.", style="List Bullet")
     document.add_heading("Rollback", level=2)
-    document.add_paragraph("Demote the previous artefact and restore the schema snapshot.")
+    document.add_paragraph("Demote the previous artifact and restore the schema snapshot.")
     table = document.add_table(rows=3, cols=3)
     _fill(
         table,
         [
             ["Step", "Owner", "Timeout"],
-            ["Demote artefact", "release engineer", "4 minutes"],
+            ["Demote artifact", "release engineer", "4 minutes"],
             ["Restore snapshot", "database on-call", "17 minutes"],
         ],
     )

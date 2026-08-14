@@ -8,7 +8,7 @@ Two embedders carry the load here and they are opposites by construction:
   check, and anything above the floor should clear it.
 - :class:`MeaninglessEmbedder` has none. Its vector is a hash of the whole string, so two texts
   sharing every word but one are as far apart as two unrelated ones. It produces well-shaped,
-  normalised, deterministic vectors and raises nothing, which is exactly why an evaluation
+  normalized, deterministic vectors and raises nothing, which is exactly why an evaluation
   harness has to be able to catch it rather than trusting that somebody would notice.
 
 Both are deterministic across processes. ``hash()`` on a string is salted per interpreter, so
@@ -49,7 +49,7 @@ def _digest(text: str) -> bytes:
     return hashlib.sha256(text.encode("utf-8")).digest()
 
 
-def _normalise(values: list[float]) -> list[float]:
+def _normalize(values: list[float]) -> list[float]:
     norm = math.sqrt(sum(value * value for value in values))
     return values if norm == 0.0 else [value / norm for value in values]
 
@@ -78,7 +78,7 @@ class _FakeEmbedder:
 class BagOfWordsEmbedder(_FakeEmbedder):
     """A vector with real semantic content: which words the text contains.
 
-    Every token is hashed into a bucket and counted, then the vector is normalised. Two texts
+    Every token is hashed into a bucket and counted, then the vector is normalized. Two texts
     about the same thing share tokens and therefore share buckets, which is all a probe asks
     for.
     """
@@ -94,14 +94,14 @@ class BagOfWordsEmbedder(_FakeEmbedder):
             if not cleaned:
                 continue
             buckets[int.from_bytes(_digest(cleaned)[:4], "big") % DIMENSION] += 1.0
-        return _normalise(buckets)
+        return _normalize(buckets)
 
 
 class MeaninglessEmbedder(_FakeEmbedder):
     """A vector with no semantic content, and nothing about it says so.
 
     The whole string is hashed and the digest is stretched into a unit vector. It is
-    deterministic, correctly shaped, correctly normalised, and its similarities are unrelated
+    deterministic, correctly shaped, correctly normalized, and its similarities are unrelated
     to meaning — so a system built on it ranks documents in an order that ignores the query.
     Every guard in :mod:`manicule.evaluation.probe` exists because of this class.
     """
@@ -116,10 +116,10 @@ class MeaninglessEmbedder(_FakeEmbedder):
         while len(raw) < DIMENSION:
             raw += _digest(f"{counter}\x00{text}")
             counter += 1
-        # Centred on zero, so the vectors point in genuinely arbitrary directions. Bytes taken
+        # Centered on zero, so the vectors point in genuinely arbitrary directions. Bytes taken
         # as-is are all positive, which would make every pair of vectors similar and hide the
         # very absence of structure this class exists to have.
-        return _normalise([byte / 255.0 - 0.5 for byte in raw[:DIMENSION]])
+        return _normalize([byte / 255.0 - 0.5 for byte in raw[:DIMENSION]])
 
 
 class CosineVectorStore:

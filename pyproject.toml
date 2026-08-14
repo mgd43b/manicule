@@ -103,7 +103,7 @@ generation = [     # #7
   # dependency of one *configuration* rather than an install dependency of manicule.
   #
   # The floor is not decoration. §4.2's `ollama_chat` routing, §4.6's retry gate, §4.8's
-  # `BadRequestError` hierarchy and §4.10's usage fallbacks are behaviours verified against
+  # `BadRequestError` hierarchy and §4.10's usage fallbacks are behaviors verified against
   # this release; lowering it means re-verifying those four rather than merely resolving.
   "litellm>=1.83",
   # The generation-side token estimate (docs/retrieval.md §7.2, generation.md §9.2). Already
@@ -187,9 +187,9 @@ dev = [
   "pytest-cov>=6.0",
   # Declared directly, though pytest-cov already brings it, because `[tool.coverage.run] core`
   # is now load-bearing and `pytest-cov>=6.0` does not imply a coverage that has heard of it.
-  # coverage warns on an option it does not recognise, and `filterwarnings = ["error"]` turns
+  # coverage warns on an option it does not recognize, and `filterwarnings = ["error"]` turns
   # that into a hard stop — so on too old a release the suite does not run slower, it refuses
-  # to run, reporting an unrecognised option rather than anything about the version. The floor
+  # to run, reporting an unrecognized option rather than anything about the version. The floor
   # is the release the `[tool.coverage.run]` timings below were measured on.
   "coverage>=7.15",
   # What splits the suite across the CI matrix's shards. Chosen over the count-based splitters

@@ -1,4 +1,4 @@
-"""Pooling: the reduction, the rank check in front of it, and the normalisation after it.
+"""Pooling: the reduction, the rank check in front of it, and the normalization after it.
 
 No model is loaded here. Everything the reduction can get wrong is arithmetic on token states,
 and arithmetic is testable exhaustively and instantly — including the cases a real model would
@@ -14,7 +14,7 @@ from manicule.core.embedding import Pooling, TokenStates
 from manicule.core.errors import TokenStateError
 from manicule.embedding.pooling import (
     TOKEN_STATE_RANK,
-    l2_normalise,
+    l2_normalize,
     pool,
     pool_token_states,
     require_token_states,
@@ -32,7 +32,7 @@ def test_token_states_must_be_three_dimensional() -> None:
     ``mlx-embeddings`` binds ``last_hidden_state`` to genuine token states on one architecture
     and to the already-pooled vector on another. Pooling the pooled vector does not fail: it
     reduces over the batch axis and hands every text in the batch the same well-shaped,
-    normalised, wrong vector. A test that only checked "a vector came back" would pass on
+    normalized, wrong vector. A test that only checked "a vector came back" would pass on
     exactly that.
     """
     pooled = states()[:, 0, :]
@@ -111,15 +111,15 @@ def test_a_mask_that_does_not_match_the_states_is_refused() -> None:
         pool(states(), np.ones((2, 9), dtype=np.int64), Pooling.MEAN)
 
 
-def test_normalisation_is_applied_rather_than_read_from_the_model() -> None:
+def test_normalization_is_applied_rather_than_read_from_the_model() -> None:
     """A repository can omit its ``Normalize`` step and still publish cosine scores.
 
     Trusting the declaration reproduces neither the published numbers nor anyone else's index,
-    so normalisation is unconditional here.
+    so normalization is unconditional here.
     """
-    normalised = l2_normalise(np.array([[3.0, 4.0], [0.0, 0.0]], dtype=np.float32))
+    normalized = l2_normalize(np.array([[3.0, 4.0], [0.0, 0.0]], dtype=np.float32))
 
-    lengths = (normalised * normalised).sum(axis=-1)
+    lengths = (normalized * normalized).sum(axis=-1)
     assert np.allclose(lengths, [1.0, 0.0]), "a zero vector must not divide by zero"
 
 
@@ -134,13 +134,13 @@ def test_cls_and_mean_disagree_enough_to_matter() -> None:
     values = states(1, 8, 4)
     mask = np.ones((1, 8), dtype=np.int64)
 
-    cls = l2_normalise(pool(values, mask, Pooling.CLS))
-    mean = l2_normalise(pool(values, mask, Pooling.MEAN))
+    cls = l2_normalize(pool(values, mask, Pooling.CLS))
+    mean = l2_normalize(pool(values, mask, Pooling.MEAN))
 
     assert float(cls[0] @ mean[0]) < 0.99
 
 
-def test_pooled_output_is_normalised_and_plain() -> None:
+def test_pooled_output_is_normalized_and_plain() -> None:
     """Vectors cross a storage boundary next, so they leave as sequences, not native arrays."""
     vectors = pool_token_states(
         TokenStates(states=states(), attention_mask=np.ones((2, 4), dtype=np.int64), dimension=3),

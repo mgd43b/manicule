@@ -6,7 +6,7 @@ no company names, no real URLs, no copied page content. Hosts are under ``.test`
 
 Two properties get the most attention, because they are the two that would be silent if wrong.
 
-**Identity is the page id.** A mirroring tool that reorganises its directories has not created new
+**Identity is the page id.** A mirroring tool that reorganizes its directories has not created new
 pages, and a connector keyed on the path would report every document deleted and every document
 new on the next sync. Several tests move a page's directory and assert its identity did not move.
 
@@ -156,7 +156,7 @@ async def test_moving_a_page_between_directories_does_not_change_its_identity(
 ) -> None:
     """The trap this connector exists to avoid, and the reason it does not key on the path.
 
-    A mirroring tool that organises by space this year and by page tree next year has not created
+    A mirroring tool that organizes by space this year and by page tree next year has not created
     new pages. Keyed on the path, every document would be reported deleted and every document new
     — a full re-index, and every citation into the old corpus dangling.
     """
@@ -668,7 +668,7 @@ async def test_a_macro_with_no_reader_is_still_reported(tmp_path: Path) -> None:
 
 
 async def test_a_recovered_cdata_body_is_not_reported_as_dropped(tmp_path: Path) -> None:
-    """The stale diagnostic, which contradicted the behaviour for as long as #90 has been merged.
+    """The stale diagnostic, which contradicted the behavior for as long as #90 has been merged.
 
     The connector said ``!body-content-dropped: … content is absent from this document …`` whenever
     a page held an ``ac:plain-text-body``. Since #90 the HTML parser recovers those sections as

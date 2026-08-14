@@ -88,7 +88,7 @@ def test_an_operators_own_cache_directory_is_neither_replaced_nor_removed(
     assert os.environ[store.CACHE_DIR_ENV] == str(tmp_path / "theirs")
 
 
-def test_a_temporary_directory_is_recognised_as_one() -> None:
+def test_a_temporary_directory_is_recognized_as_one() -> None:
     """What ``doctor`` asks so it can refuse to call an impermanent cache healthy."""
     assert vocabularies.is_impermanent(Path(tempfile.gettempdir()) / store.CACHE_DIR_NAME)
     assert vocabularies.is_impermanent(Path(tempfile.gettempdir()))

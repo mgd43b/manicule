@@ -8,7 +8,7 @@ returned rather than against a template read off disk.
 - a **document title** — whatever was in the file that got indexed;
 - a **heading path** — whatever the parser found inside it;
 - an **answer body** — a model writing about that document;
-- a **citation quote and label** — the document's own words, travelling back out under
+- a **citation quote and label** — the document's own words, traveling back out under
   manicule's name;
 - an **authoritative source title** and **source hierarchy** — whatever an adjacent sidecar
   manifest declared, and preferred over the filename.
@@ -171,7 +171,7 @@ def test_a_refused_manifests_reason_reaches_the_page_inert() -> None:
         }
     )
     backend.store.documents[refused.id] = refused
-    backend.organisation_.documents[refused.id] = refused
+    backend.organization_.documents[refused.id] = refused
 
     with client_for(backend) as client:
         body = client.get(f"/ui/documents/{refused.id}").text
@@ -229,7 +229,7 @@ def test_switching_the_escaping_off_lets_the_markup_through(
     :func:`~manicule.web.rendering.build_environment`. An off-switch that ships is an off-switch
     somebody can reach; this one exists only for the length of this test.
 
-    **Parametrised over the two pages that were added to** :data:`PLANTED`. Proving the control
+    **Parametrized over the two pages that were added to** :data:`PLANTED`. Proving the control
     on one page and then trusting it for two more that render through different templates is
     exactly the assumption that left those two untested in the first place — a page whose
     fixture gives it nothing to render also carries no raw markup with the escaping off, and

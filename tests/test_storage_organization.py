@@ -1,4 +1,4 @@
-"""Organisation on top of the corpus: collections, tags, versions, relations, the trash.
+"""Organization on top of the corpus: collections, tags, versions, relations, the trash.
 
 Three properties carry most of the weight here, and each of them fails in silence.
 
@@ -25,7 +25,7 @@ from sqlalchemy import text as sql
 from manicule.core.content import Document, DocumentStatus
 from manicule.core.errors import NameInUseError, UnknownEntityError
 from manicule.core.ids import content_hash
-from manicule.core.organisation import (
+from manicule.core.organization import (
     ChunkRelationType,
     CitationState,
     CollectionRule,
@@ -38,10 +38,10 @@ from manicule.core.protocols import (
     VersionStore,
 )
 from manicule.core.retrieval import Filter
-from manicule.storage import organisation
+from manicule.storage import organization
 from manicule.storage.blobs import BlobStore
 from manicule.storage.docstore import SqliteDocStore
-from manicule.storage.organisation import normalise_name, resolve_filter
+from manicule.storage.organization import normalize_name, resolve_filter
 from manicule.storage.scoped import DEFAULT_WORKSPACE
 from manicule.testing import (
     assert_chunk_relation_store_contract,
@@ -94,7 +94,7 @@ async def _with_chunks(store: SqliteDocStore, document: Document, count: int = 2
 
 
 @pytest.mark.contract
-def test_one_store_satisfies_every_organisation_protocol(store: SqliteDocStore) -> None:
+def test_one_store_satisfies_every_organization_protocol(store: SqliteDocStore) -> None:
     """``DocStore`` was left partial on the promise that these would arrive separately.
 
     Structural conformance *and* signature conformance, because ``@runtime_checkable`` checks
@@ -129,7 +129,7 @@ async def test_a_rule_driven_collection_picks_up_documents_indexed_after_it(
 ) -> None:
     """A rule is a saved query, not a snapshot taken the day it was written.
 
-    Materialising membership at write time would make "everything from the runbooks space"
+    Materializing membership at write time would make "everything from the runbooks space"
     quietly mean "what was there in March", and nothing about the collection would say so.
     """
     collection = await store.create_collection(
@@ -220,7 +220,7 @@ async def test_the_sqlite_store_passes_the_tag_suite(
 
 
 async def test_two_encodings_of_one_label_are_one_tag(store: SqliteDocStore) -> None:
-    """``café`` typed two ways is one label to a reader and two rows without normalisation.
+    """``café`` typed two ways is one label to a reader and two rows without normalization.
 
     A precomposed ``é`` and an ``e`` followed by a combining acute are different byte strings
     and identical on screen. Filtering by one would then return half the documents, with both
@@ -242,10 +242,10 @@ async def test_a_tag_cannot_be_applied_to_another_workspaces_document(
         await store.tag_document(outsider.id, [tag.id])
 
 
-async def test_normalising_refuses_a_name_that_is_only_whitespace() -> None:
+async def test_normalizing_refuses_a_name_that_is_only_whitespace() -> None:
     """A nameless label cannot be found again, and would collide with the next one."""
     with pytest.raises(ValueError, match="empty once whitespace is collapsed"):
-        normalise_name("   \n ")
+        normalize_name("   \n ")
 
 
 # --- chunk relations --------------------------------------------------------------------------
@@ -287,7 +287,7 @@ async def test_replacing_a_documents_chunks_takes_their_edges_with_them(
 
 
 async def test_an_edge_into_the_trash_is_not_returned(store: SqliteDocStore) -> None:
-    """A soft-deleted document must not reach a reader through a neighbour that is still live.
+    """A soft-deleted document must not reach a reader through a neighbor that is still live.
 
     Deletion is deferred, so the far chunk and its row are both still there. Relations are a
     context-expansion mechanism; one that ignored the soft-delete predicate would put deleted
@@ -586,7 +586,7 @@ async def test_a_collection_too_large_to_carry_is_refused_rather_than_truncated(
     documents = await _seed(store, 3)
     collection = await store.create_collection("large")
     await store.add_to_collection(collection.id, [document.id for document in documents])
-    monkeypatch.setattr(organisation, "MAX_RESOLVED_DOCUMENTS", 2)
+    monkeypatch.setattr(organization, "MAX_RESOLVED_DOCUMENTS", 2)
 
     scope = Filter(
         workspace_ids=frozenset({DEFAULT_WORKSPACE}), collection_ids=frozenset({collection.id})

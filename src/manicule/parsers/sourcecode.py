@@ -25,7 +25,7 @@ would hand the file to the plain-text parser and line-split it — the very outc
 declared language set exists to prevent. See :mod:`manicule.parsers.grammars`.
 
 **No native object is alive at a ``yield``.** ``parse`` is an async generator, and one
-abandoned part-way stays suspended holding everything in its frame until CPython finalises it
+abandoned part-way stays suspended holding everything in its frame until CPython finalizes it
 through the event loop that created it — which, if that loop has closed, means running a
 native destructor against a torn-down runtime. The usual answer is a ``try``/``finally``
 around the ``yield``, and it is the right answer when a generator must hold a handle open.
@@ -230,7 +230,7 @@ def _read_tree(language: str, data: bytes, lines: _Lines) -> _Item:
     A separate function so that the grammar's ``Parser`` and the ``Tree`` it produces are
     locals *here* rather than in the generator frame of :meth:`SourceCodeParser.parse`. An
     async generator abandoned part-way stays suspended holding everything in its frame, and
-    CPython finalises it later through the loop that created it — against a torn-down runtime
+    CPython finalizes it later through the loop that created it — against a torn-down runtime
     if that loop has closed, which surfaces as a crash inside the interpreter rather than as
     anything nameable. Releasing in a ``finally`` would answer the abandoned case; keeping
     the native objects out of the frame entirely answers it and the never-closed case too.
@@ -535,10 +535,10 @@ def _pack(items: tuple[_Item, ...], lines: _Lines, budget: int) -> list[tuple[_I
         current.append(item)
     if current:
         groups.append(current)
-    return [tuple(group) for group in _joined_to_neighbours(groups)]
+    return [tuple(group) for group in _joined_to_neighbors(groups)]
 
 
-def _joined_to_neighbours(groups: list[list[_Item]]) -> list[list[_Item]]:
+def _joined_to_neighbors(groups: list[list[_Item]]) -> list[list[_Item]]:
     """Fold any group of nothing but unnamed tokens into an adjacent one.
 
     Descending far enough eventually offers the closing brace of a block as a boundary of its

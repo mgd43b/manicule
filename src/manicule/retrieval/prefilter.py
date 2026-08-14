@@ -62,7 +62,7 @@ class Resolution:
     ) -> None:
         self.pushdown = pushdown
         """What the vector store is asked. Only fields it has a column for, plus the workspace
-        it is exempt from honouring."""
+        it is exempt from honoring."""
 
         self.join = join
         """What the hydrating join applies. The scope, and every join-requiring field —
@@ -119,7 +119,7 @@ async def resolve(
         docstore: The store for the workspace the query names.
         prefilter_id_limit: Above this many resolved documents, stop resolving and
             post-filter instead. Resolution stops one past the limit, so a query against a
-            large corpus never materialises its whole document list to answer a question the
+            large corpus never materializes its whole document list to answer a question the
             first thousand rows already answered.
 
     Returns:
@@ -127,7 +127,7 @@ async def resolve(
         return no candidates rather than falling through to an unconstrained search.
 
     Raises:
-        ValueError: The store cannot honour a field the filter sets — collection or tag
+        ValueError: The store cannot honor a field the filter sets — collection or tag
             membership, until the store that owns those relations can resolve them. Refused
             rather than dropped: a silently ignored restriction returns rows the filter was
             written to exclude, and the search still looks like it worked.

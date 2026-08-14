@@ -16,7 +16,7 @@ fingerprint hash, so two spaces cannot occupy one name even for the length of a 
 
 **A different model is refused, not accepted at the same size.** Comparison goes through
 :meth:`~manicule.core.fingerprints.Fingerprint.require_match`, which compares the canonical
-serialisation byte for byte. Two unrelated 1024-dimension models pass any size check and
+serialization byte for byte. Two unrelated 1024-dimension models pass any size check and
 turn every stored vector into noise relative to every new query, with nothing downstream
 able to notice.
 
@@ -121,7 +121,7 @@ for; those are resolved in the document store first and arrive here as ``documen
 """
 
 EXEMPT_FILTER_FIELDS: Final = frozenset({"workspace_ids"})
-""":class:`~manicule.core.retrieval.Filter` fields this store neither honours nor refuses.
+""":class:`~manicule.core.retrieval.Filter` fields this store neither honors nor refuses.
 
 **A named exemption rather than an omission, because the two look identical in a loop and
 only one of them is deliberate.** ``workspace_ids`` is a security boundary (``PLAN.md`` §14),
@@ -200,7 +200,7 @@ def predicate_for(filter: Filter | None) -> str | None:  # noqa: A002 - the doma
     :data:`EXEMPT_FILTER_FIELDS` names, one field, with the reason attached.
 
     Raises:
-        ValueError: When ``filter`` sets a field this store can neither honour nor has been
+        ValueError: When ``filter`` sets a field this store can neither honor nor has been
             granted an exemption for. Refusing is the point: quietly dropping a restriction
             returns results the filter was written to exclude, and the search still looks
             like it worked.
@@ -208,13 +208,11 @@ def predicate_for(filter: Filter | None) -> str | None:  # noqa: A002 - the doma
     if filter is None:
         return None
 
-    unhonoured = sorted(
-        filter.restricting_fields - PUSHED_DOWN_FILTER_FIELDS - EXEMPT_FILTER_FIELDS
-    )
-    if unhonoured:
+    unhonored = sorted(filter.restricting_fields - PUSHED_DOWN_FILTER_FIELDS - EXEMPT_FILTER_FIELDS)
+    if unhonored:
         msg = (
-            f"the vector table has no column for {', '.join(unhonoured)}, so this store "
-            f"cannot honour {'them' if len(unhonoured) > 1 else 'it'}. Resolve those fields "
+            f"the vector table has no column for {', '.join(unhonored)}, so this store "
+            f"cannot honor {'them' if len(unhonored) > 1 else 'it'}. Resolve those fields "
             f"in the document store and pass the result as document_ids; ignoring them here "
             f"would return results the filter was written to exclude."
         )
@@ -287,7 +285,7 @@ class _MetaRow(LanceModel):
     Two columns because they answer different questions. ``embed_fingerprint`` is the whole
     model, which is what :meth:`LanceVectorStore.fingerprint` has to return — the canonical
     form holds identity fields only and cannot rebuild the type. ``canonical`` is the
-    identity serialisation the table name hashes, comparable byte for byte by anything that
+    identity serialization the table name hashes, comparable byte for byte by anything that
     would rather not parse it.
     """
 
@@ -457,7 +455,7 @@ class LanceVectorStore:
     ) -> list[Candidate]:
         """Return up to ``k`` nearest chunks, best first.
 
-        Stored vectors are L2-normalised and the metric is cosine, so ``score`` is
+        Stored vectors are L2-normalized and the metric is cosine, so ``score`` is
         ``1 - distance``: a real cosine similarity in ``[-1, 1]``, not a monotone transform of
         a distance that happens to rank the same way. It is clamped to that interval, which
         float error can otherwise exceed by an ulp or two.
@@ -473,7 +471,7 @@ class LanceVectorStore:
 
         Raises:
             ValueError: If ``vector`` is not the dimension the index was built for, or if
-                ``filter`` sets a field this store cannot honour.
+                ``filter`` sets a field this store cannot honor.
             VectorStoreStateError: If :meth:`ensure_ready` has not run.
         """
         table, fingerprint = self._ready()
@@ -679,7 +677,7 @@ class LanceVectorStore:
     def _row(
         self, chunk: Chunk, vector: Vector, fingerprint: EmbedFingerprint
     ) -> dict[str, object]:
-        """One Lance row: the normalised vector, the promoted columns, the chunk, its identity."""
+        """One Lance row: the normalized vector, the promoted columns, the chunk, its identity."""
         values = unit(vector)
         if len(values) != fingerprint.dimension:
             msg = (
@@ -758,7 +756,7 @@ class LanceVectorStore:
         if stored.canonical() != canonical:
             msg = (
                 f"{META_TABLE} in {self._directory} contradicts itself: the recorded "
-                f"identity is {canonical}, but the fingerprint stored beside it canonicalises "
+                f"identity is {canonical}, but the fingerprint stored beside it canonicalizes "
                 f"to {stored.canonical()}. The row has been edited or half-written; restore "
                 f"the directory rather than trusting either half."
             )

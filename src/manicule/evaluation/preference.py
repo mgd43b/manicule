@@ -1,7 +1,7 @@
 """Pairwise preference: what was shown, what was chosen, and what produced each side.
 
 Pairwise rather than absolute relevance labels, and that is the methodological choice this
-package is built around. Absolute judgements need a scale, a definition of relevant, and a
+package is built around. Absolute judgments need a scale, a definition of relevant, and a
 minute of attention per passage; a preference between two ranked lists takes seconds and
 answers the question actually being asked — *is this configuration better than the one I have*.
 Absolute labels and nDCG come later, and only if preference stops discriminating between
@@ -13,7 +13,7 @@ from the recorded seed, and uncorrelated with anything about the systems. A judg
 picks the first list therefore produces a split indistinguishable from a coin rather than a
 clean win for whichever system was passed first.
 
-**Records are append-only JSON Lines.** They are evidence. Rewriting a file of judgements in
+**Records are append-only JSON Lines.** They are evidence. Rewriting a file of judgments in
 place is how a run gets re-scored after the fact, and a line-per-record file can be appended to
 across sessions, read by anything, and diffed.
 """
@@ -120,7 +120,7 @@ class Pairing(BaseModel):
 
     @property
     def incomparable(self) -> tuple[str, ...]:
-        """Why this pairing may not count towards a rate, labelled by side."""
+        """Why this pairing may not count towards a rate, labeled by side."""
         return tuple(
             f"{result.config_label}: {reason}"
             for result in (self.left, self.right)
@@ -129,7 +129,7 @@ class Pairing(BaseModel):
 
 
 class PreferenceRecord(BaseModel):
-    """One judgement, self-contained.
+    """One judgment, self-contained.
 
     Everything needed to read it back without the query set, the configuration files or the
     person who ran it: the question, both configurations in full, both corpus versions, both
@@ -143,7 +143,7 @@ class PreferenceRecord(BaseModel):
     recorded_at: datetime
     query_id: str = Field(min_length=1)
     query_text: str = Field(min_length=1)
-    intent: Intent = Intent.UNCATEGORISED
+    intent: Intent = Intent.UNCATEGORIZED
     thumbs: Thumbs | None = None
     query_set: str = Field(min_length=1)
     provenance: Provenance
@@ -177,7 +177,7 @@ class PreferenceRecord(BaseModel):
             ]
             msg = (
                 f"a preference cannot be recorded for a side that retrieves at chance: "
-                f"{', '.join(failing)}. The judgement would be a judgement about noise, and a "
+                f"{', '.join(failing)}. The judgment would be a judgment about noise, and a "
                 f"stored one would outlive the knowledge that it was"
             )
             raise ValueError(msg)
@@ -185,7 +185,7 @@ class PreferenceRecord(BaseModel):
 
     @property
     def admissible(self) -> bool:
-        """Whether this judgement may count towards a rate.
+        """Whether this judgment may count towards a rate.
 
         A record is kept either way — it is evidence about the run — but a pairing where a run
         was degraded, cached or stopped by its own budget is not a comparison of two pipelines.
@@ -236,7 +236,7 @@ def build_record(
 class PreferenceStore:
     """Append-only JSON Lines on disk.
 
-    No update and no delete, deliberately. A judgement is an observation; correcting one is
+    No update and no delete, deliberately. A judgment is an observation; correcting one is
     making a new observation, and a file that can be edited in place is a file whose history
     is whatever the last writer decided it was.
     """
@@ -249,14 +249,14 @@ class PreferenceStore:
         return self._path
 
     def append(self, record: PreferenceRecord) -> None:
-        """Add one judgement. Creates the file and its directory on first write."""
+        """Add one judgment. Creates the file and its directory on first write."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record.model_dump(mode="json"), ensure_ascii=False)
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
     def records(self) -> Iterator[PreferenceRecord]:
-        """Every judgement, in the order it was made.
+        """Every judgment, in the order it was made.
 
         Raises:
             PreferenceRecordError: A line is not a record this build can read. Refused rather than

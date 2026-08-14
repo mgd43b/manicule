@@ -1,6 +1,6 @@
 """The embedding path both backends share: tokenize, read token states, pool here.
 
-The division of labour is deliberate. A backend contributes exactly one thing — a forward
+The division of labor is deliberate. A backend contributes exactly one thing — a forward
 pass returning per-token hidden states — and everything that decides what a vector *means*
 happens in this module and in :mod:`manicule.embedding.pooling`, once, for every runtime:
 
@@ -10,7 +10,7 @@ happens in this module and in :mod:`manicule.embedding.pooling`, once, for every
   raises nothing;
 * the reduction, because the field a backend calls its embedding is not reliably the
   reduction the model was trained with;
-* L2 normalisation, because a repository can omit its ``Normalize`` step while still
+* L2 normalization, because a repository can omit its ``Normalize`` step while still
   publishing cosine scores that assume it.
 
 What is left to a backend is throughput. That is the Apple-hardware principle expressed as a
@@ -81,7 +81,7 @@ class PooledEmbedder(Lifecycle, ABC):
         # on one thread and evaluated on another abort the process outright — `libc++abi:
         # terminating ... There is no Stream(gpu, N) in current thread`, not an exception
         # anything can catch. `asyncio.to_thread` hands out whichever pool thread is free, so
-        # it is exactly the wrong tool here. A single worker also serialises forward passes,
+        # it is exactly the wrong tool here. A single worker also serializes forward passes,
         # which is what one accelerator wants anyway.
         self._worker = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix=f"manicule-embed-{backend}"
@@ -92,15 +92,15 @@ class PooledEmbedder(Lifecycle, ABC):
 
     @abstractmethod
     def _forward(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
-        """Run the encoder and return per-token hidden states, unpooled and unnormalised.
+        """Run the encoder and return per-token hidden states, unpooled and unnormalized.
 
-        **Materialised into numpy here, on the worker thread, before returning.** MLX is lazy:
+        **Materialized into numpy here, on the worker thread, before returning.** MLX is lazy:
         a forward pass hands back an unevaluated graph bound to a stream that belongs to the
         thread that built it, and MLX's streams are thread-local. Converting it anywhere else —
         including in the pooling code one call up — evaluates it on a thread where its stream
         does not exist and aborts the process: ``libc++abi: terminating ... There is no
         Stream(gpu, N) in current thread``. That is a hard abort, not an exception, so nothing
-        catches it and nothing reports it. Returning a materialised array makes the boundary
+        catches it and nothing reports it. Returning a materialized array makes the boundary
         the type.
 
         Rank is checked by the caller: a backend handing back an already-pooled vector is an

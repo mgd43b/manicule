@@ -165,7 +165,7 @@ async def select(
     longer installed, plus documents carrying no recorded lineage at all.
 
     **Both of these matter without waiting for a sync.** Change detection re-parses a stale
-    document the next time its connector reports it, which is the right behaviour and the
+    document the next time its connector reports it, which is the right behavior and the
     wrong latency: between the upgrade and that sync, every anchor stored under the old
     version is being resolved by the new one. This is the selector that closes that window on
     demand, and it needs no network — re-parse reads retained bytes.
@@ -478,7 +478,7 @@ DEFAULT_SWEEP_BATCH = 25
 """How many documents one page of the sweep holds.
 
 Small, because the page is not where the work is. A document costs a parse, a chunking and an
-embedding pass, and those are serialised anyway — so a larger page buys nothing but a longer
+embedding pass, and those are serialized anyway — so a larger page buys nothing but a longer
 window in which an interrupted run has read rows it will not reach.
 """
 
@@ -641,7 +641,7 @@ async def re_parse_stale(
     where nothing can be repaired at all.
 
     **A document is the transaction boundary.** Each one is committed by the pipeline before
-    the next is read, so an interrupted run — ``Ctrl-C``, a killed process, a cancelled task —
+    the next is read, so an interrupted run — ``Ctrl-C``, a killed process, a canceled task —
     leaves every document it finished internally consistent and every document it did not
     still selected. Resuming is running the command again; there is no state to clean up and
     no resume token to keep.
@@ -839,7 +839,7 @@ def _entry_shape(
     **Every field, rather than the ones that decide a lookup**, and the difference was a real
     defect: an earlier version of this omitted ``display`` and ``location`` on the reasoning that
     nothing resolves through them. Both are *stored* and both are *shown* — ``display`` is the
-    source's own spelling of the term, which a citation quotes instead of the normalised key, and
+    source's own spelling of the term, which a citation quotes instead of the normalized key, and
     ``location`` is where in the document it was found. A detector change that moved either would
     have rewritten what a reader is served while this reported the document unchanged, which is a
     quieter version of exactly the defect the fingerprint exists to remove.

@@ -45,7 +45,7 @@ every connection the pool opens later silently skipping referential integrity â€
 still declares its foreign keys, and nothing enforces them.
 
 ``busy_timeout`` matters because ``aiosqlite`` runs each connection on its own thread, so
-"async SQLAlchemy" does not serialise writers. Without it, concurrent work fails immediately
+"async SQLAlchemy" does not serialize writers. Without it, concurrent work fails immediately
 with ``SQLITE_BUSY`` rather than waiting.
 """
 
@@ -139,7 +139,7 @@ def exposure(path: Path) -> int:
 
     Returns:
         The bits, so a caller can print the mode it objected to. Always ``0`` where POSIX
-        modes do not apply, because ``st_mode`` is synthesised there and would report a
+        modes do not apply, because ``st_mode`` is synthesized there and would report a
         healthy directory as world-readable.
 
     Raises:
@@ -194,7 +194,7 @@ def secure_output_dir(target: Path, *, operation: str, allow_insecure: bool = Fa
         # 0700. Root-first, one at a time, so each one manicule invents gets manicule's mode.
         #
         # An ancestor already there raises ``FileExistsError`` and is left exactly as found,
-        # modes included. That is the intended behaviour rather than a tolerated one: an
+        # modes included. That is the intended behavior rather than a tolerated one: an
         # existing directory is the operator's, and tightening it would be a mode change to a
         # path nobody asked about. Guarding with ``if not ancestor.exists()`` first would read
         # as the thing enforcing that, and would enforce nothing.

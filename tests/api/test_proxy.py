@@ -6,7 +6,7 @@ client-controlled value. The failure it defends against is silent: a server that
 somebody sets the header.
 
 So the tests come in pairs. For each property there is a **negative** — the header is ignored
-— and a **positive** — the header is honoured — because a resolver that ignored the header
+— and a **positive** — the header is honored — because a resolver that ignored the header
 always would satisfy every negative test on its own, and would also be useless.
 
 The end-to-end cases drive the whole application, through the real middleware, and read the
@@ -69,7 +69,7 @@ def test_a_spoofed_header_from_a_peer_outside_the_allowlist_is_ignored() -> None
     assert policy.client_address(peer=outsider, forwarded_for=SPOOFED) == outsider
 
 
-def test_a_forwarded_address_from_an_allowlisted_peer_is_honoured() -> None:
+def test_a_forwarded_address_from_an_allowlisted_peer_is_honored() -> None:
     """The positive control.
 
     Without it, a resolver that returned the peer unconditionally would pass every test above
@@ -192,7 +192,7 @@ def test_the_running_application_ignores_a_spoofed_header_from_an_untrusted_peer
     assert _address_seen_by_the_app(backend, peer="192.0.2.50", header=SPOOFED) == "192.0.2.50"
 
 
-def test_the_running_application_honours_a_forwarded_header_from_a_trusted_peer() -> None:
+def test_the_running_application_honors_a_forwarded_header_from_a_trusted_peer() -> None:
     """End to end, positive: the same request from an allowlisted peer is believed."""
     backend, _ = backend_with_a_document(security={"transport": {"trusted_proxies": list(TRUSTED)}})
     assert _address_seen_by_the_app(backend, peer=PROXY, header=REAL_CLIENT) == REAL_CLIENT

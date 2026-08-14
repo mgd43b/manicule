@@ -151,8 +151,8 @@ def inner_path(name: str) -> str | None:
 
     Members are parsed in memory and never written to disk, which removes most of the risk in
     a hostile name — but the name still becomes part of a ``uri`` shown to users and stored in
-    the index, so it is normalised, and a name that escapes the container root is **rejected**
-    rather than sanitised. Sanitising ``../../etc/passwd`` into ``etc/passwd`` produces a
+    the index, so it is normalized, and a name that escapes the container root is **rejected**
+    rather than sanitized. Sanitizing ``../../etc/passwd`` into ``etc/passwd`` produces a
     citation that looks ordinary and describes a file the archive never contained.
 
     Backslashes are read as separators because a zip written on Windows uses them, empty and
@@ -254,7 +254,7 @@ async def expanding(
     <manicule.core.protocols.Parser.parse>`, and it holds more: an archive expansion is
     suspended at the ``yield`` holding an open :class:`zipfile.ZipFile` and a decompression
     stream. A consumer that stops after one member — a pipeline with a member budget, an
-    assertion failing between two members — strands all of it until CPython finalises the
+    assertion failing between two members — strands all of it until CPython finalizes the
     generator through the loop that created it, which by then may have closed.
 
     So iteration goes through here::

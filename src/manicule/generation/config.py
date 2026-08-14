@@ -27,7 +27,7 @@ class GeneratorConfig(BaseModel):
     extra_params: dict[str, JsonValue] = Field(
         default_factory=dict,
         description="Additional parameters passed to the provider call untouched — an API "
-        "version, an organisation id, a provider-specific sampling knob. Deliberately opaque: "
+        "version, an organization id, a provider-specific sampling knob. Deliberately opaque: "
         "the alternative is a per-vendor settings type, which becomes a per-vendor branch in "
         "every consumer. Anything manicule itself sets (model, messages, stream, the three "
         "timeouts, num_ctx) is set after these, so this cannot quietly override a guarantee.",

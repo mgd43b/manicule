@@ -111,7 +111,7 @@ containers.
 """
 
 LEGACY_CACHE_DIR_ENV: Final = "DATA_GYM_CACHE_DIR"
-"""``tiktoken``'s older name for the same setting, still honoured by it and so honoured here.
+"""``tiktoken``'s older name for the same setting, still honored by it and so honored here.
 
 Reproduced rather than ignored because this module answers "where would ``tiktoken`` read
 this file from" and an answer that disagrees with ``tiktoken`` is worse than no answer: it
@@ -301,7 +301,7 @@ def pointed_at_the_cache(*, create: bool = False) -> Generator[None]:
 
     Scoped to the call rather than set once at import, for the reason every side effect in this
     package is scoped: a module that rewrites the environment when it is imported changes the
-    behaviour of a process that merely mentioned it. Set only when neither variable is already
+    behavior of a process that merely mentioned it. Set only when neither variable is already
     present, so an operator's own choice is never disturbed and never restored to something
     they did not set.
 
@@ -403,13 +403,13 @@ def blobs_for(encoding: str) -> tuple[Blob, ...]:
     cheap and is the case a pre-seed acts on. When every file is present the constructor runs
     to completion and builds a 200 000-entry BPE table, because the only way to learn whether
     an encoding needs a *second* file is to let it ask for one. That full pass happens at most
-    once per encoding per process: a complete answer is memoised in :data:`_enumerated`, and
+    once per encoding per process: a complete answer is memoized in :data:`_enumerated`, and
     the file list is a property of the installed library rather than of the disk, so the memo
     cannot go stale. Nothing on the query path calls this.
 
     Returns:
         Every blob recorded, in the order the constructor asked for them. An enumeration that
-        stopped at a gap is not memoised, so the next call — after a pre-seed has filled that
+        stopped at a gap is not memoized, so the next call — after a pre-seed has filled that
         gap — sees what comes after it.
 
     Raises:
@@ -428,9 +428,9 @@ def blobs_for(encoding: str) -> tuple[Blob, ...]:
         raise _Probed
 
     with _lock:
-        memoised = _enumerated.get(encoding)
-        if memoised is not None:
-            return memoised
+        memoized = _enumerated.get(encoding)
+        if memoized is not None:
+            return memoized
         original = loader.read_file_cached
         loader.read_file_cached = record
         complete = False

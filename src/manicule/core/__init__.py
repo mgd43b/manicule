@@ -77,7 +77,7 @@ from manicule.core.lifecycle import (
     SupportsTeardown,
     worst_state,
 )
-from manicule.core.organisation import (
+from manicule.core.organization import (
     ChunkEdge,
     ChunkRelationType,
     CitationResolution,

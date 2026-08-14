@@ -8,7 +8,7 @@ decides what a valid key is; this module carries the header to it and turns the 
 principal. Nothing about "is this key revoked, expired, or another tenant's" is decided here,
 because a rule implemented in a surface is a rule the other surfaces do not have.
 
-**Authorisation is a floor, expressed once per route.** ``admin > member > viewer``, and a
+**Authorization is a floor, expressed once per route.** ``admin > member > viewer``, and a
 route asks for the least it needs. Reads take a viewer; writes take a member; anything that
 changes what the installation *is* takes an admin.
 

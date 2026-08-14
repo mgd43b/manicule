@@ -596,7 +596,7 @@ def _chunk(account: str, index: int) -> str:
 def _account(base_url: str) -> str:
     """The keychain account a site's session is filed under.
 
-    Normalised so that ``https://wiki.example.com`` and ``https://wiki.example.com/`` are one
+    Normalized so that ``https://wiki.example.com`` and ``https://wiki.example.com/`` are one
     entry rather than two, one of which would be found and the other silently not.
     """
     return base_url.strip().rstrip("/")

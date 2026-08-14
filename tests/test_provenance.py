@@ -5,7 +5,7 @@ for.
 
 **Canonical identity and snapshot identity are both preserved, and neither can pretend to be the
 other.** That is asserted structurally where it can be — a model that has nowhere to put a local
-path cannot be made to assert one — and behaviourally where it cannot.
+path cannot be made to assert one — and behaviorally where it cannot.
 
 **A record is attacker-controlled input.** It comes out of a file inside the corpus and then out
 of a database, so the validation is asserted on both paths: on the way in, where a bad manifest
@@ -146,7 +146,7 @@ def test_a_provenance_carries_a_source_or_a_reason_and_never_both_or_neither() -
 def test_a_record_that_identifies_nothing_is_refused() -> None:
     """A record carrying only a timestamp would take the canonical path and change nothing.
 
-    That is the silent partial success: the manifest is honoured, the code path is the new one,
+    That is the silent partial success: the manifest is honored, the code path is the new one,
     and the citation renders the filename it always did — so the person who wrote the manifest
     has no way to tell it is doing nothing.
     """

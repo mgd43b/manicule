@@ -74,7 +74,7 @@ def wired(settings: Settings) -> tuple[Container, list[str]]:
 # --- resolution ---------------------------------------------------------------------------
 
 
-def test_resolution_is_typed_and_memoised(wired: tuple[Container, list[str]]) -> None:
+def test_resolution_is_typed_and_memoized(wired: tuple[Container, list[str]]) -> None:
     container, _ = wired
     parser = container.get(keys.PARSER.named("lines"))
     assert isinstance(parser, Parser)
@@ -316,7 +316,7 @@ async def test_a_health_check_that_raises_is_itself_the_diagnosis(settings: Sett
     assert "connection reset" in report.checks[0].detail
 
 
-async def test_metrics_are_labelled_with_where_they_came_from(
+async def test_metrics_are_labeled_with_where_they_came_from(
     wired: tuple[Container, list[str]],
 ) -> None:
     container, _ = wired
@@ -379,7 +379,7 @@ async def test_a_parser_disagreeing_with_its_own_declaration_is_caught(settings:
     """Routing reads the declaration, so a parser that handles something else is unreachable."""
     registry = ComponentRegistry().bind("test")
     registry.add(
-        keys.PARSER.named("mislabelled"), lambda _: LineParser(), media_types={"application/pdf"}
+        keys.PARSER.named("mislabeled"), lambda _: LineParser(), media_types={"application/pdf"}
     )
     container = Container(settings, registry)
     with pytest.raises(PluginError, match="must agree"):

@@ -16,14 +16,14 @@ Five decisions carry this module, and each is a trap something else here already
 **Identity is the page id, never the path.** This is the difference from
 :class:`~manicule.connectors.filesystem.FilesystemConnector`, where identity *is* the resolved
 path, and it is the whole of "an updated page replaces its previous version". A mirroring tool
-that renames a directory, or organises by space this year and by tree next year, has not created
+that renames a directory, or organizes by space this year and by tree next year, has not created
 new pages — but a connector keyed on the path would report every document deleted and every
 document new. The page id is the one handle Confluence itself promises is stable, so
 ``DocRef.source_id`` is the page id and the directory travels in ``DocRef.metadata``, which is
 what that field is for. :func:`~manicule.parsers.expansion.member_source_id` settled the same
 question for archive members: identity comes from a stable key, never from a position.
 
-**The manifest never authorises a read.** Carried over from :mod:`.sidecar` unchanged, because it
+**The manifest never authorizes a read.** Carried over from :mod:`.sidecar` unchanged, because it
 is the same threat: a manifest is a file in the corpus, so anyone who can get a directory indexed
 can write one. The raw representation is found by *looking* — it is the file beside the manifest —
 and a manifest that declares a filename has that declaration compared against what was found, not
@@ -518,8 +518,8 @@ class ConfluenceSnapshotConnector:
 
         declared = parsed.body_file.strip()
         if declared:
-            wanted = _normalised(declared)
-            found = next((path for path in candidates if _normalised(path.name) == wanted), None)
+            wanted = _normalized(declared)
+            found = next((path for path in candidates if _normalized(path.name) == wanted), None)
             if found is None:
                 msg = (
                     f"declares body_file {parsed.body_file!r}, which is not a file in this "
@@ -724,11 +724,11 @@ def _names(paths: Sequence[Path]) -> list[str]:
     return sorted(path.name for path in paths)
 
 
-def _normalised(name: str) -> str:
+def _normalized(name: str) -> str:
     """A declared or observed filename, comparable across the two ways of writing one.
 
     Separators folded only. **No ``..`` resolution**, which matters: collapsing ``a/../b`` to
-    ``b`` is exactly the normalisation that makes a traversal compare equal to a legitimate name,
+    ``b`` is exactly the normalization that makes a traversal compare equal to a legitimate name,
     and there is nothing to gain from it when both sides are bare filenames.
     """
     return str(PurePosixPath(name.replace("\\", "/")))

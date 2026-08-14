@@ -38,7 +38,7 @@ def test_the_document_store_reports_a_generation_counter(store: SqliteDocStore) 
 async def test_every_committed_write_moves_the_counter(store: SqliteDocStore) -> None:
     """It counts *commits*, not calls to the write methods somebody remembered to instrument.
 
-    The same reasoning that puts lexical-index synchronisation in triggers rather than in
+    The same reasoning that puts lexical-index synchronization in triggers rather than in
     application code: a per-method bump covers only the paths its author enumerated, and the
     one nobody enumerated is the one that serves a stale ranking.
     """

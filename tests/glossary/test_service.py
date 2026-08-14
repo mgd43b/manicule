@@ -6,7 +6,7 @@ breaking it means writing one field fewer, and the result still looks like a wor
 
 So the source is resolved through the **scoped** store rather than copied off the entry, and an
 entry whose document this workspace cannot see is dropped rather than shown with a blank source.
-The tests below were written after a mutation showed that neither behaviour was covered at all.
+The tests below were written after a mutation showed that neither behavior was covered at all.
 """
 
 from __future__ import annotations

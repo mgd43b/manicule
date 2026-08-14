@@ -102,7 +102,7 @@ def test_the_sequence_limit_is_required() -> None:
 
 
 def test_the_canonical_form_is_byte_stable() -> None:
-    """Storage compares the serialised form, so field order must not matter."""
+    """Storage compares the serialized form, so field order must not matter."""
     one = EmbedFingerprint.model_validate(
         {
             "model_id": "m",

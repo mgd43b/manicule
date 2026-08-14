@@ -74,7 +74,7 @@ def test_pages_are_one_based(page: int) -> None:
         PageAnchor(page=page)
 
 
-def test_rectangles_are_normalised_and_ordered() -> None:
+def test_rectangles_are_normalized_and_ordered() -> None:
     with pytest.raises(ValidationError, match="less than or equal to 1"):
         Rect(x0=0.0, y0=0.0, x1=1.5, y1=1.0)
     with pytest.raises(ValidationError, match="out of order"):

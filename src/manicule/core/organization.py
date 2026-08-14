@@ -1,7 +1,7 @@
-"""Organisation on top of the corpus: collections, tags, versions, relations, the trash.
+"""Organization on top of the corpus: collections, tags, versions, relations, the trash.
 
 The corpus itself is documents and chunks. This module is the vocabulary for everything a
-person imposes on it afterwards — grouping documents, labelling them, tracking what they used
+person imposes on it afterwards — grouping documents, labeling them, tracking what they used
 to say, linking chunks to one another, and taking a document out of circulation without
 destroying it.
 
@@ -31,8 +31,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from manicule.core.content import Chunk, Document, Metadata
 
 
-class _Organisation(BaseModel):
-    """Organisation types are frozen values, like the content types they describe."""
+class _Organization(BaseModel):
+    """Organization types are frozen values, like the content types they describe."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -40,7 +40,7 @@ class _Organisation(BaseModel):
 # --- collections ---------------------------------------------------------------------------
 
 
-class CollectionRule(_Organisation):
+class CollectionRule(_Organization):
     """A stored restriction that decides membership without anyone listing documents.
 
     A rule-driven collection is a saved query. Membership is then the union of the documents
@@ -98,7 +98,7 @@ class CollectionRule(_Organisation):
         )
 
 
-class Collection(_Organisation):
+class Collection(_Organization):
     """A named set of documents, filled by hand, by a rule, or by both."""
 
     id: str = Field(min_length=1)
@@ -111,7 +111,7 @@ class Collection(_Organisation):
 # --- tags ----------------------------------------------------------------------------------
 
 
-class Tag(_Organisation):
+class Tag(_Organization):
     """An arbitrary label, unique by name within a workspace."""
 
     id: str = Field(min_length=1)
@@ -122,7 +122,7 @@ class Tag(_Organisation):
 # --- versions ------------------------------------------------------------------------------
 
 
-class DocumentVersion(_Organisation):
+class DocumentVersion(_Organization):
     """A state a document has **left**, recorded at the moment it was superseded.
 
     The state a document is in *now* lives in ``documents`` and has no row here. That
@@ -183,7 +183,7 @@ class CitationState(StrEnum):
     ``chunks.id`` is derived from ``(document_id, position, text)``, so a chunk that survived
     a re-parse unchanged kept its id — and one whose text or position moved did not. The old
     id therefore *dangles* rather than silently re-pointing at different text, which is the
-    behaviour ``docs/storage.md`` §3.2 chose it for. Nothing in manicule resolves this to the
+    behavior ``docs/storage.md`` §3.2 chose it for. Nothing in manicule resolves this to the
     superseding text: the citation quoted a passage that is gone, and offering the paragraph
     that replaced it as though it were the same passage is precisely the substitution the
     anchor rules exist to forbid.
@@ -205,7 +205,7 @@ class CitationState(StrEnum):
     """
 
 
-class CitationResolution(_Organisation):
+class CitationResolution(_Organization):
     """The answer to "does this citation still point at something", with its reason."""
 
     state: CitationState
@@ -231,7 +231,7 @@ class CitationResolution(_Organisation):
 # --- the trash -----------------------------------------------------------------------------
 
 
-class TrashEntry(_Organisation):
+class TrashEntry(_Organization):
     """One soft-deleted document, and how much of it is left.
 
     :attr:`purged` is the difference between a restore that costs nothing and a restore that
@@ -256,7 +256,7 @@ class TrashEntry(_Organisation):
         return not self.purged
 
 
-class Restoration(_Organisation):
+class Restoration(_Organization):
     """What restoring a document actually achieved, and what is still needed.
 
     A restore that returns nothing leaves the caller unable to tell "back in service" from
@@ -309,12 +309,12 @@ class ChunkRelationType(StrEnum):
     """
 
 
-class ChunkEdge(_Organisation):
+class ChunkEdge(_Organization):
     """One typed link between two chunks, as stored.
 
     Direction is a property of the row, not of the query, so a lookup from either end returns
     the edge as it was written. A caller asking "what is above this chunk" reads
-    :meth:`points_away_from`; one that only wants the neighbour reads :meth:`other_than`.
+    :meth:`points_away_from`; one that only wants the neighbor reads :meth:`other_than`.
     """
 
     source_chunk_id: str = Field(min_length=1)

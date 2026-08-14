@@ -113,7 +113,7 @@ class DropReason(StrEnum):
     """A closed marker whose payload was not a slot list.
 
     Counted rather than shown. The ``cite:`` prefix exists so that a malformed attempt is
-    still recognisable as an attempt instead of being mistaken for prose.
+    still recognizable as an attempt instead of being mistaken for prose.
     """
 
 
@@ -146,7 +146,7 @@ class Citation(BaseModel):
     )
     quote: str = Field(
         description="``Chunk.text``, whole and byte for byte. Never ``embed_text``, which "
-        "carries the retrieval breadcrumb; never normalised, because showing a "
+        "carries the retrieval breadcrumb; never normalized, because showing a "
         "whitespace-flattened rendering of a quotation is a change to the quotation; never "
         "trimmed, because an anchor describes the whole chunk and a trimmed quote makes the "
         "anchor claim more than the text says."

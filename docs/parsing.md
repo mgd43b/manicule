@@ -65,14 +65,14 @@ degraded index.
 
 **Why not 256**, which would clear MiniLM too. 256 tokens is roughly a long paragraph. An
 answer that spans a paragraph and its follow-up no longer fits in one chunk, so retrieval
-returns half of it and the generator has to be lucky enough to pull the neighbour as well.
+returns half of it and the generator has to be lucky enough to pull the neighbor as well.
 It also doubles the chunk count, which doubles embedding time, index size, and the number
 of near-duplicate results competing for slots in the fused ranking. The published work on
 retrieval chunking converges on the 256–512 band for question-answering corpora; 512 is the
 top of that band, and the top is where the model limit also happens to sit.
 
 **Why not 2048**, on a model that permits it. Two reasons, and the second is the one that
-matters here. A single vector summarising 2048 tokens is a weaker signal — the embedding
+matters here. A single vector summarizing 2048 tokens is a weaker signal — the embedding
 averages over more topics, so a chunk covering four subjects retrieves poorly for all four.
 And a budget set by whichever model is installed today makes the **corpus non-portable**: a
 2048-token corpus cannot be re-embedded with a 512-token model without re-chunking, which
@@ -99,7 +99,7 @@ enforces that limit. Estimating is not good enough, for three compounding reason
 - **Estimation error is one-directional in the dangerous direction.** Undercounting
   produces a chunk that overflows the model and is silently truncated. Overcounting only
   wastes budget.
-- **Sampling makes it worse.** The tempting optimisation — encode the first few thousand
+- **Sampling makes it worse.** The tempting optimization — encode the first few thousand
   characters and extrapolate — turns a bounded error into an unbounded one on exactly the
   documents that matter, the long ones.
 
@@ -159,7 +159,7 @@ max_tokens (512)  =  breadcrumb budget (64)  +  text budget (448)
 The breadcrumb budget is reserved unconditionally, whether or not a given chunk has a
 breadcrumb. Reserving it conditionally would make chunk boundaries depend on heading depth,
 so the same paragraph would chunk differently under a deep heading than a shallow one —
-and a document reorganisation would silently re-chunk sections it did not touch.
+and a document reorganization would silently re-chunk sections it did not touch.
 
 ### 1.4 One budget for every block kind
 
@@ -173,7 +173,7 @@ and no symptom — the exact failure §1.1 exists to prevent. A per-kind budget 
 floor is just a smaller budget with extra configuration surface and no measurement behind
 it.
 
-One number, checked once, against the model. Kind-specific behaviour lives in *how* an
+One number, checked once, against the model. Kind-specific behavior lives in *how* an
 oversized block is split (§4.2), which is where it belongs — that is a structural question,
 not a size question.
 
@@ -225,7 +225,7 @@ is the thing this document is mostly about.
 **The merge never crosses a heading.** A short section merged backwards would take the
 previous section's `heading_path`, so its text would be embedded under a breadcrumb it does
 not belong to and cited under a heading it is not in — a wrong location produced by a
-size optimisation. A chunk that opens a section stands alone however short it is.
+size optimization. A chunk that opens a section stands alone however short it is.
 
 **`min_tokens` equals the overlap window, which needs one guard.** A 64-token prose chunk
 followed by a 64-token overlap window would make the next chunk begin as an exact duplicate
@@ -298,7 +298,7 @@ which the fingerprint makes an explicit, priced operation rather than an acciden
 1. **An anchor is constructed from a location the source or the library reports, never from
    a heuristic over extracted text.** A `PageAnchor` is built from a page index the PDF
    library returns. Text-position heuristics — blank-line runs, form feeds, page-number
-   regexes — never synthesise one. A document whose pagination cannot be recovered yields
+   regexes — never synthesize one. A document whose pagination cannot be recovered yields
    `Unlocated` with a reason.
 2. **`Unlocated` carries a reason a human can act on.** `"no text layer"`,
    `"page rotation unsupported"`, `"source positions unavailable for TOML"` — not
@@ -322,15 +322,15 @@ which the fingerprint makes an explicit, priced operation rather than an acciden
    produces a citation that resolves to adjacent text, which reads plausibly and is wrong;
    assertion 3 in §3.3 exists largely to catch it.
 
-### 2.2 `Rect` — one coordinate convention, normalised at parse time
+### 2.2 `Rect` — one coordinate convention, normalized at parse time
 
-`Rect` is `(x0, y0, x1, y1)` **normalised 0.0–1.0 on both axes, origin top-left, y increasing
+`Rect` is `(x0, y0, x1, y1)` **normalized 0.0–1.0 on both axes, origin top-left, y increasing
 downward, relative to the CropBox with `/Rotate` applied** — the page exactly as a reader
 sees it. This is the shape [`contracts.md`](contracts.md) §1 fixes and
 `src/manicule/core/anchors.py` implements; an earlier draft of this section said "points",
 which would have required storing the page dimensions alongside every rectangle to render it.
 
-Normalising at parse time means a consumer needs the page number and nothing else. Getting
+Normalizing at parse time means a consumer needs the page number and nothing else. Getting
 there is not one flip, and the shape of the mistake is worth spelling out because it is
 invisible when it happens.
 
@@ -341,7 +341,7 @@ across `/Rotate` 0/90/180/270, across a MediaBox of `[0 0 612 792]` versus `[50 
 842]`, and with a CropBox applied. Content objects stay in user space because the page
 matrix that encodes crop and rotation is only composed in at render time.
 
-**The page dimensions, however, *do* honour both.** The convenient page-size call returns
+**The page dimensions, however, *do* honor both.** The convenient page-size call returns
 the rotated, cropped size — `(792, 612)` for a `/Rotate 90` page, `(350, 500)` for a cropped
 one.
 
@@ -369,8 +369,8 @@ page-bounding-box accessor returns the CropBox intersected with the MediaBox, in
 would be wrong on any file whose CropBox extends beyond its MediaBox, which is legal and
 occurs.
 
-**pdfium normalises `/Rotate` into a quarter turn**, so a malformed `/Rotate 45` arrives as
-`0` and the "not a multiple of 90 yields `rects=[]`" rule is defence in depth rather than a
+**pdfium normalizes `/Rotate` into a quarter turn**, so a malformed `/Rotate 45` arrives as
+`0` and the "not a multiple of 90 yields `rects=[]`" rule is defense in depth rather than a
 live branch. It costs one comparison and it is kept, so that a later reader reaching for the
 raw dictionary value does not silently produce rectangles rotated by a fraction of a turn.
 
@@ -402,7 +402,7 @@ sufficient to resolve against, because heading paths repeat — two sections cal
   anchors from heading text and appends `-1`, `-2`… for duplicates
   ([`confluence.md`](connectors/confluence.md) §8); HTML authors write `id=`. Using ours
   instead would produce citations that do not deep-link.
-- **When the source defines none, synthesise one** with GitHub-style slugification
+- **When the source defines none, synthesize one** with GitHub-style slugification
   (lowercase, non-alphanumerics to hyphens, collapse runs, trim) plus the same `-N`
   de-duplication suffix, counted in document order. Markdown, DOCX and Jupyter go this way.
   The slug is stored in the parser's block index so resolution is an exact lookup rather
@@ -428,9 +428,9 @@ whether provenance is real.
 | **Code** | 40+ | `LineAnchor(start, end, symbol)` | tree-sitter node byte range → line numbers; `symbol` from the AST (§8.2) | **Exact** |
 | **Confluence ADF** | — (v1 source) | `HeadingAnchor(path, fragment)` | ADF `heading` nodes; fragment is Confluence's own anchor | **Exact**, deep-links to the section |
 | **Confluence storage** | — (body format) | `HeadingAnchor(path, fragment\|None)` | `selectolax` heading elements; fragment from the heading's `id=` or a preceding `anchor` macro | **Partial** — fragment only where the author published one; ambiguous repeats are `Unlocated` |
-| **Markdown** | `.md` `.mdx` | `HeadingAnchor(path, fragment)` | `markdown-it-py` token `map` (source line span) → heading tree; slug synthesised | **Exact** |
+| **Markdown** | `.md` `.mdx` | `HeadingAnchor(path, fragment)` | `markdown-it-py` token `map` (source line span) → heading tree; slug synthesized | **Exact** |
 | **HTML** | `.html` `.htm` | `HeadingAnchor(path, fragment\|None)` | `selectolax` heading elements; fragment from the nearest preceding `id=` | **Partial** — fragment only where the author supplied an `id` |
-| **DOCX** | `.docx` | `HeadingAnchor(path, fragment)` | paragraph style (`Heading N`); slug synthesised | **Sections only.** No page numbers, ever — see §2.5 |
+| **DOCX** | `.docx` | `HeadingAnchor(path, fragment)` | paragraph style (`Heading N`); slug synthesized | **Sections only.** No page numbers, ever — see §2.5 |
 | **XLSX / CSV** | `.xlsx` `.csv` | `CellAnchor(sheet, ref)` | sheet name + the row/column range the block covers, as `Sheet1!B4:D12`. A CSV has no sheet, so `sheet` is the file stem | **Exact** |
 | **PPTX** | `.pptx` | `PageAnchor(page, rects)` | slide index (1-based, presentation order); shape geometry → `Rect` | **Exact** |
 | **Jupyter** | `.ipynb` | `HeadingAnchor(path, "cell-<id>")` | markdown-cell heading tree; fragment is the nbformat cell `id` | **Exact** for nbformat ≥ 4.5; see §2.5 below |
@@ -464,7 +464,7 @@ an extension because neither is ever a file the way a `.docx` is.
 publishes no IANA type for either body format, so `application/json;profile=atlas-doc-format` and
 `application/xhtml+xml;profile=confluence-storage` were coined here — the first by the ADF parser,
 the second by following it. They are stable identifiers *within this project* and nothing outside
-it will recognise them. Written down because a convention that reads like a standard gets cited as
+it will recognize them. Written down because a convention that reads like a standard gets cited as
 one: a future reader deciding what a third-party tool should emit, or what to send in an `Accept`
 header, would be reasoning from a string this repository invented. The profile syntax itself is
 ordinary RFC 9110 — a parameter on a real base type — so the shape is standard even where the
@@ -472,8 +472,8 @@ value is ours. The fixture extension `.storage` is a convention of the same kind
 so the test corpus can route a file to this parser.
 
 Both obey the same anchor rules as everything else. Storage format's fragments are `Partial` for
-the HTML parser's reason and one of its own: Confluence synthesises heading ids at *render* time,
-so a stored body usually publishes none, and synthesising one here would produce a citation that
+the HTML parser's reason and one of its own: Confluence synthesizes heading ids at *render* time,
+so a stored body usually publishes none, and synthesizing one here would produce a citation that
 looks precise and lands at the top of the page (§2.5).
 
 **Changing what a body format is routed as re-routes every document already ingested under the
@@ -542,7 +542,7 @@ what the optional `docling` / `marker` parsers are for; they are layout models a
 belong behind the fallback chain, off by default, not woven into the fast path.
 
 **HTML deep links exist only where the author made them.** No `id=`, no fragment. We could
-synthesise a slug, but it would not resolve on a page we do not serve, producing a citation
+synthesize a slug, but it would not resolve on a page we do not serve, producing a citation
 that looks precise and lands at the top of the page. `fragment=None` and a document-level
 link is the honest output.
 
@@ -555,7 +555,7 @@ path is ambiguous the block is `Unlocated(reason="notebook predates cell ids")`.
 notebook is still indexed and still cited at document level. Upgrading the notebook file
 fixes it, which is worth saying in the diagnostic.
 
-**`.msg` needs a GPL-3.0 parser, which the relicence permits.** §10, §12.
+**`.msg` needs a GPL-3.0 parser, which the relicense permits.** §10, §12.
 
 ### 2.6 Content that precedes the first heading
 
@@ -565,7 +565,7 @@ opening. The first draft of this document did not say, and the three plausible a
 not equally honest.
 
 **Where the format is line-addressable, use a `LineAnchor`.** Markdown source lines are exact
-and free, and an exact location beats a synthesised one every time. A parser emitting two
+and free, and an exact location beats a synthesized one every time. A parser emitting two
 anchor kinds is fine: `Anchor` is a union and each kind is budgeted separately.
 
 **Otherwise, `HeadingAnchor(path=(document_title,), fragment=None)`** — the document root,
@@ -698,11 +698,11 @@ well. What does not work is leaving it out; that is what turns the round-trip ru
 aspiration. [#1](https://github.com/mgd43b/manicule/issues/1) owns the protocol code and
 this ask has been raised there.
 
-### 3.2 Normalisation, stated once
+### 3.2 Normalization, stated once
 
 Exact string equality is the wrong assertion. PDF extraction reintroduces ligatures and
 hyphenation, HTML collapses whitespace differently from its source, and DOCX splits a
-sentence across runs. So both sides of every comparison pass through one normaliser, and it
+sentence across runs. So both sides of every comparison pass through one normalizer, and it
 is defined here rather than per-parser.
 
 **Order is load-bearing** — step 3 needs the line breaks that step 4 destroys, so running
@@ -717,16 +717,16 @@ them the other way round silently disables de-hyphenation and nothing fails to i
 5. Strip leading and trailing whitespace.
 
 Codepoints are named rather than written literally because several of them are invisible. A
-normalisation rule an implementer cannot see on the page is not a specification.
+normalization rule an implementer cannot see on the page is not a specification.
 
 **NFC rather than NFKC**, deliberately. NFKC would fold the ligatures for free, but it also
 rewrites `½`, superscripts and full-width forms — changes to text that a citation is supposed
 to reproduce verbatim. Folding five ligatures explicitly is the narrow fix; NFKC is a wide one
 that would quietly alter quoted content.
 
-The normaliser is versioned, and its version is deliberately **not** part of
+The normalizer is versioned, and its version is deliberately **not** part of
 `chunker_version`. It is used by the tests and by nothing else — stored `text` is never
-normalised, because `text` is what gets shown — so it cannot move a chunk boundary or shift
+normalized, because `text` is what gets shown — so it cannot move a chunk boundary or shift
 an anchor. Putting it in the fingerprint would force a re-chunk and a full re-embed of a
 corpus in exchange for a change that cannot alter one stored byte. (The pinned HTML-to-text
 conversion in §10 is a different matter and *is* in `chunker_version`, because email line
@@ -792,7 +792,7 @@ numbers address its output.)
      non-overlapping remainder only. The shared sentences are duplicated by design. **This
      exclusion applies to chunks and never to blocks** — a parser does not overlap, so a
      block whose text happens to end with the next block's text is not sharing a window, it
-     is an anchor confused with its neighbour, which is the failure the assertion exists for.
+     is an anchor confused with its neighbor, which is the failure the assertion exists for.
    - **Anchors whose locations genuinely nest** — a `HeadingAnchor` for a section and one
      for its subsection — are excluded, and the parser declares the nesting.
 
@@ -911,7 +911,7 @@ Committed fixtures are limited to what cannot be generated faithfully: a real-wo
 a PDF exported by a real word processor (generated PDFs have suspiciously clean text
 layers), a scanned page. Every committed fixture must be public-domain, CC0, or authored for
 this repository, with its provenance recorded in a file alongside the corpus. **No customer
-documents and no scraped files of uncertain licence** — a fixture corpus is published with
+documents and no scraped files of uncertain license** — a fixture corpus is published with
 the project.
 
 Per parser, four kinds, all four required:
@@ -934,8 +934,8 @@ generator. That has a consequence the protocol does not state and every parser h
 A generator abandoned part-way — a consumer that stops early, an exception in the loop body,
 an assertion failing between two blocks — stays **suspended**, holding whatever it had open
 at the `yield`: a PDF document handle, a native text page, a `ZipFile` and a member stream.
-Nothing collects it promptly. CPython finalises a live async generator through the event loop
-that created it, so one still suspended when that loop closes is finalised late, from the
+Nothing collects it promptly. CPython finalizes a live async generator through the event loop
+that created it, so one still suspended when that loop closes is finalized late, from the
 wrong loop, after the resources it is about to release have been torn down.
 
 Two rules, and both are needed:
@@ -1181,7 +1181,7 @@ can price it:
   | a **forward pass** is avoided | the vector being correct *and* readable *and* found |
 
   A chunk can keep its id while the string that produced its vector changes — a document whose
-  headings moved is exactly that — so an optimisation keyed on the id preserves a stale vector
+  headings moved is exactly that — so an optimization keyed on the id preserves a stale vector
   under current text. It can also lose its id while its embedding input stands still, because
   inserting one paragraph renumbers every chunk below it. Both are handled, and neither by the
   id: `ingest/embedding.py` compares a persisted **embedding-input identity**, derived from the
@@ -1337,7 +1337,7 @@ against a block id would name something no citation can open, so moving detectio
 not a one-line change — it is detection before packing *plus* a mapping from the block that
 stated the definition to the chunk that finally carries it.
 
-**Not done here, and the judgement is that it should not be.** The paragraph rule is a parser
+**Not done here, and the judgment is that it should not be.** The paragraph rule is a parser
 invariant: a block's `text` should say what the page says, whoever reads it afterwards. Block
 lineage is an argument about which representation a *consumer* should depend on. Doing the
 second while fixing the first would mean a fix whose diff was mostly not about the defect, and
@@ -1510,13 +1510,13 @@ One of the 40 settings. **Keyed by media type**, value an ordered list of parser
   **This only works because the plaintext parser refuses non-text bytes.** It declares the
   input unsupported when the bytes contain a NUL or do not decode as UTF-8 (or a confidently
   detected text encoding). Without that refusal a shipped `"*"` tail would index every
-  unrecognised binary as mojibake — a JPEG becoming a page of replacement characters that
+  unrecognized binary as mojibake — a JPEG becoming a page of replacement characters that
   matches queries by accident — and would make `unsupported_media_type` unreachable, since
   some parser would always claim every document.
 - User configuration **replaces** the chain for a media type rather than merging into it.
   Merging produces chains nobody can predict from reading the config.
 - **A named parser that is not installed is a startup error**, not a silent skip. A chain
-  whose behaviour depends on what happens to be installed reproduces exactly the hazard the
+  whose behavior depends on what happens to be installed reproduces exactly the hazard the
   OCR decision exists to avoid: the same document ingesting differently on different
   machines.
 - The **resolved chain is deterministic and recorded** on each document
@@ -1601,7 +1601,7 @@ full.
 
 **Definition.** After the chain has run to completion: no parser raised a hard failure, and
 the union of all blocks returned by all parsers contains zero characters after
-normalisation (§3.2). Whitespace-only, form-feed-only and empty-string blocks all count as
+normalization (§3.2). Whitespace-only, form-feed-only and empty-string blocks all count as
 zero.
 
 **The fallback chain runs first, in full.** This is the answer to "does a fallback get to
@@ -1658,7 +1658,7 @@ not fail an ingest run. It is a normal outcome, counted and reported.
 ## 7. PDF
 
 **`pypdfium2` is the fast path.** Licensing is the reason the obvious choice is wrong, and it
-survives the GPL-3.0 relicence: PyMuPDF is **AGPL-3.0**, so combining with it would put AGPL
+survives the GPL-3.0 relicense: PyMuPDF is **AGPL-3.0**, so combining with it would put AGPL
 §13's network-source obligation onto everyone running manicule as a service. See §12.
 pypdfium2 is `Apache-2.0 OR BSD-3-Clause` and the pdfium it bundles is BSD-3-Clause — both
 permissive, and it is not slower in any way that shows up here. Its binary wheels ship a
@@ -1793,13 +1793,13 @@ The declared set, the pack version, and the resolved grammar versions all feed
 `ChunkFingerprint.grammars` (§8.3), so "which grammars built this corpus"
 is recorded rather than inferred from a cache directory.
 
-**Licences are settled, not an open audit.** The pack's stated policy is that every included
+**Licenses are settled, not an open audit.** The pack's stated policy is that every included
 grammar is permissively licensed — MIT, Apache-2.0, BSD, ISC or similar — and that copyleft
-licences (GPL, AGPL, LGPL, MPL) are not accepted. Individual grammar licences vary across
-those permissive terms, which is fine under any licence this project might carry. The
+licenses (GPL, AGPL, LGPL, MPL) are not accepted. Individual grammar licenses vary across
+those permissive terms, which is fine under any license this project might carry. The
 packaging step still asserts the policy rather than trusting it, and §8.1.1 is where that
 happens: a bundle build fails on any copyleft term, so a change in upstream policy surfaces as
-a build failure instead of a licence problem discovered later.
+a build failure instead of a license problem discovered later.
 
 ### 8.1.1 The offline bundle
 
@@ -1861,9 +1861,9 @@ both (`1.14.3+macos.arm64`, a PEP 440 local segment, so it describes what the th
 in `pip list`). Two lines in it are load-bearing rather than boilerplate:
 
 - `artifacts = ["*.so", "*.dylib", "*.dll"]`. The payload is entirely compiled shared libraries,
-  hatchling honours a `.gitignore` beside the project it builds, and `*.so` is one of the most
+  hatchling honors a `.gitignore` beside the project it builds, and `*.so` is one of the most
   commonly ignored patterns in existence. Without it the wheel builds, installs, and carries a
-  manifest describing libraries that are not in it — demonstrated, not theorised.
+  manifest describing libraries that are not in it — demonstrated, not theorized.
 - No dependency on `manicule`. A bundle is valid for a `tree-sitter-language-pack` release and a
   platform, and neither of those is a manicule version.
 
@@ -1871,9 +1871,9 @@ Because a test that listed the files the builder wrote would have passed against
 not installable at all, `tests/parsers/test_grammar_bundle.py` installs the distribution with
 `uv pip install --offline` and seeds and parses out of what was *installed*.
 
-**The licence is asserted where redistribution starts.** The bundle build refuses any copyleft
+**The license is asserted where redistribution starts.** The bundle build refuses any copyleft
 term and any term nobody has assessed, and records the expression it asserted. The scope of
-that assertion is stated rather than overstated: the pack enumerates no per-grammar licences —
+that assertion is stated rather than overstated: the pack enumerates no per-grammar licenses —
 its manifest carries a group and a size per language, and the SBOM beside it describes the
 native extension's Rust build dependencies — so what is checked is the distribution that
 publishes them under a stated permissive-only policy. A release that changes that expression
@@ -1907,11 +1907,11 @@ per merge, and on a restored cache the pre-seed runs with the manifest pointed a
 reporting the same green tick.
 
 The staged directory is named for the release it holds and the build looks for the release it
-installs, which is what makes a stale cache a miss rather than a mislabelled bundle. Nothing
+installs, which is what makes a stale cache a miss rather than a mislabeled bundle. Nothing
 about the image changes: the smoke test still runs `init`, an index and a search under
 `--network=none`, and both paths build the same bundle or fail naming the language they could
 not. A third fallback — proceeding from a previously built bundle when upstream is gone — was
-considered and rejected. The cache already *is* the previously built artefact, and a fallback
+considered and rejected. The cache already *is* the previously built artifact, and a fallback
 that produced an image with fewer grammars than declared would be worse than the outage: the
 image would build, pass every check, ship, and parse those languages as plain text.
 
@@ -2095,7 +2095,7 @@ The nesting is what makes the member findable when its own filename is generic.
   ([#5](https://github.com/mgd43b/manicule/issues/5)), not the parser. Stated here rather
   than described as though it existed.
 
-### 9.3 Zip-bomb defence — four limits, because any one is bypassable
+### 9.3 Zip-bomb defense — four limits, because any one is bypassable
 
 | Limit | Default | What it catches |
 |---|---:|---|
@@ -2115,10 +2115,10 @@ Two more, which are about names rather than sizes:
 - **Path traversal.** Member names may contain `../`, absolute paths, drive letters, or
   backslashes. Members are parsed in memory and never written to disk, which removes most of
   the risk — but the name still becomes part of a `uri` shown to users and stored in the
-  index, so names are normalised and any name escaping the archive root is rejected with a
-  reason rather than sanitised into something plausible.
+  index, so names are normalized and any name escaping the archive root is rejected with a
+  reason rather than sanitized into something plausible.
 - **Symlink members.** Zip can store symlinks in the Unix external attributes. They are
-  skipped, with a reason. `zipfile` does not follow them today; the defence is against a
+  skipped, with a reason. `zipfile` does not follow them today; the defense is against a
   future extraction path being added without remembering.
 
 Exceeding a limit **fails that member, or that archive, and never the batch.** The container
@@ -2135,7 +2135,7 @@ content sniffer looking for `PK\x03\x04` will happily identify every Office docu
 archive, and the archive parser will happily recurse into one and index `word/document.xml`
 as a member.
 
-Two defences, both required, because either alone fails:
+Two defenses, both required, because either alone fails:
 
 - **Media type resolution runs before parser dispatch** and sniffing never overrides a
   declared type (§6.1). A `.docx` with a correct extension or a correct declared media type
@@ -2175,7 +2175,7 @@ Headers (`From`, `To`, `Cc`, `Date`, `Subject`) become a single `prose` block pr
 body, with its own line span. `Subject` also becomes the document title and the first
 element of the heading path, since it is the only structure an email has.
 
-Quoted reply chains are kept. Trimming them is a retrieval optimisation with a real downside
+Quoted reply chains are kept. Trimming them is a retrieval optimization with a real downside
 — the quoted text is frequently the only statement of the thing being replied to — and it is
 not a parsing decision.
 
@@ -2185,7 +2185,7 @@ Confluence connector does with page attachments
 ([`confluence.md`](connectors/confluence.md) §6), so a PDF is a PDF wherever it arrived
 from.
 
-**`.msg` was the one format whose obvious library was licence-incompatible, and that has
+**`.msg` was the one format whose obvious library was license-incompatible, and that has
 changed.** The maintained Python `.msg` parser, `extract-msg`, is GPL-3.0 — which was
 disqualifying under MIT and is an ordinary dependency now that manicule is GPL-3.0-or-later
 (§12). It is **not** the PyMuPDF case: GPL is not AGPL, and no network obligation follows.
@@ -2194,7 +2194,7 @@ So **`extract-msg` is the route**, and [#21](https://github.com/mgd43b/manicule/
 a dependency plus a mapping rather than the hand-written property reader below.
 
 The permissive routes are kept on record, because they are what to reach for if `extract-msg`
-turns out to be unmaintained or wrong, not because the licence forbids it. **`msg_parser` is
+turns out to be unmaintained or wrong, not because the license forbids it. **`msg_parser` is
 BSD-2-Clause** and is a higher-level reader. Failing that, a `.msg` file is a compound-file
 (OLE/CFBF) container readable with **`olefile` (BSD-2-Clause)** — the same layer
 `extract-msg` itself sits on — holding MAPI properties as named streams. The ones that
@@ -2216,19 +2216,19 @@ because `PidTagHtml` is `PT_BINARY`, so the stream is `…10130102` and a reader
 no HTML part.
 
 Storage suffixes are 8 zero-based hex digits, so the eleventh attachment is `#0000000A`, not
-`#00000011`. String encoding across the whole file is signalled once, by `STORE_UNICODE_OK`
+`#00000011`. String encoding across the whole file is signaled once, by `STORE_UNICODE_OK`
 (`0x00040000`) in `PidTagStoreSupportMask` within `__properties_version1.0`: set means every
 string property is Unicode, absent or unset means 8-bit.
 
 So `.msg` is a **shim, not a second parser**: read the transport headers and the body,
 reconstitute an RFC 5322 message, and hand it to the `.eml` code path. Anchors, chunking and
-round-trip behaviour are then identical between the two formats by construction, which is
+round-trip behavior are then identical between the two formats by construction, which is
 worth more than it costs.
 
 **Its trap:** `PR_TRANSPORT_MESSAGE_HEADERS` is absent on messages that never traversed a
 transport — drafts and items in Sent Items, which is a large share of what people export.
-There the shim synthesises headers from `PR_SUBJECT`, the sender properties and the
-recipient table. The synthesised path is a required fixture (§3.5).
+There the shim synthesizes headers from `PR_SUBJECT`, the sender properties and the
+recipient table. The synthesized path is a required fixture (§3.5).
 
 Because this is a MAPI property reader rather than a library call, it is sized as its own
 unit of work and filed as [#21](https://github.com/mgd43b/manicule/issues/21). `.eml` ships
@@ -2277,32 +2277,32 @@ the JSON position path can legitimately decline.
 
 ---
 
-## 12. Licence obligations
+## 12. License obligations
 
-Parsing is where this project's licences get decided, because the best library for a format
+Parsing is where this project's licenses get decided, because the best library for a format
 is repeatedly the one that cannot be used. Recorded together so the next person choosing a
 parser has the precedents rather than re-deriving them.
 
 **manicule is GPL-3.0-or-later** (`LICENSE`). It was MIT when most of this section was
-written, and the relicence — driven by the embedding runtime, see
+written, and the relicense — driven by the embedding runtime, see
 [`embeddings.md`](embeddings.md) §1.1 — changes two of the entries below and not the rest.
-The old reasoning is corrected here rather than left standing, because "rejected on licence
+The old reasoning is corrected here rather than left standing, because "rejected on license
 grounds" is exactly the kind of conclusion that outlives its premise.
 
-| Dependency | Licence | Note |
+| Dependency | License | Note |
 |---|---|---|
 | **pypdfium2** | `Apache-2.0 OR BSD-3-Clause`; bundled pdfium BSD-3-Clause | wheels ship `BUILD_LICENSES/`, which must be redistributed |
 | **tree-sitter-language-pack** | MIT; grammars uniformly permissive by stated upstream policy | policy asserted at build time, not trusted (§8.1) |
 | **python-calamine**, **python-pptx**, **ruamel.yaml**, **markdown-it-py**, **olefile** | MIT / BSD-2-Clause | no obligations beyond attribution |
 | **selectolax** | wheel bundles **two** engines: lexbor (Apache-2.0) and Modest (**LGPL-2.1**) | import the lexbor backend only; see below |
 | **extract-msg** | GPL-3.0 | **now available.** GPL-3.0 in a GPL-3.0 project carries no extra obligation — see below |
-| **PyMuPDF** | **AGPL-3.0**, dual-licensed with an Artifex commercial licence | **still rejected**, and the reason changed — see below |
+| **PyMuPDF** | **AGPL-3.0**, dual-licensed with an Artifex commercial license | **still rejected**, and the reason changed — see below |
 
 ### `extract-msg` is unblocked, and #21 gets much simpler
 
 It was rejected for being GPL-3.0 in an MIT project. That premise is gone: GPL-3.0 code in a
 GPL-3.0-or-later project is an ordinary dependency with no additional obligation. §10's
-hand-written MAPI property reader was work created entirely by the old licence, and
+hand-written MAPI property reader was work created entirely by the old license, and
 [#21](https://github.com/mgd43b/manicule/issues/21) is updated to say so rather than left
 carrying stale reasoning.
 
@@ -2324,7 +2324,7 @@ on users rather than accepting ourselves. `pypdfium2` is permissively licensed a
 provides the page and bbox provenance §7 needs, so the trade buys nothing and costs every
 operator an obligation they did not choose. **`pypdfium2` stays.**
 
-### selectolax still needs a judgement rather than a rule
+### selectolax still needs a judgment rather than a rule
 
 Both engines ship as separate compiled objects in the same wheel, so importing only the
 permissive backend still means an LGPL-2.1 binary is present on disk. That is not a problem
@@ -2337,7 +2337,7 @@ frozen distribution containing that binary, and that is the moment to revisit.
 
 The old rule was "a copyleft dependency is rejected at selection time". That was right for an
 MIT project and is too blunt for this one. What survives is the part that was doing the work:
-**a licence obligation is decided at selection time, not worked around later — and an
+**a license obligation is decided at selection time, not worked around later — and an
 obligation that falls on the operator rather than on us is the one to refuse.** That is why
 GPL is now ordinary, and AGPL still is not.
 

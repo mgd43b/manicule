@@ -19,7 +19,7 @@ of that, and each guard is a test rather than a convention.
 | Dimension | **1024** |
 | `max_seq_length` | **8192** |
 | Pooling | **CLS** |
-| Licence | **MIT** |
+| License | **MIT** |
 | Languages | multilingual, 100+ |
 
 Verified from the repository rather than the card prose: `config.json` gives
@@ -38,7 +38,7 @@ Found during implementation, and it changes a little of what follows. **`BAAI/bg
 `pytorch_model.bin` and no safetensors**, which is the only weight format MLX reads. So on
 Apple hardware the bytes that actually execute come from a community conversion —
 `mlx-community/bge-m3-mlx-fp16` — while the *identity* (pooling, dimension, tokenizer,
-revision) still comes from `BAAI/bge-m3`. Reading identity from the artefact would fail
+revision) still comes from `BAAI/bge-m3`. Reading identity from the artifact would fail
 outright: the conversion ships no `1_Pooling/config.json` at all, so a backend reading its
 pooling from what it loaded would find nothing and fall back to mean, on a CLS model.
 
@@ -50,30 +50,30 @@ Which conversion is not a detail, because the conversions are not equivalent:
 | `8bit` | 0.9996 – 0.9998 |
 | `4bit` | 0.9249 – 0.9694 |
 
-Measured, on CLS-pooled normalised vectors, on the texts §6.2 uses. **A quantised conversion is
+Measured, on CLS-pooled normalized vectors, on the texts §6.2 uses. **A quantized conversion is
 a different vector space wearing the same name**, and since `backend` is excluded from
 fingerprint identity nothing downstream would notice one mixed into an index built by another.
-So quantisation is **refused at load**, by the one component positioned to see it. That is the
+So quantization is **refused at load**, by the one component positioned to see it. That is the
 Apple-hardware principle drawn precisely: use Metal, use fp16 storage, use whatever is fastest,
 and stop at anything that moves the vectors.
 
-The artefact that ran is recorded in `EmbedFingerprint.weights_ref` (§5) so a vector can be
+The artifact that ran is recorded in `EmbedFingerprint.weights_ref` (§5) so a vector can be
 traced to its bytes.
 
-### 1.1 The licence gate moved, and it moved the whole section
+### 1.1 The license gate moved, and it moved the whole section
 
-An earlier draft of this design eliminated candidates on a **permissive-licence** gate, and
+An earlier draft of this design eliminated candidates on a **permissive-license** gate, and
 chose the runtime on the same grounds. manicule is now **GPL-3.0-or-later** (`LICENSE`), and
 that gate is gone in one direction and intact in the other:
 
 - **GPL-3.0 dependencies are ordinary.** `mlx-embeddings` is GPL-3.0 — verified from the
   installed distribution metadata, `Classifier: License :: OSI Approved :: GNU General Public
-  License v3 (GPLv3)` — and was the reason the relicence happened at all. It is usable.
+  License v3 (GPLv3)` — and was the reason the relicense happened at all. It is usable.
 - **AGPL-3.0 dependencies are still refused**, because AGPL §13 puts a source obligation on
   anyone *running* the result as a network service, and manicule ships an HTTP API and a web
   UI. That obligation would fall on operators rather than on us. See
   [`parsing.md`](parsing.md) §12.
-- **Non-commercial and gated licences remain eliminated outright**, which is what removed
+- **Non-commercial and gated licenses remain eliminated outright**, which is what removed
   `jina-embeddings-v3` (CC-BY-NC-4.0) and `google/embeddinggemma-300m` (gated Gemma Terms).
 
 BGE-M3's weights are **MIT**, so none of this constrains the model itself. It constrains what
@@ -184,7 +184,7 @@ model = "BAAI/bge-m3"          # the default
 provider = "mlx"               # or "onnx"
 
 [plugins.config."embedder.mlx"]
-weights = ""                   # the artefact to execute, when it is not the model's own repo
+weights = ""                   # the artifact to execute, when it is not the model's own repo
 pooling = ""                   # only for a model that declares none; contradicting one is refused
 max_sequence_length = 0        # only for a model that declares none, in usable content tokens
 ```
@@ -196,7 +196,7 @@ must supply them only where its repository declares nothing, and a setting that 
 declaration is refused rather than obeyed: a setting that overrules how the weights were
 trained is worse than one that is ignored, because it succeeds.
 
-There is no `normalize` setting. Normalisation is always applied (§4.2), so there is nothing to
+There is no `normalize` setting. Normalization is always applied (§4.2), so there is nothing to
 configure and no way to configure it wrongly.
 
 **What switching costs, stated up front rather than discovered:**
@@ -214,21 +214,21 @@ configure and no way to configure it wrongly.
 
 ## 3. The runtime
 
-### 3.1 MLX is the primary backend, and the relicence is why
+### 3.1 MLX is the primary backend, and the relicense is why
 
 An earlier draft of this design made **onnxruntime** primary, on the grounds that
 `mlx-embeddings` is GPL-3.0 and manicule was MIT. That premise is gone: the project is
 GPL-3.0-or-later, chosen deliberately so that this dependency is usable
 ([`parsing.md`](parsing.md) §12).
 
-With the licence objection removed, the Apple-hardware principle decides it:
+With the license objection removed, the Apple-hardware principle decides it:
 
-> Optimise execution for Apple hardware freely; **never let the platform change what ends up
+> Optimize execution for Apple hardware freely; **never let the platform change what ends up
 > in the index.**
 
 MLX gives Metal-native execution in-process on the machine this is built for. onnxruntime
 gives the same in-process property everywhere else. Both satisfy "no server to operate", so
-the platform argument is what remains, and it favours MLX on Apple Silicon.
+the platform argument is what remains, and it favors MLX on Apple Silicon.
 
 **The maturity objection is not withdrawn, it is converted into a test.** `mlx-embeddings` is
 version **0.1.0** and gives the same attribute different meanings on different architectures
@@ -261,7 +261,7 @@ for the 3-D assertion in §6.1, and it is the reason §1.2 counts XLM-RoBERTa as
 reduction rather than a coincidence.
 
 **The ONNX side has the same problem in a different shape, found during implementation.**
-Nothing standardises an export's output names. `BAAI/bge-m3` calls its two outputs
+Nothing standardizes an export's output names. `BAAI/bge-m3` calls its two outputs
 `token_embeddings` and `sentence_embedding` — *neither* of which is `last_hidden_state`, so a
 name-based lookup finds no token states at all. `BAAI/bge-small-en-v1.5` publishes only the
 3-D output and no pooled one. And reading `outputs[0]` is a guess about export order.
@@ -276,7 +276,7 @@ Both backends are supported, and the second one has a job beyond portability.
 
 | | MLX | onnxruntime |
 |---|---|---|
-| Licence | GPL-3.0 | MIT |
+| License | GPL-3.0 | MIT |
 | In-process | yes | yes |
 | Apple Silicon | Metal-native | yes, CPU |
 | Off Apple Silicon | no | yes |
@@ -291,7 +291,7 @@ re-embed. If parity cannot be brought within tolerance, the correction is to mov
 into the identity set, which makes a runtime change a loud error with a re-embed path.
 
 **Measured, and it holds.** MLX on fp16 weights against the fp32 ONNX export, CLS-pooled and
-L2-normalised, on short English, non-English, code and a 402-token passage:
+L2-normalized, on short English, non-English, code and a 402-token passage:
 
 | | cosine, worst of four | largest component difference |
 |---|---:|---:|
@@ -301,7 +301,7 @@ L2-normalised, on short English, non-English, code and a 402-token passage:
 So `backend` stays out of `IDENTITY_FIELDS`, and the two runtimes write byte-identical
 canonical fingerprints — which is what an index actually compares. The gate in the test sits
 about a hundred times looser than the measurement, and still tight enough to catch a
-substituted model: 8-bit quantised `bge-m3` scores 0.9998 and fails it.
+substituted model: 8-bit quantized `bge-m3` scores 0.9998 and fails it.
 
 **One thing the ONNX backend gives up for this.** It runs on `CPUExecutionProvider`, including
 on Apple Silicon where CoreML would be faster. A reference that varies by accelerator measures
@@ -330,7 +330,7 @@ text_embeds = normalize_embeddings(text_embeds)
 
 **Unconditionally, for every XLM-RoBERTa checkpoint.** So a caller that reaches for
 `text_embeds` — the obviously-named field, the one an example would use — gets **mean pooling
-on a model trained for CLS**, silently, with correctly-shaped normalised vectors and no error.
+on a model trained for CLS**, silently, with correctly-shaped normalized vectors and no error.
 
 This is not a hypothetical version of the pooling hazard. It is the specific, current,
 default-path instance of it for the model this project has chosen, and it is why the pooling
@@ -338,7 +338,7 @@ path below reads token states and pools them here rather than trusting any field
 offers.
 
 **How wrong is it?** CLS and mean pooling of the same token states diverge with sequence
-length. Measured on `gte-modernbert-base`, both L2-normalised, from true 3-D token states:
+length. Measured on `gte-modernbert-base`, both L2-normalized, from true 3-D token states:
 
 | tokens | 7 | 42 | 156 | **452** |
 |---|---:|---:|---:|---:|
@@ -349,7 +349,7 @@ and the *direction* is not: the two poolings disagree more the longer the chunk,
 budget is 512 — the far right of that curve.
 
 **Now measured on BGE-M3 itself**, which is what this section previously deferred to §6 rather
-than quoting from another model. Real token states, both reductions L2-normalised:
+than quoting from another model. Real token states, both reductions L2-normalized:
 
 | tokens | 15 | 20 | 22 | **402** |
 |---|---:|---:|---:|---:|
@@ -366,7 +366,7 @@ field hands you. Confirmed in the same run: `text_embeds` reproduces our *mean* 
 tokenize(texts) -> input_ids, attention_mask     # ours; masks are needed and not surfaced
 run model       -> token_states (batch, seq, D)  # 3-D, asserted (§6.1)
 pool            -> vector (batch, D)             # CLS, per the model's declared config
-L2 normalise    -> unit vector
+L2 normalize    -> unit vector
 ```
 
 Four rules:
@@ -380,7 +380,7 @@ Four rules:
 - **We tokenize.** The backend does not surface attention masks from its embedding call, and
   tokenizing ourselves also makes truncation explicit rather than inherited from a library
   default (§7).
-- **L2 normalisation is ours and is always applied**, so a model repository that omits a
+- **L2 normalization is ours and is always applied**, so a model repository that omits a
   `Normalize` step cannot produce vectors whose cosine scores silently disagree with every
   published number.
 
@@ -435,11 +435,11 @@ shipped docstring: `max_sequence_length` is excluded because including it would 
 re-embed whenever the limit *rises*, and the property that matters is checked directly by
 `require_within_context`; `backend` is excluded on the parity bet §3.3 now measures;
 `weights_ref` is excluded for the same reason and rests on the same measurement, with the one
-re-encoding that *does* move the vectors — quantisation — refused at load rather than absorbed
+re-encoding that *does* move the vectors — quantization — refused at load rather than absorbed
 here (§1.0).
 
 **`weights_ref` is added by this ticket**, additively and outside identity, so no stored
-fingerprint changes meaning. It exists because §1.0 turned out to be true: the artefact that
+fingerprint changes meaning. It exists because §1.0 turned out to be true: the artifact that
 runs is frequently not the repository named in `model_id`, and an index that cannot say which
 bytes made its vectors is not diagnosable.
 
@@ -477,7 +477,7 @@ name, pooling silently becomes a no-op over the batch axis and every vector is w
 same plausible way.
 
 This is not defensive programming — §3.2 documents a shipped library that does exactly this on
-a neighbouring architecture.
+a neighboring architecture.
 
 ### 6.2 Parity between backends
 
@@ -531,15 +531,15 @@ invisible without this test because every individual vector looks fine.
   limit, and the shipped number is the one that truncates.
 - **An unpinned `revision` lets weights change under a corpus** without the fingerprint
   changing.
-- **Normalisation may be absent** from a model's declared pipeline even when its card
+- **Normalization may be absent** from a model's declared pipeline even when its card
   recommends it, so it is always applied here rather than assumed.
 - **A conversion is not the model.** `BAAI/bge-m3` ships no safetensors, so MLX runs community
-  weights; a quantised one is a different vector space under the same name and is refused at
+  weights; a quantized one is a different vector space under the same name and is refused at
   load. §1.0.
 - **An ONNX export's output names mean nothing.** `bge-m3`'s 3-D output is called
   `token_embeddings`, so a name-based lookup finds no token states at all. Select by rank. §3.2.
 - **MLX is lazy, and its streams are thread-local.** A forward pass returns an unevaluated
-  graph; materialising it on a different thread aborts the process — `libc++abi: terminating …
+  graph; materializing it on a different thread aborts the process — `libc++abi: terminating …
   There is no Stream(gpu, N) in current thread` — which is not an exception and cannot be
   caught. Found the first time the backend ran under `asyncio.to_thread`, which hands out
   whichever pool thread is free. Each embedder therefore owns **one** worker thread, loads on
@@ -589,7 +589,7 @@ a documented property of a self-hosted tool rather than a defect.
 
 | Ticket | What | Why not here |
 |---|---|---|
-| [#6](https://github.com/mgd43b/manicule/issues/6) | **BGE-M3 learned-sparse leg** as an alternative to FTS5 BM25 (§1.4) | A retrieval feature, and retrieval features earn their place with a measured improvement on #15. Labelled `needs-evidence`. Neither backend exposes the head today, so it is a runtime change as well as a retrieval one |
+| [#6](https://github.com/mgd43b/manicule/issues/6) | **BGE-M3 learned-sparse leg** as an alternative to FTS5 BM25 (§1.4) | A retrieval feature, and retrieval features earn their place with a measured improvement on #15. Labeled `needs-evidence`. Neither backend exposes the head today, so it is a runtime change as well as a retrieval one |
 
 ## 10. Checklist against ticket #3
 
@@ -614,7 +614,7 @@ unfinished:
 
 | Section | Was | Is |
 |---|---|---|
-| §1.0 | absent | The MLX weights are a community conversion, and quantised ones are refused |
+| §1.0 | absent | The MLX weights are a community conversion, and quantized ones are refused |
 | §2 | "a model outside the known-good set must supply its own fingerprint fields" | It supplies only what its repository fails to declare, and may not contradict it |
 | §3.2 | the hazard was MLX's | ONNX exports name their outputs freely too; selection is by rank |
 | §3.3 | parity was a bet | parity is a measurement, and it holds |

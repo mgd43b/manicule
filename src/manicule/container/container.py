@@ -468,7 +468,7 @@ class Container:
         return HealthReport.rollup(reports)
 
     def metrics(self) -> list[Metric]:
-        """Every started component's metrics, labelled with where they came from."""
+        """Every started component's metrics, labeled with where they came from."""
         collected: list[Metric] = []
         for kind, name in self._started:
             instance = self._instances.get((kind, name))

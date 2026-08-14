@@ -707,7 +707,7 @@ async def test_the_parse_tree_is_gone_before_the_first_block_is_yielded(
     """A suspended generator must be holding nothing native.
 
     ``parse`` is an async generator, and one abandoned part-way stays suspended until CPython
-    finalises it through the loop that created it — running a native destructor against a
+    finalizes it through the loop that created it — running a native destructor against a
     torn-down runtime if that loop has closed, which surfaces as a crash inside the
     interpreter naming no library anybody here wrote. Releasing in a ``finally`` answers the
     closed case; keeping the tree out of the frame answers the never-closed case too, so that

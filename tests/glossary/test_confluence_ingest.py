@@ -35,7 +35,7 @@ Definition   Initials of its expansion   Confidence  Outcome
 
 A spaced hyphen is worth 0.45 and the threshold is 0.60, so a definition on a page that does
 not announce itself as a glossary needs the 0.35 of initials agreement to clear it. ``SaFeR``
-has it only through :func:`~manicule.ingest.glossary.initial_skeleton`: the normalised key is
+has it only through :func:`~manicule.ingest.glossary.initial_skeleton`: the normalized key is
 ``SAFER``, whose initials nothing spells, and it is the *display* spelling's skeleton ``SFR``
 that ``Signal Fault Router`` matches. ``OLD`` and ``NEXT`` have no such route and are refused.
 
@@ -93,17 +93,17 @@ EXPANSION = "Signal Fault Router"
 DESCRIPTION = "a service that routes operational signals"
 """The words that follow the expansion on the same line, and must not be part of it."""
 
-NEIGHBOURS = ("Older Delivery Layer", "Network Event Exchange Toolkit")
+NEIGHBORS = ("Older Delivery Layer", "Network Event Exchange Toolkit")
 """The definitions either side of the one under test.
 
 Asserted absent from its expansion, which is the direct form of "not swallowed": under the
 defect the whole macro body was one line, and a detector matching from the start of it read
-every neighbour as part of the first definition's right-hand side — which is also why that
+every neighbor as part of the first definition's right-hand side — which is also why that
 first definition was then refused for being too long to be an expansion.
 """
 
 DEFINITION_QUERIES = ("What is SaFeR?", "what is safer?", "WHAT IS SAFER?")
-"""One question in three spellings. The key is normalised; the display is not."""
+"""One question in three spellings. The key is normalized; the display is not."""
 
 USES_THE_TERM = "restart SaFeR after the maintenance window closes"
 """A query that names the term and does not ask what it means."""
@@ -265,7 +265,7 @@ async def test_the_stylized_term_is_detected_from_the_middle_paragraph(
     Under the old join this definition was not at the start of any line, because there was only
     one line. Disabling the fix and running this case alone reports ``Recorded: []``.
     """
-    assert entry.acronym == KEY, "the normalised lookup key"
+    assert entry.acronym == KEY, "the normalized lookup key"
     assert entry.display == TERM, "the source's own spelling, stored verbatim"
 
 
@@ -283,10 +283,10 @@ async def test_the_adjacent_definitions_are_not_swallowed_into_the_expansion(
     """The requirement the boundary fix is really for.
 
     Under the defect the three paragraphs were one line, so the first definition's right-hand
-    side ran to the end of the macro body and carried both of its neighbours with it.
+    side ran to the end of the macro body and carried both of its neighbors with it.
     """
-    for neighbour in NEIGHBOURS:
-        assert neighbour not in entry.expansion
+    for neighbor in NEIGHBORS:
+        assert neighbor not in entry.expansion
 
 
 async def test_the_defining_chunk_is_kept_as_the_entry_provenance(
@@ -312,7 +312,7 @@ async def test_the_defining_chunk_is_kept_as_the_entry_provenance(
 async def test_a_definition_query_resolves_the_term_whatever_its_case(
     store: SqliteDocStore, indexed: list[Chunk], entry: GlossaryEntry, text: str
 ) -> None:
-    """Case-insensitive because the key is normalised, and the display survives regardless."""
+    """Case-insensitive because the key is normalized, and the display survives regardless."""
     retriever = await system.retriever_over(store, BagOfWordsEmbedder(), indexed)
 
     result = await retriever.retrieve(_ask(text))
@@ -331,7 +331,7 @@ async def test_a_definition_query_resolves_the_term_whatever_its_case(
 async def test_the_public_result_reports_an_explicit_definition(
     store: SqliteDocStore, indexed: list[Chunk], entry: GlossaryEntry
 ) -> None:
-    """The whole path, ending where a caller reads it: the serialised search payload."""
+    """The whole path, ending where a caller reads it: the serialized search payload."""
     service = await _service(store, indexed)
 
     payload = await service.search(DEFINITION_QUERIES[0], limit=LIMIT)
@@ -365,7 +365,7 @@ async def test_an_ordinary_use_of_the_term_is_not_an_explicit_definition(
 # --- the two definitions the page does not carry evidence for ----------------------------------
 
 
-async def test_the_neighbours_are_refused_on_their_initials_rather_than_lost(
+async def test_the_neighbors_are_refused_on_their_initials_rather_than_lost(
     store: SqliteDocStore,
 ) -> None:
     """Named, so nobody reads this suite's single entry as a boundary still being missed.
@@ -392,7 +392,7 @@ async def test_a_page_that_says_it_is_a_glossary_records_all_three(
     ``GLOSSARY_CONTEXT_EVIDENCE`` carries a bare spaced hyphen from 0.45 to 0.60, which is why
     every other case on this page runs under a title that says nothing. What this adds is the
     thing a single entry cannot show — that the boundaries produced three independently recorded
-    definitions rather than one long one — and it is worth having only because it is labelled.
+    definitions rather than one long one — and it is worth having only because it is labeled.
     """
     _, chunks = await _ingest(store, title=GLOSSARY_TITLE)
     found = await system.entries_by_acronym(store, chunks)

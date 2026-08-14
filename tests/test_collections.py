@@ -18,10 +18,10 @@ from typing import TYPE_CHECKING
 import pytest
 
 from manicule.core.errors import ManiculeError, NameInUseError
-from manicule.core.organisation import CollectionRule
+from manicule.core.organization import CollectionRule
 from manicule.core.retrieval import Filter
 from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
-from manicule.storage.organisation import resolve_filter, rule_clause
+from manicule.storage.organization import resolve_filter, rule_clause
 from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
@@ -163,7 +163,7 @@ async def test_renaming_a_collection_moves_no_document_and_re_indexes_nothing(
 
     renamed = await store.rename_collection(collection.id, "  alpha runbooks  ")
 
-    assert renamed.name == "alpha runbooks", "the new name was not normalised on the way in"
+    assert renamed.name == "alpha runbooks", "the new name was not normalized on the way in"
     assert renamed.id == collection.id, "renaming minted a new collection"
     assert renamed.description == "worked examples", "renaming dropped the description"
     assert {
@@ -282,12 +282,12 @@ async def test_concurrent_membership_updates_settle_on_one_set(store: SqliteDocS
 async def test_a_rule_selects_documents_that_arrived_after_it_was_written(
     store: SqliteDocStore,
 ) -> None:
-    """Why reconciliation has nothing to resume: membership is evaluated, never materialised.
+    """Why reconciliation has nothing to resume: membership is evaluated, never materialized.
 
     A rule stored and not evaluated is a saved query that answers about the day it was
-    written. This is the test that would fail if anyone ever "optimised" it into a snapshot,
+    written. This is the test that would fail if anyone ever "optimized" it into a snapshot,
     and it is also the whole safety argument for interruption — there is no reconciliation
-    pass to be interrupted, because there is no materialised membership to build.
+    pass to be interrupted, because there is no materialized membership to build.
     """
     await _corpus(store)
     ruled = await store.create_collection(
@@ -344,7 +344,7 @@ async def test_clearing_a_rule_leaves_the_manual_members_behind(store: SqliteDoc
 async def test_removing_a_document_a_rule_still_selects_leaves_it_a_member(
     store: SqliteDocStore,
 ) -> None:
-    """Documented behaviour, pinned so it stays a decision rather than becoming a surprise.
+    """Documented behavior, pinned so it stays a decision rather than becoming a surprise.
 
     ``remove_from_collection`` drops *manual* memberships. A document the rule still selects
     is still selected, and the alternative — a tombstone that suppresses it — would be a
@@ -411,7 +411,7 @@ async def test_a_rule_selects_nothing_from_another_workspace(
     """The *evaluation* half of the workspace promise.
 
     That the stored rule cannot name a workspace is a property of the type, and
-    ``tests/test_storage_organisation.py`` already pins it. This is the other half: a rule
+    ``tests/test_storage_organization.py`` already pins it. This is the other half: a rule
     matching on ``source`` alone, evaluated by a handle that owns one workspace, against a
     corpus where another workspace has documents from the same source name. Source names are
     not tenant-unique — two people both call a connector ``fs`` — so this is the realistic
@@ -532,12 +532,12 @@ async def test_the_too_large_refusal_tells_the_caller_what_to_do(
     collection filters and that no caller can ask for. Naming an unreachable remedy is worse
     than naming none: it reads as though there were a way and the reader simply missed it.
     """
-    from manicule.storage import organisation  # noqa: PLC0415 - only this test patches the cap
+    from manicule.storage import organization  # noqa: PLC0415 - only this test patches the cap
 
     corpus = await _corpus(store)
     collection = await store.create_collection("large")
     await store.add_to_collection(collection.id, [document.id for document in corpus.values()])
-    monkeypatch.setattr(organisation, "MAX_RESOLVED_DOCUMENTS", 1)
+    monkeypatch.setattr(organization, "MAX_RESOLVED_DOCUMENTS", 1)
 
     scope = Filter(
         workspace_ids=frozenset({DEFAULT_WORKSPACE}),

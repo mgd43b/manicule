@@ -57,7 +57,7 @@ async def test_a_retriever_whose_cache_can_hit_is_refused(store: SqliteDocStore)
     """A hit is one sample counted twice at the cache's latency.
 
     Refused at construction rather than filtered at reporting time, because a run that served
-    half its queries from memory would report a latency improvement that is an artefact and a
+    half its queries from memory would report a latency improvement that is an artifact and a
     quality figure computed from fewer observations than it claims.
     """
     chunks = await build_corpus(store)
@@ -105,7 +105,7 @@ async def test_an_external_system_is_an_adapter_and_a_label() -> None:
 
 
 async def test_two_chunks_of_one_document_stay_two_results() -> None:
-    """Collapsing them would be a judgement about diversity that this type does not make."""
+    """Collapsing them would be a judgment about diversity that this type does not make."""
 
     async def search(text: str, limit: int) -> Sequence[ResultItem]:
         del text, limit

@@ -21,15 +21,15 @@ Design decisions that are not obvious from the field list:
     A quote that spans a column break occupies two boxes. Merging them yields a rectangle
     covering text that was not quoted, which is a wrong highlight rather than a missing one.
 
-Rectangles are in normalised page coordinates
+Rectangles are in normalized page coordinates
     ``0.0``-``1.0`` on both axes, origin top-left, **relative to the CropBox with
     ``/Rotate`` applied** — the page as a reader sees it. Storing points would require
-    storing the page dimensions alongside every rectangle to render it; normalising once at
+    storing the page dimensions alongside every rectangle to render it; normalizing once at
     parse time, where the page box is known, removes that coupling and makes the values
     checkable.
 
 ``kind`` is a discriminator
-    Anchors are serialised into the index and read back. A tagged union round-trips
+    Anchors are serialized into the index and read back. A tagged union round-trips
     unambiguously; an untagged one does not.
 """
 
@@ -80,7 +80,7 @@ def _snap(value: float) -> float:
 
 
 class Rect(BaseModel):
-    """An axis-aligned rectangle in normalised page coordinates.
+    """An axis-aligned rectangle in normalized page coordinates.
 
     Origin is the top-left; ``x1``/``y1`` are the bottom-right corner. Both axes run
     ``0.0`` to ``1.0``, so a rectangle is meaningful without knowing the page size, at any

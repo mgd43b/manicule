@@ -4,7 +4,7 @@
 reason is that they answer to something that is not a person: a process supervisor, a
 container orchestrator, a monitoring probe. Those read a status code and nothing else, and a
 liveness probe that has to parse JSON is a liveness probe that reports unhealthy when the
-serialiser changes.
+serializer changes.
 
 They also answer **different questions**, which is why there are two. ``/healthz`` says this
 process is running and can serve a request — it opens nothing. ``/readyz`` says the index is

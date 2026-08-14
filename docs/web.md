@@ -57,14 +57,14 @@ implementation has to answer.
 
 ---
 
-## 2. Where the behaviour is
+## 2. Where the behavior is
 
 Nowhere in this package. Every page does the same three things:
 
 1. admit the reader through `manicule.api.security.require` — the *same* function the JSON
    routes use, not a second implementation;
 2. run one or more operations through `manicule.app.dispatch.run_op`, which is what produces the
-   envelope every other surface serialises;
+   envelope every other surface serializes;
 3. render that envelope.
 
 **It renders against the service rather than consuming its own HTTP API.** The alternative — a
@@ -192,7 +192,7 @@ HTTP API, so [`surfaces.md` §9.6](surfaces.md#96-what-the-http-surface-will-not
 whole: no hard delete, no reset, no backup or restore, no import or export, no upgrade, no
 plugin install, no connector creation, no benchmark.
 
-Two of those collide with the ticket that asked for this surface, and both are resolved in favour
+Two of those collide with the ticket that asked for this surface, and both are resolved in favor
 of the boundary:
 
 **There is no drag-and-drop upload.** `POST /api/v1/documents/upload` does not exist, by a

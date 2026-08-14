@@ -232,7 +232,7 @@ async def test_a_store_that_answers_reuse_on_the_embedding_input_passes() -> Non
 
 
 async def test_a_store_that_answers_reuse_on_the_chunk_id_is_caught() -> None:
-    """The optimisation that looks right and keeps a stale vector under current text."""
+    """The optimization that looks right and keeps a stale vector under current text."""
     chunks = make_chunks(make_document())
     with pytest.raises(AssertionError, match="embed_text had changed"):
         await assert_vector_store_reuses_by_embedding_input(IdKeyedVectorStore, chunks)

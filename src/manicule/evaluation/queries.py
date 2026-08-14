@@ -62,7 +62,7 @@ class Intent(StrEnum):
     """An error code, symbol, ticket number or filename. The lexical leg's home ground, and
     the category most often quietly damaged by a change that improves the average."""
 
-    UNCATEGORISED = "uncategorised"
+    UNCATEGORIZED = "uncategorized"
     """Not yet grouped. A real state for a fresh export, and reported as its own row rather
     than folded into another category — a bucket that silently absorbs the awkward ones would
     make every other row look cleaner than it is."""
@@ -96,7 +96,7 @@ class EvalQuery(BaseModel):
     """One question, with whatever is known about it.
 
     Nothing here is a relevance label. The harness compares two systems on the same question
-    and records which was preferred; absolute judgements are a different and much more
+    and records which was preferred; absolute judgments are a different and much more
     expensive instrument, and building them first is how a query set never gets finished.
     """
 
@@ -104,7 +104,7 @@ class EvalQuery(BaseModel):
 
     id: str = Field(min_length=1, description="Stable within a set. Preferences key on it.")
     text: str = Field(min_length=1)
-    intent: Intent = Intent.UNCATEGORISED
+    intent: Intent = Intent.UNCATEGORIZED
     thumbs: Thumbs | None = Field(
         default=None,
         description="What the user thought of the answer they originally got, where a running "
@@ -148,7 +148,7 @@ class QuerySet(BaseModel):
             duplicates = sorted(repeated)
             msg = (
                 f"duplicate query ids: {', '.join(duplicates)}. Preferences are keyed by id, so "
-                f"a repeat would overwrite an earlier judgement rather than add to it."
+                f"a repeat would overwrite an earlier judgment rather than add to it."
             )
             raise ValueError(msg)
         if self.exported_at is not None and self.exported_at.tzinfo is None:
@@ -161,7 +161,7 @@ class QuerySet(BaseModel):
         """Whether results from this set may be described as measured.
 
         ``False`` for an example set, and the report reads this rather than deciding for
-        itself. The alternative — a convention that example sets get labelled by whoever
+        itself. The alternative — a convention that example sets get labeled by whoever
         publishes the number — is the convention that fails.
         """
         return self.provenance is not Provenance.EXAMPLE

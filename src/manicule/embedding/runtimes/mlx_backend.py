@@ -7,7 +7,7 @@ It is also version 0.1.0, and it earns the caution. ``models/xlm_roberta.py`` co
 ``text_embeds = normalize_embeddings(mean_pooling(sequence_output, attention_mask))``
 **unconditionally**, for every XLM-RoBERTa checkpoint — including ``bge-m3``, which declares
 CLS pooling. Reaching for the obviously named field returns a correctly shaped, correctly
-normalised vector from the wrong reduction, at cosine 0.66-0.80 to the right one, with nothing
+normalized vector from the wrong reduction, at cosine 0.66-0.80 to the right one, with nothing
 raised. So this class touches ``last_hidden_state`` and nothing else, checks its rank, and
 hands the states to :mod:`manicule.embedding.pooling`.
 
@@ -39,7 +39,7 @@ class MlxEmbedder(PooledEmbedder):
     The weights are usually not the model's own: ``BAAI/bge-m3`` publishes a PyTorch pickle and
     no safetensors, so MLX runs a community conversion, recorded in
     :attr:`~manicule.core.embedding.EmbedFingerprint.weights_ref` and refused outright if it is
-    quantised (:mod:`manicule.embedding.artifacts`).
+    quantized (:mod:`manicule.embedding.artifacts`).
     """
 
     def __init__(
@@ -74,7 +74,7 @@ class MlxEmbedder(PooledEmbedder):
         if weights.describe() != self.fingerprint.weights_ref:
             # Only reachable if resolution stopped being a pure function of the same inputs.
             # Worth catching: the fingerprint is already fixed, so a divergence here would
-            # record one artefact and execute another.
+            # record one artifact and execute another.
             msg = (
                 f"the MLX weights resolved to {weights.describe()} at setup but "
                 f"{self.fingerprint.weights_ref} was recorded in the fingerprint at "

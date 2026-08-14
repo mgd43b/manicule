@@ -172,7 +172,7 @@ class BrowserSession:
     def to_json(self) -> str:
         """The record as the one string a keychain item holds.
 
-        Serialised by hand rather than through pydantic's JSON mode, which would render every
+        Serialized by hand rather than through pydantic's JSON mode, which would render every
         secret as asterisks — correct for a log and useless for storage. Writing it out here is
         the one place the values are deliberately unwrapped, which is where a reader looks for
         that.

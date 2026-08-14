@@ -626,7 +626,7 @@ class ConfluenceConnector:
     # --- macro resolution ----------------------------------------------------------------
 
     def _lookup_for(self, body: _Body, space_key: str) -> Lookup:
-        """How an include macro finds the page it names, memoised for this fetch.
+        """How an include macro finds the page it names, memoized for this fetch.
 
         Two macros naming the same page — an overview that includes a definition twice — would
         otherwise be two searches and two body fetches for one answer.

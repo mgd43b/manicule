@@ -119,7 +119,7 @@ COMMON_ENGLISH_WORDS: Final[frozenset[str]] = frozenset(word.upper() for word in
 
 
 def is_common_word(key: str) -> bool:
-    """Whether a normalised glossary key is also an ordinary English word."""
+    """Whether a normalized glossary key is also an ordinary English word."""
     return key.upper() in COMMON_ENGLISH_WORDS
 
 

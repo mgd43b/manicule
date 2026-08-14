@@ -13,7 +13,7 @@ wrong highlight rather than an error:
 **Units and origin.** python-pptx reports EMU with a **top-left** origin, which is already
 the convention :class:`~manicule.core.anchors.Rect` uses, so there is no y-flip here — unlike
 the PDF path, where there is. The coordinates are divided by the slide's own width and height,
-because ``Rect`` is normalised ``0.0``-``1.0``.
+because ``Rect`` is normalized ``0.0``-``1.0``.
 
 **Geometry that is not reported.** A placeholder inheriting its position from a layout that
 declares none, or a shape whose ``<a:xfrm>`` was dropped by an editor, reports ``None`` for
@@ -62,7 +62,7 @@ _CELL_SEPARATOR = "\t"
 _ROW_SEPARATOR = "\n"
 
 _COORDINATE_TOLERANCE = 1e-9
-"""How close two normalised coordinates must be to name the same shape.
+"""How close two normalized coordinates must be to name the same shape.
 
 :meth:`SlidesParser.resolve` recomputes a shape's box with the same arithmetic
 :meth:`SlidesParser.parse` used, so the values agree exactly; the tolerance is here so that a
