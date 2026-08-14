@@ -140,12 +140,16 @@ DERIVED_FROM: Final[dict[str, str]] = {
         "module it is closed by the entry below instead, since a distribution's dependencies "
         "move with the version recorded for it."
     ),
-    "static imports only": (
+    "static imports only, and the guard against that is not total either": (
         "`importlib.import_module('x')` and `__import__('x')` are function calls, so the walk "
-        "cannot resolve them and would miss the dependency in silence. That is the one blind "
-        "spot with no reasoning behind it, so it is not left as one: "
-        "`tests/glossary/test_lineage.py` fails if a digested source contains either form, "
-        "which turns the thing this cannot see into the thing it is not allowed to do."
+        "cannot resolve them and would miss the dependency in silence. "
+        "`tests/glossary/test_lineage.py` refuses them — but it matches the *name being called*, "
+        "so what it catches is the four spellings somebody writes without meaning to hide "
+        "anything: bare, attribute, `builtins.__import__`, and a rebound import. It does NOT "
+        "catch `f = importlib.import_module` then `f('x')`, `getattr(importlib, 'import_module')"
+        "('x')`, or a call built in `eval`. Closing those needs value-flow analysis, which an "
+        "AST walk is not, so the honest claim is narrower than a prohibition: it raises the cost "
+        "of this mistake from accidental to deliberate, and a test cannot do more than that."
     ),
     "a distribution's own pins": (
         "pydantic's version is recorded and pydantic-core's is not — no version is written down "
