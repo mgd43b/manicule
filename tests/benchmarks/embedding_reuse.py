@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import time
 import tracemalloc
 from dataclasses import dataclass
@@ -101,8 +102,13 @@ def corpus(*, documents: int, chunks_per_document: int, changed_fraction: float)
     Distinct on purpose: duplicate text is what the in-memory cache is good at, so a corpus
     with repeats would let the LRU account for the result and prove nothing about the identity
     this benchmark is about.
+
+    **Rounded half up, not with :func:`round`.** Python rounds halves to even, so
+    ``round(5 * 0.5)`` is 2 — asking for half of five documents would change 40% of them, and
+    this program exists to price a migration. An operator reading "0.5" off the flag and 40% out
+    of the result would be misled by the tool they reached for to avoid being misled.
     """
-    changed = round(documents * changed_fraction)
+    changed = math.floor(documents * changed_fraction + 0.5)
     pages: dict[str, str] = {}
     for index in range(documents):
         marker = MARKER if index < changed else ""

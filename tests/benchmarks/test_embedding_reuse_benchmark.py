@@ -53,22 +53,37 @@ async def test_reuse_removes_the_re_parse_entirely_when_no_text_moves() -> None:
     assert second.documents == DOCUMENTS, "every document was still rebuilt from retained bytes"
 
 
-@pytest.mark.parametrize("fraction", [0.25, 0.5])
-async def test_the_fraction_embedded_is_the_fraction_that_moved(fraction: float) -> None:
+@pytest.mark.parametrize(
+    ("documents", "fraction", "expected_documents"),
+    [
+        (4, 0.25, 1),
+        (4, 0.5, 2),
+        # An exact half on an odd count. `round` sends halves to even and would change two of
+        # five — 40% from a flag that says 50% — and this is the case that catches it. The
+        # expectation is written out rather than computed, because a test that repeated the
+        # implementation's arithmetic would have agreed with the bug.
+        (5, 0.5, 3),
+        (2, 0.25, 1),
+    ],
+)
+async def test_the_fraction_embedded_is_the_fraction_that_moved(
+    documents: int, fraction: float, expected_documents: int
+) -> None:
     """What a structural rebuild costs is proportional to what it actually changes.
 
     The property another caller needs from this program: not that reuse works, but that the
     number it reports tracks the change. A benchmark that only ever measured the all-or-nothing
-    cases could not be used to price a partial migration.
+    cases could not be used to price a partial migration — and one whose expectations are
+    computed the same way the program computes them cannot catch the program being wrong.
     """
     _, second = await measure(
-        documents=DOCUMENTS,
+        documents=documents,
         chunks_per_document=CHUNKS_EACH,
         changed_fraction=fraction,
         reuse=True,
     )
 
-    assert second.embedded == round(DOCUMENTS * fraction) * CHUNKS_EACH
+    assert second.embedded == expected_documents * CHUNKS_EACH
 
 
 def test_the_rendering_lines_up_and_names_both_passes() -> None:
