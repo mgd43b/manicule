@@ -104,6 +104,14 @@ application's cookies.
 tracks them, and some tenants will decline it outright. That is a property of the tenant rather
 than a bug here; the paste path is unaffected because the browser is yours.
 
+manicule tries to tell that case apart from "sign-in is just slow", by whether the browser ever
+received a cookie from your Confluence at all — and it is a heuristic rather than a diagnosis.
+An unauthenticated Confluence usually issues a session cookie on the first visit, so a browser
+that reached the instance and was then turned away still gets the *wait longer* message. The
+*this will not work* message fires when something in front of Confluence intercepts the request
+before Confluence answers at all. The heuristic errs toward telling you to wait, which costs a
+timeout you were spending anyway rather than talking you out of a setup that works.
+
 **The session lives in the macOS Keychain.** Not `config.toml`, even at `0600`: a session cookie
 is the sync account's whole identity at that company rather than a scoped grant, and a
 configuration file reaches version control eventually. The configuration model forbids unknown

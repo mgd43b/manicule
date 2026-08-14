@@ -456,8 +456,22 @@ class PlaywrightProvider:
             ``base_url`` names a host the sign-in never lands on. Telling this person to raise
             the timeout sends them to wait five more minutes for the same nothing.
 
-        Distinguishing the last two costs one boolean, and the signal is already in hand: whether
-        :func:`origin_cookies` ever returned anything.
+        Distinguishing the last two costs one boolean: whether :func:`origin_cookies` ever
+        returned anything.
+
+        **It is a heuristic and it is worth saying which way it is wrong.** An unauthenticated
+        Confluence commonly issues a session cookie on the first visit, before anybody has signed
+        in — so a browser that reached the instance and was then sent away still sets the flag,
+        and gets the "wait longer" message. The "never reached" case therefore fires for the
+        shape where something in front of Confluence intercepts the request before Confluence
+        answers at all, which is one conditional-access arrangement among several rather than the
+        whole class.
+
+        That is the safer direction to be wrong in. "Wait longer" costs somebody a timeout they
+        were going to spend anyway; "give up, this will never work" told to a person whose
+        provider merely needed another minute is advice that abandons a working setup. The
+        message itself claims no more than it knows — it names the two usual causes rather than
+        diagnosing one.
         """
         import asyncio  # noqa: PLC0415 - kept beside its only use
 
