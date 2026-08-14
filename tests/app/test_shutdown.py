@@ -252,6 +252,8 @@ async def test_a_shutdown_that_finishes_is_not_cut_short(socket_path: Path) -> N
 
 
 MANICULE = Path(sys.executable).with_name("manicule")
+"""The console script beside the interpreter running the suite. See ``tests/app/test_launchd.py``
+for why it is the console script rather than ``python -m``."""
 
 SCHEDULER_STOPPING = "stopping the scheduler"
 SOCKET_CLOSING = "closing the control socket"

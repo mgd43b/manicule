@@ -65,7 +65,7 @@ finished letting go yet", and the second is an ordinary moment during a restart 
 fault.
 
 What makes it retry *sensibly* rather than spin is ``ThrottleInterval`` in the plist
-(``docs/deployment.md`` §4), which is where the cadence belongs: a wait built into this process
+(``docs/deployment.md`` §6.3), which is where the cadence belongs: a wait built into this process
 would be a wait an operator running ``manicule serve`` by hand would also have to sit through,
 for a refusal they can read and act on immediately.
 
@@ -207,15 +207,19 @@ async def _serve(
                     allow_public=allow_public,
                 )
         except ProtocolError as exc:
-            # A control socket that will not bind is a refusal rather than a crash: the
-            # commonest cause is a second server, and the second commonest is a runtime
-            # directory somebody else owns. The first fixes itself and the second does not, and
-            # the message says which — but the *status* has to be one of them, so it is the one
-            # that retries: a directory somebody else owns is a refusal an operator will read on
-            # the first attempt, while a lock held by a process still exiting is a race that a
-            # retry resolves and a permanent status would turn into a server that never came up.
+            # A control socket that will not bind is a refusal rather than a crash, and it is a
+            # **permanent** one — `1`, not `EX_TEMPFAIL`. That is worth setting out, because the
+            # obvious reading is the opposite: this used to be raised by a second server already
+            # listening, which is exactly the transient case.
+            #
+            # It cannot be that any more. Reaching here means `runtime.acquire()` succeeded, so no
+            # other manicule holds the directory — and the outgoing server closes its control
+            # socket *before* the `async with runtime` above releases the lock, so a process that
+            # has the lock cannot find a live socket left by the one it replaced. What is left is
+            # a runtime directory that is not ours or is readable by somebody else, which no
+            # amount of retrying fixes and which the message names.
             _report(failed("start", service.workspace, error_info(exc)), json_output)
-            return EX_TEMPFAIL
+            return 1
         finally:
             pid.unlink(missing_ok=True)
     return 0

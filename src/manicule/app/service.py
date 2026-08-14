@@ -1763,8 +1763,9 @@ class ApplicationService:
                 state="degraded",
                 detail=(
                     f"the manicule server holds no Confluence session for {_listed(missing)}, so "
-                    f"the next scheduled sync of that source stops without contacting the "
-                    f"instance. This is what a restart looks like — sessions live in the "
+                    f"the next scheduled sync of {'it' if len(missing) == 1 else 'each'} stops "
+                    f"without contacting the instance. This is what a restart looks like — "
+                    f"sessions live in the "
                     f"server's memory and do not survive one — rather than a fault, and it is "
                     f"not an outage at the instance: nothing has been asked of it. Sign in again "
                     f"with `manicule connector login {first} --browser`; manicule never asks for "

@@ -215,6 +215,19 @@ exit status of nothing, which is precisely the failure this file exists to not h
 """
 
 
+def test_the_console_script_this_suite_drives_is_installed() -> None:
+    """A missing entry point fails here, saying so, rather than as a confusing ENOENT below.
+
+    ``uv sync`` installs it beside the interpreter. A suite that reported "No such file or
+    directory" from inside a ``subprocess.run`` would send somebody looking at the test rather
+    than at their environment.
+    """
+    assert MANICULE.is_file(), (
+        f"{MANICULE} is not there, so the environment has manicule importable but not installed "
+        f"as a command. Run `uv sync --all-groups`."
+    )
+
+
 def _serve(data_dir: Path, *extra: str, wide: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the real ``manicule serve`` against ``data_dir`` and return what it did.
 

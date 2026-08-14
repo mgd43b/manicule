@@ -42,8 +42,8 @@ guarding it — and a setting that could grant an exception would trade that for
 guarantee, which is a weaker one that fails silently.
 
 It exists so the rule can be *read* at the one place a reader would look for it, and so
-``tests/mcp/test_network_surface.py`` can name it. If a write over the network is ever wanted, it
-is its own decision with its own threat model rather than a flag flipped here.
+``tests/mcp/test_transports.py`` can name it. If a write over the network is ever wanted, it is
+its own decision with its own threat model rather than a flag flipped here.
 """
 
 

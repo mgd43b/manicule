@@ -274,8 +274,8 @@ class Scheduler:
     **One refusal is reported as itself, and it is the one a restart causes.** A session lives in
     this process's memory, so launchd restarting the server — a crash, a logout, a reboot — ends
     every one of them and the next scheduled sync cannot authenticate. Reported like any other
-    failure that reads, at three in the morning, exactly like an instance that is down; and the
-    two need opposite things, one a person at a browser and the other nothing at all. So
+    failure, that reads at three in the morning exactly like an instance being down — and the two
+    need opposite things, one a person at a browser and the other nothing at all. So
     :class:`~manicule.connectors.errors.SessionMissingError` is matched on its type, announced in
     its own sentence naming the command that fixes it, and recorded as
     :attr:`ScheduledSource.awaiting_sign_in` so that the state is inspectable rather than only
