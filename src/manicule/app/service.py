@@ -828,7 +828,7 @@ class ApplicationService:
 
         The filter is applied *here* rather than inside the provider, so that every provider —
         Playwright today, something else later — is held to it by the caller rather than by its
-        own good behaviour. An identity provider's cookies never reach the store because they
+        own good behavior. An identity provider's cookies never reach the store because they
         never get past this line.
         """
         from manicule.connectors.browser import (  # noqa: PLC0415 - optional dependency

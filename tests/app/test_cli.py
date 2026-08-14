@@ -243,19 +243,19 @@ def test_allow_insecure_target_is_refused_on_a_restore_rather_than_ignored(
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
-"""A colour escape, which Rich emits on CI and not on this machine.
+"""A color escape, which Rich emits on CI and not on this machine.
 
 Kept as a named pattern because its absence was a real failure rather than a hypothetical one:
 the first version of :func:`_unwrapped` stripped box drawing and not escapes, so on the runner
 the sentence read ``... there is no \x1b[31m\x1b[0m file for the flag ...`` and the substring
-was not there. Local runs were colourless and passed.
+was not there. Local runs were colorless and passed.
 """
 
 
 def _unwrapped(output: str) -> str:
     """Terminal output as the sentence it is, independent of how it was rendered.
 
-    Rich wraps a refusal to the terminal width, draws a border around it, and colours the border
+    Rich wraps a refusal to the terminal width, draws a border around it, and colors the border
     when it thinks it is writing to a terminal. All three break a substring that spans a line, so
     all three come out: escapes first, then the box drawing, then the wrapping.
     """
@@ -278,11 +278,15 @@ def test_allow_insecure_state_is_refused_without_a_state_file_rather_than_ignore
 
     result = run(["connector", "login", "wiki", "--browser", "--allow-insecure-state"])
 
-    # The message, not merely the status. A login for an unconfigured source exits non-zero on
-    # its own, so an exit-code assertion here passes with the guard deleted — checked by
-    # deleting it.
+    # The *flags*, not the prose. A login for an unconfigured source exits non-zero on its own,
+    # so an exit-code assertion passes with the guard deleted — checked by deleting it. And a
+    # sentence fragment would break the next time somebody improves the wording, which is a test
+    # failing for a change that made the product better. What has to hold is that the refusal
+    # names the flag that was given and the flag it belongs to.
     assert result.exit_code != 0
-    assert "no file for the flag to consent to" in _unwrapped(result.output)
+    refusal = _unwrapped(result.output)
+    assert "--allow-insecure-state" in refusal
+    assert "--browser-state" in refusal
 
 
 def test_a_timeout_is_refused_without_the_path_that_waits(bound: ApplicationService) -> None:
@@ -297,7 +301,9 @@ def test_a_timeout_is_refused_without_the_path_that_waits(bound: ApplicationServ
     result = run(["connector", "login", "wiki", "--forget", "--timeout", "99"])
 
     assert result.exit_code != 0
-    assert "only the --browser path waits for" in _unwrapped(result.output)
+    refusal = _unwrapped(result.output)
+    assert "--timeout" in refusal
+    assert "--browser" in refusal
 
 
 # --- one document or the whole corpus -----------------------------------------------------------
@@ -2058,5 +2064,9 @@ def test_connector_sidecar_reports_which_profiles_ran(
     result = run(["connector", "sidecar", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
-    assert "standalone-storage" in result.output
-    assert "no configured source" in result.output
+    # Through `_unwrapped` like every other assertion on rendered output: these pass today
+    # because their phrases happen to fall inside one wrapped line on this terminal width, which
+    # is luck rather than correctness.
+    rendered = _unwrapped(result.output)
+    assert "standalone-storage" in rendered
+    assert "no configured source" in rendered

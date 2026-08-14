@@ -28,6 +28,7 @@ invented here, invented cookie values, and an identity provider that exists only
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
@@ -58,7 +59,7 @@ from manicule.connectors.sessions import MemoryStore
 from manicule.core.errors import ConfigError, PolicyError, UnknownEntityError
 from tests.app.fakes import FakeBackend
 from tests.connectors.fake_confluence import FakeConfluence, FakePage
-from tests.connectors.support import SESSION_ACCOUNT
+from tests.connectors.support import SESSION_ACCOUNT, sso_config
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -586,6 +587,109 @@ async def test_a_browser_that_finds_no_cookies_for_the_instance_is_a_stated_refu
     assert "no cookies for" in str(refusal.value)
     assert "untouched" in str(refusal.value)
     assert store.load(BASE) is None
+
+
+# --- the wait loop itself, over a fake browser context ------------------------------------------
+#
+# These drive `PlaywrightProvider._wait` rather than the seam above it, because the thing under
+# test is how the provider distinguishes its own failures — which is the one piece of that class
+# that is logic rather than plumbing, and the piece a person reads the output of.
+
+
+class FakeContext:
+    """A Playwright context that reports a fixed jar. Nothing else is ever asked of it."""
+
+    def __init__(self, jar: list[dict[str, Any]]) -> None:
+        self.jar = jar
+
+    async def cookies(self) -> list[dict[str, Any]]:
+        return self.jar
+
+
+class FakeBrowser:
+    """A browser that is open, or was closed by the person."""
+
+    def __init__(self, *, connected: bool = True) -> None:
+        self.connected = connected
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+
+async def _waited(
+    monkeypatch: pytest.MonkeyPatch, jar: list[dict[str, Any]], *, connected: bool = True
+) -> str:
+    """Run the wait loop against ``jar`` with a deadline already past, and return the refusal.
+
+    The deadline is in the past so the loop makes exactly one pass — enough to observe the jar
+    and give up, with no sleeping and no wall-clock dependence.
+
+    ``cookies_authenticate`` is stubbed to "not yet", which is what it would answer for a jar
+    that has not finished signing in. Left real it opens an HTTP client and retries a name that
+    does not resolve, at fifteen seconds a test — and the subject here is which sentence the
+    timeout produces, not whether cookies work.
+    """
+
+    async def not_yet(*_: object, **__: object) -> bool:
+        return False
+
+    monkeypatch.setattr(sessions_module, "cookies_authenticate", not_yet)
+    provider = PlaywrightProvider(poll_seconds=0.0)
+    with pytest.raises(ConfigError) as refusal:
+        await provider._wait(  # pyright: ignore[reportPrivateUsage]
+            FakeContext(jar),  # type: ignore[arg-type]
+            FakeBrowser(connected=connected),  # type: ignore[arg-type]
+            config=sso_config(BASE),
+            deadline=asyncio.get_running_loop().time() - 1,
+        )
+    return str(refusal.value)
+
+
+async def test_a_timeout_that_never_reached_confluence_does_not_say_wait_longer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The conditional-access case, and the reason it needs its own sentence.
+
+    A policy that declines a driven browser looks exactly like a person being slow: the window
+    sits there and nothing happens. Telling them to raise ``--timeout`` sends them to wait five
+    more minutes for the same nothing. The signal that separates the two is whether a cookie for
+    the configured instance ever appeared.
+    """
+    message = await _waited(monkeypatch, [entry("SSOSESSION", domain=IDP_HOST, path="/")])
+
+    assert "never received a cookie" in message
+    assert "A longer --timeout will not help" in message
+    assert "conditional-access" in message
+    assert "without --browser" in message, "the path that does work is not named"
+
+
+async def test_a_timeout_that_did_reach_confluence_says_wait_longer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half, so the sentence above is a distinction rather than the only message."""
+    message = await _waited(monkeypatch, [entry()])
+
+    assert "did reach" in message
+    assert "longer --timeout" in message
+    assert "will not help" not in message
+
+
+async def test_a_closed_browser_is_reported_as_closed_rather_than_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three endings, three sentences. This one is checked before the jar is even read."""
+    message = await _waited(monkeypatch, [entry()], connected=False)
+
+    assert "closed before sign-in finished" in message
+    assert "timeout" not in message
+
+
+async def test_every_timeout_message_says_the_stored_session_is_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-authenticating a session that had merely aged must not look like losing it."""
+    for jar in ([entry()], [entry("SSOSESSION", domain=IDP_HOST, path="/")]):
+        assert "previously stored session is untouched" in await _waited(monkeypatch, jar)
 
 
 @pytest.mark.parametrize(
