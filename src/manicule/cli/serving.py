@@ -414,13 +414,17 @@ def stop_running(overrides: Mapping[str, Any], *, workspace: str) -> Envelope:
     # The control socket, on the same principle `stop_server` removes the pid file: the process
     # is confirmed gone, so nothing is behind it.
     #
-    # It has to happen **here** rather than as the server unwinds, and the reason is uvicorn's:
-    # it handles the signal, shuts down cleanly, then restores the default handler and re-raises
-    # — so the process dies without unwinding the `async with` that would have tidied up. The
-    # stdio transport does unwind and does tidy up, which is exactly the sort of difference
-    # nobody would predict from reading either side. A socket left behind by a crash, a
-    # `SIGKILL` or a power cut is still possible and is not a problem: it is a file with nothing
-    # behind it, and `ControlServer.start` clears one.
+    # **The server now removes it itself**, on every path including a supervisor's `SIGTERM`:
+    # `_serve_over_a_socket` owns the signals, so `ControlServer.aclose` runs and unlinks the
+    # path. This line therefore removes a file that is usually already gone, and it stays for the
+    # cases where it is not — a `SIGKILL`, a power cut, or an older server on the far side of an
+    # upgrade. It used to be load-bearing for the ordinary stop as well, because uvicorn's own
+    # signal handling ended the process before the `async with` unwound; that is what
+    # `manicule.api.serve.Server` exists to prevent, and `tests/app/test_shutdown.py` asserts the
+    # socket is gone before this ever runs.
+    #
+    # A socket left behind by a crash, a `SIGKILL` or a power cut is not a problem either way: it
+    # is a file with nothing behind it, and `ControlServer.start` clears one.
     socket_path(settings.data_dir).unlink(missing_ok=True)
     return succeeded(
         "stop",

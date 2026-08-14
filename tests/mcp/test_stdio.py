@@ -26,6 +26,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
+from manicule.mcp.server import TOOL_NAMES
 from tests.mcp.qualification import CHUNK_COUNT, COLLECTION, DOCUMENT_COUNT
 
 if TYPE_CHECKING:
@@ -121,3 +122,27 @@ async def test_the_read_only_annotations_survive_the_transport() -> None:
 
     assert published["document_delete"] is not None
     assert published["document_delete"].readOnlyHint is False
+
+
+async def test_stdio_still_carries_the_whole_tool_surface() -> None:
+    """Every tool, over a pipe, unchanged by MCP having learned to be served over a socket.
+
+    **The other half of the network surface's absence assertions**, and without it those are one
+    sided: a change that filtered *every* transport down to the read-only tools would satisfy
+    every one of them and would silently remove the reason to run manicule under an assistant at
+    all. Over stdio the write tools are unreachable from a network by construction — stdin and
+    stdout are a pipe between one client and one process — so there is nothing for a filter to
+    buy here and it must not be applied.
+
+    Asserted against ``TOOL_NAMES`` rather than against a count, so a tool added tomorrow is
+    covered without anybody remembering to change a number.
+    """
+    async with Client(_transport()) as client:
+        published = sorted(tool.name for tool in await client.list_tools())
+
+    assert published == sorted(TOOL_NAMES)
+    for name in sorted(WRITE_TOOLS):
+        assert name in published, (
+            f"{name} is missing from the stdio surface. The read-only filter is for transports "
+            f"that bind a socket; stdio binds nothing and is where the write tools live."
+        )

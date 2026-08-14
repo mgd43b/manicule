@@ -22,10 +22,17 @@ is what "no shared session" means in the only terms a caller can see.
 from __future__ import annotations
 
 import asyncio
+import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, override
 
+import pytest
+
+from manicule.api.app import build_app
+from manicule.app.bind import Bind
+from manicule.app.service import ApplicationService
+from manicule.core.errors import PolicyError
 from tests.api.live import serving
 from tests.api.support import backend_with_a_document
 from tests.app.fakes import FakeRetriever
@@ -264,6 +271,31 @@ async def test_the_browser_surface_and_mcp_are_served_from_the_same_port() -> No
     assert page.status_code == OK, "the browser surface is not on this port"
     assert api.status_code == OK, "the JSON API is not on this port"
     assert tools, "MCP is on this port and offered nothing"
+
+
+def test_mounting_mcp_did_not_add_a_second_way_to_bind() -> None:
+    """The bind policy still refuses, with the surface that arrived after it in place.
+
+    Two refusals, and both are asserted because they are different code. ``resolve_bind`` decides
+    an *address* and refuses one that is not loopback without the flag and without authentication;
+    ``build_app`` decides whether an *application* may exist at all and refuses an unauthenticated
+    one that is not loopback. Mounting MCP on that application put a new surface behind both, and
+    "the policy is unchanged" is worth a test rather than an inspection: the way it would go wrong
+    is a mount that built its own server with its own address, which neither refusal would see.
+    """
+    from manicule.api.serve import address_for  # noqa: PLC0415 - heavy
+
+    wide, _ = backend_with_a_document(
+        security={"transport": {"bind_host": "0.0.0.0"}, "auth": {"mode": "api_key"}}  # noqa: S104
+    )
+    with pytest.raises(PolicyError, match="--allow-public-bind"):
+        address_for(ApplicationService(wide))
+
+    unauthenticated, _ = backend_with_a_document(
+        security={"transport": {"bind_host": "203.0.113.7"}}
+    )
+    with pytest.raises(PolicyError, match=re.escape("security.auth.mode")):
+        build_app(ApplicationService(unauthenticated), bind=Bind("203.0.113.7", 8765, False))
 
 
 async def test_no_web_removes_the_browser_surface_and_leaves_mcp() -> None:
