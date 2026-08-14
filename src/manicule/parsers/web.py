@@ -39,6 +39,7 @@ from manicule.parsers.inline import (
     collapse,
     collapse_lines,
     collapse_run,
+    item_prefix,
 )
 
 __all__ = ["WEB_MEDIA_TYPES", "WebConfig", "WebParser", "recover_cdata"]
@@ -72,6 +73,9 @@ _INLINE_TAGS = frozenset(
 collected rather than starting a block, so ``<p>`` is not split at every ``<strong>``."""
 
 _BREAK = "br"
+
+_ITEM_TAGS: Final = frozenset({"li", "dt", "dd"})
+"""Elements that are a list item: bulleted, ordered, or a definition list's term and body."""
 
 _NESTED_LISTS = frozenset({"ul", "ol"})
 """Direct children a list item renders separately rather than as part of its own text."""
@@ -442,13 +446,13 @@ def _list_lines(node: LexborNode, depth: int) -> Iterator[str]:
     """
     marker = "1." if node.tag == "ol" else "-"
     for item in node.iter():
-        if item.tag not in {"li", "dt", "dd"}:
+        if item.tag not in _ITEM_TAGS:
             continue
         own = collapse_run(_parts(item, skip=_NESTED_LISTS))
         if own:
-            yield f"{_INDENT * depth}{marker} {own}"
+            yield f"{_INDENT * depth}{item_prefix(item.tag or '', marker)}{own}"
         for nested in item.iter():
-            if nested.tag in {"ul", "ol"}:
+            if nested.tag in _NESTED_LISTS:
                 yield from _list_lines(nested, depth + 1)
 
 

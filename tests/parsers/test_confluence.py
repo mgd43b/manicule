@@ -1255,3 +1255,45 @@ async def test_the_whole_corpus_round_trips_within_its_location_budget(
     """Every fixture, every assertion, and the budget that stops the easy way out."""
     raws = [raw_from(corpus / "confluence" / name, MEDIA_TYPE) for name in CORPUS_FIXTURES]
     await check_corpus(_parser(), raws, chunker=chunker, min_blocks=MIN_CORPUS_BLOCKS)
+
+
+async def test_a_definition_list_renders_the_relationship_it_carries() -> None:
+    """**A ``<dl>`` says which of two lines is the term, and that was thrown away.**
+
+    Every part used to render with the same ``- ``, so ``<dt>NOW</dt><dd>Network Operations
+    Workspace</dd>`` came out as two indistinguishable bullets. The relationship is the only
+    thing a definition list adds over a bulleted one, and it was exactly what did not survive —
+    a reader of the chunk could not tell term from definition, and neither could detection,
+    measured at 0 of 4 on a glossary written this way.
+
+    ``TERM`` above ``: definition`` is the Markdown definition-list convention, so it reads as
+    what it is, and it is the shape ``ingest.glossary._DEFINITION_MARKER_RE`` has always
+    accepted. There was no test for ``<dl>`` in this suite at all before this one, which is why
+    the rendering could be wrong for as long as it was.
+    """
+    blocks = await _blocks(
+        "<dl><dt>NOW</dt><dd>Network Operations Workspace</dd>"
+        "<dt>QRS</dt><dd>Queue Replay Service</dd></dl>"
+    )
+
+    listing = next(block for block in blocks if block.kind is BlockKind.LIST)
+    assert listing.text.splitlines() == [
+        "NOW",
+        ": Network Operations Workspace",
+        "QRS",
+        ": Queue Replay Service",
+    ]
+
+
+async def test_a_bulleted_list_keeps_its_marker_when_a_definition_list_loses_it() -> None:
+    """The ``<dt>``/``<dd>`` rendering must not reach ``<li>``.
+
+    A bullet is what ``ingest.glossary._LIST_MARKER_RE`` strips to find a term, so a list item
+    that stopped carrying one would break the shape this repository fixed two changes ago.
+    """
+    blocks = await _blocks("<ul><li>first</li></ul><ol><li>second</li></ol>")
+
+    assert [block.text for block in blocks if block.kind is BlockKind.LIST] == [
+        "- first",
+        "1. second",
+    ]

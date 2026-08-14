@@ -36,11 +36,13 @@ from manicule.parsers.config import (
 )
 from manicule.parsers.confluence import ConfluenceStorageParser
 from manicule.parsers.markdown import MarkdownParser
+from manicule.parsers.web import WebConfig, WebParser
 from tests.glossary.corpus import PROSE_ON_THE_GLOSSARY_PAGE
 from tests.parsers.support import document_for, make_chunker, raw_of
 from tests.storage_helpers import make_chunk, make_document
 
 MARKDOWN_MEDIA_TYPE = min(MARKDOWN_MEDIA_TYPES)
+WEB_MEDIA_TYPE = "text/html"
 """One of the Markdown types, chosen deterministically so routing is not a coin toss."""
 
 FULL_WIDTH_SAFER = "\uff33a\uff26e\uff32"
@@ -448,6 +450,93 @@ def test_a_right_hand_side_with_no_initials_evidence_is_kept_whole() -> None:
 
     assert [entry.expansion for entry in entries] == [
         "central processor, the part that executes instructions"
+    ]
+
+
+# --- definition lists -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "media_type",
+    [CONFLUENCE_MEDIA_TYPE, WEB_MEDIA_TYPE],
+    ids=["confluence", "web"],
+)
+async def test_a_definition_list_is_detected_through_the_real_parser(media_type: str) -> None:
+    """**A detector rule that was correct, tested, and unreachable for want of an input.**
+
+    ``DefinitionForm.DEFINITION_LIST`` and ``_DEFINITION_MARKER_RE`` have been here since the
+    feature shipped, with a unit test feeding them ``'NOW\n: Network Operations Workspace'`` by
+    hand. No parser produced that shape: ``<dt>`` and ``<dd>`` both rendered as ``- ``, so the
+    two lines were indistinguishable and the form fired on nothing a corpus contains. Measured
+    at 0 of 4 on a ``<dl>`` glossary.
+
+    So this asserts through the parser rather than on a hand-written string, which is the whole
+    point — the unit test passed throughout and said nothing about whether the form worked.
+    Parametrised over both parsers that render ``<dl>``; ADF has no definition-list node type.
+    """
+    body = (
+        "<dl><dt>NOW</dt><dd>Network Operations Workspace</dd>"
+        "<dt>QRS</dt><dd>Queue Replay Service</dd></dl>"
+    )
+    parser = (
+        ConfluenceStorageParser(ConfluenceConfig())
+        if media_type == CONFLUENCE_MEDIA_TYPE
+        else WebParser(WebConfig())
+    )
+    raw = raw_of(
+        body if media_type == CONFLUENCE_MEDIA_TYPE else f"<html><body>{body}</body></html>",
+        media_type,
+        uri="glossary",
+        title="Platform glossary",
+    )
+    blocks = [block async for block in parser.parse(raw)]
+    chunker = make_chunker()
+    await chunker.setup()
+    chunks = chunker.chunk(document_for(raw, title="Platform glossary"), blocks)
+
+    entries = detect_entries(chunks, title="Platform glossary")
+
+    assert {entry.acronym: entry.expansion for entry in entries} == {
+        "NOW": "Network Operations Workspace",
+        "QRS": "Queue Replay Service",
+    }
+    assert {entry.form for entry in entries} == {DefinitionForm.DEFINITION_LIST}
+
+
+async def test_a_second_definition_under_one_term_is_not_silently_chosen_between() -> None:
+    """Two ``<dd>`` under one ``<dt>`` record the first and refuse the second.
+
+    Through the parser rather than from a hand-written string, for the reason this whole change
+    exists: a unit test fed the shape it wants proves the detector reads that shape, and says
+    nothing about whether a ``<dl>`` produces it. That gap is what let ``DEFINITION_LIST`` pass
+    its tests for as long as it did while firing on nothing.
+
+    The line above the second ``: `` is itself a ``: `` line, which is not a term, so the shape
+    gate refuses it. That is the conservative outcome and it is asserted rather than left to
+    chance: choosing which of two definitions a term has is the judgement this feature is
+    forbidden to make.
+    """
+    raw = raw_of(
+        "<dl><dt>NOW</dt><dd>Network Operations Workspace</dd>"
+        "<dd>Nightly Operations Watch</dd></dl>",
+        CONFLUENCE_MEDIA_TYPE,
+        uri="glossary",
+        title="Platform glossary",
+    )
+    parser = ConfluenceStorageParser(ConfluenceConfig())
+    blocks = [block async for block in parser.parse(raw)]
+    chunker = make_chunker()
+    await chunker.setup()
+    chunks = chunker.chunk(document_for(raw, title="Platform glossary"), blocks)
+
+    assert blocks[0].text.splitlines() == [
+        "NOW",
+        ": Network Operations Workspace",
+        ": Nightly Operations Watch",
+    ]
+    entries = detect_entries(chunks, title="Platform glossary")
+    assert [(entry.acronym, entry.expansion) for entry in entries] == [
+        ("NOW", "Network Operations Workspace")
     ]
 
 
