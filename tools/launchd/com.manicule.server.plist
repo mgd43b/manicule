@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Run manicule as a per-user launchd agent.
+
+  A template, not an installed file: three values have to be yours before it will work, and each
+  is marked REPLACE below. Copy it, edit it, then load it — `docs/deployment.md` §6.3 has the
+  four commands and the reasons.
+
+    ~/Library/LaunchAgents/com.manicule.server.plist
+
+  A *user* agent rather than a system daemon, because manicule installs per user with no
+  privileged component: the data directory is in your home, the sessions are yours, and the
+  control socket is 0600 owned by you. Running it as root would put a copy of everything you
+  indexed behind an account you do not log in as.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.manicule.server</string>
+
+  <!-- REPLACE: the absolute path to the `manicule` console script. `which manicule` prints it.
+       An absolute path because launchd does not read your shell's profile: PATH here is the
+       system default, and a bare `manicule` is a job that fails to start with no clear reason
+       why. The `transport http` flag below serves the JSON API, the browser surface
+       and MCP together on the one port. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/REPLACE/WITH/PATH/TO/manicule</string>
+    <string>serve</string>
+    <string>--transport</string>
+    <string>http</string>
+  </array>
+
+  <!-- Start at login and keep it running. `KeepAlive` as a plain true rather than a dictionary:
+       a server that exits for any reason should come back, and the two states that would
+       otherwise need a condition are handled by the exit status instead — see ThrottleInterval. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- **The one setting that stops a restart becoming a spin.** launchd will not respawn a job
+       more than once every ThrottleInterval seconds, and manicule exits 75 (EX_TEMPFAIL) when
+       another process holds the data directory. That pairing is the whole arrangement: during
+       an ordinary restart the outgoing process may still hold the lock for a moment, the new
+       one refuses, and thirty seconds later it takes it. If you genuinely started a second
+       server by hand, the agent retries every thirty seconds — noisy in the log and harmless —
+       and takes over the moment you stop it. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <!-- REPLACE both, with absolute paths under your own home. launchd does not create parent
+       directories, so `mkdir -p ~/Library/Logs/manicule` first. Two files rather than one:
+       stdout is the transport's own output and stderr is where the scheduler reports a sync
+       that did not run — including the one that says nobody has signed in since this process
+       started, which is the line you will be looking for after a reboot. -->
+  <key>StandardOutPath</key>
+  <string>/REPLACE/WITH/PATH/TO/Library/Logs/manicule/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>/REPLACE/WITH/PATH/TO/Library/Logs/manicule/server.err.log</string>
+
+  <!-- REPLACE: your home directory. The working directory matters because a relative
+       `[connectors.<name>] root` in configuration is resolved from it, and launchd's default is
+       `/`, which would silently point a filesystem source at the wrong tree. -->
+  <key>WorkingDirectory</key>
+  <string>/REPLACE/WITH/PATH/TO/HOME</string>
+
+  <!-- Nothing else is set on purpose. In particular there is no `EnvironmentVariables` block
+       holding a credential: manicule reads no session from the environment, and one written
+       here would be a live token in a world-readable plist that every process you start
+       inherits. Sessions are captured with `manicule connector login <name>` with the browser flag and live
+       in this process's memory. -->
+</dict>
+</plist>

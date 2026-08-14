@@ -468,6 +468,68 @@ a stopped loop.
 `schedule_s` existed before and was deleted in #98, because it configured a scheduler that did
 not exist and would have been cited as evidence that one did. It is back because one does.
 
+### 6.3 Running it under launchd
+
+`tools/launchd/com.manicule.server.plist` is a template with three values marked `REPLACE`. Copy
+it, edit those three, then load it:
+
+```bash
+mkdir -p ~/Library/Logs/manicule
+cp tools/launchd/com.manicule.server.plist ~/Library/LaunchAgents/
+$EDITOR ~/Library/LaunchAgents/com.manicule.server.plist   # the three REPLACE values
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.manicule.server.plist
+```
+
+`launchctl print gui/$(id -u)/com.manicule.server` says whether it is running and what it last
+exited with. To stop it: `launchctl bootout gui/$(id -u)/com.manicule.server`.
+
+**A user agent, not a system daemon.** manicule installs per user with no privileged component:
+the data directory is in your home, the sessions are yours, and the control socket is `0600`
+owned by you. A root daemon would put a verbatim copy of everything you indexed (§1.1) behind an
+account you do not log in as.
+
+**Restarting does not fight the lock, and the reason is one number in the plist.** The data
+directory has one writer (§2), so during a restart the outgoing process may still hold it when
+the incoming one starts. That is not a fault and it fixes itself, so `manicule serve` exits
+**75** — `EX_TEMPFAIL`, "try again later" — rather than the `1` it uses for a refusal that will
+be identical in thirty seconds. `ThrottleInterval` is what turns that into a sensible retry:
+launchd waits thirty seconds before respawning, the lock is long gone, and the server comes up. A
+job with no throttle would spin on the refusal; a job that gave up on any non-zero status would
+stay down after an ordinary restart.
+
+The lock itself needs no cleanup. It is an `flock` held by an open file description, so the
+kernel releases it however the process died — including `SIGKILL` and a power cut. The lock
+*file* is left behind and is a diagnostic rather than a lock; nothing has to delete it.
+
+**A restart signs you out, and that is the design rather than a bug.** A Confluence session lives
+in the server's memory and nowhere else, so a crash, a logout or a reboot ends it. What manicule
+guarantees is that you find out in the two places you would look rather than from a sync that
+quietly stopped working:
+
+- **The scheduler says so, in its own sentence.** A scheduled sync of a source with no session
+  does not report a failure that reads like the instance being down. It says the server holds no
+  session, that the instance has not been contacted, that this is expected after a restart, and
+  it names `manicule connector login <name> --browser`.
+- **`doctor` reports it.** The `sessions` check asks the running server — over the control
+  socket, because a `doctor` typed at a terminal is a different process and holds no sessions —
+  and reports `degraded` naming the source and the same command. It also tells the two apart:
+  no server at all is its own state with its own remedy.
+
+So the morning after a reboot, `manicule doctor` is enough:
+
+```text
+sessions   degraded   the manicule server holds no Confluence session for 'handbook', so the
+                      next scheduled sync of that source stops without contacting the instance.
+                      … Sign in again with `manicule connector login handbook --browser`.
+```
+
+**Stopping it.** `launchctl bootout` sends `SIGTERM`, and manicule handles it itself rather than
+letting the HTTP server handle it: the scheduler stops first so no new sync starts, whatever was
+syncing drains its ingest stages within `ingest.shutdown_grace_s`, the control socket waits for
+the write commands already in flight, and the MCP sessions and the HTTP server close last. A
+second `SIGTERM` — or a second `Ctrl-C` — stops waiting. `docs/surfaces.md` §6.2 has the order
+and why it is that order.
+
 ## 7. Still open
 
 Not settled here, and deliberately:
