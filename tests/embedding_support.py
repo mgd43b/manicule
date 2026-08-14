@@ -141,7 +141,7 @@ def requires_metal_allocator() -> None:
     :func:`requires_mlx` does not answer this. It asks whether ``mx.eval`` works, and that
     succeeds on MLX's CPU device too — so a green job proves MLX *evaluates*, not that Metal was
     involved. Neither do the memory counters, which is the trap worth recording here: with
-    ``mx.set_default_device(mx.cpu)``, a 16 MiB allocation reports ``get_active_memory() ==
+    ``mx.set_default_device(mx.cpu)``, a 16 MiB allocation reports ``mx.get_active_memory() ==
     16777216``, the same shape of figure Metal gives. **Anyone reaching for a memory counter as
     proof that Metal ran will get a confident wrong answer.**
 
@@ -178,7 +178,7 @@ def requires_metal_allocator() -> None:
         return
     pytest.skip(
         f"MLX has no Metal here and is on {mx.default_device()}, so the Metal allocator these "
-        f"assert about is not the one in use"
+        f"tests assert about is not the one in use"
     )
 
 
