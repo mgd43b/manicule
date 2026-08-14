@@ -310,6 +310,13 @@ everything that space ever contributed.
   unadvanced watermark. A `next` link addressing a cursor already followed is refused for the
   same reason: a loop over a paginated search reads as a very large space.
 
+  **The pipeline's side of this is the bound on how far ahead of durable progress a cursor may
+  be held.** Discovery blocks on a full hand-off rather than paging on, so the gap between the
+  last page requested and the last document committed is at most the configured queue depths
+  (`ingest.md` §8.3.1) rather than however fast the source answers. That is the whole reason
+  the hand-offs are bounded, and it is why a slow embedder produces a slow sync here rather
+  than a refused cursor partway through one.
+
 **`_links.next` is resolved against `_links.base` by concatenation, and the origin is
 checked.** An instance served from a context path (`/confluence`) has that path in `base` and
 not in `next`, and RFC 3986 resolution of a root-absolute reference discards it.

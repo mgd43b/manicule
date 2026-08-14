@@ -40,7 +40,8 @@ one of them, that is a bug in this document.
 **The unit of work is one document. A batch is a scheduling artifact with no semantics of its
 own.** This is what makes "one bad document never aborts a batch" a structural property rather
 than a promise: there is no batch-level transaction to abort, and no batch-level state a
-document can corrupt.
+document can corrupt. It is also what makes the staged run in §8.3 possible without weakening
+anything: several documents may be in flight because no two of them share any state.
 
 | Stage | Input | Output | Where it runs | Bounded by |
 |---|---|---|---|---|
@@ -691,7 +692,10 @@ thing: when it refuses, it prints the count of documents that *would* have been 
 | discover / fetch | Remote rate limits | `fetch_concurrency = 8`, per connector |
 | parse / chunk | CPU cores | `parse_workers = min(4, cpu_count - 1)` |
 | embed | **Memory and one accelerator** | serialized; one batch at a time |
-| store | SQLite single writer | serialized |
+| store | SQLite single writer, per-document exclusion | serialized per document |
+
+§8.3 is how those four are actually arranged, and §8.3.3 is which of them to change when a sync
+is slow.
 
 **Embedding is serialized, and this is the difference an in-process embedder makes.** With a
 model server, concurrency is a connection-pool question and more requests mean more throughput
@@ -712,17 +716,129 @@ the second is where an in-process embedder runs the machine out of memory.
 `target_batch_tokens` is the one tunable, and it is the honest place to put the knob because it
 is the quantity that actually maps to memory.
 
-### 8.3 Backpressure is a bounded queue
+### 8.3 The stage topology, as built
 
-Stages are connected by bounded queues (`asyncio.Queue`, `maxsize = 2 × the consumer's
-parallelism`). When embed falls behind, the chunk queue fills, parse workers block on `put`,
-fetch blocks behind them, and discovery stops pulling pages.
+> **This section described intent for a long time and the loop did none of it.** `run` awaited
+> one document's complete fetch, parse, chunk, embed and commit path before pulling the next, so
+> `fetch_concurrency` guarded a semaphore that ordinarily never saw a second caller. Measured
+> before the change, with `fetch_concurrency = 4` over eight documents, the most fetches that
+> ever overlapped was **one**. `queue_depth_factor` and `shutdown_grace_s` were configurable and
+> read by nothing. What follows is what the code now does.
+
+**Three stages, joined by two bounded hand-offs.** Every bound below comes from configuration;
+none of it is derived from how many tasks happen to exist.
+
+```
+discover                                   one task
+   │  fetch hand-off      depth = queue_depth_factor × fetch_concurrency
+   ▼
+fetch × fetch_concurrency                  change detection (level 1), then the network
+   │  parse hand-off      depth = queue_depth_factor × ingest workers
+   ▼
+ingest × (parse_workers + 1)               parse in the pool, chunk, embed under one
+                                           lock, commit under the document's own
+```
+
+| Stage | Width | Where the bound comes from |
+|---|---|---|
+| discover | 1 | One cursor per connector; a second reader of one paginated source is not a thing |
+| fetch | `fetch_concurrency` (8) | One task per permitted in-flight fetch |
+| parse | at most `parse_workers + 1` attempts | The ingest workers are the only callers of the pool |
+| embed | 1 | `asyncio.Lock` around the model call, and nothing else |
+| store | per document | The keyed mutation lock, plus SQLite's own single writer |
+
+**Why the ingest stage is `parse_workers + 1` and not `parse_workers`.** One document is
+normally inside the embedder, holding the accelerator; without the extra worker a parse slot
+sits idle behind it for the length of every forward pass. Not `+ 2` or more: past that, the
+extra workers only queue for the same accelerator, and each one is holding a fetched body in
+memory while it waits.
+
+**Level-1 change detection sits in the fetch stage, not in discovery.** It is what avoids the
+fetch, so it belongs on the same side of the hand-off as the fetch — and it costs a store read,
+which has no business blocking the source being paged. An unchanged corpus therefore moves
+through this stage at the speed of the store and never reaches the parse hand-off at all.
+
+**One document is never in two stages.** The concurrency is between documents. A document's
+record, chunks, glossary and vectors are published under the keyed lock in §8.4 and guarded by
+the compare-and-swap in §8.5, exactly as when one document went through at a time — concurrency
+makes those guards more reachable, not less needed.
+
+**Members of a container are expanded by the worker that holds the container**, breadth-first,
+rather than being fed back to the front of the pipeline. A wide archive is therefore one worker's
+work while the others carry on with other documents, which is simpler than re-entering the
+stages and costs only that one archive's serialization.
+
+### 8.3.1 Backpressure is a bounded hand-off
+
+When embed falls behind: the ingest workers block on the embedding lock, the parse hand-off
+fills, the fetch workers block on `put`, the fetch hand-off fills, and **discovery stops pulling
+pages**.
 
 That last consequence is the point. Unbounded queues turn a slow embedder into unbounded
 memory growth *and* cause a subtler failure: a connector that keeps enumerating will exhaust
 its cursors. Confluence search cursors expire (`confluence.md` §2), so a sync that races ahead
 during a slow embed can fail pagination partway through — a failure that looks like a connector
 bug and is actually missing backpressure.
+
+**The most a run holds in memory**, with the defaults and a four-core machine
+(`parse_workers = 3`, so five ingest workers):
+
+```
+  fetched bodies  =  parse hand-off  +  ingest workers  +  fetch workers blocked on put
+                  =  2 × 5           +  5               +  8                            =  23
+```
+
+The fetch hand-off holds `DiscoveredDoc` references rather than bodies, which is why it is the
+cheap one and can be the deeper of the two. **The complete discovery result is never held**, and
+neither is the complete fetched corpus; the run's report carries the observed peak so the claim
+is checkable rather than argued.
+
+**The end-of-stream is not subject to the bound**, and the reason is a deadlock that this
+otherwise has. A stage closes the hand-off in front of it from a `finally`, which is where it
+lands when the run is being torn down — and at that moment its consumers are being canceled too.
+A bounded queue would make delivering the end-of-stream wait for a drain that is never coming,
+inside a `finally`, which is a teardown that never completes. So the items are bounded by a
+semaphore and the sentinels go into an unbounded queue: closing a stage cannot wait.
+
+### 8.3.2 What a run reports about its own stages
+
+`connectors.metadata.last_run.stages` carries counts and never content: accepted documents, each
+hand-off's capacity, peak depth and how many times a producer had to wait, peak occupancy of the
+fetch, parse and embed stages, and peak retained bodies. It is what §14's "queue depth and embed
+throughput during a run" is made of, and what makes each bound above checkable from outside.
+
+**Two of them are process-wide and are labeled as such.** The parse pool and the embedder are
+one pool and one accelerator for the whole process, so a re-parse sweep running beside a sync is
+counted in `peak_parses` and `peak_embeds` too. Retained bodies belong to the run.
+
+`blocked_puts` on the fetch hand-off is the one number that is direct evidence rather than a
+description: a bound that is configured and never reached proves nothing, and a bound that made
+discovery wait is the claim this section makes.
+
+### 8.3.3 Tuning it on a local Apple Silicon machine
+
+The in-process MLX embedder is the bottleneck by construction, and everything upstream exists to
+keep it fed. So the tuning order is: leave `target_batch_tokens` alone unless memory is the
+problem, and change the widths only when a measurement says which stage is idle.
+
+| Symptom | Read | Change |
+|---|---|---|
+| Sync is slow, `peak_fetches` well below `fetch_concurrency` | The source is not the limit | Nothing; look downstream |
+| `blocked_puts` is zero and the run is slow | Nothing is waiting on anything; the source is the limit | Raise `fetch_concurrency`, within the remote's rate limit |
+| `blocked_puts` is large and `peak_parses` is at its ceiling | Parse is the limit | Raise `parse_workers`, up to one below the core count |
+| `blocked_puts` is large and `peak_parses` is low | The model is the limit, which is the expected steady state | Nothing here helps; this is what the machine does |
+| Memory pressure during a sync | Too much held at once | Lower `queue_depth_factor` to 1, then `fetch_concurrency` |
+| Memory pressure inside the model | The batch is too large for this budget | Lower `target_batch_tokens` (§8.2) |
+
+`parse_workers` above `cpu_count - 1` costs more than it buys: the parent is doing the embedding
+and every write, and a machine with no core left for it makes the accelerator wait on the
+scheduler. `fetch_concurrency` is bounded by the remote rather than by the machine — a source
+that rate-limits at four concurrent requests is not improved by eight.
+
+`tools/benchmark_ingest_stages.py` measures the shape of all of this against the sequential loop
+it replaced, over a synthetic delayed source. Its timings are synthetic and are not a throughput
+claim; what they are good for is showing that the stages overlap and that the bounds hold while
+they do.
 
 > **Prior art.** The sync loop bounds concurrency with a `Set` of in-flight promises and
 > `Promise.race`, which is a queue with no backpressure onto discovery: `discover()` is pulled
@@ -751,6 +867,14 @@ about the model being read as a statement about the database.
 embedder, one after the other, and then write over each other's documents — which is exactly
 what happened. It is one lock, held around one stage, and the stages either side of it are
 where a document is read and where it is written.
+
+**All four are now reached by a single sync**, which they were not while the loop was sequential.
+Before §8.3, one connector sync had one document in flight, so the second row could only be
+contended by a *second* operation — a sweep beside a sync — and the first row had one caller by
+construction. A staged run contends both from inside one command. Nothing about the four
+changed; what changed is that a run now exercises them, and the tests in
+`tests/ingest/test_concurrency.py` assert each of the first two separately rather than inferring
+one from the other.
 
 **The mutation lock is keyed, and that is the whole reason it is affordable.** A document is
 published by three writes in sequence — its record, its chunks and glossary rows, its
@@ -1501,21 +1625,81 @@ delete one.
 re-enumerates fully. That is a connector property, not a pipeline one, and it is visible in
 `doctor` rather than hidden.
 
+### 13.2.1 What "clean" means once completion order is not discovery order
+
+A watermark is **one value describing a whole enumeration**, so there is no partial version of it
+to get wrong. That is exactly why it must not be written unless the whole enumeration landed:
+under a staged run several documents are in flight at any moment, and "the last one finished"
+says nothing about the first.
+
+So the gate is three conditions, not one. Each is a different way for the connector's reported
+position to describe more than what actually landed:
+
+| Condition | Fails when | Why the position would lie |
+|---|---|---|
+| `clean` | `discover` raised | The enumeration is a prefix, and the position describes the whole |
+| not `limited` | `--limit` stopped discovery early | Same, for a reason nothing went wrong |
+| `unrecorded == 0` | A document reached no durable record at all | It exists at the source, was seen once, and is nowhere |
+
+**`unrecorded` counts exactly one shape, and the narrowness is the point.** A fetch that failed
+for a document the index had never seen writes nothing — there is no row to record the failure
+against, so it is in no listing and no repair can select it. Advance the position past that and
+no later sync enumerates it either.
+
+A document that failed and **did** leave a row is a different case and does not hold the
+watermark back. It is stored, countable, selectable by `document reindex`, and compared again by
+the next sync. Holding the position for it would make one permanently broken document
+re-enumerate a whole corpus for ever, which is a cost with no corresponding loss.
+
+### 13.2.2 `--limit N` bounds acceptance
+
+A sequential loop could count completions and stop; a staged run has several documents in flight
+by the time the *N*th is accepted, so the bound is applied where discovery hands work downstream.
+
+- At most *N* **top-level** documents are accepted. Members found inside a container are counted
+  separately and never consume the limit — one archive of five hundred files must not exhaust a
+  limit of ten.
+- Everything accepted is carried to a terminal outcome before the run returns. Nothing is left
+  abandoned in a hand-off.
+- The run is reported as **bounded**: `clean` (nothing went wrong), `limited` (discovery stopped
+  early), and therefore not `complete`. **No watermark is written.** `--limit 10` against ten
+  thousand documents that advanced a position would skip the other nine thousand nine hundred
+  and ninety on every subsequent sync, silently.
+
 ### 13.3 Cancellation
 
 `Ctrl-C`, `manicule sync --stop`, or shutdown:
 
 1. Stop pulling from `discover`. Cursors are abandoned, not persisted — they expire anyway
    (`confluence.md` §2).
-2. Let in-flight documents finish, up to `shutdown_grace` (default 30 s). A document mid-embed
+2. Let accepted documents finish, up to `shutdown_grace_s` (default 30 s). A document mid-embed
    is close to done and finishing it is cheaper than redoing it.
-3. Kill parse workers still running at the deadline. Their documents stay non-terminal and are
+3. Cancel whatever is still running at the deadline. Those documents stay non-terminal and are
    swept by §6.4.
 4. **Do not advance the watermark.** A canceled run is an incomplete run.
 5. **Do not run reconciliation.** §11.1's first guard, in its most likely form.
 
 A second `Ctrl-C` skips step 2. The recovery path is the same either way, which is what makes
 the impatient case safe.
+
+**How step 1 brings the rest down.** Stopping discovery is the whole protocol rather than the
+first of several: the fetch hand-off closes, its workers finish what they hold and exit on the
+end-of-stream, closing the parse hand-off behind them, and the ingest workers drain what is
+queued. The grace window is a bound on *that*, not a separate drain. So step 2 finishes what was
+accepted rather than only what was mid-flight, which is the stronger of the two and costs
+nothing extra.
+
+**Nothing outlives the command.** The stages are children of the call that started them, in one
+`asyncio.TaskGroup`, and every path — clean, failed, canceled, or canceled twice — joins them
+before returning. A canceled run re-raises rather than returning a report, so there is no path on
+which a watermark or a set of run counters is written for work that was interrupted.
+
+**The source is not read during the drain.** A canceled sync that kept enumerating for the length
+of the grace window would still be hammering a rate-limited API after somebody pressed `Ctrl-C`,
+which is the opposite of what they asked for. At most one further document is produced by the
+source and dropped — discovery reads the stop at the top of its loop, so an item already
+in hand is abandoned rather than never fetched. Nothing is lost by that: no watermark was
+written, so the next sync sees it again.
 
 ---
 
@@ -1540,7 +1724,7 @@ every document that has no retained bytes, and the lock file's holder.
 | Time since last clean `reconcile` per connector | §11's cadence silently not happening |
 | Proposed-deletion refusals awaiting confirmation | §11.1 guard 2 having fired |
 | Documents with `original_ref IS NULL`, by reason | The set for which rung 4 is the only repair |
-| Queue depth and embed throughput during a run | Where the bottleneck actually is |
+| Queue depth and stage occupancy during a run (`last_run.stages`, §8.3.2) | Where the bottleneck actually is; §8.3.3 reads it |
 | `manicule.lock` holder | A second writer having been attempted (§6.5) |
 
 ---
@@ -1586,6 +1770,12 @@ Decisions the implementation added, each argued where it appears:
 | A connector reports its position through `Connector.watermark`, asked only on a clean run | §13.2 |
 | Retention happens before any hook, so retained bytes are the connector's and `content_hash` describes them | §4.2 |
 | Members of a container are counted apart from discovered documents, so one archive cannot exhaust a `--limit` | §13.1 |
+| A run is three stages and two bounded hand-offs; the ingest stage is `parse_workers + 1` wide | §8.3 |
+| Level-1 change detection belongs to the fetch stage, so a skip never costs a fetch or blocks paging | §8.3 |
+| An end-of-stream is not subject to the queue bound, because closing a stage happens during teardown | §8.3.1 |
+| A watermark needs a *complete* run, not merely a clean one: not limited, and nothing left unrecorded | §13.2.1 |
+| `--limit` bounds acceptance rather than completion, and reports the run as bounded | §13.2.2 |
+| Cancellation stops discovery and lets that close the stages in order; the grace window bounds it | §13.3 |
 
 ## Appendix B: filed, not deferred
 
