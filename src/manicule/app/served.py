@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from manicule.app.service import ApplicationService
     from manicule.connectors.sessions import SessionVault
 
-__all__ = ["ControlHandler", "ScheduledSource", "Scheduler", "Serving"]
+__all__ = ["ControlHandler", "ScheduledSource", "Scheduler", "Serving", "announce"]
 
 
 class ControlHandler:
@@ -351,7 +351,7 @@ class Scheduler:
                 # an operator finds says which of the two refusals it was.
                 record.failures += 1
                 record.awaiting_sign_in = True
-                _announce(
+                announce(
                     f"scheduled sync of {name!r} did not run: this server holds no Confluence "
                     f"session, so it cannot authenticate. Sessions live in the server's memory "
                     f"and a restart ends them, so this is expected after one rather than a "
@@ -365,18 +365,22 @@ class Scheduler:
                 # unreachable at ten past may be reachable at twenty past, and a session that
                 # expired needs a person rather than a stopped loop.
                 record.failures += 1
-                _announce(f"scheduled sync of {name!r} failed: {exc}")
+                announce(f"scheduled sync of {name!r} failed: {exc}")
             else:
                 record.runs += 1
                 record.awaiting_sign_in = False
 
 
-def _announce(message: str) -> None:
+def announce(message: str) -> None:
     """Say something on the server's own stderr.
 
     stderr rather than stdout because a ``stdio`` transport serves the protocol on stdout, and a
     line of prose there is a corrupt message — the same reason
     :func:`~manicule.cli.serving._serve` announces its address there.
+
+    Public because the shutdown says what it is doing through it as well as the scheduler, and
+    those two are the whole of what a served manicule tells an operator without being asked. A
+    second way of writing a line to stderr would be a second thing to get the stream wrong in.
     """
     sys.stderr.write(f"{message}\n")
     sys.stderr.flush()
@@ -424,9 +428,17 @@ class Serving:
         The scheduler's ``aclose`` is wrapped because a loop that raised while being canceled
         must not stop the socket being closed: the socket is a *file*, and one left behind with
         no server answering is what the next start has to clear.
+
+        **Each step says it is starting**, on the server's own stderr. A stop can take as long as
+        ``ingest.shutdown_grace_s`` plus whatever a proxied command is still doing, which is long
+        enough that an operator watching a terminal needs to know it is working rather than hung
+        — and it is exactly the interval in which somebody reaches for ``kill -9`` and gets the
+        half-written index :data:`~manicule.app.daemon.STOP_GRACE_S` refuses to produce.
         """
+        announce("stopping the scheduler, so no further sync starts")
         with contextlib.suppress(Exception):
             await self.scheduler.aclose()
+        announce("closing the control socket, waiting for any write command still running")
         await self.server.aclose()
 
     async def __aenter__(self) -> Serving:

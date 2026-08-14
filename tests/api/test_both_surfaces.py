@@ -22,10 +22,9 @@ is what "no shared session" means in the only terms a caller can see.
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, override
-
-from fastmcp import Client
 
 from tests.api.live import serving
 from tests.api.support import backend_with_a_document
@@ -33,8 +32,6 @@ from tests.app.fakes import FakeRetriever
 from tests.ingest.fakes import Gate
 
 if TYPE_CHECKING:
-    from contextlib import AbstractAsyncContextManager
-
     from manicule.core.retrieval import Query
     from manicule.retrieval.retriever import RetrievalResult
 
@@ -231,14 +228,17 @@ async def test_a_client_that_disconnects_does_not_cancel_the_work_it_started() -
     parking = _parking(backend)
 
     async with serving(backend) as live:
-        client = live.mcp()
-        await client.__aenter__()
+        # An exit stack rather than `async with`, because the client has to be closed *while a
+        # call is in flight* — which a `with` block cannot express, since it would have to end
+        # inside itself.
+        attached = AsyncExitStack()
+        client = await attached.enter_async_context(live.mcp())
         call = asyncio.create_task(client.call_tool("search", {"query": "abandoned", "limit": 1}))
         await parking.gate.wait_for(1)
 
         call.cancel()
         await asyncio.gather(call, return_exceptions=True)
-        await asyncio.gather(_closed(client), return_exceptions=True)
+        await asyncio.gather(attached.aclose(), return_exceptions=True)
         assert parking.finished == 0, "the call finished before the client was even gone"
 
         parking.gate.open()
@@ -282,14 +282,3 @@ async def test_no_web_removes_the_browser_surface_and_leaves_mcp() -> None:
 
     assert page.status_code == NOT_FOUND, "the browser surface was served with --no-web"
     assert tools, "--no-web took the MCP surface with it"
-
-
-async def _closed(client: Client[Any]) -> None:
-    """Close a client that was opened by hand, for the one test that cannot use ``async with``.
-
-    That test needs the client to go away *while a call is in flight*, which a context manager
-    cannot express: the block would have to end inside itself. Wrapped in a function so the
-    exit is named once rather than at the call site.
-    """
-    closing: AbstractAsyncContextManager[object] = client
-    await closing.__aexit__(None, None, None)

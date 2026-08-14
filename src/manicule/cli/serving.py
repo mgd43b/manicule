@@ -41,7 +41,7 @@ from manicule.app.daemon import Running, read_pidfile, stop_server, write_pidfil
 from manicule.app.dispatch import error_info
 from manicule.app.results import Envelope, ServerAddress, failed, succeeded
 from manicule.app.runtime import Runtime
-from manicule.app.served import ControlHandler, Scheduler, Serving
+from manicule.app.served import ControlHandler, Scheduler, Serving, announce
 from manicule.app.service import ApplicationService
 from manicule.cli import render
 from manicule.config.loader import load_settings
@@ -285,9 +285,10 @@ async def _serve_over_a_socket(
             # Steps 1 to 3, and the second interrupt cancels the *wait* rather than the work:
             # what is abandoned is this process's patience, and the ingest stages still get their
             # own bounded drain because that bound is inside them.
-            await _bounded_by(writing.aclose(), impatient)
+            await bounded_by(writing.aclose(), impatient)
             # Step 4. `should_exit` is the field uvicorn's own handler sets, so what happens next
             # is uvicorn's shutdown and not a reimplementation of it.
+            announce("closing the HTTP server and any MCP sessions on it")
             transport.should_exit = True
             await running
 
@@ -308,8 +309,11 @@ async def _first_of(stop: asyncio.Event, running: asyncio.Task[None]) -> None:
             await waiting
 
 
-async def _bounded_by(work: Awaitable[None], impatient: asyncio.Event) -> None:
+async def bounded_by(work: Awaitable[None], impatient: asyncio.Event) -> None:
     """Await ``work``, unless the operator interrupts a second time.
+
+    Public because it *is* the "a second interrupt cancels the wait" promise, and a promise a
+    test can only reach through a private name is one nobody outside this module can check.
 
     The work is *canceled* on the second interrupt rather than left running, because the thing
     being waited on is a drain and a drain nobody is waiting for is a process that will not exit.
@@ -472,4 +476,4 @@ def _report(
         render.render_error(out, envelope.op, envelope.error)
 
 
-__all__ = ["running_address", "serve_forever", "stop_running"]
+__all__ = ["EX_TEMPFAIL", "bounded_by", "running_address", "serve_forever", "stop_running"]
