@@ -242,14 +242,25 @@ def test_allow_insecure_target_is_refused_on_a_restore_rather_than_ignored(
     assert result.exit_code != 0
 
 
-def _unwrapped(output: str) -> str:
-    """Terminal output with the box drawing and wrapping taken out.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+"""A colour escape, which Rich emits on CI and not on this machine.
 
-    Rich wraps a refusal to the terminal width and draws a border around it, so a substring that
-    spans a line break is not present in the raw text. Joining on whitespace makes the assertion
-    about the sentence rather than about how wide the runner's terminal happened to be.
+Kept as a named pattern because its absence was a real failure rather than a hypothetical one:
+the first version of :func:`_unwrapped` stripped box drawing and not escapes, so on the runner
+the sentence read ``... there is no \x1b[31m\x1b[0m file for the flag ...`` and the substring
+was not there. Local runs were colourless and passed.
+"""
+
+
+def _unwrapped(output: str) -> str:
+    """Terminal output as the sentence it is, independent of how it was rendered.
+
+    Rich wraps a refusal to the terminal width, draws a border around it, and colours the border
+    when it thinks it is writing to a terminal. All three break a substring that spans a line, so
+    all three come out: escapes first, then the box drawing, then the wrapping.
     """
-    stripped = "".join(char for char in output if char not in "│╭╮╰╯─")
+    plain = _ANSI.sub("", output)
+    stripped = "".join(char for char in plain if char not in "│╭╮╰╯─")
     return " ".join(stripped.split())
 
 
