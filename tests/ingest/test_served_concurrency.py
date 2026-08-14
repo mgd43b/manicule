@@ -42,7 +42,7 @@ from tests.fakes import MEDIA_TYPE, HashEmbedder
 from tests.ingest import fakes
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
 
     from manicule.core.protocols import Embedder, Middleware
     from manicule.core.sources import Connector
@@ -137,9 +137,12 @@ class Overlap:
     the interleaving under test actually happened, rather than two runs that took turns.
     """
 
-    def __init__(self, service: ApplicationService, path: Path) -> None:
+    def __init__(
+        self, service: ApplicationService, path: Path, *, release: Callable[[], None] | None = None
+    ) -> None:
         self._service = service
         self._path = path
+        self._release = release
         self._clock = _Clock()
         self.scheduler = Scheduler(service, {"scheduled": 600}, sleep=self._clock.sleep)
         self.server = control.ControlServer(path, ControlHandler(service, SessionVault()))
@@ -154,6 +157,16 @@ class Overlap:
 
     async def __aexit__(self, *exc: object) -> None:
         del exc
+        # Anything parked in a gate is let go **first**, and this is load-bearing rather than
+        # tidy. `ControlServer.aclose` waits for the connections in flight — deliberately, since
+        # each is a write command and tearing one down mid-write is how a document ends up half
+        # written — so a run still parked inside a hook would make shutdown wait for ever.
+        #
+        # That is not hypothetical: it is what disabling the keying did. The test failed
+        # correctly, at `wait_for`, and then hung in teardown, which turns a clear diagnosis into
+        # a suite that has to be killed.
+        if self._release is not None:
+            self._release()
         if self._proxied is not None and not self._proxied.done():
             self._proxied.cancel()
             await asyncio.gather(self._proxied, return_exceptions=True)
@@ -207,6 +220,34 @@ class _Clock:
 
     def release(self) -> None:
         self._release.set()
+
+
+class GatedConnector(fakes.ObservedConnector):
+    """A source that parks in ``fetch`` until a test lets it through.
+
+    **The only place outside the per-document lock that a test can hold two runs.** Every
+    middleware hook — ``before_parse`` included — runs *inside*
+    :meth:`~manicule.ingest.pipeline.IngestPipeline._mutating`, so a gate in one of them can
+    never hold two runs of the same document at once: that is precisely what the lock prevents,
+    and a test that tried would deadlock rather than assert.
+
+    Fetching happens before the lock is taken. Parking both runs here and releasing them on one
+    tick is what puts them into the write sequence together — which is what makes the
+    capacity-one gate inside it a statement about exclusion rather than about scheduling luck.
+
+    **This was not a refinement.** Without it the same-document test passed with the lock
+    removed: the two runs simply did not overlap, so nothing was excluded and nothing said so.
+    """
+
+    def __init__(self, documents: Mapping[str, str], *, name: str, gate: fakes.Gate) -> None:
+        super().__init__(documents, name=name)
+        self._gate = gate
+
+    @override
+    async def fetch(self, ref: str) -> RawDocument:
+        fetched = await super().fetch(ref)
+        await self._gate.pass_through()
+        return fetched
 
 
 def corpus(count: int, *, prefix: str) -> dict[str, str]:
@@ -291,7 +332,7 @@ async def test_two_documents_from_two_runs_may_be_written_at_the_same_time(
         },
         middleware=(Parking(),),
     )
-    async with Overlap(service, socket_for()) as both:
+    async with Overlap(service, socket_for(), release=inside.open) as both:
         both.start_scheduled()
         both.start_proxied()
         await inside.wait_for(2)
@@ -318,6 +359,7 @@ async def test_one_document_is_never_written_by_the_scheduler_and_the_proxy_at_o
     hypothetical — it is what the first version of this file did.
     """
     inside = fakes.Gate(capacity=1, opened=True)
+    fetched = fakes.Gate()
 
     class Watching(fakes.PassThrough):
         name = "watching"
@@ -334,18 +376,24 @@ async def test_one_document_is_never_written_by_the_scheduler_and_the_proxy_at_o
     # the write sequence and a capacity-1 gate would pass against no exclusion at all.
     service, _, _ = served(
         {
-            "scheduled": fakes.ObservedConnector(
-                {"the-one-page": "as the schedule found it"}, name="handbook"
+            "scheduled": GatedConnector(
+                {"the-one-page": "as the schedule found it"}, name="handbook", gate=fetched
             ),
-            "proxied": fakes.ObservedConnector(
-                {"the-one-page": "as the command line found it"}, name="handbook"
+            "proxied": GatedConnector(
+                {"the-one-page": "as the command line found it"}, name="handbook", gate=fetched
             ),
         },
         middleware=(Watching(),),
     )
-    async with Overlap(service, socket_for()) as both:
+    async with Overlap(service, socket_for(), release=lambda: (fetched.open(), inside.open())) as (
+        both
+    ):
         both.start_scheduled()
         both.start_proxied()
+        # Both runs have fetched and neither has taken the lock. Releasing them on one tick is
+        # what makes the next thing they do a race for it.
+        await fetched.wait_for(2)
+        fetched.open()
         answered = await both.proxied_result()
         await both.scheduled_finished()
 
@@ -366,6 +414,18 @@ async def test_a_stale_guarded_write_loses_to_a_scheduled_sync_that_moved_the_do
     the thing most likely to move that document underneath it is a sync nobody typed. The guard
     is in the write rather than before it, so this lets the scheduled sync land and then asks
     the stale caller to commit.
+
+    **Two of the guard's three points are shown by this test and the third is not**, which is
+    worth recording rather than leaving to be discovered. Disabling the record write's
+    ``expected``, or the ``indexed`` write's, turns this red with "the stale write was not
+    refused". Disabling the third — the guarded publish at the head of ``_commit`` — turns
+    nothing red here, in ``tests/ingest/test_concurrency.py``, or in
+    ``tests/ingest/test_reindex.py``. That point catches a document moving *between* the record
+    write and the commit, and :meth:`~manicule.ingest.pipeline.IngestPipeline._mutating` makes
+    that unreachable from inside this process: its own docstring says reaching it means a second
+    process is writing the data directory without the instance lock. It is defence in depth
+    against a state this process cannot produce, so it has no test, and that is a gap in the
+    suite rather than in the guard.
     """
     connector = fakes.ObservedConnector({"page": "first version\nsecond line"}, name="handbook")
     service, ingestion, store = served(
@@ -417,13 +477,21 @@ async def test_the_embedder_is_never_re_entered_with_two_runs_offering_it_work(
 ) -> None:
     """#120's partition, under the pressure a server actually creates.
 
-    :class:`~tests.ingest.fakes.ExclusiveEmbedder` raises on re-entry rather than reporting a
-    peak afterwards, so a single overlap fails the run rather than being averaged away. Twenty
-    documents on each side with four fetch workers and four ingest workers means overlap is
-    offered continuously, and every document is a different one — the per-document claims are
+    :class:`~tests.ingest.fakes.GatedEmbedder` raises on re-entry rather than reporting a peak
+    afterwards, so a single overlap fails the run instead of being averaged away — and it parks
+    *inside the model*, which is what makes the re-entry reachable at all.
+
+    **The parking is not decoration.** Without it this test passed with the embedding lock
+    removed: the fake embedder has no ``await`` that yields, so two callers could never
+    interleave inside it and "no overlap" said nothing about the lock. Holding one caller inside
+    the model while twenty more documents are ready behind it is what turns the assertion into a
+    statement about exclusion.
+
+    Twenty documents on each side, four fetch workers and four ingest workers, so work is
+    offered continuously. Every document is a different one; the per-document claims are
     asserted separately above rather than inferred from this.
     """
-    embedder = fakes.ExclusiveEmbedder()
+    embedder = fakes.GatedEmbedder()
     service, _, store = served(
         {
             "scheduled": fakes.ObservedConnector(corpus(20, prefix="sched"), name="scheduled"),
@@ -433,15 +501,22 @@ async def test_the_embedder_is_never_re_entered_with_two_runs_offering_it_work(
         fetch_concurrency=4,
         parse_workers=3,
     )
-    async with Overlap(service, socket_for()) as both:
+    async with Overlap(service, socket_for(), release=embedder.gate.open) as both:
         both.start_scheduled()
         both.start_proxied()
+        # One caller is held inside the model. Everything else that reaches the embedder while
+        # it is there is a re-entry, and there is a great deal of it behind them.
+        await embedder.gate.wait_for(1)
+        embedder.gate.open()
         answered = await both.proxied_result()
         await both.scheduled_finished()
 
     assert answered["ok"] is True
-    assert len(embedder.batches) > 1, "the embedder was never given more than one batch"
     assert len(store.documents) == 40, "both runs did not finish, so overlap was never offered"
+    # The gate counts arrivals *inside* the model, so this is "the embedder was entered many
+    # times", which is the precondition for re-entry being reachable. `batches` is not used:
+    # `GatedEmbedder` reaches past `CountingEmbedder` to the hash, so it stays empty.
+    assert embedder.gate.entries > 2, "the embedder was entered too few times to prove anything"
     assert embedder.overlaps == 0, "the embedding lock had one holder at a time"
 
 

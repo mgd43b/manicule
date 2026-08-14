@@ -209,6 +209,17 @@ def stop_running(overrides: Mapping[str, Any], *, workspace: str) -> Envelope:
         running = stop_server(settings.data_dir)
     except (ManiculeError, TimeoutError, OSError) as exc:
         return failed("stop", settings.workspace, error_info(exc))
+    # The control socket, on the same principle `stop_server` removes the pid file: the process
+    # is confirmed gone, so nothing is behind it.
+    #
+    # It has to happen **here** rather than as the server unwinds, and the reason is uvicorn's:
+    # it handles the signal, shuts down cleanly, then restores the default handler and re-raises
+    # — so the process dies without unwinding the `async with` that would have tidied up. The
+    # stdio transport does unwind and does tidy up, which is exactly the sort of difference
+    # nobody would predict from reading either side. A socket left behind by a crash, a
+    # `SIGKILL` or a power cut is still possible and is not a problem: it is a file with nothing
+    # behind it, and `ControlServer.start` clears one.
+    socket_path(settings.data_dir).unlink(missing_ok=True)
     return succeeded(
         "stop",
         settings.workspace,

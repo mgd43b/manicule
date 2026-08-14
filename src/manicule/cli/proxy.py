@@ -95,11 +95,29 @@ def refuse(command: Command, *, workspace: str, overrides: Mapping[str, Any]) ->
     produce a sentence that could be about either.
     """
     try:
-        where = f" for {load_settings(**overrides).data_dir}"
+        settings = load_settings(**overrides)
+        where = f" for {settings.data_dir}"
+        # A socket that is there and cannot be used is a different situation with a different
+        # fix, and telling somebody to start a server when one is already running would send
+        # them to a refusal from the instance lock naming a process they did not know about.
+        blocked = control.unusable(control.socket_path(settings.data_dir))
     except (ManiculeError, ValueError, OSError):
         # Configuration that will not load is reported by the caller's own path. Here it only
         # costs the message a clause.
-        where = ""
+        where, blocked = "", ""
+    if blocked:
+        return failed(
+            command.op,
+            workspace,
+            error_info(
+                NoServerError(
+                    f"`{command.op}` writes, and the manicule server's control socket{where} "
+                    f"cannot be used: {blocked} A server may well be running — this is about "
+                    f"the socket rather than the process. Put the socket back to mode 0600 "
+                    f"owned by you, or stop the server with `manicule stop` and start it again."
+                )
+            ),
+        )
     return failed(
         command.op,
         workspace,

@@ -283,6 +283,44 @@ def test_a_write_command_with_no_server_refuses_and_names_the_fix(
     assert "connector_sync" in result.output
 
 
+async def test_a_socket_that_cannot_be_used_is_not_reported_as_no_server(
+    socket_for: Callable[[], Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two different situations with two different fixes, and one message for both is a trap.
+
+    **Found by running it rather than by reading it.** A server was running, its socket was
+    chmod-ed wide, and the command line said "no manicule server is running ... start one with
+    `manicule serve`" — which would have sent the operator to an instance-lock refusal naming a
+    process they had just been told did not exist. The socket being unusable is about the
+    socket; the process is fine.
+    """
+    path = socket_for()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setenv("MANICULE_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(control, "socket_path", lambda _: path)
+
+    server = control.ControlServer(path, ControlHandler(a_service(), SessionVault()))
+    await server.start()
+    try:
+        path.chmod(0o666)
+        envelope = proxy.refuse(
+            Command("connector_sync", {"name": "handbook"}),
+            workspace="default",
+            overrides={},
+        )
+    finally:
+        path.chmod(0o600)
+        await server.aclose()
+
+    assert envelope.error is not None
+    message = envelope.error.message
+    assert "no manicule server is running" not in message, message
+    assert "cannot be used" in message, message
+    assert "0666" in message, message
+    assert "A server may well be running" in message, message
+
+
 def test_a_write_command_with_no_server_starts_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

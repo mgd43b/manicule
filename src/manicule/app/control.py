@@ -91,6 +91,7 @@ __all__ = [
     "read_request",
     "runtime_dir",
     "socket_path",
+    "unusable",
 ]
 
 SOCKET_MODE = 0o600
@@ -706,6 +707,29 @@ def is_serving(path: Path) -> bool:
     except ProtocolError:
         return False
     return _answers(path)
+
+
+def unusable(path: Path) -> str:
+    """Why this socket cannot be used, or ``""`` when nothing is wrong with it.
+
+    The complement of :func:`is_serving`, which answers a boolean because its caller has to
+    branch. This answers the *sentence*, and it exists because "no manicule server is running"
+    is the wrong thing to tell somebody whose server is running perfectly well behind a socket
+    whose permissions changed underneath it — they would go and start a second one, and be told
+    the data directory is taken by a process they now have two reasons to be confused about.
+
+    A path that is simply not there returns ``""``, and so does a socket that is fine but that
+    nothing is behind. Neither is a socket being unusable: the first is a server not existing
+    and the second is one that stopped without tidying up, and the caller already has a sentence
+    for both.
+    """
+    if not path.exists():
+        return ""
+    try:
+        _require_usable(path)
+    except ProtocolError as exc:
+        return str(exc)
+    return ""
 
 
 def _answers(path: Path) -> bool:
