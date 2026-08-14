@@ -57,6 +57,7 @@ from tests.embedding_support import (
     REQUIRE_MODELS_ENV,
     is_required,
     require_model,
+    requires_metal,
     requires_mlx,
 )
 
@@ -394,6 +395,7 @@ async def test_mlx_memory_metrics_are_readable_off_the_worker_thread() -> None:
     server, not a red test.
     """
     require(PARITY_MODEL, "mlx")
+    requires_metal()
     embedder = await embedder_for(PARITY_MODEL, "mlx")
     await embedder.embed(["a short text, so that something has been allocated"])
 
@@ -426,6 +428,7 @@ def test_repeated_embedding_holds_a_bounded_physical_footprint() -> None:
         pytest.skip(f"set {REQUIRE_MODELS_ENV} to include {FULL_MODEL} to run the qualification")
     require_model(FULL_MODEL, mlx=True)
     requires_mlx(FULL_MODEL)
+    requires_metal()
 
     completed = subprocess.run(  # noqa: S603 - our own script, fixed arguments
         [
