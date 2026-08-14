@@ -500,14 +500,30 @@ the data directory is in your home, the sessions are yours, and the control sock
 owned by you. A root daemon would put a verbatim copy of everything you indexed (§1.1) behind an
 account you do not log in as.
 
-**Restarting does not fight the lock, and the reason is one number in the plist.** The data
-directory has one writer (§2), so during a restart the outgoing process may still hold it when
-the incoming one starts. That is not a fault and it fixes itself, so `manicule serve` exits
-**75** — `EX_TEMPFAIL`, "try again later" — rather than the `1` it uses for a refusal that will
-be identical in thirty seconds. `ThrottleInterval` is what turns that into a sensible retry:
-launchd waits thirty seconds before respawning, the lock is long gone, and the server comes up. A
-job with no throttle would spin on the refusal; a job that gave up on any non-zero status would
-stay down after an ordinary restart.
+**Restarting does not fight the lock, and a refusal says which kind it is.** The data directory
+has one writer (§2), so during a restart the outgoing process may still hold it when the incoming
+one starts. That is not a fault and it fixes itself. A wrong setting is a fault and does not. So
+`manicule serve` exits with one of two statuses:
+
+| Status | Meaning | What is in the way | What to do |
+|---|---|---|---|
+| **75** `EX_TEMPFAIL` | try again later | another manicule holds the data directory, or something answers on the control socket | nothing — it clears when that process goes |
+| **78** `EX_CONFIG` | somebody has to fix it | a bind this configuration forbids, a plugin that will not import, a data directory that cannot be opened, a runtime directory another account owns or others can read | read the message; it names the setting or the path |
+
+**launchd restarts the job either way, and it is worth being exact about that** because the
+opposite is widely assumed. `launchd.plist(5)`'s `KeepAlive` conditions are `SuccessfulExit`,
+`PathState`, `OtherJobEnabled` and `Crashed` — **none of them keys on an exit status** — so there
+is no way to tell launchd "stop retrying this one". What bounds the loop is `ThrottleInterval`:
+one attempt every thirty seconds rather than a spin, for both.
+
+The status is therefore a *diagnostic*. `launchctl print gui/$(id -u)/com.manicule.server` reports
+the last exit status, so a service that keeps coming back tells you in one line whether it is
+waiting for a process to let go (75, and it will stop on its own) or waiting for you (78, and it
+will not). A repeating 78 with no repair is a server that will never come up; the log line beside
+it names the setting.
+
+A claim you will find repeated elsewhere — that launchd declines to restart a job exiting
+`EX_CONFIG` — is not in the manual page, and nothing here depends on it.
 
 The lock itself needs no cleanup. It is an `flock` held by an open file description, so the
 kernel releases it however the process died — including `SIGKILL` and a power cut. The lock

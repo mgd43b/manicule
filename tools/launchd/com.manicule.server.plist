@@ -41,12 +41,22 @@
   <true/>
 
   <!-- **The one setting that stops a restart becoming a spin.** launchd will not respawn a job
-       more than once every ThrottleInterval seconds, and manicule exits 75 (EX_TEMPFAIL) when
-       another process holds the data directory. That pairing is the whole arrangement: during
-       an ordinary restart the outgoing process may still hold the lock for a moment, the new
-       one refuses, and thirty seconds later it takes it. If you genuinely started a second
-       server by hand, the agent retries every thirty seconds — noisy in the log and harmless —
-       and takes over the moment you stop it. -->
+       more than once every ThrottleInterval seconds. That matters because launchd restarts this
+       job whatever it exited with: KeepAlive's conditions are SuccessfulExit, PathState,
+       OtherJobEnabled and Crashed, and none of them looks at an exit status. So the throttle is
+       the only thing bounding a restart loop, and thirty seconds is chosen to be longer than a
+       clean stop takes.
+
+       manicule exits with one of two statuses so that you can tell the loops apart in
+       `launchctl print`:
+
+         75  EX_TEMPFAIL  something else has the data directory or the control socket. Ordinary
+                          for a moment during a restart; it clears without you doing anything.
+         78  EX_CONFIG    a setting or a permission is wrong — a bind this configuration forbids,
+                          a plugin that will not import, a runtime directory somebody else can
+                          read. Every retry produces the same failure until you change it.
+
+       A 78 repeating in the log is the agent waiting for you. See docs/deployment.md 6.3. -->
   <key>ThrottleInterval</key>
   <integer>30</integer>
 

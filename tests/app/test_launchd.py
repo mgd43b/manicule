@@ -6,11 +6,16 @@ Two halves, and the second is what makes the first mean anything.
 property list fails here rather than at ``launchctl bootstrap``. What it asserts is the three
 decisions in it: start at login and keep running, throttle the respawn, and carry no credential.
 
-**The exit status is observed from a real process.** ``ThrottleInterval`` alone does nothing —
-launchd throttles every respawn, and a job that exits ``1`` on a lock somebody else holds is
-still a job that restarts every thirty seconds for ever. What makes the pairing work is that
-manicule distinguishes "try again later" from "this will fail identically next time", and the
-only way to know it does is to run it against a held directory and look at what it exits with.
+**The exit statuses are observed from real processes**, and there are two of them because a
+refusal is one of two kinds. ``EX_TEMPFAIL`` means the thing in the way is somebody else's
+process and will go; ``EX_CONFIG`` means it is a setting or a permission and will not.
+
+``launchd`` restarts the job either way — ``launchd.plist(5)``'s ``KeepAlive`` conditions are
+``SuccessfulExit``, ``PathState``, ``OtherJobEnabled`` and ``Crashed``, and none of them keys on
+an exit status — so the status is what an operator reads in ``launchctl print`` to know which of
+the two they are looking at, and ``ThrottleInterval`` is what keeps either to one attempt every
+thirty seconds. Three tests below drive a real process for each: a held directory, a bind
+configuration forbids, and a runtime directory somebody else can read.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from manicule.app.daemon import STOP_GRACE_S
-from manicule.cli.serving import EX_TEMPFAIL
+from manicule.cli.serving import EX_CONFIG, EX_TEMPFAIL
 from manicule.ingest.recovery import InstanceLock
 
 if TYPE_CHECKING:
@@ -228,7 +233,9 @@ def test_the_console_script_this_suite_drives_is_installed() -> None:
     )
 
 
-def _serve(data_dir: Path, *extra: str, wide: bool = False) -> subprocess.CompletedProcess[str]:
+def _serve(
+    data_dir: Path, *extra: str, wide: bool = False, runtime_dir: Path | None = None
+) -> subprocess.CompletedProcess[str]:
     """Run the real ``manicule serve`` against ``data_dir`` and return what it did.
 
     Stdio, with a closed stdin, for every case here: the refusal happens before any transport
@@ -239,6 +246,8 @@ def _serve(data_dir: Path, *extra: str, wide: bool = False) -> subprocess.Comple
             environment, which is also how the launchd job would.
         extra: Further arguments, for the case that needs ``--transport http``.
         wide: Configure a non-loopback bind, for the refusal that is permanent.
+        runtime_dir: Where the control socket's directory is looked for, through the variable
+            `manicule.app.control.runtime_dir` consults first. For the other permanent refusal.
     """
     environment = {
         **os.environ,
@@ -253,6 +262,8 @@ def _serve(data_dir: Path, *extra: str, wide: bool = False) -> subprocess.Comple
     }
     if wide:
         environment["MANICULE_SECURITY__TRANSPORT__BIND_HOST"] = "0.0.0.0"  # noqa: S104
+    if runtime_dir is not None:
+        environment["XDG_RUNTIME_DIR"] = str(runtime_dir)
     return subprocess.run(  # noqa: S603 - this project's own console script
         [str(MANICULE), "serve", *extra],
         env=environment,
@@ -293,19 +304,61 @@ def test_a_refusal_that_will_not_fix_itself_is_not_asking_to_be_retried(data_dir
     """The control, without which the status above is "manicule exits 75" and not a distinction.
 
     An unauthenticated non-loopback bind is refused by configuration and will be refused
-    identically for ever, so it exits ``1`` — the status a supervisor should treat as a job that
-    is not going to come up. Nothing holds the directory here, so the two tests differ in exactly
-    the thing being classified.
+    identically for ever, so it exits :data:`~manicule.cli.serving.EX_CONFIG` — the status that
+    says a person has to change something. Nothing holds the directory here, so the two tests
+    differ in exactly the thing being classified.
     """
     outcome = _serve(data_dir, "--transport", "http", wide=True)
 
-    assert outcome.returncode == 1, (
-        f"a permanently refused bind exited {outcome.returncode}; only the temporary refusal may "
-        f"use {EX_TEMPFAIL}. stdout={outcome.stdout!r} stderr={outcome.stderr!r}"
+    assert outcome.returncode == EX_CONFIG, (
+        f"a permanently refused bind exited {outcome.returncode}; a refusal that no amount of "
+        f"waiting fixes must not ask to be retried. stdout={outcome.stdout!r} "
+        f"stderr={outcome.stderr!r}"
     )
     assert "bind_host" in outcome.stdout + outcome.stderr, (
-        "the refusal has to name the setting, or exit 1 is a status with no cause attached"
+        "the refusal has to name the setting, or the status is a number with no cause attached"
     )
+
+
+def test_a_runtime_directory_that_is_not_ours_is_permanent_rather_than_temporary(
+    data_dir: Path, tmp_path: Path
+) -> None:
+    """The second half of the split, and the one the classification was wrong about.
+
+    A control socket that will not bind used to be one status covering two opposite situations.
+    One of them — something is already listening — clears on its own. This one does not: a
+    runtime directory that grants anything to group or other is a permission somebody has to
+    change, and a supervisor told "try again later" retries it every thirty seconds for ever
+    while the operator sees a service that keeps restarting rather than one that says what is
+    wrong.
+
+    Driven through ``XDG_RUNTIME_DIR``, which :func:`~manicule.app.control.runtime_dir` consults
+    first, so the refusal comes from the production check rather than from a patched function.
+    """
+    runtime = tmp_path / "runtime"
+    (runtime / f"manicule-{os.getuid()}").mkdir(parents=True)
+    # 0755: readable and traversable by everybody, which is exactly what `_require_private`
+    # refuses. Set after `mkdir` because the mode argument is subject to the umask.
+    (runtime / f"manicule-{os.getuid()}").chmod(0o755)
+
+    outcome = _serve(data_dir, runtime_dir=runtime)
+
+    assert outcome.returncode == EX_CONFIG, (
+        f"a runtime directory somebody else can read exited {outcome.returncode}. Waiting does "
+        f"not change a mode. stdout={outcome.stdout!r} stderr={outcome.stderr!r}"
+    )
+    said = outcome.stdout + outcome.stderr
+    assert "runtime directory" in said, said
+    assert "0755" in said, "the refusal does not say what the mode actually is"
+
+
+def test_the_two_statuses_are_different_numbers() -> None:
+    """Stated as its own assertion, because the whole arrangement is that they differ.
+
+    Two constants that happened to be equal would make every classification above vacuous and
+    each test still green: each asserts a status, and both would be the same status.
+    """
+    assert EX_TEMPFAIL != EX_CONFIG
 
 
 def test_the_directory_is_free_the_moment_the_holder_goes(

@@ -44,7 +44,26 @@ if TYPE_CHECKING:
     from manicule.app.service import ApplicationService
     from manicule.connectors.sessions import SessionVault
 
-__all__ = ["ControlHandler", "ScheduledSource", "Scheduler", "Serving", "announce"]
+SESSIONS_HELD = "sessions_held"
+"""The ``op`` a :class:`~manicule.app.control.Held` reply carries.
+
+Named rather than written at the one place it is used, because the *other* end reads it too:
+anything keying off an envelope's ``op`` — a log, a shell pipeline, a future client — joins on
+this string, and a literal is how the two ends come to disagree about one word.
+
+Deliberately not ``connector_login``, which the hand-off and the forget replies carry. Those two
+are the server side of that command; this is a question about the process that no command emits,
+so borrowing the name would file every one of these under an operation nobody ran.
+"""
+
+__all__ = [
+    "SESSIONS_HELD",
+    "ControlHandler",
+    "ScheduledSource",
+    "Scheduler",
+    "Serving",
+    "announce",
+]
 
 
 class ControlHandler:
@@ -168,9 +187,16 @@ class ControlHandler:
         The reply is a list of two-field objects rather than a mapping, so a base URL containing
         anything awkward is a value rather than a key — and so the shape has somewhere to grow if
         a capture time is ever wanted here, which a mapping would not.
+
+        **The envelope's ``op`` is** :data:`SESSIONS_HELD` **rather than ``connector_login``**,
+        which the other two session frames use. Those two are the server side of that command —
+        capturing and forgetting are what ``connector login`` does — and this is not: it is a
+        question ``doctor`` asks, run by nobody's command. An envelope naming the operation
+        wrongly is a log that cannot be read six months later, and ``op`` is the field a reader
+        joins on.
         """
         return _succeeded(
-            "connector_login",
+            SESSIONS_HELD,
             self._service.workspace,
             {
                 "held": [

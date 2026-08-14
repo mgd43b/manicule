@@ -36,7 +36,7 @@ import signal
 from typing import TYPE_CHECKING, Any, cast
 
 from manicule.app.bind import is_loopback
-from manicule.app.control import ControlServer, ProtocolError, socket_path
+from manicule.app.control import AlreadyServingError, ControlServer, ProtocolError, socket_path
 from manicule.app.daemon import Running, read_pidfile, stop_server, write_pidfile
 from manicule.app.dispatch import error_info
 from manicule.app.results import Envelope, ServerAddress, failed, succeeded
@@ -55,24 +55,43 @@ if TYPE_CHECKING:
     from manicule.mcp.serve import Transport
 
 EX_TEMPFAIL = 75
-"""The exit status for "somebody else has this data directory; try again later".
+"""The exit status for a refusal that will clear on its own: **try again later**.
 
-``EX_TEMPFAIL`` from ``sysexits.h``, whose stated meaning is exactly this one: the failure is
-temporary and the caller is invited to retry. It matters because the caller is usually launchd,
-which restarts what it supervises and has no way to ask *why* a start failed — so the status is
-the only thing that distinguishes "this will never work" from "the previous process has not
-finished letting go yet", and the second is an ordinary moment during a restart rather than a
-fault.
+``EX_TEMPFAIL`` from ``sysexits.h``, whose stated meaning is exactly this one. Two conditions
+earn it, and both are somebody else's process being where this one wants to be:
 
-What makes it retry *sensibly* rather than spin is ``ThrottleInterval`` in the plist
-(``docs/deployment.md`` §6.3), which is where the cadence belongs: a wait built into this process
-would be a wait an operator running ``manicule serve`` by hand would also have to sit through,
-for a refusal they can read and act on immediately.
+* :class:`~manicule.core.errors.InstanceLockedError` — another manicule holds the data
+  directory. During an ordinary restart the outgoing process may still hold it for a moment.
+* :class:`~manicule.app.control.AlreadyServingError` — something answers on the control socket.
 
-Separate from the ``1`` every other refusal exits with, and that is the whole point of it. A bind
-this configuration will never permit, a plugin that will not import and a data directory somebody
-else holds are not the same event, and restarting the first two thirty seconds later produces the
-identical failure thirty seconds later, for ever.
+Neither needs anybody to change anything. The process on the other side stops, or an operator
+stops it, and the next attempt succeeds with nothing edited.
+"""
+
+EX_CONFIG = 78
+"""The exit status for a refusal that will be identical next time: **somebody has to fix it**.
+
+``EX_CONFIG`` from ``sysexits.h``. Everything that is not one of :data:`EX_TEMPFAIL`'s two
+conditions: a bind this configuration forbids, a plugin that will not import, a data directory
+that cannot be opened, and :class:`~manicule.app.control.SocketUnusableError` — a runtime
+directory owned by somebody else or readable by them. Waiting changes none of it.
+
+**What a supervisor does with these two, said exactly, because the tempting claim is false.**
+``launchd`` has no ``KeepAlive`` condition that keys on an exit status: ``launchd.plist(5)``
+offers ``SuccessfulExit``, ``PathState``, ``OtherJobEnabled`` and ``Crashed``, and that is the
+whole list. With ``KeepAlive`` true it restarts the job whichever of these it exited with, and
+``ThrottleInterval`` is what keeps that to one attempt every thirty seconds rather than a spin.
+
+So the status is a **diagnostic rather than a lever**, and that is what it is for: ``launchctl
+print`` reports the last exit status, so an operator looking at a service that keeps coming back
+can tell in one line whether it is waiting for a process to let go or waiting for them.
+``docs/deployment.md`` §6.3 says which to do about each. A widely repeated claim that ``launchd``
+declines to restart a job exiting ``EX_CONFIG`` is **not** documented in the manual page on any
+machine this was written against, so nothing here depends on it.
+
+Separate from :data:`EX_TEMPFAIL` rather than folded into one non-zero status, because
+"the previous server has not finished letting go" and "the runtime directory belongs to another
+account" produce the same restart loop and need opposite responses.
 """
 
 
@@ -99,9 +118,10 @@ def serve_forever(
     way of running manicule still opens no socket at all.
 
     Returns:
-        ``0`` on a clean stop, :data:`EX_TEMPFAIL` when another process holds the data
-        directory, ``2`` for a transport that does not exist, ``130`` for ``Ctrl-C`` on the stdio
-        path, and ``1`` for every other refusal.
+        ``0`` on a clean stop; :data:`EX_TEMPFAIL` for a refusal that will clear on its own —
+        another process holds the data directory or answers on the control socket;
+        :data:`EX_CONFIG` for one that will not, which is every other refusal; ``2`` for a
+        transport that does not exist; and ``130`` for ``Ctrl-C`` on the stdio path.
     """
     if transport not in {"stdio", "http"}:
         out = render.console(stderr=True)
@@ -151,8 +171,10 @@ async def _serve(
         _report(failed("start", "unknown", error_info(exc)), json_output)
         return EX_TEMPFAIL
     except (ManiculeError, ValueError, OSError) as exc:
+        # Configuration that will not load, a plugin that will not import, a data directory that
+        # cannot be opened. None of them is different thirty seconds later.
         _report(failed("start", "unknown", error_info(exc)), json_output)
-        return 1
+        return EX_CONFIG
     async with runtime:
         service = ApplicationService(runtime)
         api = transport == "http" and not mcp_only
@@ -169,8 +191,11 @@ async def _serve(
                 )
             )
         except ManiculeError as exc:
+            # The bind policy's refusal, and it is the clearest permanent one there is: a
+            # non-loopback host without the flag or without authentication is refused by
+            # configuration, and configuration is identical on the next attempt.
             _report(failed("start", service.workspace, error_info(exc)), json_output)
-            return 1
+            return EX_CONFIG
         # Announced before the socket exists, and to stderr when the transport is stdio —
         # where stdout is the protocol channel and a banner on it is a corrupt message.
         #
@@ -206,20 +231,21 @@ async def _serve(
                     port=port,
                     allow_public=allow_public,
                 )
-        except ProtocolError as exc:
-            # A control socket that will not bind is a refusal rather than a crash, and it is a
-            # **permanent** one — `1`, not `EX_TEMPFAIL`. That is worth setting out, because the
-            # obvious reading is the opposite: this used to be raised by a second server already
-            # listening, which is exactly the transient case.
-            #
-            # It cannot be that any more. Reaching here means `runtime.acquire()` succeeded, so no
-            # other manicule holds the directory — and the outgoing server closes its control
-            # socket *before* the `async with runtime` above releases the lock, so a process that
-            # has the lock cannot find a live socket left by the one it replaced. What is left is
-            # a runtime directory that is not ours or is readable by somebody else, which no
-            # amount of retrying fixes and which the message names.
+        except AlreadyServingError as exc:
+            # Something answers on the control socket. Rare once the lock has been taken — the
+            # outgoing server closes its socket *before* `async with runtime` releases the lock,
+            # so a process holding the lock cannot find a live socket left by the one it replaced
+            # — and it is still the temporary kind when it happens, because what is there is a
+            # process rather than a permission.
             _report(failed("start", service.workspace, error_info(exc)), json_output)
-            return 1
+            return EX_TEMPFAIL
+        except ProtocolError as exc:
+            # Everything else the control socket refuses for: a runtime directory that is not
+            # ours, a symbolic link where a directory belongs, a mode granting group or other.
+            # `SocketUnusableError` names them and none resolves by waiting, so this is the
+            # status that says a person has to act rather than a supervisor.
+            _report(failed("start", service.workspace, error_info(exc)), json_output)
+            return EX_CONFIG
         finally:
             pid.unlink(missing_ok=True)
     return 0
@@ -496,6 +522,7 @@ def _report(
 
 
 __all__ = [
+    "EX_CONFIG",
     "EX_TEMPFAIL",
     "bounded_by",
     "running_address",

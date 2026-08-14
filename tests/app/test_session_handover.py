@@ -19,7 +19,7 @@ import pytest
 from pydantic import SecretStr
 
 from manicule.app import control
-from manicule.app.served import ControlHandler
+from manicule.app.served import SESSIONS_HELD, ControlHandler
 from manicule.app.service import ApplicationService
 from manicule.cli import proxy
 from manicule.config.settings import ConnectorSettings
@@ -443,6 +443,47 @@ async def test_no_session_value_reaches_the_reply_that_says_what_is_held(
     data = answered["data"]
     assert isinstance(data, dict)
     assert data["held"] == [{"base_url": SITE, "account": "sync.user"}], data
+
+
+async def test_the_reply_names_the_question_it_answered_rather_than_a_command(
+    socket_for: Callable[[], Path],
+) -> None:
+    """``op`` is the field a log joins on, so it has to name the operation that ran.
+
+    The hand-off and the forget replies carry ``connector_login``, and that is accurate: they are
+    the server side of that command. This one is not — it is a question ``doctor`` asks, which no
+    command emits — so borrowing the name would file every one of these under an operation nobody
+    ran, and a reader six months later would be looking for a sign-in that never happened.
+
+    Asserted against :data:`~manicule.app.served.SESSIONS_HELD` rather than a literal, because the
+    string is the contract between the two ends and a second copy is how they come to disagree.
+    """
+    path = socket_for()
+    server = a_server(path, SessionVault())
+    await server.start()
+    try:
+        answered = await control.connect(path, control.Held(), on_progress=lambda _: None)
+        acknowledged = await control.connect(
+            path,
+            control.Handover(
+                base_url=SITE,
+                account="sync.user",
+                captured_at=datetime.now(tz=UTC).isoformat(),
+                cookies={"JSESSIONID": SecretStr(SENTINEL)},
+            ),
+            on_progress=lambda _: None,
+        )
+    finally:
+        await server.aclose()
+
+    assert answered["op"] == SESSIONS_HELD
+    assert answered["op"] != "connector_login", (
+        "a question about what the server holds is reported as the command that captures a "
+        "session, so a log cannot tell the two apart"
+    )
+    # The control, so this is a statement about naming rather than about renaming everything:
+    # the frame that *is* part of `connector login` still says so.
+    assert acknowledged["op"] == "connector_login"
 
 
 async def test_no_session_value_reaches_a_tool_result_on_the_network_surface() -> None:
