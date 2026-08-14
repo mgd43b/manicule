@@ -532,3 +532,26 @@ async def test_an_attachment_content_type_is_never_a_guess_from_the_filename() -
     record = _source(Provenance.from_metadata(raw.metadata))
     assert raw.media_type == "text/markdown", "the guess still routes the bytes"
     assert record.content_type == "", "and stays out of the source's own account"
+
+
+async def test_a_refusal_sends_an_operator_looking_for_a_file_that_exists() -> None:
+    """A live page has no manifest, so a refusal must not tell anybody to edit one.
+
+    The core validator's message ended "Remove it from the manifest" — true of the only
+    producer that existed when it was written, and wrong for this one. An operator told to edit
+    a file that is not there spends longer than one told nothing at all. Naming where the value
+    came from is the caller's job, and this caller names the page.
+
+    Guarded here rather than left to prose because nothing else asserted the wording: the
+    sentence drifted once already, by the codebase growing a second kind of producer around it.
+    """
+    instance = _cloud(pages=[_page(title="Retry\x1bPolicy", created=CREATED)])
+    record = await _record(instance)
+
+    assert record is not None
+    assert record.source is None
+    assert "manifest" not in record.unavailable_reason
+    assert record.unavailable_reason.startswith(f"page {PAGE_ID}: the source declared")
+    # The field and the code point survive, which is what somebody actually needs.
+    assert "title" in record.unavailable_reason
+    assert "U+001B" in record.unavailable_reason

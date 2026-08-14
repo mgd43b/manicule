@@ -156,7 +156,13 @@ def _require_printable(value: str, *, field: str) -> None:
 
     Raises:
         ValueError: Naming the field and the offending code point, because "invalid title" does
-            not tell whoever wrote the manifest which character to remove.
+            not tell whoever declared the value which character to remove. **The message names
+            no manifest**, and used to: it ended "Remove it from the manifest", which was true
+            of the only producer that existed when it was written and is now wrong for half of
+            them. A live wiki connector's records come out of API responses, and an operator
+            told to edit a manifest goes looking for a file that is not there — a diagnostic
+            that costs more time than no diagnostic. The value's *origin* is the caller's to
+            name; this function knows the field and the character and says those.
     """
     if len(value) > MAX_FIELD_CHARS:
         msg = f"{field} is {len(value)} characters, over the {MAX_FIELD_CHARS}-character limit"
@@ -165,7 +171,7 @@ def _require_printable(value: str, *, field: str) -> None:
         if unicodedata.category(character) == "Cc":
             msg = (
                 f"{field} contains the control character U+{ord(character):04X}, which cannot "
-                f"appear in a citation. Remove it from the manifest."
+                f"appear in a citation"
             )
             raise ValueError(msg)
 
