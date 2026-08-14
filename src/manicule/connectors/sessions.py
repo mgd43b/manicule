@@ -4,20 +4,39 @@ Self-hosted Confluence behind an identity provider commonly has personal access 
 by policy, so the credential its users can actually obtain is the session they already hold in
 their browser. Three decisions shape this module, and each is a refusal of an easier option.
 
-**manicule never sees the password.** The person signs in to their own browser, against their
-own identity provider, with whatever second factor that provider demands, and copies the
-resulting session cookies into ``manicule connector login``. No password, no one-time code and
-no device approval passes through this process, and that is a property of the design rather
-than a promise about the code: there is no code path that could accept one.
+**manicule never asks for the password and has nowhere to put one.** No password, no one-time
+code and no device approval passes through this process on any path, and that much *is* a fact
+about the code rather than a promise: there is no parameter that could carry one and no branch
+that would accept one.
 
-**No browser is driven.** Playwright would be the ergonomic answer and its licence (Apache-2.0)
-is compatible with GPL-3.0-or-later, so the objection is not licensing. It is that a driven
-browser is a browser manicule controls the DOM of, and the person is asked to type a corporate
-password into it. "manicule never sees the password" would become a promise about restraint
-instead of a fact about capability, and it is the single hardest constraint on this feature.
-The practical arguments run the same way: a driven Chromium is a new device to a conditional
-access policy and is often refused outright, and a browser download is a heavy dependency for
-a paste.
+**A browser is now driven, and this paragraph used to say the opposite.** It said that Playwright
+was the ergonomic answer, that the licence (Apache-2.0) was not the objection, and that the
+objection was this: a driven browser is a browser manicule controls the DOM of, and the person is
+asked to type a corporate password into it, so "manicule never sees the password" would become a
+promise about restraint instead of a fact about capability.
+
+That argument was right and it has been overruled, for a reason the argument did not weigh. An
+instance behind an identity provider commonly has personal access tokens disabled by policy. For
+those installations the manual paste was not the safer of two options — it was the *only* option,
+and it asks somebody to open developer tools, find a live session cookie and paste several
+kilobytes of it into a terminal. Refusing to drive a browser did not remove the risk; it moved it
+onto the person, by hand, every time their session expired.
+
+So the property has genuinely weakened, and it is worth naming precisely rather than glossing:
+
+*Before:* manicule **cannot** see the password, because there is no browser.
+*Now, on ``--browser`` only:* manicule **does not** see the password, because
+    :mod:`manicule.connectors.browser` reads no page content — a claim a test enforces over that
+    module's source, and a reviewer enforces over its diff.
+
+*On this module's own path, unchanged:* manicule cannot see it, because there is still no
+    browser. **The paste is not deprecated and is not a fallback.** It is the option that keeps
+    the stronger guarantee, and somebody who wants that guarantee should use it.
+
+The two practical warnings from the original argument stand and are documented rather than
+solved: a driven Chromium is a new device to a conditional-access policy and may be refused
+outright, and the browser is a heavy dependency — which is why it is an extra
+(``manicule[browser-auth]``) that nothing else needs.
 
 **The session lives in the macOS Keychain, and nowhere else.** Not ``config.toml``, even at
 ``0600``: a session cookie is the sync account's whole identity at that company rather than a
@@ -55,6 +74,8 @@ __all__ = [
     "MemoryStore",
     "SessionStore",
     "capture",
+    "capture_cookies",
+    "cookies_authenticate",
     "default_store",
     "load_session",
     "parse_cookies",
@@ -384,27 +405,72 @@ async def capture(
 ) -> BrowserSession:
     """Prove a pasted session works, then store it.
 
-    The proof is the point. A cookie that was copied short, copied from the wrong tab, or copied
-    from a session that had already timed out is indistinguishable from a working one until
-    something uses it, and "something uses it" would otherwise be the first page of the next
-    sync. So this makes one request as the session, reads back who the instance says that is,
-    and stores nothing at all if the answer is anybody other than a signed-in user.
+    The manual path, unchanged. Parsing is the only thing it does that
+    :func:`capture_cookies` does not, and everything after the parse is that function — so a
+    session captured from a paste, from a driven browser and from an imported state file are
+    verified and stored by one piece of code rather than by three that could drift.
 
     Raises:
         ConfigError: The paste carried no cookies, or the instance does not answer the endpoint
             this asks.
         SessionExpiredError: The instance answered, and answered as somebody signed out.
     """
+    return await capture_cookies(
+        config,
+        parse_cookies(cookie_text),
+        store=store,
+        transport=transport,
+        now=now,
+    )
+
+
+async def capture_cookies(
+    config: ConfluenceConfig,
+    cookies: Mapping[str, SecretStr],
+    *,
+    store: SessionStore | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    now: datetime | None = None,
+) -> BrowserSession:
+    """Prove a set of cookies works, then store it. The only route to the credential store.
+
+    The proof is the point. A cookie that was copied short, taken from the wrong tab, extracted
+    from a state file belonging to another instance, or collected from a browser the person had
+    not finished signing in to is indistinguishable from a working one until something uses it —
+    and "something uses it" would otherwise be the first page of the next sync. So this makes one
+    request as the session, reads back who the instance says that is, and stores nothing at all
+    if the answer is anybody other than a signed-in user.
+
+    **Verification happens before the store is touched, which is what makes replacement atomic.**
+    A failed login leaves whatever was there before exactly as it was: there is no delete-then-
+    write window, because the write is the last thing and it only happens on success. That
+    matters most for the browser flow, where a person re-authenticating a session that had merely
+    aged would otherwise be able to lose a working credential by closing the window.
+
+    Raises:
+        ConfigError: No cookies were given, or the instance does not answer the endpoint this
+            asks, or it answers without naming a user.
+        SessionExpiredError: The instance answered, and answered as somebody signed out — which
+            includes the sign-in page served with status 200 that
+            :mod:`~manicule.connectors.intercept` exists for.
+    """
     from manicule.connectors.client import ConfluenceClient  # noqa: PLC0415 - no HTTP at import
     from manicule.connectors.credentials import BrowserSessionCredential  # noqa: PLC0415
     from manicule.connectors.errors import NotFoundError  # noqa: PLC0415
+
+    if not cookies:
+        msg = (
+            f"no cookies for {config.base_url} were found, so there is nothing to verify and "
+            f"nothing to store. A session with no cookies authenticates as nobody."
+        )
+        raise ConfigError(msg)
 
     moment = now if now is not None else datetime.now(tz=UTC)
     candidate = BrowserSession(
         base_url=config.base_url,
         account="",
         captured_at=moment,
-        cookies=parse_cookies(cookie_text),
+        cookies=dict(cookies),
     )
     credential = BrowserSessionCredential(
         session=candidate,
@@ -418,7 +484,7 @@ async def capture(
     except NotFoundError as exc:
         msg = (
             f"{config.base_url}{_PROBE_PATH} does not exist on this instance, so manicule "
-            f"cannot confirm who the pasted session belongs to and will not store it. Check "
+            f"cannot confirm who the session belongs to and will not store it. Check "
             f"base_url names the site root including any context path."
         )
         raise ConfigError(msg) from exc
@@ -429,7 +495,7 @@ async def capture(
     if not account:
         msg = (
             f"{config.base_url}{_PROBE_PATH} answered without naming a user, so manicule "
-            f"cannot confirm the pasted session is signed in and will not store it."
+            f"cannot confirm the session is signed in and will not store it."
         )
         raise ConfigError(msg)
 
@@ -442,6 +508,75 @@ async def capture(
     keychain = store if store is not None else default_store()
     keychain.save(session)
     return session
+
+
+async def cookies_authenticate(
+    config: ConfluenceConfig,
+    cookies: Mapping[str, SecretStr],
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Whether ``cookies`` are signed in yet — the question a wait loop asks, without raising.
+
+    :func:`capture_cookies` answers the same question by raising, which is right for a command
+    that has been asked to store something and cannot. It is wrong for the browser flow's poll:
+    a person who has not finished signing in yet is the *expected* state there, several times a
+    second, and an exception per poll would turn the ordinary case into a stack of handled
+    errors.
+
+    So this is the same probe with the verdict as a boolean. It shares the endpoint and the
+    client with :func:`capture_cookies` rather than reimplementing the check, because a poll loop
+    that believed something the storing path would then refuse would hang until the timeout while
+    the browser sat signed in.
+
+    **A ``True`` here is not a decision to store.** The caller hands the cookies to
+    :func:`capture_cookies`, which asks again through the same client and is the only thing that
+    writes. The double check costs one request and closes the window between "signed in" and
+    "stored" — a session that died in between is refused rather than persisted dead.
+    """
+    if not cookies:
+        return False
+    from manicule.connectors.errors import ConnectorError  # noqa: PLC0415
+
+    try:
+        await capture_cookies(
+            config,
+            cookies,
+            store=_Discarding(),
+            transport=transport,
+            now=now,
+        )
+    except (ConfigError, ConnectorError):
+        # Every refusal means "not signed in yet", which is what a poll wants to hear. The
+        # distinction between a dead session, a sign-in page and a half-finished login matters
+        # to the *final* attempt, and that one goes through `capture_cookies` and keeps its
+        # message.
+        return False
+    return True
+
+
+class _Discarding:
+    """A store that keeps nothing, so the poll can reuse the verifying path without writing.
+
+    The alternative was a ``store=None`` sentinel meaning "do not store", which is a second
+    meaning for a parameter that already means "use the default" — and the failure mode of
+    getting that wrong is a credential written to the keychain by a loop that was only asking.
+    """
+
+    def describe(self) -> str:  # pragma: no cover - never shown to anybody
+        return "nowhere; this probe stores nothing"
+
+    def load(self, base_url: str) -> BrowserSession | None:
+        del base_url
+        return None
+
+    def save(self, session: BrowserSession) -> None:
+        del session
+
+    def forget(self, base_url: str) -> bool:
+        del base_url
+        return False
 
 
 def _named(payload: Mapping[str, object]) -> str:

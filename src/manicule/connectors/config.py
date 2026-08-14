@@ -220,6 +220,19 @@ class ConfluenceConfig(BaseModel):
     the identity provider's own session lifetime; too high costs nothing but a later, noisier
     failure, and too low costs an unnecessary sign-in."""
 
+    browser_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0.0,
+        description="How long `manicule connector login --browser` waits for a person to finish "
+        "signing in before giving up and storing nothing.",
+    )
+    """Five minutes, because the thing being waited for is a person and an identity provider.
+
+    A flat field rather than a ``[connectors.<name>.browser_auth]`` table: this is the only
+    browser setting there is, and a nested table for one value invites the next one to go there
+    rather than being thought about. ``--timeout`` overrides it per run, which is what somebody
+    reaches for when a conditional-access check turns out to need longer than the default."""
+
     session_env: str = Field(
         default="CONFLUENCE_SESSION_COOKIE",
         min_length=1,

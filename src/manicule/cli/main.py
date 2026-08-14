@@ -136,6 +136,43 @@ than inert: the flag reads as "show me what this would do", and silently doing i
 the one outcome the person typing it was trying to avoid.
 """
 
+INSECURE_STATE_IS_AN_IMPORT_OPTION = (
+    "--allow-insecure-state applies to --browser-state, which reads a file whose permissions "
+    "decide whether importing it is safe. --browser opens a browser and takes cookies from it "
+    "in memory; there is no file for the flag to consent to."
+)
+"""Why ``--browser --allow-insecure-state`` is refused rather than ignored.
+
+The same rule :data:`INSECURE_TARGET_IS_A_BACKUP_OPTION` states, and it bites hardest on a
+*security* flag: an option that reads as "I have considered this risk and accept it" and reaches
+nothing is the precise defect the option exists to prevent. Found by re-reading the diff against
+the convention rather than by anything failing.
+"""
+
+BROWSER_TIMEOUT_IS_A_BROWSER_OPTION = (
+    "--timeout is how long to wait for a person to finish signing in, which only the --browser "
+    "path waits for. Importing a state file and forgetting a session are both immediate, and "
+    "pasting a Cookie header waits on you rather than on a clock."
+)
+"""Why ``--timeout`` without ``--browser`` is refused rather than ignored.
+
+Milder than the one above — nothing unsafe follows from it — and refused on the same principle,
+because a person who passed a timeout and watched the command return instantly has been told
+something untrue about what it did.
+"""
+
+BROWSER_TIMEOUT_MUST_BE_POSITIVE = (
+    "--timeout is how many seconds to wait for sign-in, so it has to be more than zero. "
+    "browser_timeout_seconds is constrained the same way."
+)
+"""Why ``--timeout 0`` is refused rather than treated as "use the default".
+
+Zero is falsy, and the first version of this folded it into the configured default — so somebody
+who asked to wait no time would have waited five minutes instead. Refusing is the only reading
+that invents nothing: neither "you meant the default" nor "you meant to give up immediately" is
+something the command should decide on their behalf.
+"""
+
 UNKNOWN_WORKSPACE = "unknown"
 """What an envelope reports when configuration could not be loaded at all.
 
@@ -1015,20 +1052,80 @@ def connector_sidecar(
 @connector_app.command("login")
 def connector_login(
     name: Annotated[str, typer.Argument(help="The configured source's name.")],
+    *,
+    browser: Annotated[
+        bool,
+        typer.Option("--browser", help="Open a browser and sign in there instead of pasting."),
+    ] = False,
+    browser_state: Annotated[
+        Path | None,
+        typer.Option(
+            "--browser-state",
+            help="Import cookies from a Playwright storage_state JSON file.",
+        ),
+    ] = None,
+    timeout: Annotated[
+        float | None,
+        typer.Option(
+            "--timeout",
+            help="Seconds to wait for browser sign-in. Defaults to browser_timeout_seconds.",
+        ),
+    ] = None,
+    allow_insecure_state: Annotated[
+        bool,
+        typer.Option(
+            "--allow-insecure-state",
+            help="Import a --browser-state file that other users on this machine can read.",
+        ),
+    ] = False,
     forget: Annotated[
         bool, typer.Option("--forget", help="Remove the stored session instead of taking one.")
     ] = False,
 ) -> None:
     """Capture the browser session a Confluence source behind single sign-on signs in with.
 
-    Sign in to Confluence in your own browser first, then paste the Cookie header from its
-    developer tools when this asks. manicule never asks for your password, cannot use one,
-    and has nowhere to put one.
+    `--browser` opens a browser at the source's URL and waits while you sign in — including any
+    second factor or conditional-access step. Nothing is typed for you and no page content is
+    read; manicule watches only the cookie jar, and stores nothing until the instance confirms
+    who you are. It needs `manicule[browser-auth]`.
+
+    Without it, sign in to Confluence in your own browser and paste the Cookie header from its
+    developer tools when this asks. That path needs nothing installed and keeps the stronger
+    property: with no browser to drive, manicule cannot see the page you type into.
+
+    manicule never asks for your password, cannot use one, and has nowhere to put one.
+
+    Command line only. It opens a window on this machine and writes a credential to the
+    keychain, neither of which belongs on a surface an unattended caller can reach.
     """
-    cookies = "" if forget else read_secret(SESSION_PROMPT)
+    # An option that reaches nothing is refused rather than accepted, on the rule
+    # `INSECURE_TARGET_IS_A_BACKUP_OPTION` states. Here rather than in the service because these
+    # are facts about the *invocation* — which flags were typed together — and Typer is what
+    # turns that into the error a person reads. Mutual exclusion between the three ways in stays
+    # in the service, because that one is a fact about the operation and every surface needs it.
+    if allow_insecure_state and browser_state is None:
+        raise typer.BadParameter(INSECURE_STATE_IS_AN_IMPORT_OPTION)
+    if timeout is not None and not browser:
+        raise typer.BadParameter(BROWSER_TIMEOUT_IS_A_BROWSER_OPTION)
+    if timeout is not None and timeout <= 0:
+        raise typer.BadParameter(BROWSER_TIMEOUT_MUST_BE_POSITIVE)
+
+    # Prompting is skipped for every path that is not the paste, so `--browser` does not stop to
+    # ask for the thing it is there to avoid — and `--forget` does not ask for a secret it is
+    # about to delete.
+    manual = not (browser or browser_state is not None or forget)
+    cookies = read_secret(SESSION_PROMPT) if manual else ""
     emit(
         "connector_login",
-        lambda service: service.connector_login(name, cookies=cookies, forget=forget),
+        lambda service: service.connector_login(
+            name,
+            cookies=cookies,
+            forget=forget,
+            browser=browser,
+            browser_state=browser_state,
+            timeout_seconds=timeout,
+            allow_insecure_state=allow_insecure_state,
+        ),
     )
 
 

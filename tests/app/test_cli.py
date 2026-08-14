@@ -242,6 +242,64 @@ def test_allow_insecure_target_is_refused_on_a_restore_rather_than_ignored(
     assert result.exit_code != 0
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+"""A colour escape, which Rich emits on CI and not on this machine.
+
+Kept as a named pattern because its absence was a real failure rather than a hypothetical one:
+the first version of :func:`_unwrapped` stripped box drawing and not escapes, so on the runner
+the sentence read ``... there is no \x1b[31m\x1b[0m file for the flag ...`` and the substring
+was not there. Local runs were colourless and passed.
+"""
+
+
+def _unwrapped(output: str) -> str:
+    """Terminal output as the sentence it is, independent of how it was rendered.
+
+    Rich wraps a refusal to the terminal width, draws a border around it, and colours the border
+    when it thinks it is writing to a terminal. All three break a substring that spans a line, so
+    all three come out: escapes first, then the box drawing, then the wrapping.
+    """
+    plain = _ANSI.sub("", output)
+    stripped = "".join(char for char in plain if char not in "│╭╮╰╯─")
+    return " ".join(stripped.split())
+
+
+def test_allow_insecure_state_is_refused_without_a_state_file_rather_than_ignored(
+    bound: ApplicationService,
+) -> None:
+    """The same rule, on the login command. A security flag reaching nothing is the bug.
+
+    ``--browser`` takes cookies out of a browser in memory; there is no file whose permissions
+    the flag could be consenting to. Accepting it would tell somebody they had considered a risk
+    that was not present.
+    """
+    del bound
+    assert "--allow-insecure-state" in cli.INSECURE_STATE_IS_AN_IMPORT_OPTION
+
+    result = run(["connector", "login", "wiki", "--browser", "--allow-insecure-state"])
+
+    # The message, not merely the status. A login for an unconfigured source exits non-zero on
+    # its own, so an exit-code assertion here passes with the guard deleted — checked by
+    # deleting it.
+    assert result.exit_code != 0
+    assert "no file for the flag to consent to" in _unwrapped(result.output)
+
+
+def test_a_timeout_is_refused_without_the_path_that_waits(bound: ApplicationService) -> None:
+    """Milder than the flag above and refused on the same principle.
+
+    Nothing unsafe follows from an ignored ``--timeout``, but a person who passed one and watched
+    the command return instantly has been told something untrue about what it did.
+    """
+    del bound
+    assert "--timeout" in cli.BROWSER_TIMEOUT_IS_A_BROWSER_OPTION
+
+    result = run(["connector", "login", "wiki", "--forget", "--timeout", "99"])
+
+    assert result.exit_code != 0
+    assert "only the --browser path waits for" in _unwrapped(result.output)
+
+
 # --- one document or the whole corpus -----------------------------------------------------------
 
 

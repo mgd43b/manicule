@@ -58,7 +58,11 @@ from manicule.ingest.reindex import DEFAULT_SWEEP_BATCH
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 
+    from pydantic import SecretStr
+
     from manicule.app.ports import Backend, Conversing
+    from manicule.connectors.browser import BrowserSessionProvider
+    from manicule.connectors.config import ConfluenceConfig
     from manicule.connectors.enriched import EnrichedProfile
     from manicule.connectors.filesystem import FilesystemConnector
     from manicule.core.content import Chunk, Document
@@ -673,35 +677,82 @@ class ApplicationService:
         return _ingest_payload(report, started)
 
     async def connector_login(
-        self, name: str, *, cookies: str = "", forget: bool = False
+        self,
+        name: str,
+        *,
+        cookies: str = "",
+        forget: bool = False,
+        browser: bool = False,
+        browser_state: Path | str | None = None,
+        timeout_seconds: float | None = None,
+        allow_insecure_state: bool = False,
+        provider: BrowserSessionProvider | None = None,
     ) -> r.ConnectorSignedIn:
         """Capture the browser session a Confluence source authenticates with, or forget it.
 
-        The session is proved against the instance before it is stored, because a cookie copied
-        short, copied from the wrong tab or copied from a session that had already timed out is
-        indistinguishable from a working one until something uses it — and otherwise the first
-        thing to use it would be the first page of the next sync.
+        Three ways in, one way through. ``--browser`` drives a browser the person signs in to,
+        ``--browser-state`` imports a Playwright state file somebody else's tooling wrote, and the
+        default asks for a pasted ``Cookie`` header. All three end at
+        :func:`~manicule.connectors.sessions.capture_cookies`, which proves the cookies against
+        the instance before anything is stored — so a session copied short, taken from the wrong
+        tab, extracted from a state file belonging to another site, or collected from a browser
+        the person had not finished signing in to is refused rather than persisted. Otherwise the
+        first thing to use it would be the first page of the next sync.
 
-        manicule never sees the password. The caller supplies cookies from a browser that is
-        already signed in; there is no parameter here that could carry a password and no code
-        path that would accept one.
+        **manicule never sees the password on any of the three.** There is no parameter here that
+        could carry one and no code path that would accept one. On the browser path the person
+        types into a browser manicule opened, which is a weaker statement than the other two —
+        :mod:`manicule.connectors.browser` says exactly how much weaker and what replaces it.
+
+        **A failed login leaves a working credential alone.** Nothing is removed before the
+        replacement is verified, so a timeout, a closed window or a dead session costs the attempt
+        and not the session already stored.
 
         Args:
-            name: The configured source. Its type must be the Confluence connector, which is
-                the only one that authenticates this way.
-            cookies: The ``Cookie`` header from a signed-in browser.
+            name: The configured source. It must exist, be enabled, and be a Confluence source,
+                which is the only type that authenticates this way.
+            cookies: The ``Cookie`` header from a signed-in browser. The manual path.
             forget: Remove the stored session instead of capturing one.
+            browser: Open a browser and wait for the person to sign in.
+            browser_state: Import cookies from a Playwright ``storage_state`` document.
+            timeout_seconds: How long the browser path waits. ``None`` uses the source's
+                ``browser_timeout_seconds``.
+            allow_insecure_state: Import a state file other users on this machine can read.
+            provider: What opens the browser. ``None`` uses Playwright. A parameter so the flow
+                can be exercised without one, on the same principle as ``capture``'s ``transport``.
 
         Raises:
             UnknownEntityError: Configuration has no connector by that name.
-            ConfigError: That connector is not a Confluence source, or the paste carried no
-                cookies, or the instance would not confirm who the session belongs to.
+            PolicyError: The source is configured ``enabled = false``.
+            ConfigError: That connector is not a Confluence source, more than one way in was
+                asked for, the material carried no usable cookies, or the instance would not
+                confirm who the session belongs to.
         """
         from manicule.connectors.config import (  # noqa: PLC0415 - no HTTP stack at import
             CONNECTOR_NAME,
             ConfluenceConfig,
         )
-        from manicule.connectors.sessions import capture, default_store  # noqa: PLC0415
+        from manicule.connectors.sessions import (  # noqa: PLC0415
+            capture,
+            capture_cookies,
+            default_store,
+        )
+
+        chosen = [
+            label
+            for label, asked in (
+                ("--browser", browser),
+                ("--browser-state", browser_state is not None),
+                ("--forget", forget),
+            )
+            if asked
+        ]
+        if len(chosen) > 1:
+            msg = (
+                f"{' and '.join(chosen)} were given together, and each is a different thing to "
+                f"do with this source's credential. Pick one."
+            )
+            raise ConfigError(msg)
 
         # Settings directly rather than ``Runtime.connector(name)``, which every other
         # connector operation uses. That builds the connector, and building it resolves the
@@ -712,6 +763,13 @@ class ApplicationService:
             known = ", ".join(sorted(self.settings.connectors)) or "none configured"
             msg = f"no connector named {name!r}. Configured: {known}"
             raise UnknownEntityError(msg)
+        if not configured.enabled:
+            msg = (
+                f"connector {name!r} is configured `enabled = false`, so a credential captured "
+                f"for it would not be used by anything. Set it to true in [connectors.{name}] "
+                f"first."
+            )
+            raise PolicyError(msg)
         if configured.type != CONNECTOR_NAME:
             msg = (
                 f"{name!r} is a {configured.type!r} source, and a browser session is how the "
@@ -732,7 +790,23 @@ class ApplicationService:
                 stored_in=store.describe(),
                 forgotten=True,
             )
-        session = await capture(config, cookies, store=store)
+
+        if browser:
+            session = await capture_cookies(
+                config,
+                await self._browser_cookies(
+                    config, provider=provider, timeout_seconds=timeout_seconds
+                ),
+                store=store,
+            )
+        elif browser_state is not None:
+            session = await capture_cookies(
+                config,
+                _state_cookies(config, browser_state, allow_insecure=allow_insecure_state),
+                store=store,
+            )
+        else:
+            session = await capture(config, cookies, store=store)
         expires = session.captured_at + timedelta(hours=config.session_max_age_hours)
         return r.ConnectorSignedIn(
             name=name,
@@ -742,6 +816,42 @@ class ApplicationService:
             expires_at=expires.isoformat(),
             stored_in=store.describe(),
         )
+
+    async def _browser_cookies(
+        self,
+        config: ConfluenceConfig,
+        *,
+        provider: BrowserSessionProvider | None,
+        timeout_seconds: float | None,
+    ) -> Mapping[str, SecretStr]:
+        """Sign in through a browser and return the cookies that belong to this instance.
+
+        The filter is applied *here* rather than inside the provider, so that every provider —
+        Playwright today, something else later — is held to it by the caller rather than by its
+        own good behaviour. An identity provider's cookies never reach the store because they
+        never get past this line.
+        """
+        from manicule.connectors.browser import (  # noqa: PLC0415 - optional dependency
+            PlaywrightProvider,
+            origin_cookies,
+        )
+
+        driver = provider if provider is not None else PlaywrightProvider()
+        # `is None` rather than `or`: a `--timeout 0` is falsy, and folding it into the default
+        # would silently wait five minutes for somebody who asked to wait none. Zero is refused
+        # at the command line rather than substituted, so neither reading is invented here.
+        wait = config.browser_timeout_seconds if timeout_seconds is None else timeout_seconds
+        candidates = await driver.authenticate(config, timeout_seconds=wait)
+        found = origin_cookies(candidates, base_url=config.base_url)
+        if not found:
+            msg = (
+                f"the browser finished with no cookies for {config.base_url}. Nothing has been "
+                f"stored and any previously stored session is untouched. If sign-in redirected "
+                f"to a different host than the one configured, check base_url names the site "
+                f"root including any context path."
+            )
+            raise ConfigError(msg)
+        return found
 
     async def connector_list(self) -> r.ConnectorList:
         """Every configured source, with what the last run recorded."""
@@ -4313,6 +4423,43 @@ def _local(path: Path | str) -> Path:
     blocking I/O that has to leave the event loop.
     """
     return Path(path).expanduser()
+
+
+def _state_cookies(
+    config: ConfluenceConfig, path: Path | str, *, allow_insecure: bool
+) -> Mapping[str, SecretStr]:
+    """The cookies in a Playwright state file that belong to this instance.
+
+    Three steps, each independently testable and each refusing for its own reason: read the file
+    (permissions, size), parse it (shape), filter it (origin). The last is the same function the
+    browser path uses, so a state file and a live browser cannot disagree about which cookies are
+    Confluence's.
+
+    Raises:
+        ConfigError: The file cannot be read or is not a state document, or it carries nothing
+            for this instance. The message never includes any of the contents — the whole file
+            is secret, and a diagnostic quoting the offending entry would put a session cookie
+            in a terminal and a log.
+    """
+    from manicule.connectors.browser import (  # noqa: PLC0415 - kept beside its only use
+        cookies_from_state,
+        origin_cookies,
+        read_state_file,
+    )
+
+    found = origin_cookies(
+        cookies_from_state(read_state_file(_local(path), allow_insecure=allow_insecure)),
+        base_url=config.base_url,
+    )
+    if not found:
+        msg = (
+            f"the browser state has no cookies for {config.base_url}. A state file records the "
+            f"cookies of whatever was signed in when it was written, so this one is most likely "
+            f"from a different site — or from a sign-in that did not reach Confluence itself. "
+            f"Nothing has been stored and any previously stored session is untouched."
+        )
+        raise ConfigError(msg)
+    return found
 
 
 def _bounded_root(candidate: Path | str | None, root: Path, source: str) -> Path:

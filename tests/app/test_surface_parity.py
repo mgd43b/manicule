@@ -136,6 +136,17 @@ def test_no_tool_writes_files_into_the_users_corpus() -> None:
     assert "connector_sidecar" not in TOOL_NAMES
 
 
+def test_no_tool_opens_a_browser_or_captures_a_credential() -> None:
+    """``connector_login`` is command line only, and now for two reasons rather than one.
+
+    It has always written a credential to the keychain. It can now also **open a browser window
+    on this machine** and wait several minutes for a person to sign in. An assistant that could
+    call it would launch a GUI nobody asked for on a host nobody may be sitting at, and then
+    block until the timeout — which is a new kind of authority rather than a new operation.
+    """
+    assert "connector_login" not in TOOL_NAMES
+
+
 def test_no_tool_re_parses_the_whole_corpus() -> None:
     """``document reindex --stale`` is command line only, by the rule above.
 
