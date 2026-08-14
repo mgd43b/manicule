@@ -304,7 +304,10 @@ command-line only. Each of them either destroys data, mints a credential, writes
 operator's own corpus directory, or changes what the installation *is* — and a tool an
 assistant can call unattended should not be able to do any of that. The twenty-eight tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
-surface, and `tests/app/test_surface_parity.py` asserts each of these absences by name.
+surface. Four of these absences are asserted by name in `tests/app/test_surface_parity.py` —
+`collection_orphans`, `connector_sidecar`, `connector_login` and `document_reindex_stale`,
+each of which was argued about rather than obvious. The rest are held by the tool count and by
+this list.
 
 `document_reindex_stale` is there for a fourth reason, and it is the one that also keeps it off
 the HTTP surface (`tests/api/test_routes.py`). It re-parses, re-chunks and re-embeds every

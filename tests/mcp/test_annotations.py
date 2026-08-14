@@ -171,6 +171,14 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
 
     The arguments below are written down, and a read-only tool missing from them fails rather
     than being skipped — a tool this cannot call is a tool whose annotation nothing has checked.
+
+    **What this does not catch, said plainly.** The comparison is over the *backend*, so a tool
+    that wrote to the filesystem rather than through a store would pass it. Two tools reach
+    outside the fakes today and both were read instead: ``config_get`` resolves a path and
+    redacts settings already in memory, and ``doctor`` stats the data directory without
+    creating anything the runtime had not already created by opening it. A third case is
+    excluded by argument rather than by luck — ``plugin_list`` is called without ``registry``,
+    which is the only branch of it that opens a connection.
     """
     service, backend = await build_fixture()
     document_id = next(iter(backend.store.documents))

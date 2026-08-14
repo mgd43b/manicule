@@ -273,14 +273,14 @@ class LexicalRetriever(FakeRetriever):
         self.seen.append(query)
         wanted = _terms(query.text)
         scope = query.filter.collection_ids
-        scored = [
-            (overlap, chunk)
-            for chunk in self.chunks
-            if not scope
-            or (self.collections_by_document.get(chunk.document_id, frozenset()) & scope)
-            for overlap in (len(_terms(chunk.text) & wanted),)
-            if overlap
-        ]
+        scored: list[tuple[int, Chunk]] = []
+        for chunk in self.chunks:
+            held = self.collections_by_document.get(chunk.document_id, frozenset())
+            if scope and not (held & scope):
+                continue
+            overlap = len(_terms(chunk.text) & wanted)
+            if overlap:
+                scored.append((overlap, chunk))
         # Highest overlap first, then by chunk id, so two runs of the same query rank the same.
         scored.sort(key=lambda pair: (-pair[0], pair[1].id))
         candidates = [
@@ -379,13 +379,24 @@ class Accounting:
     """The sum of every ``limit`` asked for."""
 
     returned_passages: int
-    """How many came back. Below ``requested_passages`` whenever the corpus ran out first."""
+    """How many came back, control included. Below ``requested_passages`` when the corpus ran
+    out of matching passages before the limit did."""
 
     deduplicated_passages: int
-    """How many survive deduplication by document and heading — what synthesis would read."""
+    """How many survive deduplication by document and heading — what synthesis would read.
+
+    The **supported** searches only. The control's passages are the thing being refused rather
+    than evidence to be read, so folding them in here would report a client as carrying material
+    it decided not to use.
+    """
 
     payload_bytes: int
-    """Bytes of serialized MCP result across every call, ``tools/list`` included."""
+    """Bytes of every tool result this run received, serialized.
+
+    Tool *results* — a client also pays for the ``tools/list`` block and for its own prompt, and
+    neither is counted here, because neither is a cost the recipe controls. What this bounds is
+    what a search decision spends.
+    """
 
     generator_tokens: int | None
     """Estimated generator tokens for the deduplicated evidence, or ``None``.
@@ -396,9 +407,11 @@ class Accounting:
     """
 
     def within(self, budget: Budget) -> bool:
-        """Whether every declared ceiling held."""
+        """Whether every declared ceiling held: searches, passages, bytes and tokens."""
         return (
             self.searches <= budget.searches
+            and self.requested_passages <= budget.searches * budget.limit
+            and self.returned_passages <= self.requested_passages
             and self.payload_bytes <= budget.payload_bytes
             and (self.generator_tokens is None or self.generator_tokens <= budget.generator_tokens)
         )
@@ -506,7 +519,7 @@ class _Transcript:
 
     def __init__(self, client: Client[Any]) -> None:
         self._client = client
-        self.bytes = 0
+        self.payload_bytes = 0
 
     async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Call one tool and return its envelope, counting what it serialized to.
@@ -517,7 +530,7 @@ class _Transcript:
         """
         result = await self._client.call_tool(tool, arguments)
         envelope: dict[str, Any] = dict(result.structured_content or {})
-        self.bytes += len(json.dumps(envelope, sort_keys=True).encode("utf-8"))
+        self.payload_bytes += len(json.dumps(envelope, sort_keys=True).encode("utf-8"))
         return envelope
 
 
@@ -629,7 +642,7 @@ async def qualify(service: ApplicationService, *, budget: Budget | None = None) 
             requested_passages=searches * limit,
             returned_passages=returned,
             deduplicated_passages=len(evidence),
-            payload_bytes=transcript.bytes,
+            payload_bytes=transcript.payload_bytes,
             generator_tokens=estimate_tokens(evidence),
         ),
     )
