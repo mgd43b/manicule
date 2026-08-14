@@ -384,24 +384,55 @@ def _announce(message: str) -> None:
 
 @dataclass(slots=True)
 class Serving:
-    """The control socket and the scheduler, started and stopped together.
+    """The control socket and the scheduler, started and stopped together, in that order.
 
     A small object rather than two variables in :func:`~manicule.cli.serving._serve`, because
     the thing that must not be got wrong is that both are closed on every path out — including
     the one where the transport raised — and one ``async with`` is harder to get wrong than two
     ``finally`` blocks.
+
+    **The closing order is the first half of the server's shutdown and is not arbitrary.**
+
+    1. The scheduler, so that no new sync starts. Canceling its loops cancels whatever sync each
+       was inside, and a canceled run drains its ingest stages within ``ingest.shutdown_grace_s``
+       (#138) rather than abandoning a document mid-write.
+    2. The control socket, whose ``aclose`` waits for the write commands already in flight. It is
+       second because a proxied sync that is still running is work an operator asked for and is
+       watching, and because closing it first would leave those commands with nowhere to answer.
+
+    The second half — the MCP sessions and the HTTP server — belongs to whatever is serving the
+    transport and happens after this returns, which is why it is not here. See
+    :func:`~manicule.cli.serving._serve`.
     """
 
     server: control.ControlServer
     scheduler: Scheduler
 
-    async def __aenter__(self) -> Serving:
+    async def astart(self) -> None:
+        """Bind the socket, then begin the schedule.
+
+        Socket first, so that the moment anything is syncing there is somewhere for
+        ``manicule stop`` and a proxied command to reach. The reverse order leaves a window in
+        which a sync is running and the process cannot be talked to.
+        """
         await self.server.start()
         self.scheduler.start()
+
+    async def aclose(self) -> None:
+        """Stop the schedule, then the socket. Both, on every path, in that order.
+
+        The scheduler's ``aclose`` is wrapped because a loop that raised while being canceled
+        must not stop the socket being closed: the socket is a *file*, and one left behind with
+        no server answering is what the next start has to clear.
+        """
+        with contextlib.suppress(Exception):
+            await self.scheduler.aclose()
+        await self.server.aclose()
+
+    async def __aenter__(self) -> Serving:
+        await self.astart()
         return self
 
     async def __aexit__(self, *exc: object) -> None:
         del exc
-        with contextlib.suppress(Exception):
-            await self.scheduler.aclose()
-        await self.server.aclose()
+        await self.aclose()
