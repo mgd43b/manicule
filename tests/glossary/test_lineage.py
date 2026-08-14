@@ -211,14 +211,17 @@ def test_the_detector_may_not_import_dynamically() -> None:
     genuinely needs a dynamic import, this fails and whoever wrote it has to decide how the
     fingerprint covers it — which is the conversation that would otherwise not happen.
 
-    **Matched on the name being called rather than on how it was reached**, because the obvious
-    version of this had the same blind spot as the derivation it defends: checking `ast.Attribute`
-    for `import_module` misses `from importlib import import_module` followed by a bare call, and
-    the guard would then be silent about exactly the thing it exists to make loud. All four
-    spellings are caught — bare, attribute, `builtins.__import__`, and the rebound name.
+    **One rule: a call is refused when the name at the call site is `import_module` or
+    `__import__`, plain name or attribute.** Stated rather than enumerated, because a list of
+    example spellings reads as a specification and drifts from the code the first time either
+    moves. The obvious version of this matched `ast.Attribute` for `import_module` and
+    `ast.Name` for `__import__`, which had the same blind spot as the derivation it defends:
+    `from importlib import import_module` then a bare call walked past it, and the guard was
+    silent about exactly the thing it exists to make loud.
 
-    **It is over-broad by the same rule, and that is the trade rather than an oversight.** Any
-    `.import_module(...)` is flagged whether or not it is importlib's. Narrowing it would mean
+    **The same rule makes it over-broad, and that is the trade rather than an oversight.** An
+    unrelated `whatever.import_module(...)` is flagged too, because the rule reads the call site
+    and not what the name resolves to. Narrowing it would mean
     resolving the binding — machinery whose only purpose is to grant an exemption, in two files
     that today import nothing but `re`, `unicodedata`, `typing`, `enum` and ``pydantic``. A false
     positive here is one loud failure landing on whoever wrote the line, with an assertion
