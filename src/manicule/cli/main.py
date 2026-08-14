@@ -161,6 +161,18 @@ because a person who passed a timeout and watched the command return instantly h
 something untrue about what it did.
 """
 
+BROWSER_TIMEOUT_MUST_BE_POSITIVE = (
+    "--timeout is how many seconds to wait for sign-in, so it has to be more than zero. "
+    "browser_timeout_seconds is constrained the same way."
+)
+"""Why ``--timeout 0`` is refused rather than treated as "use the default".
+
+Zero is falsy, and the first version of this folded it into the configured default — so somebody
+who asked to wait no time would have waited five minutes instead. Refusing is the only reading
+that invents nothing: neither "you meant the default" nor "you meant to give up immediately" is
+something the command should decide on their behalf.
+"""
+
 UNKNOWN_WORKSPACE = "unknown"
 """What an envelope reports when configuration could not be loaded at all.
 
@@ -1095,6 +1107,8 @@ def connector_login(
         raise typer.BadParameter(INSECURE_STATE_IS_AN_IMPORT_OPTION)
     if timeout is not None and not browser:
         raise typer.BadParameter(BROWSER_TIMEOUT_IS_A_BROWSER_OPTION)
+    if timeout is not None and timeout <= 0:
+        raise typer.BadParameter(BROWSER_TIMEOUT_MUST_BE_POSITIVE)
 
     # Prompting is skipped for every path that is not the paste, so `--browser` does not stop to
     # ask for the thing it is there to avoid — and `--forget` does not ask for a secret it is

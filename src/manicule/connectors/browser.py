@@ -279,10 +279,14 @@ def read_state_file(path: Path, *, allow_insecure: bool = False) -> str:
             f"else."
         )
         raise ConfigError(msg)
-    exposed = info.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+    # Read and write bits only. `S_IRWXG | S_IRWXO` would include *execute*, and a state file at
+    # mode 0601 is not readable by anybody else — refusing it would be a refusal the message
+    # cannot justify, since the message says "readable". Write counts as well as read: a file
+    # somebody else can rewrite is one whose contents this could be made to import.
+    exposed = info.st_mode & (stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH | stat.S_IWOTH)
     if exposed and not allow_insecure and sys.platform != "win32":
         msg = (
-            f"{path} is readable by other users on this machine (mode "
+            f"{path} is readable or writable by other users on this machine (mode "
             f"{stat.S_IMODE(info.st_mode):04o}), and it holds live session cookies. Run "
             f"`chmod 600 {path}`, or pass --allow-insecure-state to import it anyway."
         )

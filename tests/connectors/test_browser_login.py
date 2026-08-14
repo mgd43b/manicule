@@ -296,8 +296,31 @@ def test_a_world_readable_state_file_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as refusal:
         read_state_file(path)
 
-    assert "readable by other users" in str(refusal.value)
+    assert "readable or writable by other users" in str(refusal.value)
     assert "chmod 600" in str(refusal.value)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes are not the access control on Windows")
+def test_a_group_writable_state_file_is_refused(tmp_path: Path) -> None:
+    """Write counts as well as read: a file somebody else can rewrite is one this would import."""
+    path = written_state(tmp_path, state(entry()), mode=0o620)
+
+    with pytest.raises(ConfigError) as refusal:
+        read_state_file(path)
+
+    assert "readable or writable by other users" in str(refusal.value)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes are not the access control on Windows")
+def test_an_execute_bit_alone_does_not_make_a_state_file_exposed(tmp_path: Path) -> None:
+    """0601 is not readable by anybody else, and refusing it says something untrue.
+
+    ``S_IRWXG | S_IRWXO`` includes execute, so the first version refused this and told the
+    operator the file was "readable by other users" when it was not. Found by Copilot on #133.
+    """
+    path = written_state(tmp_path, state(entry()), mode=0o601)
+
+    assert "JSESSIONID" in read_state_file(path)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX modes are not the access control on Windows")
@@ -610,6 +633,29 @@ async def test_the_configured_timeout_reaches_the_provider(
     )
 
     assert provider.calls == [42.0]
+
+
+async def test_a_zero_timeout_is_not_folded_into_the_configured_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero is falsy, and ``or`` would have turned "wait none" into "wait five minutes".
+
+    The command line refuses a non-positive ``--timeout`` outright, so this is about the service
+    not *inventing* a reading when one arrives by another route. Found by Copilot on #133.
+    """
+    service, _ = service_for(browser_timeout_seconds=300.0)
+    provider = FakeProvider([cookie()])
+
+    await login(
+        service,
+        provider=provider,
+        monkeypatch=monkeypatch,
+        site=instance(),
+        store=MemoryStore(),
+        timeout_seconds=0.0,
+    )
+
+    assert provider.calls == [0.0], "a falsy timeout was replaced by the configured default"
 
 
 async def test_an_explicit_timeout_overrides_the_configured_one(

@@ -232,8 +232,8 @@ dev = [
   # The browser driver, so the Playwright provider is type-checked and importable in CI. This
   # is the *package* only — `playwright install chromium` downloads the browser and CI does not
   # run it. Every test of the login flow drives `BrowserSessionProvider` with a fake, so the
-  # suite neither downloads nor launches a browser; the one test that would needs the binary
-  # and skips with a reason when it is absent.
+  # suite neither downloads nor launches a browser. The one test that does need the binary skips
+  # with a reason when it is absent.
   "manicule[browser-auth]",
   # The context fitter's tokenizer, for the same reason. `manicule[rerank]` is deliberately
   # *not* here: it is torch, and the cross-encoder's ordering, truncation and failure rules are

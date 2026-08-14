@@ -837,9 +837,11 @@ class ApplicationService:
         )
 
         driver = provider if provider is not None else PlaywrightProvider()
-        candidates = await driver.authenticate(
-            config, timeout_seconds=timeout_seconds or config.browser_timeout_seconds
-        )
+        # `is None` rather than `or`: a `--timeout 0` is falsy, and folding it into the default
+        # would silently wait five minutes for somebody who asked to wait none. Zero is refused
+        # at the command line rather than substituted, so neither reading is invented here.
+        wait = config.browser_timeout_seconds if timeout_seconds is None else timeout_seconds
+        candidates = await driver.authenticate(config, timeout_seconds=wait)
         found = origin_cookies(candidates, base_url=config.base_url)
         if not found:
             msg = (
