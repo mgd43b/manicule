@@ -165,13 +165,20 @@ def test_every_envelope_route_returns_the_same_six_keys() -> None:
     ``/widget`` and ``/ui`` are excluded because they are documents rather than data — the
     browser surface has its own suites, and a page that returned an envelope would be a page
     nobody could read.
+
+    ``/`` is the third kind: a signpost. It is a redirect to the browser surface on a whole
+    server and a plain-text list of what is served on the two modes that have no browser
+    surface, and neither is data a client parses. ``tests/app/test_front_door.py`` is its suite.
     """
     backend, _ = backend_with_a_document()
     probes = {"/healthz", "/readyz"}
+    signposts = {"/"}
     documents = ("/widget", "/ui")
     with client_for(backend) as client:
         for method, path in _operations():
-            if method != "GET" or "{" in path or path in probes or path.startswith(documents):
+            if method != "GET" or "{" in path or path in probes or path in signposts:
+                continue
+            if path.startswith(documents):
                 continue
             if path.startswith("/api/docs") or path.endswith("openapi.json"):
                 continue

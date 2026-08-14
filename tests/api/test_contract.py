@@ -83,6 +83,11 @@ NOT_OPERATIONS: frozenset[str] = frozenset(
         # The widget is a script and a page, not an operation.
         "widget_script",
         "widget_demo",
+        # The front door is a signpost: a redirect to the browser surface, or — with no browser
+        # surface — a list of what this process is serving. It runs nothing and produces no
+        # envelope, so naming it after an operation would put a word on a contract it never
+        # reaches. `tests/app/test_front_door.py` is its suite.
+        "front_door",
         # FastAPI's own, mounted by the framework.
         "swagger_ui_html",
         "swagger_ui_redirect",

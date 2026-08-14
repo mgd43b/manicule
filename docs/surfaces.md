@@ -670,6 +670,16 @@ decision, one address in a plist, one firewall rule and one thing to remember; a
 would need its own answer to every question §6 answers here, and the way that goes wrong is that
 it gets a *different* answer.
 
+**`--mcp-only` answers at that same address, directly**, which is a thing this had to be told
+rather than a thing it did. The two ways of serving MCP go through different code — one is a
+mount on the HTTP application, the other hands the server to the library — and left to the
+library's default the second put the endpoint at `/mcp` and redirected `/mcp/` to it, the
+opposite way round from the first. Both answered *something* at both addresses, so nothing
+failed and a browser saw nothing; what paid for it was a client configured from this page,
+sending a `POST` to `/mcp/` and getting a 307 it may not re-send a body for.
+`manicule.mcp.serve.serve` now passes the path rather than accepting one, and
+`tests/app/test_front_door.py` drives both ways of serving it with redirects switched off.
+
 **Every mutating tool is absent from it.** Not refused — absent. `manicule.mcp.server` is asked
 for the read-only surface, and it never calls `@mcp.tool` for a tool whose `readOnlyHint` is not
 true, so there is no handler behind `document_delete`, `connector_sync`, `config_set`,
@@ -721,6 +731,36 @@ previous handler and re-raises — so the transport shuts down *first* and the t
 run afterwards, in whatever order is left. `manicule.api.serve.Server` overrides one method to
 take the signals back. `tests/app/test_shutdown.py` asserts the order from outside a real
 process that was sent a real `SIGTERM`; reverting that override turns it red.
+
+### 6.3 What answers at `/`
+
+The address the server prints is the address somebody opens, and it used to be a 404 — told by
+the process they had just started, at the address it had just named. Everything is at a path:
+the browser surface at `/ui`, the JSON API under `/api/v1`, MCP at `/mcp/`. Finding the front
+door meant already knowing the layout, which is the one thing a front door exists to remove.
+
+**On a whole server, `/` redirects to `/ui`.** A redirect rather than the dashboard served at
+two paths, so what ends up in the address bar is somewhere real — bookmarkable, linkable,
+reloadable. It is **307**, and temporary is the decision rather than a detail: a browser caches
+a permanent redirect and goes on honoring it long after the server stopped sending one, with no
+way to reach out and clear it. MCP moved onto this port in #143; `/` pointing at `/ui` is a
+default, not a promise. The `Location` is relative, so it names this server's own path rather
+than a value read out of the `Host` header, and the query string is carried across rather than
+dropped.
+
+**With no browser surface, `/` says so and names what is served.** `--no-web` and `--mcp-only`
+each remove the thing a redirect would point at, and **redirecting to a surface an operator
+switched off would be worse than the 404 it replaces** — it spends a second request to reach the
+same answer, having first claimed the thing was somewhere. So each answers 200 with plain text:
+what this process is serving, at absolute addresses built from the address the request arrived
+on, and the flag that is suppressing the pages. `--mcp-only` is the one that matters most,
+because its operator's next move is to paste an address into a client's configuration and the
+bare address is not the one that works.
+
+The wording is `manicule.app.frontdoor`, which is neither surface's, because `manicule.api.app`
+builds a FastAPI application and `manicule.mcp.serve` may not load FastAPI at all — stdio is the
+default transport and an editor spawning it pays for every import. `tests/app/test_front_door.py`
+covers each of the three modes by name.
 
 ---
 

@@ -15,7 +15,7 @@ project keeps failing on. Two things here are cheap to derive and are therefore 
 The CLI and HTTP sections are *not* checked against the code, and pretending otherwise would be
 worse than leaving them alone. Neither is a one-to-one list of anything the code has: the CLI
 section maps another tool's verb vocabulary onto manicule's commands — 35 ticked entries
-against 20 commands — and the HTTP section is a curated list of endpoints, 46 ticked against 75
+against 20 commands — and the HTTP section is a curated list of endpoints, 46 ticked against 76
 walked route objects, because a websocket, a redirect and an unversioned liveness probe are all
 routes and none is an item in that ledger. A comparison between those pairs would need a
 mapping maintained by hand, and a hand-maintained mapping asserting a hand-maintained list is a

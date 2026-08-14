@@ -20,6 +20,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from manicule.app import frontdoor
 from manicule.app import results as r
 
 if TYPE_CHECKING:
@@ -697,6 +698,20 @@ the two strings agree so the mirror cannot drift.
 """
 
 
+_SIGNPOST_WIDTH: Final = len("API documentation")
+"""How wide the labels below the address line are padded, so their addresses share a column.
+
+The longest of them, named rather than counted, because the thing being kept true is that no
+label is wider than the padding — a label that overflowed would push its own address out of
+line and read as the one that is broken.
+"""
+
+
+def _signpost(out: Console, label: str, target: str) -> None:
+    """One "here is where X is" line under the address, in the shared column."""
+    out.print(f"[dim]{label.ljust(_SIGNPOST_WIDTH)}[/dim]  {target}")
+
+
 def render_address(
     out: Console, payload: r.ServerAddress, *, web: bool | None = None, stopped: bool = False
 ) -> None:
@@ -735,15 +750,22 @@ def render_address(
     else:
         out.print(f"[red]{what} on {where} — reachable from the network[/red]")
     if not serves_api:
+        # `--mcp-only`. The bare address above is not what a client is configured with, and
+        # until this line the trailing-slash endpoint appeared in no output at all — so the
+        # next thing an operator did was paste an address that answers nothing.
+        _signpost(out, "MCP endpoint", f"{where}{frontdoor.MCP_ENDPOINT}")
         out.print(f"[dim]{payload.tools} tool(s)[/dim]")
         return
     # The signposts a person wants next, and none of them were printed before. A server whose
     # browser surface is not named is one nobody finds without reading the source.
     if web is True:
-        out.print(f"[dim]browser surface[/dim]  {where}/ui")
+        _signpost(out, "browser surface", f"{where}{frontdoor.UI}")
     elif web is False:
-        out.print("[dim]browser surface off (--no-web)[/dim]")
-    out.print(f"[dim]API documentation[/dim] {where}/api/docs")
+        _signpost(out, "browser surface", "off (--no-web)")
+    # MCP has been on this port since #143 and was named in none of this. An operator wiring up
+    # a client had the port and had to know the path.
+    _signpost(out, "MCP endpoint", f"{where}{frontdoor.MCP_ENDPOINT}")
+    _signpost(out, "API documentation", f"{where}{frontdoor.DOCS}")
 
 
 def render_upgrade(out: Console, payload: r.UpgradeReport) -> None:
