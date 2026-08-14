@@ -136,6 +136,31 @@ than inert: the flag reads as "show me what this would do", and silently doing i
 the one outcome the person typing it was trying to avoid.
 """
 
+INSECURE_STATE_IS_AN_IMPORT_OPTION = (
+    "--allow-insecure-state applies to --browser-state, which reads a file whose permissions "
+    "decide whether importing it is safe. --browser opens a browser and takes cookies from it "
+    "in memory; there is no file for the flag to consent to."
+)
+"""Why ``--browser --allow-insecure-state`` is refused rather than ignored.
+
+The same rule :data:`INSECURE_TARGET_IS_A_BACKUP_OPTION` states, and it bites hardest on a
+*security* flag: an option that reads as "I have considered this risk and accept it" and reaches
+nothing is the precise defect the option exists to prevent. Found by re-reading the diff against
+the convention rather than by anything failing.
+"""
+
+BROWSER_TIMEOUT_IS_A_BROWSER_OPTION = (
+    "--timeout is how long to wait for a person to finish signing in, which only the --browser "
+    "path waits for. Importing a state file and forgetting a session are both immediate, and "
+    "pasting a Cookie header waits on you rather than on a clock."
+)
+"""Why ``--timeout`` without ``--browser`` is refused rather than ignored.
+
+Milder than the one above — nothing unsafe follows from it — and refused on the same principle,
+because a person who passed a timeout and watched the command return instantly has been told
+something untrue about what it did.
+"""
+
 UNKNOWN_WORKSPACE = "unknown"
 """What an envelope reports when configuration could not be loaded at all.
 
@@ -1061,9 +1086,19 @@ def connector_login(
     Command line only. It opens a window on this machine and writes a credential to the
     keychain, neither of which belongs on a surface an unattended caller can reach.
     """
+    # An option that reaches nothing is refused rather than accepted, on the rule
+    # `INSECURE_TARGET_IS_A_BACKUP_OPTION` states. Here rather than in the service because these
+    # are facts about the *invocation* — which flags were typed together — and Typer is what
+    # turns that into the error a person reads. Mutual exclusion between the three ways in stays
+    # in the service, because that one is a fact about the operation and every surface needs it.
+    if allow_insecure_state and browser_state is None:
+        raise typer.BadParameter(INSECURE_STATE_IS_AN_IMPORT_OPTION)
+    if timeout is not None and not browser:
+        raise typer.BadParameter(BROWSER_TIMEOUT_IS_A_BROWSER_OPTION)
+
     # Prompting is skipped for every path that is not the paste, so `--browser` does not stop to
     # ask for the thing it is there to avoid — and `--forget` does not ask for a secret it is
-    # about to delete. Mutual exclusion is the service's, so one refusal covers every surface.
+    # about to delete.
     manual = not (browser or browser_state is not None or forget)
     cookies = read_secret(SESSION_PROMPT) if manual else ""
     emit(

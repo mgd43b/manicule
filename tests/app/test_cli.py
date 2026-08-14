@@ -242,6 +242,53 @@ def test_allow_insecure_target_is_refused_on_a_restore_rather_than_ignored(
     assert result.exit_code != 0
 
 
+def _unwrapped(output: str) -> str:
+    """Terminal output with the box drawing and wrapping taken out.
+
+    Rich wraps a refusal to the terminal width and draws a border around it, so a substring that
+    spans a line break is not present in the raw text. Joining on whitespace makes the assertion
+    about the sentence rather than about how wide the runner's terminal happened to be.
+    """
+    stripped = "".join(char for char in output if char not in "│╭╮╰╯─")
+    return " ".join(stripped.split())
+
+
+def test_allow_insecure_state_is_refused_without_a_state_file_rather_than_ignored(
+    bound: ApplicationService,
+) -> None:
+    """The same rule, on the login command. A security flag reaching nothing is the bug.
+
+    ``--browser`` takes cookies out of a browser in memory; there is no file whose permissions
+    the flag could be consenting to. Accepting it would tell somebody they had considered a risk
+    that was not present.
+    """
+    del bound
+    assert "--allow-insecure-state" in cli.INSECURE_STATE_IS_AN_IMPORT_OPTION
+
+    result = run(["connector", "login", "wiki", "--browser", "--allow-insecure-state"])
+
+    # The message, not merely the status. A login for an unconfigured source exits non-zero on
+    # its own, so an exit-code assertion here passes with the guard deleted — checked by
+    # deleting it.
+    assert result.exit_code != 0
+    assert "no file for the flag to consent to" in _unwrapped(result.output)
+
+
+def test_a_timeout_is_refused_without_the_path_that_waits(bound: ApplicationService) -> None:
+    """Milder than the flag above and refused on the same principle.
+
+    Nothing unsafe follows from an ignored ``--timeout``, but a person who passed one and watched
+    the command return instantly has been told something untrue about what it did.
+    """
+    del bound
+    assert "--timeout" in cli.BROWSER_TIMEOUT_IS_A_BROWSER_OPTION
+
+    result = run(["connector", "login", "wiki", "--forget", "--timeout", "99"])
+
+    assert result.exit_code != 0
+    assert "only the --browser path waits for" in _unwrapped(result.output)
+
+
 # --- one document or the whole corpus -----------------------------------------------------------
 
 
