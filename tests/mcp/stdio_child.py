@@ -11,8 +11,12 @@ holding a real data directory would need an embedder, a migrated database and a 
 before it could answer a scoped search — which is a test of installation, running under a
 `slow` marker, that fails for a dozen reasons having nothing to do with the protocol.
 
-**Nothing may be written to stdout but the protocol.** A stray ``print`` here is a parse error
-at the other end, which is the whole reason ``serve`` passes ``show_banner=False``.
+**Nothing may be written to stdout but the protocol**, which is why ``serve`` passes
+``show_banner=False`` — and the suite next door does *not* catch a violation, which was
+measured rather than assumed. A ``print`` added here leaves ``tests/mcp/test_stdio.py`` green:
+the client this package uses skips a line it cannot parse as a message. So "stdout is the
+protocol channel" is upheld by review here, not by a test, and saying otherwise would be a
+check whose name outran what it verified.
 """
 
 from __future__ import annotations

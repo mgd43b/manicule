@@ -3,13 +3,17 @@
 Every other suite here drives the server in memory, which exercises the tool registry and the
 envelope and nothing about the transport. This one spawns ``python -m tests.mcp.stdio_child``
 and speaks MCP to it over stdin and stdout, because the deployment everybody actually uses is a
-client spawning a process — and the failure that deployment has is a byte on stdout that is not
-a message.
+client spawning a process.
 
-What it establishes is narrow and deliberate: a client can discover the surface, resolve a
-collection, get its counts and run a scoped search, and **nothing was indexed, synchronized or
-deleted to make that work**. The corpus is the same synthetic fixture the rest of this package
-uses; see ``tests/mcp/stdio_child.py`` for what is real in the child and what is not.
+What it establishes is narrow and deliberate: a client can discover the surface, read the
+annotations off ``tools/list`` *as they arrive over the wire*, resolve a collection, get its
+counts and run a scoped search — and **nothing was indexed, synchronized or deleted to make
+that work**. The corpus is the same synthetic fixture the rest of this package uses; see
+``tests/mcp/stdio_child.py`` for what is real in the child and what is not.
+
+**What it does not establish, because it was tried:** that the child keeps stdout clean. A
+stray write leaves this file green — the client skips a line it cannot parse as a message — so
+that rule is upheld by review rather than here.
 """
 
 from __future__ import annotations
