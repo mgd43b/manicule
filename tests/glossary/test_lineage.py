@@ -264,12 +264,17 @@ def test_the_prohibition_is_narrower_than_it_sounds(*, route: str, source: str) 
     can route around a test.
 
     **This failing is good news and the message says so.** If the guard is ever strengthened, this
-    goes red and tells whoever did it to narrow `DERIVED_FROM` less.
+    goes red and tells whoever did it to narrow `DERIVED_FROM` less — naming the entry by looking
+    it up rather than by quoting it, because a message that hard-codes the key sends the next
+    reader to a heading that has since been reworded. Which is the same defect as the one this
+    file is about, in an error string.
     """
+    entry = next((key for key in DERIVED_FROM if key.startswith("static imports only")), "")
+    assert entry, "the DERIVED_FROM entry this test is the counterpart to has been renamed"
+
     assert not _dynamic_import_offenders(source), (
-        f"the guard now catches {route}, which is better than it was — update the 'static "
-        f"imports only' entry in DERIVED_FROM, which currently says this route is open, and "
-        f"then delete this case."
+        f"the guard now catches {route}, which is better than it was — update the {entry!r} "
+        f"entry in DERIVED_FROM, which currently says this route is open, then delete this case."
     )
 
 
