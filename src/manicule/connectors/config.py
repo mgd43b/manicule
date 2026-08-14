@@ -5,6 +5,8 @@ configuration model eagerly, so settings written for the connector are validated
 silently ignored, and nothing else. This module imports nothing heavier than pydantic, so
 plugin discovery — which runs in every process that starts, before any configuration is
 read — does not load an HTTP client on a machine that is never going to sync anything.
+:mod:`manicule.connectors.cql` is imported for one predicate, whether a configured root page id
+is a content id, and it is pure text and datetime work with no dependency of its own.
 
 **The index this connector builds is not permission-aware.** Every page and attachment is
 fetched as the account whose credentials are configured here, so the index ends up holding
@@ -25,6 +27,7 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from manicule.connectors.cql import is_page_id
 from manicule.connectors.enriched import DEFAULT_PROFILE, EnrichedProfile
 from manicule.core.errors import ConfigError
 
@@ -275,6 +278,47 @@ class ConfluenceConfig(BaseModel):
         "picked up without a configuration change.",
     )
 
+    root_page_ids: tuple[str, ...] = Field(
+        default=(),
+        description="Page ids whose trees are the scope of this source. Empty means whole "
+        "spaces, which is the behavior every existing configuration has. Set it to index one "
+        "documentation area rather than everything its space contains.",
+    )
+    """A **narrowing of** :attr:`spaces`, never a second way of widening it.
+
+    The two settings answer one question between them: ``spaces`` says which spaces this source
+    may read at all, and ``root_page_ids`` says which trees inside them it actually reads. So
+    the effective scope is the intersection, and every combination that cannot be honored as an
+    intersection is refused at startup rather than resolved by a rule nobody would guess — a
+    root outside the allowlist, and a listed space containing no configured root, are both
+    configuration errors. Union would make ``spaces`` stop being an allowlist the moment a root
+    was added outside it, which is the one thing a setting called an allowlist may not do.
+
+    With no ``spaces`` there is no allowlist, and each root's space is read from the root
+    itself. That is the shortest correct configuration for "index this page tree": one setting.
+    """
+
+    include_root_pages: bool = Field(
+        default=True,
+        description="Whether the configured root pages are themselves indexed, alongside their "
+        "descendants.",
+    )
+    """**True**, because ``root_page_ids = ["100100"]`` names page 100100 and a corpus that
+    contains everything under it *except it* is not what anybody wrote that down to mean.
+
+    The default decides what a corpus contains, so it is chosen for the direction the mistake
+    fails in. Defaulting to ``false`` would leave exactly one page missing — the one that was
+    named — and nothing about the run would say so: the counts look right, the descendants are
+    all there, and the gap surfaces months later as a citation to an overview page that is not
+    in the index. Defaulting to ``true`` costs one extra page for somebody who wanted only the
+    children, and they find out immediately, because the page they did not want is the first
+    thing they see.
+
+    Setting it with no ``root_page_ids`` is refused rather than ignored: with no roots there is
+    no root page to include or leave out, and a setting that silently does nothing reads as one
+    that is in force.
+    """
+
     page_size: int = Field(
         default=100,
         ge=1,
@@ -366,6 +410,24 @@ class ConfluenceConfig(BaseModel):
             if not space.strip():
                 msg = "spaces contains an empty key; remove it rather than syncing everything"
                 raise ValueError(msg)
+        for root in self.root_page_ids:
+            if not is_page_id(root.strip()):
+                msg = (
+                    f"root_page_ids contains {root!r}, which is not a Confluence page id. Ids "
+                    f"are decimal numbers: take the `pageId` from the page's URL, or open the "
+                    f"page and use the number at the end of its short link. A title will not "
+                    f"do — two pages in one space can share one, and the id is what survives a "
+                    f"rename."
+                )
+                raise ValueError(msg)
+        if not self.root_page_ids and "include_root_pages" in self.model_fields_set:
+            msg = (
+                "include_root_pages is set but root_page_ids is empty, so there is no root "
+                "page for it to include or leave out. Set root_page_ids to the tree(s) this "
+                "source should index, or remove include_root_pages — a setting that silently "
+                "does nothing reads like one that is in force."
+            )
+            raise ValueError(msg)
         if self.auth is AuthMethod.BROWSER_SESSION and self.deployment is not Deployment.SERVER:
             msg = (
                 "auth = 'browser_session' is a Server/Data Center arrangement and this is "
@@ -393,7 +455,34 @@ class ConfluenceConfig(BaseModel):
                 "email the token belongs to."
             )
             raise ValueError(msg)
+        # Written back deduplicated and in a stable order, because this tuple is half of the
+        # scope identity a stored watermark is compared against: `["1", "2"]` and `["2", "1",
+        # "1"]` are the same scope, and a run that re-enumerated everything because somebody
+        # reordered a list would be a full sync nobody asked for.
+        self.root_page_ids = tuple(dict.fromkeys(root.strip() for root in self.root_page_ids))
         return self
+
+    @property
+    def scope_identity(self) -> str:
+        """What this configuration's scope is, in a form a stored watermark can be compared to.
+
+        A watermark is a position **within a scope**, and the two are meaningless apart: a
+        position recorded while one page tree was configured says nothing about a run that has
+        just been pointed at a different one. Reusing it would skip every page in the new scope
+        that had not changed since — permanently, because nothing enumerates them again.
+
+        Deliberately legible rather than a digest. It is read by whoever is working out why a
+        sync re-enumerated, and ``roots=100100,100200 include_roots=true`` answers that where a
+        hash would only prove that something changed.
+
+        Spaces are absent on purpose: they are already the keys of the per-space map, so a space
+        added to the allowlist arrives with no stored position and is enumerated in full on its
+        own, and one removed simply stops being asked about. Neither needs the rest discarded.
+        """
+        if not self.root_page_ids:
+            return "whole-space"
+        roots = ",".join(sorted(self.root_page_ids))
+        return f"roots={roots} include_roots={str(self.include_root_pages).lower()}"
 
     @property
     def auth_method(self) -> AuthMethod:

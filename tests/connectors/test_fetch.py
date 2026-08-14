@@ -240,6 +240,54 @@ async def test_a_ref_without_ancestors_still_gets_a_breadcrumb() -> None:
     assert raw.metadata["breadcrumb_complete"] is True
 
 
+async def test_a_breadcrumb_without_its_space_key_does_not_claim_to_be_complete() -> None:
+    """The Cloud body endpoint reports a numeric space id, not the key a breadcrumb starts with.
+
+    So a ref that carries neither ancestors nor a space key — a re-fetch from a stored record
+    written before this connector kept one — produces a breadcrumb one level short: every chunk
+    of that page is prefixed ``Platform > Auth Service`` where the rest of the corpus reads
+    ``ENG > Platform > Auth Service``, and it retrieves worse against exactly the queries a
+    space key disambiguates.
+
+    Inventing the key is not available and is not wanted; saying so is. ``breadcrumb_complete``
+    exists for a breadcrumb that is short, and it has to be false when this one is, or a
+    survey of incomplete breadcrumbs reports clean while the gap is in the index.
+    """
+    instance = FakeConfluence(
+        pages=[FakePage(id="1", title="Page", space="ENG", ancestors=("Platform", "Auth Service"))]
+    )
+    connector = await connected(instance)
+    try:
+        raw = await connector.fetch(DocRef(source_id="1", uri=f"{instance.base_url}/pages/1"))
+    finally:
+        await connector.teardown()
+
+    assert raw.metadata[ANCESTORS] == ["Platform", "Auth Service"]
+    assert raw.metadata["breadcrumb_complete"] is False
+
+
+async def test_a_server_breadcrumb_comes_from_the_fetch_own_expansion() -> None:
+    """Storage format expands ``ancestors`` alongside the body, so no ref and no second call.
+
+    Worth pinning because ``docs/connectors/confluence.md`` §4 read as though discovery were
+    the only source of a breadcrumb; on Server and Data Center the fetch has its own, it is
+    complete including the space key, and it is preferred over anything the ref carries.
+    """
+    instance = FakeConfluence(
+        base_url=SERVER_BASE,
+        pages=[FakePage(id="1", title="Page", space="ENG", ancestors=("Platform", "Auth Service"))],
+    )
+    connector = await connected(instance, server_config(instance.base_url))
+    try:
+        raw = await connector.fetch(DocRef(source_id="1", uri=f"{SERVER_BASE}/pages/1"))
+    finally:
+        await connector.teardown()
+
+    assert raw.metadata[ANCESTORS] == ["ENG", "Platform", "Auth Service"]
+    assert raw.metadata["breadcrumb_complete"] is True
+    assert [request.url.path for request in instance.requests] == ["/confluence/rest/api/content/1"]
+
+
 async def test_a_page_whose_adf_body_is_declined_falls_back_to_storage() -> None:
     """The page exists and the format does not, which is not the same as an empty page.
 

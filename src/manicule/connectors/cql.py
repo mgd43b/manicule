@@ -20,6 +20,7 @@ zone anybody had to know.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta
 
@@ -27,9 +28,11 @@ __all__ = [
     "CQL_TIMESTAMP",
     "content_query",
     "cql_timestamp",
+    "is_page_id",
     "latest",
     "parse_when",
     "quote",
+    "subtree_clause",
     "title_query",
 ]
 
@@ -37,6 +40,21 @@ CQL_TIMESTAMP = "%Y/%m/%d %H:%M"
 """The format CQL compares dates in. Minute granularity, which §2's overlap exists to absorb."""
 
 _FORBIDDEN = frozenset({"\n", "\r", "\x00"})
+
+_PAGE_ID = re.compile(r"[0-9]+")
+
+
+def is_page_id(value: str) -> bool:
+    """Whether ``value`` is something this module will put in a query unquoted.
+
+    Confluence content ids are decimal integers on both Cloud and Server/Data Center, and
+    :func:`subtree_clause` emits them as bare numbers rather than as quoted literals. That is
+    not a shortcut: ``ancestor`` and ``id`` compare against a content id, and a bare number has
+    no way to end a string literal and continue as query syntax. Refusing anything that is not
+    digits at the point configuration is read therefore makes the injection hazard
+    :func:`quote` exists for structurally impossible here, instead of escaped.
+    """
+    return bool(value) and _PAGE_ID.fullmatch(value) is not None
 
 
 def quote(value: str) -> str:
@@ -58,12 +76,54 @@ def quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+def subtree_clause(roots: Sequence[str], *, include_roots: bool) -> str:
+    """The CQL that selects one or more page trees, and nothing else in the space.
+
+    ``ancestor`` is Confluence's own descendant predicate: it matches content at any depth
+    below the named page, and it does **not** match that page. So the root itself is selected
+    by a second disjunct on ``id``, and ``include_roots`` decides whether that disjunct is
+    written at all.
+
+    Writing the flag into the query rather than filtering afterwards is what makes it
+    debuggable: the scope of a run is the query it sent, and a page the source was never asked
+    for arriving anyway is then a fact about the deployment rather than something the connector
+    quietly absorbed.
+
+    Args:
+        roots: Configured root page ids. Each must satisfy :func:`is_page_id`.
+        include_roots: Whether the root pages themselves are in scope.
+
+    Raises:
+        ValueError: ``roots`` is empty, or one of them is not a content id. Both are refusals
+            rather than repairs: an empty tree clause would widen the query to the whole space,
+            and a non-numeric id is either a title somebody pasted or an attempt to write
+            query syntax.
+    """
+    if not roots:
+        msg = "subtree_clause needs at least one root page id"
+        raise ValueError(msg)
+    for root in roots:
+        if not is_page_id(root):
+            msg = (
+                f"{root!r} is not a Confluence page id. Ids are decimal numbers — the "
+                f"`pageId` in a page's URL, or the number at the end of a short link."
+            )
+            raise ValueError(msg)
+    listed = ", ".join(roots)
+    descendants = f"ancestor = {roots[0]}" if len(roots) == 1 else f"ancestor in ({listed})"
+    if not include_roots:
+        return descendants
+    themselves = f"id = {roots[0]}" if len(roots) == 1 else f"id in ({listed})"
+    return f"({descendants} OR {themselves})"
+
+
 def content_query(
     space: str,
     *,
     types: Sequence[str] = ("page",),
     since: str | None = None,
     ordered: bool = True,
+    subtree: str = "",
 ) -> str:
     """The CQL for one space's content, optionally only what changed since ``since``.
 
@@ -78,6 +138,9 @@ def content_query(
         since: A :data:`CQL_TIMESTAMP`-formatted timestamp, or ``None`` for everything.
         ordered: Sort oldest first. Deterministic enumeration, so an interrupted run resumes
             over the same ground rather than a reshuffled corpus.
+        subtree: A :func:`subtree_clause`, or ``""`` for the whole space. Narrowing happens
+            **at the source**: a client-side filter over a space-wide enumeration returns the
+            same documents while paying for the space, which is the cost this exists to avoid.
     """
     if not types:
         msg = "content_query needs at least one content type"
@@ -88,6 +151,8 @@ def content_query(
         f"space = {quote(space)}",
         "status = current",
     ]
+    if subtree:
+        clauses.append(subtree)
     if since is not None:
         clauses.append(f"lastmodified >= {quote(since)}")
     query = " AND ".join(clauses)
