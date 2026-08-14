@@ -780,13 +780,17 @@ its cursors. Confluence search cursors expire (`confluence.md` §2), so a sync t
 during a slow embed can fail pagination partway through — a failure that looks like a connector
 bug and is actually missing backpressure.
 
-**The most a run holds in memory**, with the defaults and a four-core machine
-(`parse_workers = 3`, so five ingest workers):
+**The most a run holds in memory**, with the defaults on a four-core machine — where
+`default_worker_count()` is `min(4, cpu_count - 1)` = 3, so there are four ingest workers:
 
 ```
   fetched bodies  =  parse hand-off  +  ingest workers  +  fetch workers blocked on put
-                  =  2 × 5           +  5               +  8                            =  23
+                  =  2 × 4           +  4               +  8                            =  20
 ```
+
+`tests/ingest/test_stage_widths.py` derives those numbers from the pipeline and fails if either
+this arithmetic or the formula behind it moves, because a documented limit that has quietly
+stopped matching the code is the defect this whole section was.
 
 The fetch hand-off holds `DiscoveredDoc` references rather than bodies, which is why it is the
 cheap one and can be the deeper of the two. **The complete discovery result is never held**, and
