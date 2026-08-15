@@ -271,6 +271,28 @@ async def test_a_non_finite_vector_is_refused_before_storage(
     assert await store.count() == 0
 
 
+async def test_float32_overflow_is_refused_without_a_warning_or_partial_row(
+    store: LanceVectorStore,
+) -> None:
+    """A finite Python float can still be non-finite in Lance's physical type."""
+    import warnings  # noqa: PLC0415
+
+    embed = fingerprint().model_copy(update={"backend": "overflowing-backend"})
+    await store.ensure_ready(embed)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ValueError, match="non-finite") as raised:
+            await store.upsert(
+                [chunk("overflow")],
+                [[1e39, 0.0, 0.0, 0.0]],
+                publication_id="never-published",
+            )
+
+    assert "overflowing-backend" in str(raised.value)
+    assert await store.count() == 0
+
+
 @pytest.mark.parametrize(
     "value",
     [float("nan"), float("inf"), float("-inf")],

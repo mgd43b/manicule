@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, override
 
@@ -19,13 +20,14 @@ from sqlalchemy import text
 from manicule.connectors import CursorExpiredError
 from manicule.core.content import (
     IN_FLIGHT,
+    LEGACY_PUBLICATION,
     Commit,
     DocumentStatus,
     PipelineStage,
     RawDocument,
     Retention,
 )
-from manicule.core.embedding import IndexFingerprints
+from manicule.core.embedding import IndexFingerprints, Vector
 from manicule.core.ids import content_hash, document_id, vector_id
 from manicule.core.sources import Watermark
 from manicule.ingest.middleware import MiddlewareRunner
@@ -50,13 +52,16 @@ if TYPE_CHECKING:
 
 
 def _pipeline(
-    docs: SqliteDocStore, vectors: LanceVectorStore, blobs: BlobStore | None = None
+    docs: SqliteDocStore,
+    vectors: LanceVectorStore,
+    blobs: BlobStore | None = None,
+    embedder: HashEmbedder | None = None,
 ) -> IngestPipeline:
     chunker = fakes.BlockChunker()
     return IngestPipeline(
         store=docs,
         chunker=chunker,
-        embedder=HashEmbedder(),
+        embedder=embedder or HashEmbedder(),
         vectors=vectors,
         runner=InProcessRunner({"lines": fakes.LineParser()}),
         resolve_chain=lambda _: ["lines"],
@@ -368,6 +373,42 @@ async def test_a_document_reaches_both_stores_and_is_marked_indexed_last(
     assert document.status is DocumentStatus.INDEXED
     assert await store.count_chunks(document.id) == 2
     assert await vectors.count() == 2
+    await vectors.teardown()
+
+
+async def test_float32_overflow_never_stages_or_publishes_a_real_vector(
+    store: SqliteDocStore,
+    data_dir: Path,
+) -> None:
+    """A finite backend value outside Lance's range is a contextual document failure."""
+    import warnings  # noqa: PLC0415
+
+    class OverflowEmbedder(HashEmbedder):
+        @override
+        async def embed(self, texts: Sequence[str]) -> list[Vector]:
+            return [[1e39, 0.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    embedder = OverflowEmbedder(model_id="fake/overflowing")
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embedder.fingerprint)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        report = await _pipeline(store, vectors, embedder=embedder).run(
+            fakes.DictConnector({"overflow": "finite in Python, not in float32"})
+        )
+
+    document = await store.find_document("memory", "overflow")
+    assert report.by_status == {DocumentStatus.FAILED.value: 1}
+    assert document is not None
+    assert document.status is DocumentStatus.FAILED
+    assert document.publication_id == LEGACY_PUBLICATION
+    assert document.status_detail is not None
+    assert "non-finite" in document.status_detail
+    assert "fake/overflowing" in document.status_detail
+    assert await store.count_chunks(document.id) == 0
+    assert await vectors.count() == 0
+    assert await store.take_tombstones(10) == []
     await vectors.teardown()
 
 

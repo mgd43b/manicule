@@ -1559,16 +1559,16 @@ class IngestPipeline:
             _SupersededError: The stored document moved past ``expected`` before the atomic
                 relational flip. Its staged vectors remain tombstoned for cleanup.
         """
-        publication = self._publication_of(document, chunks, vectors)
-        indexed_document = document.model_copy(
-            update={
-                "publication_id": publication,
-                "status": DocumentStatus.INDEXED,
-                "status_detail": None,
-                "failed_stage": None,
-            }
-        )
         try:
+            publication = self._publication_of(document, chunks, vectors)
+            indexed_document = document.model_copy(
+                update={
+                    "publication_id": publication,
+                    "status": DocumentStatus.INDEXED,
+                    "status_detail": None,
+                    "failed_stage": None,
+                }
+            )
             if existing is None or existing.publication_id != publication:
                 await self._store.stage_vectors(publication, chunks)
             await self._vectors.upsert(chunks, vectors, publication_id=publication)
@@ -1694,10 +1694,27 @@ class IngestPipeline:
                     self._parse_lineage_of(document) or "",
                     self._glossary_lineage or "",
                     *(chunk.model_dump_json() for chunk in chunks),
-                    *(repr(canonical_stored_vector(vector)) for vector in vectors),
+                    *(
+                        repr(self._canonical_vector(chunk, vector))
+                        for chunk, vector in zip(chunks, vectors, strict=True)
+                    ),
                 )
             )
         )
+
+    def _canonical_vector(self, chunk: Chunk, vector: Sequence[float]) -> tuple[float, ...]:
+        """Canonicalize with enough attribution to diagnose a backend's invalid output."""
+        try:
+            return canonical_stored_vector(vector)
+        except ValueError as exc:
+            fingerprint = self._embedder.fingerprint
+            backend = fingerprint.backend or "an unspecified backend"
+            msg = (
+                f"chunk {chunk.id!r} was offered a vector with non-finite values for "
+                f"{fingerprint.describe()} from {backend}. NaN and infinity cannot participate "
+                "in cosine distance, so the vector was refused before publication."
+            )
+            raise ValueError(msg) from exc
 
     # --- change detection ------------------------------------------------------------------
 

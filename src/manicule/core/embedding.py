@@ -46,10 +46,31 @@ def canonical_stored_vector(vector: Vector) -> tuple[float, ...]:
     from turning an identical retry into a different publication.
     """
     values = [float(value) for value in vector]
+    try:
+        float32_inputs = tuple(struct.unpack("!f", struct.pack("!f", value))[0] for value in values)
+    except OverflowError as exc:
+        msg = (
+            "embedding vector became non-finite when converted to float32; NaN and infinity "
+            "cannot participate in cosine distance"
+        )
+        raise ValueError(msg) from exc
+    if not is_finite_vector(float32_inputs):
+        msg = (
+            "embedding vector became non-finite when converted to float32; NaN and infinity "
+            "cannot participate in cosine distance"
+        )
+        raise ValueError(msg)
     norm = math.sqrt(math.fsum(value * value for value in values))
     if norm != 0.0 and abs(norm - 1.0) >= FLOAT32_EPSILON:
         values = [value / norm for value in values]
-    return tuple(struct.unpack("!f", struct.pack("!f", value))[0] for value in values)
+    canonical = tuple(struct.unpack("!f", struct.pack("!f", value))[0] for value in values)
+    if not is_finite_vector(canonical):
+        msg = (
+            "embedding vector became non-finite when canonicalized to float32; NaN and infinity "
+            "cannot participate in cosine distance"
+        )
+        raise ValueError(msg)
+    return canonical
 
 
 def is_finite_vector(vector: Vector) -> bool:
