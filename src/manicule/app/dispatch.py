@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from manicule.app.results import Envelope, ErrorInfo, Payload, failed, succeeded
+from manicule.app.results import Envelope, ErrorInfo, IngestReport, Payload, failed, succeeded
 from manicule.app.tenancy import CrossWorkspaceError
 from manicule.core.errors import (
     ConfigError,
@@ -101,6 +101,13 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
         payload = await call()
     except (ManiculeError, ValueError, OSError) as exc:
         return failed(op, workspace, error_info(exc))
+    if isinstance(payload, IngestReport) and payload.retry_required:
+        reason = payload.incomplete_reason or ErrorInfo(
+            type="IncompleteIngestError",
+            message="the ingest run did not complete",
+            hint="Run the same ingest operation again; its watermark was not advanced.",
+        )
+        return failed(op, workspace, reason, payload=payload)
     return succeeded(op, workspace, payload)
 
 

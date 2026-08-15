@@ -1587,10 +1587,11 @@ and the debounce collapses most of them before they get there.
 
 A first sync of a large Confluence space is hours. It must survive being interrupted.
 
-Each run records id, connector, start/end, watermark before and after, and counters by outcome
-(`discovered`, `skipped_version`, `skipped_hash`, `indexed`, plus one per terminal status). The
-counters are what the summary line in `parsing.md` §6.5 is built from, and what makes the
-fallback-rate signal in §6.6 computable.
+Each run records counters by terminal status and the machine-readable run outcome:
+`complete`, `bounded`, or `incomplete`. The last-run metadata also records whether enumeration
+completed, whether a watermark advanced, whether retry is required, and the typed failure
+reason. This makes an incomplete source walk observable without inferring it from a missing
+watermark or parsing a sentence.
 
 **This needs no new table**, but it does need one column. `connectors.status`, `error_message`,
 `last_synced_at` and `watermark` already exist (`storage.md` §4.7); the per-run counters have
@@ -1669,6 +1670,12 @@ A document that failed and **did** leave a row is a different case and does not 
 watermark back. It is stored, countable, selectable by `document reindex`, and compared again by
 the next sync. Holding the position for it would make one permanently broken document
 re-enumerate a whole corpus for ever, which is a cost with no corresponding loss.
+
+These same three conditions define the public outcome without changing the gate. A discovery
+error or `unrecorded > 0` is `incomplete` and requires retry. A limit is `bounded` and is not an
+unexpected failure. A full walk whose document failures all left durable rows is `complete`.
+The application surfaces report `watermark_advanced` separately because a complete connector
+may legitimately offer no watermark at all.
 
 ### 13.2.2 `--limit N` bounds acceptance
 

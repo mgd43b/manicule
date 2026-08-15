@@ -438,6 +438,10 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     table.add_row("indexed", str(payload.ingested))
     table.add_row("unchanged", str(payload.skipped))
     table.add_row("failed", str(payload.failed))
+    table.add_row("outcome", payload.outcome)
+    table.add_row("enumeration completed", "yes" if payload.enumeration_completed else "no")
+    table.add_row("watermark advanced", "yes" if payload.watermark_advanced else "no")
+    table.add_row("retry required", "yes" if payload.retry_required else "no")
     if payload.expanded:
         table.add_row("found inside others", str(payload.expanded))
     for status, count in sorted(payload.by_status.items()):
@@ -447,6 +451,16 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     if payload.error:
         out.print(f"[red]the run did not finish: {escape(payload.error)}[/red]")
         out.print("[dim]the watermark was not advanced, so running it again resumes[/dim]")
+        return
+    if payload.retry_required:
+        detail = payload.incomplete_reason.message if payload.incomplete_reason else "unknown"
+        out.print(f"[red]the run did not finish: {escape(detail)}[/red]")
+        out.print("[dim]the watermark was not advanced, so running it again resumes[/dim]")
+        return
+    if payload.intentionally_bounded:
+        out.print(
+            "[dim]the requested limit stopped discovery; the watermark was not advanced[/dim]"
+        )
         return
     # The longest command in the first run ends here, often after minutes, and ended on a
     # table with nothing to do about it — the same gap `init` had. Only when something was
@@ -521,7 +535,17 @@ def render_diagnosis(out: Console, payload: r.Diagnosis) -> None:
 
 
 def render_connectors(out: Console, payload: r.ConnectorList) -> None:
-    table = Table("name", "type", "enabled", "installed", "documents", box=None, pad_edge=False)
+    table = Table(
+        "name",
+        "type",
+        "enabled",
+        "installed",
+        "documents",
+        "last outcome",
+        "retry",
+        box=None,
+        pad_edge=False,
+    )
     for connector in payload.connectors:
         table.add_row(
             escape(connector.name),
@@ -529,6 +553,8 @@ def render_connectors(out: Console, payload: r.ConnectorList) -> None:
             "yes" if connector.enabled else "no",
             "yes" if connector.installed else "[red]no[/red]",
             "—" if connector.documents is None else str(connector.documents),
+            connector.last_outcome or "—",
+            "[red]yes[/red]" if connector.retry_required else "no",
         )
     out.print(table)
     if not payload.connectors:

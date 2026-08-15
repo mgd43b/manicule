@@ -246,9 +246,8 @@ class ScheduledSource:
     """One source's schedule, and what its last automatic run did.
 
     Kept so that the server can be asked what its scheduler has been doing without reading a
-    log. ``failures`` counts refusals the sync reported — a disabled source, an expired session —
-    and nothing ends a loop short of the server stopping, which is why there is no third counter
-    for that.
+    log. ``failures`` counts both refusals and returned incomplete outcomes; nothing ends a loop
+    short of the server stopping, so either kind is retried on the next interval.
     """
 
     name: str
@@ -256,6 +255,9 @@ class ScheduledSource:
     runs: int = 0
     failures: int = 0
     awaiting_sign_in: bool = False
+    last_outcome: str = ""
+    retry_required: bool = False
+    last_error_type: str = ""
     """Whether the last run failed because nobody has signed in to this source's instance.
 
     A field rather than a fourth counter, because it is a *state* and not an event: it is true
@@ -366,7 +368,7 @@ class Scheduler:
         while True:
             await self._sleep(interval_s)
             try:
-                await self._service.connector_sync(name)
+                report = await self._service.connector_sync(name)
             except asyncio.CancelledError:
                 raise
             except SessionMissingError as exc:
@@ -393,8 +395,26 @@ class Scheduler:
                 record.failures += 1
                 announce(f"scheduled sync of {name!r} failed: {exc}")
             else:
-                record.runs += 1
-                record.awaiting_sign_in = False
+                record.last_outcome = report.outcome
+                record.retry_required = report.retry_required
+                record.last_error_type = (
+                    report.incomplete_reason.type if report.incomplete_reason is not None else ""
+                )
+                if report.retry_required:
+                    record.failures += 1
+                    detail = (
+                        report.incomplete_reason.message
+                        if report.incomplete_reason is not None
+                        else report.error
+                    )
+                    announce(
+                        f"scheduled sync of {name!r} was incomplete and will be retried: "
+                        f"{record.last_error_type or 'IncompleteIngestError'}: "
+                        f"{detail}"
+                    )
+                else:
+                    record.runs += 1
+                    record.awaiting_sign_in = False
 
 
 def announce(message: str) -> None:

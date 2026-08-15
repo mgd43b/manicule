@@ -543,22 +543,28 @@ def print_envelope(envelope: Envelope) -> None:
         if not envelope.ok:
             raise typer.Exit(1)
         return
-    if envelope.ok and envelope.data is not None:
+    if envelope.data is not None:
         payload = PAYLOADS[envelope.op].model_validate(envelope.data)
         console = render.console()
         if isinstance(payload, r.AnswerResultPayload):
             console.print()
             render.render_answer(console, payload, text_already_shown=STATE.text_already_streamed)
-            return
+            if envelope.ok:
+                return
+            raise typer.Exit(1)
         # `stop` and `start` share a payload — an address is an address — and only the
         # operation says which way the server was going. Without this, stopping one printed
         # the banner that announces one, down to the URL of a browser surface that had just
         # gone away.
         if isinstance(payload, r.ServerAddress) and envelope.op == "stop":
             render.render_address(console, payload, stopped=True)
-            return
+            if envelope.ok:
+                return
+            raise typer.Exit(1)
         render.render(console, payload)
-        return
+        if envelope.ok:
+            return
+        raise typer.Exit(1)
     if envelope.error is not None:
         render.render_error(render.console(stderr=True), envelope.op, envelope.error)
     raise typer.Exit(1)

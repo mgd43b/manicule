@@ -12,7 +12,9 @@ The envelope carries four things before any payload:
     tool call all name the same operation the same way.
 
 ``ok``
-    Whether ``data`` or ``error`` is present. Exactly one of the two always is.
+    Whether the operation completed successfully. Most failures carry only ``error``; an
+    incomplete ingest also retains its partial counters in ``data`` so retry automation does
+    not have to choose between the failure signal and the work already committed.
 
 ``workspace``
     Which tenant the operation ran in. Present on **every** envelope, including failures,
@@ -91,9 +93,17 @@ def succeeded(op: str, workspace: str, payload: Payload) -> Envelope:
     return Envelope(op=op, ok=True, workspace=workspace, data=payload.model_dump(mode="json"))
 
 
-def failed(op: str, workspace: str, error: ErrorInfo) -> Envelope:
-    """Wrap a failure. The only way a failed result is built."""
-    return Envelope(op=op, ok=False, workspace=workspace, error=error)
+def failed(
+    op: str, workspace: str, error: ErrorInfo, *, payload: Payload | None = None
+) -> Envelope:
+    """Wrap a failure, retaining a partial result when the operation produced one."""
+    return Envelope(
+        op=op,
+        ok=False,
+        workspace=workspace,
+        data=payload.model_dump(mode="json") if payload is not None else None,
+        error=error,
+    )
 
 
 type CheckState = Literal["ok", "degraded", "failing", "unknown"]
@@ -1211,6 +1221,9 @@ class AuthProviders(Payload):
 # --- ingest --------------------------------------------------------------------------------
 
 
+type IngestOutcome = Literal["complete", "bounded", "incomplete"]
+
+
 class IngestReport(Payload):
     """What one ingest run did. Shared by ``index_path``, ``connector_sync`` and ``import``.
 
@@ -1227,6 +1240,13 @@ class IngestReport(Payload):
     expanded: int = Field(default=0, ge=0)
     by_status: dict[str, int] = Field(default_factory=dict)
     error: str = ""
+    outcome: IngestOutcome = "complete"
+    enumeration_completed: bool = True
+    watermark_advanced: bool = False
+    retry_required: bool = False
+    intentionally_bounded: bool = False
+    unrecorded: int = Field(default=0, ge=0)
+    incomplete_reason: ErrorInfo | None = None
     elapsed_ms: int = Field(default=0, ge=0)
 
 
@@ -1350,6 +1370,11 @@ class ConnectorSummary(Payload):
     last_synced_at: str | None = None
     status: str = ""
     documents: int | None = Field(default=None, ge=0)
+    last_outcome: IngestOutcome | None = None
+    retry_required: bool = False
+    last_error_type: str = ""
+    last_enumeration_completed: bool | None = None
+    last_watermark_advanced: bool | None = None
 
 
 class ConnectorList(Payload):
@@ -1740,6 +1765,7 @@ __all__ = [
     "Identity",
     "ImportReport",
     "IndexStatus",
+    "IngestOutcome",
     "IngestReport",
     "InitReport",
     "Payload",

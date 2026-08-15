@@ -38,6 +38,7 @@ NOT_FOUND = 404
 CONFLICT = 409
 UNPROCESSABLE = 422
 SERVER_ERROR = 500
+SERVICE_UNAVAILABLE = 503
 
 STATUS_BY_ERROR: dict[str, int] = {
     # Keyed by class name, so these two must stay spelled exactly as the classes are. A
@@ -71,6 +72,8 @@ def status_for(envelope: Envelope) -> int:
     """The HTTP status this envelope should be sent with."""
     if envelope.ok:
         return OK
+    if envelope.data is not None and envelope.data.get("outcome") == "incomplete":
+        return SERVICE_UNAVAILABLE
     kind = envelope.error.type if envelope.error else ""
     return STATUS_BY_ERROR.get(kind, BAD_REQUEST)
 
@@ -129,6 +132,7 @@ __all__ = [
     "NOT_FOUND",
     "OK",
     "SERVER_ERROR",
+    "SERVICE_UNAVAILABLE",
     "STATUS_BY_ERROR",
     "UNAUTHORIZED",
     "UNPROCESSABLE",

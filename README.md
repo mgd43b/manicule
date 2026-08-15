@@ -146,6 +146,11 @@ result envelope is the whole of stdout — no prose, no progress, nothing else �
 that same envelope with `"ok": false`, a typed `error` and a non-zero exit status. So `jq` reads
 well-formed JSON whether the command succeeded or not.
 
+Connector syncs additionally report `data.outcome` as `complete`, `bounded`, or `incomplete`.
+An incomplete sync exits non-zero and keeps its partial counters in `data`; a requested
+`--limit` is `bounded`, exits zero, and never advances the watermark. A document-level failure
+that left a durable repairable row does not by itself make the source enumeration incomplete.
+
 **The HTTP API** is twelve route groups over the same service — health, documents, chat with SSE
 streaming, conversations and shareable links, collections, tags, admin, plugins, auth, a
 workbench, a websocket channel and an MCP endpoint — plus an embeddable chat widget at
