@@ -17,6 +17,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import islice
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
@@ -107,6 +108,8 @@ class BlobStore:
         self._root = data_dir / BLOBS_DIRNAME
         self._max_bytes = max_bytes
         self._sessions = sessions or session_factory(engine)
+        self._staging_cleanup_lock = asyncio.Lock()
+        self._staging_cleanup_complete = False
 
     @property
     def root(self) -> Path:
@@ -119,6 +122,9 @@ class BlobStore:
     def _stage_path(self, key: str) -> Path:
         name = hashlib.blake2b(key.encode(), digest_size=20).hexdigest()
         return self._root / "acquisition-staging" / name
+
+    def _stage_partial_root(self) -> Path:
+        return self._root / "acquisition-staging-partials"
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -143,9 +149,17 @@ class BlobStore:
             cls._fsync_directory(directory.parent)
 
     @classmethod
-    def _write_durable(cls, destination: Path, payload: bytes) -> None:
+    def _write_durable(
+        cls,
+        destination: Path,
+        payload: bytes,
+        *,
+        temporary_dir: Path | None = None,
+    ) -> None:
         cls._mkdir_durable(destination.parent)
-        temporary = destination.with_name(f"{destination.name}.{uuid4().hex}.partial")
+        temporary_parent = temporary_dir or destination.parent
+        cls._mkdir_durable(temporary_parent)
+        temporary = temporary_parent / f"{destination.name}.{uuid4().hex}.partial"
         try:
             descriptor = os.open(
                 temporary,
@@ -158,6 +172,8 @@ class BlobStore:
                 os.fsync(handle.fileno())
             temporary.replace(destination)
             cls._fsync_directory(destination.parent)
+            if temporary_parent != destination.parent:
+                cls._fsync_directory(temporary_parent)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -165,7 +181,7 @@ class BlobStore:
     def _publish_durable(cls, destination: Path, payload: bytes) -> bytes:
         """Publish once across processes and return the representation that won.
 
-        A hard link is the POSIX no-clobber analogue of an atomic rename: exactly one
+        A hard link is the POSIX no-clobber analog of an atomic rename: exactly one
         temporary inode can acquire ``destination``. Every contender then syncs the parent
         before it may create a database reference, including one that observed another
         process's newly linked name before that process reached its own directory sync.
@@ -311,7 +327,7 @@ class BlobStore:
         self, key: str, raw: RawDocument
     ) -> tuple[Retention, AcquiredSource]:
         """Durably stage a complete source envelope so a pre-association crash can resume."""
-        await self.cleanup_staging_partials()
+        await self._cleanup_staging_once()
         acquired = AcquiredSource.from_raw(raw)
         data = raw.as_bytes()
         if len(data) > self._max_bytes:
@@ -334,7 +350,11 @@ class BlobStore:
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        await self._durable_thread_call(lambda: self._write_durable(self._stage_path(key), payload))
+        await self._durable_thread_call(
+            lambda: self._write_durable(
+                self._stage_path(key), payload, temporary_dir=self._stage_partial_root()
+            )
+        )
         await self._record_blob(stored, raw.media_type)
         return Retention(ref=stored.hash), acquired
 
@@ -345,21 +365,15 @@ class BlobStore:
         limit: int = STAGING_PARTIAL_CLEANUP_LIMIT,
     ) -> StagingCleanup:
         """Remove only old abandoned staging writes, reporting aggregate counts."""
-        root = self._root / "acquisition-staging"
+        root = self._stage_partial_root()
         if not root.exists() or limit <= 0:
             return StagingCleanup(scanned=0, removed=0, truncated=False)
         cutoff = time.time() - stale_after_seconds
-        candidates: list[Path] = []
-        scanned = 0
-        truncated = False
-        for path in root.iterdir():
-            if scanned == limit:
-                truncated = True
-                break
-            scanned += 1
-            if not path.is_file() or not path.name.endswith(".partial"):
-                continue
-            candidates.append(path)
+        # This directory contains only temporary writes, separate from live recovery markers,
+        # so ``limit + 1`` bounds directory traversal as well as deletions and report size.
+        inspected = list(islice(root.iterdir(), limit + 1))
+        truncated = len(inspected) > limit
+        candidates = [path for path in inspected[:limit] if path.is_file()]
         removed = 0
         for path in candidates:
             try:
@@ -370,11 +384,23 @@ class BlobStore:
                 continue
         if removed:
             await self._durable_thread_call(lambda: self._fsync_directory(root))
-        return StagingCleanup(scanned=scanned, removed=removed, truncated=truncated)
+        return StagingCleanup(
+            scanned=min(len(inspected), limit), removed=removed, truncated=truncated
+        )
+
+    async def _cleanup_staging_once(self) -> None:
+        """Run startup cleanup once rather than rescanning all markers for every document."""
+        if self._staging_cleanup_complete:
+            return
+        async with self._staging_cleanup_lock:
+            if self._staging_cleanup_complete:
+                return
+            await self.cleanup_staging_partials()
+            self._staging_cleanup_complete = True
 
     async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None:
         """Recover a staged blob/envelope pair without contacting its source."""
-        await self.cleanup_staging_partials()
+        await self._cleanup_staging_once()
         path = self._stage_path(key)
         if not path.exists():
             return None

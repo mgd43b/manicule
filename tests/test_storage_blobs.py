@@ -14,7 +14,13 @@ from sqlalchemy import text
 
 from manicule.core.content import RawDocument
 from manicule.core.ids import content_hash
-from manicule.storage.blobs import BlobStore, OmittedBlob, StoredBlob, should_compress
+from manicule.storage.blobs import (
+    BlobStore,
+    OmittedBlob,
+    StagingCleanup,
+    StoredBlob,
+    should_compress,
+)
 from manicule.storage.docstore import SqliteDocStore
 from tests.storage_helpers import make_document
 
@@ -174,6 +180,7 @@ async def test_staging_partial_is_private_while_live_and_after_publication_failu
     """Sensitive envelopes are 0600 at creation, not only after their write completes."""
     blobs = BlobStore(engine, data_dir)
     staging = blobs.root / "acquisition-staging"
+    partials = blobs._stage_partial_root()  # pyright: ignore[reportPrivateUsage]
     destination = staging / "opaque-marker"
     entered = threading.Event()
     release = threading.Event()
@@ -188,10 +195,15 @@ async def test_staging_partial_is_private_while_live_and_after_publication_failu
 
     monkeypatch.setattr(os, "fsync", gated_file_sync)
     write = asyncio.create_task(
-        asyncio.to_thread(write_durable, destination, b"private source metadata")
+        asyncio.to_thread(
+            write_durable,
+            destination,
+            b"private source metadata",
+            temporary_dir=partials,
+        )
     )
     assert await asyncio.to_thread(entered.wait, 5)
-    partial = next(staging.glob("*.partial"))
+    partial = next(partials.glob("*.partial"))
     assert stat.S_IMODE(partial.stat().st_mode) == 0o600
     release.set()
     await write
@@ -212,7 +224,7 @@ async def test_staging_partial_is_private_while_live_and_after_publication_failu
     assert stat.S_IMODE(failed_destination.stat().st_mode) == 0o600
 
 
-async def test_cancelled_staging_write_is_joined_before_cancellation_returns(
+async def test_canceled_staging_write_is_joined_before_cancellation_returns(
     engine: AsyncEngine,
     data_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -223,16 +235,18 @@ async def test_cancelled_staging_write_is_joined_before_cancellation_returns(
     release = threading.Event()
     original = BlobStore._write_durable  # pyright: ignore[reportPrivateUsage]
 
-    def gated_write(destination: Path, payload: bytes) -> None:
+    def gated_write(
+        destination: Path, payload: bytes, *, temporary_dir: Path | None = None
+    ) -> None:
         if destination.parent.name == "acquisition-staging":
             entered.set()
             assert release.wait(timeout=5)
-        original(destination, payload)
+        original(destination, payload, temporary_dir=temporary_dir)
 
     monkeypatch.setattr(BlobStore, "_write_durable", staticmethod(gated_write))
     raw = RawDocument(
         source_id="private-id",
-        uri="https://private.invalid/cancelled",
+        uri="https://private.invalid/canceled",
         media_type="text/plain",
         content="sensitive body",
     )
@@ -249,7 +263,7 @@ async def test_cancelled_staging_write_is_joined_before_cancellation_returns(
         await task
 
     staging = blobs.root / "acquisition-staging"
-    assert not list(staging.glob("*.partial"))
+    assert not list(blobs._stage_partial_root().glob("*.partial"))  # pyright: ignore[reportPrivateUsage]
     assert len([path for path in staging.iterdir() if path.is_file()]) == 1
 
 
@@ -277,7 +291,7 @@ async def test_durable_thread_failure_takes_precedence_over_cancellation() -> No
         await task
 
 
-async def test_cancelled_marker_completion_waits_for_parent_fsync(
+async def test_canceled_marker_completion_waits_for_parent_fsync(
     engine: AsyncEngine,
     data_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -326,8 +340,12 @@ async def test_stale_staging_partial_cleanup_is_bounded_and_aggregate_only(
     blobs = BlobStore(engine, data_dir)
     staging = blobs.root / "acquisition-staging"
     staging.mkdir(parents=True)
+    for index in range(20):
+        (staging / f"ordinary-marker-{index}").write_text("live recovery envelope")
+    partials = blobs._stage_partial_root()  # pyright: ignore[reportPrivateUsage]
+    partials.mkdir(parents=True)
     for index in range(3):
-        path = staging / f"opaque-{index}.partial"
+        path = partials / f"opaque-{index}.partial"
         path.write_text(f"secret-uri-{index}")
         os.utime(path, (1, 1))
 
@@ -337,10 +355,40 @@ async def test_stale_staging_partial_cleanup_is_bounded_and_aggregate_only(
     assert report.removed == 2
     assert report.truncated
     assert "secret" not in repr(report)
-    fresh = staging / "active.partial"
+    fresh = partials / "active.partial"
     fresh.write_text("still being written")
     await blobs.cleanup_staging_partials(stale_after_seconds=60, limit=10)
     assert fresh.exists()
+
+
+async def test_staging_cleanup_candidate_traversal_is_bounded(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A small cleanup budget cannot stat the entire abandoned-partial population."""
+    blobs = BlobStore(engine, data_dir)
+    partials = blobs._stage_partial_root()  # pyright: ignore[reportPrivateUsage]
+    partials.mkdir(parents=True)
+    for index in range(25):
+        path = partials / f"opaque-{index}.partial"
+        path.write_text("private metadata")
+        os.utime(path, (1, 1))
+    path_type = type(data_dir)
+    original_stat = path_type.stat
+    candidate_stats = 0
+
+    def counted_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal candidate_stats
+        if path.parent == partials:
+            candidate_stats += 1
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(path_type, "stat", counted_stat)
+    report = await blobs.cleanup_staging_partials(stale_after_seconds=60, limit=2)
+
+    assert report == StagingCleanup(scanned=2, removed=2, truncated=True)
+    assert candidate_stats <= 4, "cleanup traversed candidates beyond its advertised budget"
 
 
 async def test_text_is_compressed_and_binary_is_not(engine: AsyncEngine, data_dir: Path) -> None:

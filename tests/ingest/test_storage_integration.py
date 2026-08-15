@@ -838,23 +838,26 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     )
 
     task = asyncio.create_task(pipeline.run(connector))
-    await connector.enumeration_completed.wait()
-    await embedder.gate.wait_for(1)
+    try:
+        await connector.enumeration_completed.wait()
+        await embedder.gate.wait_for(1)
 
-    durable = await store.latest_unsettled_acquisition_run(connector.name)
-    assert durable is not None
-    assert durable.discovered_count == 1_000
-    assert durable.enumeration_completed_at is not None
-    assert durable.candidate_watermark == connector.watermark
-    assert connector.pages_requested == 10
-    assert clock.now == pytest.approx(0.19)
-    assert len(await store.list_acquisition_records(durable.id, limit=3)) == 3
-    assert await store.get_watermark(connector.name) == connector.watermark, (
-        "source coverage is checkpointed before the parked embedder completes"
-    )
+        durable = await store.latest_unsettled_acquisition_run(connector.name)
+        assert durable is not None
+        assert durable.discovered_count == 1_000
+        assert durable.enumeration_completed_at is not None
+        assert durable.candidate_watermark == connector.watermark
+        assert connector.pages_requested == 10
+        assert clock.now == pytest.approx(0.19)
+        assert len(await store.list_acquisition_records(durable.id, limit=3)) == 3
+        assert await store.get_watermark(connector.name) == connector.watermark, (
+            "source coverage is checkpointed before the parked embedder completes"
+        )
+    finally:
+        # A failed observation must not strand pipeline tasks or their SQLite connections.
+        embedder.gate.open()
+        report = await task
 
-    embedder.gate.open()
-    report = await task
     indexed = {source_id async for source_id in store.known_source_ids(connector.name)}
 
     assert report.error_type == ""
