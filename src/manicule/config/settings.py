@@ -475,7 +475,7 @@ class EventSettings(Section):
 class StorageSettings(Section):
     """Where indexed data lives.
 
-    The choices are closed: a relational store for the 32 modeled tables that own the corpus,
+    The choices are closed: a relational store for the 35 modeled tables that own the corpus,
     durable acquisition, re-embedding, collections, versions and audit records, and a vector
     store for vectors. Naming the alternatives in
     configuration would advertise support that does not exist.

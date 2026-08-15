@@ -91,7 +91,7 @@ class StoragePlugin:
         name="storage",
         version="0.1.0",
         core_version=">=0.1,<0.2",
-        summary="SQLite for the 32 modeled relational tables and FTS5; LanceDB for vectors.",
+        summary="SQLite for the 35 modeled relational tables and FTS5; LanceDB for vectors.",
     )
 
     def register(self, registry: ComponentRegistry) -> None:

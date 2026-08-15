@@ -229,21 +229,22 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **32 relational tables**. The 25 that predate durable
+The authoritative SQLAlchemy model has **35 relational tables**. The 28 that predate durable
 re-embedding are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`, `blobs`,
 `acquisition_markers`, `chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
 `conversations`, `document_tags`, `document_versions`, `documents`, `glossary_aliases`,
-`glossary_entries`, `index_state`, `messages`, `plugins`, `query_logs`, `tags`,
+`glossary_entries`, `index_state`, `messages`, `plugins`, `query_logs`, `reconciliation_candidates`,
+`reconciliation_inventory_items`, `reconciliation_runs`, `tags`,
 `vector_tombstones`, `workspace_members` and `workspaces`. Seven more make a re-embedding run
 durable without changing live reads until publication: `corpus_revision`,
 `reembed_corpus_snapshots`, `reembed_snapshot_documents`, `reembed_snapshot_chunks`,
 `reembed_runs`, `reembed_shadow_generations` and `reembed_publication_receipts`.
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 32.
+included in the 35.
 
 ### 4.1 The pre-#187 additions
 
-These nine supporting tables predate durable re-embedding. Each has a job the earlier proposal
+These twelve supporting tables predate durable re-embedding. Each has a job the earlier proposal
 could not do.
 
 | Table | Why it must exist |
@@ -255,6 +256,9 @@ could not do.
 | `acquisition_runs` | Durable connector-run lifecycle, base and candidate watermarks, generation-fenced lease, completion markers and bounded aggregate counters, including unchanged source coverage separately from indexed work. It separates discovering source coverage from publishing derived content. |
 | `acquisition_records` | One idempotent source identity per run, with the validated fetched envelope, acquisition/indexing state and retained-blob reference. Acquired and indexing states require the blob; the acquired transition also stores the fetched URI, media type, encoding, metadata, byte length and content hash atomically. Unchanged remains a distinct terminal provenance state. A discovery record is acknowledged only after this row commits. |
 | `acquisition_markers` | Indexed inventory of filesystem recovery markers. It blocks history cleanup until marker ownership is reconciled and contributes blob hashes to GC without a directory-wide scan. |
+| `reconciliation_runs` | Durable full-inventory lifecycle and scope binding for explicit deletion reconciliation, separate from ordinary incremental acquisition. |
+| `reconciliation_inventory_items` | Bounded, deduplicated source identities for one completed reconciliation inventory. |
+| `reconciliation_candidates` | Revision-fenced deletion proposals whose later confirmation cannot act on a document observed since proposal. |
 | `glossary_entries` | Definitions detected in document chunks, with their display form, expansion, location and confidence. The document/chunk foreign keys keep citations authoritative. |
 | `glossary_aliases` | Normalized alternate lookup keys for glossary entries. A composite key prevents duplicate aliases and cascading deletion keeps them tied to their definition. |
 
@@ -1700,7 +1704,7 @@ so this is the difference between a diagnostic and a decoration.
 
 ## 11. Organization on top of the corpus
 
-Six of the 32 modeled tables exist to let a person impose structure on a corpus rather than to
+Six of the 35 modeled tables exist to let a person impose structure on a corpus rather than to
 index one: `collections`, `collection_documents`, `tags`, `document_tags`, `document_versions`
 and `chunk_relations`. They shipped with the schema and are filled by
 [#10](https://github.com/mgd43b/manicule/issues/10). The operations arrive as five protocols
@@ -1867,7 +1871,7 @@ into an answer by the side door.
 
 ### 11.8 Migrations after the initial schema
 
-The schema had 25 modeled tables before #187. Earlier revisions added lineage, publication
+The schema had 28 modeled tables before #187. Earlier revisions added lineage, publication
 state, `acquisition_runs` and `acquisition_records` without synthesizing backlog for an existing
 index. A following additive revision gives each acquired record its validated source envelope;
 the body remains in content-addressed storage while the envelope preserves the fetched URI,
@@ -1906,7 +1910,7 @@ without turning cleanup into an implicit deletion of resumable backlog. `alembic
 continues to enforce model/migration parity.
 
 #187 then adds the seven durable re-embedding tables listed in §4.1.1, bringing the modeled
-total to 32. Their migration follows the complete durable-acquisition chain, so an offline
+total to 35. Their migration follows the complete durable-acquisition and reconciliation chain, so an offline
 snapshot remains reconstructable before any shadow vector generation is planned or published.
 
 ---
@@ -1918,7 +1922,7 @@ one.
 
 | Decision | Rationale in |
 |---|---|
-| The pre-#187 schema has 25 modeled tables; seven durable re-embedding tables bring the authoritative total to 32 | §4.1 |
+| The pre-#187 schema has 28 modeled tables; seven durable re-embedding tables bring the authoritative total to 35 | §4.1 |
 | `chunks.id` is content-derived; `position` is part of the digest, and the trade is stated | §3.2 |
 | Identity is `(workspace_id, source, source_id)`; the workspace is part of the derived id, settled before any corpus exists | §4.2 |
 | `documents.connector_id` is `NOT NULL`; filesystem and upload are connectors | §4.2 |
