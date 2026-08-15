@@ -912,9 +912,7 @@ class IngestPipeline:
             for worker in range(self._ingest_workers):
                 stages.create_task(self._ingest_from(run, bodies), name=f"ingest-{worker}")
 
-    async def _heartbeat_acquisition_until_done(
-        self, run: _Sync, work: asyncio.Task[None]
-    ) -> None:
+    async def _heartbeat_acquisition_until_done(self, run: _Sync, work: asyncio.Task[None]) -> None:
         """Renew independently of document mutations and stop all work if ownership is lost."""
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover - created only for journal runs
