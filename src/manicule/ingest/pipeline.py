@@ -1823,7 +1823,20 @@ class IngestPipeline:
         Raises:
             _SupersededError: The stored document is no longer ``expected``, so nothing was written.
         """
-        keep_status = self._keeps_status(existing, result.status)
+        if existing is not None and self._keeps_status(existing, result.status):
+            # A failed parse reached no conclusion about the newly fetched bytes. Preserve the
+            # indexed source revision as one indivisible snapshot: adopting even its new token
+            # would make the next sync skip bytes this document does not hold. The error is the
+            # only fact this attempt established, so it is the only field merged into the row.
+            metadata = dict(existing.metadata)
+            metadata["last_ingest_error"] = {
+                "stage": PipelineStage.PARSE.value,
+                "detail": result.status_detail,
+            }
+            return await self._publish(
+                existing.model_copy(update={"metadata": metadata}), expected=expected
+            )
+
         # **The connector's own metadata reaches the document, and it is not decoration.** The
         # chunker builds its breadcrumb from `document.metadata["ancestors"]`, so a pipeline that
         # dropped what the connector attached to the fetched bytes would leave every breadcrumb
@@ -1853,14 +1866,6 @@ class IngestPipeline:
             **dict(raw.metadata),
             **result.metadata,
         }
-        if keep_status:
-            # The document keeps everything a reader can see, and the failure still goes on the
-            # record. It simply does not cost anybody a document that was working.
-            metadata["last_ingest_error"] = {
-                "stage": PipelineStage.PARSE.value,
-                "detail": result.status_detail,
-            }
-        settled = existing if keep_status and existing else None
         # **What a citation shows comes from the record when there is one.** Read back out of
         # `metadata` rather than from `fresh`, so that the record which decides the citation is
         # by construction the record that gets stored — reading one and storing the other is how
@@ -1887,37 +1892,32 @@ class IngestPipeline:
                 if canonical and canonical.title
                 else title or (existing.title if existing else "")
             ),
-            content_hash=settled.content_hash if settled else digest,
+            content_hash=digest,
             version_token=version_token,
-            original_ref=settled.original_ref if settled else retention.ref,
+            original_ref=retention.ref,
             media_type=raw.media_type,
-            status=settled.status if settled else result.status,
-            status_detail=(settled.status_detail if settled else result.status_detail) or None,
-            failed_stage=settled.failed_stage if settled else result.failed_stage,
+            status=result.status,
+            status_detail=result.status_detail or None,
+            failed_stage=result.failed_stage,
             metadata=metadata,
         )
         stored = await self._publish(document, expected=expected)
-        if settled is None:
-            await self._store.set_original(
-                stored.id, ref=retention.ref, omitted_reason=retention.omitted_reason
-            )
+        await self._store.set_original(
+            stored.id, ref=retention.ref, omitted_reason=retention.omitted_reason
+        )
         if result.status in {DocumentStatus.CONTAINER, DocumentStatus.NO_EXTRACTABLE_TEXT}:
             await self._store.replace_chunks(stored.id, [])
         return stored
 
     @staticmethod
-    def _keeps_status(existing: Document | None, proposed: DocumentStatus) -> bool:
+    def _keeps_status(existing: Document, proposed: DocumentStatus) -> bool:
         """Whether an indexed document keeps its status rather than taking the new one.
 
         Only a ``failed`` outcome is refused, and only for a document that is currently
         servable. Everything else is a conclusion about the new bytes rather than a failure to
         reach one.
         """
-        return (
-            existing is not None
-            and existing.status is DocumentStatus.INDEXED
-            and proposed is DocumentStatus.FAILED
-        )
+        return existing.status is DocumentStatus.INDEXED and proposed is DocumentStatus.FAILED
 
     async def _settle(
         self,

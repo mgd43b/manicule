@@ -467,6 +467,70 @@ async def test_a_re_routed_document_is_not_skipped_on_an_unchanged_version_token
     )
 
 
+async def test_a_failed_parse_keeps_the_indexed_revision_retryable_on_the_next_sync() -> None:
+    """A failed attempt learned only its error, not that the new source revision was indexed.
+
+    Adopting the fetched token while retaining the old chunks makes the next healthy sync skip at
+    level 1 forever. The same rule applies to every source fact beside the token: failed bytes do
+    not get to change the retained-byte pointer, routing, provenance or connector metadata of the
+    indexed revision they failed to replace.
+    """
+    blobs = fakes.MemoryBlobs()
+    connector = a_connector(metadata={**a_record(version="7"), "content_status": "current"})
+    healthy, store, vectors = build(blobs=blobs)
+    await healthy.run(connector)
+    first = await store.find_document("memory", MIRRORED)
+    assert first is not None
+
+    connector.documents[MIRRORED] = "The client retries three times.\n"
+    connector.tokens[MIRRORED] = "v8"
+    connector.media_types[MIRRORED] = RE_ROUTED
+    connector.metadata[MIRRORED] = {
+        **a_record(version="8", title="Retry policy, revised"),
+        "content_status": "archived",
+    }
+    broken, _, _ = build(
+        store=store,
+        vectors=vectors,
+        blobs=blobs,
+        parsers={"lines": fakes.ExplodingParser()},
+    )
+
+    await broken.run(connector)
+
+    failed = await store.find_document("memory", MIRRORED)
+    assert failed is not None
+    assert failed.revision == first.revision, (
+        "the failed bytes' token, hash, retained-byte pointer or provenance was adopted"
+    )
+    assert (failed.uri, failed.title, failed.media_type) == (
+        first.uri,
+        first.title,
+        first.media_type,
+    ), "the failed bytes changed a reader-visible source fact"
+    assert failed.metadata["content_status"] == "current"
+    error = failed.metadata["last_ingest_error"]
+    assert isinstance(error, dict)
+    assert error["stage"] == "parse"
+
+    connector.fetches.clear()
+    report = await healthy.run(connector)
+
+    assert connector.fetches == [MIRRORED], (
+        "the healthy retry trusted the failed bytes' version token and skipped the fetch"
+    )
+    assert report.indexed == 1
+    repaired = await store.find_document("memory", MIRRORED)
+    assert repaired is not None
+    assert repaired.content_hash != first.content_hash
+    assert repaired.original_ref != first.original_ref
+    assert repaired.media_type == RE_ROUTED
+    assert repaired.provenance == Provenance.from_metadata(connector.metadata[MIRRORED])
+    assert [chunk.text for chunk in store.chunks[repaired.id]] == [
+        "The client retries three times."
+    ]
+
+
 async def test_a_connectors_mutable_facts_refresh_rather_than_freezing() -> None:
     """Labels and a content status move at the source; the stored copy must not win.
 

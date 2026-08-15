@@ -561,15 +561,15 @@ parse_memory_limit   default: 1 GiB per worker
 ### 6.4 Attributing a death to a document
 
 When a worker dies, the parent knows which document it dispatched, marks it `failed` with
-`failed_stage=parse` and `reason="worker killed: timeout"` or `"worker killed: memory limit"`, and continues. The batch
-is unaffected because the batch was never a unit.
+`failed_stage=parse` and `status_detail="worker killed: timeout"` or `"worker killed: memory
+limit"`, and continues. The batch is unaffected because the batch was never a unit.
 
 **When the parent dies**, in-flight documents are left in a non-terminal status. Recovery is a
 startup sweep, and it needs no new schema — `status` and `updated_at` already exist:
 
 ```sql
 UPDATE documents
-   SET status = 'pending', error_message = 'interrupted; requeued'
+   SET status = 'pending', status_detail = 'interrupted; requeued'
  WHERE status IN ('fetching', 'parsing', 'embedding')
    AND updated_at < :now - :stale_after
 ```
@@ -1012,8 +1012,12 @@ adds two rules.
 
 **A failed re-ingest must not demote a working document.** If a document is `indexed` and a
 re-ingest fails at any stage, it stays `indexed` with its existing chunks and vectors, and the
-failure is recorded in `error_message` and `metadata.last_ingest_error`. The new status is
-applied only when there is something to replace the old content with.
+failure is recorded in `status_detail` or `metadata.last_ingest_error`, according to whether the
+document was already indexed. A new status is applied only when there is something to replace the
+old content with. A parse failure preserves
+the indexed source revision wholesale — token, content hash, retained-byte reference, routing and
+provenance — because adopting the failed fetch's token would make the next healthy sync skip bytes
+the document does not hold. The error is the only new fact that attempt established.
 
 **A terminal *determination* does replace it, and that is not a softening of the rule.**
 Implementation forced the distinction: `failed` means we do not know whether the new bytes hold
