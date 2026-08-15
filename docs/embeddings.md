@@ -531,6 +531,11 @@ Local artifacts use a digest of the complete executable directory tree, and setu
 before opening the runtime. The directory is therefore configuration, not a live deployment
 target: do not mutate it while manicule is running. A concurrent writer can race any
 path-based model loader after the check; publish a new immutable directory and restart instead.
+Public provenance records local weights as `local:sha256:<digest>`—never as their absolute
+path—because `weights_ref` is returned by `index_status` and MCP. The configured path remains
+internal to loading and host/user directory layout is neither identity nor public metadata.
+For the same reason, a local model's public `model_id`/`tokenizer_id` is a
+`local-model:local-sha256:<digest>` descriptor; its load path stays only in the in-memory card.
 When `embedding.model` itself is local, its card, pooling configuration and tokenizer inputs
 receive a separate content digest in `revision`, even if `weights` points somewhere else.
 Setting `embedding.revision` for a local directory is refused because it would be an unverifiable

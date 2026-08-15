@@ -65,7 +65,7 @@ class MlxEmbedder(PooledEmbedder):
         cache_limit_bytes: int = DEFAULT_CACHE_LIMIT_BYTES,
     ) -> None:
         artifact = resolve_artifact(
-            BACKEND, card.model_id, card.revision, override=weights, revision=weights_revision
+            BACKEND, card.source_ref, card.revision, override=weights, revision=weights_revision
         )
         super().__init__(
             card,

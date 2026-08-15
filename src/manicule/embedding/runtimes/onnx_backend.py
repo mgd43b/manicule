@@ -59,7 +59,7 @@ class OnnxEmbedder(PooledEmbedder):
         cache_entries: int = 10_000,
     ) -> None:
         artifact = resolve_artifact(
-            BACKEND, card.model_id, card.revision, override=weights, revision=weights_revision
+            BACKEND, card.source_ref, card.revision, override=weights, revision=weights_revision
         )
         super().__init__(
             card,

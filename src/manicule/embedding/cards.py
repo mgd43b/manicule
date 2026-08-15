@@ -76,6 +76,11 @@ class ModelCard(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     model_id: str = Field(min_length=1)
+    source_ref: str = Field(
+        min_length=1,
+        description="Internal repository id or local load path. Local paths never enter the "
+        "public embedding fingerprint; model_id carries their content descriptor instead.",
+    )
     revision: str | None = Field(
         default=None,
         description="The resolved hub commit or local declaration/tokenizer digest, so model "
@@ -155,13 +160,19 @@ def read_card(
     specials = tokenizer.special_token_count()
     usable = _resolve_length(model_id, path, config, specials, max_sequence_length_override)
 
+    public_model_id = (
+        f"local-model:{resolved}"
+        if Path(model_id).expanduser().is_dir() and resolved is not None
+        else model_id
+    )
     return ModelCard(
-        model_id=model_id,
+        model_id=public_model_id,
+        source_ref=model_id,
         revision=resolved,
         architecture=str(config.get("model_type") or "unknown"),
         dimension=dimension,
         pooling=pooling,
-        tokenizer_id=model_id,
+        tokenizer_id=public_model_id,
         max_sequence_length=usable,
         special_token_count=specials,
         path=path,

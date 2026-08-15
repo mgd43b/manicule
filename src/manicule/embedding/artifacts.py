@@ -114,9 +114,8 @@ class WeightsRef(BaseModel):
         """What goes into :attr:`~manicule.core.embedding.EmbedFingerprint.weights_ref`."""
         if self.revision:
             return f"hf:{self.repo}@{self.revision}"
-        path = Path(self.repo).expanduser().resolve()
         digest = self.identity.rsplit(":", 1)[-1]
-        return f"local:{path}#sha256:{digest}"
+        return f"local:sha256:{digest}"
 
 
 class WeightArtifact(BaseModel):
@@ -155,7 +154,9 @@ def resolve_artifact(
                 "`weights_revision` cannot describe local weights; their bytes are hashed"
             )
         digest = _directory_digest(local, provider)
-        ref = f"local:{local.resolve()}#sha256:{digest}"
+        # Public provenance deliberately carries no filesystem path: weights_ref is exposed
+        # through index_status/MCP, and host/user directory layout is not model identity.
+        ref = f"local:sha256:{digest}"
         return WeightArtifact(
             provider=provider,
             repo=repo,
@@ -331,7 +332,11 @@ def planned_weights(
     # is cache-only, so when that card is not cached yet it cannot honestly invent the commit;
     # report the pending fetch without claiming a ref. The service supplies the cached resolved
     # commit here whenever one exists.
-    if not override and not _COMMIT.fullmatch(model_revision or ""):
+    if (
+        not override
+        and not Path(model_id).expanduser().is_dir()
+        and not _COMMIT.fullmatch(model_revision or "")
+    ):
         return WeightsPlan(
             provider=provider,
             repo=repo,
@@ -353,9 +358,10 @@ def planned_weights(
 
     card_present = is_cached(model_id, CARD_FILES, model_revision)
     weights_present = is_cached(artifact.repo, patterns, artifact.revision)
+    public_repo = artifact.ref if Path(artifact.repo).expanduser().is_dir() else artifact.repo
     return WeightsPlan(
         provider=provider,
-        repo=artifact.repo,
+        repo=public_repo,
         patterns=patterns,
         present=card_present and weights_present,
         card_present=card_present,

@@ -458,6 +458,20 @@ def test_builtin_plan_is_pending_when_weights_are_cached_but_card_is_missing(
     assert plan.present is False
 
 
+def test_fully_local_model_and_weights_are_present_without_a_download(tmp_path: Path) -> None:
+    directory = write_model(tmp_path / "private" / "local-model")
+    (directory / "model.safetensors").write_bytes(b"weights")
+    card = read_card(str(directory))
+
+    plan = planned_weights("mlx", str(directory), model_revision=card.revision)
+
+    assert plan.present is True
+    assert plan.card_present is True
+    assert plan.ref is not None
+    assert plan.ref.startswith("local:sha256:")
+    assert str(tmp_path) not in plan.ref
+
+
 def test_local_weight_bytes_change_identity(tmp_path: Path) -> None:
     directory = write_model(tmp_path / "local")
     weights = directory / "model.safetensors"

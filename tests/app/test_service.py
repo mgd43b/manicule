@@ -1295,6 +1295,26 @@ async def test_doctor_is_quiet_about_weights_that_are_already_here(
     )
 
 
+async def test_doctor_recognizes_a_fully_local_model_without_a_download(
+    backend: FakeBackend, tmp_path: Path
+) -> None:
+    from tests.embedding_support import write_model  # noqa: PLC0415
+
+    directory = write_model(tmp_path / "local-model")
+    (directory / "model.safetensors").write_bytes(b"weights")
+    backend.settings = Settings(
+        embedding={"model": str(directory)}  # pyright: ignore[reportArgumentType]
+    )
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "ok"
+    assert "no download is pending" in check.detail
+    assert check.facts["card_present"] is True
+    assert str(tmp_path) not in str(check.facts["ref"])
+
+
 async def test_doctor_refuses_a_mutable_remote_weights_revision(backend: FakeBackend) -> None:
     backend.settings = Settings(
         plugins={  # pyright: ignore[reportArgumentType] - validated settings fixture
@@ -2590,6 +2610,36 @@ async def test_status_names_the_detector_beside_the_other_three_stages(
 
     assert status.glossary.startswith(f"{DETECTOR} rules sha256:")
     assert status.stale_glossary == 1
+
+
+async def test_status_and_mcp_payload_do_not_expose_a_local_weights_path(
+    backend: FakeBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.core.embedding import IndexFingerprints  # noqa: PLC0415
+    from manicule.embedding.artifacts import resolve_artifact  # noqa: PLC0415
+    from manicule.embedding.cards import read_card  # noqa: PLC0415
+    from tests.embedding_support import write_model  # noqa: PLC0415
+
+    directory = write_model(tmp_path / "users" / "private-name" / "model")
+    (directory / "model.safetensors").write_bytes(b"weights")
+    card = read_card(str(directory))
+    artifact = resolve_artifact("mlx", str(directory), card.revision)
+    fingerprint = card.fingerprint(
+        backend="mlx", weights_ref=artifact.ref, weights_identity=artifact.identity
+    )
+
+    async def fingerprints() -> IndexFingerprints:
+        return IndexFingerprints(embed=fingerprint)
+
+    monkeypatch.setattr(backend.store, "index_fingerprints", fingerprints)
+    status = await ApplicationService(backend).index_status()
+    payload = status.model_dump_json()
+
+    assert status.weights_ref == artifact.ref
+    assert isinstance(status.weights_ref, str)
+    assert status.weights_ref.startswith("local:sha256:")
+    assert str(directory) not in payload
+    assert "private-name" not in payload
 
 
 async def test_the_glossary_sweep_reaches_the_port_with_what_the_caller_asked_for(
