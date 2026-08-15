@@ -319,7 +319,14 @@ class ShadowVectorGeneration(Protocol):
         vectors: Sequence[Vector],
         *,
         lease: ReembedLease,
-    ) -> None: ...
+    ) -> None:
+        """Idempotently write rows only if ``lease`` is current at the mutation boundary.
+
+        Checking before embedding, waiting, or acquiring a backend lock is insufficient: the
+        lease can expire and a higher fence can take over during any of them. Concrete storage
+        must compare owner, generation, and expiry atomically with the physical row mutation.
+        """
+        ...
 
     async def inspect(
         self, generation: ShadowGeneration, *, lease: ReembedLease

@@ -100,10 +100,13 @@ class Authority:
         ttl_seconds: float,
     ) -> tuple[ReembedRun, ReembedLease]:
         run = ReembedRun(id=run_id, commitment=commitment)
-        existing = self.runs.setdefault(run_id, run)
-        if existing.commitment != commitment:
+        existing = self.runs.get(run_id)
+        if existing is not None and existing.commitment != commitment:
             raise ReembedError("run id already belongs to another immutable plan")
         lease = await self.acquire(run_id, owner_token, ttl_seconds=ttl_seconds)
+        if existing is None:
+            self.runs[run_id] = run
+            existing = run
         return existing, lease
 
     async def get(self, run_id: str) -> ReembedRun | None:
@@ -180,6 +183,9 @@ class Authority:
         if self.pause_first_upsert and not self.upsert_entered.is_set():
             self.upsert_entered.set()
             await self.release_upsert.wait()
+        # The barrier stands in for embedding/backend-lock latency. Ownership must be tested
+        # again at the physical mutation boundary, after every await that can admit takeover.
+        self._assert_lease(generation.run_id, lease)
         self.live_during_upsert.append(self.live.generation_id)
         self.upsert_attempts += len(chunks)
         self.max_upsert_batch = max(self.max_upsert_batch, len(chunks))
@@ -195,6 +201,7 @@ class Authority:
         if self.pause_inspection:
             self.inspection_entered.set()
             await self.release_inspection.wait()
+        self._assert_lease(generation.run_id, lease)
         if self.inspection_override is not None:
             return self.inspection_override
         rows = self.rows[generation.id]
@@ -598,6 +605,38 @@ async def test_expired_owner_is_fenced_from_shadow_journal_and_publication_after
             expected_corpus_revision=run.commitment.snapshot.revision,
             lease=lease_a,
         )
+    assert authority.live.generation_id == "live-old"
+
+
+async def test_takeover_while_upsert_waits_refuses_stale_physical_write() -> None:
+    authority = Authority()
+    corpus = synthetic_corpus(authority, 1)
+    embedder = CountingEmbedder()
+    run = await prepare_run(authority, corpus, embedder)
+    lease_a = authority.leases[run.id]
+    generation = await authority.open_or_create(
+        run.id,
+        fingerprint=embedder.fingerprint,
+        inventory_digest=run.commitment.chunk_inventory_digest,
+        lease=lease_a,
+    )
+    chunk = corpus.raw_chunks(run.commitment.snapshot, make_document().id)[0]
+    stored_chunk = SnapshotChunk(chunk, f"legacy:{chunk.id}", chunk.position + 1)
+    authority.pause_first_upsert = True
+
+    stale_write = asyncio.create_task(
+        authority.upsert(generation, [stored_chunk], [[1.0] * 5], lease=lease_a)
+    )
+    await asyncio.wait_for(authority.upsert_entered.wait(), timeout=1.0)
+    authority.advance(31.0)
+    lease_b = await authority.acquire(run.id, "owner-b", ttl_seconds=30.0)
+    assert lease_b.generation > lease_a.generation
+    authority.release_upsert.set()
+
+    with pytest.raises(ReembedError, match="stale or expired"):
+        await asyncio.wait_for(stale_write, timeout=1.0)
+    assert authority.rows[generation.id] == {}
+    assert authority.upsert_attempts == 0
     assert authority.live.generation_id == "live-old"
 
 
