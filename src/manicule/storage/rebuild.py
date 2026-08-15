@@ -204,31 +204,23 @@ class SqliteRebuildStore(WorkspaceScoped):
         documents = 0
         known_bytes = 0
         largest_input = 0
-        after: int | None = None
-        while True:
-            page = await self._acquisition.list_acquisition_records(
-                snapshot_run_id, after_sequence=after, limit=1
-            )
-            if not page:
-                break
-            for record in page:
-                if record.sequence != documents:
-                    return self._refused_estimate(
-                        snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
-                    )
-                documents += 1
-                if (
-                    record.blob_ref is None
-                    or record.acquired_source is None
-                    or not await self._blobs.contains(record.blob_ref)
-                ):
-                    missing_count += 1
-                    if len(missing) < missing_limit:
-                        missing.append(MissingSnapshotInput(sequence=record.sequence))
-                else:
-                    known_bytes += record.acquired_source.byte_length
-                    largest_input = max(largest_input, record.acquired_source.byte_length)
-            after = page[-1].sequence
+        async for record in self._acquisition.iter_acquisition_records(snapshot_run_id):
+            if record.sequence != documents:
+                return self._refused_estimate(
+                    snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
+                )
+            documents += 1
+            if (
+                record.blob_ref is None
+                or record.acquired_source is None
+                or not await self._blobs.contains(record.blob_ref)
+            ):
+                missing_count += 1
+                if len(missing) < missing_limit:
+                    missing.append(MissingSnapshotInput(sequence=record.sequence))
+            else:
+                known_bytes += record.acquired_source.byte_length
+                largest_input = max(largest_input, record.acquired_source.byte_length)
         if documents != run.discovered_count:
             return self._refused_estimate(
                 snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED

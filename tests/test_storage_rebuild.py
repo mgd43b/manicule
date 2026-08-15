@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, cast, override
 
 import pytest
 from pydantic import JsonValue
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, event, select, text, update
 
 from manicule.core.acquisition import (
     AcquiredSource,
@@ -228,7 +228,7 @@ async def publish_one_replacement(
     )
 
 
-async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempotent(
+async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempotent(  # noqa: PLR0915
     store: SqliteDocStore,
     engine: AsyncEngine,
     data_dir: Path,
@@ -270,7 +270,24 @@ async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempote
         blobs=BlobStore(engine, data_dir),
         vectors=vectors,
     )
-    stale = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    record_selects = 0
+
+    def count_record_selects(*args: object) -> None:
+        nonlocal record_selects
+        statement = args[2]
+        if (
+            isinstance(statement, str)
+            and statement.lstrip().upper().startswith("SELECT")
+            and "FROM acquisition_records" in statement
+        ):
+            record_selects += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_record_selects)
+    try:
+        stale = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_record_selects)
+    assert record_selects == 2, "one manifest verification and one bounded planning cursor"
     sessions = session_factory(engine)
     async with sessions.begin() as session:
         state = await session.get(models.IndexState, 1)
