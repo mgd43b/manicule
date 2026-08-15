@@ -466,6 +466,57 @@ async def test_repeated_cancel_during_lazy_spawn_readiness_restores_exact_width(
     assert {child.pid for child in multiprocessing.active_children()} == baseline
 
 
+async def test_repeated_cancel_at_completed_checkout_handoff_restores_exact_width(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed worker remains owned until the shield hands it to `run_attempt`."""
+    del manicule_environment
+    async with WorkerPool(_config(tmp_path), workers=1, timeout_s=5.0) as pool:
+        completed = asyncio.Event()
+        hold_delivery = asyncio.Event()
+        restoring = asyncio.Event()
+        release_restore = asyncio.Event()
+        original_delivery = pool._deliver_checkout  # pyright: ignore[reportPrivateUsage]
+        original_restore = pool._restore_permit  # pyright: ignore[reportPrivateUsage]
+
+        async def held_delivery(
+            checkout: asyncio.Task[object],
+        ) -> object:
+            result = await asyncio.shield(checkout)
+            completed.set()
+            await hold_delivery.wait()
+            return result
+
+        async def held_restore(worker: object, generation: int) -> None:
+            restoring.set()
+            await release_restore.wait()
+            await original_restore(worker, generation)  # pyright: ignore[reportArgumentType]
+
+        monkeypatch.setattr(pool, "_deliver_checkout", held_delivery)
+        monkeypatch.setattr(pool, "_restore_permit", held_restore)
+        attempt = asyncio.create_task(pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)))
+        await asyncio.wait_for(completed.wait(), timeout=10)
+        attempt.cancel()
+        await asyncio.wait_for(restoring.wait(), timeout=10)
+        attempt.cancel()
+        release_restore.set()
+        with pytest.raises(asyncio.CancelledError):
+            await attempt
+
+        assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+        assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setattr(pool, "_deliver_checkout", original_delivery)
+        monkeypatch.setattr(pool, "_restore_permit", original_restore)
+        after = await asyncio.wait_for(
+            pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)), timeout=10
+        )
+        assert after.attempt.outcome is Outcome.PARSED
+        assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+        assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
+
+
 def test_the_default_worker_count_leaves_a_core_for_the_parent() -> None:
     """The parent does the embedding and every write, so it is not a spare."""
     count = default_worker_count()

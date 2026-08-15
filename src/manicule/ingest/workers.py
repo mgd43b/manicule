@@ -1056,7 +1056,7 @@ class WorkerPool:
         """Own checkout through selection, close cleanup and any lazy spawn."""
         checkout = asyncio.create_task(self._acquire_owned(generation))
         try:
-            return await asyncio.shield(checkout)
+            return await self._deliver_checkout(checkout)
         except asyncio.CancelledError:
             checkout.cancel()
             while not checkout.done():
@@ -1068,9 +1068,22 @@ class WorkerPool:
                         current.uncancel()
                 except BaseException:  # noqa: BLE001 - caller cancellation has precedence
                     break
-            with contextlib.suppress(BaseException):
-                checkout.result()
+            if checkout.done() and not checkout.cancelled():
+                with contextlib.suppress(BaseException):
+                    checked_out = checkout.result()
+                    if isinstance(checked_out, _Worker):
+                        restoring = asyncio.create_task(
+                            self._restore_permit(checked_out, generation)
+                        )
+                        await _join_despite_cancellation(restoring)
+                        restoring.result()
             raise
+
+    async def _deliver_checkout(
+        self, checkout: asyncio.Task[_Worker | _PoolStopped | None]
+    ) -> _Worker | _PoolStopped | None:
+        """Transfer a completed checkout to its caller without canceling its owner task."""
+        return await asyncio.shield(checkout)
 
     async def _acquire_owned(self, generation: int) -> _Worker | _PoolStopped | None:
         """Take a permit from the queue, and a worker with it.
