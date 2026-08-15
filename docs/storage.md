@@ -1870,12 +1870,15 @@ authoritative run's incomplete enumeration, retry, acquired, or indexing work, w
 overlap cannot pin blob references forever. Cascading record deletion merely releases
 acquisition references. Publications and retained bytes remain governed by their own tables,
 and blob mark-and-sweep includes marker references through the indexed
-`acquisition_markers` table. Reconciliation and legacy-file admission are bounded pages with
+`acquisition_markers` table. A marker root commits before either physical blob or envelope is
+published, and a sweep rechecks all roots atomically with candidate deletion. Reconciliation
+and legacy-file admission are bounded pages with
 batched database reads. History cleanup excludes runs still named by the inventory and is
 deferred entirely until the bounded legacy scanner completes one pass, so association evidence
 cannot disappear before its marker decision. Exact committed associations are redundant;
 superseded pre-association markers are unrecoverable by definition and are removed;
-authoritative pre-association markers remain. Unmatched legacy markers receive a 30-day safe
+authoritative pre-association markers remain. Markers whose explicit owning run disappeared are
+removed; unmatched legacy markers receive a 30-day safe
 harbor before expiring. This ordering prevents either crash window from pinning a blob forever
 without turning cleanup into an implicit deletion of resumable backlog. `alembic check`
 continues to enforce model/migration parity.

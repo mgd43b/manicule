@@ -8,7 +8,7 @@ import os
 import stat
 import threading
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import pytest
 from sqlalchemy import text
@@ -464,6 +464,92 @@ async def test_the_sweep_reclaims_only_unreferenced_blobs(
     assert await blobs.get(dropped.hash) is None
 
 
+async def test_sweep_atomically_rechecks_marker_created_after_candidate_selection(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """A collector cannot delete a blob after acquisition establishes its durable root."""
+    candidate_selected = asyncio.Event()
+    release_delete = asyncio.Event()
+
+    class GatedBlobStore(BlobStore):
+        @override
+        async def _unlink_blob_if_still_unreferenced(self, digest: str) -> bool:
+            candidate_selected.set()
+            await release_delete.wait()
+            return await super()._unlink_blob_if_still_unreferenced(digest)
+
+    blobs = GatedBlobStore(engine, data_dir)
+    raw = RawDocument(
+        source_id="raced-source",
+        uri="memory:raced-source",
+        media_type="text/plain",
+        content=b"raced bytes",
+    )
+    stored = await blobs.put(raw.as_bytes(), raw.media_type)
+    assert isinstance(stored, StoredBlob)
+
+    collection = asyncio.create_task(blobs.collect_garbage())
+    await asyncio.wait_for(candidate_selected.wait(), timeout=5)
+    async with engine.connect() as connection:
+        assert (
+            await connection.execute(
+                text("SELECT count(*) FROM blobs WHERE hash = :digest"),
+                {"digest": stored.hash},
+            )
+        ).scalar_one() == 0
+    retained, _ = await blobs.retain_acquisition("raced-run\0raced-source", raw)
+    assert retained.ref == stored.hash
+    release_delete.set()
+
+    assert await collection == []
+    assert await blobs.get(stored.hash) == raw.as_bytes()
+
+
+async def test_conflicting_marker_retry_preserves_durable_evidence_and_repairs_stale_inventory(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    key = "retry-run\0retry-source"
+    old = RawDocument(
+        source_id="retry-source",
+        uri="memory:retry-source",
+        media_type="text/plain",
+        content=b"old bytes",
+    )
+    new = old.model_copy(update={"content": b"new bytes"})
+    old_result = await blobs.retain_acquisition(key, old)
+
+    with pytest.raises(RuntimeError, match="conflicts with durable recovery evidence"):
+        await blobs.retain_acquisition(key, new)
+    assert await blobs.resume_acquisition(key) == old_result
+
+    new_blob = await blobs.put(new.as_bytes(), new.media_type)
+    assert isinstance(new_blob, StoredBlob)
+    new_acquired = AcquiredSource.from_raw(new)
+    path = blobs._stage_path(key)  # pyright: ignore[reportPrivateUsage]
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": "retry-run",
+                "source_id": "retry-source",
+                "blob_ref": new_blob.hash,
+                "compression": new_blob.compression,
+                "acquired_source": new_acquired.model_dump(mode="json"),
+            }
+        )
+    )
+
+    repaired = await blobs.retain_acquisition(key, new)
+    assert repaired[0].ref == new_blob.hash
+    async with engine.connect() as connection:
+        inventory_ref = (
+            await connection.execute(
+                text("SELECT blob_ref FROM acquisition_markers WHERE run_id = 'retry-run'")
+            )
+        ).scalar_one()
+    assert inventory_ref == new_blob.hash
+
+
 async def test_preassociation_marker_supersession_releases_only_the_fenced_blob(
     engine: AsyncEngine, data_dir: Path
 ) -> None:
@@ -576,6 +662,35 @@ async def test_legacy_marker_is_inferred_or_expires_without_blocking_forever(
     assert await restarted.collect_garbage() == [stored.hash]
 
 
+async def test_explicit_marker_is_removed_when_its_cascaded_run_owner_disappears(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    await store.create_acquisition_run("vanished-run", "vanished-connector")
+    raw = RawDocument(
+        source_id="vanished-source",
+        uri="memory:vanished-source",
+        media_type="text/plain",
+        content=b"vanished bytes",
+    )
+    retained, _ = await blobs.retain_acquisition("vanished-run\0vanished-source", raw)
+    assert retained.ref is not None
+    marker = blobs._stage_path(  # pyright: ignore[reportPrivateUsage]
+        "vanished-run\0vanished-source"
+    )
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("DELETE FROM acquisition_runs WHERE id = 'vanished-run'")
+        )
+
+    await blobs.reconcile_acquisition_markers()
+
+    assert not marker.exists()
+    assert await blobs.collect_garbage() == [retained.ref]
+
+
 async def test_large_forged_marker_directory_reconciles_in_bounded_pages(
     engine: AsyncEngine, data_dir: Path
 ) -> None:
@@ -599,6 +714,17 @@ async def test_large_forged_marker_directory_reconciles_in_bounded_pages(
             await connection.execute(text("SELECT count(*) FROM acquisition_markers"))
         ).scalar_one()
     assert final == 250
+
+    async with engine.connect() as connection:
+        plan = (
+            await connection.execute(
+                text(
+                    "EXPLAIN QUERY PLAN SELECT run_id, source_id, marker_name "
+                    "FROM acquisition_records WHERE marker_name IN ('forged-0000')"
+                )
+            )
+        ).all()
+    assert any("ix_acquisition_records_marker_name" in str(row) for row in plan)
 
 
 async def test_a_leaked_file_is_found_by_the_directory_scan(

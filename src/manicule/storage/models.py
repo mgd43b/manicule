@@ -341,6 +341,7 @@ class AcquisitionRecord(Base):
     connector_id: Mapped[str] = mapped_column(Text, nullable=False)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     source_id: Mapped[str] = mapped_column(Text, nullable=False)
+    marker_name: Mapped[str | None] = mapped_column(Text)
     source_record: Mapped[JsonValue] = mapped_column(JSON, nullable=False)
     state: Mapped[AcquisitionRecordState] = mapped_column(
         _acquisition_record_state_enum(),
@@ -370,6 +371,7 @@ class AcquisitionRecord(Base):
         UniqueConstraint("run_id", "source_id"),
         UniqueConstraint("run_id", "sequence"),
         Index("ix_acquisition_records_run_state_sequence", "run_id", "state", "sequence"),
+        Index("ix_acquisition_records_marker_name", "marker_name", unique=True),
         CheckConstraint(
             "sequence >= 0 AND attempts >= 0", name="acquisition_record_numbers_are_not_negative"
         ),

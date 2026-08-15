@@ -813,20 +813,24 @@ Blob retention also writes a run-and-record-keyed staging envelope before the jo
 if the process stops in that narrow window, takeover recovers the staged hash and fetched source
 envelope instead of downloading the body again. The marker is removed only after the fenced
 `ACQUIRED` transition commits and pins the same blob.
-Every new marker is registered in an indexed relational inventory before its file can exist. If
+Every new marker is registered in an indexed relational inventory before either its blob or
+marker file can exist. Blob sweep conditionally rechecks every relational root in the same
+transaction that deletes a candidate, closing the candidate-selection race. If
 the process dies after association but before unlink, a bounded reconciliation page compares
 run/source identity, blob hash and acquired envelope with the journal; an exact match makes the
 marker redundant. A superseded run's marker is removed even when the association never
 committed, because its incremented generation can never resume. History cleanup excludes every
 run still named by the inventory, so it cannot erase the evidence before either decision.
-Authoritative pre-association markers remain resumable.
+Authoritative pre-association markers remain resumable; explicit markers whose owning run has
+been cascade-deleted are removed rather than becoming permanent GC roots.
 
 Older marker files are admitted to the inventory in bounded directory pages and matched to
 journal records in one batched query, including legacy payloads without run/source fields by
 checking their hashed run-and-source key. Until a complete legacy pass finishes, history cleanup
 and blob collection fail closed. Unmatched legacy files receive a 30-day safe-harbor entry and
 then expire; indexed marker blob references participate directly in GC's SQL mark set. No sync
-or inventory call walks the directory or performs one query per marker.
+or inventory call walks the directory or performs one query per marker. Legacy ownership is
+looked up by the marker-name index, so one page cannot expand into unbounded source history.
 Durable staging writes are joined before task cancellation returns. A process death can still
 leave a temporary staging file; acquisition startup and blob inventory remove only day-old
 partials from a partial-only directory, in genuinely bounded batches whose report contains

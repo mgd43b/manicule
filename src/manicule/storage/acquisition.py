@@ -25,6 +25,7 @@ from manicule.core.acquisition import (
     UnsetValue,
 )
 from manicule.core.errors import AcquisitionLeaseLostError, ManiculeError, UnknownEntityError
+from manicule.core.ids import acquisition_marker_id
 from manicule.core.sources import Watermark
 from manicule.storage import models
 from manicule.storage.scoped import WorkspaceScoped
@@ -402,6 +403,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         connector_id=run.connector_id,
                         sequence=sequence,
                         source_id=source.source_id,
+                        marker_name=acquisition_marker_id(run_id, source.source_id),
                         source_record=source_json,
                         state=AcquisitionRecordState.DISCOVERED,
                         created_at=utcnow(),
