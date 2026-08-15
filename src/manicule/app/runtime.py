@@ -516,8 +516,8 @@ class Runtime:
         # Before the dense leg is ever asked a question. A store that has not been prepared
         # raises rather than returning nothing, so an empty index would answer every search
         # with an error about vector spaces.
-        await self.prepared_vectors()
-        return await build_retriever(self._container)
+        vectors = await self.prepared_vectors()
+        return await build_retriever(self._container, vectors=vectors)
 
     async def _build_answerer(self) -> Answering:
         from manicule.generation.answering import Answerer  # noqa: PLC0415 - heavy

@@ -386,6 +386,29 @@ async def test_the_vector_store_is_prepared_before_anything_writes_a_vector(
         assert held.dimension == HashEmbedder().fingerprint.dimension
 
 
+async def test_retrieval_uses_the_same_published_vector_handle_as_ingest(
+    manicule_environment: Path,
+) -> None:
+    """The dense plugin must not retain the undecorated, unprepared Lance store.
+
+    The runtime wraps Lance with the generation-following handle used by ingestion.  Retrieval
+    stages are assembled by the plugin container, whose dense factory initially sees the
+    underlying store.  A real index followed by a real search catches any failure to rebind
+    that stage: the underlying handle refuses the query because nobody prepared it.
+    """
+    source = manicule_environment / "published-handle.md"
+    source.write_text("# Durable snapshots\n\nOffline rebuilds retain durable source bytes.")
+
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        service = ApplicationService(opened)
+        indexed = await service.index_path(source)
+        found = await service.search("durable source", limit=1)
+
+    assert indexed.ingested == 1
+    assert len(found.hits) == 1
+    assert found.hits[0].title == source.name
+
+
 async def test_the_runtime_disposes_its_engine_on_the_way_out(
     manicule_environment: Path,
 ) -> None:
