@@ -69,15 +69,17 @@ def _json(adapter: TypeAdapter[Any], value: object) -> str:
     return adapter.dump_json(value).decode("utf-8")
 
 
-def _generation_id(run_id: str) -> str:
-    return f"reembed-{hashlib.sha256(run_id.encode('utf-8')).hexdigest()}"
+def _generation_id(workspace_id: str, run_id: str) -> str:
+    identity = f"{workspace_id}\0{run_id}"
+    return f"reembed-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
 
 
 class SqliteReembedCorpus:
     """Complete, durable, connector-free corpus snapshots over authoritative SQLite rows."""
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(self, engine: AsyncEngine, workspace_id: str = "default") -> None:
         self._engine = engine
+        self.workspace_id = workspace_id
 
     async def discard_snapshot(self, snapshot_id: str) -> None:
         """Remove an unreferenced planning snapshot and its cascaded rows."""
@@ -86,8 +88,9 @@ class SqliteReembedCorpus:
                 await connection.execute(
                     select(models.ReembedRunRecord.id)
                     .where(
+                        models.ReembedRunRecord.workspace_id == self.workspace_id,
                         func.json_extract(models.ReembedRunRecord.commitment_json, "$.snapshot.id")
-                        == snapshot_id
+                        == snapshot_id,
                     )
                     .limit(1)
                 )
@@ -96,7 +99,8 @@ class SqliteReembedCorpus:
                 raise ReembedError("a snapshot bound to a durable run cannot be discarded")
             await connection.execute(
                 delete(models.ReembedCorpusSnapshot).where(
-                    models.ReembedCorpusSnapshot.id == snapshot_id
+                    models.ReembedCorpusSnapshot.workspace_id == self.workspace_id,
+                    models.ReembedCorpusSnapshot.id == snapshot_id,
                 )
             )
 
@@ -133,6 +137,7 @@ class SqliteReembedCorpus:
             await connection.execute(
                 insert(models.ReembedCorpusSnapshot).values(
                     id=snapshot_id,
+                    workspace_id=self.workspace_id,
                     revision=revision,
                     live_json="",
                     complete=False,
@@ -158,7 +163,10 @@ class SqliteReembedCorpus:
             )
             await connection.execute(
                 update(models.ReembedCorpusSnapshot)
-                .where(models.ReembedCorpusSnapshot.id == snapshot_id)
+                .where(
+                    models.ReembedCorpusSnapshot.workspace_id == self.workspace_id,
+                    models.ReembedCorpusSnapshot.id == snapshot_id,
+                )
                 .values(
                     live_json=_json(_LIVE, live),
                     complete=True,
@@ -169,7 +177,7 @@ class SqliteReembedCorpus:
                 )
             )
             await connection.commit()
-            return CorpusSnapshot(snapshot_id, revision, live)
+            return CorpusSnapshot(snapshot_id, revision, live, self.workspace_id)
         except BaseException:
             await connection.rollback()
             raise
@@ -181,7 +189,8 @@ class SqliteReembedCorpus:
     ) -> Sequence[SnapshotDocument]:
         await self._require_snapshot(snapshot)
         statement = select(models.ReembedSnapshotDocument.payload_json).where(
-            models.ReembedSnapshotDocument.snapshot_id == snapshot.id
+            models.ReembedSnapshotDocument.workspace_id == self.workspace_id,
+            models.ReembedSnapshotDocument.snapshot_id == snapshot.id,
         )
         if after is not None:
             statement = statement.where(models.ReembedSnapshotDocument.document_id > after)
@@ -203,6 +212,7 @@ class SqliteReembedCorpus:
             value = (
                 await connection.execute(
                     select(models.ReembedSnapshotDocument.payload_json).where(
+                        models.ReembedSnapshotDocument.workspace_id == self.workspace_id,
                         models.ReembedSnapshotDocument.snapshot_id == snapshot.id,
                         models.ReembedSnapshotDocument.document_id == document_id,
                     )
@@ -220,6 +230,7 @@ class SqliteReembedCorpus:
     ) -> Sequence[SnapshotChunk]:
         await self._require_snapshot(snapshot)
         statement = select(models.ReembedSnapshotChunk.payload_json).where(
+            models.ReembedSnapshotChunk.workspace_id == self.workspace_id,
             models.ReembedSnapshotChunk.snapshot_id == snapshot.id,
             models.ReembedSnapshotChunk.document_id == document_id,
         )
@@ -256,7 +267,8 @@ class SqliteReembedCorpus:
                 (
                     await connection.execute(
                         select(models.ReembedCorpusSnapshot.revision).where(
-                            models.ReembedCorpusSnapshot.id == snapshot_id
+                            models.ReembedCorpusSnapshot.workspace_id == self.workspace_id,
+                            models.ReembedCorpusSnapshot.id == snapshot_id,
                         )
                     )
                 ).scalar_one()
@@ -264,7 +276,10 @@ class SqliteReembedCorpus:
         )
         chunk_digest = SnapshotChunkDigester()
         while True:
-            statement = select(models.Document).where(models.Document.deleted_at.is_(None))
+            statement = select(models.Document).where(
+                models.Document.workspace_id == self.workspace_id,
+                models.Document.deleted_at.is_(None),
+            )
             if document_after is not None:
                 statement = statement.where(models.Document.id > document_after)
             page = (
@@ -291,6 +306,7 @@ class SqliteReembedCorpus:
                 inventory.add_document(_SNAPSHOT_DOCUMENT.validate_json(document_json))
                 await connection.execute(
                     insert(models.ReembedSnapshotDocument).values(
+                        workspace_id=self.workspace_id,
                         snapshot_id=snapshot_id,
                         document_id=row.id,
                         payload_json=document_json,
@@ -332,6 +348,7 @@ class SqliteReembedCorpus:
                         chunk_digest.add(persisted_chunk)
                         await connection.execute(
                             insert(models.ReembedSnapshotChunk).values(
+                                workspace_id=self.workspace_id,
                                 snapshot_id=snapshot_id,
                                 document_id=row.id,
                                 position=chunk_row.position,
@@ -357,7 +374,8 @@ class SqliteReembedCorpus:
                 (
                     await connection.execute(
                         select(models.ReembedCorpusSnapshot.__table__).where(
-                            models.ReembedCorpusSnapshot.id == snapshot.id
+                            models.ReembedCorpusSnapshot.workspace_id == self.workspace_id,
+                            models.ReembedCorpusSnapshot.id == snapshot.id,
                         )
                     )
                 )
@@ -366,6 +384,7 @@ class SqliteReembedCorpus:
             )
         if (
             row is None
+            or snapshot.workspace_id != self.workspace_id
             or not row.complete
             or row.revision != snapshot.revision
             or _LIVE.validate_json(row.live_json) != snapshot.live
@@ -376,8 +395,15 @@ class SqliteReembedCorpus:
 class SqliteReembedStore:
     """SQLite implementation of the journal, lease authority, and publisher protocols."""
 
-    def __init__(self, engine: AsyncEngine, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        workspace_id: str = "default",
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self._engine = engine
+        self.workspace_id = workspace_id
         self._clock = clock
 
     @asynccontextmanager
@@ -404,13 +430,15 @@ class SqliteReembedStore:
         owner_token: str,
         ttl_seconds: float,
     ) -> tuple[ReembedRun, ReembedLease]:
+        self._require_commitment_workspace(commitment)
         commitment_json = _json(_COMMITMENT, commitment)
         async with self._immediate() as connection:
             row = (
                 (
                     await connection.execute(
                         select(models.ReembedRunRecord.__table__).where(
-                            models.ReembedRunRecord.id == run_id
+                            models.ReembedRunRecord.workspace_id == self.workspace_id,
+                            models.ReembedRunRecord.id == run_id,
                         )
                     )
                 )
@@ -418,10 +446,11 @@ class SqliteReembedStore:
                 .one_or_none()
             )
             if row is None:
-                run = ReembedRun(id=run_id, commitment=commitment)
+                run = ReembedRun(id=run_id, commitment=commitment, workspace_id=self.workspace_id)
                 await connection.execute(
                     insert(models.ReembedRunRecord).values(
                         id=run_id,
+                        workspace_id=self.workspace_id,
                         commitment_json=commitment_json,
                         state=run.state.value,
                         checkpoint_json=_json(_RUN, run),
@@ -440,13 +469,15 @@ class SqliteReembedStore:
 
     async def create_released(self, run_id: str, commitment: ReembedCommitment) -> ReembedRun:
         """Create-or-read a run with no lease owner in the same durable transaction."""
+        self._require_commitment_workspace(commitment)
         commitment_json = _json(_COMMITMENT, commitment)
         async with self._immediate() as connection:
             row = (
                 (
                     await connection.execute(
                         select(models.ReembedRunRecord.__table__).where(
-                            models.ReembedRunRecord.id == run_id
+                            models.ReembedRunRecord.workspace_id == self.workspace_id,
+                            models.ReembedRunRecord.id == run_id,
                         )
                     )
                 )
@@ -457,10 +488,11 @@ class SqliteReembedStore:
                 if row.commitment_json != commitment_json:
                     raise ReembedError("run id already belongs to another immutable plan")
                 return await self._reconciled(connection, _RUN.validate_json(row.checkpoint_json))
-            run = ReembedRun(id=run_id, commitment=commitment)
+            run = ReembedRun(id=run_id, commitment=commitment, workspace_id=self.workspace_id)
             await connection.execute(
                 insert(models.ReembedRunRecord).values(
                     id=run_id,
+                    workspace_id=self.workspace_id,
                     commitment_json=commitment_json,
                     state=run.state.value,
                     checkpoint_json=_json(_RUN, run),
@@ -479,13 +511,40 @@ class SqliteReembedStore:
             value = (
                 await connection.execute(
                     select(models.ReembedRunRecord.checkpoint_json).where(
-                        models.ReembedRunRecord.id == run_id
+                        models.ReembedRunRecord.workspace_id == self.workspace_id,
+                        models.ReembedRunRecord.id == run_id,
                     )
                 )
             ).scalar_one_or_none()
             if value is None:
                 return None
             return await self._reconciled(connection, _RUN.validate_json(value))
+
+    async def recoverable_run_ids(self) -> tuple[str, ...]:
+        """Ownerless nonterminal runs for this workspace, without private plan fields."""
+        async with self._engine.connect() as connection:
+            values = (
+                await connection.execute(
+                    select(models.ReembedRunRecord.id)
+                    .where(
+                        models.ReembedRunRecord.workspace_id == self.workspace_id,
+                        models.ReembedRunRecord.state.in_(
+                            (
+                                ReembedState.PLANNED.value,
+                                ReembedState.BUILDING.value,
+                                ReembedState.VALIDATING.value,
+                                ReembedState.READY.value,
+                            )
+                        ),
+                        or_(
+                            models.ReembedRunRecord.lease_expires_at.is_(None),
+                            models.ReembedRunRecord.lease_expires_at <= self._clock(),
+                        ),
+                    )
+                    .order_by(models.ReembedRunRecord.created_at, models.ReembedRunRecord.id)
+                )
+            ).scalars()
+        return tuple(str(value) for value in values)
 
     async def live_generation_id(self) -> str | None:
         """The currently published vector pointer, without requiring a complete identity."""
@@ -505,7 +564,8 @@ class SqliteReembedStore:
             checkpoint = (
                 await connection.execute(
                     select(models.ReembedRunRecord.checkpoint_json).where(
-                        models.ReembedRunRecord.id == run_id
+                        models.ReembedRunRecord.workspace_id == self.workspace_id,
+                        models.ReembedRunRecord.id == run_id,
                     )
                 )
             ).scalar_one_or_none()
@@ -515,7 +575,7 @@ class SqliteReembedStore:
             run = await self._reconciled(connection, run)
             if run.state not in {ReembedState.FAILED, ReembedState.SUPERSEDED}:
                 raise ReembedError("only failed or superseded shadow generations may be cleaned")
-            generation_id = run.shadow_generation_id or _generation_id(run_id)
+            generation_id = run.shadow_generation_id or _generation_id(self.workspace_id, run_id)
             live = (
                 await connection.execute(
                     select(models.IndexState.vector_table).where(
@@ -537,7 +597,10 @@ class SqliteReembedStore:
             renewed = ReembedLease(lease.owner_token, lease.generation, self._clock() + ttl_seconds)
             await connection.execute(
                 update(models.ReembedRunRecord)
-                .where(models.ReembedRunRecord.id == run_id)
+                .where(
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
+                    models.ReembedRunRecord.id == run_id,
+                )
                 .values(lease_expires_at=renewed.expires_at, updated_at=utcnow())
             )
             await self._require_lease(connection, run_id, renewed)
@@ -550,6 +613,7 @@ class SqliteReembedStore:
             changed = await connection.execute(
                 update(models.ReembedRunRecord)
                 .where(
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
                     models.ReembedRunRecord.id == run_id,
                     models.ReembedRunRecord.lease_owner == lease.owner_token,
                     models.ReembedRunRecord.lease_generation == lease.generation,
@@ -573,6 +637,7 @@ class SqliteReembedStore:
     async def save(
         self, run: ReembedRun, *, expected_revision: int, lease: ReembedLease
     ) -> ReembedRun:
+        self._require_run_workspace(run)
         async with self._immediate() as connection:
             await self._require_lease(connection, run.id, lease)
             if await self._receipt(connection, run.id) is not None:
@@ -580,6 +645,7 @@ class SqliteReembedStore:
             saved = ReembedRun(
                 id=run.id,
                 commitment=run.commitment,
+                workspace_id=self.workspace_id,
                 state=run.state,
                 document_after=run.document_after,
                 active_document_id=run.active_document_id,
@@ -594,6 +660,7 @@ class SqliteReembedStore:
             result = await connection.execute(
                 update(models.ReembedRunRecord)
                 .where(
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
                     models.ReembedRunRecord.id == run.id,
                     models.ReembedRunRecord.revision == expected_revision,
                 )
@@ -631,6 +698,9 @@ class SqliteReembedStore:
         expected_corpus_revision: str,
         lease: ReembedLease,
     ) -> PublicationReceipt:
+        self._require_run_workspace(run)
+        if generation.workspace_id != self.workspace_id:
+            raise ReembedError("the re-embedding run does not exist in this workspace")
         async with self.fenced(run.id, lease) as connection:
             if (
                 expected != run.commitment.snapshot.live
@@ -640,7 +710,8 @@ class SqliteReembedStore:
             prior = (
                 await connection.execute(
                     select(models.ReembedPublicationReceipt.receipt_json).where(
-                        models.ReembedPublicationReceipt.run_id == run.id
+                        models.ReembedPublicationReceipt.workspace_id == self.workspace_id,
+                        models.ReembedPublicationReceipt.run_id == run.id,
                     )
                 )
             ).scalar_one_or_none()
@@ -668,6 +739,7 @@ class SqliteReembedStore:
                     (
                         await connection.execute(
                             select(models.ReembedShadowGeneration.__table__).where(
+                                models.ReembedShadowGeneration.workspace_id == self.workspace_id,
                                 models.ReembedShadowGeneration.id == generation.id,
                                 models.ReembedShadowGeneration.run_id == run.id,
                             )
@@ -715,7 +787,10 @@ class SqliteReembedStore:
                 await self._supersede_prior_winner(connection, run.id)
                 await connection.execute(
                     update(models.ReembedShadowGeneration)
-                    .where(models.ReembedShadowGeneration.id == generation.id)
+                    .where(
+                        models.ReembedShadowGeneration.workspace_id == self.workspace_id,
+                        models.ReembedShadowGeneration.id == generation.id,
+                    )
                     .values(state="published")
                 )
                 outcome = PublishOutcome.PUBLISHED
@@ -730,16 +805,21 @@ class SqliteReembedStore:
                 expected=expected,
                 observed_winner=winner,
                 published_generation_id=published_generation_id,
+                workspace_id=self.workspace_id,
             )
             await connection.execute(
                 insert(models.ReembedPublicationReceipt).values(
-                    run_id=run.id, receipt_json=_json(_RECEIPT, receipt), created_at=utcnow()
+                    workspace_id=self.workspace_id,
+                    run_id=run.id,
+                    receipt_json=_json(_RECEIPT, receipt),
+                    created_at=utcnow(),
                 )
             )
             terminal = _run_from_receipt(run, receipt, revision=run.revision + 1)
             checkpoint = await connection.execute(
                 update(models.ReembedRunRecord)
                 .where(
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
                     models.ReembedRunRecord.id == run.id,
                     models.ReembedRunRecord.revision == run.revision,
                 )
@@ -758,7 +838,8 @@ class SqliteReembedStore:
         value = (
             await connection.execute(
                 select(models.ReembedPublicationReceipt.receipt_json).where(
-                    models.ReembedPublicationReceipt.run_id == run_id
+                    models.ReembedPublicationReceipt.workspace_id == self.workspace_id,
+                    models.ReembedPublicationReceipt.run_id == run_id,
                 )
             )
         ).scalar_one_or_none()
@@ -773,7 +854,8 @@ class SqliteReembedStore:
             (
                 await connection.execute(
                     select(models.ReembedCorpusSnapshot.__table__).where(
-                        models.ReembedCorpusSnapshot.id == run.commitment.snapshot.id
+                        models.ReembedCorpusSnapshot.workspace_id == self.workspace_id,
+                        models.ReembedCorpusSnapshot.id == run.commitment.snapshot.id,
                     )
                 )
             )
@@ -783,6 +865,8 @@ class SqliteReembedStore:
         snapshot = run.commitment.snapshot
         if (
             row is None
+            or snapshot.workspace_id != self.workspace_id
+            or run.workspace_id != self.workspace_id
             or not row.complete
             or row.revision != snapshot.revision
             or _LIVE.validate_json(row.live_json) != snapshot.live
@@ -805,9 +889,15 @@ class SqliteReembedStore:
                 )
                 .join(
                     models.ReembedShadowGeneration,
-                    models.ReembedShadowGeneration.run_id == models.ReembedRunRecord.id,
+                    (models.ReembedShadowGeneration.workspace_id == self.workspace_id)
+                    & (
+                        models.ReembedShadowGeneration.workspace_id
+                        == models.ReembedRunRecord.workspace_id
+                    )
+                    & (models.ReembedShadowGeneration.run_id == models.ReembedRunRecord.id),
                 )
                 .where(
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
                     or_(
                         models.ReembedRunRecord.state == ReembedState.PUBLISHED.value,
                         models.ReembedShadowGeneration.state == "published",
@@ -824,6 +914,7 @@ class SqliteReembedStore:
             await connection.execute(
                 update(models.ReembedRunRecord)
                 .where(
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
                     models.ReembedRunRecord.id == row.id,
                     models.ReembedRunRecord.revision == row.revision,
                 )
@@ -836,7 +927,10 @@ class SqliteReembedStore:
             )
             await connection.execute(
                 update(models.ReembedShadowGeneration)
-                .where(models.ReembedShadowGeneration.run_id == row.id)
+                .where(
+                    models.ReembedShadowGeneration.workspace_id == self.workspace_id,
+                    models.ReembedShadowGeneration.run_id == row.id,
+                )
                 .values(state="superseded")
             )
 
@@ -864,7 +958,8 @@ class SqliteReembedStore:
             (
                 await connection.execute(
                     select(models.ReembedRunRecord.__table__).where(
-                        models.ReembedRunRecord.id == run_id
+                        models.ReembedRunRecord.workspace_id == self.workspace_id,
+                        models.ReembedRunRecord.id == run_id,
                     )
                 )
             )
@@ -883,7 +978,10 @@ class SqliteReembedStore:
         lease = ReembedLease(owner_token, generation, now + ttl_seconds)
         await connection.execute(
             update(models.ReembedRunRecord)
-            .where(models.ReembedRunRecord.id == run_id)
+            .where(
+                models.ReembedRunRecord.workspace_id == self.workspace_id,
+                models.ReembedRunRecord.id == run_id,
+            )
             .values(
                 lease_owner=lease.owner_token,
                 lease_generation=lease.generation,
@@ -902,7 +1000,10 @@ class SqliteReembedStore:
                     models.ReembedRunRecord.lease_owner,
                     models.ReembedRunRecord.lease_generation,
                     models.ReembedRunRecord.lease_expires_at,
-                ).where(models.ReembedRunRecord.id == run_id)
+                ).where(
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
+                    models.ReembedRunRecord.id == run_id,
+                )
             )
         ).one_or_none()
         if (
@@ -913,6 +1014,17 @@ class SqliteReembedStore:
             or lease.expires_at <= self._clock()
         ):
             raise ReembedError("stale or expired re-embedding lease")
+
+    def _require_commitment_workspace(self, commitment: ReembedCommitment) -> None:
+        if commitment.snapshot.workspace_id != self.workspace_id:
+            raise ReembedError("the re-embedding snapshot does not exist in this workspace")
+
+    def _require_run_workspace(self, run: ReembedRun) -> None:
+        if (
+            run.workspace_id != self.workspace_id
+            or run.commitment.snapshot.workspace_id != self.workspace_id
+        ):
+            raise ReembedError("the re-embedding run does not exist in this workspace")
 
     @asynccontextmanager
     async def _immediate(self) -> AsyncGenerator[AsyncConnection]:
@@ -955,14 +1067,20 @@ class LanceShadowGenerations:
         lease: ReembedLease,
     ) -> ShadowGeneration:
         offered = ShadowGeneration(
-            _generation_id(run_id), run_id, fingerprint.canonical(), inventory_digest
+            _generation_id(self._authority.workspace_id, run_id),
+            run_id,
+            fingerprint.canonical(),
+            inventory_digest,
+            self._authority.workspace_id,
         )
         async with self._authority.fenced(run_id, lease) as connection:
             existing = (
                 (
                     await connection.execute(
                         select(models.ReembedShadowGeneration.__table__).where(
-                            models.ReembedShadowGeneration.run_id == run_id
+                            models.ReembedShadowGeneration.workspace_id
+                            == self._authority.workspace_id,
+                            models.ReembedShadowGeneration.run_id == run_id,
                         )
                     )
                 )
@@ -973,6 +1091,7 @@ class LanceShadowGenerations:
                 await connection.execute(
                     insert(models.ReembedShadowGeneration).values(
                         id=offered.id,
+                        workspace_id=self._authority.workspace_id,
                         run_id=run_id,
                         fingerprint_json=fingerprint.model_dump_json(),
                         fingerprint=offered.fingerprint,
@@ -984,7 +1103,11 @@ class LanceShadowGenerations:
                 generation = offered
             else:
                 generation = ShadowGeneration(
-                    existing.id, existing.run_id, existing.fingerprint, existing.inventory_digest
+                    existing.id,
+                    existing.run_id,
+                    existing.fingerprint,
+                    existing.inventory_digest,
+                    existing.workspace_id,
                 )
                 if generation != offered:
                     raise ReembedError("shadow identity is immutable")
@@ -1105,7 +1228,8 @@ class LanceShadowGenerations:
             commitment_json = (
                 await connection.execute(
                     select(models.ReembedRunRecord.commitment_json).where(
-                        models.ReembedRunRecord.id == generation.run_id
+                        models.ReembedRunRecord.workspace_id == self._authority.workspace_id,
+                        models.ReembedRunRecord.id == generation.run_id,
                     )
                 )
             ).scalar_one()
@@ -1130,7 +1254,9 @@ class LanceShadowGenerations:
                 (
                     await connection.execute(
                         select(models.ReembedShadowGeneration.__table__).where(
-                            models.ReembedShadowGeneration.id == generation.id
+                            models.ReembedShadowGeneration.workspace_id
+                            == self._authority.workspace_id,
+                            models.ReembedShadowGeneration.id == generation.id,
                         )
                     )
                 )
@@ -1145,6 +1271,7 @@ class LanceShadowGenerations:
             result = await connection.execute(
                 update(models.ReembedShadowGeneration)
                 .where(
+                    models.ReembedShadowGeneration.workspace_id == self._authority.workspace_id,
                     models.ReembedShadowGeneration.id == generation.id,
                     models.ReembedShadowGeneration.state == "building",
                 )
@@ -1166,6 +1293,7 @@ class LanceShadowGenerations:
                     shutil.rmtree(path)
                 await connection.execute(
                     delete(models.ReembedShadowGeneration).where(
+                        models.ReembedShadowGeneration.workspace_id == self._authority.workspace_id,
                         models.ReembedShadowGeneration.id == generation_id,
                         models.ReembedShadowGeneration.run_id == run_id,
                     )
@@ -1188,6 +1316,7 @@ class LanceShadowGenerations:
             (
                 await connection.execute(
                     select(models.ReembedShadowGeneration.__table__).where(
+                        models.ReembedShadowGeneration.workspace_id == self._authority.workspace_id,
                         models.ReembedShadowGeneration.id == generation.id,
                         models.ReembedShadowGeneration.run_id == generation.run_id,
                     )
@@ -1199,7 +1328,9 @@ class LanceShadowGenerations:
         if row is None:
             raise ReembedError("the durable shadow generation does not exist")
         if (
-            row.fingerprint != generation.fingerprint
+            generation.workspace_id != self._authority.workspace_id
+            or row.workspace_id != self._authority.workspace_id
+            or row.fingerprint != generation.fingerprint
             or row.inventory_digest != generation.inventory_digest
         ):
             raise ReembedError("shadow identity is immutable")
@@ -1244,6 +1375,7 @@ def _run_from_receipt(run: ReembedRun, receipt: PublicationReceipt, *, revision:
     return ReembedRun(
         id=run.id,
         commitment=run.commitment,
+        workspace_id=run.workspace_id,
         state=state,
         document_after=run.document_after,
         active_document_id=run.active_document_id,

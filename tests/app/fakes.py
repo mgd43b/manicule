@@ -771,6 +771,7 @@ class FakeIngestion:
     synced: list[str] = field(default_factory=list[str])
     reindexed: list[str] = field(default_factory=list[str])
     reembed_runs: dict[str, ReembedRun] = field(default_factory=dict[str, ReembedRun])
+    reembed_recoveries: int = 0
     imported: list[Path] = field(default_factory=list[Path])
     connectors: dict[str, object] = field(default_factory=dict[str, object])
     """Constructed connectors, by instance name, for :meth:`connector`.
@@ -933,6 +934,10 @@ class FakeIngestion:
 
     async def reembed_cleanup(self, run_id: str) -> bool:
         return self.reembed_runs.pop(run_id, None) is not None
+
+    async def reembed_recover_pending(self) -> tuple[ReembedRun, ...]:
+        self.reembed_recoveries += 1
+        return tuple(self.reembed_runs.values())
 
     async def reparse_stale(self, *, batch: int, dry_run: bool = False) -> StaleSweep:
         self.sweeps.append((batch, dry_run))

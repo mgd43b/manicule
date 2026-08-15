@@ -685,6 +685,20 @@
       return json("POST", "/api/v1/documents/" + encodeURIComponent(element.getAttribute("data-reindex")) + "/reindex")
     });
 
+    var reembedStatus = document.querySelector("[data-reembed-status]");
+    act("[data-reembed-start]", reembedStatus, "Starting…", "Started.", function (element) {
+      return json("POST", "/api/v1/admin/reembed/" + encodeURIComponent(element.getAttribute("data-reembed-start")) + "/start");
+    });
+    act("[data-reembed-resume]", reembedStatus, "Resuming…", "Resumed.", function (element) {
+      return json("POST", "/api/v1/admin/reembed/" + encodeURIComponent(element.getAttribute("data-reembed-resume")) + "/resume");
+    });
+    act("[data-reembed-abandon]", reembedStatus, "Abandoning…", "Abandoned.", function (element) {
+      return json("POST", "/api/v1/admin/reembed/" + encodeURIComponent(element.getAttribute("data-reembed-abandon")) + "/abandon");
+    });
+    act("[data-reembed-cleanup]", reembedStatus, "Cleaning…", "Cleaned.", function (element) {
+      return json("DELETE", "/api/v1/admin/reembed/" + encodeURIComponent(element.getAttribute("data-reembed-cleanup")));
+    });
+
     act("[data-trash]", documentStatus, "Moving to trash…", "Moved to trash.", function (element) {
       return json("DELETE", "/api/v1/documents/" + encodeURIComponent(element.getAttribute("data-trash")))
     });

@@ -1128,6 +1128,9 @@ class ReembedRunRecord(Base):
     __tablename__ = "reembed_runs"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
     commitment_json: Mapped[str] = mapped_column(Text, nullable=False)
     state: Mapped[str] = mapped_column(Text, nullable=False)
     checkpoint_json: Mapped[str] = mapped_column(Text, nullable=False)
@@ -1152,6 +1155,9 @@ class ReembedCorpusSnapshot(Base):
     __tablename__ = "reembed_corpus_snapshots"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
     revision: Mapped[str] = mapped_column(Text, nullable=False)
     live_json: Mapped[str] = mapped_column(Text, nullable=False)
     complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -1165,27 +1171,39 @@ class ReembedCorpusSnapshot(Base):
 class ReembedSnapshotDocument(Base):
     __tablename__ = "reembed_snapshot_documents"
 
-    snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("reembed_corpus_snapshots.id", ondelete="CASCADE"), primary_key=True
-    )
+    workspace_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(Text, primary_key=True)
     document_id: Mapped[str] = mapped_column(Text, primary_key=True)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
 
-    __table_args__ = (WITHOUT_ROWID,)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "snapshot_id"],
+            ["reembed_corpus_snapshots.workspace_id", "reembed_corpus_snapshots.id"],
+            ondelete="CASCADE",
+        ),
+        WITHOUT_ROWID,
+    )
 
 
 class ReembedSnapshotChunk(Base):
     __tablename__ = "reembed_snapshot_chunks"
 
-    snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("reembed_corpus_snapshots.id", ondelete="CASCADE"), primary_key=True
-    )
+    workspace_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(Text, primary_key=True)
     document_id: Mapped[str] = mapped_column(Text, primary_key=True)
     position: Mapped[int] = mapped_column(Integer, primary_key=True)
     chunk_id: Mapped[str] = mapped_column(Text, primary_key=True)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
 
-    __table_args__ = (WITHOUT_ROWID,)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "snapshot_id"],
+            ["reembed_corpus_snapshots.workspace_id", "reembed_corpus_snapshots.id"],
+            ondelete="CASCADE",
+        ),
+        WITHOUT_ROWID,
+    )
 
 
 class ReembedShadowGeneration(Base):
@@ -1194,9 +1212,8 @@ class ReembedShadowGeneration(Base):
     __tablename__ = "reembed_shadow_generations"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
-    run_id: Mapped[str] = mapped_column(
-        ForeignKey("reembed_runs.id", ondelete="CASCADE"), nullable=False, unique=True
-    )
+    workspace_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    run_id: Mapped[str] = mapped_column(Text, nullable=False)
     fingerprint_json: Mapped[str] = mapped_column(Text, nullable=False)
     fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
     inventory_digest: Mapped[str] = mapped_column(Text, nullable=False)
@@ -1204,17 +1221,33 @@ class ReembedShadowGeneration(Base):
     seal_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id"],
+            ["reembed_runs.workspace_id", "reembed_runs.id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("workspace_id", "run_id"),
+    )
+
 
 class ReembedPublicationReceipt(Base):
     """The immutable result of a run's single publication decision."""
 
     __tablename__ = "reembed_publication_receipts"
 
-    run_id: Mapped[str] = mapped_column(
-        ForeignKey("reembed_runs.id", ondelete="CASCADE"), primary_key=True
-    )
+    run_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(Text, primary_key=True)
     receipt_json: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id"],
+            ["reembed_runs.workspace_id", "reembed_runs.id"],
+            ondelete="CASCADE",
+        ),
+    )
 
 
 class VectorTombstone(Base):

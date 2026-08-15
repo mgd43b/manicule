@@ -229,10 +229,17 @@ async def test_durable_reembed_downgrade_refuses_saved_or_published_state(
         async with engine.begin() as connection:
             await connection.execute(
                 text(
+                    "INSERT INTO workspaces (id, name, mode, settings, created_at) "
+                    "VALUES ('default', 'Default', 'personal', '{}', "
+                    "'2026-01-01T00:00:00+00:00')"
+                )
+            )
+            await connection.execute(
+                text(
                     "INSERT INTO reembed_corpus_snapshots "
-                    "(id, revision, live_json, complete, document_count, chunk_count, "
-                    "inventory_digest, chunk_inventory_digest, created_at) "
-                    "VALUES ('private-snapshot-id', '1', '{}', 0, 0, 0, '', '', "
+                    "(id, workspace_id, revision, live_json, complete, document_count, "
+                    "chunk_count, inventory_digest, chunk_inventory_digest, created_at) "
+                    "VALUES ('private-snapshot-id', 'default', '1', '{}', 0, 0, 0, '', '', "
                     "'2026-01-01T00:00:00+00:00')"
                 )
             )
@@ -242,6 +249,66 @@ async def test_durable_reembed_downgrade_refuses_saved_or_published_state(
         ) as caught:
             await downgrade(engine, "6e31b7d592ac")
         assert "private-snapshot-id" not in str(caught.value)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
+async def test_workspace_scope_migration_backfills_and_keeps_legacy_snapshot_rows(
+    data_dir: Path,
+) -> None:
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="31c7f944a31e")
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO workspaces (id, name, mode, settings, created_at) "
+                    "VALUES ('alpha', 'Alpha', 'personal', '{}', "
+                    "'2026-01-01T00:00:00+00:00')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO reembed_corpus_snapshots "
+                    "(id, revision, live_json, complete, document_count, chunk_count, "
+                    "inventory_digest, chunk_inventory_digest, created_at) VALUES "
+                    "('legacy-snapshot', '1', '{}', 1, 1, 1, 'documents', 'chunks', "
+                    "'2026-01-01T00:00:00+00:00')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO reembed_snapshot_documents "
+                    "(snapshot_id, document_id, payload_json) VALUES "
+                    "('legacy-snapshot', 'doc', '{\"workspace_id\":\"alpha\"}')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO reembed_snapshot_chunks "
+                    "(snapshot_id, document_id, position, chunk_id, payload_json) VALUES "
+                    "('legacy-snapshot', 'doc', 0, 'chunk', '{}')"
+                )
+            )
+
+        await upgrade(engine)
+
+        async with engine.connect() as connection:
+            assert (
+                await connection.execute(
+                    text(
+                        "SELECT workspace_id FROM reembed_corpus_snapshots "
+                        "WHERE id = 'legacy-snapshot'"
+                    )
+                )
+            ).scalar_one() == "alpha"
+            assert (
+                await connection.execute(text("SELECT count(*) FROM reembed_snapshot_documents"))
+            ).scalar_one() == 1
+            assert (
+                await connection.execute(text("SELECT count(*) FROM reembed_snapshot_chunks"))
+            ).scalar_one() == 1
     finally:
         await engine.dispose()
 

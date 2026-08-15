@@ -1287,6 +1287,11 @@ class ApplicationService:
             removed=await ingestion.reembed_cleanup(run_id),
         )
 
+    async def reembed_recover_pending(self) -> tuple[ReembedRun, ...]:
+        """Internal serving-process restart recovery; each run remains inspectable normally."""
+        ingestion = await self._backend.ingestion()
+        return await ingestion.reembed_recover_pending()
+
     async def document_reindex_stale(
         self, *, batch: int = DEFAULT_SWEEP_BATCH, dry_run: bool = False
     ) -> r.StaleReparseReport:

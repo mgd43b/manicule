@@ -327,13 +327,12 @@ caller able to start one has the machine's accelerator for an hour, which is the
 already made for refusing a benchmark endpoint. `document_reindex` stays on every surface,
 because one document is a bound.
 
-The same resource boundary keeps `reembed plan/start/resume/abandon/cleanup` local. Even the
-dry-run plan takes an immutable full-corpus snapshot and scans every stored embedding input;
-execution consumes corpus-sized accelerator, disk and time. `reembed_status` is different: it
-reads one journal row by opaque id, exposes aggregates only, reaches no network and writes
-nothing, so it has CLI, MCP and authenticated HTTP parity. The browser deliberately has no run
-listing or status page: opaque recovery ids are returned only to the local operator, and adding
-a discoverable list would turn private migration state into a broader information surface.
+MCP retains only `reembed_status`: an assistant cannot spend corpus-sized accelerator, disk and
+time unattended. Authenticated admin HTTP now has plan/start/resume/abandon/cleanup parity so
+the Web operator page can use the same JSON operations as every other browser mutation. The page
+accepts an opaque run id and never lists or discovers runs. Every payload remains aggregate-only;
+workspace ownership is checked before a supplied id resolves, so another tenant's id is the same
+sanitized not-found as an unknown id.
 
 `connector_login` is in that list for the credential reason and for one more: it reads a secret
 from a terminal without echoing it. A surface that cannot do that would have to accept the

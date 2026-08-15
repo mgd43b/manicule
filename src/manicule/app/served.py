@@ -276,6 +276,16 @@ class ScheduledSource:
     last_error_type: str = ""
 
 
+@dataclass(slots=True)
+class ScheduledReembedRecovery:
+    """Aggregate-safe outcome of restart recovery for durable re-embedding runs."""
+
+    recovered: int = 0
+    failures: int = 0
+    complete: bool = False
+    last_error_type: str = ""
+
+
 class Scheduler:
     """Syncs that happen because configuration said so.
 
@@ -326,6 +336,7 @@ class Scheduler:
             name: ScheduledSource(name=name, interval_s=interval)
             for name, interval in self._sources.items()
         }
+        self.reembedding = ScheduledReembedRecovery()
 
     @staticmethod
     def configure(service: ApplicationService) -> dict[str, float]:
@@ -346,10 +357,30 @@ class Scheduler:
 
     def start(self) -> None:
         """Begin every source's loop. Returns immediately; the loops run until :meth:`aclose`."""
+        recovery = asyncio.create_task(self._recover_reembedding(), name="recover:reembedding")
+        self._tasks.add(recovery)
+        recovery.add_done_callback(self._tasks.discard)
         for name, interval in self._sources.items():
             task = asyncio.create_task(self._run(name, interval), name=f"schedule:{name}")
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
+
+    async def _recover_reembedding(self) -> None:
+        """Resume ownerless durable runs once at startup; run status remains authoritative."""
+        try:
+            runs = await self._service.reembed_recover_pending()
+        except asyncio.CancelledError:
+            raise
+        except (ManiculeError, ValueError, OSError) as exc:
+            self.reembedding.failures += 1
+            self.reembedding.last_error_type = type(exc).__name__
+            announce(
+                "durable re-embedding restart recovery failed; inspect the saved run status "
+                f"and retry ({type(exc).__name__})"
+            )
+        else:
+            self.reembedding.recovered += len(runs)
+            self.reembedding.complete = True
 
     async def aclose(self) -> None:
         """Stop every loop and wait for it.

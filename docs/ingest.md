@@ -1600,11 +1600,19 @@ generation pin and only removes failed or superseded, non-live storage, so an in
 cannot lose its directory. `abandon` makes an unfinished run terminal without moving the live
 pointer.
 
-Runs are intentionally **not scheduled or auto-resumed**. This is a corpus-sized,
-accelerator-consuming operator migration, so restart recovery is explicit: `status` is safe to
-poll, and `resume` is the decision to spend the remaining resources. The local CLI alone can
-plan, execute, abandon or clean. Aggregate `reembed_status` is also available as the read-only
-MCP tool and `GET /api/v1/admin/reembed/{run_id}`; no browser page lists opaque run ids.
+Snapshots, runs, generations and receipts are keyed by workspace as well as their opaque id.
+Materialization filters authoritative documents to that workspace, and every journal, lease,
+publication and cleanup lookup repeats the workspace predicate. Legacy state is backfilled only
+when its stored document payloads identify exactly one workspace (or an empty legacy database has
+exactly one workspace); ambiguous state refuses migration rather than guessing ownership.
+
+The serving scheduler runs one restart-recovery job for ownerless nonterminal runs in its active
+workspace. It records aggregate recovered/failure counts, while the durable run remains the
+authoritative status. This is process-crash recovery, not connector scheduling: no connector or
+parser is called, and a live fenced owner is never taken over before lease expiry. The local CLI,
+authenticated admin HTTP routes and `/ui/reembed` expose plan, start, resume, abandon and cleanup;
+the Web page calls those JSON routes and never introduces a second write path. MCP retains the
+aggregate read-only `reembed_status` tool. No network or browser surface lists opaque run ids.
 
 ## 11. `reconcile()` and deletion
 

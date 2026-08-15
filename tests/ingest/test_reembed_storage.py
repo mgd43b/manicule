@@ -27,6 +27,7 @@ from manicule.ingest.reembed import (
 )
 from manicule.ingest.sweeps import sweep_vectors
 from manicule.storage import models
+from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.engine import VECTORS_DIRNAME
 from manicule.storage.migrator import downgrade
 from manicule.storage.reembed import (
@@ -96,6 +97,72 @@ class FailingEmbedder(HashEmbedder):
     async def embed(self, texts: Sequence[str]) -> list[Vector]:
         del texts
         raise OSError("synthetic embedding failure")
+
+
+class RefusingCreateJournal:
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+
+    async def create_released(self, run_id: str, commitment: object) -> ReembedRun:
+        del run_id, commitment
+        raise self.failure
+
+
+async def test_snapshots_runs_and_counts_are_workspace_scoped(
+    engine: AsyncEngine,
+) -> None:
+    alpha = SqliteDocStore(engine, workspace_id="alpha")
+    beta = SqliteDocStore(engine, workspace_id="beta")
+    await alpha.ensure_workspace()
+    await beta.ensure_workspace()
+    for scoped, workspace, source_id in ((alpha, "alpha", "a"), (beta, "beta", "b")):
+        document = make_document(source_id=source_id, workspace_id=workspace)
+        await scoped.upsert_document(document)
+        await scoped.replace_chunks(document.id, [make_chunk(document, 0, workspace)])
+    old = fingerprint(dimension=4, model_id="old/model")
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(models.IndexState).values(
+                id=1,
+                vector_table=table_name(old),
+                embed_fingerprint=old.model_dump_json(),
+                created_at=utcnow(),
+                updated_at=utcnow(),
+            )
+        )
+
+    target = HashEmbedder(dimension=4).fingerprint
+    alpha_corpus = SqliteReembedCorpus(engine, "alpha")
+    beta_corpus = SqliteReembedCorpus(engine, "beta")
+    alpha_commitment = await plan_reembed_commitment(alpha_corpus, target)
+    beta_commitment = await plan_reembed_commitment(beta_corpus, target)
+    assert alpha_commitment.plan.documents == alpha_commitment.plan.chunks == 1
+    assert beta_commitment.plan.documents == beta_commitment.plan.chunks == 1
+    assert alpha_commitment.snapshot.workspace_id == "alpha"
+    assert beta_commitment.snapshot.workspace_id == "beta"
+
+    alpha_store = SqliteReembedStore(engine, "alpha")
+    beta_store = SqliteReembedStore(engine, "beta")
+    alpha_run = await alpha_store.create_released("same-run-id", alpha_commitment)
+    beta_run = await beta_store.create_released("same-run-id", beta_commitment)
+    assert alpha_run.workspace_id == "alpha"
+    assert beta_run.workspace_id == "beta"
+    assert await alpha_store.get("beta-only") is None
+    beta_only = await beta_store.create_released("beta-only", beta_commitment)
+    assert beta_only.workspace_id == "beta"
+    assert await alpha_store.get("beta-only") is None
+
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(
+                select(
+                    models.ReembedRunRecord.workspace_id,
+                    func.count(models.ReembedRunRecord.id),
+                ).group_by(models.ReembedRunRecord.workspace_id)
+            )
+        ).all()
+        counts = {str(row[0]): int(row[1]) for row in rows}
+    assert counts == {"alpha": 1, "beta": 2}
 
 
 async def seeded_run(
@@ -198,6 +265,45 @@ async def test_failed_or_canceled_plan_removes_every_private_snapshot_row(
         ]
     assert counts == [0, 0, 0]
     await downgrade(engine, "6e31b7d592ac")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("synthetic create refusal"), asyncio.CancelledError()],
+    ids=["refusal", "cancellation"],
+)
+async def test_start_cleans_its_self_created_snapshot_when_run_creation_does_not_commit(
+    engine: AsyncEngine, store: SqliteDocStore, failure: BaseException
+) -> None:
+    old = fingerprint(dimension=4, model_id="old/model")
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(models.IndexState).values(
+                id=1,
+                vector_table=table_name(old),
+                embed_fingerprint=old.model_dump_json(),
+                created_at=utcnow(),
+                updated_at=utcnow(),
+            )
+        )
+    document = make_document()
+    await store.upsert_document(document)
+    await store.replace_chunks(document.id, [make_chunk(document, 0, "local")])
+    corpus = SqliteReembedCorpus(engine)
+
+    with pytest.raises(type(failure)):
+        await start_reembed(
+            "not-created",
+            owner_token="synthetic-owner",  # noqa: S106
+            corpus=corpus,
+            target=HashEmbedder(dimension=4).fingerprint,
+            journal=RefusingCreateJournal(failure),  # type: ignore[arg-type]
+        )
+
+    async with engine.connect() as connection:
+        assert (
+            await connection.execute(select(func.count()).select_from(models.ReembedCorpusSnapshot))
+        ).scalar_one() == 0
 
 
 async def test_canceled_resume_releases_fence_for_immediate_takeover_and_abandon(

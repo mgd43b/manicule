@@ -464,8 +464,8 @@ def test_no_route_generates_sidecar_manifests() -> None:
     )
 
 
-def test_reembed_network_surface_is_status_only_and_browser_has_no_run_discovery() -> None:
-    """Remote callers can inspect a supplied opaque id, never start or discover migrations."""
+def test_reembed_network_surface_has_operator_action_and_status_parity() -> None:
+    """Authenticated admins receive the same explicit run lifecycle as other surfaces."""
     reembed = sorted(
         (
             route.name,
@@ -476,7 +476,13 @@ def test_reembed_network_surface_is_status_only_and_browser_has_no_run_discovery
         if "reembed" in route.name.lower() or "reembed" in route.path.lower()
     )
     assert reembed == [
+        ("reembed_abandon", "/api/v1/admin/reembed/{run_id}/abandon", ["POST"]),
+        ("reembed_cleanup", "/api/v1/admin/reembed/{run_id}", ["DELETE"]),
+        ("reembed_plan", "/api/v1/admin/reembed", ["GET"]),
+        ("reembed_resume", "/api/v1/admin/reembed/{run_id}/resume", ["POST"]),
+        ("reembed_start", "/api/v1/admin/reembed/{run_id}/start", ["POST"]),
         ("reembed_status", "/api/v1/admin/reembed/{run_id}", ["GET"]),
+        ("ui_reembed", "/ui/reembed", ["GET"]),
     ]
 
 

@@ -862,12 +862,15 @@ class _Ingestion:
 
     async def reembed_plan(self) -> tuple[ReembedPlan, str, int]:
         """Price from a transient durable snapshot, with no embedding or source access."""
-        from manicule.ingest.reembed import plan_reembed_commitment  # noqa: PLC0415
+        from manicule.ingest.reembed import (  # noqa: PLC0415
+            discard_reembed_snapshot,
+            plan_reembed_commitment,
+        )
         from manicule.storage.reembed import SqliteReembedCorpus  # noqa: PLC0415
 
         await self._require_reembed_backend()
         await self._runtime.documents()
-        corpus = SqliteReembedCorpus(self._runtime.require_engine())
+        corpus = SqliteReembedCorpus(self._runtime.require_engine(), self._runtime.workspace)
         embedder = await self._runtime.embedder()
         commitment = await plan_reembed_commitment(corpus, embedder.fingerprint)
         try:
@@ -877,7 +880,7 @@ class _Ingestion:
                 commitment.target_dimension,
             )
         finally:
-            await corpus.discard_snapshot(commitment.snapshot.id)
+            await discard_reembed_snapshot(corpus, commitment.snapshot.id)
 
     async def reembed_start(self, run_id: str, owner_token: str) -> ReembedRun:
         from manicule.ingest.reembed import (  # noqa: PLC0415
@@ -890,23 +893,24 @@ class _Ingestion:
 
         await self._require_reembed_backend()
         await self._runtime.documents()
-        authority = SqliteReembedStore(self._runtime.require_engine())
+        authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
         existing = await authority.get(run_id)
         if existing is not None:
             return existing
         corpus, authority, _shadows, embedder = await self._reembed_components()
         commitment = await plan_reembed_commitment(corpus, embedder.fingerprint)
         if not commitment.plan.runnable:
-            await corpus.discard_snapshot(commitment.snapshot.id)
-            raise PolicyError(
+            error = PolicyError(
                 f"{commitment.plan.unrepairable_documents} document(s) have no stored chunks. "
                 "Re-embedding never falls back to a connector or parser; repair local inputs "
                 "first."
             )
+            await discard_reembed_snapshot(corpus, commitment.snapshot.id, error)
+            raise error
         try:
             self._require_reembed_capacity_bytes(commitment.plan.temporary_disk_bytes)
-        except ReembedCapacityError:
-            await corpus.discard_snapshot(commitment.snapshot.id)
+        except ReembedCapacityError as error:
+            await discard_reembed_snapshot(corpus, commitment.snapshot.id, error)
             raise
         # Starting is deliberately a durable, non-embedding checkpoint.  The operator receives
         # the run id before the expensive step begins, so a process exit can always be recovered
@@ -935,13 +939,13 @@ class _Ingestion:
         await self._require_reembed_backend()
         await self._runtime.documents()
         engine = self._runtime.require_engine()
-        authority = SqliteReembedStore(engine)
+        authority = SqliteReembedStore(engine, self._runtime.workspace)
         run = await authority.get(run_id)
         if run is None:
             raise UnknownEntityError("no durable re-embedding run has that id")
         # Refuse for local disk before constructing a potentially multi-gigabyte model runtime.
         self._require_reembed_capacity(run)
-        corpus = SqliteReembedCorpus(engine)
+        corpus = SqliteReembedCorpus(engine, self._runtime.workspace)
         shadows = LanceShadowGenerations(
             self._runtime.settings.data_dir / VECTORS_DIRNAME, authority
         )
@@ -959,13 +963,15 @@ class _Ingestion:
         from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
 
         await self._runtime.documents()
-        return await SqliteReembedStore(self._runtime.require_engine()).get(run_id)
+        return await SqliteReembedStore(
+            self._runtime.require_engine(), self._runtime.workspace
+        ).get(run_id)
 
     async def reembed_abandon(self, run_id: str, owner_token: str) -> ReembedRun:
         from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
 
         await self._runtime.documents()
-        authority = SqliteReembedStore(self._runtime.require_engine())
+        authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
         if await authority.get(run_id) is None:
             raise UnknownEntityError("no durable re-embedding run has that id")
         lease = await authority.acquire(run_id, owner_token, ttl_seconds=30.0)
@@ -980,10 +986,24 @@ class _Ingestion:
 
         await self._require_reembed_backend()
         await self._runtime.documents()
-        authority = SqliteReembedStore(self._runtime.require_engine())
+        authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
         return await LanceShadowGenerations(
             self._runtime.settings.data_dir / VECTORS_DIRNAME, authority
         ).cleanup_terminal(run_id)
+
+    async def reembed_recover_pending(self) -> tuple[ReembedRun, ...]:
+        """Resume ownerless runs after a serving-process restart, scoped to this workspace."""
+        import secrets  # noqa: PLC0415
+
+        from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
+
+        await self._require_reembed_backend()
+        await self._runtime.documents()
+        authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
+        completed: list[ReembedRun] = []
+        for run_id in await authority.recoverable_run_ids():
+            completed.append(await self.reembed_resume(run_id, secrets.token_urlsafe(24)))
+        return tuple(completed)
 
     async def _reembed_components(
         self,
@@ -997,9 +1017,9 @@ class _Ingestion:
 
         await self._runtime.documents()
         engine = self._runtime.require_engine()
-        authority = SqliteReembedStore(engine)
+        authority = SqliteReembedStore(engine, self._runtime.workspace)
         return (
-            SqliteReembedCorpus(engine),
+            SqliteReembedCorpus(engine, self._runtime.workspace),
             authority,
             LanceShadowGenerations(self._runtime.settings.data_dir / VECTORS_DIRNAME, authority),
             await self._runtime.embedder(),

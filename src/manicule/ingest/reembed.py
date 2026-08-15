@@ -73,6 +73,7 @@ class CorpusSnapshot:
     id: str
     revision: str
     live: LivePublication
+    workspace_id: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -226,12 +227,14 @@ class PublicationReceipt:
     expected: LivePublication
     observed_winner: LivePublication
     published_generation_id: str | None
+    workspace_id: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True, slots=True)
 class ReembedRun:
     id: str
     commitment: ReembedCommitment = field(repr=False)
+    workspace_id: str = field(default="", repr=False)
     state: ReembedState = ReembedState.PLANNED
     document_after: str | None = None
     active_document_id: str | None = None
@@ -250,6 +253,7 @@ class ShadowGeneration:
     run_id: str
     fingerprint: str
     inventory_digest: str
+    workspace_id: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,6 +487,7 @@ async def start_reembed(
     commitment: ReembedCommitment | None = None,
 ) -> ReembedRun:
     _validate_owner(owner_token, lease_ttl_seconds)
+    created_snapshot = commitment is None
     if commitment is None:
         commitment = await plan_reembed_commitment(
             corpus,
@@ -494,11 +499,19 @@ async def start_reembed(
     elif commitment.target_fingerprint != target.canonical():
         raise ReembedError("the prepared commitment belongs to another target embedder")
     if not commitment.plan.runnable:
-        raise PolicyError(
+        error = PolicyError(
             f"{commitment.plan.unrepairable_documents} document(s) have no stored chunks. "
             "Re-embedding never falls back to a connector or parser; repair local inputs first."
         )
-    return await journal.create_released(run_id, commitment)
+        if created_snapshot:
+            await _discard_after_failure(corpus, commitment.snapshot.id, error)
+        raise error
+    try:
+        return await journal.create_released(run_id, commitment)
+    except BaseException as error:
+        if created_snapshot:
+            await _discard_after_failure(corpus, commitment.snapshot.id, error)
+        raise
 
 
 async def resume_reembed(
@@ -889,10 +902,23 @@ async def _discard_after_failure(
 
 
 async def discard_reembed_snapshot(
-    corpus: ReembedCorpus, snapshot_id: str, failure: BaseException
+    corpus: ReembedCorpus, snapshot_id: str, failure: BaseException | None = None
 ) -> None:
     """Cancellation-safe cleanup for a commitment that never became a durable run."""
-    await _discard_after_failure(corpus, snapshot_id, failure)
+    if failure is not None:
+        await _discard_after_failure(corpus, snapshot_id, failure)
+        return
+    cleanup = asyncio.create_task(corpus.discard_snapshot(snapshot_id))
+    canceled: asyncio.CancelledError | None = None
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as error:
+            canceled = error
+            continue
+    cleanup.result()
+    if canceled is not None:
+        raise canceled
 
 
 async def _release_after_operation(

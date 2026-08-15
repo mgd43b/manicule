@@ -172,6 +172,25 @@ async def test_nothing_is_synced_at_startup() -> None:
     assert ingestion.synced == []
 
 
+async def test_startup_runs_durable_reembedding_recovery_as_an_inspectable_job() -> None:
+    service, ingestion = service_with({})
+    await ingestion.reembed_start("recoverable", "synthetic-owner")
+    scheduler = Scheduler(service, {})
+
+    scheduler.start()
+    try:
+        for _ in range(20):
+            if scheduler.reembedding.complete:
+                break
+            await asyncio.sleep(0)
+        assert scheduler.reembedding.complete
+        assert scheduler.reembedding.recovered == 1
+        assert scheduler.reembedding.failures == 0
+        assert ingestion.reembed_recoveries == 1
+    finally:
+        await scheduler.aclose()
+
+
 async def test_a_disabled_source_is_not_synced_even_with_the_scheduler_running() -> None:
     """The configuration test above says it is not scheduled; this says it is not synced.
 
