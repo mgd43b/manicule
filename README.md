@@ -4,10 +4,12 @@
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
 
-Self-hosted document search and answers. Point it at a directory or a Confluence space, ask
-questions in natural language, and get answers with citations that resolve to a real location
-in a real document — a page, a heading, a line, a cell. Usable from the command line, from a
-browser, over HTTP, and by AI assistants over MCP.
+Self-hosted retrieval infrastructure for AI assistants. **MCP is the primary interface**: an
+agent searches a private corpus or asks a grounded question, and gets evidence that resolves to
+a real location in a real document — a page, a heading, a line, a cell. The core value is the
+accuracy of the embedding and retrieval pipeline, plus evidence a caller can inspect at its
+source. The command line and HTTP expose the same service; the browser is a functional operator
+and retrieval-inspection console, not the primary knowledge-work interface.
 
 > **Early, and runnable.** All four surfaces work today: point it at a directory, search it, ask
 > it questions, read it in a browser, hand the same operations to an assistant over MCP, or serve
@@ -129,17 +131,17 @@ alongside it.
 
 | Surface | Started by | Shape |
 |---|---|---|
-| **Command line** | `manicule <command>` | 20 commands; `--json` anywhere data is emitted |
-| **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
-| **Browser** | the same process, at `/ui` | 12 areas of server-rendered HTML, 11 of them in the navigation |
 | **MCP** | `manicule start --mcp-only` | 28 tools over stdio, which opens no socket; 13 read-only tools at `/mcp/` when served over a port |
+| **Command line** | `manicule <command>` | 21 commands; `--json` anywhere data is emitted |
+| **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
+| **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 12 areas of server-rendered HTML, 11 in the navigation |
 
 They are adapters over one application service, and `tests/app/test_surface_parity.py` holds
 them to it: for the same operation and the same arguments the CLI under `--json`, the MCP tool
 and the HTTP route return **byte-identical** envelopes, and the browser page is asserted to
 show what that envelope said rather than anything it worked out for itself.
 
-**The command line** is twenty commands; `manicule --help` lists them. Under `--json` the
+**The command line** is twenty-one commands; `manicule --help` lists them. Under `--json` the
 result envelope is the whole of stdout — no prose, no progress, nothing else — and a failure is
 that same envelope with `"ok": false`, a typed `error` and a non-zero exit status. So `jq` reads
 well-formed JSON whether the command succeeded or not.
@@ -170,8 +172,9 @@ talks to one process down a pipe, the whole surface is offered. `docs/surfaces.m
 `/api/docs` is Swagger over the OpenAPI document at `/api/openapi.json`. Every response is the
 same envelope the CLI prints under `--json`.
 
-**The browser surface** is server-rendered HTML at `/ui`, on the same socket, with eleven areas
-in its navigation: a dashboard; chat with streaming citations, confidence and feedback;
+**The browser surface** is the functional operator and inspection console, not the primary
+knowledge-work interface. It is server-rendered HTML at `/ui`, on the same socket, with eleven
+areas in its navigation: a dashboard; chat with streaming citations, confidence and feedback;
 documents, their chunks, the trash and restore; collections and tags; connectors; plugins;
 workspaces; health; an admin dashboard; your own API keys; and settings. Command palette on
 `Ctrl`/`Cmd`+`K`, keyboard navigation, dark mode. `manicule start --no-web` prints `browser
@@ -186,8 +189,8 @@ of Node. It also adds **no operation** — every page reads through a service me
 has a route, so there is no upload and no configuration write here either.
 [`docs/web.md`](docs/web.md) has the reasoning, including what that costs.
 
-**The MCP server** is nineteen tools over the same service, and it speaks stdio by default —
-which opens no socket at all. To let Claude Code use your index:
+**The MCP server** is the primary interface: twenty-eight tools over the same service, speaking
+stdio by default, which opens no socket at all. To let Claude Code use your index:
 
 ```bash
 claude mcp add manicule -s project -- "$(pwd)/.venv/bin/manicule" start --mcp-only
@@ -243,10 +246,11 @@ type = "confluence"
 schedule_s = 3600      # a served manicule syncs this hourly, with nothing typed
 ```
 
-There is no HTTP route that starts a sync, deliberately, and adding one is not on the roadmap:
-an unattended caller could hold the accelerator for an hour. A server acting on its own
-configuration is a different thing from a caller telling it to. `docs/deployment.md` §6 has the
-whole of it.
+An admin may also start one already-configured connector through
+`POST /api/v1/admin/connectors/{name}/sync`. The route cannot declare or reconfigure a source:
+connectors hold credentials and reach remote systems, so the complete set remains in
+configuration where it can be reviewed. Per-source schedules remain the unattended path.
+`docs/deployment.md` §6 has the whole of it.
 
 ## In a container
 
@@ -317,9 +321,9 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/container` | Typed resolution and lifecycle. Assembled at startup, injected |
 | `src/manicule/testing` | Conformance suites every implementation must pass |
 | `src/manicule/app` | The application service. All the behavior, once, for every surface |
-| `src/manicule/cli` | Nineteen commands over that service, and nothing else |
-| `src/manicule/mcp` | Nineteen MCP tools over that service, and nothing else |
-| `src/manicule/api` | Eleven HTTP route groups over that service, and nothing else |
+| `src/manicule/cli` | Twenty-one commands over that service, and nothing else |
+| `src/manicule/mcp` | Twenty-eight MCP tools over that service, and nothing else |
+| `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/web` | Twelve areas of HTML — eleven pages and the frame they render inside. No build step, no new operation |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |
 
