@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Iterator, Sequence
 from enum import StrEnum
 from typing import ClassVar, Final, Protocol, override, runtime_checkable
@@ -31,6 +32,16 @@ type Vector = Sequence[float]
 Deliberately a plain sequence: vectors cross a storage boundary, where a concrete,
 serializable value is what is wanted. Backends holding native arrays convert at the seam.
 """
+
+
+def is_finite_vector(vector: Vector) -> bool:
+    """Whether every component can participate in distance arithmetic.
+
+    ``NaN`` and infinities have the right shape and serialize cleanly, but cosine distance
+    against them is undefined. Treating one as readable would preserve a transient numerical
+    failure as durable retrieval state.
+    """
+    return all(math.isfinite(value) for value in vector)
 
 
 @runtime_checkable
@@ -406,7 +417,8 @@ def classify_stored_vector(
     3. **A row about a different embedding input is stale.** The case chunk-id reuse gets
        wrong: the id survived a re-parse because ``text`` did, while the heading breadcrumb in
        ``embed_text`` did not.
-    4. **A row of the wrong dimension is corrupt**, however current its identity says it is.
+    4. **A row of the wrong dimension or with a non-finite component is corrupt**, however
+       current its identity says it is. ``NaN`` and infinities cannot be ranked meaningfully.
     5. What is left is readable.
 
     Args:
@@ -441,7 +453,11 @@ def classify_stored_vector(
 
     if recorded != wanted:
         return StoredVector(state=VectorState.STALE)
-    if stored_vector is None or len(stored_vector) != embed.dimension:
+    if (
+        stored_vector is None
+        or len(stored_vector) != embed.dimension
+        or not is_finite_vector(stored_vector)
+    ):
         return StoredVector(state=VectorState.CORRUPT)
     return StoredVector(
         state=VectorState.READABLE,
@@ -569,5 +585,6 @@ __all__ = [
     "choose_stored_vector",
     "classify_stored_vector",
     "embedding_input_identity",
+    "is_finite_vector",
     "require_within_context",
 ]

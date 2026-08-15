@@ -156,6 +156,32 @@ def test_pooled_output_is_normalized_and_plain() -> None:
     assert np.allclose((pooled * pooled).sum(axis=-1), 1.0)
 
 
+@pytest.mark.parametrize(
+    "value", [np.nan, np.inf, -np.inf], ids=["nan", "positive-inf", "negative-inf"]
+)
+def test_non_finite_embedding_output_is_refused_with_its_origin_named(value: float) -> None:
+    """A numerical failure must not become a well-shaped, durable vector in the index."""
+    broken = states(1, 4, 3)
+    broken[0, 0, 0] = value
+
+    with np.errstate(invalid="ignore"), pytest.raises(TokenStateError) as raised:
+        pool_token_states(
+            TokenStates(
+                states=broken,
+                attention_mask=np.ones((1, 4), dtype=np.int64),
+                dimension=3,
+            ),
+            Pooling.CLS,
+            backend="test-backend",
+            model_id="test/model",
+        )
+
+    message = str(raised.value)
+    assert "non-finite" in message
+    assert "test-backend" in message
+    assert "test/model" in message
+
+
 def test_token_states_narrower_than_declared_are_refused() -> None:
     """The declared dimension is what the vector table was created with.
 

@@ -180,6 +180,13 @@ def pool_token_states(
         raise TokenStateError(msg)
 
     pooled = l2_normalize(pool(states, mask, pooling))
+    if not np.isfinite(pooled).all():
+        msg = (
+            f"{model_id} produced non-finite embedding values under {backend}. NaN and "
+            "infinity cannot participate in cosine distance, so these vectors were refused "
+            "before they could enter the index. Check the model weights and runtime precision."
+        )
+        raise TokenStateError(msg)
     return [row.tolist() for row in pooled]
 
 

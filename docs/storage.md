@@ -849,11 +849,13 @@ A stored vector may be reused **if and only if all three hold**:
    every code point of it, under the document that owns it. Never Unicode-normalized, and never
    the chunk id, the display text, the content hash or the parse fingerprint.
 3. **A readable stored vector actually exists for that identity** — established by reading the
-   row, not by believing what it says about itself.
+   row, not by believing what it says about itself. A vector containing `NaN` or infinity is
+   not readable, whatever its shape or identity metadata says.
 
 **Clause 3 is manicule's own and is the one to keep.** Two specifications have now been written
 for this problem by different authors, and *both* state only the first two. A row whose recorded
-identity says "current" while its vector is missing, unreadable, or of the wrong dimension
+identity says "current" while its vector is missing, unreadable, of the wrong dimension, or
+contains a non-finite component
 satisfies both documents and is refused here — because a claim that a vector exists is not a
 vector existing, which is the shape of defect this repository keeps finding. The
 identity recorded in a row is also cross-checked against one derived from the `chunk_json`

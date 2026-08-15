@@ -74,6 +74,7 @@ from manicule.core.embedding import (
     choose_stored_vector,
     classify_stored_vector,
     embedding_input_identity,
+    is_finite_vector,
 )
 from manicule.core.errors import ManiculeError
 from manicule.core.retrieval import Candidate, Filter
@@ -678,6 +679,14 @@ class LanceVectorStore:
         self, chunk: Chunk, vector: Vector, fingerprint: EmbedFingerprint
     ) -> dict[str, object]:
         """One Lance row: the normalized vector, the promoted columns, the chunk, its identity."""
+        if not is_finite_vector(vector):
+            backend = fingerprint.backend or "an unspecified backend"
+            msg = (
+                f"chunk {chunk.id!r} was offered a vector with non-finite values for "
+                f"{fingerprint.describe()} from {backend}. NaN and infinity cannot participate "
+                "in cosine distance, so the vector was refused before storage."
+            )
+            raise ValueError(msg)
         values = unit(vector)
         if len(values) != fingerprint.dimension:
             msg = (
