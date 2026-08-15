@@ -80,9 +80,7 @@ async def test_marker_name_index_upgrades_from_already_applied_inventory_revisio
 
         await upgrade(engine)
         async with engine.connect() as connection:
-            after = (
-                await connection.execute(text("PRAGMA table_info(acquisition_records)"))
-            ).all()
+            after = (await connection.execute(text("PRAGMA table_info(acquisition_records)"))).all()
             indexes = (
                 await connection.execute(text("PRAGMA index_list(acquisition_records)"))
             ).all()

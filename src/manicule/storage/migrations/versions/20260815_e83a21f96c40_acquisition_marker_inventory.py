@@ -32,9 +32,7 @@ def upgrade() -> None:
         sa.Column("blob_ref", sa.Text(), nullable=True),
         sa.Column("acquired_source", sa.JSON(), nullable=True),
         sa.Column("legacy", sa.Boolean(), nullable=False),
-        sa.Column(
-            "created_at", manicule.storage.types.UtcDateTime(), nullable=False
-        ),
+        sa.Column("created_at", manicule.storage.types.UtcDateTime(), nullable=False),
         sa.PrimaryKeyConstraint("name"),
     )
     op.create_index(

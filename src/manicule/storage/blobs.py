@@ -363,9 +363,7 @@ class BlobStore:
             "source_id": source_id if separator else None,
         }
         name = self._stage_name(key)
-        async with self._durable_locks(
-            [f"marker:{name}", f"blob:{acquired.content_hash}"]
-        ):
+        async with self._durable_locks([f"marker:{name}", f"blob:{acquired.content_hash}"]):
             await self._record_marker(name, marker, legacy=False)
             stored = await self._durable_thread_call(
                 lambda: self._published_blob(
@@ -703,13 +701,17 @@ class BlobStore:
     async def _reconcile_marker_page(self) -> None:
         async with self._sessions() as session:
             names = (
-                await session.execute(
-                    select(models.AcquisitionMarker.name)
-                    .where(models.AcquisitionMarker.name > self._marker_cursor)
-                    .order_by(models.AcquisitionMarker.name)
-                    .limit(STAGING_MARKER_RECONCILE_LIMIT)
+                (
+                    await session.execute(
+                        select(models.AcquisitionMarker.name)
+                        .where(models.AcquisitionMarker.name > self._marker_cursor)
+                        .order_by(models.AcquisitionMarker.name)
+                        .limit(STAGING_MARKER_RECONCILE_LIMIT)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         if not names:
             self._marker_cursor = ""
             return
@@ -731,8 +733,7 @@ class BlobStore:
                         .outerjoin(
                             models.AcquisitionRecord,
                             and_(
-                                models.AcquisitionRecord.run_id
-                                == models.AcquisitionMarker.run_id,
+                                models.AcquisitionRecord.run_id == models.AcquisitionMarker.run_id,
                                 models.AcquisitionRecord.source_id
                                 == models.AcquisitionMarker.source_id,
                             ),

@@ -2313,9 +2313,7 @@ async def test_crash_after_acquired_association_reconciles_marker_before_history
     restarted_blobs = BlobStore(engine, data_dir)
     await restarted_blobs.reconcile_acquisition_markers()
     assert list(staging.iterdir()) == []
-    assert await store.cleanup_acquisition_history(
-        datetime(2100, 1, 1, tzinfo=UTC), limit=10
-    ) == 1
+    assert await store.cleanup_acquisition_history(datetime(2100, 1, 1, tzinfo=UTC), limit=10) == 1
 
     assert await store.get_acquisition_run(durable.id) is None
     assert await restarted_blobs.collect_garbage() == [record.blob_ref]

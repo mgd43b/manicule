@@ -53,9 +53,7 @@ async def test_identical_bytes_are_stored_once(engine: AsyncEngine, data_dir: Pa
     assert isinstance(first, StoredBlob)
     assert isinstance(second, StoredBlob)
     assert first.hash == second.hash
-    assert sum(
-        1 for path in (blobs.root / "blake2b").rglob("*") if path.is_file()
-    ) == 1
+    assert sum(1 for path in (blobs.root / "blake2b").rglob("*") if path.is_file()) == 1
 
 
 async def test_concurrent_media_types_reuse_one_coherent_blob_representation(
@@ -713,9 +711,7 @@ async def test_preassociation_marker_supersession_releases_only_the_fenced_blob(
             text("DELETE FROM acquisition_markers WHERE name = :name"),
             {"name": live_path.name},
         )
-    await store.set_watermark(
-        "stale", Watermark(value="new", observed_at=now)
-    )
+    await store.set_watermark("stale", Watermark(value="new", observed_at=now))
     replacement = await store.claim_or_create_acquisition_run(
         "stale",
         "replacement",
@@ -730,9 +726,7 @@ async def test_preassociation_marker_supersession_releases_only_the_fenced_blob(
     assert await restarted.reconcile_acquisition_markers()
     assert await restarted.resume_acquisition(f"stale-run\0{stale_source}") is None
     assert await restarted.resume_acquisition(f"live-run\0{live_source}") is not None
-    assert await store.cleanup_acquisition_history(
-        datetime(2100, 1, 1, tzinfo=UTC), limit=10
-    ) == 1
+    assert await store.cleanup_acquisition_history(datetime(2100, 1, 1, tzinfo=UTC), limit=10) == 1
     assert await restarted.collect_garbage() == [stale_ref]
     assert await restarted.get(live_ref) == b"live bytes"
 
@@ -790,9 +784,7 @@ async def test_explicit_marker_is_removed_when_its_cascaded_run_owner_disappears
         "vanished-run\0vanished-source"
     )
     async with engine.begin() as connection:
-        await connection.execute(
-            text("DELETE FROM acquisition_runs WHERE id = 'vanished-run'")
-        )
+        await connection.execute(text("DELETE FROM acquisition_runs WHERE id = 'vanished-run'"))
 
     await blobs.reconcile_acquisition_markers()
 

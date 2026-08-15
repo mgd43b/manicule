@@ -693,9 +693,7 @@ async def test_cleanup_is_bounded_and_discards_only_superseded_retry_work(
     assert len(records) == 1
     assert records[0].state is AcquisitionRecordState.RETRY
 
-    removed = await store.cleanup_acquisition_history(
-        datetime(2100, 1, 1, tzinfo=UTC), limit=10
-    )
+    removed = await store.cleanup_acquisition_history(datetime(2100, 1, 1, tzinfo=UTC), limit=10)
 
     assert removed == 2
     assert await store.get_acquisition_run(retry.id) is None
@@ -733,9 +731,7 @@ async def test_stale_generation_cannot_publish_connector_run_metadata(
         updates={"last_run": {"outcome": "stale"}},
         release=True,
     )
-    assert (await store.connector_metadata("wiki"))["last_run"] == {
-        "outcome": "successor"
-    }
+    assert (await store.connector_metadata("wiki"))["last_run"] == {"outcome": "successor"}
 
 
 async def test_orderly_release_is_generation_fenced_and_immediately_claimable(
