@@ -64,6 +64,7 @@ from manicule.parsers.chain import Attempt, Outcome
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from manicule.container.container import Container
     from manicule.core.content import Document, ParsedBlock, RawDocument
     from manicule.core.protocols import Chunker
     from manicule.ingest.middleware import MiddlewareRunner
@@ -443,7 +444,7 @@ def _parser_builder(config: WorkerConfig) -> ParserBuilder:
     return build
 
 
-async def _stage_components(config: WorkerConfig) -> tuple[object, object]:
+async def _stage_components(config: WorkerConfig) -> tuple[object, object, object]:
     """Construct one document-scoped production middleware/chunker session."""
     from manicule.config.settings import Settings  # noqa: PLC0415 - child-only imports
     from manicule.container import keys  # noqa: PLC0415
@@ -470,7 +471,21 @@ async def _stage_components(config: WorkerConfig) -> tuple[object, object]:
         disabled=frozenset(settings.plugins.disabled),
     )
     container = Container(settings, found.registry, discovery=found)
-    return MiddlewareRunner(await container.middleware()), await container.aget(keys.CHUNKER)
+    try:
+        middleware = MiddlewareRunner(await container.middleware())
+        # Chunk construction needs the configured embedder's tokenizer identity, not its model
+        # weights. ``aget`` would set up every construction dependency and load the platform's
+        # default embedding runtime inside this parse/chunk-only child (MLX on a Linux runner),
+        # turning a valid offline stage into CONFIGURATION and leaking its partially started
+        # lifecycle. ``get`` preserves the production chunker factory and exact token counter
+        # while keeping the zero-embedding boundary explicit.
+        chunker = container.get(keys.CHUNKER)
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            await container.aclose()
+        raise
+    else:
+        return middleware, chunker, container
 
 
 async def _stage_in_child(
@@ -505,23 +520,29 @@ def _stage_worker_main(
     async def run() -> None:
         effective_limit = min(config.memory_limit_bytes, memory_limit_bytes)
         limit_address_space(effective_limit * ADDRESS_SPACE_HEADROOM)
+        container: object | None = None
         try:
-            middleware, chunker = await _stage_components(config)
+            middleware, chunker, container = await _stage_components(config)
         except BaseException:  # noqa: BLE001 - bounded classification, no private detail
             connection.send(_StageReady(StageFailure.CONFIGURATION))
             return
-        connection.send(_StageReady())
-        while True:
-            request = connection.recv()
-            if isinstance(request, _StageClose):
-                return
-            if not isinstance(request, _StageRequest):
-                connection.send(StageResult(None, 0, 0, StageFailure.INVALID_REPLY))
-                continue
-            try:
-                connection.send(await _stage_in_child(middleware, chunker, request))
-            except BaseException:  # noqa: BLE001 - hook failure is one bounded document result
-                connection.send(StageResult(None, 0, 0, StageFailure.STAGE_FAILED))
+        try:
+            connection.send(_StageReady())
+            while True:
+                request = connection.recv()
+                if isinstance(request, _StageClose):
+                    return
+                if not isinstance(request, _StageRequest):
+                    connection.send(StageResult(None, 0, 0, StageFailure.INVALID_REPLY))
+                    continue
+                try:
+                    connection.send(await _stage_in_child(middleware, chunker, request))
+                except BaseException:  # noqa: BLE001 - bounded document failure
+                    connection.send(StageResult(None, 0, 0, StageFailure.STAGE_FAILED))
+        finally:
+            if container is not None:
+                with contextlib.suppress(BaseException):
+                    await cast("Container", container).aclose()
 
     try:
         asyncio.run(run())
