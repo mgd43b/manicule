@@ -71,7 +71,7 @@ def _build_cli(context: BuildContext) -> Generator:
     from manicule.config.profiles import profile_config  # noqa: PLC0415
     from manicule.config.providers import ModelRole  # noqa: PLC0415
     from manicule.generation.budget import TokenEstimator  # noqa: PLC0415
-    from manicule.generation.cli_provider import CliGenerator  # noqa: PLC0415
+    from manicule.generation.cli_provider import CliGenerator, cli_system_prompt  # noqa: PLC0415
     from manicule.generation.prompt import system_message  # noqa: PLC0415
 
     config = context.config
@@ -87,7 +87,8 @@ def _build_cli(context: BuildContext) -> Generator:
     endpoint = next(point for point in settings.selected_endpoints if point.role is ModelRole.LLM)
     profile = profile_config(settings.rag.profile, settings.rag.overrides)
     estimator = TokenEstimator(safety_factor=llm.token_safety_factor)
-    system_prompt_tokens = estimator.count(system_message(llm.system_prompt_extra)["content"])
+    system_prompt = cli_system_prompt(system_message(llm.system_prompt_extra)["content"])
+    system_prompt_tokens = estimator.count(system_prompt)
     return CliGenerator(
         llm,
         base_url=endpoint.base_url,

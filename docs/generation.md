@@ -476,8 +476,9 @@ and `tests/test_import_boundary.py` keeps it out of `import manicule`.
 
 `llm.generator = "cli"` selects a second built-in adapter. With `llm.provider = "codex"` it
 runs `codex exec`; with `"claude"` it runs `claude --print`. The already-built, redacted
-system message is passed as Codex developer instructions or Claude's system prompt; the remaining
-user/assistant transcript is serialized as JSON on stdin. Both command-line and browser questions
+system message is written to a private temporary file and loaded as Codex model instructions or
+Claude's system prompt; the remaining user/assistant transcript is serialized as JSON on stdin.
+Both command-line and browser questions
 therefore retain the prompt's authority, history, citation binder and persistence behavior. The
 commands run in a fresh empty directory. Codex ignores user configuration and rules, is
 ephemeral and read-only, and has its shell tool disabled. Claude runs in safe mode with session
