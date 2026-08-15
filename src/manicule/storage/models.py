@@ -39,6 +39,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from manicule.core.acquisition import AcquisitionRecordState, AcquisitionRunState
 from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
+from manicule.core.reconciliation import ReconciliationRunState
 from manicule.storage.types import UtcDateTime, utcnow
 
 NAMING_CONVENTION = {
@@ -109,6 +110,10 @@ def _acquisition_run_state_enum() -> Enum:
 
 def _acquisition_record_state_enum() -> Enum:
     return _value_enum(AcquisitionRecordState, "acquisition_record_state")
+
+
+def _reconciliation_run_state_enum() -> Enum:
+    return _value_enum(ReconciliationRunState, "reconciliation_run_state")
 
 
 class Base(DeclarativeBase):
@@ -379,6 +384,115 @@ class AcquisitionRecord(Base):
             "state NOT IN ('acquired', 'indexing') OR blob_ref IS NOT NULL",
             name="blob_backed_acquisition_states_have_a_blob",
         ),
+    )
+
+
+# --- durable reconciliation -------------------------------------------------------------
+
+
+class ReconciliationRun(Base):
+    """A full-source inventory whose completion is a durable safety boundary."""
+
+    __tablename__ = "reconciliation_runs"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    connector_id: Mapped[str] = mapped_column(Text, nullable=False)
+    connector_name: Mapped[str] = mapped_column(Text, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[ReconciliationRunState] = mapped_column(
+        _reconciliation_run_state_enum(),
+        nullable=False,
+        default=ReconciliationRunState.ENUMERATING,
+    )
+    seen_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    live_count: Mapped[int | None] = mapped_column(Integer)
+    missing_count: Mapped[int | None] = mapped_column(Integer)
+    completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["connector_id", "workspace_id"],
+            ["connectors.id", "connectors.workspace_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("id", "workspace_id", "connector_id"),
+        Index(
+            "ix_reconciliation_runs_workspace_connector_scope_state",
+            "workspace_id",
+            "connector_id",
+            "scope",
+            "state",
+            "created_at",
+        ),
+        CheckConstraint(
+            "seen_count >= 0 AND (live_count IS NULL OR live_count >= 0) "
+            "AND (missing_count IS NULL OR missing_count >= 0)",
+            name="reconciliation_counts_are_not_negative",
+        ),
+        CheckConstraint(
+            "state = 'enumerating' OR state = 'canceled' OR completed_at IS NOT NULL",
+            name="completed_reconciliation_states_have_completion",
+        ),
+    )
+
+
+class ReconciliationInventoryItem(Base):
+    """One deduplicated source identity in a full enumeration."""
+
+    __tablename__ = "reconciliation_inventory_items"
+
+    run_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
+    connector_id: Mapped[str] = mapped_column(Text, nullable=False)
+    source_id: Mapped[str] = mapped_column(Text, primary_key=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "workspace_id", "connector_id"],
+            [
+                "reconciliation_runs.id",
+                "reconciliation_runs.workspace_id",
+                "reconciliation_runs.connector_id",
+            ],
+            ondelete="CASCADE",
+        ),
+        WITHOUT_ROWID,
+    )
+
+
+class ReconciliationCandidate(Base):
+    """The immutable document revisions a refused proposal asked to delete."""
+
+    __tablename__ = "reconciliation_candidates"
+
+    run_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    document_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
+    connector_id: Mapped[str] = mapped_column(Text, nullable=False)
+    publication_id: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    version_token: Mapped[str | None] = mapped_column(Text)
+    last_seen_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "workspace_id", "connector_id"],
+            [
+                "reconciliation_runs.id",
+                "reconciliation_runs.workspace_id",
+                "reconciliation_runs.connector_id",
+            ],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["document_id"], ["documents.id"], ondelete="CASCADE"),
+        WITHOUT_ROWID,
     )
 
 
@@ -1044,6 +1158,9 @@ __all__ = [
     "Message",
     "Plugin",
     "QueryLog",
+    "ReconciliationCandidate",
+    "ReconciliationInventoryItem",
+    "ReconciliationRun",
     "Tag",
     "VectorTombstone",
     "Workspace",

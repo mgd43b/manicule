@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     )
     from manicule.core.embedding import IndexFingerprints
     from manicule.core.glossary import GlossaryEntry
+    from manicule.core.reconciliation import CompletedInventory, ReconciliationAssessment
     from manicule.core.retrieval import Filter
     from manicule.core.sources import SourceId, Watermark
 
@@ -485,6 +486,44 @@ class AcquisitionStore(Protocol):
 
 
 @runtime_checkable
+class ReconciliationStore(Protocol):
+    """Storage-owned proof that a full inventory completed for one immutable scope."""
+
+    async def begin_reconciliation_inventory(
+        self, run_id: str, connector: str, scope: str
+    ) -> None: ...
+
+    async def append_reconciliation_inventory_page(
+        self, run_id: str, connector: str, scope: str, source_ids: Sequence[str]
+    ) -> int: ...
+
+    async def cancel_reconciliation_inventory(
+        self, run_id: str, connector: str, scope: str
+    ) -> bool: ...
+
+    async def complete_reconciliation_inventory(
+        self, run_id: str, connector: str, scope: str, *, now: datetime
+    ) -> CompletedInventory: ...
+
+    async def latest_completed_reconciliation_inventory(
+        self, connector: str, scope: str
+    ) -> CompletedInventory | None: ...
+
+    async def assess_reconciliation_inventory(
+        self,
+        inventory: CompletedInventory,
+        *,
+        max_delete_fraction: float,
+        dry_run: bool = False,
+        now: datetime,
+    ) -> ReconciliationAssessment: ...
+
+    async def confirm_reconciliation_proposal(
+        self, connector: str, *, scope: str, now: datetime
+    ) -> ReconciliationAssessment | None: ...
+
+
+@runtime_checkable
 class FencedIngestStore(Protocol):
     """Attempt-owned writes whose lease guard is inside their storage transaction."""
 
@@ -613,4 +652,5 @@ __all__ = [
     "GlossaryStore",
     "GlossaryWriter",
     "IngestStore",
+    "ReconciliationStore",
 ]
