@@ -75,6 +75,27 @@ async def test_incomplete_sync_keeps_partial_data_in_a_failure_envelope() -> Non
     assert envelope.data["watermark_advanced"] is False
 
 
+async def test_pending_durable_derivation_is_a_retry_required_failure_envelope() -> None:
+    service, _ = _service(
+        RunReport(
+            connector="synthetic-wiki",
+            discovered=1,
+            pending_derivation=True,
+            enumeration_completed=True,
+            watermark_advanced=True,
+        )
+    )
+
+    envelope = await _envelope(service)
+
+    assert envelope.ok is False
+    assert envelope.data is not None
+    assert envelope.data["outcome"] == "incomplete"
+    assert envelope.data["retry_required"] is True
+    assert envelope.error is not None
+    assert envelope.error.type == "IncompleteIngestError"
+
+
 def test_json_and_human_cli_fail_for_the_same_incomplete_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -591,7 +591,9 @@ class Runtime:
         )
         return IngestPipeline(
             store=store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
-            acquisitions=cast("AcquisitionStore", store),
+            acquisitions=(
+                cast("AcquisitionStore", store) if settings.storage.retain_source_bytes else None
+            ),
             chunker=chunker,
             embedder=embedder,
             vectors=vectors,

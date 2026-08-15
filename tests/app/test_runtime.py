@@ -579,6 +579,27 @@ async def test_the_runtime_wires_the_durable_offline_indexing_path(
         assert pipeline._acquisitions is not None  # pyright: ignore[reportPrivateUsage]
 
 
+async def test_retention_disabled_runtime_uses_the_supported_live_derivation_path(
+    manicule_environment: Path,
+) -> None:
+    """Turning retention off remains functional instead of creating permanent journal retries."""
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, retain_source_bytes=False
+    ) as opened:
+        pipeline = await opened.pipeline()
+        connector = DictConnector(
+            {"public-no-retention": "public source body"}, name="no-retention-source"
+        )
+        connector.media_types["public-no-retention"] = "text/plain"
+
+        report = await pipeline.run(connector)
+        assert pipeline._acquisitions is None  # pyright: ignore[reportPrivateUsage]
+        assert report.indexed == 1
+        assert not report.retry_required
+
+
 async def test_turning_detection_off_in_configuration_reaches_the_pipeline(
     manicule_environment: Path,
 ) -> None:
@@ -608,7 +629,10 @@ async def test_turning_detection_off_in_configuration_reaches_the_pipeline(
 
 
 def _runtime_with_a_buildable_pipeline(
-    environment: Path, *, detect_on_ingest: bool = True
+    environment: Path,
+    *,
+    detect_on_ingest: bool = True,
+    retain_source_bytes: bool = True,
 ) -> Runtime:
     """A runtime whose ``pipeline()`` can actually be resolved.
 
@@ -630,6 +654,7 @@ def _runtime_with_a_buildable_pipeline(
     settings = Settings(
         data_dir=environment / "data",
         embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
+        storage={"retain_source_bytes": retain_source_bytes},  # pyright: ignore[reportArgumentType]
         rag={  # pyright: ignore[reportArgumentType]
             "chunker": "block",
             "glossary": {"detect_on_ingest": detect_on_ingest},

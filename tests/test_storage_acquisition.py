@@ -415,6 +415,38 @@ async def test_lifecycle_edges_and_lease_generation_are_compare_and_swap_guarded
     assert settled.state is AcquisitionRunState.SETTLED
 
 
+async def test_orderly_release_is_generation_fenced_and_immediately_claimable(
+    store: SqliteDocStore,
+) -> None:
+    run = await _claimed_run(store)
+
+    assert not await store.release_acquisition_lease(
+        run.id,
+        "stale-worker",
+        run.lease_generation,
+        now=_NOW,
+    )
+    assert await store.release_acquisition_lease(
+        run.id,
+        "worker",
+        run.lease_generation,
+        now=_NOW,
+    )
+    released = await store.get_acquisition_run(run.id)
+    assert released is not None
+    assert released.lease_owner is None
+    assert released.lease_expires_at is None
+
+    replacement = await store.claim_acquisition_run(
+        run.id,
+        "replacement",
+        now=_NOW,
+        expires_at=_NOW + timedelta(minutes=1),
+    )
+    assert replacement is not None
+    assert replacement.lease_generation == run.lease_generation + 1
+
+
 async def test_expired_owner_cannot_append_or_complete(store: SqliteDocStore) -> None:
     lease = await _claimed_run(store)
     expired = _NOW + timedelta(minutes=1)

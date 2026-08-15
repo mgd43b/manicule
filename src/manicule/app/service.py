@@ -4645,7 +4645,7 @@ def _summary(document: Document, *, chunk_count: int | None = None) -> r.Documen
 
 
 def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
-    incomplete = bool(report.error or report.unrecorded)
+    incomplete = report.retry_required
     bounded = report.limited and not incomplete
     reason: r.ErrorInfo | None = None
     if incomplete:
@@ -4655,9 +4655,16 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
             or (
                 f"{report.unrecorded} accepted document(s) left no durable record"
                 if report.unrecorded
+                else "retained source snapshots still require local indexing"
+                if report.pending_derivation
                 else report.error
             ),
-            hint="Run the same ingest operation again; its watermark was not advanced.",
+            hint=(
+                "Run the same ingest operation again; retained source snapshots will be "
+                "retried without contacting the source."
+                if report.pending_derivation
+                else "Run the same ingest operation again; its watermark was not advanced."
+            ),
         )
     return r.IngestReport(
         connector=report.connector,

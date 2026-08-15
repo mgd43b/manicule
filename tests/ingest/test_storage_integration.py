@@ -20,9 +20,11 @@ from sqlalchemy import text
 from manicule.connectors import CursorExpiredError, NotFoundError, SessionExpiredError
 from manicule.core.acquisition import (
     AcquiredSource,
+    AcquisitionFailureCode,
     AcquisitionRecord,
     AcquisitionRecordState,
     AcquisitionRunState,
+    AcquisitionStage,
 )
 from manicule.core.content import (
     IN_FLIGHT,
@@ -1478,9 +1480,9 @@ async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
     assert durable.discovered_count == 3
     assert durable.enumeration_completed_at is None
     assert durable.candidate_watermark is None
+    assert durable.lease_owner is None
     assert await store.get_watermark(connector.name) is None
 
-    lease_clock.advance(301)
     repeated = await pipeline.run(connector, limit=3)
     same_run = await store.latest_unsettled_acquisition_run(connector.name)
 
@@ -1671,6 +1673,8 @@ async def test_failed_local_derivation_retries_from_blob_without_source_access(
     assert record.blob_ref is not None
     assert record.diagnostic is not None
     assert record.diagnostic.code.value == "embed_failed"
+    assert first.pending_derivation
+    assert first.retry_required
     preserved = await store.find_document(connector.name, "public-retry-document")
     assert preserved is not None
     assert preserved.status is DocumentStatus.INDEXED
@@ -1679,7 +1683,6 @@ async def test_failed_local_derivation_retries_from_blob_without_source_access(
     fetches = list(connector.fetches)
 
     connector.fail_fetch.add("public-retry-document")
-    lease_clock.advance(2)
     resumed = await pipeline(embedder).run(connector)
 
     assert connector.fetches == fetches
@@ -1799,6 +1802,86 @@ async def test_container_expansion_runs_from_the_retained_parent_snapshot(
     assert second.original_ref is not None
 
 
+@pytest.mark.parametrize(
+    ("replacement", "code"),
+    [
+        (None, AcquisitionFailureCode.SNAPSHOT_MISSING),
+        (b"corrupt local snapshot", AcquisitionFailureCode.SNAPSHOT_CORRUPT),
+    ],
+)
+async def test_unavailable_local_snapshot_is_an_explicit_indexing_retry(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    replacement: bytes | None,
+    code: AcquisitionFailureCode,
+) -> None:
+    class RefusingRead(BlobStore):
+        @override
+        async def get(self, digest: str) -> bytes | None:
+            del digest
+            return replacement
+
+    connector = fakes.DictConnector(
+        {"public-local-snapshot": "retained public text"}, name=f"local-{code.value}-source"
+    )
+    chunker = fakes.BlockChunker()
+    report = await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=RefusingRead(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    ).run(connector)
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    record = (await store.list_acquisition_records(durable.id))[0]
+    assert report.retry_required
+    assert record.state is AcquisitionRecordState.RETRY
+    assert record.diagnostic is not None
+    assert record.diagnostic.stage is AcquisitionStage.INDEXING
+    assert record.diagnostic.code is code
+
+
+async def test_parser_chain_failure_is_classified_as_an_indexing_parse_retry(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    connector = fakes.DictConnector(
+        {"public-parse-failure": "synthetic text"}, name="parse-failure-source"
+    )
+    chunker = fakes.BlockChunker()
+    report = await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"broken": fakes.ExplodingParser()}),
+        resolve_chain=lambda _: ["broken"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    ).run(connector)
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    record = (await store.list_acquisition_records(durable.id))[0]
+    assert report.retry_required
+    assert record.diagnostic is not None
+    assert record.diagnostic.stage is AcquisitionStage.INDEXING
+    assert record.diagnostic.code is AcquisitionFailureCode.PARSE_FAILED
+
+
 async def test_failed_container_member_retries_by_reexpanding_the_retained_parent(
     store: SqliteDocStore,
     engine: AsyncEngine,
@@ -1818,6 +1901,16 @@ async def test_failed_container_member_retries_by_reexpanding_the_retained_paren
                 raise RuntimeError("synthetic member embed failure")
             return await super().embed(texts)
 
+    class CountingBlobs(BlobStore):
+        def __init__(self) -> None:
+            super().__init__(engine, data_dir)
+            self.member_retentions = 0
+
+        @override
+        async def retain(self, data: bytes, media_type: str | None = None) -> Retention:
+            self.member_retentions += 1
+            return await super().retain(data, media_type)
+
     connector = fakes.DictConnector(
         {"public-retry-bundle": "one=alpha\ntwo=beta"}, name="retry-container-source"
     )
@@ -1825,12 +1918,13 @@ async def test_failed_container_member_retries_by_reexpanding_the_retained_paren
     embedder = OnceFailingEmbedder()
     lease_clock = fakes.ManualLeaseClock()
     chunker = fakes.BlockChunker()
+    blobs = CountingBlobs()
 
     def pipeline() -> IngestPipeline:
         return IngestPipeline(
             store=store,
             acquisitions=store,
-            blobs=BlobStore(engine, data_dir),
+            blobs=blobs,
             chunker=chunker,
             embedder=embedder,
             vectors=fakes.MemoryVectors(),
@@ -1843,20 +1937,97 @@ async def test_failed_container_member_retries_by_reexpanding_the_retained_paren
             detect_glossary=False,
         )
 
-    await pipeline().run(connector)
+    first_report = await pipeline().run(connector)
     durable = await store.latest_unsettled_acquisition_run(connector.name)
     assert durable is not None
     record = (await store.list_acquisition_records(durable.id))[0]
     assert record.state is AcquisitionRecordState.RETRY
     assert record.blob_ref is not None
+    assert first_report.retry_required
+    assert blobs.member_retentions == 2
     fetches = list(connector.fetches)
 
     connector.fail_fetch.add("public-retry-bundle")
-    lease_clock.advance(2)
     resumed = await pipeline().run(connector)
 
     assert connector.fetches == fetches
-    assert resumed.by_status[DocumentStatus.INDEXED.value] == 2
+    assert resumed.by_status[DocumentStatus.INDEXED.value] == 1
+    assert resumed.skipped_hash == 1
+    assert blobs.member_retentions == 3, "retry retained the successful member a second time"
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+
+
+async def test_crashed_indexing_container_reexpands_its_retained_parent_on_resume(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """An INDEXING parent cannot hash-skip away members left behind by a process crash."""
+
+    class GateSecondMember(HashEmbedder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.entered = asyncio.Event()
+
+        @override
+        async def embed(self, texts: Sequence[str]) -> list[Vector]:
+            self.calls += 1
+            if self.calls == 2:
+                self.entered.set()
+                await asyncio.Event().wait()
+            return await super().embed(texts)
+
+    connector = fakes.DictConnector(
+        {"public-crash-bundle": "one=alpha\ntwo=beta"}, name="crash-container-source"
+    )
+    connector.media_types["public-crash-bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    gated = GateSecondMember()
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+    blobs = BlobStore(engine, data_dir)
+    vectors = fakes.MemoryVectors()
+
+    def pipeline(embedder: HashEmbedder) -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=blobs,
+            chunker=chunker,
+            embedder=embedder,
+            vectors=vectors,
+            runner=InProcessRunner({"archive": fakes.FakeArchive(), "lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["archive", "lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            acquisition_clock=lease_clock,
+            acquisition_lease_s=1,
+            shutdown_grace_s=0,
+            detect_glossary=False,
+        )
+
+    task = asyncio.create_task(pipeline(gated).run(connector))
+    await gated.entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    record = (await store.list_acquisition_records(durable.id))[0]
+    assert record.state is AcquisitionRecordState.INDEXING
+    assert await store.find_document(connector.name, "public-crash-bundle!/one") is not None
+    assert await store.find_document(connector.name, "public-crash-bundle!/two") is None
+    fetches = list(connector.fetches)
+
+    connector.fail_fetch.add("public-crash-bundle")
+    lease_clock.advance(2)
+    resumed = await pipeline(HashEmbedder()).run(connector)
+
+    assert connector.fetches == fetches
+    assert resumed.indexed == 1
+    assert resumed.skipped_hash == 1
+    assert await store.find_document(connector.name, "public-crash-bundle!/two") is not None
     assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 

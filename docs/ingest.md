@@ -739,8 +739,10 @@ is the quantity that actually maps to memory.
 **Durable enumeration, bounded acquisition, then local derivation.** Every bound
 below comes from configuration; none is derived from how many tasks happen to exist.
 
-The runtime explicitly wires its document store through the pipeline's `acquisitions` handle;
-protocol-only stores may omit it and retain the legacy bounded path. The durable path's source
+When source-byte retention is enabled, the runtime explicitly wires its document store through
+the pipeline's `acquisitions` handle; retention-disabled and protocol-only stores use the legacy
+bounded live-derivation path. A durable journal without durable bytes is deliberately never
+constructed. The durable path's source
 checkpoint is independent of parsing and publication: every current revision is either proved
 unchanged or retained and associated with its complete fetched source envelope before the
 candidate watermark can become the connector watermark.
@@ -828,6 +830,9 @@ reference; it does not retain the top-level body again. Container members are di
 created by local expansion, so they retain their own member bytes once. A local parse, embed or
 publication failure leaves the journal record retryable with its blob reference intact. A later
 invocation forces that retained snapshot through derivation again without discovery or fetch.
+An orderly invocation that leaves retained derivation pending reports an incomplete,
+retry-required outcome and releases its fenced lease so the retry can begin immediately. Process
+cancellation and crashes do not release ownership; takeover still waits for lease expiry.
 
 Fetched revision evidence is source-owned. A versioned discovery record must receive a fetched
 token; opaque token sources require exact equality, while a connector may expose an ordering
