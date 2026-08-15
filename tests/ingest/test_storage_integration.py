@@ -48,7 +48,8 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    from manicule.core.sources import DiscoveredDoc
+    from manicule.core.content import Document
+    from manicule.core.sources import DiscoveredDoc, DocRef
     from manicule.storage.docstore import SqliteDocStore
 
 
@@ -1099,6 +1100,163 @@ async def test_expired_worker_is_fenced_before_publication_after_takeover(
     assert stored is None, "the expired generation made no document revision servable"
 
 
+@pytest.mark.parametrize(
+    ("unchanged", "status"),
+    [(True, DocumentStatus.INDEXED), (False, DocumentStatus.PARSING)],
+)
+async def test_takeover_fences_fetch_side_last_seen_and_status_writes(
+    engine: AsyncEngine, *, unchanged: bool, status: DocumentStatus
+) -> None:
+    """A slow lookup cannot let an expired fetch worker mutate the document it found."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    class GatedFindStore(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.arm = False
+            self.found = asyncio.Event()
+            self.release = asyncio.Event()
+
+        @override
+        async def find_document(self, source: str, source_id: str) -> Document | None:
+            document = await super().find_document(source, source_id)
+            if self.arm:
+                self.arm = False
+                self.found.set()
+                await self.release.wait()
+            return document
+
+    store = GatedFindStore()
+    await store.ensure_workspace()
+    source = "fenced-fetch-source"
+    source_id = "public-fetch-document"
+    stored = make_document(
+        source=source,
+        source_id=source_id,
+        status=status,
+        media_type=fakes.MEDIA_TYPE,
+        body=b"public synthetic line",
+    ).model_copy(update={"version_token": "same-token" if unchanged else "old-token"})
+    before = await store.upsert_document(stored)
+    connector = fakes.DictConnector({source_id: "public synthetic line"}, name=source)
+    connector.tokens[source_id] = "same-token" if unchanged else "new-token"
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    store.arm = True
+    task = asyncio.create_task(pipeline.run(connector))
+    await store.found.wait()
+    durable = await store.latest_unsettled_acquisition_run(source)
+    assert durable is not None
+    lease_clock.advance(301)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-fetch-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=300),
+    )
+    assert successor is not None
+    store.release.set()
+
+    report = await task
+    after = await store.find_document(source, source_id)
+
+    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert after == before, "the stale worker changed last-seen/version metadata or status"
+
+
+@pytest.mark.parametrize("fetch_fails", [False, True])
+async def test_takeover_fences_hash_skip_and_failure_demotion(
+    store: SqliteDocStore, *, fetch_fails: bool
+) -> None:
+    """Neither a hash skip nor a fetch failure may mutate after lease takeover."""
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    class GatedFailureConnector(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "public-failure-document": (
+                        "replacement line" if fetch_fails else "original line"
+                    )
+                },
+                name="fenced-failure-source",
+            )
+            self.tokens["public-failure-document"] = "replacement-token"
+            self.fetch_arrived = asyncio.Event()
+            self.release_fetch = asyncio.Event()
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            self.fetch_arrived.set()
+            await self.release_fetch.wait()
+            if fetch_fails:
+                raise RuntimeError("synthetic fetch failure")
+            return await super().fetch(ref)
+
+    connector = GatedFailureConnector()
+    source_id = "public-failure-document"
+    before = await store.upsert_document(
+        make_document(
+            source=connector.name,
+            source_id=source_id,
+            media_type=fakes.MEDIA_TYPE,
+            body=b"original line",
+        ).model_copy(update={"version_token": "original-token"})
+    )
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await connector.fetch_arrived.wait()
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    lease_clock.advance(301)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-failure-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=300),
+    )
+    assert successor is not None
+    connector.release_fetch.set()
+
+    report = await task
+    after = await store.find_document(connector.name, source_id)
+
+    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert after == before, "the stale worker changed version/last-seen data or failure state"
+
+
 async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
     store: SqliteDocStore,
 ) -> None:
@@ -1318,7 +1476,7 @@ async def test_stale_retained_failure_cannot_overwrite_an_indexed_winners_origin
     """Failure retention and its guarded row are one commit, not a trailing setter."""
     from sqlalchemy.ext.asyncio import AsyncSession  # noqa: PLC0415
 
-    from manicule.core.content import Document, DocumentRevision  # noqa: PLC0415
+    from manicule.core.content import DocumentRevision  # noqa: PLC0415
     from manicule.storage import models  # noqa: PLC0415
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
     from tests.storage_helpers import make_document  # noqa: PLC0415
@@ -1432,7 +1590,6 @@ async def test_initial_failure_rolls_back_retained_reference_with_its_row(
     """The expected=None path cannot expose half of its retention decision."""
     from sqlalchemy.ext.asyncio import AsyncSession  # noqa: PLC0415
 
-    from manicule.core.content import Document  # noqa: PLC0415
     from tests.storage_helpers import make_document  # noqa: PLC0415
 
     retained_ref = (await BlobStore(engine, data_dir).retain(b"failed source", "text/plain")).ref

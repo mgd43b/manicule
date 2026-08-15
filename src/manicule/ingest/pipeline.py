@@ -1139,7 +1139,16 @@ class IngestPipeline:
                         )
                 else:
                     discovered = source_work
-                accepted = await self._accept(run.connector, discovered)
+                fence_token = (
+                    _publication_fence.set(lambda: self._fence_acquisition_publication(run))
+                    if journaled
+                    else None
+                )
+                try:
+                    accepted = await self._accept(run.connector, discovered)
+                finally:
+                    if fence_token is not None:
+                        _publication_fence.reset(fence_token)
                 if isinstance(accepted, DocumentOutcome):
                     run.report.record(accepted)
                     if journaled:
@@ -1366,6 +1375,7 @@ class IngestPipeline:
         existing = await self._store.find_document(source, source_id)
 
         if self._unchanged_by_token(existing, discovered):
+            await self._check_publication_fence()
             await self._store.record_seen(existing.id)  # pyright: ignore[reportOptionalMemberAccess]
             return DocumentOutcome(
                 source_id=source_id,
@@ -1458,6 +1468,7 @@ class IngestPipeline:
             existing = await self._store.find_document(source, raw.source_id)
 
         if not force and self._unchanged_by_hash(existing, digest, raw):
+            await self._check_publication_fence()
             await self._store.record_seen(existing.id, version_token=version_token)  # pyright: ignore[reportOptionalMemberAccess]
             return (
                 DocumentOutcome(
@@ -1943,6 +1954,7 @@ class IngestPipeline:
                     "failed_stage": None,
                 }
             )
+            await self._check_publication_fence()
             if existing is None or existing.publication_id != publication:
                 await self._store.stage_vectors(publication, chunks)
             await self._vectors.upsert(chunks, vectors, publication_id=publication)
@@ -2039,12 +2051,14 @@ class IngestPipeline:
             # value in the column rather than an absence somebody has to interpret. Switching
             # detection back on changes the installed fingerprint, so every document stamped
             # this way is selected by the next survey.
+            await self._check_publication_fence()
             await self._store.set_lineage(
                 document.id, chunk_fp=None, embed_fp=None, glossary_fp=fingerprint
             )
             return detail
         if self._glossary is None:  # pragma: no cover - entries imply an installed writer
             return detail
+        await self._check_publication_fence()
         await self._glossary.replace_glossary_entries(document.id, entries, fingerprint=fingerprint)
         return detail
 
@@ -2405,6 +2419,7 @@ class IngestPipeline:
         )
         if result.status is not DocumentStatus.FAILED:
             return document
+        await self._check_publication_fence()
         committed = await self._store.publish_failure(
             document,
             expected=expected,
@@ -2476,6 +2491,7 @@ class IngestPipeline:
         """
         if existing is None or existing.status is DocumentStatus.INDEXED:
             return
+        await self._check_publication_fence()
         await self._store.set_status(existing.id, status)
 
     async def _observe(self, document: Document) -> None:
@@ -2483,6 +2499,7 @@ class IngestPipeline:
         try:
             await self._middleware.after_store(document)
         except Exception as exc:  # noqa: BLE001 - the document is already committed
+            await self._check_publication_fence()
             await self._store.annotate(
                 document.id, {"last_after_store_error": f"{type(exc).__name__}: {exc}"}
             )
@@ -2537,6 +2554,7 @@ class IngestPipeline:
         does not cost anybody a document that was working five minutes ago.
         """
         was_indexed = existing is not None and existing.status is DocumentStatus.INDEXED
+        await self._check_publication_fence()
         await self._store.annotate(
             document.id, {"last_ingest_error": {"stage": stage.value, "detail": detail}}
         )
