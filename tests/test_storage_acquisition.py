@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -26,8 +27,10 @@ from manicule.core.acquisition import (
     SnapshotPromotionPolicy,
 )
 from manicule.core.content import Metadata, RawDocument
+from manicule.core.errors import UnknownEntityError
 from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
+from manicule.ingest.capacity import CapacityRefusedError, CapacityResource
 from manicule.storage.acquisition import (
     AcquisitionConflictError,
     AcquisitionCoverageError,
@@ -41,9 +44,10 @@ from manicule.storage.migrator import current, downgrade, upgrade
 from tests.storage_helpers import make_document
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
     from pathlib import Path
 
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 
 def _watermark(value: str) -> Watermark:
@@ -225,6 +229,333 @@ async def test_records_page_forward_by_sequence_without_loading_the_run(
     ]
 
 
+async def test_concurrent_journal_reservations_cannot_exceed_the_record_limit(
+    engine: AsyncEngine,
+) -> None:
+    limited = SqliteDocStore(engine, max_journal_records=1)
+    await limited.ensure_workspace()
+    run = await _claimed_run(limited)
+
+    outcomes = await asyncio.gather(
+        *(
+            limited.append_acquisition_record(
+                run.id,
+                sequence,
+                _source(f"page-{sequence}"),
+                lease_owner="worker",
+                lease_generation=run.lease_generation,
+                now=_NOW,
+            )
+            for sequence in range(2)
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1
+    refused = [outcome for outcome in outcomes if isinstance(outcome, CapacityRefusedError)]
+    assert len(refused) == 1
+    assert refused[0].diagnostic.resource is CapacityResource.JOURNAL_RECORDS
+    persisted = await limited.get_acquisition_run(run.id)
+    assert persisted is not None
+    assert persisted.discovered_count == 1
+    assert len(await limited.list_acquisition_records(run.id)) == 1
+
+
+async def test_metadata_refusal_acknowledges_nothing_and_exposes_only_aggregates(
+    engine: AsyncEngine,
+) -> None:
+    limited = SqliteDocStore(engine, max_journal_metadata_bytes=1)
+    await limited.ensure_workspace()
+    run = await _claimed_run(limited)
+    private_title = "private roadmap cinder"
+    private_url = "https://example.test/page?token=fake-secret-cinder"
+    source = _source(uri=private_url).model_copy(update={"title": private_title})
+
+    with pytest.raises(CapacityRefusedError) as caught:
+        await limited.append_acquisition_record(
+            run.id,
+            0,
+            source,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+    rendered = f"{caught.value!s}\n{caught.value!r}\n{caught.value.diagnostic.as_metadata()!r}"
+    assert private_title not in rendered
+    assert private_url not in rendered
+    assert "fake-secret-cinder" not in rendered
+    assert caught.value.diagnostic.resource is CapacityResource.JOURNAL_METADATA_BYTES
+    persisted = await limited.get_acquisition_run(run.id)
+    assert persisted is not None
+    assert persisted.discovered_count == 0
+    assert persisted.metadata_bytes == 0
+    assert await limited.list_acquisition_records(run.id) == []
+
+
+async def test_journal_disk_headroom_refuses_before_acknowledgment(
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limited = SqliteDocStore(engine, min_disk_headroom_bytes=8)
+    await limited.ensure_workspace()
+    run = await _claimed_run(limited)
+
+    def nearly_full(path: object) -> SimpleNamespace:
+        del path
+        return SimpleNamespace(total=100, used=90, free=10)
+
+    monkeypatch.setattr("manicule.storage.acquisition.shutil.disk_usage", nearly_full)
+
+    with pytest.raises(CapacityRefusedError) as caught:
+        await limited.append_acquisition_record(
+            run.id,
+            0,
+            _source(),
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+
+    assert caught.value.diagnostic.resource is CapacityResource.DISK_HEADROOM_BYTES
+    persisted = await limited.get_acquisition_run(run.id)
+    assert persisted is not None
+    assert persisted.discovered_count == 0
+    assert await limited.list_acquisition_records(run.id) == []
+
+
+async def test_below_floor_recovery_and_idempotency_can_shrink_or_settle_backlog(
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limited = SqliteDocStore(engine, min_disk_headroom_bytes=8)
+    await limited.ensure_workspace()
+    lease = await _claimed_run(limited)
+    source = _source()
+    record = await limited.append_acquisition_record(
+        lease.id,
+        0,
+        source,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+
+    def below_floor(path: object) -> SimpleNamespace:
+        del path
+        return SimpleNamespace(total=100, used=99, free=1)
+
+    monkeypatch.setattr("manicule.storage.acquisition.shutil.disk_usage", below_floor)
+
+    assert await limited.create_acquisition_run(lease.id, "wiki")
+    assert (
+        await limited.append_acquisition_record(
+            lease.id,
+            0,
+            source,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+    ) == record
+    assert await limited.renew_acquisition_lease(
+        lease.id,
+        "worker",
+        lease.lease_generation,
+        now=_NOW,
+        expires_at=_NOW + timedelta(minutes=2),
+    )
+    await limited.complete_acquisition_enumeration(
+        lease.id,
+        _watermark("settled-below-floor"),
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    await limited.transition_acquisition_record(
+        lease.id,
+        "page-1",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.UNCHANGED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    assert await limited.commit_acquisition_watermark(
+        lease.id,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    settled = await limited.transition_acquisition_run(
+        lease.id,
+        AcquisitionRunState.ACQUIRING,
+        AcquisitionRunState.SETTLED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    assert settled.state is AcquisitionRunState.SETTLED
+
+
+@pytest.mark.parametrize("force_locked_recheck", [False, True])
+async def test_exact_snapshot_run_identity_is_idempotent_before_headroom(
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    force_locked_recheck: bool,
+) -> None:
+    store = SqliteDocStore(engine, min_disk_headroom_bytes=8)
+    await store.ensure_workspace()
+    created = await store.create_acquisition_run(
+        "snapshot-identity",
+        "wiki",
+        source_scope="space:ENG",
+        scope_fingerprint="scope-eng-v1",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+
+    if force_locked_recheck:
+
+        async def miss_fast_path(session: AsyncSession, run_id: str) -> AcquisitionRun | None:
+            del session, run_id
+            return None
+
+        monkeypatch.setattr(store, "_run_row", miss_fast_path)
+
+    def unexpected_headroom(path: object) -> SimpleNamespace:
+        del path
+        raise AssertionError("an exact idempotent identity must not perform a growth check")
+
+    monkeypatch.setattr("manicule.storage.acquisition.shutil.disk_usage", unexpected_headroom)
+
+    repeated = await store.create_acquisition_run(
+        created.id,
+        "wiki",
+        source_scope="space:ENG",
+        scope_fingerprint="scope-eng-v1",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+
+    assert repeated == created
+
+
+@pytest.mark.parametrize("force_locked_recheck", [False, True])
+@pytest.mark.parametrize(
+    ("source_scope", "scope_fingerprint", "promotion_policy"),
+    [
+        ("space:OTHER", "scope-eng-v1", SnapshotPromotionPolicy.ALLOW_OMISSIONS),
+        ("space:ENG", "scope-other-v1", SnapshotPromotionPolicy.ALLOW_OMISSIONS),
+        ("space:ENG", "scope-eng-v1", SnapshotPromotionPolicy.REQUIRE_COMPLETE),
+    ],
+    ids=("source-scope", "scope-fingerprint", "promotion-policy"),
+)
+async def test_changed_snapshot_run_identity_conflicts_before_headroom(
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    source_scope: str,
+    scope_fingerprint: str,
+    promotion_policy: SnapshotPromotionPolicy,
+    *,
+    force_locked_recheck: bool,
+) -> None:
+    store = SqliteDocStore(engine, min_disk_headroom_bytes=8)
+    await store.ensure_workspace()
+    await store.create_acquisition_run(
+        "snapshot-identity-conflict",
+        "wiki",
+        source_scope="space:ENG",
+        scope_fingerprint="scope-eng-v1",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+
+    if force_locked_recheck:
+
+        async def miss_fast_path(session: AsyncSession, run_id: str) -> AcquisitionRun | None:
+            del session, run_id
+            return None
+
+        monkeypatch.setattr(store, "_run_row", miss_fast_path)
+
+    def unexpected_headroom(path: object) -> SimpleNamespace:
+        del path
+        raise AssertionError("identity conflicts must be reported before a growth check")
+
+    monkeypatch.setattr("manicule.storage.acquisition.shutil.disk_usage", unexpected_headroom)
+
+    with pytest.raises(AcquisitionConflictError, match="requested run identity"):
+        await store.create_acquisition_run(
+            "snapshot-identity-conflict",
+            "wiki",
+            source_scope=source_scope,
+            scope_fingerprint=scope_fingerprint,
+            promotion_policy=promotion_policy,
+        )
+
+
+async def test_concurrent_idempotent_writers_recheck_before_the_disk_floor(
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = SqliteDocStore(engine, min_disk_headroom_bytes=8)
+    second = SqliteDocStore(engine, min_disk_headroom_bytes=8)
+    await first.ensure_workspace()
+    original_guard = SqliteDocStore._begin_capacity_guard  # pyright: ignore[reportPrivateUsage]
+
+    async def race_once(*operations: Awaitable[object]) -> list[object]:
+        barrier = asyncio.Barrier(2)
+        disk_checks = 0
+
+        async def gated_guard(session: AsyncSession) -> None:
+            await barrier.wait()
+            await original_guard(session)
+
+        def falling_headroom(path: object) -> SimpleNamespace:
+            nonlocal disk_checks
+            del path
+            disk_checks += 1
+            return SimpleNamespace(
+                total=1_000,
+                used=500 if disk_checks == 1 else 999,
+                free=500 if disk_checks == 1 else 1,
+            )
+
+        monkeypatch.setattr(SqliteDocStore, "_begin_capacity_guard", staticmethod(gated_guard))
+        monkeypatch.setattr("manicule.storage.acquisition.shutil.disk_usage", falling_headroom)
+        outcomes = await asyncio.gather(*operations)
+        assert disk_checks == 1, "the idempotent loser performed a growth-only floor check"
+        return list(outcomes)
+
+    created = await race_once(
+        first.create_acquisition_run("raced-run", "wiki"),
+        second.create_acquisition_run("raced-run", "wiki"),
+    )
+    assert created[0] == created[1]
+    lease = await first.claim_acquisition_run(
+        "raced-run", "worker", now=_NOW, expires_at=_NOW + timedelta(minutes=1)
+    )
+    assert lease is not None
+
+    appended = await race_once(
+        first.append_acquisition_record(
+            lease.id,
+            0,
+            _source(),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        ),
+        second.append_acquisition_record(
+            lease.id,
+            99,
+            _source(),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        ),
+    )
+    assert appended[0] == appended[1]
+
+
 async def test_run_identity_and_records_do_not_cross_workspaces(
     engine: AsyncEngine,
 ) -> None:
@@ -234,10 +565,13 @@ async def test_run_identity_and_records_do_not_cross_workspaces(
     await second.ensure_workspace()
 
     run = await _claimed_run(first, "same-run")
+    private_title = "private cross-workspace title cinder"
+    private_url = "https://example.test/private?token=fake-secret-cinder"
+    private_source = _source(uri=private_url).model_copy(update={"title": private_title})
     await first.append_acquisition_record(
         "same-run",
         0,
-        _source(),
+        private_source,
         lease_owner="worker",
         lease_generation=run.lease_generation,
         now=_NOW,
@@ -246,6 +580,28 @@ async def test_run_identity_and_records_do_not_cross_workspaces(
     assert await second.get_acquisition_run("same-run") is None
     with pytest.raises(AcquisitionConflictError, match="requested run identity"):
         await second.create_acquisition_run("same-run", "wiki")
+    with pytest.raises(UnknownEntityError) as cross_workspace:
+        await second.append_acquisition_record(
+            "same-run",
+            0,
+            private_source,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+    with pytest.raises(AcquisitionConflictError) as wrong_lease:
+        await first.append_acquisition_record(
+            "same-run",
+            0,
+            private_source,
+            lease_owner="other-worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+    rendered = f"{cross_workspace.value!s}\n{wrong_lease.value!s}"
+    assert private_title not in rendered
+    assert private_url not in rendered
+    assert "fake-secret-cinder" not in rendered
 
 
 async def test_candidate_watermark_is_not_committed_until_coverage(
@@ -1965,6 +2321,396 @@ async def test_reuse_never_falls_back_behind_the_authoritative_latest_snapshot(
     reusable = await store.reusable_snapshot_record("wiki", "versioned-scope", "page-1", "v2")
     assert reusable is not None
     assert reusable.run_id == latest.id
+
+
+async def test_concurrent_blob_reservations_preserve_backlog_and_publications(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    limited = SqliteDocStore(engine, max_acquired_blob_backlog_bytes=10)
+    await limited.ensure_workspace()
+    published = make_document(source="wiki", source_id="published-before-refusal")
+    await limited.upsert_document(published)
+    before = await limited.find_document("wiki", "published-before-refusal")
+    blobs = BlobStore(engine, data_dir, min_disk_headroom_bytes=1)
+    stored = [
+        await blobs.put(payload, "application/octet-stream") for payload in (b"a" * 10, b"b" * 10)
+    ]
+    assert all(isinstance(blob, StoredBlob) for blob in stored)
+
+    lease = await _claimed_run(limited)
+    for sequence in range(2):
+        await limited.append_acquisition_record(
+            lease.id,
+            sequence,
+            _source(f"page-{sequence}"),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+    await limited.complete_acquisition_enumeration(
+        lease.id,
+        _watermark("uncommitted-after-refusal"),
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    for sequence in range(2):
+        await limited.transition_acquisition_record(
+            lease.id,
+            f"page-{sequence}",
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+
+    outcomes = await asyncio.gather(
+        *(
+            limited.transition_acquisition_record(
+                lease.id,
+                f"page-{sequence}",
+                AcquisitionRecordState.ACQUIRING,
+                AcquisitionRecordState.ACQUIRED,
+                lease_owner="worker",
+                lease_generation=lease.lease_generation,
+                now=_NOW,
+                blob_ref=blob.hash,
+                acquired_source=_acquired((b"a" * 10, b"b" * 10)[sequence], f"page-{sequence}"),
+                fetched_version_token="v1",  # noqa: S106 - synthetic revision
+            )
+            for sequence, blob in enumerate(stored)
+            if isinstance(blob, StoredBlob)
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1
+    refused = [outcome for outcome in outcomes if isinstance(outcome, CapacityRefusedError)]
+    assert len(refused) == 1
+    assert refused[0].diagnostic.resource is CapacityResource.ACQUIRED_BLOB_BACKLOG_BYTES
+    recovered = SqliteDocStore(engine, max_acquired_blob_backlog_bytes=10)
+    run = await recovered.get_acquisition_run(lease.id)
+    assert run is not None
+    assert run.acquired_blob_bytes == 10
+    assert run.watermark_committed_at is None
+    records = await recovered.list_acquisition_records(lease.id)
+    assert sum(record.blob_ref is not None for record in records) == 1
+    assert await recovered.find_document("wiki", "published-before-refusal") == before
+
+    winner = next(
+        index for index, outcome in enumerate(outcomes) if not isinstance(outcome, BaseException)
+    )
+    loser = 1 - winner
+    await recovered.transition_acquisition_record(
+        lease.id,
+        f"page-{winner}",
+        AcquisitionRecordState.ACQUIRED,
+        AcquisitionRecordState.INDEXING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    await recovered.transition_acquisition_record(
+        lease.id,
+        f"page-{winner}",
+        AcquisitionRecordState.INDEXING,
+        AcquisitionRecordState.SETTLED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    loser_blob = stored[loser]
+    assert isinstance(loser_blob, StoredBlob)
+    await recovered.transition_acquisition_record(
+        lease.id,
+        f"page-{loser}",
+        AcquisitionRecordState.ACQUIRING,
+        AcquisitionRecordState.ACQUIRED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+        blob_ref=loser_blob.hash,
+        acquired_source=_acquired((b"a" * 10, b"b" * 10)[loser], f"page-{loser}"),
+        fetched_version_token="v1",  # noqa: S106 - synthetic revision
+    )
+    resumed = await recovered.get_acquisition_run(lease.id)
+    assert resumed is not None
+    assert resumed.acquired_blob_bytes == 10, "settled bytes no longer consume backlog capacity"
+
+
+async def test_shared_blob_is_charged_once_and_remains_pinned_until_every_record_settles(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    limited = SqliteDocStore(engine, max_acquired_blob_backlog_bytes=10)
+    await limited.ensure_workspace()
+    blobs = BlobStore(engine, data_dir, min_disk_headroom_bytes=1)
+    shared = await blobs.put(b"same bytes", "application/octet-stream")
+    replacement = await blobs.put(b"new-bytes!", "application/octet-stream")
+    assert isinstance(shared, StoredBlob)
+    assert isinstance(replacement, StoredBlob)
+    lease = await _claimed_run(limited)
+
+    for sequence in range(3):
+        source_id = f"page-{sequence}"
+        await limited.append_acquisition_record(
+            lease.id,
+            sequence,
+            _source(source_id),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+        await limited.transition_acquisition_record(
+            lease.id,
+            source_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+
+    for source_id in ("page-0", "page-1"):
+        await limited.transition_acquisition_record(
+            lease.id,
+            source_id,
+            AcquisitionRecordState.ACQUIRING,
+            AcquisitionRecordState.ACQUIRED,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+            blob_ref=shared.hash,
+            acquired_source=_acquired(b"same bytes", source_id),
+        )
+
+    run = await limited.get_acquisition_run(lease.id)
+    assert run is not None
+    assert run.acquired_blob_bytes == shared.stored_bytes
+
+    await limited.transition_acquisition_record(
+        lease.id,
+        "page-0",
+        AcquisitionRecordState.ACQUIRED,
+        AcquisitionRecordState.INDEXING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    await limited.transition_acquisition_record(
+        lease.id,
+        "page-0",
+        AcquisitionRecordState.INDEXING,
+        AcquisitionRecordState.SETTLED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    still_pinned = await limited.get_acquisition_run(lease.id)
+    assert still_pinned is not None
+    assert still_pinned.acquired_blob_bytes == shared.stored_bytes
+    with pytest.raises(CapacityRefusedError):
+        await limited.transition_acquisition_record(
+            lease.id,
+            "page-2",
+            AcquisitionRecordState.ACQUIRING,
+            AcquisitionRecordState.ACQUIRED,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+            blob_ref=replacement.hash,
+            acquired_source=_acquired(b"new-bytes!", "page-2"),
+        )
+
+    await limited.transition_acquisition_record(
+        lease.id,
+        "page-1",
+        AcquisitionRecordState.ACQUIRED,
+        AcquisitionRecordState.INDEXING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    await limited.transition_acquisition_record(
+        lease.id,
+        "page-1",
+        AcquisitionRecordState.INDEXING,
+        AcquisitionRecordState.SETTLED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    released = await limited.get_acquisition_run(lease.id)
+    assert released is not None
+    assert released.acquired_blob_bytes == 0
+    await limited.transition_acquisition_record(
+        lease.id,
+        "page-2",
+        AcquisitionRecordState.ACQUIRING,
+        AcquisitionRecordState.ACQUIRED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+        blob_ref=replacement.hash,
+        acquired_source=_acquired(b"new-bytes!", "page-2"),
+    )
+
+
+async def test_lowered_backlog_limit_never_blocks_capacity_releasing_transitions(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    initial = SqliteDocStore(engine, max_acquired_blob_backlog_bytes=100)
+    await initial.ensure_workspace()
+    blobs = BlobStore(engine, data_dir, min_disk_headroom_bytes=1)
+    stored = [
+        await blobs.put(bytes([value]) * 10, "application/octet-stream") for value in range(3)
+    ]
+    assert all(isinstance(blob, StoredBlob) for blob in stored)
+    lease = await _claimed_run(initial)
+    for sequence, blob in enumerate(stored):
+        assert isinstance(blob, StoredBlob)
+        source_id = f"page-{sequence}"
+        await initial.append_acquisition_record(
+            lease.id,
+            sequence,
+            _source(source_id),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+        await initial.transition_acquisition_record(
+            lease.id,
+            source_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+        await initial.transition_acquisition_record(
+            lease.id,
+            source_id,
+            AcquisitionRecordState.ACQUIRING,
+            AcquisitionRecordState.ACQUIRED,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+            blob_ref=blob.hash,
+            acquired_source=_acquired(bytes([sequence]) * 10, source_id),
+            fetched_version_token="v1",  # noqa: S106 - synthetic revision
+        )
+
+    reduced = SqliteDocStore(engine, max_acquired_blob_backlog_bytes=10)
+    await reduced.transition_acquisition_record(
+        lease.id,
+        "page-0",
+        AcquisitionRecordState.ACQUIRED,
+        AcquisitionRecordState.INDEXING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    await reduced.transition_acquisition_record(
+        lease.id,
+        "page-0",
+        AcquisitionRecordState.INDEXING,
+        AcquisitionRecordState.SETTLED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+
+    run = await reduced.get_acquisition_run(lease.id)
+    assert run is not None
+    assert run.acquired_blob_bytes == 20
+
+
+async def test_retry_and_reacquire_keep_retained_bytes_in_backlog_accounting(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    limited = SqliteDocStore(engine, max_acquired_blob_backlog_bytes=10)
+    await limited.ensure_workspace()
+    blobs = BlobStore(engine, data_dir, min_disk_headroom_bytes=1)
+    first = await blobs.put(b"a" * 10, "application/octet-stream")
+    second = await blobs.put(b"b" * 10, "application/octet-stream")
+    assert isinstance(first, StoredBlob)
+    assert isinstance(second, StoredBlob)
+    lease = await _claimed_run(limited)
+    for sequence in range(2):
+        await limited.append_acquisition_record(
+            lease.id,
+            sequence,
+            _source(f"page-{sequence}"),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+    await limited.complete_acquisition_enumeration(
+        lease.id,
+        None,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    for sequence in range(2):
+        await limited.transition_acquisition_record(
+            lease.id,
+            f"page-{sequence}",
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+    await limited.transition_acquisition_record(
+        lease.id,
+        "page-0",
+        AcquisitionRecordState.ACQUIRING,
+        AcquisitionRecordState.ACQUIRED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+        blob_ref=first.hash,
+        acquired_source=_acquired(b"a" * 10, "page-0"),
+    )
+    await limited.transition_acquisition_record(
+        lease.id,
+        "page-0",
+        AcquisitionRecordState.ACQUIRED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    await limited.transition_acquisition_record(
+        lease.id,
+        "page-0",
+        AcquisitionRecordState.RETRY,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+
+    retrying = await limited.get_acquisition_run(lease.id)
+    assert retrying is not None
+    assert retrying.acquired_blob_bytes == 10
+    with pytest.raises(CapacityRefusedError):
+        await limited.transition_acquisition_record(
+            lease.id,
+            "page-1",
+            AcquisitionRecordState.ACQUIRING,
+            AcquisitionRecordState.ACQUIRED,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+            blob_ref=second.hash,
+            acquired_source=_acquired(b"b" * 10, "page-1"),
+        )
 
 
 async def test_migration_preserves_publications_and_creates_no_backlog(data_dir: Path) -> None:

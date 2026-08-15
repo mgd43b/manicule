@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import shutil
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import and_, case, delete, exists, func, or_, select, update
+from sqlalchemy import and_, case, delete, exists, func, literal, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.acquisition import (
@@ -32,6 +33,13 @@ from manicule.core.content import JsonValue
 from manicule.core.errors import AcquisitionLeaseLostError, ManiculeError, UnknownEntityError
 from manicule.core.ids import acquisition_marker_id
 from manicule.core.sources import Watermark
+from manicule.ingest.capacity import (
+    CapacityDiagnostic,
+    CapacityRefusedError,
+    CapacityResource,
+    require_disk_headroom,
+    translate_storage_capacity_errors,
+)
 from manicule.storage import models
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import next_observation, utcnow
@@ -42,6 +50,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy import CursorResult
     from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.elements import ColumnElement
 
 _WATERMARK = TypeAdapter(Watermark)
 _SOURCE = TypeAdapter(AcquisitionSource)
@@ -89,6 +98,15 @@ _RECORD_TRANSITIONS: dict[AcquisitionRecordState, set[AcquisitionRecordState]] =
     AcquisitionRecordState.SETTLED: set(),
     AcquisitionRecordState.OMITTED: set(),
 }
+
+_BLOB_BACKLOG_STATES = (
+    AcquisitionRecordState.DISCOVERED,
+    AcquisitionRecordState.ACQUIRING,
+    AcquisitionRecordState.ACQUIRED,
+    AcquisitionRecordState.UNCHANGED,
+    AcquisitionRecordState.INDEXING,
+    AcquisitionRecordState.RETRY,
+)
 
 
 class AcquisitionConflictError(ManiculeError):
@@ -321,9 +339,57 @@ async def _manifest_matches(session: AsyncSession, run_id: str, expected: str) -
     return hmac.compare_digest(expected, actual)
 
 
+async def _source_record(
+    session: AsyncSession, workspace_id: str, run_id: str, source_id: str
+) -> models.AcquisitionRecord | None:
+    return (
+        await session.execute(
+            select(models.AcquisitionRecord).where(
+                models.AcquisitionRecord.run_id == run_id,
+                models.AcquisitionRecord.workspace_id == workspace_id,
+                models.AcquisitionRecord.source_id == source_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+def _matching_record(
+    row: models.AcquisitionRecord | None, source_json: dict[str, Any]
+) -> AcquisitionRecord | None:
+    if row is None:
+        return None
+    if cast("Any", row.source_record) != source_json:
+        raise AcquisitionConflictError("source identity was rediscovered with different data")
+    return _record(row)
+
+
+def _matching_run_identity(
+    row: models.AcquisitionRun,
+    *,
+    workspace_id: str,
+    connector: str,
+    source_scope: str,
+    scope_fingerprint: str,
+    promotion_policy: SnapshotPromotionPolicy,
+) -> bool:
+    """Whether a durable run is exactly the immutable snapshot identity requested."""
+    try:
+        stored_policy = SnapshotPromotionPolicy(row.promotion_policy)
+    except ValueError:
+        return False
+    return (
+        row.workspace_id == workspace_id
+        and row.connector_name == connector
+        and row.source_scope == source_scope
+        and row.scope_fingerprint == scope_fingerprint
+        and stored_policy is promotion_policy
+    )
+
+
 class AcquisitionJournalMixin(WorkspaceScoped):
     """Workspace-scoped durable run and record operations."""
 
+    @translate_storage_capacity_errors
     async def create_acquisition_run(
         self,
         run_id: str,
@@ -337,7 +403,38 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         if not run_id or not connector:
             msg = "run_id and connector must not be empty"
             raise ValueError(msg)
+        async with self._sessions() as session:
+            existing = await self._run_row(session, run_id)
+        if existing is not None:
+            if not _matching_run_identity(
+                existing,
+                workspace_id=self._workspace_id,
+                connector=connector,
+                source_scope=source_scope,
+                scope_fingerprint=scope_fingerprint,
+                promotion_policy=promotion_policy,
+            ):
+                raise AcquisitionConflictError(
+                    "acquisition run conflicts with requested run identity"
+                )
+            return _run(existing)
         async with self._sessions.begin() as session:
+            await self._begin_capacity_guard(session)
+            existing = await session.get(models.AcquisitionRun, run_id)
+            if existing is not None:
+                if not _matching_run_identity(
+                    existing,
+                    workspace_id=self._workspace_id,
+                    connector=connector,
+                    source_scope=source_scope,
+                    scope_fingerprint=scope_fingerprint,
+                    promotion_policy=promotion_policy,
+                ):
+                    raise AcquisitionConflictError(
+                        "acquisition run conflicts with requested run identity"
+                    )
+                return _run(existing)
+            self._require_disk_headroom(requested_bytes=1)
             connector_row = await self._ensure_connector(session, connector)
             statement = (
                 sqlite_insert(models.AcquisitionRun)
@@ -361,11 +458,15 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             row = await session.get(models.AcquisitionRun, run_id)
             if (
                 row is None
-                or row.workspace_id != self._workspace_id
                 or row.connector_id != connector_row.id
-                or row.source_scope != source_scope
-                or row.scope_fingerprint != scope_fingerprint
-                or SnapshotPromotionPolicy(row.promotion_policy) is not promotion_policy
+                or not _matching_run_identity(
+                    row,
+                    workspace_id=self._workspace_id,
+                    connector=connector,
+                    source_scope=source_scope,
+                    scope_fingerprint=scope_fingerprint,
+                    promotion_policy=promotion_policy,
+                )
             ):
                 msg = f"acquisition run {run_id!r} conflicts with the requested run identity"
                 raise AcquisitionConflictError(msg)
@@ -547,6 +648,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             ).scalar_one_or_none()
             return None if row is None else _run(row)
 
+    @translate_storage_capacity_errors
     async def claim_or_create_acquisition_run(
         self,
         connector: str,
@@ -573,6 +675,8 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             msg = "lease expiry must be after now"
             raise ValueError(msg)
         async with self._sessions.begin() as session:
+            await self._begin_capacity_guard(session)
+            self._require_disk_headroom(requested_bytes=1)
             connector_id = f"{self._workspace_id}:{connector}"
             # The insert is also the serialization point when this is the connector's first
             # ever sync. A read followed by `_ensure_connector` would let both callers observe
@@ -705,6 +809,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             await session.flush()
             return _run(row)
 
+    @translate_storage_capacity_errors
     async def append_acquisition_record(
         self,
         run_id: str,
@@ -721,15 +826,94 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             raise ValueError(msg)
         source_json = source.model_dump(mode="json")
         encoded_bytes = len(json.dumps(source_json, sort_keys=True, separators=(",", ":")).encode())
-        async with self._sessions.begin() as session:
+        async with self._sessions() as session:
             run = await self._required_run_row(session, run_id)
             self._require_live_lease(run, lease_owner, lease_generation, now)
-            if (
-                run.state is not AcquisitionRunState.ENUMERATING
-                or run.enumeration_completed_at is not None
-            ):
-                msg = f"acquisition run {run_id!r} is no longer accepting discovery records"
+            existing = await _source_record(session, self._workspace_id, run_id, source.source_id)
+        matched = _matching_record(existing, source_json)
+        if matched is not None:
+            return matched
+        async with self._sessions.begin() as session:
+            await self._begin_capacity_guard(session)
+            run = await self._required_run_row(session, run_id)
+            self._require_live_lease(run, lease_owner, lease_generation, now)
+            existing = await _source_record(session, self._workspace_id, run_id, source.source_id)
+            matched = _matching_record(existing, source_json)
+            if matched is not None:
+                return matched
+            self._require_disk_headroom(requested_bytes=encoded_bytes)
+            unsettled_records = (
+                select(func.coalesce(func.sum(models.AcquisitionRun.discovered_count), 0))
+                .where(models.AcquisitionRun.state != AcquisitionRunState.SETTLED)
+                .scalar_subquery()
+            )
+            unsettled_metadata = (
+                select(func.coalesce(func.sum(models.AcquisitionRun.metadata_bytes), 0))
+                .where(models.AcquisitionRun.state != AcquisitionRunState.SETTLED)
+                .scalar_subquery()
+            )
+            reserved = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.AcquisitionRun)
+                    .where(
+                        models.AcquisitionRun.id == run_id,
+                        models.AcquisitionRun.workspace_id == self._workspace_id,
+                        models.AcquisitionRun.state == AcquisitionRunState.ENUMERATING,
+                        models.AcquisitionRun.enumeration_completed_at.is_(None),
+                        models.AcquisitionRun.lease_owner == lease_owner,
+                        models.AcquisitionRun.lease_generation == lease_generation,
+                        models.AcquisitionRun.lease_expires_at > now,
+                        unsettled_records + 1 <= self._max_journal_records,
+                        unsettled_metadata + encoded_bytes <= self._max_journal_metadata_bytes,
+                    )
+                    .values(
+                        discovered_count=models.AcquisitionRun.discovered_count + 1,
+                        metadata_bytes=models.AcquisitionRun.metadata_bytes + encoded_bytes,
+                        updated_at=utcnow(),
+                    )
+                ),
+            )
+            if reserved.rowcount != 1:
+                run = await self._required_run_row(session, run_id)
+                self._require_live_lease(run, lease_owner, lease_generation, now)
+                existing = await _source_record(
+                    session, self._workspace_id, run_id, source.source_id
+                )
+                matched = _matching_record(existing, source_json)
+                if matched is not None:
+                    return matched
+                if (
+                    run.state is not AcquisitionRunState.ENUMERATING
+                    or run.enumeration_completed_at is not None
+                ):
+                    msg = "acquisition run is no longer accepting discovery records"
+                    raise AcquisitionConflictError(msg)
+                record_total = int((await session.execute(select(unsettled_records))).scalar_one())
+                metadata_total = int(
+                    (await session.execute(select(unsettled_metadata))).scalar_one()
+                )
+                if record_total + 1 > self._max_journal_records:
+                    raise CapacityRefusedError(
+                        CapacityDiagnostic(
+                            resource=CapacityResource.JOURNAL_RECORDS,
+                            limit=self._max_journal_records,
+                            used=record_total,
+                            requested=1,
+                        )
+                    )
+                if metadata_total + encoded_bytes > self._max_journal_metadata_bytes:
+                    raise CapacityRefusedError(
+                        CapacityDiagnostic(
+                            resource=CapacityResource.JOURNAL_METADATA_BYTES,
+                            limit=self._max_journal_metadata_bytes,
+                            used=metadata_total,
+                            requested=encoded_bytes,
+                        )
+                    )
+                msg = "acquisition journal reservation changed concurrently"
                 raise AcquisitionConflictError(msg)
+            run = await self._required_run_row(session, run_id)
             inserted = cast(
                 "CursorResult[Any]",
                 await session.execute(
@@ -759,14 +943,15 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 )
             ).scalar_one()
             if cast("Any", row.source_record) != source_json:
-                msg = f"source identity {source.source_id!r} was rediscovered with different data"
+                msg = "source identity was rediscovered with different data"
                 raise AcquisitionConflictError(msg)
-            if inserted.rowcount:
-                run.discovered_count += 1
-                run.metadata_bytes += encoded_bytes
+            if not inserted.rowcount:
+                run.discovered_count -= 1
+                run.metadata_bytes -= encoded_bytes
                 run.updated_at = utcnow()
             return _record(row)
 
+    @translate_storage_capacity_errors
     async def complete_acquisition_enumeration(
         self,
         run_id: str,
@@ -811,6 +996,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     raise AcquisitionConflictError(msg)
             return _run(await self._required_run_row(session, run_id))
 
+    @translate_storage_capacity_errors
     async def claim_acquisition_run(
         self, run_id: str, owner: str, *, now: datetime, expires_at: datetime
     ) -> AcquisitionRun | None:
@@ -845,6 +1031,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 return None
             return _run(await self._required_run_row(session, run_id))
 
+    @translate_storage_capacity_errors
     async def renew_acquisition_lease(
         self,
         run_id: str,
@@ -877,6 +1064,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             )
             return result.rowcount == 1
 
+    @translate_storage_capacity_errors
     async def release_acquisition_lease(
         self,
         run_id: str,
@@ -887,6 +1075,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
     ) -> bool:
         """Release an unfinished run only while its exact live generation is still owned."""
         async with self._sessions.begin() as session:
+            await self._begin_capacity_guard(session)
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(
@@ -905,6 +1094,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             )
             return result.rowcount == 1
 
+    @translate_storage_capacity_errors
     async def record_acquisition_run_metadata(
         self,
         run_id: str,
@@ -954,6 +1144,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             connector.run_metadata = cast("Any", merged)
             return True
 
+    @translate_storage_capacity_errors
     async def transition_acquisition_run(
         self,
         run_id: str,
@@ -1046,6 +1237,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             ).scalars()
             return [_record(row) for row in rows]
 
+    @translate_storage_capacity_errors
     async def transition_acquisition_record(  # noqa: PLR0912, PLR0915 - one atomic state edge
         self,
         run_id: str,
@@ -1139,22 +1331,134 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     if blob_ref is not None and acquired_source is not None
                     else SnapshotItemOutcome.OMITTED
                 )
+            live_run = select(models.AcquisitionRun.id).where(
+                models.AcquisitionRun.id == run_id,
+                models.AcquisitionRun.workspace_id == self._workspace_id,
+                models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                models.AcquisitionRun.lease_owner == lease_owner,
+                models.AcquisitionRun.lease_generation == lease_generation,
+                models.AcquisitionRun.lease_expires_at > now,
+            )
+            conditions: list[ColumnElement[bool]] = [
+                models.AcquisitionRecord.run_id == run_id,
+                models.AcquisitionRecord.workspace_id == self._workspace_id,
+                models.AcquisitionRecord.source_id == source_id,
+                models.AcquisitionRecord.state == expected,
+                live_run.exists(),
+            ]
+            unsettled_blob_bytes: ColumnElement[int] = literal(0)
+            projected_blob_bytes: ColumnElement[int] = literal(0)
+            if blob_ref is not None:
+                blob_bytes = (
+                    select(models.Blob.stored_bytes)
+                    .where(models.Blob.hash == blob_ref)
+                    .scalar_subquery()
+                )
+                live_blob_hashes = (
+                    select(models.AcquisitionRecord.blob_ref.label("hash"))
+                    .join(
+                        models.AcquisitionRun,
+                        models.AcquisitionRun.id == models.AcquisitionRecord.run_id,
+                    )
+                    .where(models.AcquisitionRun.state != AcquisitionRunState.SETTLED)
+                    .where(models.AcquisitionRecord.state.in_(_BLOB_BACKLOG_STATES))
+                    .where(models.AcquisitionRecord.blob_ref.is_not(None))
+                    .distinct()
+                    .subquery()
+                )
+                unsettled_blob_bytes = (
+                    select(func.coalesce(func.sum(models.Blob.stored_bytes), 0))
+                    .select_from(live_blob_hashes)
+                    .join(models.Blob, models.Blob.hash == live_blob_hashes.c.hash)
+                    .scalar_subquery()
+                )
+                other_blob_hashes = (
+                    select(models.AcquisitionRecord.blob_ref.label("hash"))
+                    .join(
+                        models.AcquisitionRun,
+                        models.AcquisitionRun.id == models.AcquisitionRecord.run_id,
+                    )
+                    .where(models.AcquisitionRun.state != AcquisitionRunState.SETTLED)
+                    .where(models.AcquisitionRecord.state.in_(_BLOB_BACKLOG_STATES))
+                    .where(models.AcquisitionRecord.blob_ref.is_not(None))
+                    .where(
+                        or_(
+                            models.AcquisitionRecord.run_id != run_id,
+                            models.AcquisitionRecord.source_id != source_id,
+                        )
+                    )
+                    .distinct()
+                    .subquery()
+                )
+                other_blob_bytes = (
+                    select(func.coalesce(func.sum(models.Blob.stored_bytes), 0))
+                    .select_from(other_blob_hashes)
+                    .join(models.Blob, models.Blob.hash == other_blob_hashes.c.hash)
+                    .scalar_subquery()
+                )
+                projected_blob_bytes = other_blob_bytes
+                if target in _BLOB_BACKLOG_STATES:
+                    already_live = (
+                        select(other_blob_hashes.c.hash)
+                        .where(other_blob_hashes.c.hash == blob_ref)
+                        .exists()
+                    )
+                    projected_blob_bytes += case(
+                        (~already_live, blob_bytes),
+                        else_=literal(0),
+                    )
+                conditions.append(
+                    or_(
+                        projected_blob_bytes <= unsettled_blob_bytes,
+                        projected_blob_bytes <= self._max_acquired_blob_backlog_bytes,
+                    )
+                )
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(
-                    update(models.AcquisitionRecord)
-                    .where(
-                        models.AcquisitionRecord.run_id == run_id,
-                        models.AcquisitionRecord.workspace_id == self._workspace_id,
-                        models.AcquisitionRecord.source_id == source_id,
-                        models.AcquisitionRecord.state == expected,
-                    )
-                    .values(**values)
+                    update(models.AcquisitionRecord).where(*conditions).values(**values)
                 ),
             )
             if result.rowcount != 1:
-                msg = f"acquisition record {source_id!r} state changed"
+                run = await self._required_run_row(session, run_id)
+                self._require_live_lease(run, lease_owner, lease_generation, now)
+                if run.state is AcquisitionRunState.SETTLED:
+                    msg = "acquisition run is settled"
+                    raise AcquisitionConflictError(msg)
+                row = (
+                    await session.execute(
+                        select(models.AcquisitionRecord).where(
+                            models.AcquisitionRecord.run_id == run_id,
+                            models.AcquisitionRecord.workspace_id == self._workspace_id,
+                            models.AcquisitionRecord.source_id == source_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if row is None:
+                    raise UnknownEntityError("acquisition record does not exist")
+                if row.state != expected:
+                    raise AcquisitionConflictError("acquisition record state changed")
+                if blob_ref is not None:
+                    requested_row = await session.get(models.Blob, blob_ref)
+                    if requested_row is None:
+                        raise UnknownEntityError("acquisition blob does not exist")
+                    used = int((await session.execute(select(unsettled_blob_bytes))).scalar_one())
+                    projected = int(
+                        (await session.execute(select(projected_blob_bytes))).scalar_one()
+                    )
+                    requested = projected - used
+                    if requested > 0 and used + requested > self._max_acquired_blob_backlog_bytes:
+                        raise CapacityRefusedError(
+                            CapacityDiagnostic(
+                                resource=CapacityResource.ACQUIRED_BLOB_BACKLOG_BYTES,
+                                limit=self._max_acquired_blob_backlog_bytes,
+                                used=used,
+                                requested=requested,
+                            )
+                        )
+                msg = "acquisition record state or capacity changed"
                 raise AcquisitionConflictError(msg)
+            run = await self._required_run_row(session, run_id)
             await self._refresh_counters(session, run)
             row = (
                 await session.execute(
@@ -1166,6 +1470,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             ).scalar_one()
             return _record(row)
 
+    @translate_storage_capacity_errors
     async def settle_unchanged_acquisition_record(
         self,
         run_id: str,
@@ -1244,6 +1549,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             ).scalar_one()
             return _record(row)
 
+    @translate_storage_capacity_errors
     async def complete_snapshot_acquisition(
         self,
         run_id: str,
@@ -1259,10 +1565,12 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         freeze that same bounded, typed omission set before an atomic promotion decision.
         """
         async with self._sessions.begin() as session:
+            await self._begin_capacity_guard(session)
             run = await self._required_run_row(session, run_id)
             self._require_live_lease(run, lease_owner, lease_generation, now)
             if run.acquisition_completed_at is not None:
                 return _run(run)
+            self._require_disk_headroom(requested_bytes=1)
             if run.enumeration_completed_at is None:
                 msg = "enumeration is incomplete"
                 raise AcquisitionCoverageError(msg)
@@ -1353,6 +1661,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             raise AcquisitionCoverageError(msg)
         return result
 
+    @translate_storage_capacity_errors
     async def promote_snapshot_and_commit_watermark(
         self,
         run_id: str,
@@ -1364,6 +1673,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
     ) -> AcquisitionRun:
         """Atomically make the frozen manifest authoritative and publish its watermark."""
         async with self._sessions.begin() as session:
+            await self._begin_capacity_guard(session)
             run = await self._required_run_row(session, run_id)
             self._require_live_lease(run, lease_owner, lease_generation, now)
             if run.scope_fingerprint != expected_scope_fingerprint:
@@ -1387,6 +1697,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 raise AcquisitionConflictError(msg)
             if run.promoted_at is not None:
                 return _run(run)
+            self._require_disk_headroom(requested_bytes=1)
 
             promoted_at = now
 
@@ -1430,6 +1741,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             run.updated_at = promoted_at
             return _run(run)
 
+    @translate_storage_capacity_errors
     async def commit_acquisition_watermark(
         self,
         run_id: str,
@@ -1575,6 +1887,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 raise AcquisitionConflictError(msg)
             return True
 
+    @translate_storage_capacity_errors
     async def cleanup_acquisition_history(self, cutoff: datetime, *, limit: int = 100) -> int:
         """Remove old settled/superseded journal history in bounded batches.
 
@@ -1696,6 +2009,21 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             await session.flush()
         return row
 
+    @staticmethod
+    async def _begin_capacity_guard(session: AsyncSession) -> None:
+        """Serialize idempotency and capacity decisions across every SQLite writer."""
+        await session.execute(text("BEGIN IMMEDIATE"))
+
+    def _require_disk_headroom(self, *, requested_bytes: int) -> None:
+        """Preserve the configured floor only for a mutation that will grow storage."""
+        if self._storage_root is None:
+            return
+        require_disk_headroom(
+            free=shutil.disk_usage(self._storage_root).free,
+            requested=max(1, requested_bytes),
+            minimum=self._min_disk_headroom_bytes,
+        )
+
     async def _run_row(self, session: AsyncSession, run_id: str) -> models.AcquisitionRun | None:
         return (
             await session.execute(
@@ -1745,12 +2073,19 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         ).scalar_one()
         run.unchanged_count = counts.get(AcquisitionRecordState.UNCHANGED, 0)
         run.retry_count = counts.get(AcquisitionRecordState.RETRY, 0)
+        live_blob_hashes = (
+            select(models.AcquisitionRecord.blob_ref.label("hash"))
+            .where(models.AcquisitionRecord.run_id == run.id)
+            .where(models.AcquisitionRecord.state.in_(_BLOB_BACKLOG_STATES))
+            .where(models.AcquisitionRecord.blob_ref.is_not(None))
+            .distinct()
+            .subquery()
+        )
         run.acquired_blob_bytes = (
             await session.execute(
-                select(func.coalesce(func.sum(models.Blob.size_bytes), 0))
-                .select_from(models.AcquisitionRecord)
-                .join(models.Blob, models.Blob.hash == models.AcquisitionRecord.blob_ref)
-                .where(models.AcquisitionRecord.run_id == run.id)
+                select(func.coalesce(func.sum(models.Blob.stored_bytes), 0))
+                .select_from(live_blob_hashes)
+                .join(models.Blob, models.Blob.hash == live_blob_hashes.c.hash)
             )
         ).scalar_one()
         run.updated_at = utcnow()

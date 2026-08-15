@@ -660,14 +660,40 @@ class ApplicationService:
         started = time.monotonic()
         totals = r.IngestReport(connector=source)
         counts: dict[str, int] = {}
-        indexed = skipped = failed = 0
+        indexed = skipped = failed = discovered = expanded = unrecorded = 0
+        incomplete_report: r.IngestReport | None = None
         for path in changed:
             report = await self.index_path(path, source=source)
+            discovered += report.discovered
             indexed += report.ingested
             skipped += report.skipped
             failed += report.failed
+            expanded += report.expanded
+            unrecorded += report.unrecorded
             for status, count in report.by_status.items():
                 counts[status] = counts.get(status, 0) + count
+            if report.retry_required:
+                incomplete_report = report
+                break
+        if incomplete_report is not None:
+            return totals.model_copy(
+                update={
+                    "discovered": discovered,
+                    "ingested": indexed,
+                    "skipped": skipped,
+                    "failed": failed,
+                    "expanded": expanded,
+                    "by_status": counts,
+                    "error": incomplete_report.error,
+                    "outcome": "incomplete",
+                    "enumeration_completed": False,
+                    "watermark_advanced": False,
+                    "retry_required": True,
+                    "unrecorded": unrecorded,
+                    "incomplete_reason": incomplete_report.incomplete_reason,
+                    "elapsed_ms": _millis(started),
+                }
+            )
         gone = 0
         for path in removed:
             identifier = document_id(self.workspace, source, str(_local(path).resolve()))
@@ -3220,7 +3246,26 @@ class ApplicationService:
             msg = f"no such archive: {path}"
             raise UnknownEntityError(msg)
         ingestion = await self._backend.ingestion()
-        return _ingest_payload(await ingestion.import_archive(path, force=force), started)
+        payload = _ingest_payload(await ingestion.import_archive(path, force=force), started)
+        if (
+            payload.retry_required
+            and payload.incomplete_reason is not None
+            and payload.incomplete_reason.type == "CapacityRefusedError"
+            and not force
+        ):
+            payload = payload.model_copy(
+                update={
+                    "incomplete_reason": payload.incomplete_reason.model_copy(
+                        update={
+                            "hint": (
+                                "Free durable ingest capacity or raise the configured limit, "
+                                "then retry this archive import with force enabled."
+                            )
+                        }
+                    )
+                }
+            )
+        return payload
 
     async def reset_index(self) -> r.ResetReport:
         """Delete every document, chunk and vector in this workspace.

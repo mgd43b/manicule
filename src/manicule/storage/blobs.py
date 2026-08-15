@@ -15,26 +15,36 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
+import stat
 import time
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from uuid import uuid4
 
-from sqlalchemy import and_, delete, exists, select, union, update
+from sqlalchemy import and_, delete, func, select, text, union, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.acquisition import AcquiredSource
 from manicule.core.content import RawDocument, Retention
 from manicule.core.ids import acquisition_marker_id, content_hash
+from manicule.ingest.capacity import (
+    CapacityDiagnostic,
+    CapacityRefusedError,
+    CapacityResource,
+    require_blob_backlog_capacity,
+    require_disk_headroom,
+    translate_storage_capacity_errors,
+)
 from manicule.storage import models
 from manicule.storage.engine import BLOBS_DIRNAME, session_factory
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Coroutine, Iterator, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -53,6 +63,9 @@ STAGING_PARTIAL_CLEANUP_LIMIT = 1_000
 STAGING_MARKER_RECONCILE_LIMIT = 100
 LEGACY_MARKER_RETENTION = timedelta(days=30)
 DURABLE_LOCK_SHARDS = 256
+GC_PENDING_PREFIX = "gc_pending:"
+GC_IDENTITY_HEX_LENGTH = 32
+GC_CAPACITY_SCAN_LIMIT = 1_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,11 +120,15 @@ class BlobStore:
         data_dir: Path,
         *,
         max_bytes: int = MAX_ORIGINAL_BYTES,
+        min_disk_headroom_bytes: int = 2 * 1024 * 1024 * 1024,
+        max_acquired_blob_backlog_bytes: int = 20 * 1024 * 1024 * 1024,
         sessions: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self._engine = engine
         self._root = data_dir / BLOBS_DIRNAME
         self._max_bytes = max_bytes
+        self._min_disk_headroom_bytes = min_disk_headroom_bytes
+        self._max_acquired_blob_backlog_bytes = max_acquired_blob_backlog_bytes
         self._sessions = sessions or session_factory(engine)
         self._staging_cleanup_lock = asyncio.Lock()
         self._staging_cleanup_complete = False
@@ -139,6 +156,26 @@ class BlobStore:
 
     def _stage_partial_root(self) -> Path:
         return self._root / "acquisition-staging-partials"
+
+    def _gc_root(self) -> Path:
+        return self._root / "gc-intents"
+
+    def _gc_paths(self, digest: str, token: str) -> tuple[Path, Path]:
+        if not self._gc_identity_safe(digest, token):
+            msg = "invalid garbage-collection identity"
+            raise ValueError(msg)
+        stem = f"{digest}.{token}"
+        root = self._gc_root()
+        return root / f"{stem}.blob", root / f"{stem}.json"
+
+    @staticmethod
+    def _gc_identity_safe(digest: str, token: str) -> bool:
+        return (
+            len(digest) == GC_IDENTITY_HEX_LENGTH
+            and len(token) == GC_IDENTITY_HEX_LENGTH
+            and all(character in "0123456789abcdef" for character in digest)
+            and all(character in "0123456789abcdef" for character in token)
+        )
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -192,8 +229,8 @@ class BlobStore:
             temporary.unlink(missing_ok=True)
 
     @classmethod
-    def _publish_durable(cls, destination: Path, payload: bytes) -> bytes:
-        """Publish once across processes and return the representation that won.
+    def _publish_durable(cls, destination: Path, payload: bytes) -> tuple[bytes, bool]:
+        """Publish once and return the winning representation plus this call's ownership.
 
         A hard link is the POSIX no-clobber analog of an atomic rename: exactly one
         temporary inode can acquire ``destination``. Every contender then syncs the parent
@@ -202,6 +239,7 @@ class BlobStore:
         """
         cls._mkdir_durable(destination.parent)
         temporary = destination.with_name(f"{destination.name}.{uuid4().hex}.partial")
+        created = False
         try:
             descriptor = os.open(
                 temporary,
@@ -212,12 +250,32 @@ class BlobStore:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            with contextlib.suppress(FileExistsError):
+            try:
                 os.link(temporary, destination)
-            cls._fsync_directory(destination.parent)
-            return destination.read_bytes()
+                created = True
+            except FileExistsError:
+                pass
+            try:
+                cls._fsync_directory(destination.parent)
+                return destination.read_bytes(), created
+            except BaseException as error:
+                # The caller must still know whether it owns the winning link when fsync or
+                # validation fails after publication. The attribute is process-private and
+                # carries no source-shaped data.
+                error.__dict__["_manicule_publication_created"] = created
+                raise
         finally:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except BaseException as error:
+                error.__dict__["_manicule_publication_created"] = created
+                error.__dict__["_manicule_publication_temporary"] = temporary
+                raise
+
+    @classmethod
+    def _remove_published(cls, destination: Path) -> None:
+        destination.unlink(missing_ok=True)
+        cls._fsync_directory(destination.parent)
 
     @staticmethod
     async def _durable_thread_call[T](call: Callable[[], T]) -> T:
@@ -239,15 +297,34 @@ class BlobStore:
         # it was in flight. Only restore cancellation after a successful, known endpoint.
         result = work.result()
         if cancellation is not None:
+            cancellation.__dict__["_manicule_durable_result"] = result
+            raise cancellation
+        return result
+
+    @staticmethod
+    async def _joined_async_call[T](call: Coroutine[Any, Any, T]) -> T:
+        """Finish an async durability sequence before honoring repeated cancellation."""
+        work = asyncio.create_task(call)
+        current = asyncio.current_task()
+        cancellation: asyncio.CancelledError | None = None
+        while not work.done():
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError as error:
+                cancellation = error
+                if current is not None:
+                    current.uncancel()
+        result = work.result()
+        if cancellation is not None:
             raise cancellation
         return result
 
     @classmethod
     def _published_blob(
         cls, destination: Path, data: bytes, digest: str, compression: str
-    ) -> StoredBlob:
+    ) -> tuple[StoredBlob, bool]:
         proposed = gzip.compress(data, mtime=0) if compression == "gzip" else data
-        published = cls._publish_durable(destination, proposed)
+        published, created = cls._publish_durable(destination, proposed)
         if published == data:
             actual_compression = "none"
         else:
@@ -255,27 +332,29 @@ class BlobStore:
                 decoded = gzip.decompress(published)
             except (OSError, EOFError) as error:
                 msg = f"retained blob {digest} has an unrecognized representation"
-                raise OSError(msg) from error
+                replacement = OSError(msg)
+                replacement.__dict__["_manicule_publication_created"] = created
+                raise replacement from error
             if decoded != data:
-                msg = f"retained blob {digest} does not match its content address"
-                raise OSError(msg)
+                error = OSError(f"retained blob {digest} does not match its content address")
+                error.__dict__["_manicule_publication_created"] = created
+                raise error
             actual_compression = "gzip"
-        return StoredBlob(
-            hash=digest,
-            size_bytes=len(data),
-            stored_bytes=len(published),
-            compression=actual_compression,
+        return (
+            StoredBlob(
+                hash=digest,
+                size_bytes=len(data),
+                stored_bytes=len(published),
+                compression=actual_compression,
+            ),
+            created,
         )
 
-    async def _record_blob(self, stored: StoredBlob, media_type: str | None) -> None:
-        """Make SQLite describe the immutable representation that is already on disk."""
-        async with self._sessions.begin() as session:
-            await self._record_blob_in_session(session, stored, media_type)
-
     @staticmethod
-    async def _record_blob_in_session(
+    async def _record_blob(
         session: AsyncSession, stored: StoredBlob, media_type: str | None
     ) -> None:
+        """Make SQLite describe the immutable representation that is already on disk."""
         await session.execute(
             sqlite_insert(models.Blob)
             .values(
@@ -289,6 +368,7 @@ class BlobStore:
             .on_conflict_do_update(
                 index_elements=[models.Blob.hash],
                 set_={
+                    "algo": "blake2b",
                     "size_bytes": stored.size_bytes,
                     "stored_bytes": stored.stored_bytes,
                     "compression": stored.compression,
@@ -296,16 +376,446 @@ class BlobStore:
             )
         )
 
-    async def _store_blob(self, data: bytes, media_type: str | None) -> StoredBlob:
+    async def _pending_blob_bytes(self, session: AsyncSession) -> int:
+        published_documents = select(models.Document.original_ref).where(
+            models.Document.original_ref.is_not(None)
+        )
+        published_versions = select(models.DocumentVersion.original_ref).where(
+            models.DocumentVersion.original_ref.is_not(None)
+        )
+        valid_normal_size = and_(
+            func.typeof(models.Blob.stored_bytes) == "integer",
+            models.Blob.stored_bytes >= 0,
+        )
+        normal_filters = (
+            models.Blob.algo.not_like(f"{GC_PENDING_PREFIX}%"),
+            models.Blob.hash.not_in(union(published_documents, published_versions)),
+        )
+        invalid_normal = (
+            await session.execute(
+                select(models.Blob.hash).where(*normal_filters, ~valid_normal_size).limit(1)
+            )
+        ).scalar_one_or_none()
+        if invalid_normal is not None:
+            self._refuse_gc_pending()
+        normal_described = 0
+        normal_sizes = await session.stream_scalars(
+            select(models.Blob.stored_bytes)
+            .where(*normal_filters, valid_normal_size, models.Blob.stored_bytes > 0)
+            .execution_options(yield_per=256)
+        )
+        async for stored_bytes in normal_sizes:
+            if type(stored_bytes) is not int or stored_bytes < 0:
+                await normal_sizes.close()
+                self._refuse_gc_pending()
+            if normal_described > self._max_acquired_blob_backlog_bytes - stored_bytes:
+                await normal_sizes.close()
+                normal_described = self._max_acquired_blob_backlog_bytes + 1
+                break
+            normal_described += stored_bytes
+        pending_filter = models.Blob.algo.like(f"{GC_PENDING_PREFIX}%")
+        pending_rows = (
+            await session.execute(
+                select(
+                    models.Blob.hash,
+                    models.Blob.algo,
+                    models.Blob.stored_bytes,
+                    func.typeof(models.Blob.hash),
+                    func.typeof(models.Blob.algo),
+                    func.typeof(models.Blob.stored_bytes),
+                )
+                .where(pending_filter)
+                .limit(GC_CAPACITY_SCAN_LIMIT + 1)
+            )
+        ).all()
+        if len(pending_rows) > GC_CAPACITY_SCAN_LIMIT:
+            self._refuse_gc_pending()
+        if any(
+            type(digest) is not str
+            or type(algo) is not str
+            or type(stored_bytes) is not int
+            or stored_bytes < 0
+            or hash_type != "text"
+            or algo_type != "text"
+            or stored_type != "integer"
+            for digest, algo, stored_bytes, hash_type, algo_type, stored_type in pending_rows
+        ):
+            self._refuse_gc_pending()
+        pending_claims = {
+            (digest, algo.removeprefix(GC_PENDING_PREFIX)): stored_bytes
+            for digest, algo, stored_bytes, _, _, _ in pending_rows
+        }
+        pending_physical = await asyncio.to_thread(self._gc_artifact_bytes, pending_claims)
+        return normal_described + pending_physical
+
+    def _gc_artifact_bytes(self, pending_claims: dict[tuple[str, str], int]) -> int:
+        """Conservatively count pending/orphan representations without an unbounded scan."""
+        claims: dict[str, int] = {
+            f"{digest}.{token}": stored_bytes
+            for (digest, token), stored_bytes in pending_claims.items()
+        }
+        identity_inodes: dict[str, set[tuple[int, int]]] = {}
+        inode_sizes: dict[tuple[int, int], int] = {}
+
+        def charge(path: Path, identity: str) -> None:
+            try:
+                status = path.lstat()
+            except FileNotFoundError:
+                return
+            except OSError:
+                self._refuse_gc_pending()
+            if not stat.S_ISREG(status.st_mode):
+                self._refuse_gc_pending()
+            inode = (status.st_dev, status.st_ino)
+            identity_inodes.setdefault(identity, set()).add(inode)
+            inode_sizes.setdefault(inode, max(0, status.st_size))
+
+        for digest, token in pending_claims:
+            if self._gc_identity_safe(digest, token):
+                charge(self.path_for(digest), f"{digest}.{token}")
+
+        root = self._gc_root()
+        try:
+            root_status = root.lstat()
+        except FileNotFoundError:
+            root_status = None
+        except OSError:
+            self._refuse_gc_pending()
+        if root_status is not None:
+            if not stat.S_ISDIR(root_status.st_mode):
+                self._refuse_gc_pending()
+            try:
+                inspected = list(islice(root.iterdir(), GC_CAPACITY_SCAN_LIMIT + 1))
+            except OSError:
+                self._refuse_gc_pending()
+            if len(inspected) > GC_CAPACITY_SCAN_LIMIT:
+                self._refuse_gc_pending()
+            for path in inspected:
+                identity = path.stem
+                if path.suffix == ".blob":
+                    charge(path, identity)
+                elif path.suffix == ".json":
+                    payload = self._read_gc_intent(path)
+                    if payload is not None:
+                        claims[identity] = max(claims.get(identity, 0), payload[2])
+        return self._gc_inode_accounted_bytes(claims, identity_inodes, inode_sizes)
+
+    @staticmethod
+    def _gc_inode_accounted_bytes(
+        claims: dict[str, int],
+        identity_inodes: dict[str, set[tuple[int, int]]],
+        inode_sizes: dict[tuple[int, int], int],
+    ) -> int:
+        """Charge each hard-linked representation once across all claiming identities."""
+        inode_identities: dict[tuple[int, int], set[str]] = {}
+        for identity, inodes in identity_inodes.items():
+            for inode in inodes:
+                inode_identities.setdefault(inode, set()).add(identity)
+        remaining = set(identity_inodes)
+        total = 0
+        while remaining:
+            frontier = [remaining.pop()]
+            component_identities: set[str] = set()
+            component_inodes: set[tuple[int, int]] = set()
+            while frontier:
+                identity = frontier.pop()
+                if identity in component_identities:
+                    continue
+                component_identities.add(identity)
+                for inode in identity_inodes[identity]:
+                    component_inodes.add(inode)
+                    for peer in inode_identities[inode]:
+                        if peer not in component_identities:
+                            remaining.discard(peer)
+                            frontier.append(peer)
+            physical_bytes = sum(inode_sizes[inode] for inode in component_inodes)
+            claimed_bytes = max(claims.get(identity, 0) for identity in component_identities)
+            total += max(physical_bytes, claimed_bytes)
+        total += sum(
+            claimed for identity, claimed in claims.items() if identity not in identity_inodes
+        )
+        return total
+
+    @staticmethod
+    async def _descriptor_is_durable_or_ambiguous(session: AsyncSession, digest: str) -> bool:
+        """Preserve bytes when a committed descriptor exists or cannot be ruled out."""
+        try:
+            return await session.get(models.Blob, digest) is not None
+        except Exception:  # noqa: BLE001 - ambiguity must preserve recoverable bytes
+            return True
+
+    @staticmethod
+    def _marker_match_state(path: Path, digest: str) -> bool | None:
+        """Whether a marker matches, with ``None`` for an ambiguous read failure."""
+        try:
+            decoded = cast("object", json.loads(path.read_text("utf-8")))
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(decoded, dict):
+            return False
+        payload = cast("dict[str, object]", decoded)
+        return payload.get("blob_ref") == digest and payload.get("compression") in {"gzip", "none"}
+
+    async def _remove_owned_with_retry(self, destination: Path) -> bool:
+        """Retry one transient unlink/fsync failure without looping on permanent refusal."""
+        for _attempt in range(2):
+            try:
+                await self._durable_thread_call(lambda: self._remove_published(destination))
+            except Exception:  # noqa: BLE001, S112 - fallback accounts the surviving file
+                continue
+            return True
+        return False
+
+    async def _cleanup_owned_blob(
+        self,
+        digest: str,
+        destination: Path,
+        stored: StoredBlob,
+        media_type: str | None,
+    ) -> None:
+        """Delete an owned link or durably account it while excluding digest adopters."""
+        try:
+            async with self._sessions() as cleanup:
+                # A waiter either commits before this reservation (and is observed below) or
+                # starts after the unlink. It cannot adopt the file between probe and unlink.
+                await cleanup.execute(text("BEGIN IMMEDIATE"))
+                if not await self._descriptor_is_durable_or_ambiguous(cleanup, digest):
+                    if await self._remove_owned_with_retry(destination):
+                        await cleanup.rollback()
+                    else:
+                        # A permanent permission/filesystem refusal must not turn physical
+                        # bytes into capacity-invisible state. This call owns the winning link,
+                        # so its exact proposed representation is safe to describe.
+                        await self._record_blob(cleanup, stored, media_type)
+                        await cleanup.commit()
+                else:
+                    await cleanup.rollback()
+        except BaseException:  # noqa: BLE001 - ambiguity preserves the recoverable file
+            return
+
+    async def _remove_failed_marker(self, path: Path) -> bool:
+        """Remove an uncertified marker; ambiguity preserves its matching blob."""
+        try:
+            await self._durable_thread_call(lambda: self._unlink_durable(path))
+        except BaseException:  # noqa: BLE001 - cleanup uncertainty preserves recovery bytes
+            return False
+        return True
+
+    async def _cleanup_publication_temporary(
+        self, failure: BaseException, destination: Path
+    ) -> None:
+        temporary = getattr(failure, "_manicule_publication_temporary", None)
+        if not isinstance(temporary, type(destination)):
+            return
+        expected_prefix = f"{destination.name}."
+        if (
+            temporary.parent != destination.parent
+            or not temporary.name.startswith(expected_prefix)
+            or not temporary.name.endswith(".partial")
+        ):
+            return
+        await self._durable_thread_call(lambda: self._unlink_durable(temporary))
+
+    def _refuse_gc_pending(self) -> NoReturn:
+        raise CapacityRefusedError(
+            CapacityDiagnostic(
+                resource=CapacityResource.ACQUIRED_BLOB_BACKLOG_BYTES,
+                limit=self._max_acquired_blob_backlog_bytes,
+                used=self._max_acquired_blob_backlog_bytes,
+                requested=1,
+            )
+        )
+
+    @staticmethod
+    def _publication_state(
+        failure: BaseException, *, completed: bool, created: bool
+    ) -> tuple[bool, bool]:
+        """Recover publication ownership hidden by a joined call's exception boundary."""
+        if completed:
+            return True, created
+        durable_result = getattr(failure, "_manicule_durable_result", None)
+        match durable_result:
+            case (StoredBlob(), result_created):
+                return True, bool(result_created)
+            case _:
+                pass
+        result_created = bool(getattr(failure, "_manicule_publication_created", False))
+        return result_created, result_created
+
+    async def _rollback_failed_store(
+        self,
+        session: AsyncSession,
+        failure: BaseException,
+        *,
+        digest: str,
+        destination: Path,
+        publication_completed: bool,
+        publication_created: bool,
+        owned_representation: StoredBlob,
+        media_type: str | None,
+        marker_completed: bool,
+        marker_path: Path | None,
+        marker_existed: bool,
+    ) -> None:
+        await session.rollback()
+        await self._cleanup_publication_temporary(failure, destination)
+        publication_completed, publication_created = self._publication_state(
+            failure,
+            completed=publication_completed,
+            created=publication_created,
+        )
+        marker_state = (
+            False if marker_path is None else self._marker_match_state(marker_path, digest)
+        )
+        preserve = marker_state is True or (marker_state is None and marker_completed)
+        if not preserve and marker_path is not None and not marker_existed:
+            preserve = not await self._remove_failed_marker(marker_path)
+        if publication_completed and publication_created and not preserve:
+            await self._cleanup_owned_blob(digest, destination, owned_representation, media_type)
+
+    @translate_storage_capacity_errors
+    async def _store_blob(
+        self,
+        data: bytes,
+        media_type: str | None,
+        *,
+        staging_key: str | None = None,
+        acquired: AcquiredSource | None = None,
+    ) -> StoredBlob:
+        digest = content_hash(data)
+        if staging_key is None:
+            return await self._store_blob_locked(data, media_type)
+        keys = [f"blob:{digest}", f"marker:{self._stage_name(staging_key)}"]
+        async with self._durable_locks(keys):
+            return await self._store_blob_locked(
+                data,
+                media_type,
+                staging_key=staging_key,
+                acquired=acquired,
+            )
+
+    async def _store_blob_locked(
+        self,
+        data: bytes,
+        media_type: str | None,
+        *,
+        staging_key: str | None = None,
+        acquired: AcquiredSource | None = None,
+    ) -> StoredBlob:
+        if (staging_key is None) != (acquired is None):
+            msg = "an acquisition stage requires both its key and source envelope"
+            raise ValueError(msg)
         digest = content_hash(data)
         compression = "gzip" if should_compress(media_type) else "none"
-        async with self._durable_locks([f"blob:{digest}"]):
-            stored = await self._durable_thread_call(
-                lambda: self._published_blob(self.path_for(digest), data, digest, compression)
-            )
-            await self._record_blob(stored, media_type)
+        proposed = gzip.compress(data, mtime=0) if compression == "gzip" else data
+        owned_representation = StoredBlob(
+            hash=digest,
+            size_bytes=len(data),
+            stored_bytes=len(proposed),
+            compression=compression,
+        )
+        destination = self.path_for(digest)
+        publication_completed = False
+        publication_created = False
+        marker_completed = False
+        marker_path = self._stage_path(staging_key) if staging_key is not None else None
+        marker_existed = marker_path is not None and marker_path.exists()
+        async with self._sessions() as session:
+            # SQLite's write reservation spans the aggregate check, filesystem publication,
+            # and descriptor commit. Separate BlobStore instances and processes therefore
+            # cannot each spend the same observed capacity.
+            await session.execute(text("BEGIN IMMEDIATE"))
+            try:
+                existing_row = await session.get(models.Blob, digest)
+                if existing_row is not None and existing_row.algo.startswith(GC_PENDING_PREFIX):
+                    await session.rollback()
+                    self._refuse_gc_pending()
+                destination_exists = destination.exists()
+                described_bytes = 0 if existing_row is None else existing_row.stored_bytes
+                if not destination_exists:
+                    requested_growth = max(0, len(proposed) - described_bytes)
+                else:
+                    requested_growth = 0
+                if requested_growth:
+                    require_blob_backlog_capacity(
+                        used=await self._pending_blob_bytes(session),
+                        requested=requested_growth,
+                        limit=self._max_acquired_blob_backlog_bytes,
+                    )
+                if not destination_exists:
+                    require_disk_headroom(
+                        free=shutil.disk_usage(self._root.parent).free,
+                        requested=len(proposed),
+                        minimum=self._min_disk_headroom_bytes,
+                    )
+                stored, publication_created = await self._durable_thread_call(
+                    lambda: self._published_blob(destination, data, digest, compression)
+                )
+                publication_completed = True
+                actual_growth = max(0, stored.stored_bytes - described_bytes)
+                if destination_exists and actual_growth:
+                    # A crash may leave a durable representation without its descriptor. Its
+                    # actual bytes, not this caller's compression preference, consume backlog.
+                    require_blob_backlog_capacity(
+                        used=await self._pending_blob_bytes(session),
+                        requested=actual_growth,
+                        limit=self._max_acquired_blob_backlog_bytes,
+                    )
+                if staging_key is not None and acquired is not None:
+                    run_id, separator, source_id = staging_key.partition("\0")
+                    marker: dict[str, object] = {
+                        "blob_ref": digest,
+                        "compression": stored.compression,
+                        "acquired_source": acquired.model_dump(mode="json"),
+                        "run_id": run_id if separator else None,
+                        "source_id": source_id if separator else None,
+                    }
+                    await self._record_marker_in_session(
+                        session,
+                        self._stage_name(staging_key),
+                        marker,
+                        legacy=False,
+                        created_at=None,
+                    )
+                    payload = json.dumps(
+                        marker,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                    await self._durable_thread_call(
+                        lambda: self._write_durable(
+                            cast("Path", marker_path),
+                            payload,
+                            temporary_dir=self._stage_partial_root(),
+                        )
+                    )
+                    marker_completed = True
+                await self._record_blob(session, stored, media_type)
+                await session.commit()
+            except BaseException as failure:
+                await self._joined_async_call(
+                    self._rollback_failed_store(
+                        session,
+                        failure,
+                        digest=digest,
+                        destination=destination,
+                        publication_completed=publication_completed,
+                        publication_created=publication_created,
+                        owned_representation=owned_representation,
+                        media_type=media_type,
+                        marker_completed=marker_completed,
+                        marker_path=marker_path,
+                        marker_existed=marker_existed,
+                    )
+                )
+                raise
         return stored
 
+    @translate_storage_capacity_errors
     async def put(self, data: bytes, media_type: str | None = None) -> StoredBlob | OmittedBlob:
         """Retain bytes, or say why they were not retained.
 
@@ -353,45 +863,7 @@ class BlobStore:
         data = raw.as_bytes()
         if len(data) > self._max_bytes:
             return await self.retain(data, raw.media_type), acquired
-        compression = "gzip" if should_compress(raw.media_type) else "none"
-        run_id, separator, source_id = key.partition("\0")
-        marker: dict[str, object] = {
-            "blob_ref": acquired.content_hash,
-            "compression": compression,
-            "acquired_source": acquired.model_dump(mode="json"),
-            "run_id": run_id if separator else None,
-            "source_id": source_id if separator else None,
-        }
-        name = self._stage_name(key)
-        async with self._durable_locks([f"marker:{name}", f"blob:{acquired.content_hash}"]):
-            await self._record_marker(name, marker, legacy=False)
-            stored = await self._durable_thread_call(
-                lambda: self._published_blob(
-                    self.path_for(acquired.content_hash),
-                    data,
-                    acquired.content_hash,
-                    compression,
-                )
-            )
-            marker["compression"] = stored.compression
-            payload = json.dumps(
-                marker,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-            try:
-                await self._durable_thread_call(
-                    lambda: self._write_durable(
-                        self._stage_path(key),
-                        payload,
-                        temporary_dir=self._stage_partial_root(),
-                    )
-                )
-            except BaseException:
-                if not self._stage_path(key).exists():
-                    await self._forget_markers([name])
-                raise
-            await self._record_blob(stored, raw.media_type)
+        stored = await self._store_blob(data, raw.media_type, staging_key=key, acquired=acquired)
         return Retention(ref=stored.hash), acquired
 
     @contextlib.asynccontextmanager
@@ -817,7 +1289,7 @@ class BlobStore:
         """Read retained bytes back, or ``None`` if they are not held."""
         async with self._sessions() as session:
             row = await session.get(models.Blob, digest)
-        if row is None:
+        if row is None or row.algo.startswith(GC_PENDING_PREFIX):
             return None
         path = self.path_for(digest)
         if not path.exists():
@@ -836,16 +1308,18 @@ class BlobStore:
         A refcount is a number that has to survive every crash in every path that touches it,
         and when it is wrong it is wrong silently in both directions.
 
-        The row goes first and the file second. Crashing between the two leaks a file, which a
-        directory scan reclaims on the next pass; the reverse order would leave a row pointing
-        at nothing. Every ordering decision here resolves the same way — prefer the failure
-        that costs space over the failure that costs correctness.
+        The descriptor remains capacity-accounting state while the owned file is unlinked and
+        its parent directory fsynced. Only then is the row removed. A failed deletion therefore
+        leaves both file and descriptor for a later pass; cancellation cannot split the two
+        durability steps because each candidate runs to a joined known endpoint.
 
         Returns:
             The hashes that were collected.
         """
         await self.cleanup_staging_partials()
         if not await self.reconcile_acquisition_markers():
+            return []
+        if not await asyncio.to_thread(self._gc_root_is_scannable):
             return []
         async with self._sessions() as session:
             referenced_documents = select(models.Document.original_ref).where(
@@ -878,55 +1352,323 @@ class BlobStore:
                 .scalars()
                 .all()
             )
+            pending_rows = (
+                (
+                    await session.execute(
+                        select(models.Blob.hash, models.Blob.algo).where(
+                            models.Blob.algo.like(f"{GC_PENDING_PREFIX}%")
+                        )
+                    )
+                )
+                .tuples()
+                .all()
+            )
 
         collected: list[str] = []
+        visited: set[str] = set()
+        for digest, algo in pending_rows:
+            token = algo.removeprefix(GC_PENDING_PREFIX)
+            visited.add(digest)
+            if self._gc_identity_safe(digest, token) and await self._joined_async_call(
+                self._run_gc_intent(digest, token)
+            ):
+                collected.append(digest)
+        for digest, token in self._gc_intents():
+            if digest in visited:
+                continue
+            visited.add(digest)
+            if await self._joined_async_call(self._run_gc_intent(digest, token)):
+                collected.append(digest)
         for digest in unreferenced:
-            if await self._delete_unreferenced_blob(digest):
+            if digest in visited:
+                continue
+            token = await self._mark_gc_candidate(digest)
+            if token is not None and await self._joined_async_call(
+                self._run_gc_intent(digest, token)
+            ):
                 collected.append(digest)
         return collected
 
-    async def _delete_unreferenced_blob(self, digest: str) -> bool:
-        """Delete one candidate only if every durable root is still absent atomically."""
-        async with self._durable_locks([f"blob:{digest}"]):
-            statement = delete(models.Blob).where(
-                models.Blob.hash == digest,
-                ~exists().where(models.Document.original_ref == digest),
-                ~exists().where(models.DocumentVersion.original_ref == digest),
-                ~exists().where(models.AcquisitionRecord.blob_ref == digest),
-                ~exists().where(models.AcquisitionMarker.blob_ref == digest),
-            )
-            async with self._sessions.begin() as session:
-                result = await session.execute(statement)
-            if cast("Any", result).rowcount != 1:
-                return False
-            return await self._unlink_blob_if_still_unreferenced(digest)
+    def _gc_intents(self) -> list[tuple[str, str]]:
+        root = self._gc_root()
+        try:
+            paths = list(root.glob("*.json")) if root.is_dir() else []
+        except OSError:
+            return []
+        intents: list[tuple[str, str]] = []
+        for path in paths:
+            digest, separator, token = path.stem.partition(".")
+            if separator and self._gc_identity_safe(digest, token):
+                intents.append((digest, token))
+        return intents
 
-    async def _unlink_blob_if_still_unreferenced(self, digest: str) -> bool:
-        """Serialize the physical unlink against roots arriving after row deletion."""
-        async with self._sessions.begin() as session:
-            # Even when it matches no rows, UPDATE obtains SQLite's writer reservation. A
-            # concurrent marker insert therefore either commits before this recheck or waits
-            # until the old file has gone and can safely republish it.
-            await session.execute(
-                update(models.AcquisitionMarker)
-                .where(models.AcquisitionMarker.blob_ref == digest)
-                .values(name=models.AcquisitionMarker.name)
-            )
-            roots = (
-                await session.execute(
-                    select(
-                        exists().where(models.Document.original_ref == digest),
-                        exists().where(models.DocumentVersion.original_ref == digest),
-                        exists().where(models.AcquisitionRecord.blob_ref == digest),
-                        exists().where(models.AcquisitionMarker.blob_ref == digest),
-                        exists().where(models.Blob.hash == digest),
-                    )
-                )
-            ).one()
-            if any(roots):
+    def _gc_root_is_scannable(self) -> bool:
+        try:
+            return stat.S_ISDIR(self._gc_root().lstat().st_mode)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    async def _blob_is_referenced(session: AsyncSession, digest: str) -> bool:
+        references = union(
+            select(models.Document.original_ref.label("ref")).where(
+                models.Document.original_ref == digest
+            ),
+            select(models.DocumentVersion.original_ref.label("ref")).where(
+                models.DocumentVersion.original_ref == digest
+            ),
+            select(models.AcquisitionRecord.blob_ref.label("ref")).where(
+                models.AcquisitionRecord.blob_ref == digest
+            ),
+            select(models.AcquisitionMarker.blob_ref.label("ref")).where(
+                models.AcquisitionMarker.blob_ref == digest
+            ),
+        ).subquery()
+        return (
+            await session.execute(select(references.c.ref).limit(1))
+        ).scalar_one_or_none() is not None
+
+    async def _mark_gc_candidate(self, digest: str) -> str | None:
+        """Persist a counted deletion intent in one short writer transaction."""
+        token = uuid4().hex
+        async with self._sessions() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            row = await session.get(models.Blob, digest)
+            if row is None:
+                await session.rollback()
+                return None
+            if row.algo.startswith(GC_PENDING_PREFIX):
+                await session.rollback()
+                return row.algo.removeprefix(GC_PENDING_PREFIX)
+            if await self._blob_is_referenced(session, digest):
+                await session.rollback()
+                return None
+            row.algo = f"{GC_PENDING_PREFIX}{token}"
+            await session.commit()
+        return token
+
+    @classmethod
+    def _quarantine_durable(cls, destination: Path, quarantine: Path) -> None:
+        """Move a content-addressed name aside without overwriting another owner."""
+        cls._mkdir_durable(quarantine.parent)
+        if destination.exists():
+            with contextlib.suppress(FileExistsError):
+                os.link(destination, quarantine)
+            cls._fsync_directory(quarantine.parent)
+            destination.unlink(missing_ok=True)
+            cls._fsync_directory(destination.parent)
+
+    @classmethod
+    def _restore_quarantine(cls, destination: Path, quarantine: Path) -> None:
+        """Restore a pending blob when a durable reference appeared before finalization."""
+        if not quarantine.exists():
+            return
+        cls._mkdir_durable(destination.parent)
+        with contextlib.suppress(FileExistsError):
+            os.link(quarantine, destination)
+        cls._fsync_directory(destination.parent)
+        quarantine.unlink(missing_ok=True)
+        cls._fsync_directory(quarantine.parent)
+
+    async def _normalize_gc_row(self, digest: str, token: str) -> None:
+        async with self._sessions() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            row = await session.get(models.Blob, digest)
+            if row is not None and row.algo == f"{GC_PENDING_PREFIX}{token}":
+                row.algo = "blake2b"
+                await session.commit()
+            else:
+                await session.rollback()
+
+    async def _remove_gc_artifacts(self, quarantine: Path, intent: Path) -> bool:
+        if not await self._remove_owned_with_retry(quarantine):
+            return False
+        return await self._remove_owned_with_retry(intent)
+
+    @staticmethod
+    def _read_gc_intent(path: Path) -> tuple[str, str, int] | None:
+        try:
+            decoded = cast("object", json.loads(path.read_text("utf-8")))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        payload = cast("dict[object, object]", decoded)
+        if set(payload) != {"digest", "token", "stored_bytes"}:
+            return None
+        digest = payload["digest"]
+        token = payload["token"]
+        stored_bytes = payload["stored_bytes"]
+        if type(digest) is not str or type(token) is not str or type(stored_bytes) is not int:
+            return None
+        if stored_bytes < 0:
+            return None
+        return digest, token, stored_bytes
+
+    @staticmethod
+    def _gc_intent_matches(path: Path, *, digest: str, token: str, stored_bytes: int) -> bool:
+        return BlobStore._read_gc_intent(path) == (digest, token, stored_bytes)
+
+    @staticmethod
+    def _gc_representation_matches(
+        path: Path,
+        *,
+        digest: str,
+        compression: str,
+        size_bytes: int,
+        stored_bytes: int,
+    ) -> bool:
+        if (
+            type(digest) is not str
+            or type(compression) is not str
+            or compression not in {"none", "gzip"}
+            or type(size_bytes) is not int
+            or type(stored_bytes) is not int
+            or size_bytes < 0
+            or stored_bytes < 0
+        ):
+            return False
+        try:
+            raw = path.read_bytes()
+            if len(raw) != stored_bytes:
                 return False
-            self.path_for(digest).unlink(missing_ok=True)
-        return True
+            data = gzip.decompress(raw) if compression == "gzip" else raw
+        except (OSError, EOFError):
+            return False
+        return len(data) == size_bytes and content_hash(data) == digest
+
+    def _gc_recovery_is_valid(
+        self,
+        stored: StoredBlob,
+        destination: Path,
+        quarantine: Path,
+        intent: Path,
+        token: str,
+    ) -> bool:
+        if (
+            type(stored.hash) is not str
+            or type(stored.compression) is not str
+            or stored.compression not in {"none", "gzip"}
+            or type(stored.size_bytes) is not int
+            or type(stored.stored_bytes) is not int
+            or stored.size_bytes < 0
+            or stored.stored_bytes < 0
+        ):
+            return False
+        intent_exists = intent.exists()
+        if intent_exists and not self._gc_intent_matches(
+            intent,
+            digest=stored.hash,
+            token=token,
+            stored_bytes=stored.stored_bytes,
+        ):
+            return False
+        if quarantine.exists():
+            if not intent_exists:
+                return False
+            if not self._gc_representation_matches(
+                quarantine,
+                digest=stored.hash,
+                compression=stored.compression,
+                size_bytes=stored.size_bytes,
+                stored_bytes=stored.stored_bytes,
+            ):
+                return False
+        if destination.exists() and not self._gc_representation_matches(
+            destination,
+            digest=stored.hash,
+            compression=stored.compression,
+            size_bytes=stored.size_bytes,
+            stored_bytes=stored.stored_bytes,
+        ):
+            return False
+        return quarantine.exists() or destination.exists()
+
+    async def _run_gc_intent(self, digest: str, token: str) -> bool:  # noqa: PLR0911
+        """Resume one deletion intent without holding SQLite across filesystem durability."""
+        if not self._gc_identity_safe(digest, token):
+            return False
+        destination = self.path_for(digest)
+        quarantine, intent = self._gc_paths(digest, token)
+        async with self._sessions() as session:
+            row = await session.get(models.Blob, digest)
+            if row is None or row.algo != f"{GC_PENDING_PREFIX}{token}":
+                pending_row = None
+                pending_stored = None
+                referenced = False
+            else:
+                pending_row = row
+                pending_stored = StoredBlob(
+                    hash=row.hash,
+                    size_bytes=row.size_bytes,
+                    stored_bytes=row.stored_bytes,
+                    compression=row.compression,
+                )
+                referenced = await self._blob_is_referenced(session, digest)
+        if pending_row is None or pending_stored is None:
+            return await self._remove_gc_artifacts(quarantine, intent)
+        if referenced:
+            if not await asyncio.to_thread(
+                self._gc_recovery_is_valid,
+                pending_stored,
+                destination,
+                quarantine,
+                intent,
+                token,
+            ):
+                return False
+            await self._durable_thread_call(
+                lambda: self._restore_quarantine(destination, quarantine)
+            )
+            await self._normalize_gc_row(digest, token)
+            await self._remove_owned_with_retry(intent)
+            return False
+        payload = json.dumps(
+            {"digest": digest, "stored_bytes": pending_stored.stored_bytes, "token": token},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        await self._durable_thread_call(lambda: self._write_durable(intent, payload))
+        try:
+            await self._durable_thread_call(
+                lambda: self._quarantine_durable(destination, quarantine)
+            )
+        except Exception:  # noqa: BLE001 - the counted intent is restart-recoverable
+            return False
+        async with self._sessions() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            current = await session.get(models.Blob, digest)
+            if current is None or current.algo != f"{GC_PENDING_PREFIX}{token}":
+                await session.rollback()
+            elif await self._blob_is_referenced(session, digest):
+                current_stored = StoredBlob(
+                    hash=current.hash,
+                    size_bytes=current.size_bytes,
+                    stored_bytes=current.stored_bytes,
+                    compression=current.compression,
+                )
+                await session.rollback()
+                if not await asyncio.to_thread(
+                    self._gc_recovery_is_valid,
+                    current_stored,
+                    destination,
+                    quarantine,
+                    intent,
+                    token,
+                ):
+                    return False
+                await self._durable_thread_call(
+                    lambda: self._restore_quarantine(destination, quarantine)
+                )
+                await self._normalize_gc_row(digest, token)
+                await self._remove_owned_with_retry(intent)
+                return False
+            else:
+                await session.execute(delete(models.Blob).where(models.Blob.hash == digest))
+                await session.commit()
+        return await self._remove_gc_artifacts(quarantine, intent)
 
     async def orphaned_files(self) -> Sequence[Path]:
         """Files on disk that no ``blobs`` row claims.

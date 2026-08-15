@@ -94,6 +94,7 @@ from manicule.core.errors import (
 from manicule.core.ids import content_hash, document_id
 from manicule.core.provenance import Provenance
 from manicule.core.sources import DiscoveredDoc
+from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError
 from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
 from manicule.ingest.glossary_lineage import glossary_fingerprint
@@ -189,7 +190,7 @@ def _acquisition_diagnostic(exc: Exception) -> AcquisitionDiagnostic:
             if "stale" in str(exc).lower() or "discovered at version" in str(exc).lower()
             else AcquisitionFailureCode.MISSING_BODY
         )
-    elif isinstance(exc, _AcquisitionRetentionError):
+    elif isinstance(exc, (CapacityRefusedError, _AcquisitionRetentionError)):
         code = AcquisitionFailureCode.CAPACITY
     else:
         code = AcquisitionFailureCode.FETCH_FAILED
@@ -392,6 +393,8 @@ class RunReport:
     error: str = ""
     error_type: str = ""
     error_message: str = ""
+    capacity_refusal: CapacityDiagnostic | None = None
+    """Aggregate-only durable refusal detail, never source or exception context."""
 
     limited: bool = False
     """Whether ``--limit`` stopped discovery before the source was exhausted.
@@ -511,6 +514,17 @@ class RunReport:
         key = outcome.status.value
         self.by_status[key] = self.by_status.get(key, 0) + 1
 
+    def refuse_capacity(self, error: CapacityRefusedError) -> None:
+        """Make capacity exhaustion an explicit retry-required run outcome."""
+        # Earlier glossary diagnostics may contain document identities and arbitrary detector
+        # details. A capacity envelope is aggregate-only, including facts recorded before the
+        # refusal in this same run.
+        self.glossary_failures.clear()
+        self.capacity_refusal = error.diagnostic
+        self.error_type = type(error).__name__
+        self.error_message = str(error)
+        self.error = f"{self.error_type}: {self.error_message}"
+
     def settle(self) -> None:
         """Put the order-sensitive parts into an order that does not depend on who finished first.
 
@@ -523,6 +537,14 @@ class RunReport:
         self.glossary_failures.sort()
 
     def as_metadata(self) -> Metadata:
+        capacity_refusal: Metadata | None = None
+        if self.capacity_refusal is not None:
+            capacity_refusal = {
+                "resource": self.capacity_refusal.resource.value,
+                "limit": self.capacity_refusal.limit,
+                "used": self.capacity_refusal.used,
+                "requested": self.capacity_refusal.requested,
+            }
         return {
             "last_run": {
                 "discovered": self.discovered,
@@ -533,6 +555,7 @@ class RunReport:
                 "error": self.error,
                 "error_type": self.error_type,
                 "error_message": self.error_message,
+                "capacity_refusal": capacity_refusal,
                 "limited": self.limited,
                 "unrecorded": self.unrecorded,
                 "outcome": (
@@ -570,6 +593,7 @@ class _Fetched:
     acquisition_record: AcquisitionRecord | None = None
     retention: Retention | None = None
     force: bool = False
+    """Re-expand a journal snapshot that was left part-way through indexing."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -869,7 +893,7 @@ class IngestPipeline:
             omission_reasons=dict(claimed.omission_reasons),
         )
 
-    async def run(
+    async def run(  # noqa: PLR0912, PLR0915 - orchestrates durable recovery stages
         self,
         connector: Connector,
         *,
@@ -935,18 +959,26 @@ class IngestPipeline:
                     now - timedelta(seconds=self._acquisition_history_s),
                     limit=self._acquisition_cleanup_batch,
                 )
+        report = RunReport(connector=connector.name)
+        if self._acquisitions is not None:
             _, scope_fingerprint = _snapshot_scope(connector)
             watermark = await self._acquisitions.get_acquisition_watermark(
                 connector.name, scope_fingerprint
             )
         else:
             watermark = await self._store.get_watermark(connector.name)
-        acquisition = await self._start_acquisition(connector, watermark)
+        try:
+            acquisition = await self._start_acquisition(connector, watermark)
+        except CapacityRefusedError as error:
+            report.enumeration_completed = False
+            report.refuse_capacity(error)
+            await self._store.record_connector_metadata(connector.name, report.as_metadata())
+            return report
 
         ref_capacity = self._queue_depth_factor * self._fetch_workers
         run = _Sync(
             connector=connector,
-            report=RunReport(connector=connector.name),
+            report=report,
             limit=limit,
             watching=watching,
             watermark=acquisition.watermark,
@@ -1005,11 +1037,25 @@ class IngestPipeline:
             # the other stages, so what is left is to say so and leave the watermark alone.
             # Documents that were mid-write when it happened are in a non-terminal status, which
             # is what the recovery sweep (`docs/ingest.md` §6.4) exists to finish.
-            first, detail = _first_failure(failures)
-            crashed = True
-            run.report.error_type = type(first).__name__
-            run.report.error_message = str(first)
-            run.report.error = detail
+            leaves = _leaves(failures)
+            capacity_failures = [
+                failure for failure in leaves if isinstance(failure, CapacityRefusedError)
+            ]
+            non_capacity = [
+                failure for failure in leaves if not isinstance(failure, CapacityRefusedError)
+            ]
+            if not non_capacity:
+                # A refusal is an orderly, retryable stop even when several workers observe the
+                # same exhausted resource together.  Releasing the lease here is what makes the
+                # retry immediate rather than delayed until the crash fence expires.
+                crashed = False
+                run.report.refuse_capacity(capacity_failures[0])
+            else:
+                crashed = True
+                first, detail = _failure_detail(non_capacity)
+                run.report.error_type = type(first).__name__
+                run.report.error_message = str(first)
+                run.report.error = detail
         except BaseException:
             stages.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1375,9 +1421,12 @@ class IngestPipeline:
                 run.candidate_watermark = completed.candidate_watermark
                 run.report.enumeration_completed = True
         except Exception as exc:  # noqa: BLE001 - an enumeration/admission failure is reported
-            run.report.error_type = type(exc).__name__
-            run.report.error_message = str(exc)
-            run.report.error = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, CapacityRefusedError):
+                run.report.refuse_capacity(exc)
+            else:
+                run.report.error_type = type(exc).__name__
+                run.report.error_message = str(exc)
+                run.report.error = f"{type(exc).__name__}: {exc}"
         finally:
             closer = getattr(stream, "aclose", None)
             if closer is not None:
@@ -1570,6 +1619,8 @@ class IngestPipeline:
                         run.connector, record.source, raw
                     )
             except Exception as exc:  # noqa: BLE001 - persisted as a typed safe diagnostic
+                if isinstance(exc, CapacityRefusedError):
+                    run.report.refuse_capacity(exc)
                 diagnostic = _acquisition_diagnostic(exc)
                 await self._keep_acquisition_lease_live(
                     run, acquisitions, self._acquisition_clock(), force=True
@@ -3181,12 +3232,18 @@ class IngestPipeline:
     async def _retain(self, raw: RawDocument, source_bytes: bytes) -> Retention:
         """Keep the connector's bytes, or record why they were not kept.
 
-        Failing to retain never fails a document: the document is still indexable, and what is
-        lost is a repair option rather than content. The reason is recorded so the set of
-        documents for which a re-crawl is the only repair stays a query.
+        Ordinary backend failures remain a per-document omission: the document is still
+        indexable, and what is lost is a repair option rather than content. Capacity refusal is
+        different because the configured durability boundary has rejected further growth; it
+        aborts the run so a successful report cannot acknowledge bytes that were not retained.
         """
         try:
             return await self._blobs.retain(source_bytes, raw.media_type)
+        except CapacityRefusedError:
+            # Capacity is an operator-actionable run refusal, not a document retention policy.
+            # Turning it into an omission would let direct ingest report success while durable
+            # storage had explicitly refused growth.
+            raise
         except Exception as exc:  # noqa: BLE001 - failing to keep bytes must not fail a document
             return Retention(omitted_reason=f"retention failed: {type(exc).__name__}: {exc}")
 
@@ -3536,15 +3593,8 @@ def _report_progress(run: _Sync) -> None:
     )
 
 
-def _first_failure(failures: BaseExceptionGroup[Exception]) -> tuple[Exception, str]:
-    """One line for what stopped the stages, from however many of them noticed.
-
-    Several ingest workers meeting the same dead store produce several identical exceptions, and
-    a report that concatenated them would say the same sentence four times and bury how many
-    stages were affected. The first is named because it is the one that happened; the count is
-    kept because "four stages" and "one stage" are different diagnoses.
-    """
-    flattened = _leaves(failures)
+def _failure_detail(flattened: Sequence[Exception]) -> tuple[Exception, str]:
+    """Describe selected leaves, including how many workers observed the same failure."""
     first = flattened[0]
     detail = f"{type(first).__name__}: {first}"
     return first, detail if len(flattened) == 1 else f"{detail} (and {len(flattened) - 1} more)"

@@ -54,6 +54,7 @@ STATUS_BY_ERROR: dict[str, int] = {
     "FingerprintMismatchError": CONFLICT,
     "ConfigError": BAD_REQUEST,
     "ValueError": BAD_REQUEST,
+    "CapacityRefusedError": SERVICE_UNAVAILABLE,
     # A cross-workspace refusal is **not** a client error. Nothing the caller sent could have
     # produced it: a store returned another tenant's row and the surface refused it. That is a
     # defect in this installation, and reporting it as 4xx would file it against the caller.

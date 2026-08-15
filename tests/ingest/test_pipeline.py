@@ -12,11 +12,12 @@ from typing import TYPE_CHECKING, override
 
 import pytest
 
-from manicule.core.content import Commit, DocumentStatus, PipelineStage, RawDocument
+from manicule.core.content import Commit, DocumentStatus, PipelineStage, RawDocument, Retention
 from manicule.core.errors import PolicyError
 from manicule.core.fingerprints import ParseFingerprint
 from manicule.core.ids import content_hash
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
+from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import BlobSink, IngestPipeline
 from manicule.ingest.workers import InProcessRunner
@@ -667,6 +668,35 @@ async def test_bytes_that_were_not_retained_record_the_reason_rather_than_nothin
     _, reason = store.originals[document.id]
     assert reason is not None
     assert "exceeds the cap" in reason
+
+
+async def test_capacity_refusal_is_not_downgraded_to_a_retention_omission() -> None:
+    private_source = "private-source-cinder"
+    private_body = "private body cinder"
+
+    class RefusingBlobs(fakes.MemoryBlobs):
+        @override
+        async def retain(self, data: bytes, media_type: str | None = None) -> Retention:
+            del data, media_type
+            raise CapacityRefusedError(
+                CapacityDiagnostic(
+                    resource=CapacityResource.DISK_HEADROOM_BYTES,
+                    limit=100,
+                    used=90,
+                    requested=20,
+                )
+            )
+
+    pipeline, store, _ = build(blobs=RefusingBlobs())
+    report = await pipeline.run(fakes.DictConnector({private_source: private_body}))
+
+    assert report.error_type == "CapacityRefusedError"
+    assert report.watermark_advanced is False
+    assert await store.find_document("memory", private_source) is None
+    rendered = repr(report.as_metadata())
+    assert "disk_headroom_bytes" in rendered
+    assert private_source not in rendered
+    assert private_body not in rendered
 
 
 async def test_a_document_larger_than_the_fetch_cap_fails_at_fetch() -> None:

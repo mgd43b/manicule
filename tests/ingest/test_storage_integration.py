@@ -48,6 +48,7 @@ from manicule.core.content import (
 from manicule.core.embedding import IndexFingerprints, Vector
 from manicule.core.ids import content_hash, document_id, vector_id
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
+from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
 from manicule.ingest.recovery import requeue_interrupted
@@ -55,6 +56,7 @@ from manicule.ingest.reindex import re_parse, reindex_document
 from manicule.ingest.sweeps import sweep_vectors
 from manicule.ingest.workers import InProcessRunner
 from manicule.storage.blobs import BlobStore, StoredBlob
+from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.vectors import LanceVectorStore
 from tests.app.fakes import FakeBackend
 from tests.fakes import HashEmbedder
@@ -69,7 +71,6 @@ if TYPE_CHECKING:
 
     from manicule.core.content import Chunk, Document, ParsedBlock
     from manicule.core.sources import DiscoveredDoc, DocRef
-    from manicule.storage.docstore import SqliteDocStore
 
 
 def _pipeline(
@@ -751,6 +752,269 @@ async def test_run_counters_land_on_the_connector_row(
     assert isinstance(recorded["last_run"], dict)
     assert recorded["last_run"]["discovered"] == 1
     await vectors.teardown()
+
+
+async def test_journal_capacity_refusal_is_retryable_without_partial_acknowledgment(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    limited = SqliteDocStore(engine, max_journal_records=1)
+    await limited.ensure_workspace()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=limited,
+        acquisitions=limited,
+        blobs=BlobStore(engine, data_dir, min_disk_headroom_bytes=1),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner([]),
+        chunk_fingerprint=chunker.fingerprint,
+    )
+
+    report = await pipeline.run(
+        fakes.DictConnector(
+            {
+                "private-source-one": "private body one",
+                "private-source-two": "private body two",
+            }
+        )
+    )
+
+    assert report.error_type == "CapacityRefusedError"
+    assert report.enumeration_completed is False
+    assert report.watermark_advanced is False
+    assert await limited.get_watermark("memory") is None
+    runs = await limited.latest_unsettled_acquisition_run("memory")
+    assert runs is not None
+    records = await limited.list_acquisition_records(runs.id)
+    assert len(records) == 1, "the refused discovery identity was never acknowledged"
+    metadata = await limited.connector_metadata("memory")
+    rendered = json.dumps(metadata, sort_keys=True)
+    assert "journal_records" in rendered
+    assert '"limit": 1' in rendered
+    for private in (
+        "private-source-one",
+        "private-source-two",
+        "private body one",
+        "private body two",
+    ):
+        assert private not in rendered
+
+
+async def test_blob_admission_refusal_persists_safe_retry_without_watermark(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(
+            engine,
+            data_dir,
+            min_disk_headroom_bytes=1,
+            max_acquired_blob_backlog_bytes=0,
+        ),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner([]),
+        chunk_fingerprint=chunker.fingerprint,
+    )
+
+    report = await pipeline.run(
+        fakes.DictConnector({"private-capacity-source": "private capacity body"})
+    )
+
+    assert report.error_type == "CapacityRefusedError"
+    assert report.enumeration_completed is True
+    assert report.watermark_advanced is False
+    assert await store.get_watermark("memory") is None
+    run = await store.latest_unsettled_acquisition_run("memory")
+    assert run is not None
+    record = (await store.list_acquisition_records(run.id))[0]
+    assert record.state is AcquisitionRecordState.RETRY
+    assert record.blob_ref is None
+    assert record.diagnostic is not None
+    assert record.diagnostic.code.value == "capacity"
+    rendered = json.dumps(await store.connector_metadata("memory"), sort_keys=True)
+    assert "acquired_blob_backlog_bytes" in rendered
+    assert "private-capacity-source" not in rendered
+    assert "private capacity body" not in rendered
+
+
+async def test_capacity_only_exception_group_releases_lease_for_immediate_retry(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    refusal = CapacityRefusedError(
+        CapacityDiagnostic(
+            resource=CapacityResource.ACQUIRED_BLOB_BACKLOG_BYTES,
+            limit=10,
+            used=10,
+            requested=1,
+        )
+    )
+
+    class GroupingPipeline(IngestPipeline):
+        refusing = True
+
+        @override
+        async def _drive(self, run: Any) -> None:
+            if self.refusing:
+                raise ExceptionGroup("capacity workers", [refusal, refusal])
+            await super()._drive(run)
+
+    chunker = fakes.BlockChunker()
+    pipeline = GroupingPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir, min_disk_headroom_bytes=1),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner([]),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+    connector = fakes.DictConnector({})
+
+    refused = await pipeline.run(connector)
+    assert refused.error_type == "CapacityRefusedError"
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.lease_owner is None
+
+    pipeline.refusing = False
+    resumed = await pipeline.run(connector)
+    assert resumed.error == ""
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+
+
+async def test_mixed_exception_group_remains_a_crash_and_keeps_lease_fence(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    refusal = CapacityRefusedError(
+        CapacityDiagnostic(
+            resource=CapacityResource.ACQUIRED_BLOB_BACKLOG_BYTES,
+            limit=10,
+            used=10,
+            requested=1,
+        )
+    )
+
+    class MixedFailurePipeline(IngestPipeline):
+        @override
+        async def _drive(self, run: Any) -> None:
+            del run
+            raise ExceptionGroup("mixed workers", [refusal, RuntimeError("database failed")])
+
+    chunker = fakes.BlockChunker()
+    pipeline = MixedFailurePipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir, min_disk_headroom_bytes=1),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner([]),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+    connector = fakes.DictConnector({})
+
+    crashed = await pipeline.run(connector)
+    assert crashed.error_type == "RuntimeError"
+    assert crashed.error_message == "database failed"
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.lease_owner is not None
+    with pytest.raises(RuntimeError, match="could not be claimed"):
+        await pipeline.run(connector)
+
+
+async def test_member_capacity_refusal_resumes_indexing_by_reexpanding_snapshot(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    class RefusingMemberBlobs(BlobStore):
+        refusing = True
+
+        @override
+        async def retain(self, data: bytes, media_type: str | None = None) -> Retention:
+            if self.refusing and data == b"private beta body":
+                raise CapacityRefusedError(
+                    CapacityDiagnostic(
+                        resource=CapacityResource.ACQUIRED_BLOB_BACKLOG_BYTES,
+                        limit=100,
+                        used=90,
+                        requested=20,
+                    )
+                )
+            return await super().retain(data, media_type)
+
+    blobs = RefusingMemberBlobs(engine, data_dir, min_disk_headroom_bytes=1)
+    chunker = fakes.BlockChunker()
+    lease_clock = fakes.ManualLeaseClock()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=blobs,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"archive": fakes.FakeArchive(), "lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["archive", "lines"],
+        middleware=MiddlewareRunner([]),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+        acquisition_clock=lease_clock,
+    )
+    connector = fakes.DictConnector(
+        {"private-bundle": "one=alpha\ntwo=private beta body\nthree=gamma"}
+    )
+    connector.media_types["private-bundle"] = fakes.CONTAINER_MEDIA_TYPE
+
+    refused = await pipeline.run(connector)
+
+    assert refused.error_type == "CapacityRefusedError"
+    assert refused.watermark_advanced is False
+    assert await store.get_watermark(connector.name) is None
+    run = await store.latest_unsettled_acquisition_run(connector.name)
+    assert run is not None
+    record = (await store.list_acquisition_records(run.id))[0]
+    assert record.state is AcquisitionRecordState.INDEXING
+    assert await store.find_document("memory", "private-bundle") is not None
+    assert await store.find_document("memory", "private-bundle!/one") is not None
+    assert await store.find_document("memory", "private-bundle!/two") is None
+    fetched = list(connector.fetches)
+    rendered = repr(refused.as_metadata())
+    assert "private-bundle" not in rendered
+    assert "private beta body" not in rendered
+
+    blobs.refusing = False
+    lease_clock.advance(301)
+    resumed = await pipeline.run(connector)
+
+    assert resumed.error == ""
+    assert connector.fetches == fetched, "retry must derive from the retained snapshot"
+    assert await store.find_document("memory", "private-bundle!/two") is not None
+    assert await store.find_document("memory", "private-bundle!/three") is not None
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 
 async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(

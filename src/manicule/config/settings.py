@@ -547,6 +547,35 @@ class IngestSettings(Section):
     max_fetch_bytes: int = Field(
         default=256 * 1024 * 1024, ge=1, description="Refuse a fetched body larger than this."
     )
+    max_journal_records: int = Field(
+        default=1_000_000,
+        ge=1,
+        description="Maximum durable discovery records admitted across unsettled runs. The "
+        "writer reserves against this bound before acknowledging a source record, so an "
+        "enumeration stops safely instead of turning a slow downstream stage into unbounded "
+        "disk growth.",
+    )
+    max_journal_metadata_bytes: int = Field(
+        default=1024 * 1024 * 1024,
+        ge=1,
+        description="Maximum encoded metadata bytes admitted across unsettled discovery "
+        "records. Separate from the record count because opaque fetch references and source "
+        "metadata vary in size by orders of magnitude.",
+    )
+    max_acquired_blob_backlog_bytes: int = Field(
+        default=20 * 1024 * 1024 * 1024,
+        ge=1,
+        description="Maximum retained source bytes waiting for offline indexing. Admission "
+        "is reservation-based so concurrent acquisitions cannot each pass the same stale "
+        "capacity check.",
+    )
+    min_disk_headroom_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        ge=1,
+        description="Free filesystem space preserved while admitting journal metadata and "
+        "acquired blobs. A write that would cross this floor is refused before its durable "
+        "record is acknowledged.",
+    )
     target_batch_tokens: int = Field(
         default=16_384,
         ge=1,

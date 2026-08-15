@@ -92,7 +92,7 @@ class Envelope(BaseModel):
             return self
         partial = IngestReport.model_validate(self.data)
         if (
-            self.op not in {"index_path", "connector_sync", "import"}
+            self.op not in {"index_path", "index_changes", "connector_sync", "import"}
             or partial.outcome != "incomplete"
             or not partial.retry_required
             or partial.incomplete_reason != self.error

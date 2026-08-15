@@ -16,13 +16,17 @@ import asyncio
 import os
 import stat
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from manicule.app.runtime import (
+    ARCHIVE_VERSION,
+    ArchiveEntry,
+    ArchiveManifest,
     AssemblyError,
     Runtime,
+    _Ingestion,  # pyright: ignore[reportPrivateUsage] - direct runtime boundary test
     _recover_reembed_runs,  # pyright: ignore[reportPrivateUsage]
 )
 from manicule.app.service import ApplicationService, pre_upgrade_destination
@@ -31,6 +35,7 @@ from manicule.container import keys
 from manicule.container.container import build_container, check_wiring
 from manicule.core.errors import InsecureTargetError
 from manicule.generation.config import GENERATOR_NAME
+from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
 from manicule.plugins.manifest import ComponentKind
 from manicule.plugins.registry import discover
@@ -160,6 +165,97 @@ async def test_the_workspace_row_exists_after_the_store_is_opened(runtime: Runti
     """Everything relational hangs off it, so it is created when the handle is."""
     maintenance = await runtime.maintenance()
     assert [row[0] for row in await maintenance.workspaces()] == ["default"]
+
+
+async def test_capacity_settings_reach_both_durable_storage_boundaries(
+    manicule_environment: Path,
+) -> None:
+    """Validated settings must not stop at the composition root and merely look enabled."""
+    from manicule.storage.blobs import BlobStore  # noqa: PLC0415
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    settings = Settings(
+        data_dir=manicule_environment / "data",
+        ingest={
+            "max_journal_records": 11,
+            "max_journal_metadata_bytes": 22,
+            "max_acquired_blob_backlog_bytes": 33,
+            "min_disk_headroom_bytes": 44,
+        },  # pyright: ignore[reportArgumentType]
+    )
+    async with Runtime(settings) as opened:
+        documents = await opened.documents()
+        blobs = await opened.blobs()
+
+        assert isinstance(documents, SqliteDocStore)
+        assert documents._max_journal_records == 11  # pyright: ignore[reportPrivateUsage]
+        assert documents._max_journal_metadata_bytes == 22  # pyright: ignore[reportPrivateUsage]
+        assert documents._max_acquired_blob_backlog_bytes == 33  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(blobs, BlobStore)
+        assert blobs._min_disk_headroom_bytes == 44  # pyright: ignore[reportPrivateUsage]
+        assert blobs._max_acquired_blob_backlog_bytes == 33  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_direct_force_and_archive_import_return_typed_capacity_refusals(
+    tmp_path: Path,
+) -> None:
+    refusal = CapacityRefusedError(
+        CapacityDiagnostic(
+            resource=CapacityResource.DISK_HEADROOM_BYTES,
+            limit=100,
+            used=90,
+            requested=20,
+        )
+    )
+
+    class RefusingPipeline:
+        async def ingest_raw(self, *args: object, **kwargs: object) -> list[object]:
+            del args, kwargs
+            raise refusal
+
+    class RefusingRuntime:
+        async def pipeline(self) -> RefusingPipeline:
+            return RefusingPipeline()
+
+    ingestion = _Ingestion(cast("Runtime", RefusingRuntime()))
+    private_path = tmp_path / "private-title-cinder.txt"
+    private_path.write_text("private body cinder")
+    forced = await ingestion.index_path(private_path, name="private-source", force=True)
+
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    (archive / "private.blob").write_bytes(b"private archive body cinder")
+    (archive / "manicule-export.json").write_text(
+        ArchiveManifest(
+            version=ARCHIVE_VERSION,
+            documents=(
+                ArchiveEntry(
+                    source="private-source",
+                    source_id="private-archive-id",
+                    uri="https://private.invalid/doc?token=fake-secret-cinder",
+                    title="private archive title",
+                    media_type="text/plain",
+                    blob="private.blob",
+                ),
+            ),
+        ).model_dump_json()
+    )
+    imported = await ingestion.import_archive(archive)
+
+    for report in (forced, imported):
+        assert report.error_type == "CapacityRefusedError"
+        assert report.enumeration_completed is False
+        assert report.watermark_advanced is False
+        rendered = repr(report.as_metadata())
+        assert "disk_headroom_bytes" in rendered
+        for private in (
+            "private-title-cinder",
+            "private body cinder",
+            "private-archive-id",
+            "private.invalid",
+            "fake-secret-cinder",
+        ):
+            assert private not in rendered
 
 
 async def test_planning_a_corpus_re_parse_builds_no_pipeline_and_loads_no_model(

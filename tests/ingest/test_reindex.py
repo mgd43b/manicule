@@ -8,7 +8,7 @@ from typing import override
 import pytest
 
 from manicule.core.anchors import Unlocated
-from manicule.core.content import Chunk, DocumentStatus, ParsedBlock, RawDocument
+from manicule.core.content import Chunk, DocumentStatus, ParsedBlock, RawDocument, Retention
 from manicule.core.embedding import Vector
 from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
 from manicule.ingest.reindex import re_embed, re_parse, repair, select
@@ -157,6 +157,29 @@ async def test_re_parse_runs_the_current_chain_over_retained_bytes() -> None:
     assert [chunk.id for chunk in store.chunks[document.id]] == before, (
         "a chunk that survives a re-parse unchanged keeps its id, and therefore its vector"
     )
+
+
+async def test_re_parse_reuses_retention_without_requesting_more_capacity() -> None:
+    class RefusingRetentionBlobs(fakes.MemoryBlobs):
+        refusing = False
+
+        @override
+        async def retain(self, data: bytes, media_type: str | None = None) -> Retention:
+            if self.refusing:
+                raise AssertionError("re-parse must not retain an already durable snapshot again")
+            return await super().retain(data, media_type)
+
+    blobs = RefusingRetentionBlobs()
+    pipeline, store, _ = build(blobs=blobs)
+    await pipeline.run(fakes.DictConnector({"private-source": "private body"}))
+    document = await store.find_document("memory", "private-source")
+    assert document is not None
+    blobs.refusing = True
+
+    report = await re_parse([document], pipeline=pipeline, blobs=blobs)
+
+    assert report.documents == 1
+    assert not report.failures
 
 
 async def test_a_parser_rules_bump_re_parses_its_documents_without_the_connector() -> None:
