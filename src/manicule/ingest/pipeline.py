@@ -1957,6 +1957,7 @@ class IngestPipeline:
             await self._check_publication_fence()
             if existing is None or existing.publication_id != publication:
                 await self._store.stage_vectors(publication, chunks)
+            await self._check_publication_fence()
             await self._vectors.upsert(chunks, vectors, publication_id=publication)
             entries, glossary_fp, glossary_detail = self._derive_definitions(document, chunks)
             await self._check_publication_fence()
@@ -2565,6 +2566,7 @@ class IngestPipeline:
                 document_id=document.id,
                 detail=detail,
             )
+        await self._check_publication_fence()
         await self._store.upsert_document(
             document.model_copy(
                 update={

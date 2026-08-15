@@ -43,12 +43,13 @@ from tests.fakes import HashEmbedder
 from tests.ingest import fakes
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Mapping, Sequence
     from pathlib import Path
+    from typing import Any
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    from manicule.core.content import Document
+    from manicule.core.content import Chunk, Document
     from manicule.core.sources import DiscoveredDoc, DocRef
     from manicule.storage.docstore import SqliteDocStore
 
@@ -1255,6 +1256,142 @@ async def test_takeover_fences_hash_skip_and_failure_demotion(
 
     assert report.error_type == "_LostAcquisitionLeaseError"
     assert after == before, "the stale worker changed version/last-seen data or failure state"
+
+
+async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_write(
+    engine: AsyncEngine,
+) -> None:
+    """A valid tombstone stage is not authority for a later vector write after takeover."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    class GatedVectorStageStore(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.staged = asyncio.Event()
+            self.release_stage = asyncio.Event()
+
+        @override
+        async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
+            await super().stage_vectors(publication_id, chunks)
+            self.staged.set()
+            await self.release_stage.wait()
+
+    store = GatedVectorStageStore()
+    await store.ensure_workspace()
+    vectors = fakes.MemoryVectors()
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+    connector = fakes.DictConnector(
+        {"public-vector-document": "public synthetic line"}, name="fenced-vector-source"
+    )
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=vectors,
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await store.staged.wait()
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    lease_clock.advance(301)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-vector-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=300),
+    )
+    assert successor is not None
+    store.release_stage.set()
+
+    report = await task
+
+    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert vectors.rows == {}, "the stale worker wrote vectors after its staged-store await"
+
+
+async def test_takeover_between_failure_annotation_and_upsert_fences_the_status_write(
+    engine: AsyncEngine,
+) -> None:
+    """A valid failure annotation is not authority for a later failed-status upsert."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    class GatedAnnotationStore(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.annotated = asyncio.Event()
+            self.release_annotation = asyncio.Event()
+
+        @override
+        async def annotate(self, document_id: str, updates: Mapping[str, Any]) -> None:
+            await super().annotate(document_id, updates)
+            self.annotated.set()
+            await self.release_annotation.wait()
+
+    store = GatedAnnotationStore()
+    await store.ensure_workspace()
+    connector = fakes.DictConnector(
+        {"public-demotion-document": "replacement line"}, name="fenced-demotion-source"
+    )
+    connector.tokens["public-demotion-document"] = "replacement-token"
+    connector.fail_fetch.add("public-demotion-document")
+    existing = await store.upsert_document(
+        make_document(
+            source=connector.name,
+            source_id="public-demotion-document",
+            status=DocumentStatus.PARSING,
+            media_type=fakes.MEDIA_TYPE,
+            body=b"original line",
+        ).model_copy(update={"version_token": "original-token"})
+    )
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await store.annotated.wait()
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    lease_clock.advance(301)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-demotion-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=300),
+    )
+    assert successor is not None
+    store.release_annotation.set()
+
+    report = await task
+    after = await store.get_document(existing.id)
+
+    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert after is not None
+    assert after.status is DocumentStatus.FETCHING
+    assert "last_ingest_error" in after.metadata
 
 
 async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
