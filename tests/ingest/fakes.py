@@ -1069,6 +1069,21 @@ class ManualClock:
         self.now += seconds
 
 
+class ClockedGatedEmbedder(GatedEmbedder):
+    """A parked embedder that advances virtual time once per completed document batch."""
+
+    def __init__(self, clock: ManualClock, *, seconds_per_document: float = 0.05) -> None:
+        super().__init__()
+        self.clock = clock
+        self.seconds_per_document = seconds_per_document
+
+    @override
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        embedded = await super().embed(texts)
+        self.clock.advance(self.seconds_per_document)
+        return embedded
+
+
 class ExpiringCursorConnector(ObservedConnector):
     """A paginated source whose next cursor expires while its consumer is suspended.
 
@@ -1086,13 +1101,17 @@ class ExpiringCursorConnector(ObservedConnector):
         clock: ManualClock,
         page_size: int,
         cursor_lifetime_seconds: float,
+        response_seconds: float = 0.019,
     ) -> None:
         super().__init__(documents, name="synthetic-cursor-source")
         self.clock = clock
         self.page_size = page_size
         self.cursor_lifetime_seconds = cursor_lifetime_seconds
+        self.response_seconds = response_seconds
         self.cursor_issued = asyncio.Event()
+        self.enumeration_completed = asyncio.Event()
         self.cursors_issued = 0
+        self.pages_requested = 0
 
     @property
     @override
@@ -1107,6 +1126,8 @@ class ExpiringCursorConnector(ObservedConnector):
         del watermark
         source_ids = sorted(self.documents)
         for start in range(0, len(source_ids), self.page_size):
+            self.pages_requested += 1
+            self.clock.advance(self.response_seconds)
             page = source_ids[start : start + self.page_size]
             has_next = start + self.page_size < len(source_ids)
             received_at = self.clock()
@@ -1132,10 +1153,47 @@ class ExpiringCursorConnector(ObservedConnector):
                 held = self.clock() - received_at
                 if held > self.cursor_lifetime_seconds:
                     msg = (
-                        f"a synthetic search cursor was held for {held:.0f}s, longer than its "
-                        f"{self.cursor_lifetime_seconds:.0f}s lifetime"
+                        f"a synthetic search cursor was held for {held:g}s, longer than its "
+                        f"{self.cursor_lifetime_seconds:g}s lifetime"
                     )
                     raise CursorExpiredError(msg)
+        self.enumeration_completed.set()
+
+
+class PausedEnumerationConnector(ObservedConnector):
+    """A source that parks before requesting the record after a durable prefix."""
+
+    def __init__(self, documents: Mapping[str, str], *, pause_after: int) -> None:
+        super().__init__(documents, name="paused-synthetic-source")
+        self.pause_after = pause_after
+        self.paused = asyncio.Event()
+        self.release = asyncio.Event()
+
+    @property
+    @override
+    def watermark(self) -> Watermark:
+        return Watermark(
+            value="paused-position-1",
+            observed_at=datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
+        )
+
+    @override
+    async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+        emitted = 0
+        async for discovered in super().discover(watermark):
+            yield discovered.model_copy(
+                update={
+                    "ref": discovered.ref.model_copy(
+                        update={
+                            "uri": (f"https://source.example.test/documents/{discovered.source_id}")
+                        }
+                    )
+                }
+            )
+            emitted += 1
+            if emitted == self.pause_after:
+                self.paused.set()
+                await self.release.wait()
 
 
 # --- middleware --------------------------------------------------------------------------------

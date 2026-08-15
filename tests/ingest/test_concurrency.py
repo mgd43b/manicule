@@ -297,12 +297,11 @@ BLOCKED_YIELDS = 9
 BLOCKED_BODIES = 6
 
 
-async def test_discovery_stops_pulling_the_source_when_the_stages_are_full() -> None:
-    """Backpressure is a correctness requirement, not a memory optimization.
+async def test_the_legacy_nonjournal_source_still_obeys_the_local_queue_bound() -> None:
+    """Protocol-only stores retain the old bounded fallback.
 
-    A connector that keeps enumerating while nothing drains exhausts its pagination cursors, and
-    a sync then fails partway through for a reason that looks like a connector bug and is
-    missing backpressure (``docs/ingest.md`` §8.3).
+    Production SQLite has the durable journal boundary. In-memory protocol doubles without that
+    optional surface still use direct discovery, and must remain bounded while callers migrate.
 
     **The stop is proven, not timed.** Once the embedder is parked, every stage behind it is
     blocked on a full hand-off, and discovery is inside a ``put`` that cannot return until the
@@ -321,8 +320,7 @@ async def test_discovery_stops_pulling_the_source_when_the_stages_are_full() -> 
         await connector.yielded.acquire()
 
     assert connector.yields == BLOCKED_YIELDS, (
-        "the source was paged further than the stages can hold, so a slow embedder is now an "
-        "unbounded read of the source"
+        "the nonjournal fallback was paged further than its local stages can hold"
     )
 
     embedder.gate.open()
@@ -330,7 +328,7 @@ async def test_discovery_stops_pulling_the_source_when_the_stages_are_full() -> 
 
     assert report.indexed == 40
     assert report.stages.fetch_queue.blocked_puts > 0, (
-        "discovery never once had to wait, so nothing here demonstrated backpressure"
+        "the fallback never reached the configured queue bound"
     )
 
 
@@ -338,23 +336,23 @@ async def test_downstream_backpressure_expires_the_cursor_before_the_next_page()
     """Characterize the coupling that durable source acquisition must remove.
 
     The first page has more records than the bounded stages can hold. Once embedding is parked,
-    discovery is suspended while holding the cursor for page two. Advancing a manual clock past
-    its lifetime and opening the embed gate proves that ordinary downstream backpressure becomes
-    a typed source-enumeration failure. No scheduler timing participates in the result.
+    discovery is suspended while holding the cursor for page two. Opening the embed gate makes
+    each completed document advance a manual clock by 50 ms, proving that ordinary downstream
+    backpressure becomes a typed source-enumeration failure. No scheduler timing participates.
 
     When issue #175's durable journal boundary lands, this test should be extended to prove that
     admission continues independently of indexing and inverted to require a complete run.
     """
     clock = fakes.ManualClock()
-    embedder = fakes.GatedEmbedder()
+    embedder = fakes.ClockedGatedEmbedder(clock, seconds_per_document=0.05)
     pipeline, store, _ = build(
         embedder=embedder, fetch_concurrency=2, parse_workers=1, queue_depth_factor=1
     )
     connector = fakes.ExpiringCursorConnector(
-        corpus(40, prefix="synthetic-doc"),
+        corpus(1_000, prefix="synthetic-doc"),
         clock=clock,
-        page_size=16,
-        cursor_lifetime_seconds=60.0,
+        page_size=100,
+        cursor_lifetime_seconds=0.5,
     )
 
     run = asyncio.create_task(pipeline.run(connector))
@@ -364,14 +362,11 @@ async def test_downstream_backpressure_expires_the_cursor_before_the_next_page()
         await connector.yielded.acquire()
 
     assert connector.yields == BLOCKED_YIELDS
-    clock.advance(61.0)
     embedder.gate.open()
     report = await run
 
     assert report.error_type == "CursorExpiredError"
-    assert report.error_message == (
-        "a synthetic search cursor was held for 61s, longer than its 60s lifetime"
-    )
+    assert "longer than its 0.5s lifetime" in report.error_message
     assert not report.enumeration_completed
     assert not report.watermark_advanced
     assert report.stages.fetch_queue.blocked_puts > 0

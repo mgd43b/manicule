@@ -11,13 +11,11 @@ is a sentinel counted out one per consumer, and a concurrency bound is a gauge t
 comes down. Nothing is inferred from a task set, and nothing depends on the order in which
 tasks happen to be scheduled.
 
-**Backpressure is the reason a hand-off is bounded**, and it is a correctness requirement rather
-than a memory optimization. An unbounded queue turns a slow embedder into unbounded memory
-growth *and* lets discovery race ahead of durable progress until the source's pagination cursors
-expire — a failure that looks like a connector bug and is actually a missing bound
-(``docs/ingest.md`` §8.3, ``docs/connectors/confluence.md`` §2). :attr:`Conveyor.blocked_puts` is
-what makes it observable: it counts the times a producer had to wait, which is the only direct
-evidence that backpressure reached the producer rather than merely being configured.
+**Backpressure is why each local hand-off is bounded.** Discovery itself writes the durable
+acquisition journal before these stages begin, so a slow embedder cannot age its pagination
+cursor. The journal reader can still outrun fetch, and fetch can outrun parse; bounding both is
+what prevents that decoupling from becoming corpus-sized memory. :attr:`Conveyor.blocked_puts`
+makes those local bounds observable (``docs/ingest.md`` §8.3).
 """
 
 from __future__ import annotations
@@ -61,10 +59,9 @@ class QueueReport:
     blocked_puts: int
     """How many times a producer found this hand-off full and had to wait.
 
-    **The direct evidence that backpressure reached the producer.** A bound that is configured
-    and never reached proves nothing; a bound that made somebody wait is the thing the design
-    claims. Zero is a real answer — it means the consumer kept up — and it is why the test for
-    backpressure blocks the consumer on purpose rather than hoping for contention.
+    **Direct evidence that a local producer reached its bound.** A configured bound that never
+    filled proves only its capacity; a blocked put proves the journal reader or fetch worker
+    really waited. Zero is a real answer — it means the consumer kept up.
     """
 
     def as_metadata(self) -> Metadata:

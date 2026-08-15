@@ -736,11 +736,12 @@ is the quantity that actually maps to memory.
 > ever overlapped was **one**. `queue_depth_factor` and `shutdown_grace_s` were configurable and
 > read by nothing. What follows is what the code now does.
 
-**Three stages, joined by two bounded hand-offs.** Every bound below comes from configuration;
-none of it is derived from how many tasks happen to exist.
+**Durable enumeration, then three local stages joined by two bounded hand-offs.** Every bound
+below comes from configuration; none is derived from how many tasks happen to exist.
 
 ```
-discover                                   one task
+discover → acquisition journal             one task; commit before advancing
+   │  bounded sequence-paged reader
    │  fetch hand-off      depth = queue_depth_factor × fetch_concurrency
    ▼
 fetch × fetch_concurrency                  change detection (level 1), then the network
@@ -752,7 +753,8 @@ ingest × (parse_workers + 1)               parse in the pool, chunk, embed unde
 
 | Stage | Width | Where the bound comes from |
 |---|---|---|
-| discover | 1 | One cursor per connector; a second reader of one paginated source is not a thing |
+| discover → journal | 1 | One cursor; each identity commits before the next source record is requested |
+| journal reader | 1 | Sequence-paged reads bounded to the fetch hand-off's capacity |
 | fetch | `fetch_concurrency` (8) | One task per permitted in-flight fetch |
 | parse | at most `parse_workers + 1` attempts | The ingest workers are the only callers of the pool |
 | embed | 1 | `asyncio.Lock` around the model call, and nothing else |
@@ -764,10 +766,9 @@ sits idle behind it for the length of every forward pass. Not `+ 2` or more: pas
 extra workers only queue for the same accelerator, and each one is holding a fetched body in
 memory while it waits.
 
-**Level-1 change detection sits in the fetch stage, not in discovery.** It is what avoids the
-fetch, so it belongs on the same side of the hand-off as the fetch — and it costs a store read,
-which has no business blocking the source being paged. An unchanged corpus therefore moves
-through this stage at the speed of the store and never reaches the parse hand-off at all.
+**Level-1 change detection sits in the fetch stage, after durable discovery.** It is what avoids
+the fetch, so it belongs on the same side of the journal boundary as fetch. An unchanged corpus
+moves through this stage at the speed of the store and never reaches the parse hand-off.
 
 **One document is never in two stages.** The concurrency is between documents. A document's
 record, chunks, glossary and vectors are published under the keyed lock in §8.4 and guarded by
@@ -779,17 +780,18 @@ rather than being fed back to the front of the pipeline. A wide archive is there
 work while the others carry on with other documents, which is simpler than re-entering the
 stages and costs only that one archive's serialization.
 
-### 8.3.1 Backpressure is a bounded hand-off
+### 8.3.1 Durable discovery, then bounded hand-offs
 
-When embed falls behind: the ingest workers block on the embedding lock, the parse hand-off
-fills, the fetch workers block on `put`, the fetch hand-off fills, and **discovery stops pulling
-pages**.
+Discovery does not feed the fetch queue. It appends one validated source record to the
+acquisition journal, waits for that transaction to commit, and only then asks the connector for
+the next record. On true iterator exhaustion it atomically records the completion marker and
+the connector's candidate watermark. A limit, cancellation, cursor/source failure or journal
+admission failure leaves that marker absent.
 
-That last consequence is the point. Unbounded queues turn a slow embedder into unbounded
-memory growth *and* cause a subtler failure: a connector that keeps enumerating will exhaust
-its cursors. Confluence search cursors expire (`confluence.md` §2), so a sync that races ahead
-during a slow embed can fail pagination partway through — a failure that looks like a connector
-bug and is actually missing backpressure.
+Only after enumeration stops does a sequence-paged journal reader feed the local pipeline. When
+embed falls behind, the ingest workers block on the embedding lock, the parse hand-off fills,
+the fetch workers block on `put`, and the journal reader blocks on the fetch hand-off. The source
+cursor is already gone. Slow local work therefore cannot turn into an expired pagination cursor.
 
 **The most a run holds in memory**, with the defaults on a four-core machine — where
 `default_worker_count()` is `min(4, cpu_count - 1)` = 3, so there are four ingest workers:
@@ -803,10 +805,10 @@ bug and is actually missing backpressure.
 this arithmetic or the formula behind it moves, because a documented limit that has quietly
 stopped matching the code is the defect this whole section was.
 
-The fetch hand-off holds `DiscoveredDoc` references rather than bodies, which is why it is the
-cheap one and can be the deeper of the two. **The complete discovery result is never held**, and
-neither is the complete fetched corpus; the run's report carries the observed peak so the claim
-is checkable rather than argued.
+The fetch hand-off holds `DiscoveredDoc` references reconstructed from a bounded journal page,
+which is why it is the cheap one. **The complete discovery result is durable but never loaded
+into memory**, and neither is the complete fetched corpus; the run report carries observed queue
+peaks so the claim is checkable.
 
 **The end-of-stream is not subject to the bound**, and the reason is a deadlock that this
 otherwise has. A stage closes the hand-off in front of it from a `finally`, which is where it
@@ -826,9 +828,8 @@ throughput during a run" is made of, and what makes each bound above checkable f
 one pool and one accelerator for the whole process, so a re-parse sweep running beside a sync is
 counted in `peak_parses` and `peak_embeds` too. Retained bodies belong to the run.
 
-`blocked_puts` on the fetch hand-off is the one number that is direct evidence rather than a
-description: a bound that is configured and never reached proves nothing, and a bound that made
-discovery wait is the claim this section makes.
+`blocked_puts` on the fetch hand-off is direct evidence that the bounded journal reader waited
+for local fetch capacity. It no longer describes source discovery, which has already completed.
 
 ### 8.3.3 Tuning it on a local Apple Silicon machine
 
@@ -1597,32 +1598,27 @@ completed, whether a watermark advanced, whether retry is required, and the type
 reason. This makes an incomplete source walk observable without inferring it from a missing
 watermark or parsing a sentence.
 
-**This needs no new table**, but it does need one column. `connectors.status`, `error_message`,
-`last_synced_at` and `watermark` already exist (`storage.md` §4.7); the per-run counters have
-nowhere to go, because unlike `documents` the `connectors` row has no `metadata` column. Adding
-`metadata JSON NOT NULL DEFAULT '{}'` there — matching the convention `documents` already
-follows — is the smallest thing that works, and it is made in `storage.md` §4.7 as part of this
-change rather than assumed here.
+Two records serve different purposes. `connectors.metadata.last_run` is the overwritten public
+diagnostic summary. `acquisition_runs` and `acquisition_records` are relational correctness
+state: committed source coverage, completion/candidate markers, leases and pending local work.
+They are not inferred from the summary and may outlive the process that created them. Their
+retention is governed by settlement rather than by diagnostic-history policy (`storage.md`
+§4.1).
 
-Resisting a `runs` table is deliberate — run history is diagnostic, not relational, and a table
-that only ever grows needs a retention policy nobody has asked for. Keeping the last run's
-counters on the connector row means they are overwritten rather than accumulated, which is the
-correct retention policy for a diagnostic.
+### 13.2 Enumeration durability and recovery are separate
 
-### 13.2 Resume is a consequence of the design, not a feature
+An interrupted enumeration now leaves an explicit, committed prefix rather than only whatever
+documents happened to publish before the process stopped:
 
-Resumability is already paid for by three decisions made for other reasons:
+1. Each source identity is committed before discovery advances past it.
+2. The completion marker and candidate watermark exist only after true iterator exhaustion.
+3. A crash before that point leaves the run visibly incomplete; a crash after it preserves the
+   complete inventory and candidate.
 
-1. **The watermark advances only on a clean run**, so an interrupted sync re-enumerates from
-   the last good point rather than from the beginning.
-2. **Change detection (§4) makes re-enumeration cheap** — already-ingested documents skip at
-   level 1 without a fetch.
-3. **`documents.status` is the per-document progress marker**, and §6.4's sweep requeues
-   anything caught in flight.
-
-So resume is: run it again. There is no checkpoint file, no resume token, and nothing to
-corrupt. The only cost is re-enumeration, which is exactly the cost the watermark exists to
-bound.
+Claiming an old lease and deciding whether to resume an incomplete enumeration or continue a
+completed run is recovery orchestration, not part of cursor decoupling. A fresh invocation may
+still re-enumerate from the committed connector watermark; change detection makes that safe.
+The durable rows ensure this is an explicit policy choice rather than lost process memory.
 
 **Where the new watermark comes from, which this document did not say.** `Connector.discover`
 *took* a position and nothing returned one, so a pipeline written to the protocol alone could
@@ -1777,14 +1773,14 @@ Calls made in the absence of a stated position.
 | One writer per data directory, by a lock file every writer acquires; readers take nothing | §6.5, §8.6 |
 | Every refusal runs once per run, before discovery, plus a budget/context cross-check | §7 |
 | Embed batch size derived from both fingerprints, not a constant | §8.2 |
-| Bounded queues, so backpressure reaches discovery and cursors do not expire | §8.3 |
+| Commit discovery to a journal before bounded local processing, so local backpressure cannot expire cursors | §8.3 |
 | A failed re-ingest never demotes a working document | §9 |
 | Three re-ingest verbs mapped to ladder rungs; re-parse is first-class | §10 |
 | The corpus-wide re-parse is a flag on the document verb, and command line only | §10.1 |
 | Reconcile: clean-completion-only, a deletion ceiling, soft delete only | §11.1 |
 | The sweep is scheduled and yields to backup and sync | §11.2 |
 | Watch never reconciles; debounce with a post-debounce re-`stat` | §12 |
-| Resume needs no checkpoint; run counters live in `connectors.metadata` | §13 |
+| Enumeration coverage is journaled; recovery/takeover remains separate orchestration | §13 |
 
 Decisions the implementation added, each argued where it appears:
 

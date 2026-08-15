@@ -399,6 +399,7 @@ class AcquisitionStore(Protocol):
         run_id: str,
         *,
         states: Sequence[AcquisitionRecordState] | None = None,
+        after_sequence: int | None = None,
         limit: int = 100,
     ) -> Sequence[AcquisitionRecord]: ...
 

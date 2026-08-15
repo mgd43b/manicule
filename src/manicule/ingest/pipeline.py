@@ -6,12 +6,12 @@ than a promise: there is no batch-level transaction to abort, and no batch-level
 document can corrupt. Every failure this module catches is attributed to a document, recorded,
 and left behind.
 
-**A run is three stages joined by bounded hand-offs**, and every bound comes from configuration
-rather than from how many tasks happen to exist. Discovery fills a hand-off; ``fetch_concurrency``
-fetch workers drain it and fill the next; ``parse_workers + 1`` ingest workers drain that one and
-carry a document the rest of the way. Nothing anywhere gathers a task per document, because a
-task per document is the same thing as no bound at all — see :meth:`IngestPipeline.run` and
-``docs/ingest.md`` §8.3.
+**A durable run enumerates first, then has three local stages joined by bounded hand-offs.** Each
+source identity is committed to the acquisition journal before discovery advances. A bounded
+journal reader then fills the fetch hand-off; ``fetch_concurrency`` fetch workers fill the next;
+and ``parse_workers + 1`` ingest workers carry documents the rest of the way. Nothing gathers a
+task or an in-memory record per document — see :meth:`IngestPipeline.run` and ``docs/ingest.md``
+§8.3.
 
 **What concurrency is not allowed to touch is the write sequence.** One document's record,
 chunks, glossary and vectors are published under the keyed lock in :meth:`IngestPipeline._mutating`
@@ -47,10 +47,13 @@ import asyncio
 import contextlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from uuid import uuid4
 
+from manicule.core.acquisition import AcquisitionSource
 from manicule.core.content import (
     SETTLED,
     Document,
@@ -68,10 +71,11 @@ from manicule.core.errors import (
 )
 from manicule.core.ids import content_hash, document_id
 from manicule.core.provenance import Provenance
+from manicule.core.sources import DiscoveredDoc
 from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
 from manicule.ingest.glossary_lineage import glossary_fingerprint
-from manicule.ingest.ports import GlossaryWriter
+from manicule.ingest.ports import AcquisitionStore, GlossaryWriter
 from manicule.ingest.refusals import require_measured
 from manicule.ingest.stages import Conveyor, CountedLock, Gauge, StageReport
 from manicule.ingest.workers import AttemptResult, default_worker_count
@@ -93,7 +97,7 @@ if TYPE_CHECKING:
     from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
     from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Chunker, Connector, Embedder, VectorStore
-    from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
+    from manicule.core.sources import DocRef, Watermark
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.ports import IngestStore
     from manicule.ingest.workers import ParseRunner
@@ -453,17 +457,24 @@ class _Sync:
     limit: int | None
     watermark: Watermark | None
     refs: Conveyor[DiscoveredDoc]
-    """Discovery to fetch. Carries references, so its depth costs metadata rather than bodies."""
+    """Journal reader to fetch. Carries references, so depth costs metadata rather than bodies."""
 
     bodies: Conveyor[_Fetched]
     """Fetch to ingest. Carries bytes, so its depth is what bounds a run's memory."""
+
+    acquisitions: AcquisitionStore | None = None
+    acquisition_run_id: str = ""
+    lease_owner: str = ""
+    lease_generation: int = 0
+    lease_expires_at: datetime | None = None
+    journal_batch: int = 1
 
     watching: Watching | None = None
     """Where to say what has happened so far, or ``None`` when nobody is watching."""
 
     accepted: int = 0
-    """Top-level documents handed to the fetch stage. What ``--limit`` bounds, counted where
-    the bound is applied rather than derived afterwards from what finished."""
+    """Top-level documents committed by discovery. What ``--limit`` bounds, counted where the
+    bound is applied rather than derived afterwards from what finished."""
 
     bodies_held: Gauge = field(default_factory=lambda: Gauge("bodies"))
     """Fetched bodies in memory: queued, and held by an ingest worker.
@@ -506,6 +517,9 @@ class IngestPipeline:
         parse_fingerprints: Callable[[str], ParseFingerprint | None] = parse_fingerprint,
         glossary: GlossaryWriter | None = None,
         detect_glossary: bool = True,
+        acquisitions: AcquisitionStore | None = None,
+        acquisition_lease_s: float = 300.0,
+        acquisition_clock: Callable[[], datetime] | None = None,
     ) -> None:
         # Second of the two places this is refused, and not a redundant one.
         # `check_before_run` is the once-per-run boundary and is what an operator meets; this
@@ -514,6 +528,9 @@ class IngestPipeline:
         # a stand-in vocabulary must not be able to reach a store at all.
         require_measured(chunk_fingerprint)
         self._store = store
+        self._acquisitions = acquisitions if acquisitions is not None else _acquisition_of(store)
+        self._acquisition_lease_s = max(1.0, acquisition_lease_s)
+        self._acquisition_clock = acquisition_clock or (lambda: datetime.now(UTC))
         self._chunker = chunker
         self._embedder = embedder
         self._vectors = vectors
@@ -634,12 +651,12 @@ class IngestPipeline:
     ) -> RunReport:
         """Ingest everything a connector reports as changed since its watermark.
 
-        **Three stages, joined by two bounded hand-offs, and every bound derived from
-        configuration:**
+        **Durable enumeration, then three bounded local stages:**
 
         .. code-block:: text
 
-            discover
+            discover → committed acquisition journal
+               │  bounded journal reader
                │  fetch hand-off, depth = queue_depth_factor x fetch_concurrency
                ▼
             fetch x fetch_concurrency          change detection, then the network
@@ -648,23 +665,22 @@ class IngestPipeline:
             ingest x (parse_workers + 1)       parse in the pool, chunk, embed under
                                                one lock, commit under the document's
 
-        Discovery is the only stage with nothing in front of it, so it is where backpressure
-        has to arrive. It does: putting a document into a full hand-off waits, and every stage
-        downstream propagates that wait upward, so a slow embedder eventually stops the source
-        being paged. That is a correctness requirement rather than a memory one — a connector
-        that races ahead of durable progress exhausts its pagination cursors and fails a sync
-        that had nothing wrong with it (``docs/ingest.md`` §8.3).
+        Discovery acknowledges one identity only after its journal transaction commits. Local
+        fetching, parsing and embedding begin after enumeration, so their backpressure cannot
+        age a live source cursor. The journal reader and both local hand-offs remain bounded, so
+        decoupling cursor lifetime does not turn into corpus-sized memory (``docs/ingest.md``
+        §8.3).
 
         **What the concurrency does not change.** Each document still travels the same path it
         did one at a time, and the per-document lock still spans its record, chunks, glossary
         and vectors. Two documents may be in the ingest stage at once; one document is never in
         two places.
 
-        **``limit`` bounds acceptance, not completion.** Discovery stops after handing ``limit``
-        top-level documents downstream, and everything already accepted is carried to a terminal
-        outcome before this returns. Members found inside a container do not count against it —
-        one archive of five hundred files must not exhaust a limit of ten. A run stopped this
-        way is *bounded*: no error, and no watermark.
+        **``limit`` bounds acceptance, not completion.** Discovery stops after committing
+        ``limit`` top-level journal records, and everything already accepted is carried to a
+        terminal outcome before this returns. Members found inside a container do not count
+        against it — one archive of five hundred files must not exhaust a limit of ten. A run
+        stopped this way is *bounded*: no error, no completion marker, and no watermark.
 
         **Cancellation.** ``Ctrl-C`` stops discovery, gives what is already accepted
         ``shutdown_grace_s`` to reach a terminal outcome, then cancels the stages and re-raises.
@@ -680,15 +696,41 @@ class IngestPipeline:
                 ingest worker, so it must not block and must not raise — the one implementation
                 appends to a list. ``None`` is the ordinary case and costs a branch per document.
         """
+        acquisition_run_id = ""
+        lease_owner = ""
+        lease_generation = 0
+        lease_expires_at: datetime | None = None
+        watermark = await self._store.get_watermark(connector.name)
+        if self._acquisitions is not None:
+            acquisition_run_id = uuid4().hex
+            lease_owner = f"pipeline:{acquisition_run_id}"
+            created = await self._acquisitions.create_acquisition_run(
+                acquisition_run_id, connector.name
+            )
+            watermark = created.base_watermark
+            now = self._acquisition_clock()
+            claimed = await self._acquisitions.claim_acquisition_run(
+                acquisition_run_id,
+                lease_owner,
+                now=now,
+                expires_at=now + timedelta(seconds=self._acquisition_lease_s),
+            )
+            if claimed is None:
+                msg = f"new acquisition run {acquisition_run_id!r} could not be claimed"
+                raise RuntimeError(msg)
+            lease_generation = claimed.lease_generation
+            lease_expires_at = claimed.lease_expires_at
+
+        ref_capacity = self._queue_depth_factor * self._fetch_workers
         run = _Sync(
             connector=connector,
             report=RunReport(connector=connector.name),
             limit=limit,
             watching=watching,
-            watermark=await self._store.get_watermark(connector.name),
+            watermark=watermark,
             refs=Conveyor(
                 name="fetch",
-                capacity=self._queue_depth_factor * self._fetch_workers,
+                capacity=ref_capacity,
                 consumers=self._fetch_workers,
             ),
             bodies=Conveyor(
@@ -697,6 +739,12 @@ class IngestPipeline:
                 consumers=self._ingest_workers,
                 producers=self._fetch_workers,
             ),
+            acquisitions=self._acquisitions,
+            acquisition_run_id=acquisition_run_id,
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+            lease_expires_at=lease_expires_at,
+            journal_batch=ref_capacity,
         )
         # Peaks only. The active counts belong to whoever is inside the stage right now, and a
         # second operation sharing this pipeline is one of them.
@@ -752,16 +800,22 @@ class IngestPipeline:
         everything a document can do is already an outcome by the time it reaches here, so what
         is left to raise is the store or a defect, and neither is survivable by carrying on.
         """
+        if run.acquisitions is not None:
+            await self._enumerate_to_journal(run)
+            producer = self._journal_into
+        else:
+            producer = self._discover_into
+
         refs, bodies = run.refs, run.bodies
         async with asyncio.TaskGroup() as stages:
-            stages.create_task(self._discover_into(run, refs), name="discover")
+            stages.create_task(producer(run, refs), name="discover")
             for worker in range(self._fetch_workers):
                 stages.create_task(self._fetch_into(run, refs, bodies), name=f"fetch-{worker}")
             for worker in range(self._ingest_workers):
                 stages.create_task(self._ingest_from(run, bodies), name=f"ingest-{worker}")
 
     async def _discover_into(self, run: _Sync, refs: Conveyor[DiscoveredDoc]) -> None:
-        """Pull the source, hand each document to the fetch stage, and stop when told to.
+        """Legacy in-memory discovery for stores without an acquisition journal.
 
         The three ways it ends are all recorded, because each means something different to the
         watermark: exhausted (may advance), stopped at ``limit`` (bounded, may not), and raised
@@ -792,6 +846,110 @@ class IngestPipeline:
                 await closer()
             # However discovery ended, the stage in front of it has to be told, or every fetch
             # worker waits for an item that is never coming and the run never returns.
+            refs.finish()
+
+    async def _enumerate_to_journal(self, run: _Sync) -> None:
+        """Commit each source record before asking discovery for the next one.
+
+        There is intentionally no downstream hand-off in this loop. The connector can be
+        delayed only by its own work, journal admission, or lease maintenance; parsing and
+        embedding do not start until the source iterator has ended and its completion marker is
+        durable.
+        """
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - caller selects this path structurally
+            return
+        stream = run.connector.discover(run.watermark)
+        run.report.enumeration_completed = False
+        try:
+            async for discovered in stream:
+                if run.stop.is_set():
+                    break
+                now = self._acquisition_clock()
+                await self._keep_acquisition_lease_live(run, acquisitions, now)
+                appended = await acquisitions.append_acquisition_record(
+                    run.acquisition_run_id,
+                    run.accepted,
+                    AcquisitionSource.from_discovered(discovered),
+                    lease_owner=run.lease_owner,
+                    lease_generation=run.lease_generation,
+                    now=now,
+                )
+                if appended.sequence != run.accepted:
+                    continue
+                run.accepted += 1
+                if run.limit is not None and run.accepted >= run.limit:
+                    run.report.limited = True
+                    break
+            else:
+                now = self._acquisition_clock()
+                await self._keep_acquisition_lease_live(run, acquisitions, now)
+                await acquisitions.complete_acquisition_enumeration(
+                    run.acquisition_run_id,
+                    run.connector.watermark,
+                    lease_owner=run.lease_owner,
+                    lease_generation=run.lease_generation,
+                    now=now,
+                )
+                run.report.enumeration_completed = True
+        except Exception as exc:  # noqa: BLE001 - an enumeration/admission failure is reported
+            run.report.error_type = type(exc).__name__
+            run.report.error_message = str(exc)
+            run.report.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            closer = getattr(stream, "aclose", None)
+            if closer is not None:
+                await closer()
+
+    async def _keep_acquisition_lease_live(
+        self, run: _Sync, acquisitions: AcquisitionStore, now: datetime
+    ) -> None:
+        """Renew near expiry; every following journal mutation is generation-fenced."""
+        renewal_margin = timedelta(seconds=self._acquisition_lease_s / 3)
+        if run.lease_expires_at is not None and now + renewal_margin < run.lease_expires_at:
+            return
+        expires_at = now + timedelta(seconds=self._acquisition_lease_s)
+        renewed = await acquisitions.renew_acquisition_lease(
+            run.acquisition_run_id,
+            run.lease_owner,
+            run.lease_generation,
+            now=now,
+            expires_at=expires_at,
+        )
+        if not renewed:
+            _raise_lost_acquisition_lease(run.acquisition_run_id)
+        run.lease_expires_at = expires_at
+
+    async def _journal_into(self, run: _Sync, refs: Conveyor[DiscoveredDoc]) -> None:
+        """Feed a bounded hand-off from committed journal pages in discovery order."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - caller selects this path structurally
+            refs.finish()
+            return
+        after: int | None = None
+        try:
+            while True:
+                records = await acquisitions.list_acquisition_records(
+                    run.acquisition_run_id,
+                    after_sequence=after,
+                    limit=run.journal_batch,
+                )
+                if not records:
+                    return
+                for record in records:
+                    source = record.source
+                    await refs.put(
+                        DiscoveredDoc(
+                            ref=source.ref,
+                            version_token=source.version_token,
+                            title=source.title,
+                            media_type=source.media_type,
+                            size_bytes=source.size_bytes,
+                            metadata=source.metadata,
+                        )
+                    )
+                after = records[-1].sequence
+        finally:
             refs.finish()
 
     async def _fetch_into(
@@ -2236,6 +2394,16 @@ def _writer_of(store: object) -> GlossaryWriter | None:
     workspace, so taking the writer from it makes the two agree by construction.
     """
     return store if isinstance(store, GlossaryWriter) else None
+
+
+def _acquisition_of(store: object) -> AcquisitionStore | None:
+    """The store itself when it implements the durable source journal."""
+    return store if isinstance(store, AcquisitionStore) else None
+
+
+def _raise_lost_acquisition_lease(run_id: str) -> None:
+    msg = f"acquisition lease for run {run_id!r} was lost"
+    raise RuntimeError(msg)
 
 
 def _with_status(document: Document, result: ChainResult) -> Document:

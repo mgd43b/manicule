@@ -788,6 +788,232 @@ async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(
     await vectors.teardown()
 
 
+async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(
+    store: SqliteDocStore,
+) -> None:
+    """A 1,000-record source reaches its true end while embedding is still parked.
+
+    Ten synthetic page responses each take 19 ms on a manual clock, below the 500 ms cursor
+    lifetime. Journal pages and both in-memory hand-offs are smaller than the corpus. The model
+    gate proves indexing has not drained anything to make enumeration succeed.
+    """
+    clock = fakes.ManualClock()
+    embedder = fakes.ClockedGatedEmbedder(clock, seconds_per_document=0.05)
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        chunker=chunker,
+        embedder=embedder,
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        fetch_concurrency=2,
+        parse_workers=1,
+        queue_depth_factor=1,
+        detect_glossary=False,
+    )
+    connector = fakes.ExpiringCursorConnector(
+        {
+            f"synthetic-doc-{number:04d}": f"public synthetic line {number}"
+            for number in range(1_000)
+        },
+        clock=clock,
+        page_size=100,
+        cursor_lifetime_seconds=0.5,
+        response_seconds=0.019,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await connector.enumeration_completed.wait()
+    await embedder.gate.wait_for(1)
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.discovered_count == 1_000
+    assert durable.enumeration_completed_at is not None
+    assert durable.candidate_watermark == connector.watermark
+    assert connector.pages_requested == 10
+    assert clock.now == pytest.approx(0.19)
+    assert len(await store.list_acquisition_records(durable.id, limit=3)) == 3
+
+    embedder.gate.open()
+    report = await task
+    indexed = {source_id async for source_id in store.known_source_ids(connector.name)}
+
+    assert report.error_type == ""
+    assert report.enumeration_completed
+    assert report.indexed == 1_000
+    assert len(indexed) == 1_000
+    assert report.watermark_advanced
+    assert await store.get_watermark(connector.name) == connector.watermark
+    assert report.stages.fetch_queue.capacity == 2
+    assert report.stages.fetch_queue.peak_depth <= 2
+    assert report.stages.parse_queue.peak_depth <= report.stages.parse_queue.capacity
+
+
+async def test_crash_during_enumeration_keeps_only_the_committed_prefix(
+    store: SqliteDocStore,
+) -> None:
+    connector = fakes.PausedEnumerationConnector(
+        {f"public-doc-{number}": f"line {number}" for number in range(10)},
+        pause_after=3,
+    )
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await connector.paused.wait()
+    task.cancel()
+    connector.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.discovered_count == 3
+    assert durable.enumeration_completed_at is None
+    assert durable.candidate_watermark is None
+    assert len(await store.list_acquisition_records(durable.id)) == 3
+    assert await store.get_watermark(connector.name) is None
+
+
+async def test_crash_after_enumeration_preserves_the_marker_records_and_candidate(
+    store: SqliteDocStore,
+) -> None:
+    clock = fakes.ManualClock()
+    connector = fakes.ExpiringCursorConnector(
+        {f"public-doc-{number}": f"line {number}" for number in range(10)},
+        clock=clock,
+        page_size=5,
+        cursor_lifetime_seconds=0.5,
+    )
+    embedder = fakes.GatedEmbedder()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        chunker=chunker,
+        embedder=embedder,
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await connector.enumeration_completed.wait()
+    await embedder.gate.wait_for(1)
+    task.cancel()
+    embedder.gate.open()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.discovered_count == 10
+    assert durable.enumeration_completed_at is not None
+    assert durable.candidate_watermark == connector.watermark
+    assert len(await store.list_acquisition_records(durable.id)) == 10
+    assert await store.get_watermark(connector.name) is None
+
+
+async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
+    store: SqliteDocStore,
+) -> None:
+    class DuplicateSource(fakes.DictConnector):
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return Watermark(value="duplicate-position", observed_at=datetime.now(UTC))
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            async for discovered in super().discover(watermark):
+                durable = discovered.model_copy(
+                    update={
+                        "ref": discovered.ref.model_copy(
+                            update={
+                                "uri": (
+                                    f"https://source.example.test/documents/{discovered.source_id}"
+                                )
+                            }
+                        )
+                    }
+                )
+                yield durable
+                if durable.source_id == "public-a":
+                    yield durable
+
+    connector = DuplicateSource({"public-a": "alpha", "public-b": "beta"})
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+
+    report = await pipeline.run(connector)
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert report.indexed == 2
+    assert durable is not None
+    assert durable.discovered_count == 2
+    records = await store.list_acquisition_records(durable.id)
+    assert [record.source.source_id for record in records] == ["public-a", "public-b"]
+
+
+async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
+    store: SqliteDocStore,
+) -> None:
+    connector = fakes.PausedEnumerationConnector(
+        {f"public-doc-{number}": f"line {number}" for number in range(10)},
+        pause_after=9,
+    )
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+
+    report = await pipeline.run(connector, limit=3)
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert report.limited
+    assert not report.enumeration_completed
+    assert report.indexed == 3
+    assert durable is not None
+    assert durable.discovered_count == 3
+    assert durable.enumeration_completed_at is None
+    assert durable.candidate_watermark is None
+    assert await store.get_watermark(connector.name) is None
+
+
 async def test_a_re_parse_reads_retained_bytes_rather_than_the_network(
     store: SqliteDocStore,
     data_dir: Path,

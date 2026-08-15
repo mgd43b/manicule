@@ -551,9 +551,8 @@ class IngestSettings(Section):
         default=2,
         ge=1,
         description="Bounded queue depth, as a multiple of the consumer's parallelism. "
-        "Bounded so that backpressure reaches discovery: an unbounded queue turns a slow "
-        "embedder into unbounded memory growth *and* lets a connector race ahead until its "
-        "pagination cursors expire.",
+        "Discovery is already durable and cursor-decoupled; this bounds how far the journal "
+        "reader and fetch workers may run ahead of local parsing and embedding.",
     )
     stale_after_s: float = Field(
         default=3600.0,

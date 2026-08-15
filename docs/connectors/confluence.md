@@ -383,20 +383,20 @@ requests carrying two. It scales with the configuration instead of with the acco
   sends the source a query nobody wrote, which is the same bug mirrored. So `+` is data in
   `cursor` and a space everywhere else, and the round trip is: decode without form rules for
   the cursor, and let the HTTP client percent-encode it back to `%2B` on the way out.
-- **Cursors expire.** A consumer that stalls mid-enumeration — a slow embed, a paused
-  pipeline — resumes onto a cursor the server has forgotten, and a forgotten cursor can be
-  answered with a fresh first page rather than an error, which enumerates the start of a space
+- **Cursors expire.** A consumer that stalls mid-enumeration — source throttling, journal
+  admission, or a paused process — resumes onto a cursor the server has forgotten, and a
+  forgotten cursor can be answered with a fresh first page rather than an error, which
+  enumerates the start of a space
   twice and its end never. A cursor held longer than `cursor_lifetime_seconds` (default 300)
   is refused **before the request is sent**, so the run fails legibly and is re-run against an
   unadvanced watermark. A `next` link addressing a cursor already followed is refused for the
   same reason: a loop over a paginated search reads as a very large space.
 
-  **The pipeline's side of this is the bound on how far ahead of durable progress a cursor may
-  be held.** Discovery blocks on a full hand-off rather than paging on, so the gap between the
-  last page requested and the last document committed is at most the configured queue depths
-  (`ingest.md` §8.3.1) rather than however fast the source answers. That is the whole reason
-  the hand-offs are bounded, and it is why a slow embedder produces a slow sync here rather
-  than a refused cursor partway through one.
+  **The pipeline's side is a durable boundary, not downstream backpressure.** Every discovered
+  identity commits to the acquisition journal before the connector is advanced, and local
+  fetch/parse/embed work starts from that journal after enumeration. A slow embedder therefore
+  cannot hold a live cursor at all (`ingest.md` §8.3.1); source and journal delays still can,
+  which is why the typed expiry guard remains.
 
 **`_links.next` is resolved against `_links.base` by concatenation, and the origin is
 checked.** An instance served from a context path (`/confluence`) has that path in `base` and

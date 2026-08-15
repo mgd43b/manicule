@@ -261,7 +261,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     )
                 )
             ).scalar_one()
-            if row.sequence != sequence or cast("Any", row.source_record) != source_json:
+            if cast("Any", row.source_record) != source_json:
                 msg = f"source identity {source.source_id!r} was rediscovered with different data"
                 raise AcquisitionConflictError(msg)
             if inserted.rowcount:
@@ -447,8 +447,13 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         run_id: str,
         *,
         states: Sequence[AcquisitionRecordState] | None = None,
+        after_sequence: int | None = None,
         limit: int = 100,
     ) -> Sequence[AcquisitionRecord]:
+        """Read a bounded sequence page without accumulating a run in memory."""
+        if after_sequence is not None and after_sequence < 0:
+            msg = "after_sequence must not be negative"
+            raise ValueError(msg)
         async with self._sessions() as session:
             await self._required_run_row(session, run_id)
             statement = select(models.AcquisitionRecord).where(
@@ -457,6 +462,8 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             )
             if states:
                 statement = statement.where(models.AcquisitionRecord.state.in_(states))
+            if after_sequence is not None:
+                statement = statement.where(models.AcquisitionRecord.sequence > after_sequence)
             rows = (
                 await session.execute(
                     statement.order_by(models.AcquisitionRecord.sequence).limit(limit)
