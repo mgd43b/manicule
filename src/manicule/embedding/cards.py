@@ -15,6 +15,7 @@ belongs to the model; the artifact is an implementation detail of running it
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
@@ -75,11 +76,15 @@ class ModelCard(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     model_id: str = Field(min_length=1)
+    source_ref: str = Field(
+        min_length=1,
+        description="Internal repository id or local load path. Local paths never enter the "
+        "public embedding fingerprint; model_id carries their content descriptor instead.",
+    )
     revision: str | None = Field(
         default=None,
-        description="The resolved commit, so weights cannot change under a corpus without "
-        "the fingerprint changing. ``None`` only for a model loaded from a local directory, "
-        "which has no commit to pin.",
+        description="The resolved hub commit or local declaration/tokenizer digest, so model "
+        "inputs cannot change under a corpus without the fingerprint changing.",
     )
     architecture: str = Field(
         min_length=1,
@@ -102,7 +107,9 @@ class ModelCard(BaseModel):
     )
     path: Path = Field(description="Local directory holding the declaration files.")
 
-    def fingerprint(self, *, backend: str, weights_ref: str = "") -> EmbedFingerprint:
+    def fingerprint(
+        self, *, backend: str, weights_ref: str = "", weights_identity: str = ""
+    ) -> EmbedFingerprint:
         """The identity every vector this model produces is written against.
 
         ``normalized`` is always ``True``: normalization is applied in
@@ -118,6 +125,7 @@ class ModelCard(BaseModel):
             max_sequence_length=self.max_sequence_length,
             backend=backend,
             weights_ref=weights_ref,
+            weights_identity=weights_identity,
         )
 
 
@@ -152,13 +160,19 @@ def read_card(
     specials = tokenizer.special_token_count()
     usable = _resolve_length(model_id, path, config, specials, max_sequence_length_override)
 
+    public_model_id = (
+        f"local-model:{resolved}"
+        if Path(model_id).expanduser().is_dir() and resolved is not None
+        else model_id
+    )
     return ModelCard(
-        model_id=model_id,
+        model_id=public_model_id,
+        source_ref=model_id,
         revision=resolved,
         architecture=str(config.get("model_type") or "unknown"),
         dimension=dimension,
         pooling=pooling,
-        tokenizer_id=model_id,
+        tokenizer_id=public_model_id,
         max_sequence_length=usable,
         special_token_count=specials,
         path=path,
@@ -214,12 +228,18 @@ def _padding(card: ModelCard, tokenizer: FastTokenizer) -> tuple[int, str]:
 def _fetch(model_id: str, revision: str | None) -> tuple[Path, str | None]:
     """The declaration files on local disk, and the commit they came from.
 
-    A local directory is accepted and records no revision: there is no commit to pin, and
-    inventing one would be a fingerprint claiming a guarantee it does not have.
+    A local directory is accepted only without a revision claim and records a digest over
+    every declaration/tokenizer input this module can read.
     """
     local = Path(model_id).expanduser()
     if local.is_dir():
-        return local, revision
+        if revision is not None:
+            raise ConfigError(
+                f"embedding.model {model_id!r} is a local directory, so `embedding.revision` "
+                "cannot identify it. Remove the revision; local model inputs are identified "
+                "by their content digest."
+            )
+        return local, f"local-sha256:{_local_card_digest(local)}"
 
     from manicule.embedding.runtimes.hub import snapshot  # noqa: PLC0415 - kept out of import time
 
@@ -228,6 +248,22 @@ def _fetch(model_id: str, revision: str | None) -> tuple[Path, str | None]:
     # the resolved commit — available without a second network call, and available offline.
     resolved = path.name if path.parent.name == "snapshots" else revision
     return path, resolved
+
+
+def _local_card_digest(path: Path) -> str:
+    """Digest every local file that can affect card resolution or tokenization."""
+    files = sorted(item for relative in CARD_FILES if (item := path / relative).is_file())
+    digest = hashlib.sha256()
+    for item in files:
+        name = item.relative_to(path).as_posix().encode()
+        digest.update(len(name).to_bytes(8, "big"))
+        digest.update(name)
+        file_digest = hashlib.sha256()
+        with item.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                file_digest.update(block)
+        digest.update(file_digest.digest())
+    return digest.hexdigest()
 
 
 def _resolve_pooling(

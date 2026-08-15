@@ -92,6 +92,8 @@ bounded because all twenty-four of them is a paragraph, and the sentence that sa
 was being lost inside it.
 """
 
+_IMMUTABLE_COMMIT_LENGTH = 40
+
 _COUNT_PAGE = 500
 """How many documents a counting or sweeping walk reads per round trip.
 
@@ -1314,6 +1316,8 @@ class ApplicationService:
             # one is for a person deciding whether this is the model they meant, the other is
             # the string a re-embed compares and must not be prettied.
             embed_fingerprint=fingerprints.embed.canonical() if fingerprints.embed else None,
+            weights_ref=fingerprints.embed.weights_ref if fingerprints.embed else None,
+            weights_identity=fingerprints.embed.weights_identity if fingerprints.embed else None,
             chunk_fingerprint=fingerprints.chunk.canonical() if fingerprints.chunk else None,
             # The fourth stage, reported beside the other three. There is no corpus-wide
             # committed value to read out of `index_state` for this one — detection is compared
@@ -2660,14 +2664,75 @@ class ApplicationService:
 
     def _weights_plan(self, provider: str | None) -> WeightsPlan | None:
         """The artifact the configured backend will load, or ``None`` with no embedding extra."""
-        from manicule.embedding.artifacts import planned_weights  # noqa: PLC0415 - an extra
+        from manicule.embedding.artifacts import (  # noqa: PLC0415 - an extra
+            WeightsPlan,
+            builtin_model_revision,
+            planned_weights,
+        )
+        from manicule.embedding.cards import CARD_FILES  # noqa: PLC0415 - an extra
+        from manicule.embedding.config import (  # noqa: PLC0415 - an extra
+            EmbedderConfig,
+            MlxEmbedderConfig,
+        )
+        from manicule.embedding.runtimes.hub import (  # noqa: PLC0415 - an extra
+            cached_revision,
+        )
 
         settings = self.settings
         chosen = provider or settings.embedding.provider
+        model = settings.embedding.model
+        configured_model_revision = settings.embedding.revision
+        model_revision = configured_model_revision or builtin_model_revision(model)
+        if Path(model).expanduser().is_dir() and model_revision is not None:
+            error = (
+                f"embedding.model {model!r} is local, so embedding.revision cannot identify "
+                "it. Remove the revision; local inputs use a content digest."
+            )
+            return WeightsPlan(
+                provider=chosen,
+                repo=model,
+                patterns=(),
+                present=False,
+                error=error,
+            )
+        weights = ""
         try:
-            return planned_weights(chosen, settings.embedding.model)
+            raw = settings.component_config("embedder", chosen)
+            if chosen == "mlx":
+                config = MlxEmbedderConfig.model_validate(raw)
+            elif chosen == "onnx":
+                config = EmbedderConfig.model_validate(raw)
+            else:
+                return planned_weights(chosen, model, model_revision=model_revision)
+            weights = config.weights
+            revision = config.weights_revision
+            if (
+                not Path(model).expanduser().is_dir()
+                and builtin_model_revision(model) is None
+                and not (
+                    model_revision
+                    and len(model_revision) == _IMMUTABLE_COMMIT_LENGTH
+                    and all(character in "0123456789abcdef" for character in model_revision)
+                )
+            ):
+                model_revision = cached_revision(model, CARD_FILES, model_revision)
+            return planned_weights(
+                chosen,
+                model,
+                model_revision=model_revision,
+                override=weights,
+                revision=revision,
+            )
         except ImportError:
             return None
+        except (ConfigError, ValidationError) as exc:
+            return WeightsPlan(
+                provider=chosen,
+                repo=weights or settings.embedding.model,
+                patterns=(),
+                present=False,
+                error=str(exc),
+            )
 
     def _inspect_models(self, *, provider: str | None) -> r.Check:
         """The blocking half of :meth:`_model_check`: one cache probe, off the event loop."""
@@ -4634,12 +4699,32 @@ def _weights_check(plan: WeightsPlan | None) -> r.Check:
             # advice for a distribution nobody installs that way — this is a checkout and uv.
             remedy="uv sync --all-extras",
         )
+    if plan.error:
+        return r.Check(
+            name="models",
+            state="failing",
+            detail=f"the configured embedding artifact is invalid: {plan.error}",
+            facts={
+                "repo": plan.repo,
+                "provider": plan.provider,
+                "present": False,
+                "configuration_valid": False,
+            },
+            remedy=plan.error,
+        )
     if plan.present:
         return r.Check(
             name="models",
             state="ok",
             detail=f"{plan.repo} is on this machine; no download is pending",
-            facts={"repo": plan.repo, "provider": plan.provider, "present": True},
+            facts={
+                "repo": plan.repo,
+                "provider": plan.provider,
+                "present": True,
+                "card_present": plan.card_present,
+                "revision": plan.revision,
+                "ref": plan.ref,
+            },
         )
     # Named per backend rather than as one line for both. `--full --mlx` fetches the parity
     # model, the ONNX export and the MLX conversion — about 3.6 GB to seed a backend that
@@ -4666,8 +4751,11 @@ def _weights_check(plan: WeightsPlan | None) -> r.Check:
                 "repo": plan.repo,
                 "provider": plan.provider,
                 "present": False,
+                "card_present": plan.card_present,
                 "offline_env": offline_env,
                 "offline_env_set": True,
+                "revision": plan.revision,
+                "ref": plan.ref,
             },
             remedy=seed,
         )
@@ -4683,7 +4771,10 @@ def _weights_check(plan: WeightsPlan | None) -> r.Check:
             "repo": plan.repo,
             "provider": plan.provider,
             "present": False,
+            "card_present": plan.card_present,
             "size": plan.size,
+            "revision": plan.revision,
+            "ref": plan.ref,
         },
         remedy=seed,
     )

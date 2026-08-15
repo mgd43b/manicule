@@ -1301,6 +1301,14 @@ class IndexStatus(Payload):
         description="The index's committed embedding identity, canonically. ``None`` means "
         "the index has committed to nothing and will accept whatever the first ingest brings.",
     )
+    weights_ref: str | None = Field(
+        default=None,
+        description="Exact hub commit or local digest whose bytes produced stored vectors.",
+    )
+    weights_identity: str | None = Field(
+        default=None,
+        description="Artifact compatibility identity; shared only by a qualified backend pair.",
+    )
     chunk_fingerprint: str | None = None
     glossary: str = Field(
         default="",

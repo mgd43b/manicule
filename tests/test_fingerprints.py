@@ -53,6 +53,14 @@ def test_two_different_models_of_the_same_size_do_not_match() -> None:
         built_with.require_match(offered)
 
 
+def test_different_executed_weight_artifacts_refuse_reuse() -> None:
+    old = embed(weights_identity="artifact:onnx:hf:acme/model@" + "1" * 40)
+    new = embed(weights_identity="artifact:onnx:hf:acme/model@" + "2" * 40)
+
+    with pytest.raises(FingerprintMismatchError, match="weights_identity"):
+        old.require_match(new)
+
+
 @pytest.mark.parametrize(
     "difference",
     [

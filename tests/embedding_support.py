@@ -71,19 +71,26 @@ FULL_MODEL: Final = "BAAI/bge-m3"
 
 def model_available(model_id: str) -> bool:
     """Whether a model's declaration is on local disk, without touching the network."""
-    return _cached(model_id, ("config.json", "tokenizer.json"))
+    from manicule.embedding.artifacts import builtin_model_revision  # noqa: PLC0415
+
+    return _cached(model_id, ("config.json", "tokenizer.json"), builtin_model_revision(model_id))
 
 
 def mlx_weights_available(model_id: str) -> bool:
     """Whether the MLX weights for ``model_id`` are cached."""
-    from manicule.embedding.artifacts import mlx_repo  # noqa: PLC0415 - an embeddings extra
+    from manicule.embedding.artifacts import (  # noqa: PLC0415 - an embeddings extra
+        builtin_revision,
+        mlx_repo,
+    )
 
-    return _cached(mlx_repo(model_id), ("*.safetensors",))
+    return _cached(mlx_repo(model_id), ("*.safetensors",), builtin_revision(model_id, "mlx"))
 
 
 def onnx_weights_available(model_id: str) -> bool:
     """Whether the ONNX export for ``model_id`` is cached."""
-    return _cached(model_id, ("onnx/model.onnx",))
+    from manicule.embedding.artifacts import builtin_revision  # noqa: PLC0415
+
+    return _cached(model_id, ("onnx/model.onnx",), builtin_revision(model_id, "onnx"))
 
 
 def is_required(model_id: str) -> bool:
@@ -182,11 +189,13 @@ def requires_metal_allocator() -> None:
     )
 
 
-def _cached(repo: str, patterns: tuple[str, ...]) -> bool:
+def _cached(repo: str, patterns: tuple[str, ...], revision: str | None = None) -> bool:
     from huggingface_hub import snapshot_download  # noqa: PLC0415 - an embeddings extra
 
     try:
-        snapshot_download(repo, allow_patterns=list(patterns), local_files_only=True)
+        snapshot_download(
+            repo, revision=revision, allow_patterns=list(patterns), local_files_only=True
+        )
     except Exception:  # noqa: BLE001 - hub raises several unrelated types for "not cached"
         return False
     return True

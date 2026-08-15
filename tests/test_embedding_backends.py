@@ -122,7 +122,9 @@ async def embedder_for(
     if cached is not None and cache_entries is None:
         return cached
 
-    card = read_card(model_id)
+    from manicule.embedding.artifacts import builtin_model_revision  # noqa: PLC0415
+
+    card = read_card(model_id, revision=builtin_model_revision(model_id))
     entries = DEFAULT_CACHE_ENTRIES if cache_entries is None else cache_entries
     if backend == "mlx":
         from manicule.embedding.runtimes.mlx_backend import MlxEmbedder  # noqa: PLC0415
@@ -347,7 +349,9 @@ async def test_bge_m3_is_the_model_the_design_settled_on() -> None:
     position ids start above the padding index.
     """
     require_model(FULL_MODEL)
-    card = read_card(FULL_MODEL)
+    from manicule.embedding.artifacts import builtin_model_revision  # noqa: PLC0415
+
+    card = read_card(FULL_MODEL, revision=builtin_model_revision(FULL_MODEL))
 
     assert card.dimension == 1024
     assert card.pooling is Pooling.CLS
@@ -366,7 +370,11 @@ async def test_the_chunk_budget_fits_this_model_sixteen_times_over() -> None:
     """The interaction ``parsing.md`` §1.1 refuses on, from the number this ticket supplies."""
     require_model(FULL_MODEL)
 
-    assert read_card(FULL_MODEL).max_sequence_length > 512
+    from manicule.embedding.artifacts import builtin_model_revision  # noqa: PLC0415
+
+    assert (
+        read_card(FULL_MODEL, revision=builtin_model_revision(FULL_MODEL)).max_sequence_length > 512
+    )
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

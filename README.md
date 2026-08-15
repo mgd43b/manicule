@@ -92,6 +92,15 @@ To take that wait deliberately, before you have a corpus to be impatient about:
 uv run tools/prefetch_embedding_models.py --backend mlx    # or --backend onnx
 ```
 
+Weights are pinned as part of vector identity, not merely downloaded by model name. The exact
+executed hub commit (or a digest for local weights) is recorded with the index. Only the
+built-in ONNX/MLX artifact pairs covered by the parity suite are portable across backends;
+custom remote weights must set an immutable `weights_revision`, and changing any artifact
+requires `reindex --re-embed` rather than reusing incomparable vectors.
+Local model card/tokenizer inputs are content-addressed too, including when weights are separate;
+local `embedding.revision` claims are rejected.
+The MCP `index_status` result exposes the exact `weights_ref` and its compatibility identity.
+
 **`ask` additionally needs a generator**, where `search` needs only the embedder. The default
 configuration expects [Ollama](https://ollama.com) on `localhost:11434` serving `qwen2.5:14b`:
 
