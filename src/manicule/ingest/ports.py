@@ -84,6 +84,16 @@ class IngestStore(Protocol):
         """Record physical vector ids before they are written, for crash cleanup."""
         ...
 
+    async def publish_failure(
+        self,
+        document: Document,
+        *,
+        expected: DocumentRevision | None,
+        original_omitted_reason: str | None,
+    ) -> Commit:
+        """Atomically publish a failed row and its source-retention state."""
+        ...
+
     async def publish_document(
         self,
         document: Document,

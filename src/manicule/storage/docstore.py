@@ -263,44 +263,9 @@ class SqliteDocStore(
     ) -> Commit:
         """Flip the active publication and every relational derivative in one transaction."""
         async with self._sessions.begin() as session:
-            if expected is not None:
-                # This must be the transaction's first SQL statement. The conditional write
-                # takes SQLite's writer lock before any snapshot read can go stale beneath it.
-                matched = cast(
-                    "CursorResult[Any]",
-                    await session.execute(
-                        update(models.Document)
-                        .where(
-                            models.Document.id == document.id,
-                            models.Document.workspace_id == self._workspace_id,
-                            models.Document.deleted_at.is_(None),
-                            models.Document.publication_id == expected.publication_id,
-                            models.Document.content_hash == expected.content_hash,
-                            models.Document.version_token == expected.version_token,
-                            models.Document.original_ref == expected.original_ref,
-                            models.Document.parse_fp == expected.parse_fp,
-                        )
-                        .values(updated_at=utcnow()),
-                    ),
-                )
-                row = await session.get(models.Document, document.id, populate_existing=True)
-                if row is not None and row.workspace_id != self._workspace_id:
-                    raise CrossWorkspaceCollisionError(
-                        _cross_workspace(document.id, row.workspace_id, self._workspace_id)
-                    )
-                stored = None if row is None else to_document(row)
-                if (
-                    matched.rowcount != 1
-                    or stored is None
-                    or stored.provenance != expected.source_record
-                ):
-                    return Commit(committed=False, stored=stored)
-            else:
-                row = await session.get(models.Document, document.id)
-                if row is not None and row.workspace_id != self._workspace_id:
-                    raise CrossWorkspaceCollisionError(
-                        _cross_workspace(document.id, row.workspace_id, self._workspace_id)
-                    )
+            row, refused = await self._publication_target(session, document, expected)
+            if refused is not None:
+                return refused
             await self._write_document(session, document)
             row = await session.get(models.Document, document.id)
             if row is None:  # pragma: no cover - _write_document creates or returns this row
@@ -332,6 +297,75 @@ class SqliteDocStore(
             row.parse_fp = parse_fp
             await session.flush()
             return Commit(committed=True, stored=to_document(row))
+
+    async def publish_failure(
+        self,
+        document: Document,
+        *,
+        expected: DocumentRevision | None,
+        original_omitted_reason: str | None,
+    ) -> Commit:
+        """Publish a failed row and retention outcome as one guarded transaction."""
+        async with self._sessions.begin() as session:
+            _, refused = await self._publication_target(session, document, expected)
+            if refused is not None:
+                return refused
+            stored = await self._write_document(session, document)
+            row = await session.get(models.Document, document.id)
+            if row is None:  # pragma: no cover - _write_document creates or returns this row
+                msg = f"document {document.id!r} vanished inside its failure transaction"
+                raise RuntimeError(msg)
+            row.original_omitted_reason = original_omitted_reason
+            await session.flush()
+            return Commit(committed=True, stored=stored)
+
+    async def _publication_target(
+        self,
+        session: AsyncSession,
+        document: Document,
+        expected: DocumentRevision | None,
+    ) -> tuple[models.Document | None, Commit | None]:
+        """Take the publication lock and resolve the guarded row before any other SQL."""
+        if expected is not None:
+            # This must be the transaction's first SQL statement. The conditional write takes
+            # SQLite's writer lock before any snapshot read can go stale beneath it.
+            matched = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.Document)
+                    .where(
+                        models.Document.id == document.id,
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.deleted_at.is_(None),
+                        models.Document.publication_id == expected.publication_id,
+                        models.Document.content_hash == expected.content_hash,
+                        models.Document.version_token == expected.version_token,
+                        models.Document.original_ref == expected.original_ref,
+                        models.Document.parse_fp == expected.parse_fp,
+                    )
+                    .values(updated_at=utcnow()),
+                ),
+            )
+            row = await session.get(models.Document, document.id, populate_existing=True)
+            if row is not None and row.workspace_id != self._workspace_id:
+                raise CrossWorkspaceCollisionError(
+                    _cross_workspace(document.id, row.workspace_id, self._workspace_id)
+                )
+            stored = None if row is None else to_document(row)
+            if (
+                matched.rowcount != 1
+                or stored is None
+                or stored.provenance != expected.source_record
+            ):
+                return row, Commit(committed=False, stored=stored)
+            return row, None
+
+        row = await session.get(models.Document, document.id)
+        if row is not None and row.workspace_id != self._workspace_id:
+            raise CrossWorkspaceCollisionError(
+                _cross_workspace(document.id, row.workspace_id, self._workspace_id)
+            )
+        return row, None
 
     async def _write_document(self, session: AsyncSession, document: Document) -> Document:
         """The write both :meth:`upsert_document` and :meth:`commit_document` perform.

@@ -905,6 +905,17 @@ every vector it has, the reconstruction is reported as `embedding.vectors_backfi
 ([`ingest.md`](ingest.md) §10.1), and the first write of each row records its identity for good.
 Backup, restore and export are unaffected: the column travels with the table like every other.
 
+**Downgrade is fail-closed once a generated publication exists.** Removing the SQLite
+`publication_id` pointer while leaving a multi-generation Lance table would make an older
+binary unable to distinguish active rows from staged or retired ones. The downgrade therefore
+refuses when any document or chunk uses a non-legacy physical id, or when vector tombstones are
+still pending. Alembic cannot safely project Lance inside its SQLite transaction, so it does not
+pretend this is automatic. The safe remediation is to rebuild the corpus into a clean data
+directory with the target release. For a deliberately empty in-place downgrade, hard-purge all
+documents, run the vector sweep to completion, verify the corpus and tombstone counts are zero,
+then retry the downgrade. Keep the original directory as the rollback path until the rebuilt
+index passes retrieval checks.
+
 **Publications use the existing tombstone collector.** Physical ids for a new publication are
 tombstoned before its vectors are staged. The atomic relational flip clears those tombstones and
 tombstones the retired publication instead. A crash therefore leaves either staged or retired

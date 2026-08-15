@@ -2004,11 +2004,14 @@ class IngestPipeline:
         )
         if result.status is not DocumentStatus.FAILED:
             return document
-        stored = await self._publish(document, expected=expected)
-        await self._store.set_original(
-            stored.id, ref=retention.ref, omitted_reason=retention.omitted_reason
+        committed = await self._store.publish_failure(
+            document,
+            expected=expected,
+            original_omitted_reason=retention.omitted_reason,
         )
-        return stored
+        if not committed.committed or committed.stored is None:
+            raise _SupersededError(committed.stored)
+        return committed.stored
 
     @staticmethod
     def _keeps_status(existing: Document, proposed: DocumentStatus) -> bool:

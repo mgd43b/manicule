@@ -17,7 +17,14 @@ import pytest
 from sqlalchemy import text
 
 from manicule.connectors import CursorExpiredError
-from manicule.core.content import IN_FLIGHT, Commit, DocumentStatus, RawDocument, Retention
+from manicule.core.content import (
+    IN_FLIGHT,
+    Commit,
+    DocumentStatus,
+    PipelineStage,
+    RawDocument,
+    Retention,
+)
 from manicule.core.embedding import IndexFingerprints
 from manicule.core.ids import content_hash, document_id, vector_id
 from manicule.core.sources import Watermark
@@ -900,6 +907,166 @@ async def test_atomic_publication_cas_has_one_winner_across_two_real_sessions(
     winner = next(result for result in results if result.committed)
     assert miss.stored == winner.stored
     assert await store.get_document(original.id) == winner.stored
+
+
+async def test_stale_retained_failure_cannot_overwrite_an_indexed_winners_original(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure retention and its guarded row are one commit, not a trailing setter."""
+    from sqlalchemy.ext.asyncio import AsyncSession  # noqa: PLC0415
+
+    from manicule.core.content import Document, DocumentRevision  # noqa: PLC0415
+    from manicule.storage import models  # noqa: PLC0415
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    blobs = BlobStore(engine, data_dir)
+    old_ref = (await blobs.retain(b"old source", "text/plain")).ref
+    winner_ref = (await blobs.retain(b"winner source", "text/plain")).ref
+    stale_failure_ref = (await blobs.retain(b"stale failed source", "text/plain")).ref
+    assert old_ref
+    assert winner_ref
+    assert stale_failure_ref
+    original = await store.upsert_document(
+        make_document(
+            source="memory",
+            source_id="failure-race",
+            status=DocumentStatus.NO_EXTRACTABLE_TEXT,
+        ).model_copy(update={"original_ref": old_ref})
+    )
+
+    winner_store = SqliteDocStore(engine)
+    loser_store = SqliteDocStore(engine)
+    winner_entered = asyncio.Event()
+    release_winner = asyncio.Event()
+    loser_attempted = asyncio.Event()
+    replace_entries = winner_store._replace_entries  # pyright: ignore[reportPrivateUsage]
+
+    async def pause_winner(*args: object, **kwargs: object) -> None:
+        winner_entered.set()
+        await release_winner.wait()
+        await replace_entries(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    target = loser_store._publication_target  # pyright: ignore[reportPrivateUsage]
+
+    async def observe_loser(
+        session: AsyncSession,
+        document: Document,
+        expected: DocumentRevision | None,
+    ) -> tuple[models.Document | None, Commit | None]:
+        loser_attempted.set()
+        return await target(session, document, expected)
+
+    monkeypatch.setattr(winner_store, "_replace_entries", pause_winner)
+    monkeypatch.setattr(loser_store, "_publication_target", observe_loser)
+    winner_document = original.model_copy(
+        update={
+            "content_hash": content_hash(b"winner source"),
+            "original_ref": winner_ref,
+            "publication_id": "winner-publication",
+            "status": DocumentStatus.INDEXED,
+            "status_detail": None,
+            "failed_stage": None,
+        }
+    )
+    failed_document = original.model_copy(
+        update={
+            "content_hash": content_hash(b"stale failed source"),
+            "original_ref": stale_failure_ref,
+            "status": DocumentStatus.FAILED,
+            "status_detail": "parser crashed",
+            "failed_stage": PipelineStage.PARSE,
+        }
+    )
+
+    winner_task = asyncio.create_task(
+        winner_store.publish_document(
+            winner_document,
+            [],
+            expected=original.revision,
+            chunk_fp=None,
+            embed_fp=None,
+            parse_fp=None,
+            glossary_entries=[],
+            glossary_fp="winner-glossary",
+            original_omitted_reason=None,
+        )
+    )
+    await winner_entered.wait()
+    loser_task = asyncio.create_task(
+        loser_store.publish_failure(
+            failed_document,
+            expected=original.revision,
+            original_omitted_reason=None,
+        )
+    )
+    await loser_attempted.wait()
+    release_winner.set()
+    winner, loser = await asyncio.gather(winner_task, loser_task)
+
+    assert winner.committed
+    assert not loser.committed
+    assert loser.stored == winner.stored
+    async with engine.connect() as connection:
+        retained = (
+            await connection.execute(
+                text(
+                    "SELECT original_ref, original_omitted_reason "
+                    "FROM documents WHERE id = :document_id"
+                ),
+                {"document_id": original.id},
+            )
+        ).one()
+    assert retained == (winner_ref, None)
+
+
+async def test_initial_failure_rolls_back_retained_reference_with_its_row(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The expected=None path cannot expose half of its retention decision."""
+    from sqlalchemy.ext.asyncio import AsyncSession  # noqa: PLC0415
+
+    from manicule.core.content import Document  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    retained_ref = (await BlobStore(engine, data_dir).retain(b"failed source", "text/plain")).ref
+    assert retained_ref
+    failed = make_document(
+        source="memory",
+        source_id="initial-failure-rollback",
+        status=DocumentStatus.FAILED,
+    ).model_copy(
+        update={
+            "original_ref": retained_ref,
+            "status_detail": "parser crashed",
+            "failed_stage": PipelineStage.PARSE,
+        }
+    )
+    write_document = store._write_document  # pyright: ignore[reportPrivateUsage]
+
+    async def interrupt_after_row_write(
+        session: AsyncSession,
+        document: Document,
+    ) -> Document:
+        await write_document(session, document)
+        raise RuntimeError("power lost before retention outcome")
+
+    monkeypatch.setattr(store, "_write_document", interrupt_after_row_write)
+
+    with pytest.raises(RuntimeError, match="power lost before retention outcome"):
+        await store.publish_failure(
+            failed,
+            expected=None,
+            original_omitted_reason=None,
+        )
+
+    assert await store.get_document(failed.id) is None
 
 
 async def test_the_stores_guard_refuses_on_a_corrected_record_over_bytes_that_never_moved(

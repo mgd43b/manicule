@@ -1016,6 +1016,10 @@ old content with. A parse failure preserves
 the indexed source revision wholesale — token, content hash, retained-byte reference, routing and
 provenance — because adopting the failed fetch's token would make the next healthy sync skip bytes
 the document does not hold. The error is the only new fact that attempt established.
+For a document without a working publication, the failed row and its byte-retention outcome are
+one transaction: an initial (`expected=None`) failure cannot expose only one of them, and a reparse
+failure uses the same revision compare-and-swap as a successful publication. A stale failure can
+therefore neither demote a concurrent winner nor replace the winner's `original_ref` afterward.
 
 **A terminal *determination* does replace it, and that is not a softening of the rule.**
 Implementation forced the distinction: `failed` means we do not know whether the new bytes hold

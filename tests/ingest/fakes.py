@@ -229,6 +229,20 @@ class MemoryIngestStore:
     async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
         self.staged_publications.append((publication_id, tuple(chunk.id for chunk in chunks)))
 
+    async def publish_failure(
+        self,
+        document: Document,
+        *,
+        expected: DocumentRevision | None,
+        original_omitted_reason: str | None,
+    ) -> Commit:
+        current = await self.get_document(document.id)
+        if expected is not None and (current is None or current.revision != expected):
+            return Commit(committed=False, stored=current)
+        stored = await self.upsert_document(document)
+        self.originals[document.id] = (document.original_ref, original_omitted_reason)
+        return Commit(committed=True, stored=stored)
+
     async def publish_document(
         self,
         document: Document,

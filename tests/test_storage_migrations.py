@@ -17,11 +17,16 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import text
 
 from manicule.core.provenance import PROVENANCE_KEY
+from manicule.core.retrieval import Filter
+from manicule.retrieval.hydration import visible_documents
 from manicule.storage.autogen import include_name, include_object
 from manicule.storage.engine import create_engine
 from manicule.storage.fts import FTS_SHADOW_TABLES
 from manicule.storage.migrator import alembic_config, current, downgrade, head_revision, upgrade
 from manicule.storage.models import Base
+from manicule.storage.vectors import LanceVectorStore
+from tests.fakes import HashEmbedder
+from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -139,6 +144,51 @@ async def test_a_migration_over_a_populated_database_keeps_the_rows(data_dir: Pa
         assert await _row_counts(engine) == before, "and neither must the downgrade"
         assert await _document_values(engine) == columns, "and neither must the downgrade"
     finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
+async def test_downgrade_refuses_to_expose_retired_real_vector_generations(
+    data_dir: Path,
+) -> None:
+    """Without the SQLite pointer, old code could hydrate either row for one logical chunk."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    engine = create_engine(data_dir)
+    vectors = LanceVectorStore(data_dir / "vectors")
+    try:
+        await upgrade(engine)
+        store = SqliteDocStore(engine)
+        await store.ensure_workspace()
+        document = make_document(source_id="generated").model_copy(
+            update={"publication_id": "active-publication"}
+        )
+        document = await store.upsert_document(document)
+        active = make_chunk(document, 0, "current text")
+        retired = active.model_copy(update={"embed_text": "retired embedding input"})
+        await store.replace_chunks(document.id, [active])
+        await vectors.ensure_ready(HashEmbedder().fingerprint)
+        await vectors.upsert([retired], [[0.1] * 5], publication_id="retired-publication")
+        await vectors.upsert([active], [[0.2] * 5], publication_id=document.publication_id)
+
+        with pytest.raises(RuntimeError, match="refusing to downgrade atomic publications"):
+            await downgrade(engine, "d4a90c7e15b3")
+
+        assert await current(engine) == head_revision()
+        candidates = await vectors.search([0.0] * 5, 10)
+        visible = await visible_documents(
+            store,
+            Filter(workspace_ids=frozenset({store.workspace_id})),
+            {document.id},
+        )
+        admitted = [
+            candidate
+            for candidate in candidates
+            if visible.get(candidate.chunk.document_id) == candidate.publication_id
+        ]
+        assert [candidate.publication_id for candidate in admitted] == [document.publication_id]
+    finally:
+        await vectors.teardown()
         await engine.dispose()
 
 
