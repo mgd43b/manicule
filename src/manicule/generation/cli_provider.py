@@ -17,6 +17,7 @@ import signal
 import stat
 import tempfile
 from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import suppress
 from pathlib import Path
 
 from manicule.config.profiles import ProfileConfig
@@ -186,7 +187,7 @@ class CliGenerator:
                 try:
                     await asyncio.shield(cleanup)
                 except asyncio.CancelledError:
-                    _signal(process, signal.SIGKILL)
+                    _kill(process)
                     raise
                 raise
 
@@ -316,7 +317,7 @@ async def _stop(process: asyncio.subprocess.Process) -> None:
     try:
         await asyncio.wait_for(process.wait(), timeout=2.0)
     except TimeoutError:
-        _signal(process, signal.SIGKILL)
+        _kill(process)
         await process.wait()
 
 
@@ -331,6 +332,15 @@ def _signal(process: asyncio.subprocess.Process, requested: signal.Signals) -> N
             process.kill()
     except ProcessLookupError:
         pass
+
+
+def _kill(process: asyncio.subprocess.Process) -> None:
+    """Force-stop the process group without assuming Windows defines ``SIGKILL``."""
+    if os.name == "posix":
+        _signal(process, signal.SIGKILL)
+        return
+    with suppress(ProcessLookupError):
+        process.kill()
 
 
 __all__ = ["SUPPORTED_PROVIDERS", "CliGenerator", "cli_system_prompt"]

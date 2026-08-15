@@ -1189,9 +1189,14 @@ class Settings(BaseSettings):
             )
             if needs_credential(name) and not (cli_owns_auth or self.provider(name).has_key):
                 expected = " or ".join(env_var_names(name))
+                cli_hint = (
+                    " To use its existing local CLI login instead, set llm.generator to 'cli'."
+                    if name in CLI_AUTH_PROVIDERS
+                    else ""
+                )
                 problems.append(
                     f"provider {name!r} is selected but has no API key. Set {expected}, or "
-                    f"providers.{name}.api_key."
+                    f"providers.{name}.api_key.{cli_hint}"
                 )
 
         transport = self.security.transport

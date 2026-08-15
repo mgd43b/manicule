@@ -91,7 +91,9 @@ def test_cli_auth_exemption_does_not_leak_to_other_component_selections() -> Non
             "embedding": {"provider": "mlx"},
         }
     )
-    assert any("provider 'codex'" in problem for problem in configured.policy_problems())
+    problems = configured.policy_problems()
+    assert any("provider 'codex'" in problem for problem in problems)
+    assert any("llm.generator to 'cli'" in problem for problem in problems)
 
     configured = Settings.model_validate(
         {
