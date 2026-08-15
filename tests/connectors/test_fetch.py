@@ -163,7 +163,8 @@ async def test_a_body_stale_in_every_format_is_refused() -> None:
     )
     with pytest.raises(
         BodyUnavailableError,
-        match=r"discovered at version 5.*Format \(version 4\).*storage format \(version 4\)",
+        match=r"discovered at version 5.*Format returned versions 4, 4.*storage format "
+        r"returned version 4",
     ):
         await _fetched(instance, "1")
 
@@ -409,12 +410,81 @@ async def test_a_page_whose_adf_body_is_declined_falls_back_to_storage() -> None
     fails for a reason the source did not actually give.
     """
     instance = FakeConfluence(
-        pages=[FakePage(id="1", title="Page", space="ENG", adf_available=False)]
+        pages=[FakePage(id="1", title="Page", space="ENG", version=5, adf_available=False)]
     )
     raw = await _fetched(instance, "1")
 
     assert raw.media_type == STORAGE_MEDIA_TYPE
     assert raw.metadata["body_format"] == "storage"
+    assert raw.metadata[VERSION_TOKEN] == "5"
+
+
+async def test_an_initially_unavailable_adf_cannot_bypass_a_stale_storage_refusal() -> None:
+    """The fallback is another candidate body, not an escape from the version boundary."""
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1",
+                title="Page",
+                space="ENG",
+                version=5,
+                adf_available=False,
+                storage_version=4,
+            )
+        ]
+    )
+
+    with pytest.raises(
+        BodyUnavailableError,
+        match=r"Format was unavailable.*storage format returned version 4",
+    ):
+        await _fetched(instance, "1")
+
+
+async def test_an_unavailable_adf_retry_falls_back_to_current_storage() -> None:
+    """Losing ADF on retry still permits a separately current representation."""
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1",
+                title="Page",
+                space="ENG",
+                version=5,
+                served_version=4,
+                adf_available_calls=1,
+            )
+        ]
+    )
+
+    raw = await _fetched(instance, "1")
+
+    assert instance.body_calls["1"] == 2
+    assert raw.media_type == STORAGE_MEDIA_TYPE
+    assert raw.metadata[VERSION_TOKEN] == "5"
+
+
+async def test_an_unavailable_adf_retry_cannot_bypass_a_stale_storage_refusal() -> None:
+    """Every bounded path ends at the same fail-closed version comparison."""
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1",
+                title="Page",
+                space="ENG",
+                version=5,
+                served_version=4,
+                adf_available_calls=1,
+                storage_version=4,
+            )
+        ]
+    )
+
+    with pytest.raises(
+        BodyUnavailableError,
+        match=r"Format returned version 4 before becoming unavailable.*storage format "
+        r"returned version 4",
+    ):
+        await _fetched(instance, "1")
 
 
 async def test_a_throttled_page_is_not_retried_through_a_second_endpoint() -> None:

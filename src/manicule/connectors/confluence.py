@@ -915,19 +915,45 @@ class ConfluenceConnector:
             # on the source's side, which is exactly the situation it exists for; anything
             # else — a 429, a rejected credential — must not be retried through a second
             # endpoint, which is why only this failure is caught.
-            return await self._storage_body(page_id)
+            return await self._checked_storage_body(
+                page_id, expected, adf_versions=(), adf_unavailable=True
+            )
         if expected is None or body.version >= expected:
             return body
-        retried = await self._adf_body(page_id)
+        try:
+            retried = await self._adf_body(page_id)
+        except BodyUnavailableError:
+            return await self._checked_storage_body(
+                page_id, expected, adf_versions=(body.version,), adf_unavailable=True
+            )
         if retried.version >= expected:
             return retried
+        return await self._checked_storage_body(
+            page_id, expected, adf_versions=(body.version, retried.version)
+        )
+
+    async def _checked_storage_body(
+        self,
+        page_id: str,
+        expected: int | None,
+        *,
+        adf_versions: Sequence[int],
+        adf_unavailable: bool = False,
+    ) -> _Body:
+        """The Cloud fallback, subject to the same freshness boundary as ADF."""
         fallback = await self._storage_body(page_id)
-        if fallback.version >= expected:
+        if expected is None or fallback.version >= expected:
             return fallback
+        if not adf_versions:
+            adf_detail = "Atlassian Document Format was unavailable"
+        else:
+            versions = ", ".join(str(version) for version in adf_versions)
+            label = "version" if len(adf_versions) == 1 else "versions"
+            suffix = " before becoming unavailable" if adf_unavailable else ""
+            adf_detail = f"Atlassian Document Format returned {label} {versions}{suffix}"
         msg = (
-            f"page {page_id} was discovered at version {expected}, but its body remained older "
-            f"after retrying Atlassian Document Format (version {retried.version}) and falling "
-            f"back to storage format (version {fallback.version}); refusing stale content"
+            f"page {page_id} was discovered at version {expected}, but {adf_detail} and storage "
+            f"format returned version {fallback.version}; refusing stale content"
         )
         raise BodyUnavailableError(msg)
 
