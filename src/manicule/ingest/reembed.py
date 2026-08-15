@@ -1,5 +1,9 @@
 """Resumable shadow-generation re-embedding from an immutable local corpus snapshot.
 
+This is the storage-independent orchestration contract, not a production implementation of
+SQLite journaling, Lance shadow tables, or cross-store publication. Those concrete adapters and
+their integration evidence remain required before issue #187 is complete.
+
 The protocols expose no connector, parser, or blob fallback. A rebuild reads only stored
 documents and their exact ``Chunk.embed_text`` inputs, writes an unpublished generation, and
 presents one atomic compare-and-swap request to a publisher. Retrieval's live generation is
@@ -17,7 +21,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
@@ -101,6 +105,30 @@ class SnapshotChunk:
     created_at: datetime | None = None
 
 
+class SnapshotChunkDigester:
+    """Incremental physical-inventory digest for a stable keyset-ordered row stream."""
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._previous: tuple[str, int, str, str, int] | None = None
+
+    def add(self, stored: SnapshotChunk) -> None:
+        key = (
+            stored.chunk.document_id,
+            stored.chunk.position,
+            stored.chunk.id,
+            stored.vector_id,
+            stored.sequence,
+        )
+        if self._previous is not None and key <= self._previous:
+            raise ValueError("snapshot chunk rows must be strictly keyset ordered")
+        self._previous = key
+        _hash_bytes(self._digest, _canonical_chunk(stored))
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class ReembedLease:
     owner_token: str
@@ -110,19 +138,14 @@ class ReembedLease:
 
 @dataclass(frozen=True, slots=True)
 class ReembedPlan:
-    """Aggregate-only dry-run output and private execution commitments."""
+    """The only dry-run DTO surfaces may serialize: aggregate facts and nothing else."""
 
-    snapshot: CorpusSnapshot
-    target_fingerprint: str
-    target_config: str
-    target_dimension: int
     documents: int
     chunks: int
     input_bytes: int
     estimated_seconds: float
     peak_memory_bytes: int
     temporary_disk_bytes: int
-    inventory_digest: str
     unrepairable_documents: int = 0
 
     @property
@@ -144,6 +167,19 @@ class ReembedPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class ReembedCommitment:
+    """Private resumability inputs. Never serialize this object onto an operator surface."""
+
+    plan: ReembedPlan
+    snapshot: CorpusSnapshot = field(repr=False)
+    target_fingerprint: str = field(repr=False)
+    target_config: str = field(repr=False)
+    target_dimension: int = field(repr=False)
+    inventory_digest: str = field(repr=False)
+    chunk_inventory_digest: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class PublicationReceipt:
     """Durable outcome of exactly one publication decision."""
 
@@ -158,7 +194,7 @@ class PublicationReceipt:
 @dataclass(frozen=True, slots=True)
 class ReembedRun:
     id: str
-    plan: ReembedPlan
+    commitment: ReembedCommitment = field(repr=False)
     state: ReembedState = ReembedState.PLANNED
     document_after: str | None = None
     active_document_id: str | None = None
@@ -181,6 +217,13 @@ class ShadowGeneration:
 
 @dataclass(frozen=True, slots=True)
 class ShadowInspection:
+    """Measurements recomputed from stored rows, never echoed from preparation arguments.
+
+    ``inventory_digest`` covers every persisted :class:`SnapshotChunk` field. ``lineage_valid``
+    additionally verifies backend-specific physical keys point at the target generation and
+    logical chunk they claim.
+    """
+
     rows: int
     unique_chunks: int
     dimension: int
@@ -232,7 +275,7 @@ class ReembedJournal(Protocol):
     async def create(
         self,
         run_id: str,
-        plan: ReembedPlan,
+        commitment: ReembedCommitment,
         *,
         owner_token: str,
         ttl_seconds: float,
@@ -272,7 +315,7 @@ class ShadowVectorGeneration(Protocol):
     async def upsert(
         self,
         generation: ShadowGeneration,
-        chunks: Sequence[Chunk],
+        chunks: Sequence[SnapshotChunk],
         vectors: Sequence[Vector],
         *,
         lease: ReembedLease,
@@ -280,7 +323,9 @@ class ShadowVectorGeneration(Protocol):
 
     async def inspect(
         self, generation: ShadowGeneration, *, lease: ReembedLease
-    ) -> ShadowInspection: ...
+    ) -> ShadowInspection:
+        """Read and recompute validation facts from physical rows under the lease fence."""
+        ...
 
 
 class ReembedPublisher(Protocol):
@@ -316,7 +361,7 @@ async def plan_reembed(
     """Price a rebuild from an immutable local snapshot without writing or embedding."""
     _validate_knobs(document_page, target_batch_tokens, chunks_per_second)
     snapshot = await corpus.begin_snapshot()
-    return await _plan_snapshot(
+    commitment = await _plan_snapshot(
         corpus,
         snapshot,
         target,
@@ -324,6 +369,7 @@ async def plan_reembed(
         target_batch_tokens=target_batch_tokens,
         chunks_per_second=chunks_per_second,
     )
+    return commitment.plan
 
 
 async def start_reembed(
@@ -339,21 +385,24 @@ async def start_reembed(
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS,
 ) -> ReembedRun:
     _validate_owner(owner_token, lease_ttl_seconds)
-    plan = await plan_reembed(
+    _validate_knobs(document_page, target_batch_tokens, chunks_per_second)
+    snapshot = await corpus.begin_snapshot()
+    commitment = await _plan_snapshot(
         corpus,
+        snapshot,
         target,
         document_page=document_page,
         target_batch_tokens=target_batch_tokens,
         chunks_per_second=chunks_per_second,
     )
-    if not plan.runnable:
+    if not commitment.plan.runnable:
         raise PolicyError(
-            f"{plan.unrepairable_documents} document(s) have no stored chunks. Re-embedding "
-            "never falls back to a connector or parser; repair local inputs first."
+            f"{commitment.plan.unrepairable_documents} document(s) have no stored chunks. "
+            "Re-embedding never falls back to a connector or parser; repair local inputs first."
         )
     run, _ = await journal.create(
         run_id,
-        plan,
+        commitment,
         owner_token=owner_token,
         ttl_seconds=lease_ttl_seconds,
     )
@@ -379,7 +428,7 @@ async def resume_reembed(
     run = await journal.get(run_id)
     if run is None:
         raise ReembedError(f"no re-embedding run {run_id!r} exists")
-    if EmbedFingerprint.model_validate_json(run.plan.target_config) != embedder.fingerprint:
+    if EmbedFingerprint.model_validate_json(run.commitment.target_config) != embedder.fingerprint:
         raise ReembedError(
             "the configured embedder is not the exact target this run planned; model, weights, "
             "dimension, normalization, tokenizer, context limit, and backend must match"
@@ -392,13 +441,13 @@ async def resume_reembed(
     generation = await shadow.open_or_create(
         run.id,
         fingerprint=embedder.fingerprint,
-        inventory_digest=run.plan.inventory_digest,
+        inventory_digest=run.commitment.chunk_inventory_digest,
         lease=lease,
     )
     if (
         generation.run_id != run.id
-        or generation.fingerprint != run.plan.target_fingerprint
-        or generation.inventory_digest != run.plan.inventory_digest
+        or generation.fingerprint != run.commitment.target_fingerprint
+        or generation.inventory_digest != run.commitment.chunk_inventory_digest
     ):
         raise ReembedError("shadow generation identity does not match the durable run")
     if run.shadow_generation_id not in {None, generation.id}:
@@ -453,8 +502,8 @@ async def resume_reembed(
         receipt = await publisher.publish(
             run,
             generation,
-            expected=run.plan.snapshot.live,
-            expected_corpus_revision=run.plan.snapshot.revision,
+            expected=run.commitment.snapshot.live,
+            expected_corpus_revision=run.commitment.snapshot.revision,
             lease=lease,
         )
         terminal = (
@@ -488,7 +537,7 @@ async def _build(
     while True:
         if run.active_document_id is None:
             documents = await corpus.documents(
-                run.plan.snapshot, after=run.document_after, limit=document_page
+                run.commitment.snapshot, after=run.document_after, limit=document_page
             )
             if not documents:
                 return await _save(
@@ -506,11 +555,11 @@ async def _build(
         active_document_id = run.active_document_id
         if active_document_id is None:  # pragma: no cover - established immediately above
             raise RuntimeError("building without an active document")
-        document = await corpus.document(run.plan.snapshot, active_document_id)
+        document = await corpus.document(run.commitment.snapshot, active_document_id)
         if document is None:
             raise ReembedError("the immutable snapshot lost a document during resume")
         stored_chunks = await corpus.chunks(
-            run.plan.snapshot,
+            run.commitment.snapshot,
             document.document.id,
             after=run.chunk_after,
             limit=chunk_limit,
@@ -525,9 +574,9 @@ async def _build(
                 target_batch_tokens=target_batch_tokens,
             )
             lease = await journal.renew(run.id, lease, ttl_seconds=lease_ttl_seconds)
-            await shadow.upsert(generation, chunks, vectors, lease=lease)
+            await shadow.upsert(generation, stored_chunks, vectors, lease=lease)
             # Do not retain one page's inputs/outputs while the next page is materialized.
-            del chunks, vectors
+            del chunks, stored_chunks, vectors
             run, lease = await _save(
                 journal,
                 replace(
@@ -565,10 +614,10 @@ async def _validate(
     target_batch_tokens: int,
     lease: ReembedLease,
 ) -> None:
-    target = EmbedFingerprint.model_validate_json(run.plan.target_config)
+    target = EmbedFingerprint.model_validate_json(run.commitment.target_config)
     current = await _plan_snapshot(
         corpus,
-        run.plan.snapshot,
+        run.commitment.snapshot,
         target,
         document_page=document_page,
         target_batch_tokens=target_batch_tokens,
@@ -576,24 +625,25 @@ async def _validate(
     )
     inspection = await shadow.inspect(generation, lease=lease)
     failures: list[str] = []
-    if current.inventory_digest != run.plan.inventory_digest:
+    if current.inventory_digest != run.commitment.inventory_digest:
         failures.append("the immutable inventory does not match its planned digest")
-    if inspection.rows != run.plan.chunks:
-        failures.append(f"expected {run.plan.chunks} rows, found {inspection.rows}")
-    if inspection.unique_chunks != run.plan.chunks:
+    expected_chunks = run.commitment.plan.chunks
+    if inspection.rows != expected_chunks:
+        failures.append(f"expected {expected_chunks} rows, found {inspection.rows}")
+    if inspection.unique_chunks != expected_chunks:
         failures.append(
-            f"expected {run.plan.chunks} unique chunks, found {inspection.unique_chunks}"
+            f"expected {expected_chunks} unique chunks, found {inspection.unique_chunks}"
         )
-    if inspection.dimension != run.plan.target_dimension:
+    if inspection.dimension != run.commitment.target_dimension:
         failures.append(
-            f"expected dimension {run.plan.target_dimension}, found {inspection.dimension}"
+            f"expected dimension {run.commitment.target_dimension}, found {inspection.dimension}"
         )
     if not inspection.finite:
         failures.append("one or more vectors contain non-finite values")
-    if inspection.fingerprint != run.plan.target_fingerprint:
+    if inspection.fingerprint != run.commitment.target_fingerprint:
         failures.append("the shadow carries a different embedding fingerprint")
-    if inspection.inventory_digest != run.plan.inventory_digest:
-        failures.append("the shadow does not cover the planned inventory")
+    if inspection.inventory_digest != run.commitment.chunk_inventory_digest:
+        failures.append("the shadow rows do not cover the planned physical chunk inventory")
     if not inspection.lineage_valid:
         failures.append("one or more rows have invalid chunk or embedding lineage")
     if not inspection.retrieval_ready:
@@ -610,8 +660,9 @@ async def _plan_snapshot(
     document_page: int,
     target_batch_tokens: int,
     chunks_per_second: float,
-) -> ReembedPlan:
+) -> ReembedCommitment:
     digest = hashlib.sha256()
+    chunk_digest = SnapshotChunkDigester()
     _hash_value(digest, snapshot.revision)
     documents_count = chunks_count = input_bytes = unrepairable = 0
     peak_memory = 0
@@ -640,7 +691,9 @@ async def _plan_snapshot(
                     break
                 found = True
                 for stored_chunk in chunks:
-                    _hash_bytes(digest, _canonical_chunk(stored_chunk))
+                    canonical = _canonical_chunk(stored_chunk)
+                    _hash_bytes(digest, canonical)
+                    chunk_digest.add(stored_chunk)
                     input_bytes += len(stored_chunk.chunk.embed_text.encode("utf-8"))
                 chunks_count += len(chunks)
                 chunk_page_bytes = sum(len(_canonical_chunk(chunk)) for chunk in chunks)
@@ -656,19 +709,23 @@ async def _plan_snapshot(
                 unrepairable += 1
         after = documents[-1].document.id
     vector_bytes = target.dimension * _FLOAT32_BYTES
-    return ReembedPlan(
-        snapshot=snapshot,
-        target_fingerprint=target.canonical(),
-        target_config=target.model_dump_json(),
-        target_dimension=target.dimension,
+    plan = ReembedPlan(
         documents=documents_count,
         chunks=chunks_count,
         input_bytes=input_bytes,
         estimated_seconds=chunks_count / chunks_per_second,
         peak_memory_bytes=peak_memory,
         temporary_disk_bytes=chunks_count * (vector_bytes + _ROW_OVERHEAD_BYTES),
-        inventory_digest=digest.hexdigest(),
         unrepairable_documents=unrepairable,
+    )
+    return ReembedCommitment(
+        plan=plan,
+        snapshot=snapshot,
+        target_fingerprint=target.canonical(),
+        target_config=target.model_dump_json(),
+        target_dimension=target.dimension,
+        inventory_digest=digest.hexdigest(),
+        chunk_inventory_digest=chunk_digest.hexdigest(),
     )
 
 
@@ -755,6 +812,7 @@ __all__ = [
     "LivePublication",
     "PublicationReceipt",
     "PublishOutcome",
+    "ReembedCommitment",
     "ReembedCorpus",
     "ReembedError",
     "ReembedJournal",
@@ -768,6 +826,7 @@ __all__ = [
     "ShadowInspection",
     "ShadowVectorGeneration",
     "SnapshotChunk",
+    "SnapshotChunkDigester",
     "SnapshotDocument",
     "plan_reembed",
     "resume_reembed",

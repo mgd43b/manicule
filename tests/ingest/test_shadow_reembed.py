@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import copy
+import asyncio
 import math
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import override
 
 import pytest
@@ -18,15 +18,16 @@ from manicule.ingest.reembed import (
     LivePublication,
     PublicationReceipt,
     PublishOutcome,
+    ReembedCommitment,
     ReembedError,
     ReembedLease,
-    ReembedPlan,
     ReembedRun,
     ReembedState,
     ReembedValidationError,
     ShadowGeneration,
     ShadowInspection,
     SnapshotChunk,
+    SnapshotChunkDigester,
     SnapshotDocument,
     plan_reembed,
     resume_reembed,
@@ -47,10 +48,11 @@ class CountingEmbedder(HashEmbedder):
 
 
 class Authority:
-    """Transactional fake for journal, shadow storage, lease fencing, and publication.
+    """Single-event-loop protocol harness for journal, shadow, fencing, and publication.
 
-    All four share one authority just as a production relational adapter must. It is concrete
-    enough to prove the atomic CAS and crash behavior instead of assuming them in a mock.
+    It demonstrates the orchestration's required adapter semantics and crash decisions. It is
+    deliberately not evidence that SQLite and Lance implement those semantics; production
+    adapters, process-level concurrency tests, and on-disk crash tests remain issue #187 work.
     """
 
     def __init__(self) -> None:
@@ -61,7 +63,7 @@ class Authority:
         self.leases: dict[str, ReembedLease] = {}
         self.highest_fence: dict[str, int] = {}
         self.generations: dict[str, ShadowGeneration] = {}
-        self.rows: dict[str, dict[str, tuple[Chunk, tuple[float, ...]]]] = {}
+        self.rows: dict[str, dict[str, tuple[SnapshotChunk, tuple[float, ...]]]] = {}
         self.receipts: dict[str, PublicationReceipt] = {}
         self.prepare_calls = 0
         self.upsert_attempts = 0
@@ -70,6 +72,12 @@ class Authority:
         self.inspection_override: ShadowInspection | None = None
         self.fail_chunk_checkpoint_once = False
         self.fail_terminal_checkpoint_once = False
+        self.pause_first_upsert = False
+        self.upsert_entered = asyncio.Event()
+        self.release_upsert = asyncio.Event()
+        self.pause_inspection = False
+        self.inspection_entered = asyncio.Event()
+        self.release_inspection = asyncio.Event()
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
@@ -86,14 +94,14 @@ class Authority:
     async def create(
         self,
         run_id: str,
-        plan: ReembedPlan,
+        commitment: ReembedCommitment,
         *,
         owner_token: str,
         ttl_seconds: float,
     ) -> tuple[ReembedRun, ReembedLease]:
-        run = ReembedRun(id=run_id, plan=plan)
+        run = ReembedRun(id=run_id, commitment=commitment)
         existing = self.runs.setdefault(run_id, run)
-        if existing.plan != plan:
+        if existing.commitment != commitment:
             raise ReembedError("run id already belongs to another immutable plan")
         lease = await self.acquire(run_id, owner_token, ttl_seconds=ttl_seconds)
         return existing, lease
@@ -163,35 +171,58 @@ class Authority:
     async def upsert(
         self,
         generation: ShadowGeneration,
-        chunks: Sequence[Chunk],
+        chunks: Sequence[SnapshotChunk],
         vectors: Sequence[Vector],
         *,
         lease: ReembedLease,
     ) -> None:
         self._assert_lease(generation.run_id, lease)
+        if self.pause_first_upsert and not self.upsert_entered.is_set():
+            self.upsert_entered.set()
+            await self.release_upsert.wait()
         self.live_during_upsert.append(self.live.generation_id)
         self.upsert_attempts += len(chunks)
         self.max_upsert_batch = max(self.max_upsert_batch, len(chunks))
         target = self.rows[generation.id]
-        for chunk, vector in zip(chunks, vectors, strict=True):
-            target[chunk.id] = (chunk, tuple(vector))
+        for stored, vector in zip(chunks, vectors, strict=True):
+            physical_id = f"{generation.id}:{stored.chunk.id}"
+            target[physical_id] = (stored, tuple(vector))
 
     async def inspect(
         self, generation: ShadowGeneration, *, lease: ReembedLease
     ) -> ShadowInspection:
         self._assert_lease(generation.run_id, lease)
+        if self.pause_inspection:
+            self.inspection_entered.set()
+            await self.release_inspection.wait()
         if self.inspection_override is not None:
             return self.inspection_override
         rows = self.rows[generation.id]
         dimensions = {len(vector) for _, vector in rows.values()}
+        stored_rows = sorted(
+            (stored for stored, _ in rows.values()),
+            key=lambda item: (
+                item.chunk.document_id,
+                item.chunk.position,
+                item.chunk.id,
+                item.vector_id,
+                item.sequence,
+            ),
+        )
+        inventory = SnapshotChunkDigester()
+        for stored in stored_rows:
+            inventory.add(stored)
         return ShadowInspection(
             rows=len(rows),
-            unique_chunks=len({chunk.id for chunk, _ in rows.values()}),
+            unique_chunks=len({stored.chunk.id for stored in stored_rows}),
             dimension=dimensions.pop() if len(dimensions) == 1 else 0,
             finite=all(math.isfinite(value) for _, vector in rows.values() for value in vector),
             fingerprint=generation.fingerprint,
-            inventory_digest=generation.inventory_digest,
-            lineage_valid=True,
+            inventory_digest=inventory.hexdigest(),
+            lineage_valid=all(
+                physical_id == f"{generation.id}:{stored.chunk.id}"
+                for physical_id, (stored, _) in rows.items()
+            ),
             retrieval_ready=True,
         )
 
@@ -235,24 +266,25 @@ class Corpus:
         self, authority: Authority, documents: Sequence[tuple[Document, Sequence[Chunk]]]
     ) -> None:
         self.authority = authority
-        self.current = {document.id: (document, list(chunks)) for document, chunks in documents}
-        self.snapshots: dict[str, dict[str, tuple[Document, list[Chunk]]]] = {}
-        self.current_lineage = {
+        initial = {document.id: (document, tuple(chunks)) for document, chunks in documents}
+        lineage = {
             document.id: ("chunk-fingerprint", "embed-fingerprint", "glossary-fingerprint")
             for document, _ in documents
         }
-        self.snapshot_lineage: dict[str, dict[str, tuple[str, str, str]]] = {}
-        self.snapshot_number = 0
+        self.current_view = "view-1"
+        self.versions: dict[str, dict[str, tuple[Document, tuple[Chunk, ...]]]] = {
+            self.current_view: initial
+        }
+        self.lineage_versions: dict[str, dict[str, tuple[str, str, str]]] = {
+            self.current_view: lineage
+        }
+        self.next_view = 2
         self.max_document_page = 0
         self.max_chunk_page = 0
 
     async def begin_snapshot(self) -> CorpusSnapshot:
-        self.snapshot_number += 1
-        snapshot_id = f"snapshot-{self.snapshot_number}"
-        self.snapshots[snapshot_id] = copy.deepcopy(self.current)
-        self.snapshot_lineage[snapshot_id] = copy.deepcopy(self.current_lineage)
         return CorpusSnapshot(
-            snapshot_id,
+            self.current_view,
             self.authority.corpus_revision,
             self.authority.live,
         )
@@ -262,14 +294,14 @@ class Corpus:
     ) -> list[SnapshotDocument]:
         documents = [
             self._stored_document(snapshot, value[0])
-            for key, value in sorted(self.snapshots[snapshot.id].items())
+            for key, value in sorted(self.versions[snapshot.id].items())
             if after is None or key > after
         ][:limit]
         self.max_document_page = max(self.max_document_page, len(documents))
         return documents
 
     async def document(self, snapshot: CorpusSnapshot, document_id: str) -> SnapshotDocument | None:
-        found = self.snapshots[snapshot.id].get(document_id)
+        found = self.versions[snapshot.id].get(document_id)
         return None if found is None else self._stored_document(snapshot, found[0])
 
     async def chunks(
@@ -281,14 +313,14 @@ class Corpus:
         limit: int,
     ) -> list[SnapshotChunk]:
         chunks = sorted(
-            self.snapshots[snapshot.id][document_id][1],
+            self.versions[snapshot.id][document_id][1],
             key=lambda chunk: (chunk.position, chunk.id),
         )
         page = [
             chunk for chunk in chunks if after is None or ChunkKey(chunk.position, chunk.id) > after
         ][:limit]
         self.max_chunk_page = max(self.max_chunk_page, len(page))
-        document = self.snapshots[snapshot.id][document_id][0]
+        document = self.versions[snapshot.id][document_id][0]
         return [
             SnapshotChunk(
                 chunk=chunk,
@@ -299,7 +331,7 @@ class Corpus:
         ]
 
     def _stored_document(self, snapshot: CorpusSnapshot, document: Document) -> SnapshotDocument:
-        chunk_fp, embed_fp, glossary_fp = self.snapshot_lineage[snapshot.id][document.id]
+        chunk_fp, embed_fp, glossary_fp = self.lineage_versions[snapshot.id][document.id]
         return SnapshotDocument(
             workspace_id="default",
             document=document,
@@ -307,6 +339,33 @@ class Corpus:
             embed_fingerprint=embed_fp,
             glossary_fingerprint=glossary_fp,
         )
+
+    def replace_document(self, document: Document, chunks: Sequence[Chunk]) -> None:
+        rows = dict(self.versions[self.current_view])
+        rows[document.id] = (document, tuple(chunks))
+        self._advance(rows, dict(self.lineage_versions[self.current_view]))
+
+    def replace_lineage(self, document_id: str, *, embed_fingerprint: str) -> None:
+        rows = dict(self.versions[self.current_view])
+        lineage = dict(self.lineage_versions[self.current_view])
+        chunk_fp, _, glossary_fp = lineage[document_id]
+        lineage[document_id] = (chunk_fp, embed_fingerprint, glossary_fp)
+        self._advance(rows, lineage)
+
+    def _advance(
+        self,
+        rows: dict[str, tuple[Document, tuple[Chunk, ...]]],
+        lineage: dict[str, tuple[str, str, str]],
+    ) -> None:
+        view = f"view-{self.next_view}"
+        self.next_view += 1
+        self.versions[view] = rows
+        self.lineage_versions[view] = lineage
+        self.current_view = view
+        self.authority.corpus_revision = f"corpus:{view}"
+
+    def raw_chunks(self, snapshot: CorpusSnapshot, document_id: str) -> tuple[Chunk, ...]:
+        return self.versions[snapshot.id][document_id][1]
 
 
 def synthetic_corpus(authority: Authority, count: int = 3, *, secret_uri: bool = False) -> Corpus:
@@ -360,10 +419,8 @@ async def test_dry_run_is_aggregate_only_and_prices_combined_bounded_memory() ->
     embedder = CountingEmbedder(dimension=7)
 
     plan = await plan_reembed(corpus, embedder.fingerprint, chunks_per_second=2.0)
-    repeated = await plan_reembed(corpus, embedder.fingerprint, chunks_per_second=2.0)
 
     assert (plan.documents, plan.chunks) == (1, 130)
-    assert repeated.inventory_digest == plan.inventory_digest
     assert plan.estimated_seconds == 65.0
     assert plan.peak_memory_bytes > 64 * 7 * 4
     assert plan.temporary_disk_bytes == 130 * (7 * 4 + 512)
@@ -375,15 +432,22 @@ async def test_dry_run_is_aggregate_only_and_prices_combined_bounded_memory() ->
     assert "wiki.example.test" not in rendered
     assert make_document().id not in rendered
     assert "wiki.example.test" not in repr(plan)
+    assert set(asdict(plan)) < set(plan.public_facts())
 
 
-async def test_huge_document_build_is_keyset_paged_and_live_reads_stay_old_until_swap() -> None:
+async def test_protocol_keyset_pages_huge_document_and_keeps_old_winner_until_swap() -> None:
     authority = Authority()
     corpus = synthetic_corpus(authority, 130)
     embedder = CountingEmbedder(dimension=5)
     run = await prepare_run(authority, corpus, embedder)
+    authority.pause_first_upsert = True
 
-    completed = await execute(run, authority, corpus, embedder)
+    rebuilding = asyncio.create_task(execute(run, authority, corpus, embedder))
+    await asyncio.wait_for(authority.upsert_entered.wait(), timeout=1.0)
+    # A concurrent reader sees the old tuple while a shadow batch is waiting to commit.
+    assert authority.live == run.commitment.snapshot.live
+    authority.release_upsert.set()
+    completed = await asyncio.wait_for(rebuilding, timeout=1.0)
 
     assert completed.state is ReembedState.PUBLISHED
     assert completed.chunks_completed == 130
@@ -392,6 +456,22 @@ async def test_huge_document_build_is_keyset_paged_and_live_reads_stay_old_until
     assert [len(call) for call in embedder.calls] == [64, 64, 2]
     assert set(authority.live_during_upsert) == {"live-old"}
     assert authority.live.generation_id == completed.shadow_generation_id
+
+
+async def test_private_commitment_hides_snapshot_model_path_and_digests_from_repr() -> None:
+    authority = Authority()
+    corpus = synthetic_corpus(authority, 1, secret_uri=True)
+    embedder = CountingEmbedder()
+    private_path = "/synthetic/private/model/weights.bin"
+    embedder.fingerprint = embedder.fingerprint.model_copy(update={"weights_ref": private_path})
+
+    run = await prepare_run(authority, corpus, embedder, "private-commitment")
+
+    rendered = f"{run!r} {run.commitment!r} {run.commitment.plan!r}"
+    assert private_path not in rendered
+    assert "wiki.example.test" not in rendered
+    assert run.commitment.snapshot.id not in rendered
+    assert run.commitment.inventory_digest not in rendered
 
 
 async def test_prepare_is_create_if_absent_and_never_clears_resumed_rows() -> None:
@@ -424,11 +504,12 @@ async def test_prepare_refuses_to_rebind_an_existing_shadow_identity() -> None:
     original = await authority.open_or_create(
         run.id,
         fingerprint=embedder.fingerprint,
-        inventory_digest=run.plan.inventory_digest,
+        inventory_digest=run.commitment.chunk_inventory_digest,
         lease=lease,
     )
+    raw = corpus.raw_chunks(run.commitment.snapshot, make_document().id)[0]
     authority.rows[original.id]["sentinel"] = (
-        corpus.snapshots[run.plan.snapshot.id][make_document().id][1][0],
+        SnapshotChunk(raw, f"legacy:{raw.id}", raw.position + 1),
         (1.0,),
     )
 
@@ -462,7 +543,7 @@ async def test_publish_receipt_prevents_retry_from_rolling_newer_generation_back
     assert completed.state is ReembedState.PUBLISHED
 
 
-async def test_atomic_publication_cas_reports_superseded_without_touching_winner() -> None:
+async def test_publication_protocol_cas_reports_superseded_without_touching_winner() -> None:
     authority = Authority()
     corpus = synthetic_corpus(authority, 1)
     embedder = CountingEmbedder()
@@ -487,13 +568,14 @@ async def test_expired_owner_is_fenced_from_shadow_journal_and_publication_after
     generation = await authority.open_or_create(
         run.id,
         fingerprint=embedder.fingerprint,
-        inventory_digest=run.plan.inventory_digest,
+        inventory_digest=run.commitment.chunk_inventory_digest,
         lease=lease_a,
     )
     authority.advance(2.0)
     lease_b = await authority.acquire(run.id, "owner-b", ttl_seconds=10.0)
     assert lease_b.generation > lease_a.generation
-    chunk = corpus.snapshots[run.plan.snapshot.id][make_document().id][1][0]
+    chunk = corpus.raw_chunks(run.commitment.snapshot, make_document().id)[0]
+    stored_chunk = SnapshotChunk(chunk, f"legacy:{chunk.id}", chunk.position + 1)
 
     with pytest.raises(ReembedError, match="stale or expired"):
         await authority.renew(run.id, lease_a, ttl_seconds=5.0)
@@ -503,17 +585,17 @@ async def test_expired_owner_is_fenced_from_shadow_journal_and_publication_after
         await authority.open_or_create(
             run.id,
             fingerprint=embedder.fingerprint,
-            inventory_digest=run.plan.inventory_digest,
+            inventory_digest=run.commitment.chunk_inventory_digest,
             lease=lease_a,
         )
     with pytest.raises(ReembedError, match="stale or expired"):
-        await authority.upsert(generation, [chunk], [[1.0] * 5], lease=lease_a)
+        await authority.upsert(generation, [stored_chunk], [[1.0] * 5], lease=lease_a)
     with pytest.raises(ReembedError, match="stale or expired"):
         await authority.publish(
             run,
             generation,
-            expected=run.plan.snapshot.live,
-            expected_corpus_revision=run.plan.snapshot.revision,
+            expected=run.commitment.snapshot.live,
+            expected_corpus_revision=run.commitment.snapshot.revision,
             lease=lease_a,
         )
     assert authority.live.generation_id == "live-old"
@@ -541,9 +623,11 @@ async def test_complete_publication_identity_and_metadata_change_inventory_diges
     authority = Authority()
     corpus = synthetic_corpus(authority, 1)
     embedder = CountingEmbedder()
-    first = await plan_reembed(corpus, embedder.fingerprint)
-    document, chunks = corpus.current[make_document().id]
-    corpus.current[document.id] = (
+    first = await prepare_run(authority, corpus, embedder, "identity-1")
+    view = first.commitment.snapshot
+    document = (await corpus.document(view, make_document().id)).document  # type: ignore[union-attr]
+    chunks = corpus.raw_chunks(view, document.id)
+    corpus.replace_document(
         document.model_copy(
             update={
                 "publication_id": "publication-moved",
@@ -553,16 +637,12 @@ async def test_complete_publication_identity_and_metadata_change_inventory_diges
         chunks,
     )
 
-    second = await plan_reembed(corpus, embedder.fingerprint)
-    corpus.current_lineage[document.id] = (
-        "chunk-fingerprint",
-        "embed-fingerprint-moved",
-        "glossary-fingerprint",
-    )
-    third = await plan_reembed(corpus, embedder.fingerprint)
+    second = await prepare_run(authority, corpus, embedder, "identity-2")
+    corpus.replace_lineage(document.id, embed_fingerprint="embed-fingerprint-moved")
+    third = await prepare_run(authority, corpus, embedder, "identity-3")
 
-    assert first.inventory_digest != second.inventory_digest
-    assert second.inventory_digest != third.inventory_digest
+    assert first.commitment.inventory_digest != second.commitment.inventory_digest
+    assert second.commitment.inventory_digest != third.commitment.inventory_digest
 
 
 async def test_operational_embedder_change_omitted_from_canonical_identity_is_refused() -> None:
@@ -577,6 +657,44 @@ async def test_operational_embedder_change_omitted_from_canonical_identity_is_re
     with pytest.raises(ReembedError, match="context limit"):
         await execute(run, authority, corpus, changed)
     assert authority.generations == {}
+
+
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    [
+        ("vector_id", "physical chunk inventory"),
+        ("sequence", "physical chunk inventory"),
+        ("physical_key", "invalid chunk or embedding lineage"),
+        ("missing", "expected 2 rows"),
+    ],
+)
+async def test_inspection_recomputes_actual_physical_rows_and_rejects_corruption(
+    corruption: str, message: str
+) -> None:
+    authority = Authority()
+    corpus = synthetic_corpus(authority, 2)
+    embedder = CountingEmbedder(dimension=4)
+    run = await prepare_run(authority, corpus, embedder, f"corrupt-{corruption}")
+    authority.pause_inspection = True
+    rebuilding = asyncio.create_task(execute(run, authority, corpus, embedder))
+    await asyncio.wait_for(authority.inspection_entered.wait(), timeout=1.0)
+    generation_id = f"shadow:{run.id}"
+    rows = authority.rows[generation_id]
+    physical_id = next(iter(rows))
+    stored, vector = rows[physical_id]
+    if corruption == "vector_id":
+        rows[physical_id] = (replace(stored, vector_id="corrupt-vector-id"), vector)
+    elif corruption == "sequence":
+        rows[physical_id] = (replace(stored, sequence=stored.sequence + 100), vector)
+    elif corruption == "physical_key":
+        rows["wrong-physical-key"] = rows.pop(physical_id)
+    else:
+        rows.pop(physical_id)
+    authority.release_inspection.set()
+
+    with pytest.raises(ReembedValidationError, match=message):
+        await asyncio.wait_for(rebuilding, timeout=1.0)
+    assert authority.live.generation_id == "live-old"
 
 
 @pytest.mark.parametrize(
@@ -600,8 +718,8 @@ async def test_validation_faults_never_replace_live_generation(
         unique_chunks=1,
         dimension=4,
         finite=True,
-        fingerprint=run.plan.target_fingerprint,
-        inventory_digest=run.plan.inventory_digest,
+        fingerprint=run.commitment.target_fingerprint,
+        inventory_digest=run.commitment.chunk_inventory_digest,
         lineage_valid=True,
         retrieval_ready=True,
     )
