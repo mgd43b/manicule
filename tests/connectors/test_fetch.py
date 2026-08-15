@@ -10,11 +10,13 @@ different code path on the source's side.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
 from manicule.connectors import (
     AttachmentTooLargeError,
+    BodyUnavailableError,
     NotFoundError,
     RateLimitedError,
     UntrustedLinkError,
@@ -25,6 +27,7 @@ from manicule.connectors.confluence import (
     STORAGE_MEDIA_TYPE,
     VERSION_TOKEN,
 )
+from manicule.core.content import DocumentStatus
 from manicule.core.sources import DocRef
 from manicule.parsers.config import ADF_MEDIA_TYPE
 from tests.connectors.fake_confluence import (
@@ -35,6 +38,7 @@ from tests.connectors.fake_confluence import (
     paragraph,
 )
 from tests.connectors.support import cloud_config, connected, drain, server_config
+from tests.ingest.test_pipeline import build
 
 
 async def _fetched(instance: FakeConfluence, source_id: str, **overrides: object):  # noqa: ANN202
@@ -144,13 +148,11 @@ async def test_a_body_that_stays_stale_falls_back_to_storage_format() -> None:
     assert raw.metadata[VERSION_TOKEN] == "5"
 
 
-async def test_a_body_stale_in_every_format_is_stored_under_the_version_it_actually_has() -> None:
-    """This is what makes it self-healing, and why the honest token matters.
+async def test_a_body_stale_in_every_format_is_refused() -> None:
+    """No response can certify bytes older than discovery's version.
 
-    Recording the version that was *asked for* against older bytes would make the document
-    permanently stale: the next sync would compare the two, find them equal, and skip the page
-    forever. Recording what came back leaves the stored token behind, so the next sync fetches
-    it again.
+    The pipeline persists discovery's token, so returning version-four bytes here would store
+    them as version five and make the next sync skip the page as current forever.
     """
     instance = FakeConfluence(
         pages=[
@@ -159,10 +161,94 @@ async def test_a_body_stale_in_every_format_is_stored_under_the_version_it_actua
             )
         ]
     )
-    raw = await _fetched(instance, "1")
+    with pytest.raises(
+        BodyUnavailableError,
+        match=r"discovered at version 5.*Format \(version 4\).*storage format \(version 4\)",
+    ):
+        await _fetched(instance, "1")
 
-    assert raw.metadata[VERSION_TOKEN] == "4"
-    assert raw.metadata["version_disagreement"] == {"discovered": 5, "fetched": 4}
+
+async def test_stale_cloud_bytes_cannot_cross_the_connector_pipeline_boundary() -> None:
+    """The end-to-end guard for the token owner mismatch that caused permanent staleness.
+
+    Connector metadata can describe the fetched revision, but ingest deliberately persists the
+    discovery token. A connector-only assertion on metadata therefore cannot prove stale bytes
+    are safe; the real pipeline must see a failed fetch and store no document under version five.
+    """
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1", title="Page", space="ENG", version=5, served_version=4, storage_version=4
+            )
+        ]
+    )
+    connector = await connected(instance)
+    pipeline, store, _ = build()
+    try:
+        refused = await pipeline.run(connector)
+
+        assert refused.indexed == 0
+        assert refused.by_status[DocumentStatus.FAILED.value] == 1
+        assert refused.unrecorded == 1, "the watermark must not advance past the refused page"
+        assert connector.name not in store.watermarks
+        assert await store.find_document(connector.name, "1") is None, (
+            "no stored token may certify bytes the connector refused"
+        )
+
+        instance.pages["1"] = replace(
+            instance.pages["1"],
+            served_version=5,
+            storage_version=5,
+            adf=paragraph("current version five"),
+        )
+        recovered = await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    document = await store.find_document(connector.name, "1")
+    assert recovered.indexed == 1
+    assert document is not None
+    assert document.version_token == "5"  # noqa: S105 - a change token, not a credential
+    assert any("current version five" in chunk.text for chunk in store.chunks[document.id])
+    reached = connector.watermark
+    assert reached is not None
+    stored = store.watermarks[connector.name]
+    assert (stored.value, stored.metadata) == (reached.value, reached.metadata), (
+        "the first complete run, and only that run, advances the source position"
+    )
+
+
+async def test_a_stale_refresh_preserves_the_last_indexed_revision() -> None:
+    """Failing closed must not make an accurate older revision disappear from retrieval."""
+    instance = FakeConfluence(
+        pages=[
+            FakePage(id="1", title="Page", space="ENG", version=4, adf=paragraph("version four"))
+        ]
+    )
+    connector = await connected(instance)
+    pipeline, store, _ = build()
+    try:
+        await pipeline.run(connector)
+        before = await store.find_document(connector.name, "1")
+        assert before is not None
+        chunks_before = list(store.chunks[before.id])
+
+        instance.pages["1"] = replace(
+            instance.pages["1"], version=5, served_version=4, storage_version=4
+        )
+        refreshed = await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    after = await store.find_document(connector.name, "1")
+    assert refreshed.indexed == 1, "the preserved revision remains servable"
+    assert after is not None
+    assert after.version_token == "4", (  # noqa: S105 - a change token, not a credential
+        "the refused revision five was never certified"
+    )
+    assert after.content_hash == before.content_hash
+    assert store.chunks[after.id] == chunks_before
+    assert "BodyUnavailableError" in str(after.metadata["last_ingest_error"])
 
 
 async def test_an_attachment_is_downloaded_and_keeps_its_page() -> None:

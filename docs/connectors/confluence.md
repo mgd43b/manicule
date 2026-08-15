@@ -599,11 +599,11 @@ modification time or from `indexed_at`. The three timestamps are three separate 
 installation's — and a network fetch has no local snapshot at all, so this connector writes only
 the first.
 
-**A version disagreement cites the bytes that were kept.** When the stale-body defense (§4) ends
-up retaining an older body, the record states *that* body's version and *that* response's
-timestamp; the `version_disagreement` diagnostic survives beside it. A record naming the version
-manicule asked for would describe a revision this index does not hold, in the one field a reader
-would use to check.
+**A version disagreement never certifies older bytes.** When the stale-body defense (§4) cannot
+retrieve a body at least as new as discovery reported, the fetch fails and produces no provenance
+record. A page that changes during the sync can return a *newer* body; in that case the record
+states the retained body's version and timestamp, and the `version_disagreement` diagnostic
+survives beside it.
 
 **An attachment is cited as itself.** It gets its own content id, its own version, its own
 address and its own media type. The page it hangs off survives as a *relationship* — in
@@ -771,12 +771,13 @@ content. Validate that the returned `version.number` matches what discovery repo
 it does not, refetch, and then fall back to `storage` — a different code path on the source's
 side, which is the whole reason it is worth trying.
 
-**If every attempt is still stale, the body is stored under the version it actually carries.**
-This is the part that makes it self-healing, and it is worth being exact about. Recording the
-version that was *asked for* against older bytes would make the document permanently stale:
-the next sync would compare the two, find them equal, and skip the page forever. Recording
-what came back leaves the stored token behind what discovery reports, so the next sync fetches
-it again. The disagreement is recorded on the document either way.
+**If every attempt is still stale, the fetch fails closed.** This boundary is worth being exact
+about: ingest persists the version token from discovery, while the connector owns the fetched
+bytes. Returning an older body would therefore store those bytes under the newer discovery token;
+the next sync would find the tokens equal and skip the page forever. A failed fetch stores neither
+the stale bytes nor that token, so a later sync can retry without first trusting content it cannot
+date correctly. An already indexed revision remains available under the pipeline's ordinary
+failed-reingest policy.
 
 ## 5. ADF → chunks
 
