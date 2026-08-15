@@ -813,7 +813,8 @@ envelope instead of downloading the body again. The marker is removed only after
 Durable staging writes are joined before task cancellation returns. A process death can still
 leave a temporary staging file; acquisition startup and blob inventory remove only day-old
 partials, in bounded batches whose report contains aggregate counts rather than source names,
-URIs or envelope contents.
+URIs or envelope contents. Marker deletion and its parent-directory sync are likewise one joined
+operation, so repeated cancellation cannot return while the deletion is still non-durable.
 Authentication loss before that point leaves a typed retry and withholds the watermark;
 authentication loss afterwards cannot block parsing, embedding or publication because those
 phases make no connector calls. Missing, stale and deleted source bodies likewise remain typed

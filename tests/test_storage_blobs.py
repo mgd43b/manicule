@@ -134,6 +134,82 @@ async def test_directory_fsync_failure_creates_no_database_reference(
     async with engine.connect() as connection:
         count = (await connection.execute(text("SELECT COUNT(*) FROM blobs"))).scalar_one()
     assert count == 0
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+
+
+def test_raced_directory_creation_must_still_certify_its_parent(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer may create the shard and die before syncing its directory entry."""
+    target = data_dir / "race-parent" / "shard"
+    raced = target.parent
+    path_type = type(data_dir)
+    original_mkdir = path_type.mkdir
+    original_sync = BlobStore._fsync_directory  # pyright: ignore[reportPrivateUsage]
+
+    def raced_mkdir(path: Path, mode: int = 0o777, parents: bool = False) -> None:
+        if path == raced:
+            original_mkdir(path, mode=mode, parents=parents)
+            raise FileExistsError
+        original_mkdir(path, mode=mode, parents=parents)
+
+    def refusing_raced_parent_sync(path: Path) -> None:
+        if path == raced.parent:
+            msg = "synthetic raced-parent fsync refusal"
+            raise OSError(msg)
+        original_sync(path)
+
+    monkeypatch.setattr(path_type, "mkdir", raced_mkdir)
+    monkeypatch.setattr(BlobStore, "_fsync_directory", staticmethod(refusing_raced_parent_sync))
+
+    with pytest.raises(OSError, match="raced-parent fsync refusal"):
+        BlobStore._mkdir_durable(target)  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_staging_partial_is_private_while_live_and_after_publication_failure(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sensitive envelopes are 0600 at creation, not only after their write completes."""
+    blobs = BlobStore(engine, data_dir)
+    staging = blobs.root / "acquisition-staging"
+    destination = staging / "opaque-marker"
+    entered = threading.Event()
+    release = threading.Event()
+    original_fsync = os.fsync
+    write_durable = BlobStore._write_durable  # pyright: ignore[reportPrivateUsage]
+
+    def gated_file_sync(descriptor: int) -> None:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            entered.set()
+            assert release.wait(timeout=5)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", gated_file_sync)
+    write = asyncio.create_task(
+        asyncio.to_thread(write_durable, destination, b"private source metadata")
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    partial = next(staging.glob("*.partial"))
+    assert stat.S_IMODE(partial.stat().st_mode) == 0o600
+    release.set()
+    await write
+
+    original_directory_sync = BlobStore._fsync_directory  # pyright: ignore[reportPrivateUsage]
+
+    def refusing_publication_sync(path: Path) -> None:
+        if path == staging:
+            msg = "synthetic staging directory fsync refusal"
+            raise OSError(msg)
+        original_directory_sync(path)
+
+    monkeypatch.setattr(os, "fsync", original_fsync)
+    monkeypatch.setattr(BlobStore, "_fsync_directory", staticmethod(refusing_publication_sync))
+    failed_destination = staging / "failed-marker"
+    with pytest.raises(OSError, match="staging directory fsync refusal"):
+        await asyncio.to_thread(write_durable, failed_destination, b"private failed metadata")
+    assert stat.S_IMODE(failed_destination.stat().st_mode) == 0o600
 
 
 async def test_cancelled_staging_write_is_joined_before_cancellation_returns(
@@ -175,6 +251,48 @@ async def test_cancelled_staging_write_is_joined_before_cancellation_returns(
     staging = blobs.root / "acquisition-staging"
     assert not list(staging.glob("*.partial"))
     assert len([path for path in staging.iterdir() if path.is_file()]) == 1
+
+
+async def test_cancelled_marker_completion_waits_for_parent_fsync(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A committed association cannot return while its marker deletion is non-durable."""
+    blobs = BlobStore(engine, data_dir)
+    raw = RawDocument(
+        source_id="completed-id",
+        uri="https://private.invalid/completed",
+        media_type="text/plain",
+        content="completed body",
+    )
+    await blobs.retain_acquisition("run\0completed-id", raw)
+    staging = blobs.root / "acquisition-staging"
+    marker = next(path for path in staging.iterdir() if not path.name.endswith(".partial"))
+    entered = threading.Event()
+    release = threading.Event()
+    original = BlobStore._fsync_directory  # pyright: ignore[reportPrivateUsage]
+
+    def gated_sync(path: Path) -> None:
+        if path == staging:
+            assert not marker.exists()
+            entered.set()
+            assert release.wait(timeout=5)
+        original(path)
+
+    monkeypatch.setattr(BlobStore, "_fsync_directory", staticmethod(gated_sync))
+    task = asyncio.create_task(blobs.complete_acquisition("run\0completed-id"))
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done(), "repeated cancellation returned before the directory sync"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not marker.exists()
 
 
 async def test_stale_staging_partial_cleanup_is_bounded_and_aggregate_only(

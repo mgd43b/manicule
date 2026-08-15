@@ -136,10 +136,10 @@ class BlobStore:
             missing.append(cursor)
             cursor = cursor.parent
         for directory in reversed(missing):
-            try:
+            # A peer may win creation and die before syncing the new name. This contender
+            # must still certify the ancestor before it builds beneath that directory.
+            with contextlib.suppress(FileExistsError):
                 directory.mkdir(mode=0o700)
-            except FileExistsError:
-                continue
             cls._fsync_directory(directory.parent)
 
     @classmethod
@@ -147,11 +147,15 @@ class BlobStore:
         cls._mkdir_durable(destination.parent)
         temporary = destination.with_name(f"{destination.name}.{uuid4().hex}.partial")
         try:
-            with temporary.open("wb") as handle:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            temporary.chmod(0o600)
             temporary.replace(destination)
             cls._fsync_directory(destination.parent)
         finally:
@@ -169,11 +173,15 @@ class BlobStore:
         cls._mkdir_durable(destination.parent)
         temporary = destination.with_name(f"{destination.name}.{uuid4().hex}.partial")
         try:
-            with temporary.open("xb") as handle:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            temporary.chmod(0o600)
             with contextlib.suppress(FileExistsError):
                 os.link(temporary, destination)
             cls._fsync_directory(destination.parent)
@@ -386,10 +394,17 @@ class BlobStore:
     async def complete_acquisition(self, key: str) -> None:
         """Remove a staging marker only after the journal association commits."""
         path = self._stage_path(key)
-        if not path.exists():
-            return
-        await asyncio.to_thread(path.unlink)
-        await asyncio.to_thread(self._fsync_directory, path.parent)
+        await self._durable_thread_call(lambda: self._unlink_durable(path))
+
+    @classmethod
+    def _unlink_durable(cls, path: Path) -> None:
+        """Unlink a name and durably record its absence as one joined operation."""
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            if not path.parent.exists():
+                return
+        cls._fsync_directory(path.parent)
 
     async def _staged_blob_refs(self) -> set[str]:
         await self.cleanup_staging_partials()

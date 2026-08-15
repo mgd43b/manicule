@@ -113,6 +113,10 @@ representation. Concurrent writers publish with an atomic no-clobber hard link a
 winning representation before recording its descriptor. This remains coherent across processes:
 every contender fsyncs the destination directory before its SQLite write, and all contenders
 derive the same compression and stored-size fields from the one immutable file.
+Shard creation follows the same rule even when another process wins `mkdir`: the losing process
+still syncs the parent, certifying a peer's new name before relying on it. Temporary blob and
+acquisition files are created exclusively with mode `0600`, before any source bytes or metadata
+are written; privacy never depends on a later `chmod` surviving a crash.
 
 **Minimum SQLite 3.35**, checked at startup and reported by `doctor`, along with a probe that
 actually creates a temporary FTS5 table. Python's `sqlite3` links against whatever the
