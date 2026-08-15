@@ -395,6 +395,11 @@ auth_app = typer.Typer(
 collection_app = typer.Typer(
     help="Named sets of documents.", no_args_is_help=True, cls=CommandsShareTheRootOptions
 )
+reembed_app = typer.Typer(
+    help="Offline, resumable whole-index embedding migration.",
+    no_args_is_help=True,
+    cls=CommandsShareTheRootOptions,
+)
 app.add_typer(document_app, name="document")
 app.add_typer(collection_app, name="collection")
 app.add_typer(connector_app, name="connector")
@@ -402,6 +407,7 @@ app.add_typer(workspace_app, name="workspace")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(config_app, name="config")
 app.add_typer(auth_app, name="auth")
+app.add_typer(reembed_app, name="reembed")
 
 
 JsonOption = Annotated[bool, typer.Option("--json", help=JSON_HELP)]
@@ -583,6 +589,12 @@ PAYLOADS: dict[str, type[Payload]] = {
     "document_reindex": r.DocumentReindexed,
     "document_reindex_stale": r.StaleReparseReport,
     "document_redetect_glossary": r.StaleGlossaryReport,
+    "reembed_plan": r.ReembedPlanReport,
+    "reembed_start": r.ReembedRunReport,
+    "reembed_resume": r.ReembedRunReport,
+    "reembed_status": r.ReembedRunReport,
+    "reembed_abandon": r.ReembedRunReport,
+    "reembed_cleanup": r.ReembedCleanupReport,
     "doctor": r.Diagnosis,
     "connector_list": r.ConnectorList,
     "connector_login": r.ConnectorSignedIn,
@@ -927,6 +939,55 @@ def document_reindex(
         submit(Command("document_redetect_glossary", {"batch": batch, "dry_run": dry_run}))
         return
     submit(Command("document_reindex_stale", {"batch": batch, "dry_run": dry_run}))
+
+
+# --- whole-index re-embedding ---------------------------------------------------------------
+
+
+@reembed_app.command("plan")
+def reembed_plan() -> None:
+    """Price the configured migration; makes zero connector, parser, or embedding calls."""
+    submit(Command("reembed_plan"))
+
+
+@reembed_app.command("start")
+def reembed_start() -> None:
+    """Create a durable migration and return its recovery id before embedding begins."""
+    submit(Command("reembed_start"))
+
+
+@reembed_app.command("execute")
+@reembed_app.command("resume")
+def reembed_resume(
+    run_id: Annotated[str, typer.Argument(help="Run id returned by `reembed start`.")],
+) -> None:
+    """Execute or resume a run after a crash or transient refusal."""
+    submit(Command("reembed_resume", {"run_id": run_id}))
+
+
+@reembed_app.command("inspect")
+@reembed_app.command("status")
+def reembed_status(
+    run_id: Annotated[str, typer.Argument(help="Run id returned by `reembed start`.")],
+) -> None:
+    """Show aggregate durable progress without source identifiers or paths."""
+    emit("reembed_status", lambda service: service.reembed_status(run_id))
+
+
+@reembed_app.command("abandon")
+def reembed_abandon(
+    run_id: Annotated[str, typer.Argument(help="Unfinished run to make cleanup-eligible.")],
+) -> None:
+    """Stop an unfinished run without touching the live generation."""
+    submit(Command("reembed_abandon", {"run_id": run_id}))
+
+
+@reembed_app.command("cleanup")
+def reembed_cleanup(
+    run_id: Annotated[str, typer.Argument(help="Failed or superseded run to remove.")],
+) -> None:
+    """Delete terminal non-live shadow storage."""
+    submit(Command("reembed_cleanup", {"run_id": run_id}))
 
 
 # --- collection -------------------------------------------------------------------------------

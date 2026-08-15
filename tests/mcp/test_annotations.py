@@ -238,6 +238,7 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
     which is the only branch of it that opens a connection.
     """
     service, backend = await build_fixture()
+    await backend.ingestion_.reembed_start("read-run", "owner")
     document_id = next(iter(backend.store.documents))
     collection_id = next(iter(backend.organization_.collections))
 
@@ -246,6 +247,7 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
         "document_list": {},
         "document_get": {"document_id": document_id, "chunks": True},
         "index_status": {},
+        "reembed_status": {"run_id": "read-run"},
         "stats": {},
         "doctor": {},
         "connector_list": {},

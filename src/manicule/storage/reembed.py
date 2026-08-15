@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from pydantic import TypeAdapter
-from sqlalchemy import delete, insert, or_, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from manicule.core.content import Chunk
@@ -78,6 +78,27 @@ class SqliteReembedCorpus:
 
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
+
+    async def discard_snapshot(self, snapshot_id: str) -> None:
+        """Remove an unreferenced planning snapshot and its cascaded rows."""
+        async with self._engine.begin() as connection:
+            referenced = (
+                await connection.execute(
+                    select(models.ReembedRunRecord.id)
+                    .where(
+                        func.json_extract(models.ReembedRunRecord.commitment_json, "$.snapshot.id")
+                        == snapshot_id
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if referenced is not None:
+                raise ReembedError("a snapshot bound to a durable run cannot be discarded")
+            await connection.execute(
+                delete(models.ReembedCorpusSnapshot).where(
+                    models.ReembedCorpusSnapshot.id == snapshot_id
+                )
+            )
 
     async def begin_snapshot(self) -> CorpusSnapshot:
         snapshot_id = f"snapshot-{uuid.uuid4().hex}"
@@ -482,6 +503,24 @@ class SqliteReembedStore:
             )
             await self._require_lease(connection, run_id, renewed)
             return renewed
+
+    async def release(self, run_id: str, lease: ReembedLease) -> None:
+        """Expire the exact current fenced lease in one SQLite write transaction."""
+        async with self._immediate() as connection:
+            await self._require_lease(connection, run_id, lease)
+            now = self._clock()
+            changed = await connection.execute(
+                update(models.ReembedRunRecord)
+                .where(
+                    models.ReembedRunRecord.id == run_id,
+                    models.ReembedRunRecord.lease_owner == lease.owner_token,
+                    models.ReembedRunRecord.lease_generation == lease.generation,
+                    models.ReembedRunRecord.lease_expires_at == lease.expires_at,
+                )
+                .values(lease_expires_at=now, updated_at=utcnow())
+            )
+            if changed.rowcount != 1:
+                raise ReembedError("stale or expired re-embedding lease")
 
     async def assert_current(self, run_id: str, lease: ReembedLease) -> None:
         """Check a fence without holding it across subsequent non-SQLite work."""

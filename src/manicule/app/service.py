@@ -22,10 +22,12 @@ structured content are the same bytes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import platform
+import secrets
 import time
 import tomllib
 from dataclasses import dataclass
@@ -73,6 +75,7 @@ if TYPE_CHECKING:
     from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
     from manicule.generation.ports import ConversationRecord
     from manicule.ingest.pipeline import RunReport, Watching
+    from manicule.ingest.reembed import ReembedRun
     from manicule.parsers.config import SourceCodeConfig
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
@@ -118,6 +121,36 @@ Named rather than written as a literal because the number *is* the definition of
 definition is a definition, and a "conflict" reported with a single candidate is a warning a
 reader cannot act on.
 """
+
+
+def _reembed_run_report(run: ReembedRun) -> r.ReembedRunReport:
+    """Public aggregate projection of a private durable re-embedding commitment."""
+    from manicule.ingest.reembed import ReembedState  # noqa: PLC0415
+
+    plan = run.commitment.plan
+    remaining_chunks = max(0, plan.chunks - run.chunks_completed)
+    seconds_per_chunk = plan.estimated_seconds / plan.chunks if plan.chunks else 0.0
+    terminal = run.state in {
+        ReembedState.PUBLISHED,
+        ReembedState.SUPERSEDED,
+        ReembedState.FAILED,
+    }
+    return r.ReembedRunReport(
+        run_id=run.id,
+        state=run.state.value,
+        documents=plan.documents,
+        chunks=plan.chunks,
+        documents_completed=run.documents_completed,
+        chunks_completed=run.chunks_completed,
+        estimated_remaining_seconds=remaining_chunks * seconds_per_chunk,
+        retry_required=not terminal,
+        terminal=terminal,
+        published=run.state is ReembedState.PUBLISHED,
+        target_identity=hashlib.sha256(
+            run.commitment.target_fingerprint.encode("utf-8")
+        ).hexdigest(),
+        target_dimension=run.commitment.target_dimension,
+    )
 
 
 @dataclass(slots=True)
@@ -1200,6 +1233,58 @@ class ApplicationService:
             status = "unchanged"
         return r.DocumentReindexed(
             document_id=document_id, status=status, chunks=report.chunks, detail=detail
+        )
+
+    async def reembed_plan(self) -> r.ReembedPlanReport:
+        """Price the exact configured embedder migration without embedding or source access."""
+        ingestion = await self._backend.ingestion()
+        plan, target_identity, target_dimension = await ingestion.reembed_plan()
+        return r.ReembedPlanReport(
+            documents=plan.documents,
+            chunks=plan.chunks,
+            input_bytes=plan.input_bytes,
+            estimated_seconds=plan.estimated_seconds,
+            peak_memory_bytes=plan.peak_memory_bytes,
+            temporary_disk_bytes=plan.temporary_disk_bytes,
+            unrepairable_documents=plan.unrepairable_documents,
+            target_identity=target_identity,
+            target_dimension=target_dimension,
+        )
+
+    async def reembed_start(self) -> r.ReembedRunReport:
+        """Create a durable plan and return its recovery id before embedding begins."""
+        ingestion = await self._backend.ingestion()
+        run = await ingestion.reembed_start(secrets.token_hex(16), secrets.token_urlsafe(24))
+        return _reembed_run_report(run)
+
+    async def reembed_resume(self, run_id: str) -> r.ReembedRunReport:
+        """Resume one durable migration after a process exit or transient refusal."""
+        ingestion = await self._backend.ingestion()
+        return _reembed_run_report(
+            await ingestion.reembed_resume(run_id, secrets.token_urlsafe(24))
+        )
+
+    async def reembed_status(self, run_id: str) -> r.ReembedRunReport:
+        """Read aggregate durable progress without exposing snapshot or source identities."""
+        ingestion = await self._backend.ingestion()
+        run = await ingestion.reembed_status(run_id)
+        if run is None:
+            raise UnknownEntityError("no durable re-embedding run has that id")
+        return _reembed_run_report(run)
+
+    async def reembed_abandon(self, run_id: str) -> r.ReembedRunReport:
+        """Mark one unfinished run failed so its unpublished generation can be cleaned."""
+        ingestion = await self._backend.ingestion()
+        return _reembed_run_report(
+            await ingestion.reembed_abandon(run_id, secrets.token_urlsafe(24))
+        )
+
+    async def reembed_cleanup(self, run_id: str) -> r.ReembedCleanupReport:
+        """Remove only terminal, non-live shadow storage for one durable run."""
+        ingestion = await self._backend.ingestion()
+        return r.ReembedCleanupReport(
+            run_id=run_id,
+            removed=await ingestion.reembed_cleanup(run_id),
         )
 
     async def document_reindex_stale(

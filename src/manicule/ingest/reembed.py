@@ -2,8 +2,8 @@
 
 This module is the storage-independent orchestration contract. The built-in SQLite journal,
 durable corpus snapshots, fenced publisher, and named Lance generations live in
-:mod:`manicule.storage.reembed`. Operator-facing service and CLI surfaces remain separate
-issue #187 work.
+:mod:`manicule.storage.reembed`. The application runtime wires those adapters to the local
+operator workflow; this module remains independent of every delivery surface.
 
 The protocols expose no connector, parser, or blob fallback. A rebuild reads only stored
 documents and their exact ``Chunk.embed_text`` inputs, writes an unpublished generation, and
@@ -279,6 +279,10 @@ class ReembedValidationError(ReembedError):
     """A complete shadow generation failed a publication prerequisite."""
 
 
+class ReembedCapacityError(ReembedError):
+    """Local capacity cannot safely hold the planned shadow generation."""
+
+
 class ReembedCorpus(Protocol):
     """Stable, bounded local reads. Implementations must never contact a source."""
 
@@ -329,6 +333,10 @@ class ReembedJournal(Protocol):
     async def renew(
         self, run_id: str, lease: ReembedLease, *, ttl_seconds: float
     ) -> ReembedLease: ...
+
+    async def release(self, run_id: str, lease: ReembedLease) -> None:
+        """Atomically expire exactly the current fence; stale owners cannot release a winner."""
+        ...
 
     async def save(
         self, run: ReembedRun, *, expected_revision: int, lease: ReembedLease
@@ -417,9 +425,28 @@ async def plan_reembed(
     A concrete corpus may persist an immutable local snapshot so a later rebuild can resume
     from exactly what was priced.
     """
+    commitment = await plan_reembed_commitment(
+        corpus,
+        target,
+        document_page=document_page,
+        target_batch_tokens=target_batch_tokens,
+        chunks_per_second=chunks_per_second,
+    )
+    return commitment.plan
+
+
+async def plan_reembed_commitment(
+    corpus: ReembedCorpus,
+    target: EmbedFingerprint,
+    *,
+    document_page: int = DEFAULT_DOCUMENT_PAGE,
+    target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
+    chunks_per_second: float = DEFAULT_CHUNKS_PER_SECOND,
+) -> ReembedCommitment:
+    """Build the private durable commitment behind a public aggregate plan."""
     _validate_knobs(document_page, target_batch_tokens, chunks_per_second)
     snapshot = await corpus.begin_snapshot()
-    commitment = await _plan_snapshot(
+    return await _plan_snapshot(
         corpus,
         snapshot,
         target,
@@ -427,7 +454,6 @@ async def plan_reembed(
         target_batch_tokens=target_batch_tokens,
         chunks_per_second=chunks_per_second,
     )
-    return commitment.plan
 
 
 async def start_reembed(
@@ -441,29 +467,34 @@ async def start_reembed(
     target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
     chunks_per_second: float = DEFAULT_CHUNKS_PER_SECOND,
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS,
+    commitment: ReembedCommitment | None = None,
 ) -> ReembedRun:
     _validate_owner(owner_token, lease_ttl_seconds)
-    _validate_knobs(document_page, target_batch_tokens, chunks_per_second)
-    snapshot = await corpus.begin_snapshot()
-    commitment = await _plan_snapshot(
-        corpus,
-        snapshot,
-        target,
-        document_page=document_page,
-        target_batch_tokens=target_batch_tokens,
-        chunks_per_second=chunks_per_second,
-    )
+    if commitment is None:
+        commitment = await plan_reembed_commitment(
+            corpus,
+            target,
+            document_page=document_page,
+            target_batch_tokens=target_batch_tokens,
+            chunks_per_second=chunks_per_second,
+        )
+    elif commitment.target_fingerprint != target.canonical():
+        raise ReembedError("the prepared commitment belongs to another target embedder")
     if not commitment.plan.runnable:
         raise PolicyError(
             f"{commitment.plan.unrepairable_documents} document(s) have no stored chunks. "
             "Re-embedding never falls back to a connector or parser; repair local inputs first."
         )
-    run, _ = await journal.create(
+    run, lease = await journal.create(
         run_id,
         commitment,
         owner_token=owner_token,
         ttl_seconds=lease_ttl_seconds,
     )
+    # ``start`` is an operator-visible recovery checkpoint, not the expensive worker phase.
+    # Hand the lease back before returning so a later command/process can acquire a fresh fence
+    # immediately instead of spuriously refusing for the full TTL.
+    await journal.release(run.id, lease)
     return run
 
 
@@ -871,6 +902,7 @@ __all__ = [
     "LivePublication",
     "PublicationReceipt",
     "PublishOutcome",
+    "ReembedCapacityError",
     "ReembedCommitment",
     "ReembedCorpus",
     "ReembedError",
@@ -889,6 +921,7 @@ __all__ = [
     "SnapshotDocument",
     "SnapshotInventoryDigester",
     "plan_reembed",
+    "plan_reembed_commitment",
     "resume_reembed",
     "start_reembed",
 ]

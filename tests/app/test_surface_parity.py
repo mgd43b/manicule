@@ -106,12 +106,12 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
 # --- the surfaces offer what they say they offer ---------------------------------------------
 
 
-def test_the_server_offers_exactly_twenty_eight_tools(service: ApplicationService) -> None:
-    """Twenty-eight, named, and matching the list the ticket specifies."""
+def test_the_server_offers_exactly_twenty_nine_tools(service: ApplicationService) -> None:
+    """Twenty-nine, named, and matching the declared surface."""
     server = build_server(service)
     offered = sorted(tool.name for tool in asyncio.run(server.list_tools()))
     assert offered == sorted(TOOL_NAMES)
-    assert len(offered) == 28
+    assert len(offered) == 29
 
 
 def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:
@@ -167,14 +167,26 @@ def test_no_tool_re_parses_the_whole_corpus() -> None:
     )
 
 
-def test_the_command_line_offers_exactly_twenty_one_commands() -> None:
+def test_only_private_safe_reembed_status_is_an_mcp_tool() -> None:
+    """Corpus scans and accelerator work stay local; one aggregate journal read has parity."""
+    assert "reembed_status" in TOOL_NAMES
+    assert {
+        "reembed_plan",
+        "reembed_start",
+        "reembed_resume",
+        "reembed_abandon",
+        "reembed_cleanup",
+    }.isdisjoint(TOOL_NAMES)
+
+
+def test_the_command_line_offers_exactly_twenty_two_commands() -> None:
     """Counted from the built command tree rather than from the source.
 
     A command registered on a sub-application and never attached would be in the file and not
     in the interface, which is the kind of thing a source-level count misses.
 
-    ``serve`` and ``start`` are one function registered under two names, and the count says
-    twenty-one rather than twenty because that is what somebody typing ``manicule --help`` sees.
+    ``serve`` and ``start`` are one function registered under two names, and the count includes
+    both because that is what somebody typing ``manicule --help`` sees.
     ``serve`` is the name the documentation uses and the one every refusal names, because it
     says what the process does; ``start`` is what scripts and habits already type, so it is kept
     rather than broken.
@@ -198,6 +210,7 @@ def test_the_command_line_offers_exactly_twenty_one_commands() -> None:
         "index",
         "init",
         "plugin",
+        "reembed",
         "reset-index",
         "search",
         "serve",
@@ -206,7 +219,7 @@ def test_the_command_line_offers_exactly_twenty_one_commands() -> None:
         "upgrade",
         "workspace",
     ]
-    assert len(names) == 21
+    assert len(names) == 22
 
 
 def test_only_the_command_line_can_ask_doctor_to_repair_anything(
@@ -360,6 +373,13 @@ PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
     ),
     ("plugin_list", {}, ["plugin", "list"], ("GET", "/api/v1/plugins", {}), None),
     ("config_get", {"key": "rag.profile"}, ["config", "get", "rag.profile"], None, None),
+    (
+        "reembed_status",
+        {"run_id": "missing-run"},
+        ["reembed", "status", "missing-run"],
+        ("GET", "/api/v1/admin/reembed/missing-run", {}),
+        None,
+    ),
     (
         "collection_list",
         {},

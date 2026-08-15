@@ -11,7 +11,7 @@ not to be asked a cross-tenant question.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, override
@@ -50,6 +50,14 @@ from manicule.generation.ports import (
 )
 from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.ingest.pipeline import RunReport, Watching
+from manicule.ingest.reembed import (
+    CorpusSnapshot,
+    LivePublication,
+    ReembedCommitment,
+    ReembedPlan,
+    ReembedRun,
+    ReembedState,
+)
 from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
 from manicule.retrieval.retriever import RetrievalResult
 from manicule.storage.organization import normalize_name
@@ -762,6 +770,7 @@ class FakeIngestion:
     paths: list[Path] = field(default_factory=list[Path])
     synced: list[str] = field(default_factory=list[str])
     reindexed: list[str] = field(default_factory=list[str])
+    reembed_runs: dict[str, ReembedRun] = field(default_factory=dict[str, ReembedRun])
     imported: list[Path] = field(default_factory=list[Path])
     connectors: dict[str, object] = field(default_factory=dict[str, object])
     """Constructed connectors, by instance name, for :meth:`connector`.
@@ -862,6 +871,68 @@ class FakeIngestion:
     async def reindex(self, document_id: str) -> ReindexReport:
         self.reindexed.append(document_id)
         return ReindexReport(documents=1, chunks=3)
+
+    @staticmethod
+    def _reembed_run(run_id: str) -> ReembedRun:
+        live = LivePublication("live", "old-fingerprint", "inventory")
+        return ReembedRun(
+            id=run_id,
+            commitment=ReembedCommitment(
+                plan=ReembedPlan(
+                    documents=2,
+                    chunks=7,
+                    input_bytes=101,
+                    estimated_seconds=3.5,
+                    peak_memory_bytes=2048,
+                    temporary_disk_bytes=4096,
+                ),
+                snapshot=CorpusSnapshot("private-snapshot", "revision", live),
+                target_fingerprint="private-target-config",
+                target_config="private-weights-path",
+                target_dimension=5,
+                inventory_digest="private-inventory",
+                chunk_inventory_digest="private-chunks",
+            ),
+        )
+
+    async def reembed_plan(self) -> tuple[ReembedPlan, str, int]:
+        run = self._reembed_run("dry-run")
+        return run.commitment.plan, "aggregate-target-identity", 5
+
+    async def reembed_start(self, run_id: str, owner_token: str) -> ReembedRun:
+        del owner_token
+        run = self._reembed_run(run_id)
+        self.reembed_runs[run_id] = run
+        return run
+
+    async def reembed_resume(self, run_id: str, owner_token: str) -> ReembedRun:
+        del owner_token
+        run = self.reembed_runs.get(run_id)
+        if run is None:
+            raise UnknownEntityError("no durable re-embedding run has that id")
+        run = replace(
+            run,
+            state=ReembedState.PUBLISHED,
+            documents_completed=run.commitment.plan.documents,
+            chunks_completed=run.commitment.plan.chunks,
+        )
+        self.reembed_runs[run_id] = run
+        return run
+
+    async def reembed_status(self, run_id: str) -> ReembedRun | None:
+        return self.reembed_runs.get(run_id)
+
+    async def reembed_abandon(self, run_id: str, owner_token: str) -> ReembedRun:
+        del owner_token
+        run = self.reembed_runs.get(run_id)
+        if run is None:
+            raise UnknownEntityError("no durable re-embedding run has that id")
+        run = replace(run, state=ReembedState.FAILED, failure="abandoned")
+        self.reembed_runs[run_id] = run
+        return run
+
+    async def reembed_cleanup(self, run_id: str) -> bool:
+        return self.reembed_runs.pop(run_id, None) is not None
 
     async def reparse_stale(self, *, batch: int, dry_run: bool = False) -> StaleSweep:
         self.sweeps.append((batch, dry_run))

@@ -46,6 +46,17 @@ async def stats(service: Service, caller: AdminPrincipal) -> Response:
     return await respond("index_status", service, service.index_status)
 
 
+@router.get(
+    "/reembed/{run_id}",
+    name="reembed_status",
+    summary="Aggregate progress for a durable re-embedding run.",
+)
+async def reembed_status(service: Service, caller: AdminPrincipal, run_id: str) -> Response:
+    """Read private-safe progress; starting or executing migrations remains operator-only."""
+    del caller
+    return await respond("reembed_status", service, lambda: service.reembed_status(run_id))
+
+
 @router.get("/query-logs", name="query_logs", summary="Retrieval telemetry, newest first.")
 async def query_logs(
     service: Service,

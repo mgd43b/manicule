@@ -181,6 +181,37 @@ async def test_on_disk_shadow_validates_publishes_and_runtime_follows_pointer(
     await live.teardown()
 
 
+async def test_lease_release_is_fenced_and_allows_immediate_worker_handoff(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    clock = Clock()
+    authority, _, run, lease_a, _, _, _, _ = await seeded_run(
+        engine, store, data_dir, clock, run_id="release-fence"
+    )
+    clock.advance(31.0)
+    lease_b = await authority.acquire(run.id, "owner-b", ttl_seconds=30.0)
+
+    with pytest.raises(ReembedError, match="stale or expired"):
+        await authority.release(run.id, lease_a)
+    await authority.assert_current(run.id, lease_b)
+
+    await authority.release(run.id, lease_b)
+    lease_c = await authority.acquire(run.id, "owner-c", ttl_seconds=30.0)
+    assert lease_c.generation > lease_b.generation
+
+
+async def test_a_snapshot_bound_to_a_durable_run_cannot_be_discarded(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    clock = Clock()
+    _, _, run, _, _, _, _, corpus = await seeded_run(
+        engine, store, data_dir, clock, run_id="bound-snapshot"
+    )
+
+    with pytest.raises(ReembedError, match="bound to a durable run"):
+        await corpus.discard_snapshot(run.commitment.snapshot.id)
+
+
 async def test_orchestration_resumes_idempotently_across_concrete_adapter_instances(
     engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
 ) -> None:

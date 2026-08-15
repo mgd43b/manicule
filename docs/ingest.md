@@ -1130,7 +1130,7 @@ of the blast-radius ladder (`storage.md` §1):
 |---|---|---|---|---|
 | **re-detect glossary** | `chunks.text` | 0 | none | `document reindex --stale-glossary` |
 | `repair` | `chunks` | 1–2 | none | `ingest.reindex.repair`, no command |
-| `re-embed` | `chunks.embed_text` | 2 | none | `ingest.reindex.re_embed`, no command |
+| **re-embed** | `chunks.embed_text` | 2 | none | `reembed plan/start/execute/status/abandon/cleanup` |
 | **re-parse** | `blobs` | 3 | none | `document reindex <id>`, `document reindex --stale` |
 | a forced sync | the source | 4 | yes, rate-limited, **may fail** | `index <path> --reindex`, for a path |
 
@@ -1154,10 +1154,8 @@ not reproducible. Everything above it is a pure function of what is already on d
 the whole return on retaining bytes, and it is why re-parse is a first-class verb rather
 than a flag on sync.
 
-The right-hand column is there because most of this table is **not** an operator-facing command,
-and listing them all as commands would describe an interface nobody can type. Repair runs on the
-recovery path and re-embed has no shipped surface at all, so both are reachable only from
-Python. Re-parse has both ends of its verb. And rung 4 ships for a *path* — `index <path>
+The right-hand column is there because not every rung is an operator-facing command. Repair runs
+on the recovery path. Re-embed and re-parse have explicit verbs. And rung 4 ships for a *path* — `index <path>
 --reindex` skips change detection — while a configured connector has no `--force`, so the only
 way to make one re-fetch today is to change what the source reports.
 
@@ -1548,6 +1546,50 @@ whether the machine spends an afternoon embedding, and finding that out from the
 the one way nobody should have to find it out.
 
 ---
+
+### 10.3 Durable whole-index re-embedding
+
+```
+manicule reembed plan
+manicule reembed start
+manicule reembed execute RUN_ID     # `resume` is an alias
+manicule reembed status RUN_ID      # `inspect` is an alias
+manicule reembed abandon RUN_ID
+manicule reembed cleanup RUN_ID
+```
+
+This workflow reads the authoritative SQLite document and chunk rows into an immutable,
+keyset-readable snapshot. It never calls a connector, blob fallback, parser or chunker. `plan`
+also makes **zero embedding forward passes**: it reports aggregate document/chunk/input counts,
+bounded peak-memory and temporary-disk estimates, elapsed-time estimate, target dimension and a
+one-way target identity. The transient plan snapshot is deleted before the command returns.
+Source ids, URIs, snapshot/revision handles, weights paths, complete configuration and inventory
+digests never cross an operator or network surface.
+
+`start` performs the same exact-target plan, checks local temporary capacity, persists the
+complete snapshot and journal row, releases its fenced planning lease, and returns the recovery
+id **before embedding starts**. A capacity refusal is typed, nonzero, and leaves neither an
+unreachable run nor a retained transient snapshot. `execute`/`resume` acquires a new
+monotonically fenced lease, builds a named shadow generation in bounded pages, checkpoints after
+each page, independently inspects every retrieval-critical stored field, seals the exact digest,
+then asks SQLite for one atomic pointer/fingerprint/inventory compare-and-swap. Live reads stay on
+the old generation throughout the build. A process exit is recovered by running `resume` with
+the same id; publication receipts make a publish-before-checkpoint retry return the original
+winner rather than roll a newer one back.
+
+After a successful publication the runtime explicitly prepares its long-lived pointer-following
+vector handle for the configured target. A handle still prepared for the old fingerprint refuses
+searches and writes with `VectorStoreReprepareRequiredError`, including same-dimension changes;
+it never silently applies an old embedder to the new generation. Cleanup obtains an exclusive
+generation pin and only removes failed or superseded, non-live storage, so an in-flight reader
+cannot lose its directory. `abandon` makes an unfinished run terminal without moving the live
+pointer.
+
+Runs are intentionally **not scheduled or auto-resumed**. This is a corpus-sized,
+accelerator-consuming operator migration, so restart recovery is explicit: `status` is safe to
+poll, and `resume` is the decision to spend the remaining resources. The local CLI alone can
+plan, execute, abandon or clean. Aggregate `reembed_status` is also available as the read-only
+MCP tool and `GET /api/v1/admin/reembed/{run_id}`; no browser page lists opaque run ids.
 
 ## 11. `reconcile()` and deletion
 

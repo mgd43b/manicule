@@ -134,6 +134,10 @@ class Authority:
         self.leases[run_id] = renewed
         return renewed
 
+    async def release(self, run_id: str, lease: ReembedLease) -> None:
+        self._assert_lease(run_id, lease)
+        self.leases[run_id] = replace(lease, expires_at=self.now)
+
     async def save(
         self, run: ReembedRun, *, expected_revision: int, lease: ReembedLease
     ) -> ReembedRun:
@@ -413,13 +417,17 @@ def synthetic_corpus(authority: Authority, count: int = 3, *, secret_uri: bool =
 async def prepare_run(
     authority: Authority, corpus: Corpus, embedder: HashEmbedder, run_id: str = "run-1"
 ) -> ReembedRun:
-    return await start_reembed(
+    run = await start_reembed(
         run_id,
         owner_token="owner-a",  # noqa: S106 - synthetic fenced lease identity, not a password
         corpus=corpus,
         target=embedder.fingerprint,
         journal=authority,
     )
+    # Most orchestration tests begin at the worker boundary. ``start_reembed`` deliberately
+    # returns its lease before surfacing the recovery id, so acquire the worker's fresh fence.
+    await authority.acquire(run.id, "owner-a", ttl_seconds=30.0)
+    return run
 
 
 async def execute(

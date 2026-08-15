@@ -125,6 +125,7 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         "document_list",
         "document_get",
         "index_status",
+        "reembed_status",
         "stats",
         "collection_list",
         "collection_documents",

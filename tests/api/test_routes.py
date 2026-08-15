@@ -23,7 +23,7 @@ of them kept in two files is a list that gets extended in one.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastmcp.exceptions import ToolError
@@ -462,6 +462,22 @@ def test_no_route_generates_sidecar_manifests() -> None:
         f"operator's corpus directory at a path the request names, so it stays on the command "
         f"line where a person is present."
     )
+
+
+def test_reembed_network_surface_is_status_only_and_browser_has_no_run_discovery() -> None:
+    """Remote callers can inspect a supplied opaque id, never start or discover migrations."""
+    reembed = sorted(
+        (
+            route.name,
+            route.path,
+            sorted(cast("set[str] | None", getattr(route, "methods", None)) or ()),
+        )
+        for route in walk_routes()
+        if "reembed" in route.name.lower() or "reembed" in route.path.lower()
+    )
+    assert reembed == [
+        ("reembed_status", "/api/v1/admin/reembed/{run_id}", ["GET"]),
+    ]
 
 
 def test_deleting_a_document_is_soft_and_there_is_no_hard_variant() -> None:

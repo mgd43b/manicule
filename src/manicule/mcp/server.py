@@ -1,4 +1,4 @@
-"""The MCP server: twenty-eight tools, each a few lines over the application service.
+"""The MCP server: twenty-nine tools, each a few lines over the application service.
 
 FastMCP derives every tool's schema from the function's type hints and its description from
 the docstring, so what an assistant sees is what the signature says. There is no protocol
@@ -205,6 +205,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "document_delete",
     "document_reindex",
     "index_status",
+    "reembed_status",
     "stats",
     "doctor",
     "connector_list",
@@ -773,6 +774,19 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
         return await dispatch("index_status", service.index_status)
 
     @register.tool(READS)
+    async def reembed_status(run_id: str) -> dict[str, Any]:
+        """Read aggregate progress for one operator-created re-embedding run.
+
+        This never exposes source identifiers, snapshot handles, model paths, or configuration.
+        Creating and executing a whole-index migration remains a local operator action because
+        it can consume unbounded accelerator, disk, and time.
+
+        Args:
+            run_id: The opaque recovery id returned by ``manicule reembed start``.
+        """
+        return await dispatch("reembed_status", lambda: service.reembed_status(run_id))
+
+    @register.tool(READS)
     async def stats() -> dict[str, Any]:
         """Count documents and chunks, grouped by source, media type and status."""
         return await dispatch("stats", service.stats)
@@ -920,6 +934,7 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
             document_delete,
             document_reindex,
             index_status,
+            reembed_status,
             stats,
             doctor,
             connector_list,

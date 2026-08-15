@@ -59,7 +59,7 @@ def test_the_announced_tool_count_is_what_the_transport_offers(
     """The line an operator reads at startup agrees with what ``tools/list`` will say.
 
     It did not have to: the count was ``len(TOOL_NAMES)`` for both transports, which would now
-    announce twenty-eight on a socket that carries thirteen — the banner disagreeing with the
+    announce twenty-nine on a socket that carries fourteen — the banner disagreeing with the
     protocol on the one number somebody would check against their client.
     """
     over_a_pipe = address_for(service, transport="stdio")
