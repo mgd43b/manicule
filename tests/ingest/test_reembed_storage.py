@@ -12,6 +12,7 @@ import pytest
 from pydantic import TypeAdapter
 from sqlalchemy import func, insert, select, update
 
+from manicule.core.content import Chunk
 from manicule.core.embedding import Vector
 from manicule.ingest.reembed import (
     CorpusSnapshot,
@@ -108,18 +109,28 @@ class RefusingCreateJournal:
         raise self.failure
 
 
-async def test_snapshots_runs_and_counts_are_workspace_scoped(
-    engine: AsyncEngine,
+async def test_snapshots_runs_and_counts_are_workspace_scoped(  # noqa: PLR0915
+    engine: AsyncEngine, data_dir: Path
 ) -> None:
     alpha = SqliteDocStore(engine, workspace_id="alpha")
     beta = SqliteDocStore(engine, workspace_id="beta")
     await alpha.ensure_workspace()
     await beta.ensure_workspace()
+    stored_chunks: list[Chunk] = []
     for scoped, workspace, source_id in ((alpha, "alpha", "a"), (beta, "beta", "b")):
         document = make_document(source_id=source_id, workspace_id=workspace)
+        chunk = make_chunk(document, 0, workspace)
         await scoped.upsert_document(document)
-        await scoped.replace_chunks(document.id, [make_chunk(document, 0, workspace)])
+        await scoped.replace_chunks(document.id, [chunk])
+        stored_chunks.append(chunk)
     old = fingerprint(dimension=4, model_id="old/model")
+    old_vectors = LanceVectorStore(data_dir / VECTORS_DIRNAME)
+    await old_vectors.ensure_ready(old)
+    await old_vectors.upsert(
+        stored_chunks,
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+    )
+    await old_vectors.teardown()
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
@@ -138,6 +149,10 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(
     beta_commitment = await plan_reembed_commitment(beta_corpus, target)
     assert alpha_commitment.plan.documents == alpha_commitment.plan.chunks == 1
     assert beta_commitment.plan.documents == beta_commitment.plan.chunks == 1
+    assert alpha_commitment.execution_plan.documents == 2
+    assert alpha_commitment.execution_plan.chunks == 2
+    assert beta_commitment.execution_plan.documents == 2
+    assert beta_commitment.execution_plan.chunks == 2
     assert alpha_commitment.snapshot.workspace_id == "alpha"
     assert beta_commitment.snapshot.workspace_id == "beta"
 
@@ -163,6 +178,25 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(
         ).all()
         counts = {str(row[0]): int(row[1]) for row in rows}
     assert counts == {"alpha": 1, "beta": 2}
+
+    shadows = LanceShadowGenerations(data_dir / VECTORS_DIRNAME, alpha_store)
+    published = await resume_reembed(
+        alpha_run.id,
+        owner_token="alpha-owner",  # noqa: S106
+        corpus=alpha_corpus,
+        embedder=HashEmbedder(dimension=4),
+        journal=alpha_store,
+        shadow=shadows,
+        publisher=alpha_store,
+    )
+    assert published.state is ReembedState.PUBLISHED
+    assert (await beta_store.get(beta_run.id)).state is ReembedState.PLANNED  # type: ignore[union-attr]
+    live = PublishedLanceVectorStore(data_dir / VECTORS_DIRNAME, engine)
+    await live.ensure_ready(HashEmbedder(dimension=4).fingerprint)
+    assert await live.count() == 2
+    assert await alpha.get_document(stored_chunks[0].document_id) is not None
+    assert await beta.get_document(stored_chunks[1].document_id) is not None
+    await live.teardown()
 
 
 async def seeded_run(

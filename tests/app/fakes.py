@@ -55,6 +55,7 @@ from manicule.ingest.reembed import (
     LivePublication,
     ReembedCommitment,
     ReembedPlan,
+    ReembedRecovery,
     ReembedRun,
     ReembedState,
 )
@@ -772,6 +773,7 @@ class FakeIngestion:
     reindexed: list[str] = field(default_factory=list[str])
     reembed_runs: dict[str, ReembedRun] = field(default_factory=dict[str, ReembedRun])
     reembed_recoveries: int = 0
+    reembed_recovery_outcome: ReembedRecovery | None = None
     imported: list[Path] = field(default_factory=list[Path])
     connectors: dict[str, object] = field(default_factory=dict[str, object])
     """Constructed connectors, by instance name, for :meth:`connector`.
@@ -916,6 +918,8 @@ class FakeIngestion:
             state=ReembedState.PUBLISHED,
             documents_completed=run.commitment.plan.documents,
             chunks_completed=run.commitment.plan.chunks,
+            workspace_documents_completed=run.commitment.plan.documents,
+            workspace_chunks_completed=run.commitment.plan.chunks,
         )
         self.reembed_runs[run_id] = run
         return run
@@ -935,9 +939,9 @@ class FakeIngestion:
     async def reembed_cleanup(self, run_id: str) -> bool:
         return self.reembed_runs.pop(run_id, None) is not None
 
-    async def reembed_recover_pending(self) -> tuple[ReembedRun, ...]:
+    async def reembed_recover_pending(self) -> ReembedRecovery:
         self.reembed_recoveries += 1
-        return tuple(self.reembed_runs.values())
+        return self.reembed_recovery_outcome or ReembedRecovery(recovered=len(self.reembed_runs))
 
     async def reparse_stale(self, *, batch: int, dry_run: bool = False) -> StaleSweep:
         self.sweeps.append((batch, dry_run))

@@ -18,6 +18,7 @@ from manicule.app.served import Scheduler
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors.errors import ConnectorError, SessionMissingError
+from manicule.ingest.reembed import ReembedRecovery
 from tests.app.fakes import FakeBackend, FakeIngestion
 
 if TYPE_CHECKING:
@@ -187,6 +188,28 @@ async def test_startup_runs_durable_reembedding_recovery_as_an_inspectable_job()
         assert scheduler.reembedding.recovered == 1
         assert scheduler.reembedding.failures == 0
         assert ingestion.reembed_recoveries == 1
+    finally:
+        await scheduler.aclose()
+
+
+async def test_reembedding_recovery_reports_isolated_failures_without_run_ids() -> None:
+    service, ingestion = service_with({})
+    ingestion.reembed_recovery_outcome = ReembedRecovery(
+        recovered=2, failures=1, failure_types=("ReembedValidationError",)
+    )
+    scheduler = Scheduler(service, {})
+
+    scheduler.start()
+    try:
+        for _ in range(20):
+            if scheduler.reembedding.complete:
+                break
+            await asyncio.sleep(0)
+        assert scheduler.reembedding.complete
+        assert scheduler.reembedding.recovered == 2
+        assert scheduler.reembedding.failures == 1
+        assert scheduler.reembedding.last_error_type == "ReembedValidationError"
+        assert "run" not in scheduler.reembedding.last_error_type.lower()
     finally:
         await scheduler.aclose()
 

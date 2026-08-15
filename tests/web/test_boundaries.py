@@ -214,6 +214,19 @@ def test_the_script_stores_nothing_but_a_theme() -> None:
     assert stored == {"THEME_KEY"}, f"the script stores something other than a theme: {stored}"
 
 
+def test_reembed_page_is_inspection_only_even_though_admin_http_can_mutate() -> None:
+    template = (Path(pages.__file__).parent / "templates" / "reembed.html").read_text(
+        encoding="utf-8"
+    )
+    script = (Path(pages.__file__).parent / "static" / "manicule.js").read_text(encoding="utf-8")
+    for action in ("start", "resume", "abandon", "cleanup"):
+        assert f"data-reembed-{action}" not in template
+    assert "data-reembed-" not in script
+    assert "/api/v1/admin/reembed/" not in script
+    assert 'method="post"' not in template
+    assert 'method="delete"' not in template
+
+
 def test_the_refusal_page_is_this_surfaces_and_the_decision_is_not() -> None:
     """Authorization is decided once, in the API's own module, and rendered twice.
 

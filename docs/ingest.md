@@ -1600,19 +1600,24 @@ generation pin and only removes failed or superseded, non-live storage, so an in
 cannot lose its directory. `abandon` makes an unfinished run terminal without moving the live
 pointer.
 
-Snapshots, runs, generations and receipts are keyed by workspace as well as their opaque id.
-Materialization filters authoritative documents to that workspace, and every journal, lease,
-publication and cleanup lookup repeats the workspace predicate. Legacy state is backfilled only
-when its stored document payloads identify exactly one workspace (or an empty legacy database has
-exactly one workspace); ambiguous state refuses migration rather than guessing ownership.
+Snapshots, runs, generations and receipts are keyed by workspace as well as their opaque id, and
+every journal, lease, publication and cleanup lookup repeats that ownership predicate. The vector
+pointer is installation-wide, however, so its immutable snapshot and replacement generation cover
+all workspaces; otherwise publishing Alpha would make Beta's vectors disappear. The public plan
+and progress projection counts only the owning workspace, while private build accounting and
+capacity checks cover the full installation. Legacy state is backfilled only when its stored
+document payloads identify exactly one owning workspace (or an empty legacy database has exactly
+one workspace); ambiguous state refuses migration rather than guessing ownership.
 
 The serving scheduler runs one restart-recovery job for ownerless nonterminal runs in its active
 workspace. It records aggregate recovered/failure counts, while the durable run remains the
-authoritative status. This is process-crash recovery, not connector scheduling: no connector or
-parser is called, and a live fenced owner is never taken over before lease expiry. The local CLI,
-authenticated admin HTTP routes and `/ui/reembed` expose plan, start, resume, abandon and cleanup;
-the Web page calls those JSON routes and never introduces a second write path. MCP retains the
-aggregate read-only `reembed_status` tool. No network or browser surface lists opaque run ids.
+authoritative status. Each run is isolated: one corrupt or transient refusal is counted by error
+class and recovery continues with later runs, without logging ids, paths or messages. This is
+process-crash recovery, not connector scheduling: no connector or parser is called, and a live
+fenced owner is never taken over before lease expiry. The local CLI and authenticated admin HTTP
+routes expose plan, start, resume, abandon and cleanup. `/ui/reembed` is read-only plan/status and
+contains no mutation controls or JavaScript handlers. MCP retains the aggregate read-only
+`reembed_status` tool. No network or browser surface lists opaque run ids.
 
 ## 11. `reconcile()` and deletion
 

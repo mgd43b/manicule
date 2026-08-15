@@ -19,13 +19,18 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from manicule.app.runtime import AssemblyError, Runtime
+from manicule.app.runtime import (
+    AssemblyError,
+    Runtime,
+    _recover_reembed_runs,  # pyright: ignore[reportPrivateUsage]
+)
 from manicule.app.service import ApplicationService, pre_upgrade_destination
 from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.container.container import build_container, check_wiring
 from manicule.core.errors import InsecureTargetError
 from manicule.generation.config import GENERATOR_NAME
+from manicule.ingest.reembed import ReembedError
 from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
 from manicule.plugins.manifest import ComponentKind
 from manicule.plugins.registry import discover
@@ -38,6 +43,23 @@ STALE_INSTALL = (
     "an entry point declared in pyproject.toml is missing from the installed distribution. "
     "Run `uv sync --reinstall-package manicule` and try again."
 )
+
+
+async def test_reembed_restart_recovery_continues_after_one_run_refuses() -> None:
+    attempted: list[str] = []
+
+    async def resume(run_id: str) -> None:
+        attempted.append(run_id)
+        if run_id == "private-corrupt-id":
+            raise ReembedError("synthetic private failure with /private/path")
+
+    outcome = await _recover_reembed_runs(("private-corrupt-id", "private-healthy-id"), resume)
+
+    assert attempted == ["private-corrupt-id", "private-healthy-id"]
+    assert outcome.recovered == 1
+    assert outcome.failures == 1
+    assert outcome.failure_types == ("ReembedError",)
+    assert "private" not in repr(outcome)
 
 
 @pytest.fixture

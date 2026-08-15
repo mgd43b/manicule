@@ -276,10 +276,10 @@ class SqliteReembedCorpus:
         )
         chunk_digest = SnapshotChunkDigester()
         while True:
-            statement = select(models.Document).where(
-                models.Document.workspace_id == self.workspace_id,
-                models.Document.deleted_at.is_(None),
-            )
+            # The live vector pointer is installation-wide, so its replacement must cover the
+            # full installation too. ``workspace_id`` owns/access-controls the private snapshot;
+            # it is not a filter on the physical generation being atomically replaced.
+            statement = select(models.Document).where(models.Document.deleted_at.is_(None))
             if document_after is not None:
                 statement = statement.where(models.Document.id > document_after)
             page = (
@@ -652,6 +652,8 @@ class SqliteReembedStore:
                 chunk_after=run.chunk_after,
                 documents_completed=run.documents_completed,
                 chunks_completed=run.chunks_completed,
+                workspace_documents_completed=run.workspace_documents_completed,
+                workspace_chunks_completed=run.workspace_chunks_completed,
                 shadow_generation_id=run.shadow_generation_id,
                 receipt=run.receipt,
                 revision=expected_revision + 1,
@@ -870,8 +872,8 @@ class SqliteReembedStore:
             or not row.complete
             or row.revision != snapshot.revision
             or _LIVE.validate_json(row.live_json) != snapshot.live
-            or row.document_count != run.commitment.plan.documents
-            or row.chunk_count != run.commitment.plan.chunks
+            or row.document_count != run.commitment.execution_plan.documents
+            or row.chunk_count != run.commitment.execution_plan.chunks
             or row.inventory_digest != run.commitment.inventory_digest
             or row.chunk_inventory_digest != run.commitment.chunk_inventory_digest
         ):
@@ -883,26 +885,28 @@ class SqliteReembedStore:
         rows = (
             await connection.execute(
                 select(
+                    models.ReembedRunRecord.workspace_id,
                     models.ReembedRunRecord.id,
                     models.ReembedRunRecord.checkpoint_json,
                     models.ReembedRunRecord.revision,
                 )
                 .join(
                     models.ReembedShadowGeneration,
-                    (models.ReembedShadowGeneration.workspace_id == self.workspace_id)
-                    & (
+                    (
                         models.ReembedShadowGeneration.workspace_id
                         == models.ReembedRunRecord.workspace_id
                     )
                     & (models.ReembedShadowGeneration.run_id == models.ReembedRunRecord.id),
                 )
                 .where(
-                    models.ReembedRunRecord.workspace_id == self.workspace_id,
                     or_(
                         models.ReembedRunRecord.state == ReembedState.PUBLISHED.value,
                         models.ReembedShadowGeneration.state == "published",
                     ),
-                    models.ReembedRunRecord.id != current_run_id,
+                    or_(
+                        models.ReembedRunRecord.workspace_id != self.workspace_id,
+                        models.ReembedRunRecord.id != current_run_id,
+                    ),
                 )
             )
         ).all()
@@ -914,7 +918,7 @@ class SqliteReembedStore:
             await connection.execute(
                 update(models.ReembedRunRecord)
                 .where(
-                    models.ReembedRunRecord.workspace_id == self.workspace_id,
+                    models.ReembedRunRecord.workspace_id == row.workspace_id,
                     models.ReembedRunRecord.id == row.id,
                     models.ReembedRunRecord.revision == row.revision,
                 )
@@ -928,7 +932,7 @@ class SqliteReembedStore:
             await connection.execute(
                 update(models.ReembedShadowGeneration)
                 .where(
-                    models.ReembedShadowGeneration.workspace_id == self.workspace_id,
+                    models.ReembedShadowGeneration.workspace_id == row.workspace_id,
                     models.ReembedShadowGeneration.run_id == row.id,
                 )
                 .values(state="superseded")
@@ -1235,8 +1239,8 @@ class LanceShadowGenerations:
             ).scalar_one()
             commitment = _COMMITMENT.validate_json(commitment_json)
             if (
-                inspection.rows != commitment.plan.chunks
-                or inspection.unique_chunks != commitment.plan.chunks
+                inspection.rows != commitment.execution_plan.chunks
+                or inspection.unique_chunks != commitment.execution_plan.chunks
                 or inspection.dimension != fingerprint.dimension
                 or not inspection.finite
                 or inspection.fingerprint != generation.fingerprint
@@ -1382,6 +1386,8 @@ def _run_from_receipt(run: ReembedRun, receipt: PublicationReceipt, *, revision:
         chunk_after=run.chunk_after,
         documents_completed=run.documents_completed,
         chunks_completed=run.chunks_completed,
+        workspace_documents_completed=run.workspace_documents_completed,
+        workspace_chunks_completed=run.workspace_chunks_completed,
         shadow_generation_id=run.shadow_generation_id or receipt.published_generation_id,
         receipt=receipt,
         revision=revision,

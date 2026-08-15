@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
     from manicule.generation.ports import ConversationRecord
     from manicule.ingest.pipeline import RunReport, Watching
-    from manicule.ingest.reembed import ReembedRun
+    from manicule.ingest.reembed import ReembedRecovery, ReembedRun
     from manicule.parsers.config import SourceCodeConfig
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
@@ -128,7 +128,7 @@ def _reembed_run_report(run: ReembedRun) -> r.ReembedRunReport:
     from manicule.ingest.reembed import ReembedState  # noqa: PLC0415
 
     plan = run.commitment.plan
-    remaining_chunks = max(0, plan.chunks - run.chunks_completed)
+    remaining_chunks = max(0, plan.chunks - run.workspace_chunks_completed)
     seconds_per_chunk = plan.estimated_seconds / plan.chunks if plan.chunks else 0.0
     terminal = run.state in {
         ReembedState.PUBLISHED,
@@ -140,8 +140,8 @@ def _reembed_run_report(run: ReembedRun) -> r.ReembedRunReport:
         state=run.state.value,
         documents=plan.documents,
         chunks=plan.chunks,
-        documents_completed=run.documents_completed,
-        chunks_completed=run.chunks_completed,
+        documents_completed=run.workspace_documents_completed,
+        chunks_completed=run.workspace_chunks_completed,
         estimated_remaining_seconds=remaining_chunks * seconds_per_chunk,
         retry_required=not terminal,
         terminal=terminal,
@@ -1287,7 +1287,7 @@ class ApplicationService:
             removed=await ingestion.reembed_cleanup(run_id),
         )
 
-    async def reembed_recover_pending(self) -> tuple[ReembedRun, ...]:
+    async def reembed_recover_pending(self) -> ReembedRecovery:
         """Internal serving-process restart recovery; each run remains inspectable normally."""
         ingestion = await self._backend.ingestion()
         return await ingestion.reembed_recover_pending()

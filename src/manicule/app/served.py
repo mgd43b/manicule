@@ -368,7 +368,7 @@ class Scheduler:
     async def _recover_reembedding(self) -> None:
         """Resume ownerless durable runs once at startup; run status remains authoritative."""
         try:
-            runs = await self._service.reembed_recover_pending()
+            outcome = await self._service.reembed_recover_pending()
         except asyncio.CancelledError:
             raise
         except (ManiculeError, ValueError, OSError) as exc:
@@ -379,7 +379,9 @@ class Scheduler:
                 f"and retry ({type(exc).__name__})"
             )
         else:
-            self.reembedding.recovered += len(runs)
+            self.reembedding.recovered += outcome.recovered
+            self.reembedding.failures += outcome.failures
+            self.reembedding.last_error_type = ",".join(outcome.failure_types)
             self.reembedding.complete = True
 
     async def aclose(self) -> None:

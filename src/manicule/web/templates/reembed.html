@@ -21,21 +21,8 @@
     <label>Run ID <input name="run_id" value="{{ run_id }}" maxlength="200" required></label>
     <button type="submit">Inspect</button>
   </form>
-  {% if run_id %}
-  <div class="actions" data-reembed-status>
-    <button type="button" data-reembed-start="{{ run_id }}">Start</button>
-    <button type="button" data-reembed-resume="{{ run_id }}">Resume</button>
-    <button type="button" data-reembed-abandon="{{ run_id }}">Abandon</button>
-    <button type="button" data-reembed-cleanup="{{ run_id }}">Cleanup</button>
-  </div>
-  {% endif %}
 </section>
 
-{% if panels.action is defined %}
-<section class="panel"><h2>Action outcome</h2>
-  {% if panels.action.ok %}<pre>{{ panels.action.data }}</pre>{% else %}{{ m.failed(panels.action) }}{% endif %}
-</section>
-{% endif %}
 {% if panels.status is defined %}
 <section class="panel"><h2>Status</h2>
   {% if panels.status.ok %}

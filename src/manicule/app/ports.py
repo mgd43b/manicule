@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     )
     from manicule.generation.sharing import ShareLink
     from manicule.ingest.pipeline import RunReport, Watching
-    from manicule.ingest.reembed import ReembedPlan, ReembedRun
+    from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
@@ -188,7 +188,7 @@ class Ingesting(Protocol):
 
     async def reembed_cleanup(self, run_id: str) -> bool: ...
 
-    async def reembed_recover_pending(self) -> tuple[ReembedRun, ...]: ...
+    async def reembed_recover_pending(self) -> ReembedRecovery: ...
 
     async def reindex(self, document_id: str) -> ReindexReport:
         """Re-parse one document from its retained bytes. No network."""

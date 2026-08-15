@@ -215,6 +215,12 @@ class ReembedCommitment:
     target_dimension: int = field(repr=False)
     inventory_digest: str = field(repr=False)
     chunk_inventory_digest: str = field(repr=False)
+    build_plan: ReembedPlan | None = field(default=None, repr=False)
+
+    @property
+    def execution_plan(self) -> ReembedPlan:
+        """Private full-installation work; legacy commitments used their public plan."""
+        return self.plan if self.build_plan is None else self.build_plan
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +247,8 @@ class ReembedRun:
     chunk_after: ChunkKey | None = None
     documents_completed: int = 0
     chunks_completed: int = 0
+    workspace_documents_completed: int = 0
+    workspace_chunks_completed: int = 0
     shadow_generation_id: str | None = None
     receipt: PublicationReceipt | None = None
     revision: int = 0
@@ -286,6 +294,15 @@ class ReembedValidationError(ReembedError):
 
 class ReembedCapacityError(ReembedError):
     """Local capacity cannot safely hold the planned shadow generation."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReembedRecovery:
+    """Aggregate-safe restart recovery outcome; never carries run ids or error messages."""
+
+    recovered: int = 0
+    failures: int = 0
+    failure_types: tuple[str, ...] = ()
 
 
 class ReembedCorpus(Protocol):
@@ -498,9 +515,9 @@ async def start_reembed(
         )
     elif commitment.target_fingerprint != target.canonical():
         raise ReembedError("the prepared commitment belongs to another target embedder")
-    if not commitment.plan.runnable:
+    if not commitment.execution_plan.runnable:
         error = PolicyError(
-            f"{commitment.plan.unrepairable_documents} document(s) have no stored chunks. "
+            "one or more stored documents have no chunks. "
             "Re-embedding never falls back to a connector or parser; repair local inputs first."
         )
         if created_snapshot:
@@ -724,6 +741,10 @@ async def _build(
                     run,
                     chunk_after=ChunkKey(last.position, last.id),
                     chunks_completed=run.chunks_completed + chunk_count,
+                    workspace_chunks_completed=(
+                        run.workspace_chunks_completed
+                        + (chunk_count if document.workspace_id == run.workspace_id else 0)
+                    ),
                 ),
                 lease,
                 lease_ttl_seconds,
@@ -739,6 +760,10 @@ async def _build(
                 active_document_id=None,
                 chunk_after=None,
                 documents_completed=run.documents_completed + 1,
+                workspace_documents_completed=(
+                    run.workspace_documents_completed
+                    + (1 if document.workspace_id == run.workspace_id else 0)
+                ),
             ),
             lease,
             lease_ttl_seconds,
@@ -768,7 +793,7 @@ async def _validate(
     failures: list[str] = []
     if current.inventory_digest != run.commitment.inventory_digest:
         failures.append("the immutable inventory does not match its planned digest")
-    expected_chunks = run.commitment.plan.chunks
+    expected_chunks = run.commitment.execution_plan.chunks
     if inspection.rows != expected_chunks:
         failures.append(f"expected {expected_chunks} rows, found {inspection.rows}")
     if inspection.unique_chunks != expected_chunks:
@@ -806,7 +831,9 @@ async def _plan_snapshot(
     digest = SnapshotInventoryDigester(snapshot.revision)
     chunk_digest = SnapshotChunkDigester()
     documents_count = chunks_count = input_bytes = unrepairable = 0
+    public_documents = public_chunks = public_input_bytes = public_unrepairable = 0
     peak_memory = 0
+    public_peak_memory = 0
     after: str | None = None
     chunk_limit = _chunk_limit(target, target_batch_tokens)
     while True:
@@ -818,7 +845,11 @@ async def _plan_snapshot(
         for document in documents:
             digest.add_document(document)
             domain_document = document.document
+            owned = not snapshot.workspace_id or document.workspace_id == snapshot.workspace_id
+            public_document_bytes = len(_canonical_document(document)) if owned else 0
+            public_peak_memory = max(public_peak_memory, public_document_bytes)
             documents_count += 1
+            public_documents += int(owned)
             chunk_after: ChunkKey | None = None
             found = False
             while True:
@@ -835,7 +866,11 @@ async def _plan_snapshot(
                     digest.add_chunk(stored_chunk)
                     chunk_digest.add(stored_chunk)
                     input_bytes += len(stored_chunk.chunk.embed_text.encode("utf-8"))
+                    if owned:
+                        public_input_bytes += len(stored_chunk.chunk.embed_text.encode("utf-8"))
                 chunks_count += len(chunks)
+                if owned:
+                    public_chunks += len(chunks)
                 chunk_page_bytes = sum(len(_canonical_chunk(chunk)) for chunk in chunks)
                 peak_memory = max(
                     peak_memory,
@@ -843,13 +878,21 @@ async def _plan_snapshot(
                     + chunk_page_bytes
                     + len(chunks) * target.dimension * _FLOAT32_BYTES,
                 )
+                if owned:
+                    public_peak_memory = max(
+                        public_peak_memory,
+                        public_document_bytes
+                        + chunk_page_bytes
+                        + len(chunks) * target.dimension * _FLOAT32_BYTES,
+                    )
                 last = chunks[-1].chunk
                 chunk_after = ChunkKey(last.position, last.id)
             if not found and domain_document.expects_chunks:
                 unrepairable += 1
+                public_unrepairable += int(owned)
         after = documents[-1].document.id
     vector_bytes = target.dimension * _FLOAT32_BYTES
-    plan = ReembedPlan(
+    build_plan = ReembedPlan(
         documents=documents_count,
         chunks=chunks_count,
         input_bytes=input_bytes,
@@ -857,6 +900,15 @@ async def _plan_snapshot(
         peak_memory_bytes=peak_memory,
         temporary_disk_bytes=chunks_count * (vector_bytes + _ROW_OVERHEAD_BYTES),
         unrepairable_documents=unrepairable,
+    )
+    plan = ReembedPlan(
+        documents=public_documents,
+        chunks=public_chunks,
+        input_bytes=public_input_bytes,
+        estimated_seconds=public_chunks / chunks_per_second,
+        peak_memory_bytes=public_peak_memory,
+        temporary_disk_bytes=public_chunks * (vector_bytes + _ROW_OVERHEAD_BYTES),
+        unrepairable_documents=public_unrepairable,
     )
     return ReembedCommitment(
         plan=plan,
@@ -866,6 +918,7 @@ async def _plan_snapshot(
         target_dimension=target.dimension,
         inventory_digest=digest.hexdigest(),
         chunk_inventory_digest=chunk_digest.hexdigest(),
+        build_plan=build_plan,
     )
 
 
@@ -1024,6 +1077,7 @@ __all__ = [
     "ReembedLease",
     "ReembedPlan",
     "ReembedPublisher",
+    "ReembedRecovery",
     "ReembedRun",
     "ReembedState",
     "ReembedValidationError",

@@ -328,11 +328,11 @@ already made for refusing a benchmark endpoint. `document_reindex` stays on ever
 because one document is a bound.
 
 MCP retains only `reembed_status`: an assistant cannot spend corpus-sized accelerator, disk and
-time unattended. Authenticated admin HTTP now has plan/start/resume/abandon/cleanup parity so
-the Web operator page can use the same JSON operations as every other browser mutation. The page
-accepts an opaque run id and never lists or discovers runs. Every payload remains aggregate-only;
-workspace ownership is checked before a supplied id resolves, so another tenant's id is the same
-sanitized not-found as an unknown id.
+time unattended. Authenticated admin HTTP has plan/start/resume/abandon/cleanup parity. The Web
+page is deliberately read-only: it displays a workspace-safe plan and accepts an opaque id for
+status, but has no mutation controls or JavaScript action handlers and never lists or discovers
+runs. Workspace ownership is checked before a supplied id resolves, so another tenant's id is the
+same sanitized not-found as an unknown id.
 
 `connector_login` is in that list for the credential reason and for one more: it reads a secret
 from a terminal without echoing it. A surface that cannot do that would have to accept the

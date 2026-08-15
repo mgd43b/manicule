@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
     from manicule.ingest.ports import IngestStore
-    from manicule.ingest.reembed import ReembedPlan, ReembedRun
+    from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
     from manicule.storage.reembed import (
@@ -74,6 +74,29 @@ ARCHIVE_MANIFEST = "manicule-export.json"
 
 ARCHIVE_VERSION = 1
 """Bumped when the archive layout changes in a way an older import cannot read."""
+
+
+async def _recover_reembed_runs(
+    run_ids: Sequence[str], resume: Callable[[str], Awaitable[object]]
+) -> ReembedRecovery:
+    """Attempt every run independently and expose only aggregate error classes."""
+    from manicule.ingest.reembed import ReembedRecovery  # noqa: PLC0415
+
+    recovered = 0
+    failure_types: list[str] = []
+    for run_id in run_ids:
+        try:
+            await resume(run_id)
+        except (ManiculeError, ValueError, OSError) as error:
+            failure_types.append(type(error).__name__)
+        else:
+            recovered += 1
+    return ReembedRecovery(
+        recovered=recovered,
+        failures=len(failure_types),
+        failure_types=tuple(sorted(failure_types)),
+    )
+
 
 KEY_PREFIX = "mnk_"
 """What every API key starts with.
@@ -899,16 +922,16 @@ class _Ingestion:
             return existing
         corpus, authority, _shadows, embedder = await self._reembed_components()
         commitment = await plan_reembed_commitment(corpus, embedder.fingerprint)
-        if not commitment.plan.runnable:
+        if not commitment.execution_plan.runnable:
             error = PolicyError(
-                f"{commitment.plan.unrepairable_documents} document(s) have no stored chunks. "
+                "one or more stored documents have no chunks. "
                 "Re-embedding never falls back to a connector or parser; repair local inputs "
                 "first."
             )
             await discard_reembed_snapshot(corpus, commitment.snapshot.id, error)
             raise error
         try:
-            self._require_reembed_capacity_bytes(commitment.plan.temporary_disk_bytes)
+            self._require_reembed_capacity_bytes(commitment.execution_plan.temporary_disk_bytes)
         except ReembedCapacityError as error:
             await discard_reembed_snapshot(corpus, commitment.snapshot.id, error)
             raise
@@ -991,7 +1014,7 @@ class _Ingestion:
             self._runtime.settings.data_dir / VECTORS_DIRNAME, authority
         ).cleanup_terminal(run_id)
 
-    async def reembed_recover_pending(self) -> tuple[ReembedRun, ...]:
+    async def reembed_recover_pending(self) -> ReembedRecovery:
         """Resume ownerless runs after a serving-process restart, scoped to this workspace."""
         import secrets  # noqa: PLC0415
 
@@ -1000,10 +1023,10 @@ class _Ingestion:
         await self._require_reembed_backend()
         await self._runtime.documents()
         authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
-        completed: list[ReembedRun] = []
-        for run_id in await authority.recoverable_run_ids():
-            completed.append(await self.reembed_resume(run_id, secrets.token_urlsafe(24)))
-        return tuple(completed)
+        return await _recover_reembed_runs(
+            await authority.recoverable_run_ids(),
+            lambda run_id: self.reembed_resume(run_id, secrets.token_urlsafe(24)),
+        )
 
     async def _reembed_components(
         self,
@@ -1038,7 +1061,7 @@ class _Ingestion:
             )
 
     def _require_reembed_capacity(self, run: ReembedRun) -> None:
-        self._require_reembed_capacity_bytes(run.commitment.plan.temporary_disk_bytes)
+        self._require_reembed_capacity_bytes(run.commitment.execution_plan.temporary_disk_bytes)
 
     def _require_reembed_capacity_bytes(self, required: int) -> None:
         from manicule.ingest.reembed import ReembedCapacityError  # noqa: PLC0415
@@ -1046,9 +1069,8 @@ class _Ingestion:
         available = shutil.disk_usage(self._runtime.settings.data_dir).free
         if required > available:
             raise ReembedCapacityError(
-                f"re-embedding requires {required} temporary byte(s), but only {available} "
-                "byte(s) are available; free local disk space and retry (resume an existing "
-                "durable run with the same id)"
+                "re-embedding does not have enough local temporary disk capacity; free local "
+                "disk space and retry (resume an existing durable run with the same id)"
             )
 
     async def _resume_reembed(
