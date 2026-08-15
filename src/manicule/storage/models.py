@@ -1093,10 +1093,11 @@ class IndexState(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     vector_table: Mapped[str | None] = mapped_column(Text)
-    """A pointer, not a constant. Re-embed builds a new table alongside the old one and moves
-    this in a single transaction, so a crash mid-rebuild leaves the old index live."""
+    """A pointer, not a constant. It names a legacy table or a generation directory; re-embed
+    moves it in one transaction, so a crash mid-rebuild leaves the old index live."""
 
     embed_fingerprint: Mapped[str | None] = mapped_column(Text)
+    vector_inventory_digest: Mapped[str | None] = mapped_column(Text)
     chunk_fingerprint: Mapped[str | None] = mapped_column(Text)
     fts_tokenizer: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
@@ -1105,6 +1106,71 @@ class IndexState(Base):
     )
 
     __table_args__ = (CheckConstraint("id = 1", name="is_a_singleton"),)
+
+
+class CorpusRevision(Base):
+    """Monotonic revision moved by triggers on every authoritative corpus mutation."""
+
+    __tablename__ = "corpus_revision"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        CheckConstraint("id = 1", name="is_a_singleton"),
+        CheckConstraint("revision >= 0", name="revision_is_not_negative"),
+    )
+
+
+class ReembedRunRecord(Base):
+    """Durable re-embedding checkpoint and its current fenced lease."""
+
+    __tablename__ = "reembed_runs"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    commitment_json: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    checkpoint_json: Mapped[str] = mapped_column(Text, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(Text)
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_expires_at: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    __table_args__ = (
+        CheckConstraint("revision >= 0", name="revision_is_not_negative"),
+        CheckConstraint("lease_generation >= 0", name="lease_generation_is_not_negative"),
+    )
+
+
+class ReembedShadowGeneration(Base):
+    """Immutable identity of one named Lance shadow generation."""
+
+    __tablename__ = "reembed_shadow_generations"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("reembed_runs.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    fingerprint_json: Mapped[str] = mapped_column(Text, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
+    inventory_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+
+class ReembedPublicationReceipt(Base):
+    """The immutable result of a run's single publication decision."""
+
+    __tablename__ = "reembed_publication_receipts"
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("reembed_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    receipt_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
 
 class VectorTombstone(Base):
@@ -1149,6 +1215,7 @@ __all__ = [
     "CollectionDocument",
     "Connector",
     "Conversation",
+    "CorpusRevision",
     "Document",
     "DocumentTag",
     "DocumentVersion",
@@ -1161,6 +1228,9 @@ __all__ = [
     "ReconciliationCandidate",
     "ReconciliationInventoryItem",
     "ReconciliationRun",
+    "ReembedPublicationReceipt",
+    "ReembedRunRecord",
+    "ReembedShadowGeneration",
     "Tag",
     "VectorTombstone",
     "Workspace",

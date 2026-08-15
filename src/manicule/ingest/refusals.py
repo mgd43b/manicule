@@ -107,20 +107,22 @@ def _vector_table(embed: EmbedFingerprint, vectors: VectorStore | None) -> str |
     "13 document(s) in no vector table" — with no code path anywhere that had ever written a
     value into it.
 
-    **Derived through the same function the store names the table with.**
-    ``LanceVectorStore.ensure_ready`` calls ``table_name(fingerprint)``; so does this. Two
-    callers of one function are not two answers to one question, which is what a second naming
-    rule here would have been.
+    A publication-aware store reports the SQLite pointer it just resolved, because after a
+    shadow swap that pointer names a generation directory rather than the inner Lance table.
+    A plain store is derived through the same ``table_name(fingerprint)`` function it uses.
 
     Returns:
         The table name, or ``None`` when there is no vector store — because then there is no
         table, and recording a name for one would be describing something that does not exist.
-        A previously stored name is deliberately not preferred over this: it can only disagree
-        when the embedding fingerprint changed, and the refusals above have already stopped
-        that from reaching here.
+        The live generation pointer is preferred when the store exposes one; replacing it with
+        the inner table name would silently roll a successful re-embedding back to the legacy
+        directory during the next ingest refusal check.
     """
     if vectors is None:
         return None
+    publication_pointer = getattr(vectors, "publication_pointer", None)
+    if isinstance(publication_pointer, str):
+        return publication_pointer
     from manicule.storage.vectors import table_name  # noqa: PLC0415 - a storage extra
 
     return table_name(embed)

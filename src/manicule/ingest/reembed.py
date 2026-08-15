@@ -1,8 +1,9 @@
 """Resumable shadow-generation re-embedding from an immutable local corpus snapshot.
 
-This is the storage-independent orchestration contract, not a production implementation of
-SQLite journaling, Lance shadow tables, or cross-store publication. Those concrete adapters and
-their integration evidence remain required before issue #187 is complete.
+This module is the storage-independent orchestration contract. The built-in SQLite journal,
+fenced publisher, and named Lance generations live in :mod:`manicule.storage.reembed`; a
+durable SQLite implementation of :class:`ReembedCorpus` and operator surfaces remain separate
+issue #187 work.
 
 The protocols expose no connector, parser, or blob fallback. A rebuild reads only stored
 documents and their exact ``Chunk.embed_text`` inputs, writes an unpublished generation, and

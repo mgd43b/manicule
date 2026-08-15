@@ -212,7 +212,28 @@ class Runtime:
         one.
         """
         try:
-            await self._container.aclose()
+            close_error: Exception | None = None
+            try:
+                await self._container.aclose()
+            except Exception as error:  # noqa: BLE001 - teardown must still close vector handles
+                close_error = error
+            try:
+                vectors = self._slots.get("vectors")
+                if vectors is not None and vectors.value is not None:
+                    from manicule.storage.vectors import (  # noqa: PLC0415
+                        PublishedLanceVectorStore,
+                    )
+
+                    if isinstance(vectors.value, PublishedLanceVectorStore):
+                        await vectors.value.teardown()
+            except Exception as vector_error:
+                if close_error is None:
+                    raise
+                close_error.add_note(
+                    f"closing the published vector handle also failed: {vector_error}"
+                )
+            if close_error is not None:
+                raise close_error  # noqa: TRY301 - preserve the container's original exception
         except Exception as during_teardown:
             if pending is None:
                 raise
@@ -434,7 +455,19 @@ class Runtime:
         return at != head_revision()
 
     async def _build_vectors(self) -> VectorStore:
-        return await self._container.aget(keys.VECTOR_STORE)
+        from manicule.storage.engine import VECTORS_DIRNAME  # noqa: PLC0415
+        from manicule.storage.vectors import (  # noqa: PLC0415
+            LanceVectorStore,
+            PublishedLanceVectorStore,
+        )
+
+        await self.documents()
+        store = await self._container.aget(keys.VECTOR_STORE)
+        if isinstance(store, LanceVectorStore):
+            return PublishedLanceVectorStore(
+                self._settings.data_dir / VECTORS_DIRNAME, self.require_engine()
+            )
+        return store
 
     async def _build_prepared_vectors(self) -> VectorStore:
         store = await self.vectors()

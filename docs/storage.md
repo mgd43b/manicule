@@ -229,11 +229,22 @@ reads.
 
 ## 4. The tables
 
-Sixteen carry over from the shape `PLAN.md` §2 names. Eight are additions, each with a job that
-one of the sixteen cannot do. `alembic_version` and the FTS5 shadow tables also exist and are
-managed, not modeled.
+The authoritative SQLAlchemy model has **31 relational tables**. The 24 that predate durable
+re-embedding are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`, `blobs`,
+`chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
+`conversations`, `document_tags`, `document_versions`, `documents`, `glossary_aliases`,
+`glossary_entries`, `index_state`, `messages`, `plugins`, `query_logs`, `tags`,
+`vector_tombstones`, `workspace_members` and `workspaces`. Seven more make a re-embedding run
+durable without changing live reads until publication: `corpus_revision`,
+`reembed_corpus_snapshots`, `reembed_snapshot_documents`, `reembed_snapshot_chunks`,
+`reembed_runs`, `reembed_shadow_generations` and `reembed_publication_receipts`.
+`alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
+included in the 31.
 
-### 4.1 The nine additions
+### 4.1 The pre-#187 additions
+
+These nine supporting tables predate durable re-embedding. Each has a job the earlier proposal
+could not do.
 
 | Table | Why it must exist |
 |---|---|
@@ -256,11 +267,23 @@ managed, not modeled.
 > cleanup is a `LIKE` over string-formatted IDs; and `document_versions.snapshot_chunk_ids`
 > is a JSON array of IDs that nothing can validate.
 
-**The alternative, recorded.** Keep sixteen tables and put chunk metadata in LanceDB, as the
-prior art does. It is fewer moving parts and one less place for ingest to write. Rejected
-because it puts anchors — locked, irreplaceable, and the product — in the store designed to
-be thrown away and rebuilt, and because it makes the lexical leg depend on the vector store
-for data the vector store has no reason to hold.
+**The alternative, recorded.** An earlier proposal put chunk metadata in LanceDB, as the prior
+art does. It is fewer moving parts and one less place for ingest to write. Rejected because it
+puts anchors — locked, irreplaceable, and the product — in the store designed to be thrown away
+and rebuilt, and because it makes the lexical leg depend on the vector store for data the vector
+store has no reason to hold.
+
+### 4.1.1 The seven durable re-embedding tables
+
+| Table | Durable responsibility |
+|---|---|
+| `corpus_revision` | Monotonic installation-wide corpus revision used to bind a snapshot and publication CAS to the exact authoritative corpus. |
+| `reembed_corpus_snapshots` | Immutable snapshot header, live publication identity and complete document/chunk inventory digests. |
+| `reembed_snapshot_documents` | Durable document rows in a snapshot, keyset-readable without connector or parser calls. |
+| `reembed_snapshot_chunks` | Durable chunk rows and their physical vector/publication identity, keyset-readable for bounded rebuilds. |
+| `reembed_runs` | Workspace-owned plan, resumable checkpoint, fenced lease and aggregate-safe progress. |
+| `reembed_shadow_generations` | Named non-live generation identity, lifecycle and validation seal. |
+| `reembed_publication_receipts` | Atomic, idempotent publication winner so a crash after the live-pointer CAS cannot reverse the outcome. |
 
 ### 4.2 `documents`
 
@@ -1677,7 +1700,7 @@ so this is the difference between a diagnostic and a decoration.
 
 ## 11. Organization on top of the corpus
 
-Six of the twenty-four tables exist to let a person impose structure on a corpus rather than to
+Six of the 31 modeled tables exist to let a person impose structure on a corpus rather than to
 index one: `collections`, `collection_documents`, `tags`, `document_tags`, `document_versions`
 and `chunk_relations`. They shipped with the schema and are filled by
 [#10](https://github.com/mgd43b/manicule/issues/10). The operations arrive as five protocols
@@ -1844,9 +1867,8 @@ into an answer by the side door.
 
 ### 11.8 Migrations after the initial schema
 
-The original twenty tables, their constraints and their indexes shipped with the initial
-schema. Later revisions add lineage and publication state, and the durable-acquisition revision
-adds `acquisition_runs` and `acquisition_records` without synthesizing backlog for an existing
+The schema had 24 modeled tables before #187. Earlier revisions added lineage, publication
+state, `acquisition_runs` and `acquisition_records` without synthesizing backlog for an existing
 index. A following additive revision gives each acquired record its validated source envelope;
 the body remains in content-addressed storage while the envelope preserves the fetched URI,
 media type, encoding, metadata, byte length and hash needed to reconstruct `RawDocument`
@@ -1883,6 +1905,10 @@ harbor before expiring. This ordering prevents either crash window from pinning 
 without turning cleanup into an implicit deletion of resumable backlog. `alembic check`
 continues to enforce model/migration parity.
 
+#187 then adds the seven durable re-embedding tables listed in §4.1.1, bringing the modeled
+total to 31. Their migration follows the complete durable-acquisition chain, so an offline
+snapshot remains reconstructable before any shadow vector generation is planned or published.
+
 ---
 
 ## Appendix A: what this design decided that nothing else had
@@ -1892,7 +1918,7 @@ one.
 
 | Decision | Rationale in |
 |---|---|
-| Eight tables added beyond the sixteen, including glossary storage and the durable `acquisition_runs` / `acquisition_records` boundary | §4.1 |
+| The pre-#187 schema has 24 modeled tables; seven durable re-embedding tables bring the authoritative total to 31 | §4.1 |
 | `chunks.id` is content-derived; `position` is part of the digest, and the trade is stated | §3.2 |
 | Identity is `(workspace_id, source, source_id)`; the workspace is part of the derived id, settled before any corpus exists | §4.2 |
 | `documents.connector_id` is `NOT NULL`; filesystem and upload are connectors | §4.2 |

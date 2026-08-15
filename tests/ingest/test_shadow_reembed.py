@@ -51,8 +51,9 @@ class Authority:
     """Single-event-loop protocol harness for journal, shadow, fencing, and publication.
 
     It demonstrates the orchestration's required adapter semantics and crash decisions. It is
-    deliberately not evidence that SQLite and Lance implement those semantics; production
-    adapters, process-level concurrency tests, and on-disk crash tests remain issue #187 work.
+    deliberately not evidence that SQLite and Lance implement those semantics; their separate
+    on-disk adapter suite supplies that evidence. Durable corpus snapshots and operator surfaces
+    remain issue #187 work.
     """
 
     def __init__(self) -> None:
