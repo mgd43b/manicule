@@ -170,7 +170,7 @@ async def _promote_current_document(
 
 @pytest.mark.contract
 async def test_retained_missing_and_corrupt_originals_migrate_without_changing_publication(
-    engine: AsyncEngine, data_dir: Path
+    engine: AsyncEngine, data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = SqliteDocStore(engine)
     await store.ensure_workspace()
@@ -178,8 +178,15 @@ async def test_retained_missing_and_corrupt_originals_migrate_without_changing_p
     retained_row, retained = await _legacy_document(store, blobs, "a-retained", b"alpha")
     missing_row, missing = await _legacy_document(store, blobs, "b-missing", b"beta")
     corrupt_row, corrupt = await _legacy_document(store, blobs, "c-corrupt", b"gamma")
-    blobs.path_for(missing.hash).unlink()
     blobs.path_for(corrupt.hash).write_bytes(b"not gamma")
+    get_blob = blobs.get
+
+    async def race_safe_get(ref: str) -> bytes | None:
+        if ref == missing.hash:
+            raise FileNotFoundError
+        return await get_blob(ref)
+
+    monkeypatch.setattr(blobs, "get", race_safe_get)
 
     before = {
         row.id: (row.publication_id, row.status, row.content_hash)

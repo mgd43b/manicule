@@ -175,13 +175,15 @@ async def _covered_by_verified_promoted_manifest(
 
 
 async def _connector_has_uncovered_document(
-    store: SqliteDocStore, connector: str, verification_cache: dict[str, bool]
+    store: SqliteDocStore,
+    connector: str,
+    verification_cache: dict[str, bool],
+    *,
+    page_size: int,
 ) -> bool:
     after: str | None = None
     while True:
-        rows = await _document_page(
-            store, connector, after_source_id=after, page_size=DEFAULT_PAGE_SIZE
-        )
+        rows = await _document_page(store, connector, after_source_id=after, page_size=page_size)
         if not rows:
             return False
         for row in rows:
@@ -233,6 +235,8 @@ async def _validate(
         return None, AcquisitionFailureCode.MISSING_BODY
     try:
         data = await blobs.get(ref)
+    except FileNotFoundError:
+        return None, AcquisitionFailureCode.MISSING_BODY
     except (OSError, EOFError):
         return None, AcquisitionFailureCode.CORRUPT_BODY
     if data is None:
@@ -402,7 +406,7 @@ async def _migrate_connector(  # noqa: PLR0912, PLR0915 - resumable lifecycle di
     prior = await store.get_acquisition_run(run_id)
     verification_cache: dict[str, bool] = {}
     if prior is None and not await _connector_has_uncovered_document(
-        store, connector, verification_cache
+        store, connector, verification_cache, page_size=page_size
     ):
         return LegacySnapshotMigration()
     run = await store.create_acquisition_run(
