@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -201,6 +202,8 @@ async def test_retained_missing_and_corrupt_originals_migrate_without_changing_p
     assert run.promoted_at is not None
     assert run.watermark_committed_at is None
     assert run.candidate_watermark is None
+    assert run.lease_owner is None
+    assert run.lease_expires_at is None
     assert run.omission_count == 2
     assert run.omission_reasons == {"missing_body": 1, "corrupt_body": 1}
 
@@ -463,6 +466,96 @@ async def test_a_real_promoted_inventory_is_not_shadowed_by_a_legacy_manifest(
             )
         ).scalar_one()
     assert legacy == 0
+
+
+@pytest.mark.contract
+async def test_manifest_coverage_scans_matching_history_in_bounded_keyset_pages(
+    engine: AsyncEngine, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.storage import legacy_snapshots  # noqa: PLC0415 - page-size test hook
+
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    blobs = BlobStore(engine, data_dir)
+    row, retained = await _legacy_document(store, blobs, "long-history", b"covered")
+    run_ids = ["history-a", "history-b", "history-c"]
+    for run_id in run_ids:
+        await _promote_current_document(store, row, retained, run_id=run_id)
+    async with store.sessions.begin() as session:
+        await session.execute(
+            update(models.AcquisitionRun)
+            .where(models.AcquisitionRun.id.in_(run_ids[:2]))
+            .values(membership_hash="invalid")
+        )
+    assert await store.verify_snapshot_manifest(run_ids[-1])
+
+    page_lengths: list[int] = []
+    cache_lengths: list[int] = []
+    original_page = getattr(  # noqa: B009 - avoids a private-use type-check diagnostic
+        legacy_snapshots, "_matching_manifest_run_id_page"
+    )
+    original_remember = getattr(  # noqa: B009 - bounded-cache test hook
+        legacy_snapshots, "_remember_manifest_verification"
+    )
+
+    async def tracked_page(
+        store_arg: SqliteDocStore,
+        row_arg: models.Document,
+        *,
+        after_run_id: str | None,
+        page_size: int,
+    ) -> list[str]:
+        page = await original_page(
+            store_arg,
+            row_arg,
+            after_run_id=after_run_id,
+            page_size=page_size,
+        )
+        page_lengths.append(len(page))
+        return page
+
+    def tracked_remember(cache: OrderedDict[str, bool], run_id: str, verified: bool) -> None:
+        original_remember(cache, run_id, verified)
+        cache_lengths.append(len(cache))
+
+    monkeypatch.setattr(legacy_snapshots, "MANIFEST_CANDIDATE_PAGE_SIZE", 2)
+    monkeypatch.setattr(legacy_snapshots, "MANIFEST_VERIFICATION_CACHE_SIZE", 2)
+    monkeypatch.setattr(legacy_snapshots, "_matching_manifest_run_id_page", tracked_page)
+    monkeypatch.setattr(legacy_snapshots, "_remember_manifest_verification", tracked_remember)
+    migrated = await migrate_legacy_snapshots(store, blobs)
+
+    assert migrated.connectors == 0
+    assert page_lengths == [2, 1]
+    assert cache_lengths == [1, 2, 2]
+
+
+@pytest.mark.contract
+async def test_a_superseded_promoted_manifest_does_not_cover_legacy_ownership(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    blobs = BlobStore(engine, data_dir)
+    row, retained = await _legacy_document(store, blobs, "superseded", b"still needs ownership")
+    run_id = "superseded-real-run"
+    await _promote_current_document(store, row, retained, run_id=run_id)
+    assert await store.verify_snapshot_manifest(run_id)
+
+    async with store.sessions.begin() as session:
+        await session.execute(
+            update(models.AcquisitionRun)
+            .where(models.AcquisitionRun.id == run_id)
+            .values(superseded_at=utcnow())
+        )
+
+    # A superseded run can still have a valid evidence digest, but cleanup may delete it.
+    assert await store.verify_snapshot_manifest(run_id)
+    migrated = await migrate_legacy_snapshots(store, blobs)
+
+    assert (migrated.connectors, migrated.retained, migrated.promoted) == (1, 1, 1)
+    legacy = await _legacy_run(store, "wiki")
+    assert legacy.id != run_id
+    assert await store.verify_snapshot_manifest(legacy.id)
 
 
 @pytest.mark.contract

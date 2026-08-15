@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -48,6 +49,8 @@ if TYPE_CHECKING:
 LEGACY_SCOPE = "legacy-published-documents; remote scope unknown"
 LEGACY_SCOPE_PREFIX = "legacy-unverified:"
 DEFAULT_PAGE_SIZE = 100
+MANIFEST_CANDIDATE_PAGE_SIZE = 100
+MANIFEST_VERIFICATION_CACHE_SIZE = 100
 LEASE_DURATION = timedelta(minutes=5)
 
 
@@ -114,70 +117,103 @@ async def _document_page(
         )
 
 
-async def _covered_by_verified_promoted_manifest(
+async def _matching_manifest_run_id_page(
     store: SqliteDocStore,
     row: models.Document,
-    verification_cache: dict[str, bool],
-) -> bool:
-    """Require exact current evidence in a still-canonical promoted manifest."""
+    *,
+    after_run_id: str | None,
+    page_size: int,
+) -> list[str]:
+    """Return one bounded keyset page of exact, authoritative manifest candidates."""
     async with store.sessions() as session:
-        run_ids = (
-            (
-                await session.execute(
-                    select(models.AcquisitionRun.id)
-                    .join(
-                        models.AcquisitionRecord,
-                        models.AcquisitionRecord.run_id == models.AcquisitionRun.id,
-                    )
-                    .where(
-                        models.AcquisitionRun.workspace_id == row.workspace_id,
-                        models.AcquisitionRun.connector_name == row.source,
-                        models.AcquisitionRun.promoted_at.is_not(None),
-                        models.AcquisitionRun.acquisition_completed_at.is_not(None),
-                        models.AcquisitionRun.membership_hash.is_not(None),
-                        models.AcquisitionRecord.source_id == row.source_id,
-                        models.AcquisitionRecord.blob_ref == row.original_ref,
-                        models.AcquisitionRecord.fetched_version_token.is_not_distinct_from(
-                            row.version_token
-                        ),
-                        models.AcquisitionRecord.snapshot_outcome.in_(
-                            (
-                                SnapshotItemOutcome.RETAINED,
-                                SnapshotItemOutcome.REUSED,
-                            )
-                        ),
-                        models.AcquisitionRecord.source_record["ref"]["source_id"].as_string()
-                        == row.source_id,
-                        models.AcquisitionRecord.source_record["version_token"]
-                        .as_string()
-                        .is_not_distinct_from(row.version_token),
-                        models.AcquisitionRecord.acquired_source["source_id"].as_string()
-                        == row.source_id,
-                        models.AcquisitionRecord.acquired_source["uri"].as_string() == row.uri,
-                        models.AcquisitionRecord.acquired_source["media_type"].as_string()
-                        == row.media_type,
-                        models.AcquisitionRecord.acquired_source["content_hash"].as_string()
-                        == row.original_ref,
-                    )
-                )
+        statement = (
+            select(models.AcquisitionRun.id)
+            .join(
+                models.AcquisitionRecord,
+                models.AcquisitionRecord.run_id == models.AcquisitionRun.id,
             )
+            .where(
+                models.AcquisitionRun.workspace_id == row.workspace_id,
+                models.AcquisitionRun.connector_name == row.source,
+                models.AcquisitionRun.promoted_at.is_not(None),
+                models.AcquisitionRun.acquisition_completed_at.is_not(None),
+                models.AcquisitionRun.membership_hash.is_not(None),
+                models.AcquisitionRun.superseded_at.is_(None),
+                models.AcquisitionRecord.source_id == row.source_id,
+                models.AcquisitionRecord.blob_ref == row.original_ref,
+                models.AcquisitionRecord.fetched_version_token.is_not_distinct_from(
+                    row.version_token
+                ),
+                models.AcquisitionRecord.snapshot_outcome.in_(
+                    (
+                        SnapshotItemOutcome.RETAINED,
+                        SnapshotItemOutcome.REUSED,
+                    )
+                ),
+                models.AcquisitionRecord.source_record["ref"]["source_id"].as_string()
+                == row.source_id,
+                models.AcquisitionRecord.source_record["version_token"]
+                .as_string()
+                .is_not_distinct_from(row.version_token),
+                models.AcquisitionRecord.acquired_source["source_id"].as_string() == row.source_id,
+                models.AcquisitionRecord.acquired_source["uri"].as_string() == row.uri,
+                models.AcquisitionRecord.acquired_source["media_type"].as_string()
+                == row.media_type,
+                models.AcquisitionRecord.acquired_source["content_hash"].as_string()
+                == row.original_ref,
+            )
+        )
+        if after_run_id is not None:
+            statement = statement.where(models.AcquisitionRun.id > after_run_id)
+        return list(
+            (await session.execute(statement.order_by(models.AcquisitionRun.id).limit(page_size)))
             .scalars()
             .all()
         )
-    for run_id in run_ids:
-        verified = verification_cache.get(run_id)
-        if verified is None:
-            verified = await store.verify_snapshot_manifest(run_id)
-            verification_cache[run_id] = verified
-        if verified:
-            return True
-    return False
+
+
+async def _covered_by_verified_promoted_manifest(
+    store: SqliteDocStore,
+    row: models.Document,
+    verification_cache: OrderedDict[str, bool],
+) -> bool:
+    """Require exact current evidence in a still-canonical promoted manifest."""
+    after_run_id: str | None = None
+    while True:
+        run_ids = await _matching_manifest_run_id_page(
+            store,
+            row,
+            after_run_id=after_run_id,
+            page_size=MANIFEST_CANDIDATE_PAGE_SIZE,
+        )
+        if not run_ids:
+            return False
+        for run_id in run_ids:
+            if run_id in verification_cache:
+                verified = verification_cache[run_id]
+                verification_cache.move_to_end(run_id)
+            else:
+                verified = await store.verify_snapshot_manifest(run_id)
+                _remember_manifest_verification(verification_cache, run_id, verified)
+            if verified:
+                return True
+        after_run_id = run_ids[-1]
+
+
+def _remember_manifest_verification(
+    verification_cache: OrderedDict[str, bool], run_id: str, verified: bool
+) -> None:
+    """Retain recent digest results without making migration memory scale with history."""
+    verification_cache[run_id] = verified
+    verification_cache.move_to_end(run_id)
+    while len(verification_cache) > MANIFEST_VERIFICATION_CACHE_SIZE:
+        verification_cache.popitem(last=False)
 
 
 async def _connector_has_uncovered_document(
     store: SqliteDocStore,
     connector: str,
-    verification_cache: dict[str, bool],
+    verification_cache: OrderedDict[str, bool],
     *,
     page_size: int,
 ) -> bool:
@@ -404,7 +440,7 @@ async def _migrate_connector(  # noqa: PLR0912, PLR0915 - resumable lifecycle di
     run_id = legacy_snapshot_run_id(workspace, connector)
     scope_fingerprint = legacy_scope_fingerprint(workspace, connector)
     prior = await store.get_acquisition_run(run_id)
-    verification_cache: dict[str, bool] = {}
+    verification_cache: OrderedDict[str, bool] = OrderedDict()
     if prior is None and not await _connector_has_uncovered_document(
         store, connector, verification_cache, page_size=page_size
     ):
@@ -606,7 +642,14 @@ async def _migrate_connector(  # noqa: PLR0912, PLR0915 - resumable lifecycle di
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat_task
-        await store.release_acquisition_lease(run_id, owner, generation, now=utcnow())
+        await store.record_acquisition_run_metadata(
+            run_id,
+            owner,
+            generation,
+            now=utcnow(),
+            updates={},
+            release=True,
+        )
 
 
 async def migrate_legacy_snapshots(
