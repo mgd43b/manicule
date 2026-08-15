@@ -241,7 +241,10 @@ async def confirm_proposed_deletion(
             raise ValueError(msg)
         assessed = await store.confirm_reconciliation_proposal(connector, scope=scope, now=moment)
         if assessed is None:
-            return []
+            return Reconciliation(
+                connector=connector,
+                refused="no durable deletion proposal exists for the current scope",
+            )
         return Reconciliation(
             connector=assessed.connector,
             seen=assessed.seen_count,

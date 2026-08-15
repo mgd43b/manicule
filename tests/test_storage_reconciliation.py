@@ -13,6 +13,7 @@ from manicule.core.reconciliation import CompletedInventory, ReconciliationAsses
 from manicule.core.sources import DiscoveredDoc, DocRef
 from manicule.ingest.reconcile import (
     PROPOSED_DELETION_KEY,
+    Reconciliation,
     confirm_proposed_deletion,
     reconcile,
 )
@@ -344,6 +345,16 @@ async def test_a_new_full_inventory_invalidates_an_older_confirmation_question(
         assert await store.find_document(_CONNECTOR, f"page-{number}") is not None
 
 
+async def test_a_new_inventory_preserves_completed_evidence_from_another_scope(
+    store: SqliteDocStore,
+) -> None:
+    completed = await _complete(store, "completed-old-scope", ["page-0"])
+
+    await store.begin_reconciliation_inventory("new-scope-run", _CONNECTOR, "spaces=OPS")
+
+    assert await store.latest_completed_reconciliation_inventory(_CONNECTOR, _SCOPE) == completed
+
+
 async def test_durable_confirmation_rejects_an_omitted_scope(store: SqliteDocStore) -> None:
     await _documents(store, 4)
     completed = await _complete(store, "scope-required", ["page-0"])
@@ -357,3 +368,13 @@ async def test_durable_confirmation_rejects_an_omitted_scope(store: SqliteDocSto
 
     for number in range(4):
         assert await store.find_document(_CONNECTOR, f"page-{number}") is not None
+
+
+async def test_durable_confirmation_without_a_proposal_returns_a_typed_refusal(
+    store: SqliteDocStore,
+) -> None:
+    result = await confirm_proposed_deletion(_CONNECTOR, store, now=_NOW, scope=_SCOPE)
+
+    assert isinstance(result, Reconciliation)
+    assert result.connector == _CONNECTOR
+    assert result.refused == "no durable deletion proposal exists for the current scope"

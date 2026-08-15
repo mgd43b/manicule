@@ -70,7 +70,6 @@ class ReconciliationJournalMixin(WorkspaceScoped):
                     models.ReconciliationRun.state.in_(
                         (
                             ReconciliationRunState.ENUMERATING,
-                            ReconciliationRunState.COMPLETED,
                             ReconciliationRunState.PROPOSED,
                         )
                     ),
@@ -121,14 +120,20 @@ class ReconciliationJournalMixin(WorkspaceScoped):
         async with self._sessions.begin() as session:
             row = await self._required_enumerating_run(session, run_id, connector, scope)
             before = row.seen_count
-            for source_id in source_ids:
-                await session.execute(
+            inserted = 0
+            if source_ids:
+                result = await session.execute(
                     sqlite_insert(models.ReconciliationInventoryItem)
                     .values(
-                        run_id=row.id,
-                        workspace_id=row.workspace_id,
-                        connector_id=row.connector_id,
-                        source_id=source_id,
+                        [
+                            {
+                                "run_id": row.id,
+                                "workspace_id": row.workspace_id,
+                                "connector_id": row.connector_id,
+                                "source_id": source_id,
+                            }
+                            for source_id in source_ids
+                        ]
                     )
                     .on_conflict_do_nothing(
                         index_elements=[
@@ -136,14 +141,10 @@ class ReconciliationJournalMixin(WorkspaceScoped):
                             models.ReconciliationInventoryItem.source_id,
                         ]
                     )
+                    .returning(models.ReconciliationInventoryItem.source_id)
                 )
-            row.seen_count = (
-                await session.execute(
-                    select(func.count())
-                    .select_from(models.ReconciliationInventoryItem)
-                    .where(models.ReconciliationInventoryItem.run_id == row.id)
-                )
-            ).scalar_one()
+                inserted = len(result.scalars().all())
+            row.seen_count += inserted
             row.updated_at = utcnow()
             return row.seen_count - before
 
