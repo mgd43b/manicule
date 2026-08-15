@@ -464,6 +464,20 @@ class Runtime:
                 self._migrated = True
             if ensure is not None:
                 await ensure()
+            # This is a storage-data migration rather than an Alembic schema rewrite: it must
+            # validate content-addressed files before it can make them manifest GC roots.  A
+            # writer holds the instance lock here, and no connector is constructed or called.
+            from manicule.storage.blobs import BlobStore  # noqa: PLC0415
+            from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+            from manicule.storage.legacy_snapshots import (  # noqa: PLC0415
+                migrate_legacy_snapshots,
+            )
+
+            if isinstance(store, SqliteDocStore):
+                await migrate_legacy_snapshots(
+                    store,
+                    BlobStore(engine, self._settings.data_dir),
+                )
             return
         if not self._migrated:
             if await self._storage_needs_initializing(engine):

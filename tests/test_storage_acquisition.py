@@ -40,7 +40,7 @@ from manicule.storage.acquisition import (
 from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.engine import create_engine
-from manicule.storage.migrator import current, downgrade, upgrade
+from manicule.storage.migrator import current, downgrade, head_revision, upgrade
 from tests.storage_helpers import make_document
 
 if TYPE_CHECKING:
@@ -2970,9 +2970,47 @@ async def test_snapshot_migration_downgrade_refuses_promoted_manifests_with_reda
             await downgrade(engine, "c41d7ea923b8")
         assert secret_scope not in str(refused.value)
         assert run.scope_fingerprint not in str(refused.value)
-        assert await current(engine) == "4d8f12a6bc91"
+        assert await current(engine) == head_revision()
     finally:
         await engine.dispose()
+
+
+async def test_incomplete_scope_inventory_can_neither_commit_nor_appear_complete(
+    store: SqliteDocStore,
+) -> None:
+    created = await store.create_acquisition_run(
+        "legacy-local-inventory",
+        "wiki",
+        scope_fingerprint="legacy-local",
+        scope_inventory_complete=False,
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+    claimed = await store.claim_acquisition_run(
+        created.id,
+        "worker",
+        now=_NOW,
+        expires_at=_NOW + timedelta(minutes=1),
+    )
+    assert claimed is not None
+    await store.complete_acquisition_enumeration(
+        claimed.id,
+        _watermark("must-not-commit"),
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=_NOW,
+    )
+    with pytest.raises(AcquisitionCoverageError, match="cannot commit a watermark"):
+        await store.complete_snapshot_acquisition(
+            claimed.id,
+            lease_owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=_NOW,
+        )
+    refused = await store.get_acquisition_run(claimed.id)
+    assert refused is not None
+    assert refused.acquisition_completed_at is None
+    assert refused.promoted_at is None
+    assert refused.watermark_committed_at is None
 
 
 async def test_downgrade_refuses_to_discard_acquisition_backlog(data_dir: Path) -> None:

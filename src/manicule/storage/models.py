@@ -275,6 +275,7 @@ class AcquisitionRun(Base):
     connector_name: Mapped[str] = mapped_column(Text, nullable=False)
     source_scope: Mapped[str] = mapped_column(Text, nullable=False, default="")
     scope_fingerprint: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    scope_inventory_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     promotion_policy: Mapped[SnapshotPromotionPolicy] = mapped_column(
         Text,
         nullable=False,
@@ -360,6 +361,10 @@ class AcquisitionRun(Base):
         CheckConstraint(
             "watermark_committed_at IS NULL OR enumeration_completed_at IS NOT NULL",
             name="committed_watermark_has_complete_enumeration",
+        ),
+        CheckConstraint(
+            "watermark_committed_at IS NULL OR scope_inventory_complete = 1",
+            name="committed_watermark_has_complete_scope_inventory",
         ),
         CheckConstraint("omission_count >= 0", name="snapshot_omissions_are_not_negative"),
         CheckConstraint(

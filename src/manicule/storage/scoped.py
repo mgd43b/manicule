@@ -138,6 +138,11 @@ class WorkspaceScoped:
         return self._engine
 
     @property
+    def sessions(self) -> async_sessionmaker[AsyncSession]:
+        """The shared session factory for storage-owned cross-table migrations."""
+        return self._sessions
+
+    @property
     def generation(self) -> int:
         """Bumped by every committed transaction on this store's engine.
 

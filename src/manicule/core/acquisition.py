@@ -85,6 +85,7 @@ class AcquisitionFailureCode(StrEnum):
     MISSING_BODY = "missing_body"
     SNAPSHOT_MISSING = "snapshot_missing"
     SNAPSHOT_CORRUPT = "snapshot_corrupt"
+    CORRUPT_BODY = "corrupt_body"
     SOURCE_DELETED = "source_deleted"
     STALE_BODY = "stale_body"
     PARSE_FAILED = "parse_failed"
@@ -238,6 +239,7 @@ class AcquisitionRun(BaseModel):
     connector: str
     source_scope: str = ""
     scope_fingerprint: str = ""
+    scope_inventory_complete: bool = True
     promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE
     state: AcquisitionRunState
     base_watermark: Watermark | None = None

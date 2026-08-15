@@ -138,6 +138,7 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
         connector=row.connector_name,
         source_scope=row.source_scope,
         scope_fingerprint=row.scope_fingerprint,
+        scope_inventory_complete=row.scope_inventory_complete,
         promotion_policy=row.promotion_policy,
         state=row.state,
         base_watermark=(
@@ -370,6 +371,7 @@ def _matching_run_identity(
     connector: str,
     source_scope: str,
     scope_fingerprint: str,
+    scope_inventory_complete: bool,
     promotion_policy: SnapshotPromotionPolicy,
 ) -> bool:
     """Whether a durable run is exactly the immutable snapshot identity requested."""
@@ -382,6 +384,7 @@ def _matching_run_identity(
         and row.connector_name == connector
         and row.source_scope == source_scope
         and row.scope_fingerprint == scope_fingerprint
+        and row.scope_inventory_complete is scope_inventory_complete
         and stored_policy is promotion_policy
     )
 
@@ -397,6 +400,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         *,
         source_scope: str = "",
         scope_fingerprint: str = "",
+        scope_inventory_complete: bool = True,
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
     ) -> AcquisitionRun:
         """Create an immutable run identity, idempotently for the same connector."""
@@ -412,6 +416,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 connector=connector,
                 source_scope=source_scope,
                 scope_fingerprint=scope_fingerprint,
+                scope_inventory_complete=scope_inventory_complete,
                 promotion_policy=promotion_policy,
             ):
                 raise AcquisitionConflictError(
@@ -428,6 +433,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     connector=connector,
                     source_scope=source_scope,
                     scope_fingerprint=scope_fingerprint,
+                    scope_inventory_complete=scope_inventory_complete,
                     promotion_policy=promotion_policy,
                 ):
                     raise AcquisitionConflictError(
@@ -445,6 +451,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     connector_name=connector,
                     source_scope=source_scope,
                     scope_fingerprint=scope_fingerprint,
+                    scope_inventory_complete=scope_inventory_complete,
                     promotion_policy=promotion_policy,
                     state=AcquisitionRunState.ENUMERATING,
                     base_watermark=connector_row.watermark,
@@ -465,6 +472,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     connector=connector,
                     source_scope=source_scope,
                     scope_fingerprint=scope_fingerprint,
+                    scope_inventory_complete=scope_inventory_complete,
                     promotion_policy=promotion_policy,
                 )
             ):
@@ -1574,6 +1582,9 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             if run.enumeration_completed_at is None:
                 msg = "enumeration is incomplete"
                 raise AcquisitionCoverageError(msg)
+            if run.candidate_watermark is not None and not run.scope_inventory_complete:
+                msg = "a snapshot without complete source-scope inventory cannot commit a watermark"
+                raise AcquisitionCoverageError(msg)
             active = (
                 await session.execute(
                     select(func.count())
@@ -1682,6 +1693,9 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             if run.acquisition_completed_at is None:
                 msg = "snapshot acquisition is incomplete"
                 raise AcquisitionCoverageError(msg)
+            if run.candidate_watermark is not None and not run.scope_inventory_complete:
+                msg = "a snapshot without complete source-scope inventory cannot commit a watermark"
+                raise AcquisitionCoverageError(msg)
             if (
                 SnapshotPromotionPolicy(run.promotion_policy)
                 is SnapshotPromotionPolicy.REQUIRE_COMPLETE
@@ -1735,7 +1749,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             run.watermark_committed_at = committed_at
             run.completeness = (
                 SnapshotCompleteness.PARTIAL
-                if run.omission_count
+                if run.omission_count or not run.scope_inventory_complete
                 else SnapshotCompleteness.COMPLETE
             )
             run.updated_at = promoted_at
@@ -1772,6 +1786,9 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             self._require_live_lease(run, lease_owner, lease_generation, now)
             if run.watermark_committed_at is not None:
                 return True
+            if run.candidate_watermark is not None and not run.scope_inventory_complete:
+                msg = "a run without complete source-scope inventory cannot commit a watermark"
+                raise AcquisitionCoverageError(msg)
             if run.enumeration_completed_at is None:
                 msg = "enumeration is incomplete"
                 raise AcquisitionCoverageError(msg)

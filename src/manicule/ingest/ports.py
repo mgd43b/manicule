@@ -351,6 +351,7 @@ class AcquisitionStore(Protocol):
         *,
         source_scope: str = "",
         scope_fingerprint: str = "",
+        scope_inventory_complete: bool = True,
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
     ) -> AcquisitionRun: ...
 
@@ -431,7 +432,6 @@ class AcquisitionStore(Protocol):
     ) -> bool:
         """Publish diagnostics, optionally releasing, under the exact run generation."""
         ...
-
     async def transition_acquisition_run(
         self,
         run_id: str,
