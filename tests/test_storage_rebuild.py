@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, cast, override
 
 import pytest
 from pydantic import JsonValue
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, update
 
 from manicule.core.acquisition import (
     AcquiredSource,
@@ -38,9 +38,36 @@ from tests.storage_helpers import make_chunk, make_document
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 NOW = datetime(2026, 8, 15, 12, tzinfo=UTC)
+
+
+class ReplayBarrierRebuildStore(SqliteRebuildStore):
+    """Pause after the serialized binding read but before published replay lookup."""
+
+    replay_observed: asyncio.Event
+    replay_release: asyncio.Event
+
+    @override
+    async def _published_replay(
+        self,
+        session: AsyncSession,
+        *,
+        snapshot_run_id: str,
+        target_digest: str,
+        vector_table: str | None,
+        vector_inventory_digest: str | None,
+    ) -> models.DerivedGeneration | None:
+        self.replay_observed.set()
+        await self.replay_release.wait()
+        return await super()._published_replay(
+            session,
+            snapshot_run_id=snapshot_run_id,
+            target_digest=target_digest,
+            vector_table=vector_table,
+            vector_inventory_digest=vector_inventory_digest,
+        )
 
 
 async def promoted_snapshot(
@@ -282,6 +309,44 @@ async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempote
     assert repeated.generation_id == winner.generation_id
     replay = await runner.run(run_id, target, owner="replay-worker")
     assert replay.state is RebuildState.PUBLISHED
+
+    # A #187 swap that starts after the binding read cannot commit ahead of the replay lookup.
+    # The planner holds SQLite's writer slot across both observations, so it returns one coherent
+    # old decision; the next plan observes the fully committed winner and creates a new identity.
+    barrier = ReplayBarrierRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    barrier.replay_observed = asyncio.Event()
+    barrier.replay_release = asyncio.Event()
+    planning = asyncio.create_task(barrier.plan_rebuild(run_id, target, missing_limit=10))
+    await barrier.replay_observed.wait()
+    swap_started = asyncio.Event()
+
+    async def swap_live_pointer() -> None:
+        async with sessions.begin() as session:
+            swap_started.set()
+            await session.execute(
+                update(models.IndexState)
+                .where(models.IndexState.id == 1)
+                .values(
+                    vector_table="later-reembed-winner",
+                    vector_inventory_digest="later-winner-inventory",
+                )
+            )
+
+    swapping = asyncio.create_task(swap_live_pointer())
+    await swap_started.wait()
+    await asyncio.sleep(0)
+    assert not swapping.done()
+    barrier.replay_release.set()
+    serialized = await planning
+    assert serialized.generation_id == winner.generation_id
+    await swapping
+    after_swap = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    assert after_swap.generation_id not in {stale.generation_id, winner.generation_id}
 
 
 async def test_second_connector_promotion_fences_a_single_scope_rebuild(

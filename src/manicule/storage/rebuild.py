@@ -199,19 +199,6 @@ class SqliteRebuildStore(WorkspaceScoped):
             return self._refused_estimate(
                 snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
             )
-        async with self._sessions() as session:
-            if not await self._is_only_promoted_scope(
-                session, run.connector, run.scope_fingerprint
-            ):
-                return self._refused_estimate(
-                    snapshot_run_id, target, RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
-                )
-            index_state = await session.get(models.IndexState, 1)
-            expected_vector_table = None if index_state is None else index_state.vector_table
-            expected_vector_inventory_digest = (
-                None if index_state is None else index_state.vector_inventory_digest
-            )
-
         missing: list[MissingSnapshotInput] = []
         missing_count = 0
         documents = 0
@@ -249,41 +236,56 @@ class SqliteRebuildStore(WorkspaceScoped):
 
         target_json = target.model_dump(mode="json")
         target_digest = hashlib.sha256(_canonical(target_json)).hexdigest()
-        publication_identity_digest = hashlib.sha256(
-            _canonical(
-                {
-                    "vector_table": expected_vector_table,
-                    "vector_inventory_digest": expected_vector_inventory_digest,
-                }
-            )
-        ).hexdigest()
-        generation_id = _generation_id(
-            self._workspace_id,
-            snapshot_run_id,
-            target_digest,
-            publication_identity_digest,
-        )
         now = utcnow()
         async with self._sessions.begin() as session:
+            # Take SQLite's writer slot before observing any global publication identity. This
+            # makes the scope gate, binding read, published replay and insert one serializable
+            # decision with respect to #187's pointer swap transaction.
+            locked = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.Workspace)
+                    .where(models.Workspace.id == self._workspace_id)
+                    .values(name=models.Workspace.name)
+                ),
+            )
+            if locked.rowcount != 1:
+                raise RuntimeError("rebuild workspace disappeared during planning")
+            if not await self._is_only_promoted_scope(
+                session, run.connector, run.scope_fingerprint
+            ):
+                return self._refused_estimate(
+                    snapshot_run_id, target, RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
+                )
+            index_state = await session.get(models.IndexState, 1)
+            expected_vector_table = None if index_state is None else index_state.vector_table
+            expected_vector_inventory_digest = (
+                None if index_state is None else index_state.vector_inventory_digest
+            )
+            publication_identity_digest = hashlib.sha256(
+                _canonical(
+                    {
+                        "vector_table": expected_vector_table,
+                        "vector_inventory_digest": expected_vector_inventory_digest,
+                    }
+                )
+            ).hexdigest()
+            generation_id = _generation_id(
+                self._workspace_id,
+                snapshot_run_id,
+                target_digest,
+                publication_identity_digest,
+            )
             # A successful publication changes the live inventory digest by design. Recognize
             # that exact resulting corpus before constructing a new identity, so repeating the
             # same dry-run or run is idempotent instead of conflicting with its own result.
-            published = (
-                await session.execute(
-                    select(models.DerivedGeneration)
-                    .where(
-                        models.DerivedGeneration.workspace_id == self._workspace_id,
-                        models.DerivedGeneration.snapshot_run_id == snapshot_run_id,
-                        models.DerivedGeneration.target_digest == target_digest,
-                        models.DerivedGeneration.state == RebuildState.PUBLISHED,
-                        models.DerivedGeneration.expected_vector_table == expected_vector_table,
-                        models.DerivedGeneration.published_vector_inventory_digest
-                        == expected_vector_inventory_digest,
-                    )
-                    .order_by(models.DerivedGeneration.published_at.desc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
+            published = await self._published_replay(
+                session,
+                snapshot_run_id=snapshot_run_id,
+                target_digest=target_digest,
+                vector_table=expected_vector_table,
+                vector_inventory_digest=expected_vector_inventory_digest,
+            )
             if published is not None:
                 generation_id = published.id
             else:
@@ -360,6 +362,32 @@ class SqliteRebuildStore(WorkspaceScoped):
             missing=tuple(missing),
             missing_truncated=missing_count > len(missing),
         )
+
+    async def _published_replay(
+        self,
+        session: AsyncSession,
+        *,
+        snapshot_run_id: str,
+        target_digest: str,
+        vector_table: str | None,
+        vector_inventory_digest: str | None,
+    ) -> models.DerivedGeneration | None:
+        return (
+            await session.execute(
+                select(models.DerivedGeneration)
+                .where(
+                    models.DerivedGeneration.workspace_id == self._workspace_id,
+                    models.DerivedGeneration.snapshot_run_id == snapshot_run_id,
+                    models.DerivedGeneration.target_digest == target_digest,
+                    models.DerivedGeneration.state == RebuildState.PUBLISHED,
+                    models.DerivedGeneration.expected_vector_table == vector_table,
+                    models.DerivedGeneration.published_vector_inventory_digest
+                    == vector_inventory_digest,
+                )
+                .order_by(models.DerivedGeneration.published_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
 
     def _refused_estimate(
         self,

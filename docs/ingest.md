@@ -1521,7 +1521,10 @@ counters. Its unique plan identity also includes the bound live vector table and
 digest, so a #187 pointer swap leaves a pristine stale plan inert and a retry can create a new
 generation against the winner. Publication records the resulting inventory digest; while that
 exact result remains live, repeating the same dry run or run returns the published generation
-idempotently rather than planning its own output again. Planning remains `PLANNED`; only a
+idempotently rather than planning its own output again. The scope gate, live binding read,
+published-result lookup and new-plan insert share one writer-serialized SQLite transaction, so a
+concurrent pointer swap cannot turn that replay decision into a mixed-time observation. Planning
+remains `PLANNED`; only a
 successful owner claim enters `BUILDING`, and dry
 run or missing-input refusal never claims a worker lease. Each claim has an expiry, renewable
 owner token, lease generation and monotonically allocated scope fence. An expired lease may be
