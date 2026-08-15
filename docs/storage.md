@@ -229,9 +229,9 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **31 relational tables**. The 24 that predate durable
+The authoritative SQLAlchemy model has **32 relational tables**. The 25 that predate durable
 re-embedding are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`, `blobs`,
-`chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
+`acquisition_markers`, `chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
 `conversations`, `document_tags`, `document_versions`, `documents`, `glossary_aliases`,
 `glossary_entries`, `index_state`, `messages`, `plugins`, `query_logs`, `tags`,
 `vector_tombstones`, `workspace_members` and `workspaces`. Seven more make a re-embedding run
@@ -239,7 +239,7 @@ durable without changing live reads until publication: `corpus_revision`,
 `reembed_corpus_snapshots`, `reembed_snapshot_documents`, `reembed_snapshot_chunks`,
 `reembed_runs`, `reembed_shadow_generations` and `reembed_publication_receipts`.
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 31.
+included in the 32.
 
 ### 4.1 The pre-#187 additions
 
@@ -1700,7 +1700,7 @@ so this is the difference between a diagnostic and a decoration.
 
 ## 11. Organization on top of the corpus
 
-Six of the 31 modeled tables exist to let a person impose structure on a corpus rather than to
+Six of the 32 modeled tables exist to let a person impose structure on a corpus rather than to
 index one: `collections`, `collection_documents`, `tags`, `document_tags`, `document_versions`
 and `chunk_relations`. They shipped with the schema and are filled by
 [#10](https://github.com/mgd43b/manicule/issues/10). The operations arrive as five protocols
@@ -1867,7 +1867,7 @@ into an answer by the side door.
 
 ### 11.8 Migrations after the initial schema
 
-The schema had 24 modeled tables before #187. Earlier revisions added lineage, publication
+The schema had 25 modeled tables before #187. Earlier revisions added lineage, publication
 state, `acquisition_runs` and `acquisition_records` without synthesizing backlog for an existing
 index. A following additive revision gives each acquired record its validated source envelope;
 the body remains in content-addressed storage while the envelope preserves the fetched URI,
@@ -1906,7 +1906,7 @@ without turning cleanup into an implicit deletion of resumable backlog. `alembic
 continues to enforce model/migration parity.
 
 #187 then adds the seven durable re-embedding tables listed in §4.1.1, bringing the modeled
-total to 31. Their migration follows the complete durable-acquisition chain, so an offline
+total to 32. Their migration follows the complete durable-acquisition chain, so an offline
 snapshot remains reconstructable before any shadow vector generation is planned or published.
 
 ---
@@ -1918,7 +1918,7 @@ one.
 
 | Decision | Rationale in |
 |---|---|
-| The pre-#187 schema has 24 modeled tables; seven durable re-embedding tables bring the authoritative total to 31 | §4.1 |
+| The pre-#187 schema has 25 modeled tables; seven durable re-embedding tables bring the authoritative total to 32 | §4.1 |
 | `chunks.id` is content-derived; `position` is part of the digest, and the trade is stated | §3.2 |
 | Identity is `(workspace_id, source, source_id)`; the workspace is part of the derived id, settled before any corpus exists | §4.2 |
 | `documents.connector_id` is `NOT NULL`; filesystem and upload are connectors | §4.2 |

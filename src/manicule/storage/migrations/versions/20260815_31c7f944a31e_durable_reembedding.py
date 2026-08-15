@@ -1,7 +1,7 @@
 """durable shadow re-embedding
 
 Revision ID: 31c7f944a31e
-Revises: c41d7ea923b8
+Revises: d52f81a439bc
 Created: 2026-08-15 12:00:00.000000
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "31c7f944a31e"
-down_revision: str | None = "c41d7ea923b8"
+down_revision: str | None = "d52f81a439bc"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
