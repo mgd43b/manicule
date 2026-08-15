@@ -30,7 +30,7 @@
     {% endfor %}
   </tbody>
 </table>
-<p class="muted" data-sync-status></p>
+<p class="muted" data-sync-status role="status" aria-live="polite"></p>
 {% else %}{{ m.empty('No connectors are configured.') }}{% endif %}
 {% else %}{{ m.failed(panels.connectors) }}{% endif %}
 {% endblock %}

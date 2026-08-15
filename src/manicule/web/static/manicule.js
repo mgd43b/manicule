@@ -22,6 +22,7 @@
   "use strict";
 
   var THEME_KEY = "manicule.theme";
+  var ACTION_QUEUES = new WeakMap();
 
   function json(method, path, body) {
     var options = {
@@ -33,6 +34,8 @@
     return fetch(path, options).then(function (response) {
       return response.json().then(function (envelope) {
         return { status: response.status, envelope: envelope };
+      }).catch(function () {
+        return { status: response.status, envelope: null };
       });
     });
   }
@@ -50,30 +53,205 @@
     return "The request was refused (" + (result ? result.status : "no response") + ").";
   }
 
+  function actionState(node, state, message) {
+    if (!node) { return; }
+    node.setAttribute("role", state === "error" ? "alert" : "status");
+    node.setAttribute("aria-live", state === "error" ? "assertive" : "polite");
+    node.setAttribute("data-action-state", state);
+    say(node, message);
+  }
+
+  function nearbyStatus(control, node) {
+    if (node) { return node; }
+    var created = document.createElement("span");
+    created.className = "muted";
+    created.setAttribute("data-generated-status", "");
+    control.parentNode.insertBefore(created, control.nextSibling);
+    return created;
+  }
+
+  function busy(control, value) {
+    control.disabled = value;
+    if (value) {
+      control.setAttribute("aria-busy", "true");
+    } else {
+      control.removeAttribute("aria-busy");
+    }
+  }
+
+  function actionQueue(node) {
+    var queue = ACTION_QUEUES.get(node);
+    if (!queue) {
+      queue = {
+        active: false,
+        pending: [],
+        reloadRequested: false,
+        reloadTimer: null,
+        reloadDelay: 250,
+      };
+      ACTION_QUEUES.set(node, queue);
+    }
+    return queue;
+  }
+
+  function advanceActionQueue(node) {
+    var queue = actionQueue(node);
+    if (queue.active) { return; }
+    var job = queue.pending.shift();
+    if (!job) {
+      if (queue.reloadRequested && !queue.reloadTimer) {
+        queue.reloadTimer = window.setTimeout(
+          function () { window.location.reload(); },
+          queue.reloadDelay
+        );
+      }
+      return;
+    }
+    queue.active = true;
+    job.control.removeAttribute("data-action-queued");
+    job.control.setAttribute("data-action-running", "true");
+    actionState(node, "pending", job.pending);
+
+    function finish() {
+      job.control.removeAttribute("data-action-running");
+      busy(job.control, false);
+      job.resolve();
+      window.setTimeout(function () {
+        queue.active = false;
+        advanceActionQueue(node);
+      }, 250);
+    }
+
+    Promise.resolve().then(job.request).then(function (result) {
+      if (!result.envelope || !result.envelope.ok) {
+        var message = failure(result);
+        if (queue.reloadRequested) {
+          queue.reloadDelay = 4000;
+          message += " An earlier change succeeded; reloading in a few seconds to show it.";
+        }
+        actionState(node, "error", message);
+        finish();
+        return;
+      }
+      job.success(result, node);
+      finish();
+    }).catch(function () {
+      var message = "The service could not be reached. Try again.";
+      if (queue.reloadRequested) {
+        queue.reloadDelay = 4000;
+        message += " An earlier change succeeded; reloading in a few seconds to show it.";
+      }
+      actionState(node, "error", message);
+      finish();
+    });
+  }
+
+  function runAction(control, node, pending, request, success) {
+    node = nearbyStatus(control, node);
+    if (control.getAttribute("data-action-queued") === "true" ||
+        control.getAttribute("data-action-running") === "true") {
+      return Promise.resolve();
+    }
+    var queue = actionQueue(node);
+    if (queue.reloadTimer) {
+      window.clearTimeout(queue.reloadTimer);
+      queue.reloadTimer = null;
+    }
+    busy(control, true);
+    control.setAttribute("data-action-queued", "true");
+    return new Promise(function (resolve) {
+      queue.pending.push({
+        control: control,
+        pending: pending,
+        request: request,
+        success: success,
+        resolve: resolve,
+      });
+      advanceActionQueue(node);
+    });
+  }
+
   /* Reload after a mutation rather than patching the table in place. The page is rendered by
    * the server from one envelope; re-rendering it there keeps one description of what a
    * listing is, instead of a second one written in this file that can disagree. */
-  function afterChange(element, node, result) {
-    if (result.envelope && result.envelope.ok) {
-      window.location.reload();
-      return;
-    }
-    /* Re-enabled on a refusal. `json()` resolves for a 4xx as well as a 2xx — an envelope is
-     * an envelope — so a failure that only re-enabled on a rejected promise would leave the
-     * button disabled for good, with the reason printed beside a control nobody can retry. */
-    if (element) { element.disabled = false; }
-    say(node, failure(result));
+  function reloadAfterChange(result, node, message) {
+    var queue = actionQueue(node);
+    queue.reloadRequested = true;
+    queue.reloadDelay = 250;
+    actionState(node, "success", message + " Reloading…");
   }
 
-  function act(selector, run) {
+  function act(selector, node, pending, success, request) {
     document.querySelectorAll(selector).forEach(function (element) {
       element.addEventListener("click", function () {
-        element.disabled = true;
-        run(element).catch(function () {
-          element.disabled = false;
+        runAction(element, node, pending, function () {
+          return request(element);
+        }, function (result, status) {
+          reloadAfterChange(result, status, success);
         });
       });
     });
+  }
+
+  function readEventStream(response, onEvent) {
+    var reader = response.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = "";
+    var finalEnvelope = null;
+    var finalCount = 0;
+
+    function protocolError(message) {
+      var error = new Error(message);
+      error.protocol = true;
+      return error;
+    }
+
+    function readFrame(raw) {
+      var name = "";
+      var payload = "";
+      raw.split(/\r?\n/).forEach(function (line) {
+        if (line.indexOf("event: ") === 0) { name = line.slice(7); }
+        if (line.indexOf("data: ") === 0) { payload = line.slice(6); }
+      });
+      if (!payload) { return; }
+      var parsed;
+      try {
+        parsed = JSON.parse(payload);
+      } catch (error) {
+        throw protocolError("The answer stream contained malformed JSON. Retry the question.");
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw protocolError("The answer stream contained a non-object event. Retry the question.");
+      }
+      if (finalCount && name !== "final") {
+        throw new Error("The answer stream continued after its final frame.");
+      }
+      if (name === "final") {
+        finalCount += 1;
+        finalEnvelope = parsed;
+      } else {
+        onEvent(name, parsed);
+      }
+    }
+
+    function pump() {
+      return reader.read().then(function (chunk) {
+        if (chunk.done) {
+          buffer += decoder.decode();
+          if (buffer.trim()) { readFrame(buffer); }
+          if (finalCount !== 1) {
+            throw new Error("The answer stream did not contain exactly one final frame.");
+          }
+          return finalEnvelope;
+        }
+        buffer += decoder.decode(chunk.value, { stream: true });
+        var frames = buffer.split(/\r?\n\r?\n/);
+        buffer = frames.pop();
+        frames.forEach(readFrame);
+        return pump();
+      });
+    }
+    return pump();
   }
 
   /* --- theme ---------------------------------------------------------------------------- */
@@ -242,8 +420,27 @@
     var status = thread.querySelector("[data-status]");
     var profile = thread.querySelector("[data-profile]");
     var question = thread.querySelector("#question");
+    var submit = form.querySelector('[type="submit"]');
+    var stop = form.querySelector("[data-stop]");
+    var retry = form.querySelector("[data-retry]");
     var conversation = thread.getAttribute("data-conversation") || "";
     var lastMessage = "";
+    var requestState = "idle";
+    var requestNumber = 0;
+    var currentRequest = null;
+    var retryRequest = null;
+    var liveComplete = false;
+
+    function setRequestState(state) {
+      requestState = state;
+      busy(submit, state !== "idle");
+      stop.hidden = state !== "streaming";
+      if (state === "idle") {
+        form.removeAttribute("aria-busy");
+      } else {
+        form.setAttribute("aria-busy", "true");
+      }
+    }
 
     function addAsked(text) {
       var article = document.createElement("article");
@@ -314,41 +511,47 @@
         conversation = data.conversation_id;
         thread.setAttribute("data-conversation", conversation);
       }
-      say(status, "");
+      liveComplete = true;
+      actionState(status, "success", "Answer complete.");
     }
 
-    function readFrames(response) {
-      var reader = response.body.getReader();
-      var decoder = new TextDecoder();
-      var buffer = "";
-      function pump() {
-        return reader.read().then(function (chunk) {
-          if (chunk.done) { return; }
-          buffer += decoder.decode(chunk.value, { stream: true });
-          var frames = buffer.split("\n\n");
-          buffer = frames.pop();
-          frames.forEach(function (raw) {
-            var name = "";
-            var payload = "";
-            raw.split("\n").forEach(function (line) {
-              if (line.indexOf("event: ") === 0) { name = line.slice(7); }
-              if (line.indexOf("data: ") === 0) { payload = line.slice(6); }
-            });
-            if (!payload) { return; }
-            var parsed;
-            try { parsed = JSON.parse(payload); } catch (error) { return; }
-            if (name === "delta") {
-              answer.textContent += parsed.text || "";
-            } else if (name === "citation" && parsed.citation) {
-              addCitation(parsed.citation);
-            } else if (name === "final") {
-              settle(parsed);
-            }
-          });
-          return pump();
-        });
-      }
-      return pump();
+    function isCurrent(request) {
+      return currentRequest && currentRequest.number === request.number;
+    }
+
+    function readFrames(response, request) {
+      return readEventStream(response, function (name, parsed) {
+        if (!isCurrent(request)) { return; }
+        if (name === "delta") {
+          answer.textContent += parsed.text || "";
+        } else if (name === "citation" && parsed.citation) {
+          addCitation(parsed.citation);
+        }
+      }).then(function (finalEnvelope) {
+        if (!isCurrent(request)) { return; }
+        if (!finalEnvelope.ok) {
+          var error = new Error(failure({ status: 0, envelope: finalEnvelope }));
+          error.terminal = true;
+          throw error;
+        }
+        settle(finalEnvelope);
+      });
+    }
+
+    function failRequest(request, message) {
+      if (!isCurrent(request)) { return; }
+      currentRequest = null;
+      setRequestState("idle");
+      retry.hidden = false;
+      actionState(status, "error", message);
+    }
+
+    function finishRequest(request) {
+      if (!isCurrent(request)) { return; }
+      currentRequest = null;
+      retryRequest = null;
+      retry.hidden = true;
+      setRequestState("idle");
     }
 
     /* The answer that was on screen, moved into the thread before the next one overwrites the
@@ -357,7 +560,7 @@
      * is dropped from the copy: cloning does not carry its listener, so a button that looked
      * live and did nothing is worse than no button. */
     function keepPreviousAnswer() {
-      if (live.hidden || !answer.textContent) { return; }
+      if (!liveComplete || live.hidden || !answer.textContent) { return; }
       var finished = live.firstElementChild;
       if (!finished) { return; }
       var copy = finished.cloneNode(true);
@@ -366,39 +569,86 @@
       turns.appendChild(copy);
     }
 
-    form.addEventListener("submit", function (event) {
-      event.preventDefault();
-      var text = question.value.trim();
-      if (!text) { return; }
-      question.value = "";
-      keepPreviousAnswer();
-      addAsked(text);
+    function ask(saved, addTurn) {
+      if (requestState !== "idle") { return; }
+      if (addTurn) {
+        keepPreviousAnswer();
+        addAsked(saved.text);
+      }
       live.hidden = false;
+      liveComplete = false;
       rate.hidden = true;
       answer.textContent = "";
       citations.textContent = "";
       say(verdict, "");
-      say(status, "asking…");
-      var body = { question: text };
-      if (profile.value) { body.profile = profile.value; }
-      if (conversation) { body.conversation_id = conversation; }
+      setRequestState("streaming");
+      actionState(status, "pending", "Asking…");
+      retry.hidden = true;
+      retryRequest = saved;
+      var request = {
+        number: requestNumber += 1,
+        controller: new AbortController(),
+        responseArrived: false,
+        responseStarted: false,
+      };
+      currentRequest = request;
       fetch("/api/v1/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "same-origin",
-        body: JSON.stringify(body),
+        body: JSON.stringify(saved.body),
+        signal: request.controller.signal,
       }).then(function (response) {
+        if (!isCurrent(request)) { return; }
+        request.responseArrived = true;
         if (!response.ok || !response.body) {
-          return response.json().then(function (envelope) {
-            say(status, failure({ status: response.status, envelope: envelope }));
-          }).catch(function () {
-            say(status, "The request was refused (" + response.status + ").");
+          return response.json().catch(function () { return null; }).then(function (envelope) {
+            throw new Error(failure({ status: response.status, envelope: envelope }));
           });
         }
-        return readFrames(response);
-      }).catch(function () {
-        say(status, "The corpus could not be reached.");
+        request.responseStarted = true;
+        return readFrames(response, request);
+      }).then(function () {
+        finishRequest(request);
+      }).catch(function (error) {
+        if (!isCurrent(request)) { return; }
+        failRequest(
+          request,
+          request.responseStarted
+            ? error.terminal || error.protocol
+              ? error.message
+              : "The answer stream ended before completion. Retry the question."
+            : request.responseArrived
+              ? (error.message || "The request was refused.")
+              : "The corpus could not be reached. Try again."
+        );
       });
+    }
+
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (requestState !== "idle") { return; }
+      var text = question.value.trim();
+      if (!text) { return; }
+      var body = { question: text };
+      if (profile.value) { body.profile = profile.value; }
+      if (conversation) { body.conversation_id = conversation; }
+      question.value = "";
+      ask({ text: text, body: body }, true);
+    });
+
+    stop.addEventListener("click", function () {
+      if (!currentRequest) { return; }
+      var request = currentRequest;
+      currentRequest = null;
+      request.controller.abort();
+      setRequestState("idle");
+      retry.hidden = false;
+      actionState(status, "stopped", "Stopped. The same question can be retried.");
+    });
+
+    retry.addEventListener("click", function () {
+      if (retryRequest) { ask(retryRequest, false); }
     });
 
     question.addEventListener("keydown", function (event) {
@@ -410,12 +660,17 @@
 
     thread.querySelectorAll("[data-feedback]").forEach(function (button) {
       button.addEventListener("click", function () {
-        if (!lastMessage) { say(rated, "There is no answer to rate yet."); return; }
-        json("POST", "/api/v1/chat/feedback", {
-          message_id: lastMessage,
-          feedback: button.getAttribute("data-feedback"),
-        }).then(function (result) {
-          say(rated, result.envelope.ok ? "Recorded." : failure(result));
+        if (!lastMessage) {
+          actionState(rated, "error", "There is no answer to rate yet.");
+          return;
+        }
+        runAction(button, rated, "Recording…", function () {
+          return json("POST", "/api/v1/chat/feedback", {
+            message_id: lastMessage,
+            feedback: button.getAttribute("data-feedback"),
+          });
+        }, function (result, node) {
+          actionState(node, "success", "Recorded.");
         });
       });
     });
@@ -426,42 +681,37 @@
   function startActions() {
     var documentStatus = document.querySelector("[data-document-status]");
 
-    act("[data-reindex]", function (element) {
+    act("[data-reindex]", documentStatus, "Reindexing…", "Reindexed.", function (element) {
       return json("POST", "/api/v1/documents/" + encodeURIComponent(element.getAttribute("data-reindex")) + "/reindex")
-        .then(function (result) { afterChange(element, documentStatus, result); });
     });
 
-    act("[data-trash]", function (element) {
+    act("[data-trash]", documentStatus, "Moving to trash…", "Moved to trash.", function (element) {
       return json("DELETE", "/api/v1/documents/" + encodeURIComponent(element.getAttribute("data-trash")))
-        .then(function (result) { afterChange(element, documentStatus, result); });
     });
 
-    act("[data-restore]", function (element) {
+    act("[data-restore]", documentStatus, "Restoring…", "Restored.", function (element) {
       return json("POST", "/api/v1/documents/" + encodeURIComponent(element.getAttribute("data-restore")) + "/restore")
-        .then(function (result) { afterChange(element, documentStatus, result); });
     });
 
     var syncStatus = document.querySelector("[data-sync-status]");
-    act("[data-sync]", function (element) {
-      say(syncStatus, "syncing…");
-      return json("POST", "/api/v1/admin/connectors/" + encodeURIComponent(element.getAttribute("data-sync")) + "/sync", {})
-        .then(function (result) {
-          element.disabled = false;
-          if (!result.envelope.ok) { say(syncStatus, failure(result)); return; }
+    document.querySelectorAll("[data-sync]").forEach(function (element) {
+      element.addEventListener("click", function () {
+        runAction(element, syncStatus, "Syncing…", function () {
+          return json("POST", "/api/v1/admin/connectors/" + encodeURIComponent(element.getAttribute("data-sync")) + "/sync", {});
+        }, function (result, node) {
           var report = result.envelope.data || {};
-          say(syncStatus, "ingested " + report.ingested + ", skipped " + report.skipped +
-                          ", failed " + report.failed + (report.error ? " — " + report.error : ""));
+          actionState(node, "success", "Ingested " + report.ingested + ", skipped " + report.skipped +
+                      ", failed " + report.failed + (report.error ? " — " + report.error : ""));
         });
+      });
     });
 
     var pluginStatus = document.querySelector("[data-plugin-status]");
-    act("[data-plugin-enable]", function (element) {
+    act("[data-plugin-enable]", pluginStatus, "Enabling…", "Enabled.", function (element) {
       return json("POST", "/api/v1/plugins/" + encodeURIComponent(element.getAttribute("data-plugin-enable")))
-        .then(function (result) { afterChange(element, pluginStatus, result); });
     });
-    act("[data-plugin-disable]", function (element) {
+    act("[data-plugin-disable]", pluginStatus, "Disabling…", "Disabled.", function (element) {
       return json("DELETE", "/api/v1/plugins/" + encodeURIComponent(element.getAttribute("data-plugin-disable")))
-        .then(function (result) { afterChange(element, pluginStatus, result); });
     });
 
     var collectionStatus = document.querySelector("[data-collection-status]");
@@ -469,13 +719,14 @@
     if (collectionForm) {
       collectionForm.addEventListener("submit", function (event) {
         event.preventDefault();
-        json("POST", "/api/v1/collections", { name: collectionForm.elements.name.value })
-          .then(function (result) { afterChange(null, collectionStatus, result); });
+        var submit = collectionForm.querySelector('[type="submit"]');
+        runAction(submit, collectionStatus, "Creating…", function () {
+          return json("POST", "/api/v1/collections", { name: collectionForm.elements.name.value });
+        }, function (result, node) { reloadAfterChange(result, node, "Created."); });
       });
     }
-    act("[data-delete-collection]", function (element) {
+    act("[data-delete-collection]", collectionStatus, "Deleting…", "Deleted.", function (element) {
       return json("DELETE", "/api/v1/collections/" + encodeURIComponent(element.getAttribute("data-delete-collection")))
-        .then(function (result) { afterChange(element, collectionStatus, result); });
     });
 
     var tagStatus = document.querySelector("[data-tag-status]");
@@ -483,13 +734,14 @@
     if (tagForm) {
       tagForm.addEventListener("submit", function (event) {
         event.preventDefault();
-        json("POST", "/api/v1/tags", { name: tagForm.elements.name.value })
-          .then(function (result) { afterChange(null, tagStatus, result); });
+        var submit = tagForm.querySelector('[type="submit"]');
+        runAction(submit, tagStatus, "Creating…", function () {
+          return json("POST", "/api/v1/tags", { name: tagForm.elements.name.value });
+        }, function (result, node) { reloadAfterChange(result, node, "Created."); });
       });
     }
-    act("[data-delete-tag]", function (element) {
+    act("[data-delete-tag]", tagStatus, "Deleting…", "Deleted.", function (element) {
       return json("DELETE", "/api/v1/tags/" + encodeURIComponent(element.getAttribute("data-delete-tag")))
-        .then(function (result) { afterChange(element, tagStatus, result); });
     });
 
     var keyStatus = document.querySelector("[data-key-status]");
@@ -501,19 +753,20 @@
         var days = keyForm.elements.expires_days.value;
         var body = { name: keyForm.elements.name.value, role: keyForm.elements.role.value };
         if (days) { body.expires_days = Number(days); }
-        json("POST", "/api/v1/auth/keys", body).then(function (result) {
-          if (!result.envelope.ok) { say(keyStatus, failure(result)); return; }
+        var submit = keyForm.querySelector('[type="submit"]');
+        runAction(submit, keyStatus, "Minting…", function () {
+          return json("POST", "/api/v1/auth/keys", body);
+        }, function (result, node) {
           /* The only copy of the secret. Written into the page and nowhere else: not stored,
            * not logged, and gone as soon as this page is left. */
           secret.hidden = false;
           say(secret, result.envelope.data.secret);
-          say(keyStatus, "Copy this now — only a digest is kept, so it cannot be shown again.");
+          actionState(node, "success", "Copy this now — only a digest is kept, so it cannot be shown again.");
         });
       });
     }
-    act("[data-revoke]", function (element) {
+    act("[data-revoke]", keyStatus, "Revoking…", "Revoked.", function (element) {
       return json("DELETE", "/api/v1/auth/keys/" + encodeURIComponent(element.getAttribute("data-revoke")))
-        .then(function (result) { afterChange(element, keyStatus, result); });
     });
   }
 

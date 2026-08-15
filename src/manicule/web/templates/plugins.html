@@ -34,7 +34,7 @@
         {% endfor %}
       </tbody>
     </table>
-    <p class="muted" data-plugin-status></p>
+    <p class="muted" data-plugin-status role="status" aria-live="polite"></p>
     {% else %}{{ m.empty('No plugins are installed.') }}{% endif %}
   {% else %}{{ m.failed(panels.plugins) }}{% endif %}
 </section>

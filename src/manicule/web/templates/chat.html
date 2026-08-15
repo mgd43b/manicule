@@ -57,7 +57,7 @@
         <div class="rate" data-rate hidden>
           <button type="button" class="ghost" data-feedback="positive">Useful</button>
           <button type="button" class="ghost" data-feedback="negative">Not useful</button>
-          <span class="muted" data-rated></span>
+          <span class="muted" data-rated role="status" aria-live="polite"></span>
         </div>
       </article>
     </div>
@@ -75,7 +75,9 @@
           <option value="precise">precise</option>
         </select>
         <button type="submit">Ask</button>
-        <span class="muted" data-status></span>
+        <button type="button" class="ghost" data-stop hidden>Stop</button>
+        <button type="button" class="ghost" data-retry hidden>Retry</button>
+        <span class="muted" data-status role="status" aria-live="polite"></span>
       </div>
     </form>
   </section>

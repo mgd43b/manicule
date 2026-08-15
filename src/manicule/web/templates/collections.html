@@ -13,7 +13,7 @@
     <label for="collection-name">Name</label>
     <input id="collection-name" name="name" required autocomplete="off">
     <button type="submit">Create</button>
-    <span class="muted" data-collection-status></span>
+    <span class="muted" data-collection-status role="status" aria-live="polite"></span>
   </form>
   {% if panels.collections.ok %}
     {% if panels.collections.data.collections %}
@@ -41,7 +41,7 @@
     <label for="tag-name">Name</label>
     <input id="tag-name" name="name" required autocomplete="off">
     <button type="submit">Create</button>
-    <span class="muted" data-tag-status></span>
+    <span class="muted" data-tag-status role="status" aria-live="polite"></span>
   </form>
   {% if panels.tags.ok %}
     {% if panels.tags.data.tags %}
