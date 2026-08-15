@@ -55,11 +55,21 @@ from importlib.metadata import PackageNotFoundError
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from uuid import uuid4
 
+from manicule.connectors.errors import (
+    BodyUnavailableError,
+    NotFoundError,
+    RemoteError,
+    SessionExpiredError,
+)
 from manicule.core.acquisition import (
+    AcquiredSource,
+    AcquisitionDiagnostic,
+    AcquisitionFailureCode,
     AcquisitionRecord,
     AcquisitionRecordState,
     AcquisitionRunState,
     AcquisitionSource,
+    AcquisitionStage,
 )
 from manicule.core.content import (
     SETTLED,
@@ -98,7 +108,7 @@ from manicule.parsers.expansion import ExpandedMember, MemberFailure
 from manicule.parsers.versions import parse_fingerprint
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 
     from manicule.core.content import Chunk, Metadata
     from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
@@ -146,6 +156,37 @@ class _LostAcquisitionLeaseError(RuntimeError):
     """The current acquisition attempt no longer owns its fencing generation."""
 
 
+class _AcquisitionRetentionError(RuntimeError):
+    """Fetched bytes could not become a durable snapshot input."""
+
+
+class _UnprovenSourceRevisionError(RuntimeError):
+    """Fetched bytes do not prove they are at least the discovered source revision."""
+
+
+def _acquisition_diagnostic(exc: Exception) -> AcquisitionDiagnostic:
+    """Reduce source failures to a bounded, non-sensitive persisted vocabulary."""
+    if isinstance(exc, SessionExpiredError) or (
+        isinstance(exc, RemoteError) and exc.status_code in {401, 403}
+    ):
+        code = AcquisitionFailureCode.AUTHENTICATION
+    elif isinstance(exc, NotFoundError):
+        code = AcquisitionFailureCode.SOURCE_DELETED
+    elif isinstance(exc, _UnprovenSourceRevisionError):
+        code = AcquisitionFailureCode.STALE_BODY
+    elif isinstance(exc, BodyUnavailableError):
+        code = (
+            AcquisitionFailureCode.STALE_BODY
+            if "stale" in str(exc).lower() or "discovered at version" in str(exc).lower()
+            else AcquisitionFailureCode.MISSING_BODY
+        )
+    elif isinstance(exc, _AcquisitionRetentionError):
+        code = AcquisitionFailureCode.CAPACITY
+    else:
+        code = AcquisitionFailureCode.FETCH_FAILED
+    return AcquisitionDiagnostic(stage=AcquisitionStage.ACQUISITION, code=code)
+
+
 class _SupersededError(Exception):
     """A guarded write found the document had moved on. Internal, like :class:`_StageError`.
 
@@ -174,6 +215,14 @@ class BlobSink(Protocol):
 
     async def get(self, digest: str) -> bytes | None: ...
 
+    async def retain_acquisition(
+        self, key: str, raw: RawDocument
+    ) -> tuple[Retention, AcquiredSource]: ...
+
+    async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None: ...
+
+    async def complete_acquisition(self, key: str) -> None: ...
+
 
 class NoRetention:
     """The blob sink that keeps nothing, and says so.
@@ -192,6 +241,19 @@ class NoRetention:
     async def get(self, digest: str) -> bytes | None:
         del digest
         return None
+
+    async def retain_acquisition(
+        self, key: str, raw: RawDocument
+    ) -> tuple[Retention, AcquiredSource]:
+        del key
+        return await self.retain(raw.as_bytes(), raw.media_type), AcquiredSource.from_raw(raw)
+
+    async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None:
+        del key
+        return None
+
+    async def complete_acquisition(self, key: str) -> None:
+        del key
 
 
 class Change(StrEnum):
@@ -460,6 +522,7 @@ class _Fetched:
     raw: RawDocument
     discovered: DiscoveredDoc
     existing: Document | None
+    acquisition_record: AcquisitionRecord | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,6 +535,7 @@ class _AcquisitionStart:
     candidate_watermark: Watermark | None = None
     accepted: int = 0
     watermark: Watermark | None = None
+    state: AcquisitionRunState | None = None
 
 
 @dataclass
@@ -499,6 +563,7 @@ class _Sync:
     lease_expires_at: datetime | None = None
     resume_completed: bool = False
     candidate_watermark: Watermark | None = None
+    acquisition_state: AcquisitionRunState | None = None
     discovery_records_held: Gauge = field(default_factory=lambda: Gauge("discovery-records"))
 
     watching: Watching | None = None
@@ -691,6 +756,7 @@ class IngestPipeline:
             if selected.state not in {
                 AcquisitionRunState.ENUMERATING,
                 AcquisitionRunState.ACQUIRING,
+                AcquisitionRunState.INDEXING,
             }:
                 msg = (
                     f"acquisition run {selected.id!r} is {selected.state}; the direct journal "
@@ -717,6 +783,7 @@ class IngestPipeline:
             candidate_watermark=selected.candidate_watermark,
             accepted=selected.discovered_count,
             watermark=selected.base_watermark,
+            state=selected.state,
         )
 
     async def run(
@@ -801,6 +868,7 @@ class IngestPipeline:
             lease_expires_at=acquisition.expires_at,
             resume_completed=acquisition.resume_completed,
             candidate_watermark=acquisition.candidate_watermark,
+            acquisition_state=acquisition.state,
             accepted=acquisition.accepted,
         )
         # Peaks only. The active counts belong to whoever is inside the stage right now, and a
@@ -836,7 +904,7 @@ class IngestPipeline:
 
         run.report.stages = self._stage_report(run)
         run.report.settle()
-        if run.report.complete:
+        if run.acquisitions is None and run.report.complete:
             try:
                 run.report.watermark_advanced = await self._advance_watermark(run)
             except Exception as exc:  # noqa: BLE001 - a checkpoint failure makes this run retry
@@ -858,41 +926,93 @@ class IngestPipeline:
         is left to raise is the store or a defect, and neither is survivable by carrying on.
         """
         if run.acquisitions is not None:
+            await self._drive_durable(run)
+            return
+        producer = self._discover_into
+
+        refs, bodies = run.refs, run.bodies
+        await self._run_local_stages(run, producer, refs, bodies)
+
+    async def _drive_durable(self, run: _Sync) -> None:
+        """Acquire a source snapshot first, then derive only from retained local bytes."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - selected structurally
+            return
+
+        async def owned(work: Coroutine[object, object, None], name: str) -> None:
+            async with asyncio.TaskGroup() as ownership:
+                task = ownership.create_task(work, name=name)
+                ownership.create_task(
+                    self._heartbeat_acquisition_until_done(run, task), name="lease-heartbeat"
+                )
+
+        if run.acquisition_state is AcquisitionRunState.ENUMERATING:
             if run.resume_completed:
                 run.report.enumeration_completed = True
             else:
                 await self._enumerate_to_journal(run)
-            producer = self._journal_into
+            if not run.report.enumeration_completed:
+                # A bounded/incomplete run may still make its durable prefix useful, but it can
+                # never publish the candidate watermark or claim complete source coverage.
+                await self._owned_acquisition(run, self._acquire_journal(run))
+                if run.stop.is_set():
+                    return
+                await owned(self._index_acquired(run), "journal-indexing")
+                return
+            run.acquisition_state = AcquisitionRunState.ACQUIRING
         else:
-            producer = self._discover_into
+            run.report.enumeration_completed = True
 
-        refs, bodies = run.refs, run.bodies
-        if run.acquisitions is not None:
-            async with asyncio.TaskGroup() as ownership:
-                work = ownership.create_task(
-                    self._run_local_stages(run, producer, refs, bodies), name="journal-work"
+        if run.acquisition_state is AcquisitionRunState.ACQUIRING:
+            acquired = await self._owned_acquisition(run, self._acquire_journal(run))
+            if run.stop.is_set():
+                return
+            if acquired:
+                now = self._acquisition_clock()
+                await self._keep_acquisition_lease_live(run, acquisitions, now, force=True)
+                run.report.watermark_advanced = await acquisitions.commit_acquisition_watermark(
+                    run.acquisition_run_id,
+                    lease_owner=run.lease_owner,
+                    lease_generation=run.lease_generation,
+                    now=now,
                 )
-                ownership.create_task(
-                    self._heartbeat_acquisition_until_done(run, work), name="lease-heartbeat"
+                await acquisitions.transition_acquisition_run(
+                    run.acquisition_run_id,
+                    AcquisitionRunState.ACQUIRING,
+                    AcquisitionRunState.INDEXING,
+                    lease_owner=run.lease_owner,
+                    lease_generation=run.lease_generation,
+                    now=now,
                 )
-        else:
-            await self._run_local_stages(run, producer, refs, bodies)
-        if (
-            run.acquisitions is not None
-            and run.report.enumeration_completed
-            and run.report.complete
-            and not run.stop.is_set()
-        ):
+                run.acquisition_state = AcquisitionRunState.INDEXING
+
+        await owned(self._index_acquired(run), "journal-indexing")
+        if run.acquisition_state is AcquisitionRunState.INDEXING and not run.stop.is_set():
             now = self._acquisition_clock()
-            await self._keep_acquisition_lease_live(run, run.acquisitions, now, force=True)
-            await run.acquisitions.transition_acquisition_run(
+            await self._keep_acquisition_lease_live(run, acquisitions, now, force=True)
+            await acquisitions.transition_acquisition_run(
                 run.acquisition_run_id,
-                AcquisitionRunState.ACQUIRING,
+                AcquisitionRunState.INDEXING,
                 AcquisitionRunState.SETTLED,
                 lease_owner=run.lease_owner,
                 lease_generation=run.lease_generation,
                 now=now,
             )
+
+    async def _owned_acquisition(self, run: _Sync, work: Awaitable[bool]) -> bool:
+        """Run a bool-returning acquisition phase with the same independent lease heartbeat."""
+        result = False
+
+        async def capture() -> None:
+            nonlocal result
+            result = await work
+
+        async with asyncio.TaskGroup() as ownership:
+            task = ownership.create_task(capture(), name="journal-acquisition")
+            ownership.create_task(
+                self._heartbeat_acquisition_until_done(run, task), name="lease-heartbeat"
+            )
+        return result
 
     async def _run_local_stages(
         self,
@@ -1059,6 +1179,388 @@ class IngestPipeline:
         await self._keep_acquisition_lease_live(
             run, acquisitions, self._acquisition_clock(), force=True
         )
+
+    async def _acquire_journal(self, run: _Sync) -> bool:
+        """Fetch and retain a bounded page stream; return whether every item has coverage."""
+        refs: Conveyor[DiscoveredDoc | AcquisitionRecord] = Conveyor(
+            name="fetch",
+            capacity=self._queue_depth_factor * self._fetch_workers,
+            consumers=self._fetch_workers,
+        )
+        run.refs = refs
+        async with asyncio.TaskGroup() as stages:
+            stages.create_task(self._acquisition_candidates_into(run, refs), name="journal-reader")
+            for worker in range(self._fetch_workers):
+                stages.create_task(self._acquire_from_journal(run, refs), name=f"acquire-{worker}")
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - selected structurally
+            return False
+        after: int | None = None
+        while True:
+            remaining = await acquisitions.list_acquisition_records(
+                run.acquisition_run_id,
+                states=(
+                    AcquisitionRecordState.DISCOVERED,
+                    AcquisitionRecordState.ACQUIRING,
+                    AcquisitionRecordState.RETRY,
+                ),
+                after_sequence=after,
+                limit=100,
+            )
+            if not remaining:
+                return True
+            if any(record.blob_ref is None for record in remaining):
+                return False
+            after = remaining[-1].sequence
+
+    async def _acquisition_candidates_into(
+        self, run: _Sync, refs: Conveyor[DiscoveredDoc | AcquisitionRecord]
+    ) -> None:
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover
+            refs.finish()
+            return
+        after: int | None = None
+        try:
+            while not run.stop.is_set():
+                await refs.wait_for_room()
+                if run.stop.is_set():
+                    return
+                records = await acquisitions.list_acquisition_records(
+                    run.acquisition_run_id,
+                    states=(
+                        AcquisitionRecordState.DISCOVERED,
+                        AcquisitionRecordState.ACQUIRING,
+                        AcquisitionRecordState.RETRY,
+                    ),
+                    after_sequence=after,
+                    limit=1,
+                )
+                if not records:
+                    return
+                if run.stop.is_set():
+                    return
+                record = records[0]
+                # A retry carrying a blob belongs to local indexing, never another source call.
+                if record.state is AcquisitionRecordState.RETRY and record.blob_ref is not None:
+                    after = record.sequence
+                    continue
+                run.discovery_records_held.enter()
+                await refs.put(record)
+                after = record.sequence
+        finally:
+            refs.finish()
+
+    async def _acquire_from_journal(
+        self, run: _Sync, refs: Conveyor[DiscoveredDoc | AcquisitionRecord]
+    ) -> None:
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover
+            return
+        while (work := await refs.take()) is not None:
+            if not isinstance(work, AcquisitionRecord):  # pragma: no cover - private conveyor
+                continue
+            run.discovery_records_held.leave()
+            record = work
+            now = self._acquisition_clock()
+            await self._keep_acquisition_lease_live(run, acquisitions, now)
+            if record.state in {AcquisitionRecordState.DISCOVERED, AcquisitionRecordState.RETRY}:
+                record = await acquisitions.transition_acquisition_record(
+                    run.acquisition_run_id,
+                    record.source.source_id,
+                    record.state,
+                    AcquisitionRecordState.ACQUIRING,
+                    lease_owner=run.lease_owner,
+                    lease_generation=run.lease_generation,
+                    now=now,
+                )
+
+            existing = await self._store.find_document(run.connector.name, record.source.source_id)
+            discovered = self._discovered(record)
+            if self._unchanged_by_token(existing, discovered):
+                await self._keep_acquisition_lease_live(
+                    run, acquisitions, self._acquisition_clock(), force=True
+                )
+                await acquisitions.transition_acquisition_record(
+                    run.acquisition_run_id,
+                    record.source.source_id,
+                    AcquisitionRecordState.ACQUIRING,
+                    AcquisitionRecordState.UNCHANGED,
+                    lease_owner=run.lease_owner,
+                    lease_generation=run.lease_generation,
+                    now=self._acquisition_clock(),
+                    blob_ref=existing.original_ref if existing is not None else None,
+                    fetched_version_token=record.source.version_token,
+                )
+                await self._fence_acquisition_publication(run)
+                await self._store.record_seen(existing.id)  # pyright: ignore[reportOptionalMemberAccess]
+                run.report.record(
+                    DocumentOutcome(
+                        source_id=record.source.source_id,
+                        status=existing.status,  # pyright: ignore[reportOptionalMemberAccess]
+                        document_id=existing.id,  # pyright: ignore[reportOptionalMemberAccess]
+                        skipped="version",
+                    )
+                )
+                _report_progress(run)
+                continue
+
+            try:
+                stage_key = f"{run.acquisition_run_id}\0{record.source.source_id}"
+                staged = await self._blobs.resume_acquisition(stage_key)
+                if staged is None:
+                    raw = await self._fetch(run.connector, record.source.ref)
+                    fetched_version = self._validated_fetched_version(
+                        run.connector, record.source, raw
+                    )
+                    retained, acquired_source = await self._retain_acquisition(
+                        stage_key, raw, record.source.source_id
+                    )
+                else:
+                    retained, acquired_source = staged
+                    data = await self._blobs.get(retained.ref or "")
+                    raw = self._staged_raw(acquired_source, data)
+                    fetched_version = self._validated_fetched_version(
+                        run.connector, record.source, raw
+                    )
+            except Exception as exc:  # noqa: BLE001 - persisted as a typed safe diagnostic
+                diagnostic = _acquisition_diagnostic(exc)
+                await self._keep_acquisition_lease_live(
+                    run, acquisitions, self._acquisition_clock(), force=True
+                )
+                await acquisitions.transition_acquisition_record(
+                    run.acquisition_run_id,
+                    record.source.source_id,
+                    AcquisitionRecordState.ACQUIRING,
+                    AcquisitionRecordState.RETRY,
+                    lease_owner=run.lease_owner,
+                    lease_generation=run.lease_generation,
+                    now=self._acquisition_clock(),
+                    diagnostic=diagnostic,
+                )
+                run.report.record(
+                    DocumentOutcome(
+                        source_id=record.source.source_id,
+                        status=(
+                            existing.status if existing is not None else DocumentStatus.PENDING
+                        ),
+                        document_id=(existing.id if existing is not None else ""),
+                        detail=diagnostic.code.value,
+                    )
+                )
+                _report_progress(run)
+                continue
+
+            await self._keep_acquisition_lease_live(
+                run, acquisitions, self._acquisition_clock(), force=True
+            )
+            await acquisitions.transition_acquisition_record(
+                run.acquisition_run_id,
+                record.source.source_id,
+                AcquisitionRecordState.ACQUIRING,
+                AcquisitionRecordState.ACQUIRED,
+                lease_owner=run.lease_owner,
+                lease_generation=run.lease_generation,
+                now=self._acquisition_clock(),
+                blob_ref=retained.ref,
+                acquired_source=acquired_source,
+                fetched_version_token=fetched_version,
+            )
+            await self._blobs.complete_acquisition(stage_key)
+
+    @staticmethod
+    def _discovered(record: AcquisitionRecord) -> DiscoveredDoc:
+        source = record.source
+        return DiscoveredDoc(
+            ref=source.ref,
+            version_token=source.version_token,
+            title=source.title,
+            media_type=source.media_type,
+            size_bytes=source.size_bytes,
+            metadata=source.metadata,
+        )
+
+    async def _retain_acquisition(
+        self, key: str, raw: RawDocument, expected_source_id: str
+    ) -> tuple[Retention, AcquiredSource]:
+        """Validate identity, durably retain bytes, and bind the returned digest."""
+        if raw.source_id != expected_source_id:
+            msg = "the fetched source identity did not match its journal record"
+            raise ValueError(msg)
+        retained, acquired_source = await self._blobs.retain_acquisition(key, raw)
+        if retained.ref is None:
+            msg = "source bytes were not retained"
+            raise _AcquisitionRetentionError(msg)
+        if retained.ref != acquired_source.content_hash:
+            msg = "the blob store returned a reference for different source bytes"
+            raise _AcquisitionRetentionError(msg)
+        return retained, acquired_source
+
+    @staticmethod
+    def _staged_raw(acquired: AcquiredSource, data: bytes | None) -> RawDocument:
+        if data is None:
+            msg = "the staged source blob is unavailable"
+            raise _AcquisitionRetentionError(msg)
+        return acquired.raw(data)
+
+    @staticmethod
+    def _validated_fetched_version(
+        connector: Connector, discovered: AcquisitionSource, raw: RawDocument
+    ) -> str | None:
+        """Require connector-owned proof that fetched bytes are not older than discovery."""
+        fetched = raw.metadata.get("version_token")
+        fetched_token = fetched if isinstance(fetched, str) and fetched else None
+        expected = discovered.version_token
+        if expected is None:
+            return fetched_token
+        if fetched_token is None:
+            msg = "the fetched body carried no revision proof for a versioned discovery record"
+            raise _UnprovenSourceRevisionError(msg)
+        comparator = getattr(connector, "fetched_revision_at_least", None)
+        if comparator is None:
+            proven = fetched_token == expected
+        else:
+            proven = comparator(expected, fetched_token)
+        if not proven:
+            msg = "the fetched body revision was not proven at least as new as discovery"
+            raise _UnprovenSourceRevisionError(msg)
+        return fetched_token
+
+    async def _index_acquired(self, run: _Sync) -> None:
+        """Derive from blob-backed journal records without consulting the connector."""
+        refs: Conveyor[DiscoveredDoc | AcquisitionRecord] = Conveyor(
+            name="snapshot",
+            capacity=self._queue_depth_factor * self._fetch_workers,
+            consumers=self._fetch_workers,
+        )
+        bodies: Conveyor[_Fetched] = Conveyor(
+            name="parse",
+            capacity=self._queue_depth_factor * self._ingest_workers,
+            consumers=self._ingest_workers,
+            producers=self._fetch_workers,
+        )
+        run.refs = refs
+        run.bodies = bodies
+        async with asyncio.TaskGroup() as stages:
+            stages.create_task(self._index_candidates_into(run, refs), name="snapshot-reader")
+            for worker in range(self._fetch_workers):
+                stages.create_task(
+                    self._snapshot_into(run, refs, bodies), name=f"snapshot-{worker}"
+                )
+            for worker in range(self._ingest_workers):
+                stages.create_task(self._ingest_from(run, bodies), name=f"ingest-{worker}")
+
+    async def _index_candidates_into(
+        self, run: _Sync, refs: Conveyor[DiscoveredDoc | AcquisitionRecord]
+    ) -> None:
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover
+            refs.finish()
+            return
+        after: int | None = None
+        try:
+            while not run.stop.is_set():
+                await refs.wait_for_room()
+                if run.stop.is_set():
+                    return
+                records = await acquisitions.list_acquisition_records(
+                    run.acquisition_run_id,
+                    states=(
+                        AcquisitionRecordState.ACQUIRED,
+                        AcquisitionRecordState.INDEXING,
+                        AcquisitionRecordState.RETRY,
+                    ),
+                    after_sequence=after,
+                    limit=1,
+                )
+                if not records:
+                    return
+                if run.stop.is_set():
+                    return
+                record = records[0]
+                after = record.sequence
+                if record.blob_ref is None:
+                    continue
+                run.discovery_records_held.enter()
+                await refs.put(record)
+        finally:
+            refs.finish()
+
+    async def _snapshot_into(
+        self,
+        run: _Sync,
+        refs: Conveyor[DiscoveredDoc | AcquisitionRecord],
+        bodies: Conveyor[_Fetched],
+    ) -> None:
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover
+            bodies.finish()
+            return
+        try:
+            while (work := await refs.take()) is not None:
+                if not isinstance(work, AcquisitionRecord):  # pragma: no cover
+                    continue
+                run.discovery_records_held.leave()
+                record = work
+                now = self._acquisition_clock()
+                await self._keep_acquisition_lease_live(run, acquisitions, now)
+                if record.state in {
+                    AcquisitionRecordState.ACQUIRED,
+                    AcquisitionRecordState.RETRY,
+                }:
+                    record = await acquisitions.transition_acquisition_record(
+                        run.acquisition_run_id,
+                        record.source.source_id,
+                        record.state,
+                        AcquisitionRecordState.INDEXING,
+                        lease_owner=run.lease_owner,
+                        lease_generation=run.lease_generation,
+                        now=now,
+                    )
+                try:
+                    raw = await self._raw_from_acquisition(record)
+                except Exception as exc:  # noqa: BLE001 - safe typed retry outcome
+                    diagnostic = _acquisition_diagnostic(exc)
+                    await acquisitions.transition_acquisition_record(
+                        run.acquisition_run_id,
+                        record.source.source_id,
+                        AcquisitionRecordState.INDEXING,
+                        AcquisitionRecordState.RETRY,
+                        lease_owner=run.lease_owner,
+                        lease_generation=run.lease_generation,
+                        now=self._acquisition_clock(),
+                        diagnostic=diagnostic,
+                    )
+                    continue
+                existing = await self._store.find_document(
+                    run.connector.name, record.source.source_id
+                )
+                run.bodies_held.enter()
+                await bodies.put(
+                    _Fetched(
+                        raw=raw,
+                        discovered=DiscoveredDoc(
+                            ref=record.source.ref,
+                            version_token=record.fetched_version_token,
+                            title=record.source.title,
+                            media_type=raw.media_type,
+                            size_bytes=len(raw.as_bytes()),
+                            metadata=record.source.metadata,
+                        ),
+                        existing=existing,
+                        acquisition_record=record,
+                    )
+                )
+        finally:
+            bodies.finish()
+
+    async def _raw_from_acquisition(self, record: AcquisitionRecord) -> RawDocument:
+        """Load and verify a journal-owned blob before local derivation sees it."""
+        data = await self._blobs.get(record.blob_ref or "")
+        if data is None or record.acquired_source is None:
+            msg = "the acquired source snapshot is unavailable"
+            raise _AcquisitionRetentionError(msg)
+        return record.acquired_source.raw(data)
 
     async def _journal_into(
         self, run: _Sync, refs: Conveyor[DiscoveredDoc | AcquisitionRecord]
@@ -1249,12 +1751,43 @@ class IngestPipeline:
                 # The first outcome is the discovered document; anything after it came out of
                 # the inside of it.
                 run.report.record(outcome, expanded=position > 0)
-            if run.acquisitions is not None:
-                await self._settle_journal_record(run, outcomes[0])
+            if fetched.acquisition_record is not None:
+                await self._settle_indexed_record(run, fetched.acquisition_record, outcomes[0])
             # After the whole document, not per outcome: a container that expanded into five
             # hundred members is one thing that happened to somebody watching, and five hundred
             # lines of it is not progress.
             _report_progress(run)
+
+    async def _settle_indexed_record(
+        self, run: _Sync, record: AcquisitionRecord, outcome: DocumentOutcome
+    ) -> None:
+        """Persist derivation outcome without weakening the independent byte snapshot."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover
+            return
+        target = (
+            AcquisitionRecordState.SETTLED if outcome.document_id else AcquisitionRecordState.RETRY
+        )
+        diagnostic = (
+            None
+            if target is AcquisitionRecordState.SETTLED
+            else AcquisitionDiagnostic(
+                stage=AcquisitionStage.INDEXING,
+                code=AcquisitionFailureCode.PUBLICATION_FAILED,
+            )
+        )
+        now = self._acquisition_clock()
+        await self._keep_acquisition_lease_live(run, acquisitions, now)
+        await acquisitions.transition_acquisition_record(
+            run.acquisition_run_id,
+            record.source.source_id,
+            AcquisitionRecordState.INDEXING,
+            target,
+            lease_owner=run.lease_owner,
+            lease_generation=run.lease_generation,
+            now=now,
+            diagnostic=diagnostic,
+        )
 
     async def _stop_within_grace(self, run: _Sync, stages: asyncio.Task[None]) -> None:
         """Stop pulling the source, let what is accepted finish, cancel the rest at the deadline.

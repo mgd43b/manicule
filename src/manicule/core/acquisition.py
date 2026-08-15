@@ -14,7 +14,8 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from manicule.core.content import Metadata
+from manicule.core.content import Metadata, RawDocument
+from manicule.core.ids import content_hash
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 
 
@@ -131,6 +132,51 @@ class AcquisitionSource(BaseModel):
         return self.ref.source_id
 
 
+class AcquiredSource(BaseModel):
+    """The complete, byte-validated source envelope retained for offline derivation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    source_id: str = Field(min_length=1)
+    uri: str = Field(min_length=1)
+    media_type: str = Field(min_length=1)
+    encoding: str = Field(min_length=1)
+    metadata: Metadata = Field(default_factory=dict)
+    text_content: bool
+    content_hash: str = Field(min_length=1)
+    byte_length: int = Field(ge=0)
+
+    @classmethod
+    def from_raw(cls, raw: RawDocument) -> AcquiredSource:
+        """Capture every non-body field needed to reconstruct ``raw`` from its blob."""
+        data = raw.as_bytes()
+        return cls(
+            source_id=raw.source_id,
+            uri=raw.uri,
+            media_type=raw.media_type,
+            encoding=raw.encoding,
+            metadata=raw.metadata,
+            text_content=isinstance(raw.content, str),
+            content_hash=content_hash(data),
+            byte_length=len(data),
+        )
+
+    def raw(self, data: bytes) -> RawDocument:
+        """Rebuild the connector result, refusing corrupt or mismatched retained bytes."""
+        if len(data) != self.byte_length or content_hash(data) != self.content_hash:
+            msg = "retained source bytes do not match their acquisition snapshot"
+            raise ValueError(msg)
+        content: bytes | str = data.decode(self.encoding) if self.text_content else data
+        return RawDocument(
+            source_id=self.source_id,
+            uri=self.uri,
+            media_type=self.media_type,
+            encoding=self.encoding,
+            content=content,
+            metadata=self.metadata,
+        )
+
+
 class AcquisitionRun(BaseModel):
     """Read model for a durable run."""
 
@@ -170,6 +216,7 @@ class AcquisitionRecord(BaseModel):
     source: AcquisitionSource
     state: AcquisitionRecordState
     blob_ref: str | None = None
+    acquired_source: AcquiredSource | None = None
     fetched_version_token: str | None = None
     attempts: int = Field(ge=0)
     diagnostic: AcquisitionDiagnostic | None = None
@@ -179,6 +226,7 @@ class AcquisitionRecord(BaseModel):
 
 __all__ = [
     "UNSET",
+    "AcquiredSource",
     "AcquisitionDiagnostic",
     "AcquisitionFailureCode",
     "AcquisitionRecord",

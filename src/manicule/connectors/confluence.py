@@ -218,6 +218,14 @@ class _Body:
 class ConfluenceConnector:
     """Discovers, fetches and reconciles Confluence pages and their attachments."""
 
+    @staticmethod
+    def fetched_revision_at_least(discovered: str, fetched: str) -> bool:
+        """Confluence revisions are ordered integers; malformed tokens prove nothing."""
+        try:
+            return int(fetched) >= int(discovered)
+        except ValueError:
+            return False
+
     def __init__(
         self, config: ConfluenceConfig, client: ConfluenceClient, *, name: str = CONNECTOR_NAME
     ) -> None:

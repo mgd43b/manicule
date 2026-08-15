@@ -307,6 +307,7 @@ class AcquisitionRecord(Base):
         default=AcquisitionRecordState.DISCOVERED,
     )
     blob_ref: Mapped[str | None] = mapped_column(ForeignKey("blobs.hash", ondelete="RESTRICT"))
+    acquired_source: Mapped[JsonValue | None] = mapped_column(JSON)
     fetched_version_token: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     diagnostic: Mapped[JsonValue | None] = mapped_column(JSON)

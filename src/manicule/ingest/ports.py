@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from manicule.core.acquisition import (
+        AcquiredSource,
         AcquisitionDiagnostic,
         AcquisitionRecord,
         AcquisitionRecordState,
@@ -414,6 +415,7 @@ class AcquisitionStore(Protocol):
         lease_generation: int,
         now: datetime,
         blob_ref: str | None = None,
+        acquired_source: AcquiredSource | None = None,
         fetched_version_token: str | UnsetValue | None = UNSET,
         diagnostic: AcquisitionDiagnostic | None = None,
     ) -> AcquisitionRecord: ...

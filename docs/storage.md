@@ -108,6 +108,16 @@ the only placement that covers every connection the pool will ever open. A test 
 web request produce `SQLITE_BUSY` immediately rather than after a wait. WAL permits many
 readers with one writer; manicule keeps a single write path and lets readers run concurrently.
 
+Blob filenames are content addresses, while compression is a property of their stored
+representation. Concurrent writers publish with an atomic no-clobber hard link and then read the
+winning representation before recording its descriptor. This remains coherent across processes:
+every contender fsyncs the destination directory before its SQLite write, and all contenders
+derive the same compression and stored-size fields from the one immutable file.
+Shard creation follows the same rule even when another process wins `mkdir`: the losing process
+still syncs the parent, certifying a peer's new name before relying on it. Temporary blob and
+acquisition files are created exclusively with mode `0600`, before any source bytes or metadata
+are written; privacy never depends on a later `chmod` surviving a crash.
+
 **Minimum SQLite 3.35**, checked at startup and reported by `doctor`, along with a probe that
 actually creates a temporary FTS5 table. Python's `sqlite3` links against whatever the
 platform provides, and a build without FTS5 fails at the first query rather than at install.
@@ -232,7 +242,7 @@ managed, not modeled.
 | `index_state` | One row recording the fingerprints and the derived-index names this data directory was built with. §6.3. |
 | `vector_tombstones` | Chunk IDs deleted from SQLite whose vectors have not yet been swept from LanceDB. §8.2. |
 | `acquisition_runs` | Durable connector-run lifecycle, base and candidate watermarks, generation-fenced lease, completion markers and bounded aggregate counters, including unchanged source coverage separately from indexed work. It separates discovering source coverage from publishing derived content. |
-| `acquisition_records` | One idempotent source identity per run, with the validated fetch snapshot, acquisition/indexing state and retained-blob reference. Acquired and indexing states require that reference; unchanged remains a distinct terminal provenance state. A source record is acknowledged only after this row commits. |
+| `acquisition_records` | One idempotent source identity per run, with the validated fetched envelope, acquisition/indexing state and retained-blob reference. Acquired and indexing states require the blob; the acquired transition also stores the fetched URI, media type, encoding, metadata, byte length and content hash atomically. Unchanged remains a distinct terminal provenance state. A discovery record is acknowledged only after this row commits. |
 | `glossary_entries` | Definitions detected in document chunks, with their display form, expansion, location and confidence. The document/chunk foreign keys keep citations authoritative. |
 | `glossary_aliases` | Normalized alternate lookup keys for glossary entries. A composite key prevents duplicate aliases and cascading deletion keeps them tied to their definition. |
 
@@ -1830,7 +1840,19 @@ into an answer by the side door.
 The original twenty tables, their constraints and their indexes shipped with the initial
 schema. Later revisions add lineage and publication state, and the durable-acquisition revision
 adds `acquisition_runs` and `acquisition_records` without synthesizing backlog for an existing
-index. Its downgrade refuses while any run is unsettled or any record remains active/retryable.
+index. A following additive revision gives each acquired record its validated source envelope;
+the body remains in content-addressed storage while the envelope preserves the fetched URI,
+media type, encoding, metadata, byte length and hash needed to reconstruct `RawDocument`
+offline. Its downgrade refuses while any run is unsettled or any record remains active/retryable.
+It also refuses with an aggregate count while any acquired envelope remains, including settled
+history: removing that column would silently discard the only complete recipe for reconstructing
+the retained source bytes. Diagnostics contain counts only, never source ids, URIs or metadata.
+
+Blob durability includes the directory entries, not only file contents. New shard parents are
+created one level at a time and their parents are fsynced; after the temporary file is fsynced
+and atomically renamed, the destination directory is fsynced before a blob row or acquisition
+staging marker can certify it. A directory-fsync failure may leak a file but creates no database
+reference, preserving the rule that storage failures cost space rather than correctness.
 Once all work is settled it may discard that completed diagnostic journal history; publications
 and retained bytes referenced by them remain governed by their own tables. This makes rollback
 possible without ever turning it into an implicit deletion of durable backlog. `alembic check`

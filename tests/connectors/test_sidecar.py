@@ -90,17 +90,15 @@ async def test_a_local_file_with_no_manifest_carries_no_record(tmp_path: Path) -
     """Backward compatibility, asserted at the boundary rather than assumed.
 
     This is the case that must not change at all. A directory of ordinary files has to produce
-    exactly what it produced before this feature existed — no record, no key in the metadata, and
-    a citation that is still the filename and the ``file://`` URI, because for a file that really
-    is the original that is the truthful citation.
+    the same provenance answer and citation it produced before this feature existed. The internal
+    version evidence used to validate fetched bytes is not a provenance record.
     """
     page = mirror(tmp_path, manifest=None)
     assert await fetch_one(tmp_path, page) is None
 
-    raw = await FilesystemConnector(tmp_path).fetch(
-        next(doc.ref for doc in await discovered(tmp_path))
-    )
-    assert raw.metadata == {}, "a file with no manifest must not gain a metadata key"
+    found = next(iter(await discovered(tmp_path)))
+    raw = await FilesystemConnector(tmp_path).fetch(found.ref)
+    assert raw.metadata == {"version_token": found.version_token}
     assert raw.uri.startswith("file://")
 
 

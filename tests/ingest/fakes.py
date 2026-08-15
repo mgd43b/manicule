@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from typing import override
 
 from manicule.connectors import CursorExpiredError
+from manicule.core.acquisition import AcquiredSource
 from manicule.core.anchors import LineAnchor
 from manicule.core.content import (
     BlockKind,
@@ -998,7 +999,12 @@ class DictConnector:
             uri=ref.uri,
             media_type=self.media_types.get(ref.source_id, MEDIA_TYPE),
             content=self.documents[ref.source_id],
-            metadata=dict(self.metadata.get(ref.source_id, {})),
+            metadata={
+                **self.metadata.get(ref.source_id, {}),
+                "version_token": self.tokens.get(
+                    ref.source_id, content_hash(self.documents[ref.source_id])
+                ),
+            },
         )
 
     async def reconcile(self) -> AsyncIterator[SourceId]:
@@ -1326,6 +1332,7 @@ class MemoryBlobs:
 
     def __init__(self, max_bytes: int = 1 << 30) -> None:
         self.data: dict[str, bytes] = {}
+        self.staged: dict[str, tuple[Retention, AcquiredSource]] = {}
         self._max = max_bytes
 
     async def retain(self, data: bytes, media_type: str | None = None) -> Retention:
@@ -1340,3 +1347,18 @@ class MemoryBlobs:
 
     async def get(self, digest: str) -> bytes | None:
         return self.data.get(digest)
+
+    async def retain_acquisition(
+        self, key: str, raw: RawDocument
+    ) -> tuple[Retention, AcquiredSource]:
+        acquired = AcquiredSource.from_raw(raw)
+        retained = await self.retain(raw.as_bytes(), raw.media_type)
+        if retained.ref is not None:
+            self.staged[key] = (retained, acquired)
+        return retained, acquired
+
+    async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None:
+        return self.staged.get(key)
+
+    async def complete_acquisition(self, key: str) -> None:
+        self.staged.pop(key, None)

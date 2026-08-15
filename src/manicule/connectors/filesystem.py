@@ -451,6 +451,14 @@ class FilesystemConnector:
         if conflict:
             metadata = {**metadata, DUPLICATE_IDENTITY: conflict}
 
+        fetched_token = version_token(
+            path,
+            adapter=self._adapter_for(path),
+            location="" if ref.source_id == str(path) else _relative(path, root=self._root),
+        )
+        if fetched_token is not None:
+            metadata["version_token"] = fetched_token
+
         adapted = await asyncio.to_thread(self._adapt, path, content)
         if not isinstance(adapted, Adaptation):
             return RawDocument(
