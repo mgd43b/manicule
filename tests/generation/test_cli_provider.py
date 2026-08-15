@@ -192,3 +192,26 @@ output.symlink_to({str(secret)!r})
 
     with pytest.raises(ProviderRequestError, match="regular output file"):
         _ = [token async for token in generator.generate(query(), context())]
+
+
+@POSIX_EXECUTABLE
+async def test_codex_output_fifo_fails_without_blocking(tmp_path: Path) -> None:
+    command = tmp_path / "codex-fifo-fake"
+    command.write_text(
+        """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+sys.stdin.read()
+output = pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1])
+os.mkfifo(output)
+""",
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    generator = CliGenerator(configured(), executable=str(command))
+    await generator.setup()
+
+    with pytest.raises(ProviderRequestError, match="not a regular file"):
+        _ = [token async for token in generator.generate(query(), context())]

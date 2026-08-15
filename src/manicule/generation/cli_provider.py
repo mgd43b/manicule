@@ -292,7 +292,7 @@ def _write_private_file(path: Path, text: str) -> None:
 
 def _read_regular_file(path: Path) -> str:
     """Read a CLI output without following a substituted symlink or special file."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = -1
     try:
         descriptor = os.open(path, flags)
