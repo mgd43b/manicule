@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 EXPECTED_TABLES = {
+    "acquisition_records",
+    "acquisition_runs",
     "api_keys",
     "audit_logs",
     "blobs",

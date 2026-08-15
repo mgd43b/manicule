@@ -17,10 +17,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from manicule.core.acquisition import UNSET, UnsetValue
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Sequence
     from datetime import datetime
 
+    from manicule.core.acquisition import (
+        AcquisitionDiagnostic,
+        AcquisitionRecord,
+        AcquisitionRecordState,
+        AcquisitionRun,
+        AcquisitionRunState,
+        AcquisitionSource,
+    )
     from manicule.core.content import (
         Chunk,
         Commit,
@@ -328,6 +338,96 @@ class IngestStore(Protocol):
 
 
 @runtime_checkable
+class AcquisitionStore(Protocol):
+    """The durable source boundary, separate from the legacy publication store."""
+
+    async def create_acquisition_run(self, run_id: str, connector: str) -> AcquisitionRun: ...
+
+    async def get_acquisition_run(self, run_id: str) -> AcquisitionRun | None: ...
+
+    async def latest_unsettled_acquisition_run(self, connector: str) -> AcquisitionRun | None: ...
+
+    async def append_acquisition_record(
+        self,
+        run_id: str,
+        sequence: int,
+        source: AcquisitionSource,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> AcquisitionRecord: ...
+
+    async def complete_acquisition_enumeration(
+        self,
+        run_id: str,
+        candidate_watermark: Watermark | None,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> AcquisitionRun: ...
+
+    async def claim_acquisition_run(
+        self, run_id: str, owner: str, *, now: datetime, expires_at: datetime
+    ) -> AcquisitionRun | None: ...
+
+    async def renew_acquisition_lease(
+        self,
+        run_id: str,
+        owner: str,
+        generation: int,
+        *,
+        now: datetime,
+        expires_at: datetime,
+    ) -> bool: ...
+
+    async def transition_acquisition_run(
+        self,
+        run_id: str,
+        expected: AcquisitionRunState,
+        target: AcquisitionRunState,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+        diagnostic: AcquisitionDiagnostic | None = None,
+    ) -> AcquisitionRun: ...
+
+    async def list_acquisition_records(
+        self,
+        run_id: str,
+        *,
+        states: Sequence[AcquisitionRecordState] | None = None,
+        limit: int = 100,
+    ) -> Sequence[AcquisitionRecord]: ...
+
+    async def transition_acquisition_record(
+        self,
+        run_id: str,
+        source_id: str,
+        expected: AcquisitionRecordState,
+        target: AcquisitionRecordState,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+        blob_ref: str | None = None,
+        fetched_version_token: str | UnsetValue | None = UNSET,
+        diagnostic: AcquisitionDiagnostic | None = None,
+    ) -> AcquisitionRecord: ...
+
+    async def commit_acquisition_watermark(
+        self,
+        run_id: str,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> bool: ...
+
+
+@runtime_checkable
 class GlossaryWriter(Protocol):
     """A store that can hold the definitions a document states.
 
@@ -393,4 +493,4 @@ class GlossaryStore(GlossaryWriter, Protocol):
         ...
 
 
-__all__ = ["GlossaryStore", "GlossaryWriter", "IngestStore"]
+__all__ = ["AcquisitionStore", "GlossaryStore", "GlossaryWriter", "IngestStore"]

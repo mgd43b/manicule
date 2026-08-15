@@ -41,3 +41,6 @@ lychee-report.json
 
 # Claude Code worktrees
 .claude/worktrees/
+
+# Local bug prompts and investigation notes
+bugs/

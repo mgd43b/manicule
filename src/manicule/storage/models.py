@@ -1,8 +1,8 @@
 """The relational schema.
 
-Sixteen tables carry the shape ``PLAN.md`` §2 names, plus four additions each doing a job
-none of the sixteen can (``docs/storage.md`` §4.1). The reasoning for every column, index and
-constraint lives in that document; what is here is the schema it describes.
+The tables carry the shape ``PLAN.md`` §2 and the durable acquisition boundary. The reasoning
+for every column, index and constraint lives in the storage and ingest design documents; what
+is here is the schema they describe.
 
 Two conventions apply throughout and are not repeated per column:
 
@@ -27,6 +27,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     MetaData,
@@ -36,6 +37,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from manicule.core.acquisition import AcquisitionRecordState, AcquisitionRunState
 from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
 from manicule.storage.types import UtcDateTime, utcnow
 
@@ -99,6 +101,14 @@ def _stage_enum() -> Enum:
 
 def _kind_enum() -> Enum:
     return _value_enum(BlockKind, "block_kind")
+
+
+def _acquisition_run_state_enum() -> Enum:
+    return _value_enum(AcquisitionRunState, "acquisition_run_state")
+
+
+def _acquisition_record_state_enum() -> Enum:
+    return _value_enum(AcquisitionRecordState, "acquisition_record_state")
 
 
 class Base(DeclarativeBase):
@@ -207,12 +217,117 @@ class Connector(Base):
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
     __table_args__ = (
+        Index("uq_connectors_id_workspace_id", "id", "workspace_id", unique=True),
         Index(
             "uq_connectors_workspace_id_name",
             "workspace_id",
             "name",
             unique=True,
             sqlite_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+
+# --- durable acquisition ---------------------------------------------------------------
+
+
+class AcquisitionRun(Base):
+    """One immutable connector enumeration and the local work derived from it."""
+
+    __tablename__ = "acquisition_runs"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    connector_id: Mapped[str] = mapped_column(Text, nullable=False)
+    connector_name: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[AcquisitionRunState] = mapped_column(
+        _acquisition_run_state_enum(), nullable=False, default=AcquisitionRunState.ENUMERATING
+    )
+    base_watermark: Mapped[JsonValue | None] = mapped_column(JSON)
+    candidate_watermark: Mapped[JsonValue | None] = mapped_column(JSON)
+    enumeration_completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    watermark_committed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    lease_owner: Mapped[str | None] = mapped_column(Text)
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    discovered_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    acquired_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    indexed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    metadata_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    acquired_blob_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    diagnostic: Mapped[JsonValue | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["connector_id", "workspace_id"],
+            ["connectors.id", "connectors.workspace_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("id", "workspace_id", "connector_id"),
+        Index(
+            "ix_acquisition_runs_workspace_connector_state", "workspace_id", "connector_id", "state"
+        ),
+        CheckConstraint("lease_generation >= 0", name="lease_generation_is_not_negative"),
+        CheckConstraint(
+            "discovered_count >= 0 AND acquired_count >= 0 AND indexed_count >= 0 "
+            "AND retry_count >= 0 AND metadata_bytes >= 0 AND acquired_blob_bytes >= 0",
+            name="acquisition_run_counters_are_not_negative",
+        ),
+        CheckConstraint(
+            "watermark_committed_at IS NULL OR enumeration_completed_at IS NOT NULL",
+            name="committed_watermark_has_complete_enumeration",
+        ),
+    )
+
+
+class AcquisitionRecord(Base):
+    """A source record acknowledged only after this row's transaction commits."""
+
+    __tablename__ = "acquisition_records"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    run_id: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
+    connector_id: Mapped[str] = mapped_column(Text, nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_id: Mapped[str] = mapped_column(Text, nullable=False)
+    source_record: Mapped[JsonValue] = mapped_column(JSON, nullable=False)
+    state: Mapped[AcquisitionRecordState] = mapped_column(
+        _acquisition_record_state_enum(),
+        nullable=False,
+        default=AcquisitionRecordState.DISCOVERED,
+    )
+    blob_ref: Mapped[str | None] = mapped_column(ForeignKey("blobs.hash", ondelete="RESTRICT"))
+    fetched_version_token: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    diagnostic: Mapped[JsonValue | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "workspace_id", "connector_id"],
+            [
+                "acquisition_runs.id",
+                "acquisition_runs.workspace_id",
+                "acquisition_runs.connector_id",
+            ],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("run_id", "source_id"),
+        UniqueConstraint("run_id", "sequence"),
+        Index("ix_acquisition_records_run_state_sequence", "run_id", "state", "sequence"),
+        CheckConstraint(
+            "sequence >= 0 AND attempts >= 0", name="acquisition_record_numbers_are_not_negative"
         ),
     )
 
@@ -858,6 +973,8 @@ __all__ = [
     "ALL_TABLES",
     "FTS_TOKENIZER",
     "NAMING_CONVENTION",
+    "AcquisitionRecord",
+    "AcquisitionRun",
     "ApiKey",
     "AuditLog",
     "Base",
