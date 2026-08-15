@@ -26,7 +26,13 @@ import pytest
 
 from manicule.core.anchors import HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, Chunk
-from manicule.core.embedding import EmbedFingerprint, Pooling, VectorState
+from manicule.core.embedding import (
+    EmbedFingerprint,
+    Pooling,
+    VectorState,
+    classify_stored_vector,
+    embedding_input_identity,
+)
 from manicule.core.errors import FingerprintMismatchError
 from manicule.core.protocols import VectorStore
 from manicule.core.retrieval import Filter
@@ -237,6 +243,56 @@ async def test_a_stored_vector_is_normalized_whatever_length_it_arrived_at(
     found = await store.search([0.0, 0.25, 0.0, 0.0], k=1)
 
     assert found[0].score == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "positive-inf", "negative-inf"],
+)
+async def test_a_non_finite_vector_is_refused_before_storage(
+    store: LanceVectorStore, value: float
+) -> None:
+    """Shape alone cannot make a value usable in cosine-distance arithmetic."""
+    embed = fingerprint().model_copy(update={"backend": "test-backend"})
+    await store.ensure_ready(embed)
+    vector = spread(4, 0)
+    vector[1] = value
+
+    with pytest.raises(ValueError, match="non-finite") as raised:
+        await store.upsert([chunk("broken")], [vector])
+
+    message = str(raised.value)
+    assert "non-finite" in message
+    assert "test/model" in message
+    assert "test-backend" in message
+    assert await store.count() == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "positive-inf", "negative-inf"],
+)
+def test_an_existing_non_finite_vector_is_not_reused(value: float) -> None:
+    """A damaged or legacy row must cause repair, not poison every future retrieval."""
+    item = chunk("broken")
+    embed = fingerprint()
+    identity = embedding_input_identity(item.embed_text, document_id=item.document_id, embed=embed)
+    vector = spread(4, 0)
+    vector[1] = value
+
+    verdict = classify_stored_vector(
+        item,
+        recorded_identity=identity,
+        stored_embed_text=item.embed_text,
+        stored_vector=vector,
+        embed=embed,
+    )
+
+    assert verdict.state is VectorState.CORRUPT
+    assert not verdict.is_reusable
+    assert verdict.vector == ()
 
 
 # --- filters -----------------------------------------------------------------------------

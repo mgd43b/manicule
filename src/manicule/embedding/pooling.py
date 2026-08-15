@@ -153,6 +153,18 @@ def l2_normalize(vectors: np.ndarray) -> np.ndarray:
     return vectors / np.maximum(norms, _EPSILON)
 
 
+def _require_finite(vectors: np.ndarray, *, backend: str, model_id: str) -> None:
+    """Refuse values cosine distance cannot represent, naming where they came from."""
+    if np.isfinite(vectors).all():
+        return
+    msg = (
+        f"{model_id} produced non-finite embedding values under {backend}. NaN and "
+        "infinity cannot participate in cosine distance, so these vectors were refused "
+        "before they could enter the index. Check the model weights and runtime precision."
+    )
+    raise TokenStateError(msg)
+
+
 def pool_token_states(
     token_states: TokenStates, pooling: Pooling, *, backend: str, model_id: str
 ) -> list[Vector]:
@@ -179,8 +191,14 @@ def pool_token_states(
         )
         raise TokenStateError(msg)
 
-    pooled = l2_normalize(pool(states, mask, pooling))
-    return [row.tolist() for row in pooled]
+    pooled = pool(states, mask, pooling)
+    # Before normalization, so ``inf / inf`` cannot emit a RuntimeWarning instead of the
+    # actionable error. Kept after it too: this is the boundary whose output enters storage,
+    # and arithmetic must not be trusted to preserve the property merely because its input did.
+    _require_finite(pooled, backend=backend, model_id=model_id)
+    normalized = l2_normalize(pooled)
+    _require_finite(normalized, backend=backend, model_id=model_id)
+    return [row.tolist() for row in normalized]
 
 
 __all__ = [
