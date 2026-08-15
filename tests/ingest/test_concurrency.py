@@ -1250,6 +1250,7 @@ async def test_the_stage_counters_reach_the_connector_row_without_any_document_c
         "peak_parses",
         "peak_embeds",
         "peak_bodies",
+        "peak_discovery_records",
     }, "the stage report grew a field, and every field here is read by an operator"
 
 

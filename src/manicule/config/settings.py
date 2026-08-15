@@ -551,8 +551,9 @@ class IngestSettings(Section):
         default=2,
         ge=1,
         description="Bounded queue depth, as a multiple of the consumer's parallelism. "
-        "Discovery is already durable and cursor-decoupled; this bounds how far the journal "
-        "reader and fetch workers may run ahead of local parsing and embedding.",
+        "With durable acquisition wired, this bounds how far the journal reader and fetch "
+        "workers may run ahead of local parsing and embedding; the legacy fallback applies "
+        "the same bound directly to discovery.",
     )
     stale_after_s: float = Field(
         default=3600.0,

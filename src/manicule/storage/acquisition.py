@@ -57,6 +57,7 @@ _RECORD_TRANSITIONS: dict[AcquisitionRecordState, set[AcquisitionRecordState]] =
         AcquisitionRecordState.ACQUIRED,
         AcquisitionRecordState.UNCHANGED,
         AcquisitionRecordState.RETRY,
+        AcquisitionRecordState.SETTLED,
     },
     AcquisitionRecordState.ACQUIRED: {
         AcquisitionRecordState.INDEXING,

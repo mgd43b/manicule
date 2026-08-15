@@ -392,11 +392,12 @@ requests carrying two. It scales with the configuration instead of with the acco
   unadvanced watermark. A `next` link addressing a cursor already followed is refused for the
   same reason: a loop over a paginated search reads as a very large space.
 
-  **The pipeline's side is a durable boundary, not downstream backpressure.** Every discovered
-  identity commits to the acquisition journal before the connector is advanced, and local
-  fetch/parse/embed work starts from that journal after enumeration. A slow embedder therefore
+  **The durable pipeline's side is a journal boundary, not downstream backpressure.** When that
+  path is wired, every discovered identity commits before the connector is advanced, and local
+  fetch/parse/embed work starts from the journal after enumeration. A slow embedder therefore
   cannot hold a live cursor at all (`ingest.md` §8.3.1); source and journal delays still can,
-  which is why the typed expiry guard remains.
+  which is why the typed expiry guard remains. The explicitly supported nonjournal fallback
+  keeps its bounded direct hand-off during the staged rollout.
 
 **`_links.next` is resolved against `_links.base` by concatenation, and the origin is
 checked.** An instance served from a context path (`/confluence`) has that path in `base` and

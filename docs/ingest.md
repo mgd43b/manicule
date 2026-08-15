@@ -739,6 +739,13 @@ is the quantity that actually maps to memory.
 **Durable enumeration, then three local stages joined by two bounded hand-offs.** Every bound
 below comes from configuration; none is derived from how many tasks happen to exist.
 
+The journal path is explicitly wired through the pipeline's `acquisitions` handle. SQLite
+implementing that protocol does not enable it by structural detection: until retained-byte
+acquisition replaces the transitional direct-fetch consumer, automatic activation would expose
+a half-complete multi-step rollout. The explicit path is complete for the work it performs: it
+resumes completed inventories, settles processed records and closes the run before publishing
+the legacy post-index watermark.
+
 ```
 discover → acquisition journal             one task; commit before advancing
    │  bounded sequence-paged reader
@@ -754,7 +761,7 @@ ingest × (parse_workers + 1)               parse in the pool, chunk, embed unde
 | Stage | Width | Where the bound comes from |
 |---|---|---|
 | discover → journal | 1 | One cursor; each identity commits before the next source record is requested |
-| journal reader | 1 | Sequence-paged reads bounded to the fetch hand-off's capacity |
+| journal reader | 1 | Waits for hand-off room, then reads one durable record |
 | fetch | `fetch_concurrency` (8) | One task per permitted in-flight fetch |
 | parse | at most `parse_workers + 1` attempts | The ingest workers are the only callers of the pool |
 | embed | 1 | `asyncio.Lock` around the model call, and nothing else |
@@ -805,10 +812,11 @@ cursor is already gone. Slow local work therefore cannot turn into an expired pa
 this arithmetic or the formula behind it moves, because a documented limit that has quietly
 stopped matching the code is the defect this whole section was.
 
-The fetch hand-off holds `DiscoveredDoc` references reconstructed from a bounded journal page,
-which is why it is the cheap one. **The complete discovery result is durable but never loaded
-into memory**, and neither is the complete fetched corpus; the run report carries observed queue
-peaks so the claim is checkable.
+The fetch hand-off holds durable source records directly. The journal reader waits for a free
+slot before reading one record, so the read page plus queued records together never exceed the
+hand-off capacity. **The complete discovery result is durable but never loaded into memory**,
+and neither is the complete fetched corpus; `peak_discovery_records` and the queue peaks make
+both claims checkable.
 
 **The end-of-stream is not subject to the bound**, and the reason is a deadlock that this
 otherwise has. A stage closes the hand-off in front of it from a `finally`, which is where it

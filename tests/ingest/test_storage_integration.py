@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import text
 
 from manicule.connectors import CursorExpiredError
+from manicule.core.acquisition import AcquisitionRecord, AcquisitionRecordState, AcquisitionRunState
 from manicule.core.content import (
     IN_FLIGHT,
     LEGACY_PUBLICATION,
@@ -802,6 +803,7 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     chunker = fakes.BlockChunker()
     pipeline = IngestPipeline(
         store=store,
+        acquisitions=store,
         chunker=chunker,
         embedder=embedder,
         vectors=fakes.MemoryVectors(),
@@ -850,7 +852,14 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     assert await store.get_watermark(connector.name) == connector.watermark
     assert report.stages.fetch_queue.capacity == 2
     assert report.stages.fetch_queue.peak_depth <= 2
+    assert report.stages.peak_discovery_records == 2
     assert report.stages.parse_queue.peak_depth <= report.stages.parse_queue.capacity
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+    settled = await store.get_acquisition_run(durable.id)
+    assert settled is not None
+    assert settled.state is AcquisitionRunState.SETTLED
+    records = await store.list_acquisition_records(durable.id)
+    assert {record.state for record in records} == {AcquisitionRecordState.SETTLED}
 
 
 async def test_crash_during_enumeration_keeps_only_the_committed_prefix(
@@ -863,6 +872,7 @@ async def test_crash_during_enumeration_keeps_only_the_committed_prefix(
     chunker = fakes.BlockChunker()
     pipeline = IngestPipeline(
         store=store,
+        acquisitions=store,
         chunker=chunker,
         embedder=HashEmbedder(),
         vectors=fakes.MemoryVectors(),
@@ -890,8 +900,33 @@ async def test_crash_during_enumeration_keeps_only_the_committed_prefix(
 
 
 async def test_crash_after_enumeration_preserves_the_marker_records_and_candidate(
-    store: SqliteDocStore,
+    engine: AsyncEngine,
 ) -> None:
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    class GatedJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.reader_arrived = asyncio.Event()
+            self.release_reader = asyncio.Event()
+
+        @override
+        async def list_acquisition_records(
+            self,
+            run_id: str,
+            *,
+            states: Sequence[AcquisitionRecordState] | None = None,
+            after_sequence: int | None = None,
+            limit: int = 100,
+        ) -> Sequence[AcquisitionRecord]:
+            self.reader_arrived.set()
+            await self.release_reader.wait()
+            return await super().list_acquisition_records(
+                run_id, states=states, after_sequence=after_sequence, limit=limit
+            )
+
+    store = GatedJournal()
+    await store.ensure_workspace()
     clock = fakes.ManualClock()
     connector = fakes.ExpiringCursorConnector(
         {f"public-doc-{number}": f"line {number}" for number in range(10)},
@@ -899,28 +934,30 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
         page_size=5,
         cursor_lifetime_seconds=0.5,
     )
-    embedder = fakes.GatedEmbedder()
     chunker = fakes.BlockChunker()
-    pipeline = IngestPipeline(
-        store=store,
-        chunker=chunker,
-        embedder=embedder,
-        vectors=fakes.MemoryVectors(),
-        runner=InProcessRunner({"lines": fakes.LineParser()}),
-        resolve_chain=lambda _: ["lines"],
-        middleware=MiddlewareRunner(()),
-        chunk_fingerprint=chunker.fingerprint,
-        detect_glossary=False,
-    )
 
-    task = asyncio.create_task(pipeline.run(connector))
-    await connector.enumeration_completed.wait()
-    await embedder.gate.wait_for(1)
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            shutdown_grace_s=0,
+            detect_glossary=False,
+        )
+
+    task = asyncio.create_task(pipeline().run(connector))
+    await store.reader_arrived.wait()
     task.cancel()
-    embedder.gate.open()
     with pytest.raises(asyncio.CancelledError):
         await task
 
+    store.release_reader.set()
     durable = await store.latest_unsettled_acquisition_run(connector.name)
     assert durable is not None
     assert durable.discovered_count == 10
@@ -929,11 +966,28 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
     assert len(await store.list_acquisition_records(durable.id)) == 10
     assert await store.get_watermark(connector.name) is None
 
+    pages_before_resume = connector.pages_requested
+    resumed = await pipeline().run(connector)
+
+    assert connector.pages_requested == pages_before_resume, "the source was rediscovered"
+    assert resumed.indexed == 10
+    assert resumed.watermark_advanced
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+    settled = await store.get_acquisition_run(durable.id)
+    assert settled is not None
+    assert settled.state is AcquisitionRunState.SETTLED
+    assert await store.get_watermark(connector.name) == durable.candidate_watermark
+
 
 async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
     store: SqliteDocStore,
 ) -> None:
     class DuplicateSource(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__({"public-a": "alpha", "public-b": "beta"})
+            self.enumerated = asyncio.Event()
+            self.release = asyncio.Event()
+
         @property
         @override
         def watermark(self) -> Watermark:
@@ -956,11 +1010,14 @@ async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
                 yield durable
                 if durable.source_id == "public-a":
                     yield durable
+            self.enumerated.set()
+            await self.release.wait()
 
-    connector = DuplicateSource({"public-a": "alpha", "public-b": "beta"})
+    connector = DuplicateSource()
     chunker = fakes.BlockChunker()
     pipeline = IngestPipeline(
         store=store,
+        acquisitions=store,
         chunker=chunker,
         embedder=HashEmbedder(),
         vectors=fakes.MemoryVectors(),
@@ -971,14 +1028,19 @@ async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
         detect_glossary=False,
     )
 
-    report = await pipeline.run(connector)
+    task = asyncio.create_task(pipeline.run(connector))
+    await connector.enumerated.wait()
     durable = await store.latest_unsettled_acquisition_run(connector.name)
-
-    assert report.indexed == 2
     assert durable is not None
     assert durable.discovered_count == 2
     records = await store.list_acquisition_records(durable.id)
     assert [record.source.source_id for record in records] == ["public-a", "public-b"]
+
+    connector.release.set()
+    report = await task
+
+    assert report.indexed == 2
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 
 async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
@@ -991,6 +1053,7 @@ async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
     chunker = fakes.BlockChunker()
     pipeline = IngestPipeline(
         store=store,
+        acquisitions=store,
         chunker=chunker,
         embedder=HashEmbedder(),
         vectors=fakes.MemoryVectors(),
