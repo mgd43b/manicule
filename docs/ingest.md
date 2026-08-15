@@ -554,6 +554,10 @@ parse_memory_limit   default: 1 GiB per worker
   manicule prevents.
 - **A killed worker is replaced immediately**; the pool size is what the run depends on, not
   the identity of any worker.
+- **Pool lifecycle owns its children through cancellation.** Setup does not publish the
+  started state or its permits until every spawn/readiness wait reaches an endpoint; a
+  canceled setup reaps the partial pool and is reusable. Teardown snapshots every worker and
+  joins every termination before propagating cancellation, including repeated cancellation.
 - **Workers hold no store handles.** They receive bytes and return blocks. Everything
   transactional happens in the parent, which is what keeps `storage.md` §8.2's ordering true
   regardless of how many workers died.

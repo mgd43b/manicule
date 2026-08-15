@@ -756,6 +756,29 @@ async def _join_despite_cancellation(task: asyncio.Task[object]) -> bool:
             return interrupted
 
 
+async def _settle_despite_cancellation(
+    task: asyncio.Task[object],
+) -> tuple[bool, BaseException | None]:
+    """Reach an owned lifecycle endpoint and report both cancellation and failure.
+
+    Lifecycle callers need both facts: cancellation has precedence once requested, while an
+    ordinary setup/teardown failure must still be observable when nobody canceled it.
+    """
+    interrupted = False
+    while True:
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except BaseException as exc:  # noqa: BLE001 - lifecycle exception precedence
+            return interrupted, exc
+        else:
+            return interrupted, None
+
+
 @dataclass(frozen=True, slots=True)
 class _Killed:
     """A worker stopped by the parent rather than by its own code."""
@@ -790,6 +813,7 @@ class WorkerPool:
         self._live: list[_Worker] = []
         self._kills: dict[str, int] = {}
         self._started = False
+        self._lifecycle = asyncio.Lock()
 
     @property
     def size(self) -> int:
@@ -815,24 +839,48 @@ class WorkerPool:
         ``default_worker_count`` returns on a two-core machine, that is a run that hangs
         forever.
         """
-        if self._started:
-            return
-        self._started = True
-        for _ in range(self._size):
-            await self._idle.put(await self._try_spawn())
+        async with self._lifecycle:
+            if self._started:
+                return
+            spawning = asyncio.create_task(self._spawn_permits())
+            interrupted, failure = await _settle_despite_cancellation(spawning)
+            if interrupted or failure is not None:
+                rollback = asyncio.create_task(self._terminate_snapshot(list(self._live)))
+                rollback_interrupted, rollback_failure = await _settle_despite_cancellation(
+                    rollback
+                )
+                self._live.clear()
+                self._drain_idle()
+                self._started = False
+                if interrupted or rollback_interrupted:
+                    raise asyncio.CancelledError
+                if failure is not None:
+                    raise failure
+                if rollback_failure is not None:
+                    raise rollback_failure
+                raise RuntimeError("parse worker setup rollback failed without a cause")
+
+            permits = spawning.result()
+            for permit in permits:
+                self._idle.put_nowait(permit)
+            self._started = True
 
     async def teardown(self) -> None:
         """Stop every worker, including ones still holding a document."""
-        self._started = False
-        while not self._idle.empty():
-            self._idle.get_nowait()
-        # Snapshotted and cleared before the first await. Iterating the live list while
-        # awaiting lets a concurrent replacement remove an element from under the index, which
-        # skips the next one — and `clear()` then drops the only reference to a worker nothing
-        # will ever kill, join or close.
-        live, self._live = self._live, []
-        for worker in live:
-            await asyncio.to_thread(worker.terminate)
+        async with self._lifecycle:
+            self._started = False
+            self._drain_idle()
+            # The cleanup task owns this snapshot until every worker reaches terminate's known
+            # endpoint.  Clearing `_live` first is safe only because cancellation cannot detach
+            # the task; it also prevents replacements from making an already-retired worker
+            # visible as live again.
+            live, self._live = self._live, []
+            stopping = asyncio.create_task(self._terminate_snapshot(live))
+            interrupted, failure = await _settle_despite_cancellation(stopping)
+            if interrupted:
+                raise asyncio.CancelledError
+            if failure is not None:
+                raise failure
 
     async def __aenter__(self) -> Self:
         await self.setup()
@@ -965,6 +1013,23 @@ class WorkerPool:
         ).start()
 
     # --- internals -------------------------------------------------------------------------
+
+    async def _spawn_permits(self) -> list[_Worker | None]:
+        return [await self._try_spawn() for _ in range(self._size)]
+
+    def _drain_idle(self) -> None:
+        while not self._idle.empty():
+            self._idle.get_nowait()
+
+    async def _terminate_snapshot(self, workers: list[_Worker]) -> None:
+        """Terminate all workers even when one termination itself reports an error."""
+        outcomes = await asyncio.gather(
+            *(asyncio.to_thread(worker.terminate) for worker in workers),
+            return_exceptions=True,
+        )
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
 
     async def _acquire(self) -> _Worker | None:
         """Take a permit from the queue, and a worker with it.

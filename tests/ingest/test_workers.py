@@ -12,6 +12,7 @@ import asyncio
 import multiprocessing
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import cast
@@ -25,6 +26,7 @@ from manicule_plugin_hostile import (
     StatefulMiddleware,
 )
 
+import manicule.ingest.workers as worker_module
 from manicule.core.anchors import Unlocated
 from manicule.core.content import BlockKind, Chunk, DocumentStatus, ParsedBlock, RawDocument
 from manicule.ingest.limits import (
@@ -225,6 +227,87 @@ async def test_repeated_cancel_during_parser_retire_restores_the_only_permit(
             after = await pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE))
         assert after.attempt.outcome is Outcome.PARSED
         assert len(multiprocessing.active_children()) == baseline_children
+
+
+async def test_cancel_during_spawn_rolls_setup_back_to_a_reusable_pool(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canceled readiness wait cannot leave `_started` true over a missing permit."""
+    del manicule_environment
+    baseline = {child.pid for child in multiprocessing.active_children()}
+    entered = threading.Event()
+    release = threading.Event()
+    original = worker_module._await_ready  # pyright: ignore[reportPrivateUsage]
+
+    def delayed_ready(connection: object, timeout: float = 60.0) -> object:
+        entered.set()
+        release.wait(timeout=10)
+        return original(connection, timeout)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(worker_module, "_await_ready", delayed_ready)
+    pool = WorkerPool(_config(tmp_path), workers=1, timeout_s=5.0)
+    starting = asyncio.create_task(pool.setup())
+    assert await asyncio.to_thread(entered.wait, 10)
+    starting.cancel()
+    starting.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+    monkeypatch.setattr(worker_module, "_await_ready", original)
+    await pool.setup()
+    result = await asyncio.wait_for(
+        pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)), timeout=10
+    )
+    assert result.attempt.outcome is Outcome.PARSED
+    await pool.teardown()
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+
+async def test_repeated_cancel_during_multiworker_teardown_reaps_every_snapshot(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown remains the owner of every snapshotted child through repeated cancellation."""
+    del manicule_environment
+    baseline = {child.pid for child in multiprocessing.active_children()}
+    pool = WorkerPool(_config(tmp_path), workers=3, timeout_s=5.0)
+    await pool.setup()
+    owned = {worker.pid for worker in pool._live}  # pyright: ignore[reportPrivateUsage]
+    assert len(owned) == 3
+
+    entered = 0
+    entered_lock = threading.Lock()
+    all_entered = threading.Event()
+    release = threading.Event()
+    original = worker_module._Worker.terminate  # pyright: ignore[reportPrivateUsage]
+
+    def delayed_terminate(worker: object) -> None:
+        nonlocal entered
+        with entered_lock:
+            entered += 1
+            if entered == 3:
+                all_entered.set()
+        release.wait(timeout=10)
+        original(worker)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(worker_module._Worker, "terminate", delayed_terminate)  # pyright: ignore[reportPrivateUsage]
+    stopping = asyncio.create_task(pool.teardown())
+    assert await asyncio.to_thread(all_entered.wait, 10)
+    stopping.cancel()
+    stopping.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+
+    active = {child.pid for child in multiprocessing.active_children()}
+    assert not (owned & active)
+    assert active == baseline
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
 
 
 def test_the_default_worker_count_leaves_a_core_for_the_parent() -> None:
