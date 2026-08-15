@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from manicule.core.acquisition import (
@@ -191,6 +192,45 @@ async def test_candidate_watermark_is_not_committed_until_coverage(
     assert persisted is not None
     assert persisted.watermark_committed_at is not None
     assert await store.get_watermark("wiki") == _watermark("candidate")
+
+
+async def test_unchanged_coverage_cannot_lose_its_provenance(
+    store: SqliteDocStore,
+) -> None:
+    lease = await _claimed_run(store)
+    await store.append_acquisition_record(
+        "run",
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    unchanged = await store.transition_acquisition_record(
+        "run",
+        "page-1",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.UNCHANGED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+
+    assert unchanged.state is AcquisitionRecordState.UNCHANGED
+    persisted = await store.get_acquisition_run("run")
+    assert persisted is not None
+    assert persisted.unchanged_count == 1
+    assert persisted.indexed_count == 0
+    with pytest.raises(InvalidAcquisitionTransitionError, match=r"invalid.*transition"):
+        await store.transition_acquisition_record(
+            "run",
+            "page-1",
+            AcquisitionRecordState.UNCHANGED,
+            AcquisitionRecordState.SETTLED,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
 
 
 async def test_completion_without_a_candidate_watermark_can_settle(
@@ -588,6 +628,195 @@ async def test_acquired_blob_is_not_garbage_and_does_not_publish_a_document(
     assert await store.find_document("wiki", "page-1") is None
     assert await blobs.collect_garbage() == []
     assert await blobs.get(stored.hash) == b"new unpublished revision"
+
+    retry = await store.transition_acquisition_record(
+        "run",
+        "page-1",
+        AcquisitionRecordState.ACQUIRED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    assert retry.blob_ref == stored.hash
+    indexing = await store.transition_acquisition_record(
+        "run",
+        "page-1",
+        AcquisitionRecordState.RETRY,
+        AcquisitionRecordState.INDEXING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    assert indexing.blob_ref == stored.hash
+
+
+async def test_acquired_state_requires_a_retained_blob_reference(
+    store: SqliteDocStore,
+) -> None:
+    lease = await _claimed_run(store)
+    await store.append_acquisition_record(
+        "run",
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        "run",
+        "page-1",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+
+    with pytest.raises(
+        InvalidAcquisitionTransitionError,
+        match="requires a retained blob reference",
+    ):
+        await store.transition_acquisition_record(
+            "run",
+            "page-1",
+            AcquisitionRecordState.ACQUIRING,
+            AcquisitionRecordState.ACQUIRED,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+
+    records = await store.list_acquisition_records("run")
+    assert len(records) == 1
+    assert records[0].state is AcquisitionRecordState.ACQUIRING
+    assert records[0].blob_ref is None
+
+
+async def test_retry_requires_an_existing_or_new_blob_before_indexing(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    stored = await blobs.put(b"retried revision", "text/plain")
+    assert isinstance(stored, StoredBlob)
+    lease = await _claimed_run(store)
+    await store.append_acquisition_record(
+        "run",
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        "run",
+        "page-1",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+
+    with pytest.raises(
+        InvalidAcquisitionTransitionError,
+        match="indexing record requires a retained blob reference",
+    ):
+        await store.transition_acquisition_record(
+            "run",
+            "page-1",
+            AcquisitionRecordState.RETRY,
+            AcquisitionRecordState.INDEXING,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+
+    retry = (await store.list_acquisition_records("run"))[0]
+    assert retry.state is AcquisitionRecordState.RETRY
+    assert retry.blob_ref is None
+    indexing = await store.transition_acquisition_record(
+        "run",
+        "page-1",
+        AcquisitionRecordState.RETRY,
+        AcquisitionRecordState.INDEXING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+        blob_ref=stored.hash,
+    )
+    assert indexing.state is AcquisitionRecordState.INDEXING
+    assert indexing.blob_ref == stored.hash
+
+
+async def test_settled_retry_does_not_require_a_blob(store: SqliteDocStore) -> None:
+    lease = await _claimed_run(store)
+    await store.append_acquisition_record(
+        "run",
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        "run",
+        "page-1",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+
+    settled = await store.transition_acquisition_record(
+        "run",
+        "page-1",
+        AcquisitionRecordState.RETRY,
+        AcquisitionRecordState.SETTLED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+
+    assert settled.state is AcquisitionRecordState.SETTLED
+    assert settled.blob_ref is None
+
+
+@pytest.mark.parametrize(
+    "state",
+    [AcquisitionRecordState.ACQUIRED, AcquisitionRecordState.INDEXING],
+)
+async def test_database_requires_blobs_for_blob_backed_states(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    state: AcquisitionRecordState,
+) -> None:
+    lease = await _claimed_run(store)
+    await store.append_acquisition_record(
+        "run",
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+
+    with pytest.raises(IntegrityError, match="blob_backed_acquisition_states_have_a_blob"):
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE acquisition_records SET state = :state "
+                    "WHERE run_id = 'run' AND source_id = 'page-1'"
+                ),
+                {"state": state.value},
+            )
+
+    record = (await store.list_acquisition_records("run"))[0]
+    assert record.state is AcquisitionRecordState.DISCOVERED
+    assert record.blob_ref is None
 
 
 async def test_migration_preserves_publications_and_creates_no_backlog(data_dir: Path) -> None:

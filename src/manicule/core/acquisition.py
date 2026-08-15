@@ -151,6 +151,7 @@ class AcquisitionRun(BaseModel):
     discovered_count: int = Field(ge=0)
     acquired_count: int = Field(ge=0)
     indexed_count: int = Field(ge=0)
+    unchanged_count: int = Field(ge=0)
     retry_count: int = Field(ge=0)
     metadata_bytes: int = Field(ge=0)
     acquired_blob_bytes: int = Field(ge=0)

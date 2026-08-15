@@ -255,6 +255,7 @@ class AcquisitionRun(Base):
     discovered_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     acquired_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     indexed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unchanged_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     metadata_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     acquired_blob_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -277,7 +278,8 @@ class AcquisitionRun(Base):
         CheckConstraint("lease_generation >= 0", name="lease_generation_is_not_negative"),
         CheckConstraint(
             "discovered_count >= 0 AND acquired_count >= 0 AND indexed_count >= 0 "
-            "AND retry_count >= 0 AND metadata_bytes >= 0 AND acquired_blob_bytes >= 0",
+            "AND unchanged_count >= 0 AND retry_count >= 0 AND metadata_bytes >= 0 "
+            "AND acquired_blob_bytes >= 0",
             name="acquisition_run_counters_are_not_negative",
         ),
         CheckConstraint(
@@ -328,6 +330,10 @@ class AcquisitionRecord(Base):
         Index("ix_acquisition_records_run_state_sequence", "run_id", "state", "sequence"),
         CheckConstraint(
             "sequence >= 0 AND attempts >= 0", name="acquisition_record_numbers_are_not_negative"
+        ),
+        CheckConstraint(
+            "state NOT IN ('acquired', 'indexing') OR blob_ref IS NOT NULL",
+            name="blob_backed_acquisition_states_have_a_blob",
         ),
     )
 

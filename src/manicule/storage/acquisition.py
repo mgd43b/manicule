@@ -62,7 +62,7 @@ _RECORD_TRANSITIONS: dict[AcquisitionRecordState, set[AcquisitionRecordState]] =
         AcquisitionRecordState.INDEXING,
         AcquisitionRecordState.RETRY,
     },
-    AcquisitionRecordState.UNCHANGED: {AcquisitionRecordState.SETTLED},
+    AcquisitionRecordState.UNCHANGED: set(),
     AcquisitionRecordState.INDEXING: {
         AcquisitionRecordState.SETTLED,
         AcquisitionRecordState.RETRY,
@@ -120,6 +120,7 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
         discovered_count=row.discovered_count,
         acquired_count=row.acquired_count,
         indexed_count=row.indexed_count,
+        unchanged_count=row.unchanged_count,
         retry_count=row.retry_count,
         metadata_bytes=row.metadata_bytes,
         acquired_blob_bytes=row.acquired_blob_bytes,
@@ -482,12 +483,29 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         if target not in _RECORD_TRANSITIONS[expected]:
             msg = f"invalid acquisition record transition: {expected} -> {target}"
             raise InvalidAcquisitionTransitionError(msg)
+        if target is AcquisitionRecordState.ACQUIRED and blob_ref is None:
+            msg = "an acquired record requires a retained blob reference"
+            raise InvalidAcquisitionTransitionError(msg)
         async with self._sessions.begin() as session:
             run = await self._required_run_row(session, run_id)
             self._require_live_lease(run, lease_owner, lease_generation, now)
             if run.state is AcquisitionRunState.SETTLED:
                 msg = f"acquisition run {run_id!r} is settled"
                 raise AcquisitionConflictError(msg)
+            if target is AcquisitionRecordState.INDEXING and blob_ref is None:
+                record = (
+                    await session.execute(
+                        select(models.AcquisitionRecord).where(
+                            models.AcquisitionRecord.run_id == run_id,
+                            models.AcquisitionRecord.workspace_id == self._workspace_id,
+                            models.AcquisitionRecord.source_id == source_id,
+                            models.AcquisitionRecord.state == expected,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if record is not None and record.blob_ref is None:
+                    msg = "an indexing record requires a retained blob reference"
+                    raise InvalidAcquisitionTransitionError(msg)
             values: dict[str, object] = {
                 "state": target,
                 "diagnostic": None if diagnostic is None else diagnostic.model_dump(mode="json"),
@@ -658,6 +676,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             )
         )
         run.indexed_count = counts.get(AcquisitionRecordState.SETTLED, 0)
+        run.unchanged_count = counts.get(AcquisitionRecordState.UNCHANGED, 0)
         run.retry_count = counts.get(AcquisitionRecordState.RETRY, 0)
         run.acquired_blob_bytes = (
             await session.execute(

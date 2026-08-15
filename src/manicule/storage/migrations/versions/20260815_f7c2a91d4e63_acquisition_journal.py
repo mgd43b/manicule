@@ -76,6 +76,7 @@ def upgrade() -> None:
         sa.Column("discovered_count", sa.Integer(), nullable=False),
         sa.Column("acquired_count", sa.Integer(), nullable=False),
         sa.Column("indexed_count", sa.Integer(), nullable=False),
+        sa.Column("unchanged_count", sa.Integer(), nullable=False),
         sa.Column("retry_count", sa.Integer(), nullable=False),
         sa.Column("metadata_bytes", sa.Integer(), nullable=False),
         sa.Column("acquired_blob_bytes", sa.Integer(), nullable=False),
@@ -84,7 +85,8 @@ def upgrade() -> None:
         sa.Column("updated_at", manicule.storage.types.UtcDateTime(), nullable=False),
         sa.CheckConstraint(
             "discovered_count >= 0 AND acquired_count >= 0 AND indexed_count >= 0 "
-            "AND retry_count >= 0 AND metadata_bytes >= 0 AND acquired_blob_bytes >= 0",
+            "AND unchanged_count >= 0 AND retry_count >= 0 AND metadata_bytes >= 0 "
+            "AND acquired_blob_bytes >= 0",
             name=op.f("ck_acquisition_runs_acquisition_run_counters_are_not_negative"),
         ),
         sa.CheckConstraint(
@@ -155,6 +157,10 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "sequence >= 0 AND attempts >= 0",
             name=op.f("ck_acquisition_records_acquisition_record_numbers_are_not_negative"),
+        ),
+        sa.CheckConstraint(
+            "state NOT IN ('acquired', 'indexing') OR blob_ref IS NOT NULL",
+            name=op.f("ck_acquisition_records_blob_backed_acquisition_states_have_a_blob"),
         ),
         sa.ForeignKeyConstraint(
             ["blob_ref"],
