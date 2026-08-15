@@ -255,9 +255,6 @@ class ScheduledSource:
     runs: int = 0
     failures: int = 0
     awaiting_sign_in: bool = False
-    last_outcome: str = ""
-    retry_required: bool = False
-    last_error_type: str = ""
     """Whether the last run failed because nobody has signed in to this source's instance.
 
     A field rather than a fourth counter, because it is a *state* and not an event: it is true
@@ -270,9 +267,13 @@ class ScheduledSource:
     session and a person has to sign in, as against an instance that was unreachable and will
     probably be reachable at twenty past. Both are refusals; only one of them needs anybody.
 
-    Cleared by a run that succeeds. Nothing else clears it: a failure of a different kind on a
-    source that is also waiting to be signed in to leaves it set, because it is still true.
+    Cleared by any returned ingest report, because reaching the pipeline proves session
+    acquisition succeeded even when a later cursor or store failure makes that run incomplete.
     """
+
+    last_outcome: str = ""
+    retry_required: bool = False
+    last_error_type: str = ""
 
 
 class Scheduler:
