@@ -387,6 +387,48 @@ async def test_deleting_chunks_tombstones_their_vectors_and_the_sweep_removes_th
     await vectors.teardown()
 
 
+async def test_failure_inside_relational_publication_rolls_back_every_derived_row(
+    store: SqliteDocStore,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after chunks are replaced still leaves the old publication wholly readable."""
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(store, vectors)
+    connector = fakes.DictConnector({"a": "NOW - Network Operations Workspace\nold body"})
+    await pipeline.run(connector)
+    before = await store.find_document("memory", "a")
+    assert before is not None
+    old_chunks = list(await store.document_chunks(before.id))
+    old_glossary = list(await store.glossary_entries(before.id))
+    old_lineage = (before.parse_fp, await store.glossary_lineage(before.id))
+
+    async def fail_between_writes(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("power lost between relational writes")
+
+    monkeypatch.setattr(store, "_replace_entries", fail_between_writes)
+    connector.documents["a"] = "SRE - Site Reliability Engineering\nnew body"
+    report = await pipeline.run(connector)
+
+    after = await store.find_document("memory", "a")
+    assert after is not None
+    assert report.indexed == 1, "the previous indexed revision remains the reported outcome"
+    assert (after.content_hash, after.publication_id, after.status) == (
+        before.content_hash,
+        before.publication_id,
+        DocumentStatus.INDEXED,
+    )
+    assert list(await store.document_chunks(after.id)) == old_chunks
+    assert list(await store.glossary_entries(after.id)) == old_glossary
+    assert (after.parse_fp, await store.glossary_lineage(after.id)) == old_lineage
+    assert await store.take_tombstones(10), "staged vectors stay named for crash-safe cleanup"
+    await sweep_vectors(store, vectors)
+    assert await vectors.count() == len(old_chunks), "cleanup retained every active vector"
+    await vectors.teardown()
+
+
 async def test_the_recovery_sweep_requeues_only_the_in_flight_statuses(
     store: SqliteDocStore,
 ) -> None:

@@ -25,6 +25,7 @@ _ANCHOR: TypeAdapter[Anchor] = TypeAdapter(Anchor)
 def to_document(row: models.Document) -> Document:
     return Document(
         id=row.id,
+        publication_id=row.publication_id,
         source=row.source,
         source_id=row.source_id,
         uri=row.uri,
@@ -61,6 +62,7 @@ def apply_document(row: models.Document, document: Document) -> None:
     documents need re-parsing" answering "all of them" for the wrong reason.
     """
     row.deleted_at = None
+    row.publication_id = document.publication_id
     row.source = document.source
     row.source_id = document.source_id
     row.uri = document.uri

@@ -45,6 +45,7 @@ from manicule.core.glossary import GlossaryEntry
 from manicule.core.ids import chunk_id, content_hash
 from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
+from manicule.ingest.ports import GlossaryWriter
 from manicule.ingest.workers import AttemptResult, InProcessRunner
 from manicule.parsers.chain import Attempt, Outcome
 from manicule.parsers.expansion import ExpandedMember, MemberFailure, MemberOutcome
@@ -182,6 +183,7 @@ class MemoryIngestStore:
         self.watermarks: dict[str, Watermark] = {}
         self.connector_meta: dict[str, Metadata] = {}
         self.state = IndexFingerprints()
+        self.staged_publications: list[tuple[str, tuple[str, ...]]] = []
 
     # documents
 
@@ -223,6 +225,42 @@ class MemoryIngestStore:
         if current is None or current.revision != expected:
             return Commit(committed=False, stored=current)
         return Commit(committed=True, stored=await self.upsert_document(document))
+
+    async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
+        self.staged_publications.append((publication_id, tuple(chunk.id for chunk in chunks)))
+
+    async def publish_document(
+        self,
+        document: Document,
+        chunks: Sequence[Chunk],
+        *,
+        expected: DocumentRevision | None,
+        chunk_fp: str | None,
+        embed_fp: str | None,
+        parse_fp: str | None,
+        glossary_entries: Sequence[GlossaryEntry] | None,
+        glossary_fp: str | None,
+        original_omitted_reason: str | None,
+    ) -> Commit:
+        current = await self.get_document(document.id)
+        if expected is not None and (current is None or current.revision != expected):
+            return Commit(committed=False, stored=current)
+        await self.upsert_document(document)
+        await self.replace_chunks(document.id, chunks)
+        self.lineage[document.id] = (chunk_fp, embed_fp)
+        if parse_fp is not None:
+            self.parse_lineage[document.id] = parse_fp
+            self.documents[document.id] = self.documents[document.id].model_copy(
+                update={"parse_fp": parse_fp}
+            )
+        if glossary_entries is not None and isinstance(self, GlossaryWriter):
+            await self.replace_glossary_entries(
+                document.id, glossary_entries, fingerprint=glossary_fp or ""
+            )
+        if glossary_fp is not None:
+            self.glossary_lineage_by_id[document.id] = glossary_fp
+        self.originals[document.id] = (document.original_ref, original_omitted_reason)
+        return Commit(committed=True, stored=self._with_lineage(self.documents[document.id]))
 
     async def set_status(self, document_id: str, status: DocumentStatus, detail: str = "") -> None:
         existing = self.documents.get(document_id)
@@ -528,7 +566,14 @@ class MemoryVectors:
     async def fingerprint(self) -> EmbedFingerprint | None:
         return self._fingerprint
 
-    async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = "legacy",
+    ) -> None:
+        del publication_id
         for chunk, vector in zip(chunks, vectors, strict=True):
             self.rows[chunk.id] = VectorRow(
                 document_id=chunk.document_id,
@@ -614,8 +659,14 @@ class RefusingVectors(MemoryVectors):
     """Fails every upsert, so the crash window between chunks and vectors is reachable."""
 
     @override
-    async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
-        del chunks, vectors
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = "legacy",
+    ) -> None:
+        del chunks, vectors, publication_id
         msg = "the vector store is unavailable"
         raise RuntimeError(msg)
 

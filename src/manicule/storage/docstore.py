@@ -20,10 +20,12 @@ from typing import TYPE_CHECKING, Any, Final, cast
 from pydantic import TypeAdapter
 from sqlalchemy import bindparam, delete, func, select, update
 from sqlalchemy import text as sql
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.content import Commit, Document, DocumentRevision, DocumentStatus
 from manicule.core.embedding import EmbedFingerprint, IndexFingerprints
 from manicule.core.fingerprints import ChunkFingerprint
+from manicule.core.ids import vector_id
 from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import SourceId, Watermark
 from manicule.storage import models
@@ -49,6 +51,7 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.elements import ColumnElement
 
     from manicule.core.content import Chunk
+    from manicule.core.glossary import GlossaryEntry
 
 _WATERMARK: TypeAdapter[Watermark] = TypeAdapter(Watermark)
 
@@ -190,6 +193,7 @@ class SqliteDocStore(
                         models.Document.id == document.id,
                         models.Document.workspace_id == self._workspace_id,
                         models.Document.deleted_at.is_(None),
+                        models.Document.publication_id == expected.publication_id,
                         models.Document.content_hash == expected.content_hash,
                         # Three of these are nullable, and in SQL `column = NULL` is never
                         # true — not even of a `NULL`. Written out it would miss on every
@@ -227,6 +231,136 @@ class SqliteDocStore(
                 # correction away.
                 return Commit(committed=False, stored=stored)
             return Commit(committed=True, stored=await self._write_document(session, document))
+
+    async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
+        """Write cleanup records before a publication's vectors can exist."""
+        if not chunks:
+            return
+        async with self._sessions.begin() as session:
+            await session.execute(
+                sqlite_insert(models.VectorTombstone)
+                .values(
+                    [
+                        {"chunk_id": vector_id(publication_id, chunk.id), "deleted_at": utcnow()}
+                        for chunk in chunks
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
+            )
+
+    async def publish_document(  # noqa: PLR0912 - each branch is one optional publication part
+        self,
+        document: Document,
+        chunks: Sequence[Chunk],
+        *,
+        expected: DocumentRevision | None,
+        chunk_fp: str | None,
+        embed_fp: str | None,
+        parse_fp: str | None,
+        glossary_entries: Sequence[GlossaryEntry] | None,
+        glossary_fp: str | None,
+        original_omitted_reason: str | None,
+    ) -> Commit:
+        """Flip the active publication and every relational derivative in one transaction."""
+        async with self._sessions.begin() as session:
+            row = await session.get(models.Document, document.id)
+            if row is not None and row.workspace_id != self._workspace_id:
+                raise CrossWorkspaceCollisionError(
+                    _cross_workspace(document.id, row.workspace_id, self._workspace_id)
+                )
+            if expected is not None:
+                matched = cast(
+                    "CursorResult[Any]",
+                    await session.execute(
+                        update(models.Document)
+                        .where(
+                            models.Document.id == document.id,
+                            models.Document.workspace_id == self._workspace_id,
+                            models.Document.deleted_at.is_(None),
+                            models.Document.publication_id == expected.publication_id,
+                            models.Document.content_hash == expected.content_hash,
+                            models.Document.version_token == expected.version_token,
+                            models.Document.original_ref == expected.original_ref,
+                            models.Document.parse_fp == expected.parse_fp,
+                        )
+                        .values(updated_at=utcnow()),
+                    ),
+                )
+                row = await session.get(models.Document, document.id, populate_existing=True)
+                stored = None if row is None else to_document(row)
+                if (
+                    matched.rowcount != 1
+                    or stored is None
+                    or stored.provenance != expected.source_record
+                ):
+                    return Commit(committed=False, stored=stored)
+            old_publication = row.publication_id if row is not None else None
+            old_chunk_ids = (
+                list(
+                    (
+                        await session.execute(
+                            select(models.Chunk.id).where(models.Chunk.document_id == document.id)
+                        )
+                    ).scalars()
+                )
+                if row is not None
+                else []
+            )
+            await self._write_document(session, document)
+            row = await session.get(models.Document, document.id)
+            if row is None:  # pragma: no cover - _write_document creates or returns this row
+                msg = f"document {document.id!r} vanished inside its publication transaction"
+                raise RuntimeError(msg)
+            row.original_omitted_reason = original_omitted_reason
+            await session.execute(
+                delete(models.Chunk).where(models.Chunk.document_id == document.id)
+            )
+            await session.flush()
+            for chunk in chunks:
+                session.add(from_chunk(chunk, document.id))
+            await session.flush()
+
+            if old_publication is not None and old_chunk_ids:
+                if old_publication != "legacy":
+                    await session.execute(
+                        delete(models.VectorTombstone).where(
+                            models.VectorTombstone.chunk_id.in_(old_chunk_ids)
+                        )
+                    )
+                await session.execute(
+                    sqlite_insert(models.VectorTombstone)
+                    .values(
+                        [
+                            {
+                                "chunk_id": vector_id(old_publication, chunk_id),
+                                "deleted_at": utcnow(),
+                            }
+                            for chunk_id in old_chunk_ids
+                        ]
+                    )
+                    .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
+                )
+            if chunks:
+                await session.execute(
+                    delete(models.VectorTombstone).where(
+                        models.VectorTombstone.chunk_id.in_(
+                            [vector_id(document.publication_id, chunk.id) for chunk in chunks]
+                        )
+                    )
+                )
+
+            if glossary_entries is not None:
+                await self._replace_entries(session, document.id, glossary_entries)
+            if glossary_fp is not None:
+                row.glossary_fp = glossary_fp
+            if chunk_fp is not None:
+                row.chunk_fp = chunk_fp
+            if embed_fp is not None:
+                row.embed_fp = embed_fp
+            if parse_fp is not None:
+                row.parse_fp = parse_fp
+            await session.flush()
+            return Commit(committed=True, stored=to_document(row))
 
     async def _write_document(self, session: AsyncSession, document: Document) -> Document:
         """The write both :meth:`upsert_document` and :meth:`commit_document` perform.
@@ -708,9 +842,36 @@ class SqliteDocStore(
         keeps its id — and therefore its vector — because the id is derived from its content.
         """
         async with self._sessions.begin() as session:
+            document = await session.get(models.Document, document_id)
+            old_ids = list(
+                (
+                    await session.execute(
+                        select(models.Chunk.id).where(models.Chunk.document_id == document_id)
+                    )
+                ).scalars()
+            )
             await session.execute(
                 delete(models.Chunk).where(models.Chunk.document_id == document_id)
             )
+            if document is not None and document.publication_id != "legacy" and old_ids:
+                await session.execute(
+                    delete(models.VectorTombstone).where(
+                        models.VectorTombstone.chunk_id.in_(old_ids)
+                    )
+                )
+                await session.execute(
+                    sqlite_insert(models.VectorTombstone)
+                    .values(
+                        [
+                            {
+                                "chunk_id": vector_id(document.publication_id, chunk_id),
+                                "deleted_at": utcnow(),
+                            }
+                            for chunk_id in old_ids
+                        ]
+                    )
+                    .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
+                )
             for chunk in chunks:
                 session.add(from_chunk(chunk, document_id))
 

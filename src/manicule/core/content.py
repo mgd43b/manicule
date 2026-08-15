@@ -21,6 +21,9 @@ from manicule.core.provenance import Provenance
 Metadata = dict[str, JsonValue]
 """Free-form per-item metadata. JSON-shaped so it survives the round trip to storage."""
 
+LEGACY_PUBLICATION: Final = "legacy"
+"""Publication assigned to rows created before derived-state generations existed."""
+
 
 class BlockKind(StrEnum):
     """What a parsed block is.
@@ -352,6 +355,13 @@ class Document(_Content):
 
     id: str = Field(min_length=1)
 
+    publication_id: str = Field(
+        default=LEGACY_PUBLICATION,
+        min_length=1,
+        exclude=True,
+        description="Active derived-state generation for chunks, vectors, glossary and lineage.",
+    )
+
     source: str = Field(min_length=1, description="Name of the connector instance that owns it.")
     source_id: str = Field(
         min_length=1,
@@ -477,6 +487,7 @@ class Document(_Content):
         call site.
         """
         return DocumentRevision(
+            publication_id=self.publication_id,
             content_hash=self.content_hash,
             version_token=self.version_token,
             original_ref=self.original_ref,
@@ -497,12 +508,12 @@ class DocumentRevision:
     this before the write closes the window only if the comparison and the write are one
     operation; see :meth:`~manicule.ingest.ports.IngestStore.commit_document`.
 
-    **These five fields and not others.** Every one of them moves when a connector sync
-    commits, and none of them moves when a re-parse of the same retained bytes commits — which
-    is the property that makes a re-parse able to write its own result and unable to write over
-    somebody else's. ``status`` is deliberately absent: a re-parse takes a document through
-    ``parsing`` and back to ``indexed``, so an identity carrying it would fail against the
-    re-parse's own earlier write.
+    **These six fields and not others.** The source fields move when a connector sync commits;
+    ``publication_id`` also moves when a re-parse publishes different derived state over the
+    same source revision. Together they let a re-parse write its own result and prevent it from
+    overwriting either kind of winner. ``status`` is deliberately absent: in-flight status is
+    operational state rather than source or derived identity, and an indexed document remains
+    indexed while its replacement is staged.
 
     ``source_record`` is here because "the bytes did not move" is not "the document did not
     move": a mirrored page whose manifest is corrected keeps its content hash and changes what
@@ -510,6 +521,7 @@ class DocumentRevision:
     correction silently.
     """
 
+    publication_id: str
     content_hash: str
     version_token: str | None
     original_ref: str | None

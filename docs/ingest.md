@@ -891,9 +891,9 @@ changed; what changed is that a run now exercises them, and the tests in
 `tests/ingest/test_concurrency.py` assert each of the first two separately rather than inferring
 one from the other.
 
-**The mutation lock is keyed, and that is the whole reason it is affordable.** A document is
-published by three writes in sequence — its record, its chunks and glossary rows, its
-vectors — and what must not interleave is the sequence, not all work everywhere. A
+**The mutation lock is keyed, and that is the whole reason it is affordable.** A document's
+vectors are staged and its relational publication is flipped under this lock; what must not
+interleave is that one document's sequence, not all work everywhere. A
 pipeline-wide lock would make a sweep over ten thousand pages block every sync in the
 installation for the length of it, to fix a problem no two unrelated pages have. The entry is
 dropped when the last holder leaves, so a sweep does not accumulate one lock per row it has
@@ -912,12 +912,11 @@ holds when it is.
 **The invariant.** An operation derived from document revision *R* does not commit if the
 stored document moved past *R* while it was running.
 
-The revision is not a column and needs no migration. It is derived from what is already
-stored — content hash, version token, retained-source reference, parse lineage, and the source
-record — chosen so that every one of them moves when a connector sync commits and none of them
-moves when a re-parse of the same retained bytes commits. `status` is deliberately not part of
-it: a re-parse takes a document through `parsing` and back to `indexed`, so a revision carrying
-it would fail against the re-parse's own earlier write.
+The revision is not a duplicate counter. It is derived from what is already stored — active
+publication, content hash, version token, retained-source reference, parse lineage, and the
+source record. Source fields detect a connector winner; the publication detects another repair
+that committed different derived state over the same bytes. `status` is deliberately not part
+of it: a re-parse may retain `indexed` throughout, and transient state is not source identity.
 
 **Who is guarded.** Every operation that derives its content from something already stored and
 has a command to reach it: `document reindex <id>` and `document reindex --stale`, both of which
@@ -932,15 +931,13 @@ they are library verbs with tests and no command. Stated rather than left implic
 day one of them gets a surface is the day it needs an expected revision, and the omission would
 otherwise have to be rediscovered.
 
-**Where the check is.** In the write, not before it. The comparison and the replacement are one
-statement in one transaction — a conditional `UPDATE` whose `WHERE` clause is the expected
-revision and whose row count is the answer — because a `SELECT` followed by a write has a gap
-between them exactly as wide as the one being closed. It is applied at every write the document
-receives on that path: the record write after parsing, again after the model has run and before
-the first chunk is replaced, and again at the `indexed` write that publishes. The last of those
-is the durable invariant; the middle one is what stops a superseded re-parse from producing a
-chunk, a vector or a glossary row at all, which is better than reconciling them afterwards —
-that is a second race in the same place.
+**Where the check is.** In the relational publication transaction, not before it. The comparison
+and the replacement are one operation — a conditional `UPDATE` takes SQLite's write lock, then
+the same transaction replaces chunks and glossary rows, advances lineage and flips the active
+publication. A `SELECT` followed by those writes would have a gap exactly as wide as the one
+being closed. Vectors are deliberately staged before this check: a losing run may leave inert
+rows, but cannot replace any row in the active publication, and tombstones make those rows
+reclaimable. The zero-chunk branch calls the same guarded transaction.
 
 **What an operator does about a `superseded` result: nothing.** It is not a failure and it is
 not work left undone. It says a connector sync committed newer bytes for that document while
@@ -951,12 +948,11 @@ picks it up — re-running the sweep converges with nothing done by hand in betw
 reporting a *lot* of them is reporting that it was run during a large sync, not that anything
 is wrong.
 
-**The mode that is intentionally not supported**: two processes writing one data directory
-concurrently. The commit guard detects it and refuses, but between the second check and the
-third there is a window in which the other process's chunks can be replaced by ours before our
-commit refuses — leaving derived rows a later repair has to fix. The exclusion for that is
-§6.5, and it is now taken by every writer (§8.6), so reaching this window means something is
-writing the directory that is not a manicule writer process.
+**The mode that is intentionally not supported** remains two processes writing one data
+directory concurrently. The commit guard nevertheless fails safely: a loser can stage an
+unpublished vector generation, but it cannot alter the winner's relational publication or its
+active vectors. The directory exclusion in §6.5 still prevents the wasted work and is taken by
+every writer (§8.6).
 
 ### 8.6 Who takes the data directory, and who does not
 
@@ -1212,12 +1208,12 @@ from the data directory. The first needs a forced re-sync, which is rung 4 and t
 that can fail; the second may only need the data directory restored. The sweep will not fetch
 on its own — leaving rung 3 is a decision an operator makes.
 
-**Stopping and resuming.** A document is the transaction boundary. Each is committed by the
-pipeline — chunks, then vectors, then `indexed`, then lineage — before the next is read, so
-interrupting the sweep leaves every document it finished internally consistent and every
-document it did not still selected. There is no resume token and nothing to clean up: run the
-command again. Documents already repaired are not selected a second time, so a restart picks up
-the remainder rather than starting the corpus over.
+**Stopping and resuming.** A document is the transaction boundary. Its vectors are staged, then
+one relational transaction publishes the document, chunks, glossary and lineage together.
+Interrupting a sweep leaves the prior indexed publication servable and selected; staged vector
+rows are inert and the normal tombstone sweep reclaims them. Run the command again. Documents
+already repaired are not selected a second time, so a restart picks up the remainder rather
+than starting the corpus over.
 
 **Batching and the cursor.** The selection is paged, `--batch` documents at a time, and the
 cursor is the number of documents a pass *left behind* rather than a page number. A repaired

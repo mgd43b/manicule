@@ -25,8 +25,9 @@ from tests.fakes import MEDIA_TYPE, HashEmbedder
 from tests.ingest import fakes
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 
+    from manicule.core.content import Chunk, Document, ParsedBlock
     from manicule.core.protocols import Chunker, Embedder, Middleware
 
 
@@ -138,7 +139,29 @@ async def test_the_write_order_marks_a_document_indexed_last() -> None:
     assert document is not None
     assert document.status is DocumentStatus.FAILED
     assert document.failed_stage is PipelineStage.STORE
-    assert store.chunks[document.id], "chunks are written first, and that is not a bug"
+    assert not store.chunks.get(document.id), "failed vectors must publish no relational chunks"
+
+
+async def test_republishing_the_identical_generation_does_not_tombstone_active_vectors() -> None:
+    """A content-addressed retry may reuse its physical rows, so it must not stage their cleanup."""
+    pipeline, store, _ = build()
+    connector = fakes.DictConnector({"a": "alpha"})
+    await pipeline.run(connector)
+    before = await store.find_document("memory", "a")
+    assert before is not None
+    staged = list(store.staged_publications)
+
+    await pipeline.ingest_raw(
+        RawDocument(source_id="a", uri="memory://a", media_type=MEDIA_TYPE, content="alpha"),
+        source="memory",
+        version_token=content_hash("alpha"),
+        force=True,
+    )
+
+    after = await store.find_document("memory", "a")
+    assert after is not None
+    assert after.publication_id == before.publication_id
+    assert store.staged_publications == staged
 
 
 # --- one bad document never aborts a batch ----------------------------------------------------
@@ -266,6 +289,39 @@ async def test_a_document_with_no_extractable_text_is_stored_with_zero_chunks() 
     assert document.status is DocumentStatus.NO_EXTRACTABLE_TEXT
     assert document.status_detail
     assert store.chunks[document.id] == []
+
+
+async def test_zero_chunk_publication_loses_its_cas_without_erasing_the_winner() -> None:
+    """The empty branch uses the same guarded relational flip as a vector-bearing revision."""
+    pipeline, store, vectors = build()
+    await pipeline.run(fakes.DictConnector({"a": "old text"}))
+    stale = await store.find_document("memory", "a")
+    assert stale is not None
+    old_chunks = list(store.chunks[stale.id])
+
+    class OvertakingEmptyChunker(fakes.BlockChunker):
+        @override
+        def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+            del document, blocks
+            winner = store.documents[stale.id].model_copy(
+                update={"content_hash": content_hash("winner"), "version_token": "winner"}
+            )
+            store.documents[stale.id] = winner
+            return []
+
+    contender, _, _ = build(store=store, vectors=vectors, chunker=OvertakingEmptyChunker())
+    outcomes = await contender.ingest_raw(
+        RawDocument(
+            source_id="a", uri="memory://a", media_type=MEDIA_TYPE, content="stale replacement"
+        ),
+        source="memory",
+        force=True,
+        expected=stale.revision,
+    )
+
+    assert outcomes[0].superseded
+    assert store.documents[stale.id].content_hash == content_hash("winner")
+    assert store.chunks[stale.id] == old_chunks
 
 
 # --- change detection -----------------------------------------------------------------------

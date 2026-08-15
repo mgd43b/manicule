@@ -452,8 +452,9 @@ well-formed empty result set. The lexical leg fixed it by filtering inside the s
 `LIMIT`.
 
 **The dense leg cannot do that, and the reason is structural rather than an oversight.** The
-Lance table holds `id`, `vector`, `document_id`, `kind`, `lang`, `position` and `chunk_json`. It
-holds no `deleted_at`, no `status`, and no `workspace_id`, and it holds none of them
+Lance table holds a physical `id`, logical `chunk_id`, `publication_id`, `vector`,
+`document_id`, `kind`, `lang`, `position` and `chunk_json`. It holds no `deleted_at`, no
+`status`, and no `workspace_id`, and it holds none of them
 deliberately: liveness and tenancy live on `documents`, in the authoritative store, and copying
 them into a derived one creates a value that can disagree. So `VectorStore.search(v, k)` returns
 `k` rows of which an unknown number are invisible, and the join that removes them necessarily
@@ -464,12 +465,13 @@ The dense stage is therefore three operations that are one stage:
 ```
 embed(query)                                  # cached by fingerprint + text
   → VectorStore.search(v, k′, pushdown)       # k′ > k, see §4.3
-  → hydrating join through documents          # workspace, deleted_at, status
+  → hydrating join through documents          # workspace, deleted_at, status, publication
   → k live candidates, scored by cosine
 ```
 
 The join is the one from `storage.md` §6.2 — `WHERE c.id IN (…) AND d.deleted_at IS NULL AND
-d.status = 'indexed'`, plus `d.workspace_id`. It is inside the stage rather than beside it for
+d.status = 'indexed'`, plus `d.workspace_id`, followed by equality between the vector candidate's
+publication and `d.publication_id`. It is inside the stage rather than beside it for
 the reason in §2.4: a boundary that configuration can omit is not a boundary.
 
 **The join also re-reads the chunk.** Lance returns `chunk_json`, which is a second copy of the

@@ -233,7 +233,14 @@ class MemoryVectorStore:
     async def fingerprint(self) -> EmbedFingerprint | None:
         return self._fingerprint
 
-    async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = "legacy",
+    ) -> None:
+        del publication_id
         expected = self._fingerprint.dimension if self._fingerprint else None
         for chunk, vector in zip(chunks, vectors, strict=True):
             if expected is not None and len(vector) != expected:

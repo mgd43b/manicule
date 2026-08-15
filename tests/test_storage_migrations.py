@@ -118,6 +118,9 @@ async def test_a_migration_over_a_populated_database_keeps_the_rows(data_dir: Pa
         assert columns["chunk_fp"] == _SEEDED_CHUNK_FP, "the seed must set the lineage it checks"
 
         await upgrade(engine)
+        assert await _document_values(engine, "publication_id") == {"publication_id": "legacy"}, (
+            "pre-publication documents must retain vectors under the legacy generation"
+        )
         assert await _row_counts(engine) == before, (
             "a migration must not delete rows it was not asked to delete"
         )

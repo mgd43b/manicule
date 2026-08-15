@@ -732,6 +732,24 @@ async def test_the_store_answers_reuse_on_the_embedding_input(tmp_path: Path) ->
     await assert_vector_store_reuses_by_embedding_input(make_store, chunks)
 
 
+async def test_publications_keep_two_vectors_for_one_stable_chunk_id(tmp_path: Path) -> None:
+    """Changing only embed_text must not overwrite the vector the active revision still uses."""
+    store = LanceVectorStore(tmp_path / "vectors")
+    await store.ensure_ready(fingerprint())
+    original = chunk("stable")
+    rewritten = original.model_copy(update={"embed_text": f"new heading > {original.text}"})
+
+    await store.upsert([original], [spread(4, 0)], publication_id="old")
+    await store.upsert([rewritten], [spread(4, 1)], publication_id="new")
+
+    assert await store.count() == 2
+    candidates = await store.search([0.0] * 4, 10)
+    assert {(item.chunk.id, item.publication_id) for item in candidates} == {
+        (original.id, "old"),
+        (original.id, "new"),
+    }
+
+
 async def test_a_reused_vector_is_the_stored_vector_to_the_last_bit(
     store: LanceVectorStore,
 ) -> None:

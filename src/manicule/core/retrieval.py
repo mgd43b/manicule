@@ -14,7 +14,7 @@ from typing import Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from manicule.core.content import BlockKind, Chunk, Metadata
+from manicule.core.content import LEGACY_PUBLICATION, BlockKind, Chunk, Metadata
 
 
 class RetrievalProfile(StrEnum):
@@ -122,6 +122,12 @@ class Candidate(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     chunk: Chunk
+    publication_id: str = Field(
+        default=LEGACY_PUBLICATION,
+        min_length=1,
+        exclude=True,
+        description="Derived-state generation this candidate's vector belongs to.",
+    )
     score: float = Field(description="Current effective score. Comparable only within a run.")
     scores: dict[str, float] = Field(
         default_factory=dict,

@@ -144,7 +144,14 @@ class CosineVectorStore:
     async def fingerprint(self) -> EmbedFingerprint | None:
         return self._fingerprint
 
-    async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = "legacy",
+    ) -> None:
+        del publication_id
         for chunk, vector in zip(chunks, vectors, strict=True):
             self._rows[chunk.id] = (chunk, list(vector))
 

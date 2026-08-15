@@ -80,6 +80,26 @@ class IngestStore(Protocol):
         """
         ...
 
+    async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
+        """Record physical vector ids before they are written, for crash cleanup."""
+        ...
+
+    async def publish_document(
+        self,
+        document: Document,
+        chunks: Sequence[Chunk],
+        *,
+        expected: DocumentRevision | None,
+        chunk_fp: str | None,
+        embed_fp: str | None,
+        parse_fp: str | None,
+        glossary_entries: Sequence[GlossaryEntry] | None,
+        glossary_fp: str | None,
+        original_omitted_reason: str | None,
+    ) -> Commit:
+        """Atomically publish one document and all relational derived state."""
+        ...
+
     async def set_status(
         self, document_id: str, status: DocumentStatus, detail: str = ""
     ) -> None: ...

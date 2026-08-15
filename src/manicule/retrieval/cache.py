@@ -231,7 +231,15 @@ async def rehydrate(
         # computed. Recomputing it from whatever key looks largest would silently reorder a
         # ranking on its way out of the cache.
         effective = scores.get(last, 0.0)
-        rebuilt.append(Candidate(chunk=by_id[chunk_id], score=effective, scores=scores))
+        chunk = by_id[chunk_id]
+        rebuilt.append(
+            Candidate(
+                chunk=chunk,
+                publication_id=visible[chunk.document_id],
+                score=effective,
+                scores=scores,
+            )
+        )
     return rebuilt
 
 

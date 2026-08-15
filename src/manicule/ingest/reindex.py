@@ -256,7 +256,7 @@ async def re_embed(
                 forward_calls=batches,
             )
         )
-        await vectors.upsert(chunks, produced)
+        await vectors.upsert(chunks, produced, publication_id=document.publication_id)
         # Only the embedding lineage moves. Re-embedding does not re-chunk, so claiming a new
         # chunk fingerprint here would make a later "which documents need re-chunking" query
         # answer "none" about documents that do.
@@ -316,7 +316,7 @@ async def repair(
             report.failures.append(f"{document.id}: {exc}")
             continue
         report.note_embedding(work)
-        await vectors.upsert(chunks, produced)
+        await vectors.upsert(chunks, produced, publication_id=document.publication_id)
         await store.upsert_document(
             document.model_copy(
                 update={

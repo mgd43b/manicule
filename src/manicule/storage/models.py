@@ -231,6 +231,9 @@ class Document(Base):
     __tablename__ = "documents"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
+    publication_id: Mapped[str] = mapped_column(
+        Text, nullable=False, default="legacy", server_default="legacy"
+    )
     workspace_id: Mapped[str] = mapped_column(
         ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )

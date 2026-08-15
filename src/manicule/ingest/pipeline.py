@@ -36,9 +36,9 @@ serve chunks derived from bytes the source no longer has would cite text the doc
 contain, which is the one thing this project will not do. ``failed`` is the case where we do
 not know, and not knowing is the case that must not destroy a working answer.
 
-The write order and its crash windows belong to ``docs/storage.md`` §8.2 and are honored
-rather than restated: chunks, then vectors, then ``indexed`` last, in the transaction that is
-the commit point.
+The publication order and its crash windows belong to ``docs/storage.md`` §8.2 and are honored
+rather than restated: versioned vectors are staged first, then one SQLite transaction flips the
+document, chunks, glossary and lineage from the old publication to the new one.
 """
 
 from __future__ import annotations
@@ -90,6 +90,7 @@ if TYPE_CHECKING:
 
     from manicule.core.content import Chunk, Metadata
     from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
+    from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Chunker, Connector, Embedder, VectorStore
     from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
     from manicule.ingest.middleware import MiddlewareRunner
@@ -1249,7 +1250,14 @@ class IngestPipeline:
             )
 
         return (
-            await self._finish(result, document, raw=raw, existing=existing, expected=expected),
+            await self._finish(
+                result,
+                document,
+                raw=raw,
+                existing=existing,
+                retention=retention,
+                expected=expected,
+            ),
             (),
         )
 
@@ -1342,6 +1350,7 @@ class IngestPipeline:
         *,
         raw: RawDocument,
         existing: Document | None,
+        retention: Retention,
         expected: DocumentRevision | None = None,
     ) -> DocumentOutcome:
         """Chunk, embed and commit a document the chain produced text for.
@@ -1360,7 +1369,14 @@ class IngestPipeline:
         try:
             chunks = await self._prepare(result, document)
             if not chunks:
-                return await self._nothing_to_index(result, document, raw=raw)
+                return await self._nothing_to_index(
+                    result,
+                    document,
+                    raw=raw,
+                    existing=existing,
+                    retention=retention,
+                    expected=expected,
+                )
             await self._advance(existing, DocumentStatus.EMBEDDING)
             # The lock goes to `embed_or_reuse`, which holds it around the model call and
             # nothing else. Both reads here — this one and the vector store's — are about what
@@ -1378,6 +1394,8 @@ class IngestPipeline:
                 maximum=self._max_embed_batch,
                 lock=self._embedding,
             )
+        except _SupersededError:
+            raise
         except _StageError as failure:
             return await self._demote(document, existing, failure.stage, failure.detail)
         except ContextOverflowError as exc:
@@ -1393,7 +1411,13 @@ class IngestPipeline:
         # one function whose ordering is the crash contract — which now also carries
         # `expected`, and has earned the right to be left alone.
         outcome = await self._commit(
-            document, chunks, vectors, raw=raw, existing=existing, expected=expected
+            document,
+            chunks,
+            vectors,
+            raw=raw,
+            existing=existing,
+            retention=retention,
+            expected=expected,
         )
         return replace(outcome, embedding=work)
 
@@ -1442,7 +1466,14 @@ class IngestPipeline:
             raise _StageError(PipelineStage.MIDDLEWARE, detail) from exc
 
     async def _nothing_to_index(
-        self, result: ChainResult, document: Document, *, raw: RawDocument
+        self,
+        result: ChainResult,
+        document: Document,
+        *,
+        raw: RawDocument,
+        existing: Document | None,
+        retention: Retention,
+        expected: DocumentRevision | None,
     ) -> DocumentOutcome:
         """A document whose blocks survived parsing and produced no chunk.
 
@@ -1459,21 +1490,24 @@ class IngestPipeline:
             parser_used=result.parser_used,
             attempts=result.attempts,
         )
-        stored = await self._store.upsert_document(_with_status(document, settled))
-        await self._store.replace_chunks(stored.id, [])
-        # A document with no chunks states no definitions. Said explicitly rather than left to
-        # the chunk cascade, because the cascade is a property of one store's schema and this
-        # is a property of the pipeline: a store that kept its chunks in a separate service
-        # would leave a whole glossary behind for a page that no longer has any text in it.
-        # It is also a derived empty result, so it records lineage like any other.
-        glossary_detail = await self._store_definitions(stored, [])
-        # The determination "there is no text in this" is itself the output of a parser
-        # version. Without lineage here, a document that yielded nothing would be re-parsed on
-        # every sync forever — and, worse, the day a library learns to read it, nothing would
-        # say which documents were judged empty by the version that could not.
-        await self._store.set_lineage(
-            stored.id, chunk_fp=None, embed_fp=None, parse_fp=self._parse_lineage_of(document)
+        settled_document = _with_status(document, settled)
+        publication = self._publication_of(settled_document, [])
+        settled_document = settled_document.model_copy(update={"publication_id": publication})
+        entries, glossary_fp, glossary_detail = self._derive_definitions(settled_document, [])
+        committed = await self._store.publish_document(
+            settled_document,
+            [],
+            expected=expected,
+            chunk_fp=None,
+            embed_fp=None,
+            parse_fp=self._parse_lineage_of(document),
+            glossary_entries=entries,
+            glossary_fp=glossary_fp,
+            original_omitted_reason=retention.omitted_reason,
         )
+        if not committed.committed or committed.stored is None:
+            raise _SupersededError(committed.stored)
+        stored = committed.stored
         await self._observe(stored)
         return DocumentOutcome(
             source_id=raw.source_id,
@@ -1491,70 +1525,53 @@ class IngestPipeline:
         *,
         raw: RawDocument,
         existing: Document | None,
+        retention: Retention,
         expected: DocumentRevision | None = None,
     ) -> DocumentOutcome:
-        """Write in the one order that survives a crash at any point.
+        """Stage vectors, then atomically flip every authoritative derived row.
 
-        1. Chunks. The document is not ``indexed``, so nothing is served.
-        2. Vectors, upserted by chunk id, so re-running step 2 is free.
-        3. ``indexed``, last, in the transaction that is the commit point.
-
-        A crash between 1 and 2 leaves chunks with no vectors and nothing served; the repair
-        re-embeds those chunk ids. A crash between 2 and 3 leaves vectors for a document that
-        is not ``indexed``; the repair re-runs 2 idempotently and then 3.
-
-        **``expected`` is verified twice here, and neither one is the other's spare.** Step 3
-        is the write that publishes everything the first two staged, so a compare-and-swap
-        there is a compare-and-swap on the act of publishing: it is the durable invariant, and
-        putting it anywhere earlier would leave a window exactly as wide as the one it closes.
-        Step 0 is what makes the *derived* writes safe. Chunks and glossary rows are replaced
-        rather than added, so step 1 destroys whatever was there — and by the time step 3 could
-        refuse, that has already happened. Verifying again after the model has run and before
-        anything is replaced is what keeps a superseded re-parse from producing derived state at
-        all, which the alternative — reconciling it afterwards — turns into a second race.
+        Vector row ids include ``publication``, so staging cannot overwrite the active
+        revision even when a chunk's logical id survives while ``embed_text`` changes. The
+        relational store replaces document, chunks, glossary and lineage in one transaction;
+        ``documents.publication_id`` is the pointer dense hydration checks. A crash or CAS miss
+        before that flip leaves the old publication wholly servable and the staged rows inert.
 
         Raises:
-            _SupersededError: The stored document moved past ``expected``. From step 0 that
-                means it moved while the document was being chunked and embedded; from step 3,
-                while the derived writes were in flight. Neither is reachable from inside this
-                process — :meth:`_mutating` is held across all of it — so both mean a second
-                process is writing this data directory without the instance lock.
+            _SupersededError: The stored document moved past ``expected`` before the atomic
+                relational flip. Its staged vectors remain tombstoned for cleanup.
         """
-        if expected is not None:
-            # Step 0. Written rather than read: a `SELECT` and a later write have a gap between
-            # them, and this whole class of bug is what lives in gaps like that.
-            await self._publish(document, expected=expected)
+        publication = self._publication_of(document, chunks, vectors)
+        indexed_document = document.model_copy(
+            update={
+                "publication_id": publication,
+                "status": DocumentStatus.INDEXED,
+                "status_detail": None,
+                "failed_stage": None,
+            }
+        )
         try:
-            await self._store.replace_chunks(document.id, chunks)
-            # Between the chunks and the vectors, because the entries have a foreign key to the
-            # chunks and none to anything written later. The crash window this opens is
-            # harmless in the one direction that matters: the document is not yet ``indexed``,
-            # and a glossary lookup only ever reads entries of indexed documents — so entries
-            # written by a run that died before its vectors are invisible until the repair
-            # finishes the job.
-            glossary_detail = await self._store_definitions(document, chunks)
-            await self._vectors.upsert(chunks, vectors)
+            if existing is None or existing.publication_id != publication:
+                await self._store.stage_vectors(publication, chunks)
+            await self._vectors.upsert(chunks, vectors, publication_id=publication)
+            entries, glossary_fp, glossary_detail = self._derive_definitions(document, chunks)
+            committed = await self._store.publish_document(
+                indexed_document,
+                chunks,
+                expected=expected,
+                chunk_fp=self._chunk_fingerprint.canonical(),
+                embed_fp=self._embedder.fingerprint.canonical(),
+                parse_fp=self._parse_lineage_of(document),
+                glossary_entries=entries,
+                glossary_fp=glossary_fp,
+                original_omitted_reason=retention.omitted_reason,
+            )
         except Exception as exc:  # noqa: BLE001 - a store failure is this document's
             return await self._demote(
                 document, existing, PipelineStage.STORE, f"{type(exc).__name__}: {exc}"
             )
-
-        indexed = await self._publish(
-            document.model_copy(
-                update={
-                    "status": DocumentStatus.INDEXED,
-                    "status_detail": None,
-                    "failed_stage": None,
-                }
-            ),
-            expected=expected,
-        )
-        await self._store.set_lineage(
-            indexed.id,
-            chunk_fp=self._chunk_fingerprint.canonical(),
-            embed_fp=self._embedder.fingerprint.canonical(),
-            parse_fp=self._parse_lineage_of(document),
-        )
+        if not committed.committed or committed.stored is None:
+            raise _SupersededError(committed.stored)
+        indexed = committed.stored
         await self._observe(indexed)
         return DocumentOutcome(
             source_id=raw.source_id,
@@ -1609,9 +1626,10 @@ class IngestPipeline:
             Why detection did not produce this document's entries, or the empty string when it
             did — or when there was nothing for it to do.
         """
-        if self._glossary is None or self._glossary_lineage is None:
-            return ""
-        if not self._detect_glossary:
+        entries, fingerprint, detail = self._derive_definitions(document, chunks)
+        if fingerprint is None:
+            return detail
+        if entries is None:
             # Detection is switched off. The rows are left exactly as they are, which is what
             # `rag.glossary.detect_on_ingest` promises an operator investigating a detector that
             # is producing rubbish — and the lineage records that no detector ran, which is a
@@ -1619,17 +1637,48 @@ class IngestPipeline:
             # detection back on changes the installed fingerprint, so every document stamped
             # this way is selected by the next survey.
             await self._store.set_lineage(
-                document.id, chunk_fp=None, embed_fp=None, glossary_fp=self._glossary_lineage
+                document.id, chunk_fp=None, embed_fp=None, glossary_fp=fingerprint
             )
-            return ""
+            return detail
+        if self._glossary is None:  # pragma: no cover - entries imply an installed writer
+            return detail
+        await self._glossary.replace_glossary_entries(document.id, entries, fingerprint=fingerprint)
+        return detail
+
+    def _derive_definitions(
+        self, document: Document, chunks: Sequence[Chunk]
+    ) -> tuple[Sequence[GlossaryEntry] | None, str | None, str]:
+        """Compute glossary state without publishing it."""
+        if self._glossary is None or self._glossary_lineage is None:
+            return None, None, ""
+        if not self._detect_glossary:
+            return None, self._glossary_lineage, ""
         try:
             entries = detect_entries(chunks, title=document.title, media_type=document.media_type)
         except Exception as exc:  # noqa: BLE001 - a detector bug costs this document's glossary
-            return f"glossary detection failed: {type(exc).__name__}: {exc}"
-        await self._glossary.replace_glossary_entries(
-            document.id, entries, fingerprint=self._glossary_lineage
+            return None, None, f"glossary detection failed: {type(exc).__name__}: {exc}"
+        return entries, self._glossary_lineage, ""
+
+    def _publication_of(
+        self,
+        document: Document,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Sequence[float]] = (),
+    ) -> str:
+        """Content address for one complete set of derived ingest state."""
+        return content_hash(
+            "\0".join(
+                (
+                    document.model_dump_json(exclude={"publication_id", "indexed_at"}),
+                    self._chunk_fingerprint.canonical(),
+                    self._embedder.fingerprint.canonical(),
+                    self._parse_lineage_of(document) or "",
+                    self._glossary_lineage or "",
+                    *(chunk.model_dump_json() for chunk in chunks),
+                    *(repr(tuple(vector)) for vector in vectors),
+                )
+            )
         )
-        return ""
 
     # --- change detection ------------------------------------------------------------------
 
@@ -1848,12 +1897,10 @@ class IngestPipeline:
         the missing capability arrives. An unstored failure is re-fetched on every sync, absent
         from every listing, and invisible to any repair.
 
-        **The first write a document gets, and therefore the first place ``expected`` is
-        verified.** Not because one guard here would be enough — the document can still move
-        between this and the commit, which is why :meth:`_commit` carries the same guard — but
-        because failing here is what keeps a superseded re-parse from ever *producing* a chunk,
-        a glossary row or a vector. The spec's alternative, reconciling stale derived state
-        after the fact, is where the second race lives.
+        A successful parse is constructed here but not written. Its source record joins chunks,
+        glossary and lineage only at the atomic publication boundary; until then an existing
+        indexed row remains the active revision. Chunk-less terminal conclusions still publish
+        here or through :meth:`_nothing_to_index`, using the caller's guard.
 
         Raises:
             _SupersededError: The stored document is no longer ``expected``, so nothing was written.
@@ -1936,6 +1983,8 @@ class IngestPipeline:
             failed_stage=result.failed_stage,
             metadata=metadata,
         )
+        if result.status is DocumentStatus.PARSED:
+            return document
         stored = await self._publish(document, expected=expected)
         await self._store.set_original(
             stored.id, ref=retention.ref, omitted_reason=retention.omitted_reason

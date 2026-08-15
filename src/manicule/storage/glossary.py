@@ -172,34 +172,34 @@ class GlossaryMixin(WorkspaceScoped):
                 # `documents`, and this document is not one.
                 await self._clear_entries(session, document_id)
                 return
-            await self._clear_entries(session, document_id)
             row.glossary_fp = fingerprint
-            aliases: list[tuple[str, str]] = []
-            for entry in entries:
-                entry_id = glossary_entry_id(entry.chunk_id, entry.acronym, entry.expansion)
-                session.add(
-                    models.GlossaryEntry(
-                        id=entry_id,
-                        document_id=document_id,
-                        chunk_id=entry.chunk_id,
-                        acronym=entry.acronym,
-                        display=entry.display,
-                        expansion=entry.expansion,
-                        location=entry.location,
-                        form=entry.form.value,
-                        confidence=entry.confidence,
-                    )
+            await self._replace_entries(session, document_id, entries)
+
+    async def _replace_entries(
+        self, session: AsyncSession, document_id: str, entries: Sequence[GlossaryEntry]
+    ) -> None:
+        """Replace entries inside a transaction owned by this mixin or an atomic publisher."""
+        await self._clear_entries(session, document_id)
+        aliases: list[tuple[str, str]] = []
+        for entry in entries:
+            entry_id = glossary_entry_id(entry.chunk_id, entry.acronym, entry.expansion)
+            session.add(
+                models.GlossaryEntry(
+                    id=entry_id,
+                    document_id=document_id,
+                    chunk_id=entry.chunk_id,
+                    acronym=entry.acronym,
+                    display=entry.display,
+                    expansion=entry.expansion,
+                    location=entry.location,
+                    form=entry.form.value,
+                    confidence=entry.confidence,
                 )
-                aliases += [(entry_id, alias) for alias in dict.fromkeys(entry.aliases)]
-            # Flushed before the aliases, explicitly. The unit of work orders inserts by table
-            # dependency only where a mapper *relationship* declares one, and there is none here
-            # — deliberately, because an alias is a lookup key rather than an object anybody
-            # navigates to. Without this the alias row reaches SQLite first and the foreign key
-            # rejects it, which is how the parenthetical form's second short form was found to
-            # be unwritable at all.
-            await session.flush()
-            for entry_id, alias in aliases:
-                session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
+            )
+            aliases += [(entry_id, alias) for alias in dict.fromkeys(entry.aliases)]
+        await session.flush()
+        for entry_id, alias in aliases:
+            session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
 
     async def glossary_lineage(self, document_id: str) -> str | None:
         """Which detector last decided this document's entries, or ``None`` if none has.

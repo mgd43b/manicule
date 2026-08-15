@@ -353,7 +353,7 @@ class Retriever:
         )
         allowed = query.filter
         return {
-            chunk.id: Candidate(chunk=chunk, score=0.0)
+            chunk.id: Candidate(chunk=chunk, publication_id=visible[chunk.document_id], score=0.0)
             for chunk in chunks
             if chunk.document_id in visible
             and (not allowed.kinds or chunk.kind in allowed.kinds)

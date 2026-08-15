@@ -57,6 +57,13 @@ def chunk_id(document_id_: str, position: int, text: str) -> str:
     return _digest("chunk", document_id_, str(position), text)
 
 
+def vector_id(publication_id: str, chunk_id_: str) -> str:
+    """Physical vector-row id for one publication of a logical chunk."""
+    if publication_id == "legacy":
+        return chunk_id_
+    return _digest("vector", publication_id, chunk_id_)
+
+
 def glossary_entry_id(chunk_id_: str, acronym: str, expansion: str) -> str:
     """A glossary entry's id.
 
@@ -72,4 +79,4 @@ def glossary_entry_id(chunk_id_: str, acronym: str, expansion: str) -> str:
     return _digest("glossary", chunk_id_, acronym, expansion)
 
 
-__all__ = ["chunk_id", "content_hash", "document_id", "glossary_entry_id"]
+__all__ = ["chunk_id", "content_hash", "document_id", "glossary_entry_id", "vector_id"]

@@ -809,7 +809,9 @@ The Lance table holds the minimum needed to find a chunk and to filter before fi
 
 | Column | Type | Purpose |
 |---|---|---|
-| `id` | `string` | `chunks.id`; the join key |
+| `id` | `string` | physical key derived from publication + logical chunk id |
+| `chunk_id` | `string` | `chunks.id`; the hydration join key |
+| `publication_id` | `string` | vector generation, matched to the document during hydration |
 | `vector` | `fixed_size_list<float32, D>` | `D` from the fingerprint, never a literal |
 | `document_id` | `string` | pushdown filter, and delete-by-document |
 | `kind` | `string` | pushdown filter |
@@ -884,22 +886,22 @@ the row is cross-checked against the chunk stored beside it before its vector is
 collision would have to survive that check as well. Assumed rather than argued away, and stated
 so the next reader knows which it is.
 
-**Migration is one `add_columns` and no re-embedding.** An existing table gains the column in
-`ensure_ready`, filled with the empty string, and every row then reads as *identity not
-recorded*. Such a row is reconstructed rather than distrusted: `upsert` wrote its `chunk_json`
+**Migration is one `add_columns` and no re-embedding.** An existing table gains the identity,
+logical-chunk and publication columns in `ensure_ready`. Existing rows use their former `id` as
+`chunk_id`, receive the `legacy` publication, and read as *identity not recorded*. Such a row is
+reconstructed rather than distrusted: `upsert` wrote its `chunk_json`
 from the same object, in the same call, as the vector beside it, so `chunk_json.embed_text` is
 the exact prior embedding input rather than a guess at one. An existing corpus therefore keeps
 every vector it has, the reconstruction is reported as `embedding.vectors_backfilled`
 ([`ingest.md`](ingest.md) §10.1), and the first write of each row records its identity for good.
 Backup, restore and export are unaffected: the column travels with the table like every other.
 
-**There is no garbage collection to define for reused vectors, because there is no second
-store.** A durable reuse cache would need one — entries outliving the chunks they were made for,
-and a rule for collecting them. Here the reused vector *is* the vector row, held against the
-chunk id it belongs to, so it is collected by the thing that already collects vector rows: the
-tombstone sweep (§8.2), which deletes by id from a list rather than by anti-joining a live
-table. Nothing accumulates that was not already accumulating, and correctness never depends on
-collection having happened.
+**Publications use the existing tombstone collector.** Physical ids for a new publication are
+tombstoned before its vectors are staged. The atomic relational flip clears those tombstones and
+tombstones the retired publication instead. A crash therefore leaves either staged or retired
+rows named for the sweep, which deletes by physical id from a list rather than anti-joining a
+live table. Correctness never depends on collection having happened: hydration rejects every
+publication except the document's active one.
 
 **`chunk_json` is a departure from the original design, forced by the protocol.** An earlier
 draft of this section said the Lance row holds no text: a search would return `(id, distance)`
@@ -924,6 +926,11 @@ SELECT c.*, d.uri, d.title
 FROM chunks c JOIN documents d ON d.id = c.document_id
 WHERE c.id IN (…) AND d.deleted_at IS NULL AND d.status = 'indexed'
 ```
+
+The application also requires the candidate vector's `publication_id` to equal
+`documents.publication_id` before returning the hydrated chunk. That comparison is the
+cross-store commit pointer: staged and retired generations fail it even when their logical
+chunk id still exists.
 
 Nothing needs to be deleted from LanceDB for a result to stop being served. The cost of
 `chunk_json` is a second copy of the corpus text, and the honest accounting is that the
@@ -1367,21 +1374,34 @@ disclosure itself is discharged here.
 | | |
 |---|---|
 | **I1** | Every servable chunk has a row in `chunks`. Retrieval hydrates through the inner join in §6.2, so this is enforced by construction, not by convention. |
-| **I2** | LanceDB may be a **superset** of `chunks`. It is never treated as a subset. Extra vectors are inert — invisible to the join — and are swept. |
-| **I3** | `documents.status = 'indexed'` is written **last**, in the transaction that is the commit point of ingest. Until then the document is not servable whatever exists elsewhere. |
+| **I2** | LanceDB may be a **superset** of active `chunks`. Each vector row names a publication, and hydration admits it only when that value equals `documents.publication_id`; staged and retired vectors are therefore inert and sweepable. |
+| **I3** | One SQLite transaction replaces the document, chunks, glossary rows and all four lineage values and flips `documents.publication_id`. That flip is the commit point: readers see the complete old publication or the complete new one. |
 | **I4** | FTS5 cannot diverge from `chunks` at all, because the triggers in §6.1 run inside the same transaction as the row change. Its only failure mode is corruption, which `integrity-check` detects and `rebuild` fixes for free. |
 
 ### 8.2 Ingest write order, and every crash window
 
-1. Write `chunks` rows (SQLite transaction). Document is still `parsing`/`embedding`.
-2. Upsert vectors into the Lance table.
-3. Set `documents.status = 'indexed'`, `indexed_at`, `embed_fp`, `chunk_fp` (SQLite transaction).
+1. Derive a content-addressed publication id from the document, chunks, vectors and stage
+   fingerprints.
+2. Write vector tombstones for that publication's physical row ids, then stage every vector.
+   The logical chunk id remains stable; the physical id includes the publication, so changed
+   `embed_text` cannot overwrite the vector the active revision still uses.
+3. In one SQLite transaction, replace the document, chunks, glossary and lineage; set
+   `documents.publication_id`; retire the old publication's vector ids; and clear the new
+   publication's tombstones.
 
-- **Crash between 1 and 2** — chunks exist, vectors do not, document is not `indexed`. Nothing
-  is served. Repair re-embeds the chunks that have no vector. Rung 2.
-- **Crash between 2 and 3** — vectors exist for a document that is not `indexed`. Nothing is
-  served (I3). Repair re-runs step 2 idempotently (upsert by `chunks.id`) and step 3.
-- **Crash during 3** — SQLite transaction, so it either happened or it did not.
+- **Crash before or during 2** — SQLite still points to the old publication, so its document,
+  chunks, glossary, lineage and vectors remain wholly servable. Any staged rows are rejected by
+  hydration and remain named by tombstones for the ordinary vector sweep.
+- **Crash before 3** — the same. Having every new vector is necessary but not sufficient to
+  publish; no relational state moved.
+- **Crash during 3** — SQLite transaction, so readers see all of the old publication or all of
+  the new one. There is no interval with new chunks and old lineage, or vice versa.
+- **Crash after 3** — the new publication is complete. Retired vectors may still exist, but
+  their publication no longer matches the document and the tombstone sweep reclaims them.
+
+The zero-chunk path uses step 3 too. It stages no vectors, but it still performs the same
+compare-and-swap and atomic relational flip; an empty result is not an escape hatch around the
+publication boundary.
 
 **Deletion is deferred, always.** Soft-deleting a document sets `deleted_at` and touches
 nothing else: chunks stay, vectors stay, FTS rows stay, and all of them become invisible at
