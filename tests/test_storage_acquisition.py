@@ -306,6 +306,15 @@ async def test_lifecycle_edges_and_lease_generation_are_compare_and_swap_guarded
     )
     assert first is not None
     assert first.lease_generation == 1
+    assert (
+        await store.claim_acquisition_run(
+            "run", "first", now=now, expires_at=now + timedelta(seconds=20)
+        )
+        is None
+    )
+    unchanged_generation = await store.get_acquisition_run("run")
+    assert unchanged_generation is not None
+    assert unchanged_generation.lease_generation == first.lease_generation
     await store.complete_acquisition_enumeration(
         "run",
         _watermark("end"),
@@ -649,6 +658,18 @@ async def test_acquired_blob_is_not_garbage_and_does_not_publish_a_document(
         now=_NOW,
     )
     assert indexing.blob_ref == stored.hash
+    await store.transition_acquisition_record(
+        "run",
+        "page-1",
+        AcquisitionRecordState.INDEXING,
+        AcquisitionRecordState.SETTLED,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    persisted = await store.get_acquisition_run("run")
+    assert persisted is not None
+    assert persisted.indexed_count == 1
 
 
 async def test_acquired_state_requires_a_retained_blob_reference(
@@ -783,6 +804,9 @@ async def test_settled_retry_does_not_require_a_blob(store: SqliteDocStore) -> N
 
     assert settled.state is AcquisitionRecordState.SETTLED
     assert settled.blob_ref is None
+    persisted = await store.get_acquisition_run("run")
+    assert persisted is not None
+    assert persisted.indexed_count == 0
 
 
 @pytest.mark.parametrize(

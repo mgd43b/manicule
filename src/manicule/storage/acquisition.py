@@ -333,7 +333,6 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         or_(
                             models.AcquisitionRun.lease_owner.is_(None),
                             models.AcquisitionRun.lease_expires_at <= now,
-                            models.AcquisitionRun.lease_owner == owner,
                         ),
                     )
                     .values(
@@ -675,7 +674,17 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 AcquisitionRecordState.SETTLED,
             )
         )
-        run.indexed_count = counts.get(AcquisitionRecordState.SETTLED, 0)
+        run.indexed_count = (
+            await session.execute(
+                select(func.count())
+                .select_from(models.AcquisitionRecord)
+                .where(
+                    models.AcquisitionRecord.run_id == run.id,
+                    models.AcquisitionRecord.state == AcquisitionRecordState.SETTLED,
+                    models.AcquisitionRecord.blob_ref.is_not(None),
+                )
+            )
+        ).scalar_one()
         run.unchanged_count = counts.get(AcquisitionRecordState.UNCHANGED, 0)
         run.retry_count = counts.get(AcquisitionRecordState.RETRY, 0)
         run.acquired_blob_bytes = (
