@@ -11,11 +11,12 @@ is a sentinel counted out one per consumer, and a concurrency bound is a gauge t
 comes down. Nothing is inferred from a task set, and nothing depends on the order in which
 tasks happen to be scheduled.
 
-**Backpressure is why each local hand-off is bounded.** Discovery itself writes the durable
-acquisition journal before these stages begin, so a slow embedder cannot age its pagination
-cursor. The journal reader can still outrun fetch, and fetch can outrun parse; bounding both is
-what prevents that decoupling from becoming corpus-sized memory. :attr:`Conveyor.blocked_puts`
-makes those local bounds observable (``docs/ingest.md`` §8.3).
+**Backpressure is why each local hand-off is bounded.** With acquisition journaling enabled,
+discovery writes the durable journal before these stages begin, so a slow embedder cannot age
+its pagination cursor. The journal reader can still outrun fetch, and fetch can outrun parse;
+bounding both prevents that decoupling from becoming corpus-sized memory. The compatibility
+fallback instead feeds bounded hand-offs directly from discovery. :attr:`Conveyor.blocked_puts`
+makes both modes' local bounds observable (``docs/ingest.md`` §8.3).
 """
 
 from __future__ import annotations
@@ -280,7 +281,7 @@ class StageReport:
     """
 
     accepted: int = 0
-    """Top-level source identities discovery committed. What ``--limit`` bounds."""
+    """Top-level source identities accepted; durably committed in journal mode."""
 
     fetch_queue: QueueReport = field(
         default_factory=lambda: QueueReport(name="fetch", capacity=0, peak_depth=0, blocked_puts=0)

@@ -398,9 +398,10 @@ class ConfluenceConfig(BaseModel):
     mid-enumeration on source traffic, journal admission or a paused process resumes onto a
     cursor the server has forgotten, and a forgotten cursor can be answered with a fresh first
     page rather than an error. That enumerates the opening of the corpus twice and its tail
-    never, silently. Local parsing and embedding start from the durable journal after
-    enumeration, so they cannot age this cursor. The guard turns remaining stalls into a refusal
-    before the request is sent."""
+    never, silently. With acquisition journaling enabled, local parsing and embedding start from
+    the durable journal after enumeration and cannot age this cursor. The compatibility fallback
+    remains backpressure-coupled. The guard turns any remaining stall into a refusal before the
+    request is sent."""
 
     @model_validator(mode="after")
     def _checkable_settings(self) -> Self:

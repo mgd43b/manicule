@@ -6,12 +6,13 @@ than a promise: there is no batch-level transaction to abort, and no batch-level
 document can corrupt. Every failure this module catches is attributed to a document, recorded,
 and left behind.
 
-**A durable run enumerates first, then has three local stages joined by bounded hand-offs.** Each
-source identity is committed to the acquisition journal before discovery advances. A bounded
-journal reader then fills the fetch hand-off; ``fetch_concurrency`` fetch workers fill the next;
-and ``parse_workers + 1`` ingest workers carry documents the rest of the way. Nothing gathers a
-task or an in-memory record per document — see :meth:`IngestPipeline.run` and ``docs/ingest.md``
-§8.3.
+**With acquisition journaling enabled, a run enumerates first, then has three local stages joined
+by bounded hand-offs.** Each source identity is committed to the journal before discovery
+advances. A bounded journal reader then fills the fetch hand-off; ``fetch_concurrency`` fetch
+workers fill the next; and ``parse_workers + 1`` ingest workers carry documents the rest of the
+way. The compatibility fallback feeds its bounded fetch hand-off directly from discovery.
+Neither mode gathers a task or an in-memory record per document — see
+:meth:`IngestPipeline.run` and ``docs/ingest.md`` §8.3.
 
 **What concurrency is not allowed to touch is the write sequence.** One document's record,
 chunks, glossary and vectors are published under the keyed lock in :meth:`IngestPipeline._mutating`
