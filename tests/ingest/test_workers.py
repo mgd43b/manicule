@@ -8,9 +8,13 @@ under test — a deadline that fires against native code, a memory bound that ca
 
 from __future__ import annotations
 
+import asyncio
+import multiprocessing
+import os
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 from manicule_plugin_example import MEDIA_TYPE as EXAMPLE_MEDIA_TYPE
@@ -18,35 +22,41 @@ from manicule_plugin_hostile import (
     CRASHING_MEDIA_TYPE,
     GREEDY_MEDIA_TYPE,
     HANGING_MEDIA_TYPE,
+    StatefulMiddleware,
 )
 
-from manicule.core.content import DocumentStatus, RawDocument
+from manicule.core.anchors import Unlocated
+from manicule.core.content import BlockKind, Chunk, DocumentStatus, ParsedBlock, RawDocument
 from manicule.ingest.limits import (
     ADDRESS_SPACE_HEADROOM,
     limit_address_space,
     resident_bytes,
 )
+from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.workers import (
     MEGABYTE,
     InProcessRunner,
+    StageFailure,
     WorkerConfig,
     WorkerPool,
     default_worker_count,
 )
 from manicule.parsers.chain import Outcome, run_chain
 from tests.ingest import fakes
+from tests.storage_helpers import make_document
 
 pytestmark = pytest.mark.slow
 
 
 def _config(tmp_path: Path, **overrides: object) -> WorkerConfig:
-    return WorkerConfig(
-        data_dir=tmp_path / "data",
-        cache_dir=tmp_path / "cache",
-        parser_fallbacks={},
-        plugin_config={},
-        **overrides,  # pyright: ignore[reportArgumentType] - test-local keyword passthrough
-    )
+    values: dict[str, object] = {
+        "data_dir": tmp_path / "data",
+        "cache_dir": tmp_path / "cache",
+        "parser_fallbacks": {},
+        "plugin_config": {},
+        **overrides,
+    }
+    return WorkerConfig.model_validate(values)
 
 
 def _raw(media_type: str, content: str = "alpha") -> RawDocument:
@@ -182,6 +192,41 @@ async def test_a_killed_worker_is_replaced_and_the_pool_keeps_working(
     )
 
 
+async def test_repeated_cancel_during_parser_retire_restores_the_only_permit(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exchange thread and replacement reach a known endpoint before cancel propagates."""
+    del manicule_environment
+    async with WorkerPool(_config(tmp_path), workers=1, timeout_s=60.0) as pool:
+        baseline_children = len(multiprocessing.active_children())
+        retiring = asyncio.Event()
+        release = asyncio.Event()
+        original_retire = pool._retire  # pyright: ignore[reportPrivateUsage]
+
+        async def delayed_retire(worker: object) -> None:
+            retiring.set()
+            await release.wait()
+            await original_retire(worker)  # pyright: ignore[reportArgumentType]
+
+        monkeypatch.setattr(pool, "_retire", delayed_retire)
+        parsing = asyncio.create_task(pool.run_attempt("hanging", _raw(HANGING_MEDIA_TYPE)))
+        await asyncio.sleep(0.05)
+        parsing.cancel()
+        await asyncio.wait_for(retiring.wait(), timeout=10)
+        parsing.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await parsing
+
+        assert len(multiprocessing.active_children()) == baseline_children
+        async with asyncio.timeout(10):
+            after = await pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE))
+        assert after.attempt.outcome is Outcome.PARSED
+        assert len(multiprocessing.active_children()) == baseline_children
+
+
 def test_the_default_worker_count_leaves_a_core_for_the_parent() -> None:
     """The parent does the embedding and every write, so it is not a spare."""
     count = default_worker_count()
@@ -240,6 +285,190 @@ async def test_an_archive_is_expanded_rather_than_parsed_for_blocks() -> None:
 
     assert result.attempt.outcome is Outcome.PARSED
     assert len(result.members) == 2
+
+
+async def test_complete_parsed_block_reply_is_refused_before_crossing_budget() -> None:
+    """The child reply budget covers ordinary blocks, not only container members."""
+    runner = InProcessRunner({"lines": fakes.LineParser()})
+
+    result = await runner.run_attempt(
+        "lines",
+        _raw("text/plain", "x" * 16_384),
+        max_output_bytes=1_024,
+        memory_limit_bytes=64 * MEGABYTE,
+    )
+
+    assert result.blocks == []
+    assert result.members == ()
+    assert result.attempt.outcome is Outcome.FAILED
+    assert result.attempt.reason == "memory_bound"
+
+
+async def test_middleware_and_chunker_output_never_materializes_in_serving_parent(
+    tmp_path: Path, manicule_environment: Path
+) -> None:
+    """An oversized hook result is measured in the disposable child, not this process."""
+    del manicule_environment
+    config = _config(
+        tmp_path,
+        middleware=("expanding",),
+        plugin_config={"middleware.expanding": {"chunk_megabytes": 16}},
+        memory_limit_bytes=1024 * MEGABYTE,
+    )
+    raw = _raw("text/plain", "small source")
+    document = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=raw.as_bytes(),
+        uri=raw.uri,
+        media_type=raw.media_type,
+    )
+    blocks = [
+        ParsedBlock(
+            kind=BlockKind.PROSE,
+            text="small source",
+            anchor=Unlocated(reason="worker isolation regression"),
+        )
+    ]
+    parent_before = resident_bytes(os.getpid())
+    async with WorkerPool(config, workers=1, timeout_s=30.0) as pool:
+        result = await pool.run_after_parse_and_chunk(
+            document,
+            blocks,
+            max_output_bytes=64 * 1024,
+            memory_limit_bytes=1024 * MEGABYTE,
+            title="Hostile expansion",
+            media_type=raw.media_type,
+            detect_glossary=True,
+        )
+    parent_after = resident_bytes(os.getpid())
+
+    assert result.reason is StageFailure.MEMORY_BOUND
+    assert result.value is None
+    if parent_before is not None and parent_after is not None:
+        assert parent_after - parent_before < 8 * MEGABYTE
+
+
+async def test_one_production_stage_session_preserves_stateful_middleware_parity(
+    tmp_path: Path, manicule_environment: Path
+) -> None:
+    del manicule_environment
+    config = _config(
+        tmp_path,
+        middleware=("stateful",),
+        memory_limit_bytes=4096 * MEGABYTE,
+    )
+    raw = _raw("text/plain", "stateful source")
+    document = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=raw.as_bytes(),
+        uri=raw.uri,
+        media_type=raw.media_type,
+    )
+    blocks = [
+        ParsedBlock(
+            kind=BlockKind.PROSE,
+            text="stateful source",
+            anchor=Unlocated(reason="stateful middleware regression"),
+        )
+    ]
+    live = MiddlewareRunner((StatefulMiddleware(),))
+    assert live.declarations() == ("stateful@",)
+    assert await live.before_parse(raw) == raw
+    await live.after_parse(document, blocks)
+
+    async with WorkerPool(config, workers=1, timeout_s=30.0) as pool:
+        session = await pool.open_stage_session(memory_limit_bytes=4096 * MEGABYTE)
+        try:
+            before = await session.run_before_parse(
+                raw,
+                max_output_bytes=MEGABYTE,
+                memory_limit_bytes=4096 * MEGABYTE,
+            )
+            offline = await session.run_after_parse_and_chunk(
+                document,
+                blocks,
+                max_output_bytes=MEGABYTE,
+                memory_limit_bytes=4096 * MEGABYTE,
+                title="Stateful",
+                media_type=raw.media_type,
+                detect_glossary=False,
+            )
+        finally:
+            await session.aclose()
+
+    assert before.reason is None
+    assert before.value == raw
+    assert offline.reason is None
+    raw_stage = cast("object", offline.value)
+    assert isinstance(raw_stage, tuple)
+    stage_value = cast("tuple[object, ...]", raw_stage)
+    assert len(stage_value) == 2
+    chunks_value, entries = stage_value
+    assert isinstance(chunks_value, tuple)
+    chunk_candidates = cast("tuple[object, ...]", chunks_value)
+    assert all(isinstance(chunk, Chunk) for chunk in chunk_candidates)
+    chunks = cast("tuple[Chunk, ...]", chunk_candidates)
+    assert entries == ()
+    assert chunks
+    base_chunks = [
+        chunk.model_copy(update={"embed_text": chunk.embed_text.removesuffix("|stateful")})
+        for chunk in chunks
+    ]
+    live_chunks = await live.after_chunk(document, base_chunks)
+    assert [chunk.embed_text for chunk in chunks] == [chunk.embed_text for chunk in live_chunks]
+
+
+async def test_repeated_stage_cancellation_reaps_every_owned_child(
+    tmp_path: Path, manicule_environment: Path
+) -> None:
+    del manicule_environment
+    config = _config(
+        tmp_path,
+        middleware=("hanging-stage",),
+        plugin_config={"middleware.hanging-stage": {"hang_seconds": 60}},
+        memory_limit_bytes=4096 * MEGABYTE,
+    )
+    async with WorkerPool(config, workers=1, timeout_s=60.0) as pool:
+        baseline = {child.pid for child in multiprocessing.active_children()}
+        for _ in range(3):
+            session = await pool.open_stage_session(memory_limit_bytes=4096 * MEGABYTE)
+            blocked = asyncio.create_task(
+                session.run_before_parse(
+                    _raw("text/plain"),
+                    max_output_bytes=MEGABYTE,
+                    memory_limit_bytes=4096 * MEGABYTE,
+                )
+            )
+            await asyncio.sleep(0.05)
+            blocked.cancel()
+            blocked.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+            await session.aclose()
+            assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+
+async def test_stage_timeout_is_typed_and_carries_no_private_exception(
+    tmp_path: Path, manicule_environment: Path
+) -> None:
+    del manicule_environment
+    config = _config(
+        tmp_path,
+        middleware=("hanging-stage",),
+        plugin_config={"middleware.hanging-stage": {"hang_seconds": 60}},
+        memory_limit_bytes=4096 * MEGABYTE,
+    )
+    async with WorkerPool(config, workers=1, timeout_s=0.1, poll_interval_s=0.01) as pool:
+        result = await pool.run_before_parse(
+            _raw("text/plain"),
+            max_output_bytes=MEGABYTE,
+            memory_limit_bytes=4096 * MEGABYTE,
+        )
+
+    assert result.reason is StageFailure.TIMEOUT
+    assert result.value is None
 
 
 def test_a_deadline_measured_in_this_process_would_not_have_fired() -> None:

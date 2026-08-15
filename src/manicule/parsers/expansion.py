@@ -53,7 +53,9 @@ __all__ = [
     "expanding",
     "inner_path",
     "media_type_for",
+    "member_raw",
     "member_source_id",
+    "member_title",
     "member_uri",
     "path_hashes_of",
     "read_members",
@@ -228,6 +230,17 @@ A union rather than "yield the good ones": exceeding a limit fails that member, 
 archive, and never the batch (§9.3), and a failure nobody is told about is indistinguishable
 from a member that was never there.
 """
+
+
+def member_raw(member: ExpandedMember) -> RawDocument:
+    """Address member bytes by the container's stable path identity."""
+    return member.raw.model_copy(update={"source_id": member.source_id, "uri": member.uri})
+
+
+def member_title(member: ExpandedMember) -> str:
+    """Read the same bounded optional title used by live ingest."""
+    title = member.metadata.get("title")
+    return title if isinstance(title, str) else ""
 
 
 @runtime_checkable

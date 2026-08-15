@@ -282,7 +282,7 @@ async def _manifest_digest(session: AsyncSession, run_id: str) -> str:
                         models.AcquisitionRecord.sequence > after,
                     )
                     .order_by(models.AcquisitionRecord.sequence)
-                    .limit(100)
+                    .limit(1)
                 )
             )
             .scalars()
@@ -387,6 +387,11 @@ def _matching_run_identity(
         and row.scope_inventory_complete is scope_inventory_complete
         and stored_policy is promotion_policy
     )
+
+
+async def snapshot_manifest_matches(session: AsyncSession, run_id: str, expected: str) -> bool:
+    """Verify one canonical manifest inside a caller-owned transaction."""
+    return await _manifest_matches(session, run_id, expected)
 
 
 class AcquisitionJournalMixin(WorkspaceScoped):
@@ -2147,4 +2152,5 @@ __all__ = [
     "AcquisitionJournalMixin",
     "AcquisitionWatermarkConflictError",
     "InvalidAcquisitionTransitionError",
+    "snapshot_manifest_matches",
 ]

@@ -13,6 +13,8 @@ Application-level synchronization covers only the write paths its author remembe
 
 from __future__ import annotations
 
+import re
+
 from manicule.storage.models import FTS_TOKENIZER
 
 FTS_TABLE = "chunks_fts"
@@ -41,6 +43,30 @@ CREATE VIRTUAL TABLE {FTS_TABLE} USING fts5(
     tokenize='{FTS_TOKENIZER}'
 )
 """
+
+_SAFE_TOKENIZER = re.compile(r"[A-Za-z0-9_ ]+\Z")
+
+
+def create_fts(tokenizer: str) -> str:
+    """Render the virtual-table DDL for one validated FTS5 tokenizer declaration.
+
+    The declaration is persisted rebuild configuration, not a SQL fragment. FTS5 accepts its
+    tokenizer as a string mini-language; limiting it to names, integers, underscores and
+    spaces covers the built-ins while making quotes, punctuation and statement separators
+    unrepresentable.
+    """
+    if not tokenizer or _SAFE_TOKENIZER.fullmatch(tokenizer) is None:
+        raise ValueError("FTS tokenizer contains unsupported characters")
+    return f"""
+CREATE VIRTUAL TABLE {FTS_TABLE} USING fts5(
+    text,
+    heading_text,
+    content='chunks',
+    content_rowid='seq',
+    tokenize='{tokenizer}'
+)
+"""
+
 
 CREATE_TRIGGERS = (
     """
@@ -166,5 +192,6 @@ __all__ = [
     "INTEGRITY_CHECK_FTS",
     "REBUILD_FTS",
     "SEARCH_SQL",
+    "create_fts",
     "escape_match_query",
 ]

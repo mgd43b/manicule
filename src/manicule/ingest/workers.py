@@ -29,7 +29,9 @@ transactional happens in the parent, which is what keeps the write ordering in
 
 ``spawn``, never ``fork``: forking a process that has loaded a model runtime and opened SQLite
 copies both into a child that must not touch either. ``spawn`` costs interpreter startup once
-per worker, amortized over the run.
+per parse worker, amortized over the run. Offline relational stages use disposable spawn
+children instead: middleware and chunker allocations must disappear with the document and
+must never be deserialized in the serving parent before their target-derived bounds pass.
 """
 
 from __future__ import annotations
@@ -38,13 +40,16 @@ import asyncio
 import contextlib
 import multiprocessing
 import os
+import pickle
+import sys
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from multiprocessing.connection import Connection
-from multiprocessing.context import SpawnProcess
+from multiprocessing.context import SpawnContext, SpawnProcess
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, Self, cast, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -59,7 +64,9 @@ from manicule.parsers.chain import Attempt, Outcome
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from manicule.core.content import ParsedBlock, RawDocument
+    from manicule.core.content import Document, ParsedBlock, RawDocument
+    from manicule.core.protocols import Chunker
+    from manicule.ingest.middleware import MiddlewareRunner
 
 MEGABYTE = 1024 * 1024
 
@@ -88,6 +95,57 @@ class AttemptResult:
     members: tuple[object, ...] = ()
     """:class:`~manicule.parsers.expansion.MemberOutcome` values. Typed loosely here so that
     this module does not import the expansion vocabulary it only ever passes through."""
+
+
+def _attempt_output_bytes(result: AttemptResult) -> int:
+    """Exact bytes the complete parse reply would put on the process pipe."""
+    return len(pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+
+
+def retained_size(value: object, seen: set[int] | None = None) -> int:
+    """Count live Python objects without constructing a serialized duplicate."""
+    visited: set[int] = set() if seen is None else seen
+    identity = id(value)
+    if identity in visited:
+        return 0
+    visited.add(identity)
+    held = sys.getsizeof(value)
+    if isinstance(value, Mapping):
+        mapped = cast("Mapping[object, object]", value)
+        return held + sum(
+            retained_size(key, visited) + retained_size(item, visited)
+            for key, item in mapped.items()
+        )
+    if isinstance(value, (str, bytes, bytearray, memoryview)):
+        return held
+    if isinstance(value, Sequence):
+        sequence = cast("Sequence[object]", value)
+        return held + sum(retained_size(item, visited) for item in sequence)
+    fields = getattr(value, "__dict__", None)
+    if isinstance(fields, dict):
+        held += retained_size(cast("dict[object, object]", fields), visited)
+    slots = getattr(type(value), "__slots__", ())
+    names = cast("tuple[object, ...]", slots if isinstance(slots, tuple) else (slots,))
+    for name in names:
+        if isinstance(name, str) and hasattr(value, name):
+            held += retained_size(getattr(value, name), visited)
+    return held
+
+
+def _bounded_stage_result(value: object | None, limit: int) -> StageResult:
+    """Measure the actual pipe payload before it can reach the serving process."""
+    candidate = StageResult(value, 0, 0)
+    live_bytes = retained_size(candidate)
+    actual = 0
+    while True:
+        candidate = StageResult(value, actual, live_bytes)
+        measured = len(pickle.dumps(candidate, protocol=pickle.HIGHEST_PROTOCOL))
+        if measured == actual:
+            break
+        actual = measured
+    if actual > limit or live_bytes > limit:
+        return StageResult(None, 0, 0, StageFailure.MEMORY_BOUND)
+    return StageResult(value, actual, live_bytes)
 
 
 @runtime_checkable
@@ -144,15 +202,78 @@ class InProcessRunner:
     a native extension observes no cancellation, so a hang in this runner is the run stopping.
     """
 
-    def __init__(self, parsers: Mapping[str, object]) -> None:
+    def __init__(
+        self,
+        parsers: Mapping[str, object],
+        *,
+        middleware: object | None = None,
+        chunker: object | None = None,
+    ) -> None:
         self._parsers = dict(parsers)
+        self._middleware = cast("MiddlewareRunner | None", middleware)
+        self._chunker = cast("Chunker | None", chunker)
 
-    async def run_attempt(self, name: str, raw: RawDocument) -> AttemptResult:
+    async def open_stage_session(self, *, memory_limit_bytes: int) -> Self:
+        del memory_limit_bytes
+        return self
+
+    async def aclose(self) -> None:
+        return
+
+    async def run_attempt(
+        self,
+        name: str,
+        raw: RawDocument,
+        *,
+        max_output_bytes: int | None = None,
+        memory_limit_bytes: int | None = None,
+    ) -> AttemptResult:
+        del memory_limit_bytes
         parser = self._parsers.get(name)
         if parser is None:
             reason = f"no parser named {name!r} is available to this runner"
             return AttemptResult([], Attempt(parser=name, outcome=Outcome.FAILED, reason=reason))
-        return await attempt_one(parser, name, raw)
+        result = await attempt_one(parser, name, raw)
+        produced = _attempt_output_bytes(result)
+        if max_output_bytes is None or produced <= max_output_bytes:
+            return result
+        return AttemptResult(
+            [], Attempt(parser=name, outcome=Outcome.FAILED, reason="memory_bound")
+        )
+
+    async def run_before_parse(
+        self, raw: RawDocument, *, max_output_bytes: int, memory_limit_bytes: int
+    ) -> StageResult:
+        del memory_limit_bytes
+        if self._middleware is None:
+            raise RuntimeError("the in-process runner has no middleware stage")
+        value = await self._middleware.before_parse(raw)
+        return _bounded_stage_result(value, max_output_bytes)
+
+    async def run_after_parse_and_chunk(
+        self,
+        document: Document,
+        blocks: list[ParsedBlock],
+        *,
+        max_output_bytes: int,
+        memory_limit_bytes: int,
+        title: str,
+        media_type: str,
+        detect_glossary: bool,
+    ) -> StageResult:
+        del memory_limit_bytes
+        if self._middleware is None or self._chunker is None:
+            raise RuntimeError("the in-process runner has no middleware/chunker stage")
+        transformed = await self._middleware.after_parse(document, blocks)
+        chunks = tuple(self._chunker.chunk(document, transformed))
+        chunks = tuple(await self._middleware.after_chunk(document, chunks)) if chunks else ()
+        if detect_glossary:
+            from manicule.ingest.glossary import detect_entries  # noqa: PLC0415
+
+            entries = tuple(detect_entries(chunks, title=title, media_type=media_type))
+        else:
+            entries = ()
+        return _bounded_stage_result((chunks, entries), max_output_bytes)
 
 
 class WorkerConfig(BaseModel):
@@ -169,6 +290,8 @@ class WorkerConfig(BaseModel):
     data_dir: Path
     cache_dir: Path
     parser_fallbacks: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    chunker: str = "structural"
+    middleware: tuple[str, ...] = ()
     plugins_enabled: tuple[str, ...] | None = None
     plugins_disabled: tuple[str, ...] = ()
     plugin_config: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
@@ -181,6 +304,8 @@ class _Request:
 
     parser: str
     raw: RawDocument
+    max_output_bytes: int | None = None
+    memory_limit_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +323,50 @@ class _Ready:
     error: str = ""
     """Why this worker cannot serve, when it cannot. A worker that failed to build its parsers
     says so here rather than dying silently and leaving every later document blame the pipe."""
+
+
+@dataclass(frozen=True, slots=True)
+class StageResult:
+    """Bounded result from isolated middleware/chunker execution."""
+
+    value: object | None
+    serialized_bytes: int
+    retained_bytes: int
+    reason: StageFailure | None = None
+
+
+class StageFailure(StrEnum):
+    """Public, bounded classification of an isolated relational-stage failure."""
+
+    MEMORY_BOUND = "memory_bound"
+    TIMEOUT = "timeout"
+    WORKER_DIED = "worker_died"
+    CONFIGURATION = "configuration"
+    INVALID_REPLY = "invalid_reply"
+    STAGE_FAILED = "stage_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class _StageRequest:
+    kind: Literal["before_parse", "after_parse_and_chunk"]
+    raw: RawDocument | None = None
+    document: Document | None = None
+    blocks: list[ParsedBlock] | None = None
+    max_output_bytes: int = 0
+    memory_limit_bytes: int = 0
+    title: str = ""
+    media_type: str = "application/octet-stream"
+    detect_glossary: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _StageReady:
+    reason: StageFailure | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _StageClose:
+    pass
 
 
 # --- the child -----------------------------------------------------------------------------
@@ -274,17 +443,117 @@ def _parser_builder(config: WorkerConfig) -> ParserBuilder:
     return build
 
 
+async def _stage_components(config: WorkerConfig) -> tuple[object, object]:
+    """Construct one document-scoped production middleware/chunker session."""
+    from manicule.config.settings import Settings  # noqa: PLC0415 - child-only imports
+    from manicule.container import keys  # noqa: PLC0415
+    from manicule.container.container import Container  # noqa: PLC0415
+    from manicule.ingest.middleware import MiddlewareRunner  # noqa: PLC0415
+    from manicule.plugins.registry import discover  # noqa: PLC0415
+
+    settings = Settings(
+        workspace=config.workspace,
+        data_dir=config.data_dir,
+        cache_dir=config.cache_dir,
+        parser_fallbacks=dict(config.parser_fallbacks),
+        rag={"chunker": config.chunker},  # pyright: ignore[reportArgumentType]
+        plugins={  # pyright: ignore[reportArgumentType]
+            "enabled": config.plugins_enabled,
+            "disabled": config.plugins_disabled,
+            "config": config.plugin_config,
+            "middleware": config.middleware,
+        },
+    )
+    enabled = settings.plugins.enabled
+    found = discover(
+        enabled=None if enabled is None else frozenset(enabled),
+        disabled=frozenset(settings.plugins.disabled),
+    )
+    container = Container(settings, found.registry, discovery=found)
+    return MiddlewareRunner(await container.middleware()), await container.aget(keys.CHUNKER)
+
+
+async def _stage_in_child(
+    middleware: object, chunker: object, request: _StageRequest
+) -> StageResult:
+    """Run one request against the document's persistent isolated component instances."""
+    runner = cast("MiddlewareRunner", middleware)
+    configured_chunker = cast("Chunker", chunker)
+    if request.kind == "before_parse":
+        if request.raw is None:
+            return StageResult(None, 0, 0, StageFailure.INVALID_REPLY)
+        return _bounded_stage_result(
+            await runner.before_parse(request.raw), request.max_output_bytes
+        )
+    if request.document is None or request.blocks is None:
+        return StageResult(None, 0, 0, StageFailure.INVALID_REPLY)
+    blocks = await runner.after_parse(request.document, request.blocks)
+    chunks = tuple(configured_chunker.chunk(request.document, blocks))
+    chunks = tuple(await runner.after_chunk(request.document, chunks)) if chunks else ()
+    if request.detect_glossary:
+        from manicule.ingest.glossary import detect_entries  # noqa: PLC0415
+
+        entries = tuple(detect_entries(chunks, title=request.title, media_type=request.media_type))
+    else:
+        entries = ()
+    return _bounded_stage_result((chunks, entries), request.max_output_bytes)
+
+
+def _stage_worker_main(
+    connection: Connection, config: WorkerConfig, memory_limit_bytes: int
+) -> None:  # pragma: no cover - exercised through the spawned process
+    async def run() -> None:
+        effective_limit = min(config.memory_limit_bytes, memory_limit_bytes)
+        limit_address_space(effective_limit * ADDRESS_SPACE_HEADROOM)
+        try:
+            middleware, chunker = await _stage_components(config)
+        except BaseException:  # noqa: BLE001 - bounded classification, no private detail
+            connection.send(_StageReady(StageFailure.CONFIGURATION))
+            return
+        connection.send(_StageReady())
+        while True:
+            request = connection.recv()
+            if isinstance(request, _StageClose):
+                return
+            if not isinstance(request, _StageRequest):
+                connection.send(StageResult(None, 0, 0, StageFailure.INVALID_REPLY))
+                continue
+            try:
+                connection.send(await _stage_in_child(middleware, chunker, request))
+            except BaseException:  # noqa: BLE001 - hook failure is one bounded document result
+                connection.send(StageResult(None, 0, 0, StageFailure.STAGE_FAILED))
+
+    try:
+        asyncio.run(run())
+    except (EOFError, KeyboardInterrupt, BrokenPipeError):
+        return
+    finally:
+        connection.close()
+
+
 def _attempt_in_child(build: ParserBuilder, request: _Request) -> _Reply:
     """Run one parser and classify what it produced, or why it could not run."""
 
     async def run() -> _Reply:
+        if request.memory_limit_bytes is not None:
+            limit_address_space(request.memory_limit_bytes * ADDRESS_SPACE_HEADROOM)
         try:
             parser = await build(request.parser)
         except Exception as exc:  # noqa: BLE001 - a build failure is this attempt's failure
             reason = f"{type(exc).__name__}: {exc}"
             failed = Attempt(parser=request.parser, outcome=Outcome.FAILED, reason=reason)
             return _Reply(AttemptResult([], failed))
-        return _Reply(await attempt_one(parser, request.parser, request.raw))
+        result = await attempt_one(parser, request.parser, request.raw)
+        if request.max_output_bytes is not None:
+            produced = _attempt_output_bytes(result)
+            if produced > request.max_output_bytes:
+                refused = Attempt(
+                    parser=request.parser,
+                    outcome=Outcome.FAILED,
+                    reason="memory_bound",
+                )
+                return _Reply(AttemptResult([], refused))
+        return _Reply(result)
 
     return asyncio.run(run())
 
@@ -318,16 +587,7 @@ class _Worker:
             return False
 
     def terminate(self) -> None:
-        """Stop the worker, hard, and reap it. Idempotent, and never raises.
-
-        Every part of that matters. ``teardown`` and a concurrent replacement can both reach
-        the same worker, and ``Process.close`` raises on a second call *and* on a process that
-        is still running — a `join` that times out because the child is wedged in
-        uninterruptible I/O, which is precisely the process this pool exists to handle. Either
-        ``ValueError`` would otherwise escape into the ingest loop and end a batch, which is
-        the one outcome this module refuses. Failing to close a handle costs one file
-        descriptor; failing to ingest costs a corpus.
-        """
+        """Stop the worker, hard, reap it and close its handles. Idempotent."""
         if self.retired:
             return
         self.retired = True
@@ -339,6 +599,161 @@ class _Worker:
             self.connection.close()
         with contextlib.suppress(ValueError, OSError):
             self.process.close()
+
+
+class _IsolatedStageSession:
+    """One document's stateful middleware/chunker process and its cancellation ownership."""
+
+    def __init__(
+        self,
+        context: SpawnContext,
+        config: WorkerConfig,
+        *,
+        timeout_s: float,
+        poll_interval_s: float,
+        memory_limit_bytes: int,
+    ) -> None:
+        parent, child = context.Pipe(duplex=True)
+        self._connection = parent
+        self._child = child
+        self._process = context.Process(
+            target=_stage_worker_main,
+            args=(child, config, memory_limit_bytes),
+            daemon=True,
+        )
+        self._timeout_s = timeout_s
+        self._poll_interval_s = poll_interval_s
+        self._memory_limit_bytes = min(config.memory_limit_bytes, memory_limit_bytes)
+        self._closed = False
+        self._startup_failure: StageFailure | None = None
+
+    async def start(self) -> Self:
+        try:
+            self._process.start()
+        except BaseException:  # noqa: BLE001 - bounded worker startup classification
+            self._startup_failure = StageFailure.WORKER_DIED
+            with contextlib.suppress(BaseException):
+                self._child.close()
+            with contextlib.suppress(BaseException):
+                self._connection.close()
+            self._closed = True
+            return self
+        self._child.close()
+        reply = await self._exchange(None)
+        if isinstance(reply, _StageReady) or (
+            isinstance(reply, StageResult) and reply.reason is not None
+        ):
+            self._startup_failure = reply.reason
+        else:
+            self._startup_failure = StageFailure.INVALID_REPLY
+        if self._startup_failure is not None:
+            await self.aclose()
+        return self
+
+    async def run_before_parse(
+        self, raw: RawDocument, *, max_output_bytes: int, memory_limit_bytes: int
+    ) -> StageResult:
+        del memory_limit_bytes
+        if self._startup_failure is not None:
+            return StageResult(None, 0, 0, self._startup_failure)
+        return await self._request(
+            _StageRequest(kind="before_parse", raw=raw, max_output_bytes=max_output_bytes)
+        )
+
+    async def run_after_parse_and_chunk(
+        self,
+        document: Document,
+        blocks: list[ParsedBlock],
+        *,
+        max_output_bytes: int,
+        memory_limit_bytes: int,
+        title: str,
+        media_type: str,
+        detect_glossary: bool,
+    ) -> StageResult:
+        del memory_limit_bytes
+        if self._startup_failure is not None:
+            return StageResult(None, 0, 0, self._startup_failure)
+        return await self._request(
+            _StageRequest(
+                kind="after_parse_and_chunk",
+                document=document,
+                blocks=blocks,
+                max_output_bytes=max_output_bytes,
+                title=title,
+                media_type=media_type,
+                detect_glossary=detect_glossary,
+            )
+        )
+
+    async def _request(self, request: _StageRequest) -> StageResult:
+        reply = await self._exchange(request)
+        return (
+            reply
+            if isinstance(reply, StageResult)
+            else StageResult(None, 0, 0, StageFailure.INVALID_REPLY)
+        )
+
+    async def _exchange(self, message: object | None) -> object:
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                _exchange_stage_message,
+                self._process,
+                self._connection,
+                message,
+                timeout_s=self._timeout_s,
+                poll_interval_s=self._poll_interval_s,
+                memory_limit_bytes=self._memory_limit_bytes,
+            )
+        )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            _kill_stage_process(self._process)
+            with contextlib.suppress(BaseException):
+                await _join_despite_cancellation(task)
+            cleanup = asyncio.create_task(asyncio.to_thread(self._close_sync, False))
+            await _join_despite_cancellation(cleanup)
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        cleanup = asyncio.create_task(asyncio.to_thread(self._close_sync, True))
+        interrupted = await _join_despite_cancellation(cleanup)
+        if interrupted:
+            raise asyncio.CancelledError
+
+    def _close_sync(self, graceful: bool) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if graceful and _stage_process_alive(self._process):
+            with contextlib.suppress(BaseException):
+                self._connection.send(_StageClose())
+        if _stage_process_alive(self._process):
+            self._process.kill()
+        with contextlib.suppress(BaseException):
+            self._process.join(timeout=5)
+        with contextlib.suppress(BaseException):
+            self._connection.close()
+        with contextlib.suppress(BaseException):
+            self._process.close()
+
+
+async def _join_despite_cancellation(task: asyncio.Task[object]) -> bool:
+    """Join owned cleanup work even when the caller repeats cancellation."""
+    interrupted = False
+    while True:
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        else:
+            return interrupted
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,7 +841,14 @@ class WorkerPool:
     async def __aexit__(self, *_: object) -> None:
         await self.teardown()
 
-    async def run_attempt(self, name: str, raw: RawDocument) -> AttemptResult:
+    async def run_attempt(
+        self,
+        name: str,
+        raw: RawDocument,
+        *,
+        max_output_bytes: int | None = None,
+        memory_limit_bytes: int | None = None,
+    ) -> AttemptResult:
         """Give one parser one turn, under this pool's time and memory limits.
 
         Returns the same :class:`AttemptResult` an in-process attempt returns, so the chain
@@ -442,7 +864,15 @@ class WorkerPool:
             reason = "no parse worker could be started for this attempt"
             return AttemptResult([], Attempt(parser=name, outcome=Outcome.FAILED, reason=reason))
         try:
-            outcome = await self._dispatch(worker, _Request(parser=name, raw=raw))
+            outcome = await self._dispatch(
+                worker,
+                _Request(
+                    parser=name,
+                    raw=raw,
+                    max_output_bytes=max_output_bytes,
+                    memory_limit_bytes=memory_limit_bytes,
+                ),
+            )
         except Exception as exc:  # noqa: BLE001 - see below; the guarantee needs the breadth
             # **A broken pipe is one document's failure, not the run's.** A worker can die
             # between being handed back as idle and being dispatched to — recycled by the OOM
@@ -451,7 +881,9 @@ class WorkerPool:
             # process-level accident on the ingest loop's exception path and end the batch,
             # which is exactly the guarantee this whole module exists to hold. So it is
             # recorded against the document, the worker is replaced, and the run continues.
-            await self._replace(worker)
+            interrupted = await self._complete_replacement(worker)
+            if interrupted:
+                raise asyncio.CancelledError from None
             self._kills["dispatch failed"] = self._kills.get("dispatch failed", 0) + 1
             reason = f"worker unreachable: {type(exc).__name__}: {exc}"
             return AttemptResult([], Attempt(parser=name, outcome=Outcome.FAILED, reason=reason))
@@ -460,11 +892,13 @@ class WorkerPool:
             # swallowing them would make Ctrl-C wait for a corpus. The worker still has to go:
             # a canceled await leaves one whose state nobody knows, and replacing it is
             # cheaper than reasoning about what it was in the middle of.
-            await self._replace(worker)
+            await self._complete_replacement(worker)
             raise
         if isinstance(outcome, _Killed):
             self._kills[outcome.reason] = self._kills.get(outcome.reason, 0) + 1
-            await self._replace(worker)
+            interrupted = await self._complete_replacement(worker)
+            if interrupted:
+                raise asyncio.CancelledError
             return AttemptResult(
                 [],
                 Attempt(
@@ -476,10 +910,59 @@ class WorkerPool:
 
         worker.documents += 1
         if worker.documents >= self._max_documents:
-            await self._replace(worker)
+            interrupted = await self._complete_replacement(worker)
+            if interrupted:
+                raise asyncio.CancelledError
         else:
             await self._idle.put(worker)
         return outcome.result
+
+    async def run_before_parse(
+        self, raw: RawDocument, *, max_output_bytes: int, memory_limit_bytes: int
+    ) -> StageResult:
+        session = await self.open_stage_session(memory_limit_bytes=memory_limit_bytes)
+        try:
+            return await session.run_before_parse(
+                raw,
+                max_output_bytes=max_output_bytes,
+                memory_limit_bytes=memory_limit_bytes,
+            )
+        finally:
+            await session.aclose()
+
+    async def run_after_parse_and_chunk(
+        self,
+        document: Document,
+        blocks: list[ParsedBlock],
+        *,
+        max_output_bytes: int,
+        memory_limit_bytes: int,
+        title: str,
+        media_type: str,
+        detect_glossary: bool,
+    ) -> StageResult:
+        session = await self.open_stage_session(memory_limit_bytes=memory_limit_bytes)
+        try:
+            return await session.run_after_parse_and_chunk(
+                document,
+                blocks,
+                max_output_bytes=max_output_bytes,
+                memory_limit_bytes=memory_limit_bytes,
+                title=title,
+                media_type=media_type,
+                detect_glossary=detect_glossary,
+            )
+        finally:
+            await session.aclose()
+
+    async def open_stage_session(self, *, memory_limit_bytes: int) -> _IsolatedStageSession:
+        return await _IsolatedStageSession(
+            self._context,
+            self._config,
+            timeout_s=self._timeout_s,
+            poll_interval_s=self._poll_interval_s,
+            memory_limit_bytes=memory_limit_bytes,
+        ).start()
 
     # --- internals -------------------------------------------------------------------------
 
@@ -509,14 +992,26 @@ class WorkerPool:
         sending on the loop stalls every other connector's fetches for the length of the
         transfer, on exactly the documents that are already slow.
         """
-        return await asyncio.to_thread(
-            _exchange,
-            worker,
-            request,
-            self._timeout_s,
-            self._poll_interval_s,
-            self._config.memory_limit_bytes,
+        exchange = asyncio.create_task(
+            asyncio.to_thread(
+                _exchange,
+                worker,
+                request,
+                self._timeout_s,
+                self._poll_interval_s,
+                min(
+                    self._config.memory_limit_bytes,
+                    request.memory_limit_bytes or self._config.memory_limit_bytes,
+                ),
+            )
         )
+        try:
+            return await asyncio.shield(exchange)
+        except asyncio.CancelledError:
+            _stop(worker)
+            with contextlib.suppress(BaseException):
+                await _join_despite_cancellation(exchange)
+            raise
 
     async def _try_spawn(self) -> _Worker | None:
         """Start one worker, or return ``None`` if it could not be started.
@@ -575,6 +1070,13 @@ class WorkerPool:
         """
         await self._retire(worker)
         await self._idle.put(await self._try_spawn())
+
+    async def _complete_replacement(self, worker: _Worker) -> bool:
+        """Reach retire/spawn/permit restoration despite repeated caller cancellation."""
+        replacement = asyncio.create_task(self._replace(worker))
+        interrupted = await _join_despite_cancellation(replacement)
+        replacement.result()
+        return interrupted
 
 
 def default_worker_count() -> int:
@@ -639,6 +1141,57 @@ def _exchange(
             return _Killed("memory limit")
 
 
+def _exchange_stage_message(
+    process: SpawnProcess,
+    connection: Connection,
+    message: object | None,
+    *,
+    timeout_s: float,
+    poll_interval_s: float,
+    memory_limit_bytes: int,
+) -> object:
+    """Exchange one message without surrendering ownership of the persistent child."""
+    if message is not None:
+        try:
+            connection.send(message)
+        except (BrokenPipeError, EOFError, OSError):
+            return StageResult(None, 0, 0, StageFailure.WORKER_DIED)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_stage_process(process)
+            return StageResult(None, 0, 0, StageFailure.TIMEOUT)
+        if connection.poll(min(poll_interval_s, remaining)):
+            try:
+                return connection.recv()
+            except (EOFError, OSError):
+                return StageResult(None, 0, 0, StageFailure.WORKER_DIED)
+        try:
+            alive = process.is_alive()
+        except (ValueError, OSError):
+            alive = False
+        resident = resident_bytes(process.pid) if process.pid is not None and alive else None
+        if resident is not None and resident > memory_limit_bytes:
+            _kill_stage_process(process)
+            return StageResult(None, 0, 0, StageFailure.MEMORY_BOUND)
+        if not alive:
+            return StageResult(None, 0, 0, StageFailure.WORKER_DIED)
+
+
+def _kill_stage_process(process: SpawnProcess) -> None:
+    if _stage_process_alive(process):
+        with contextlib.suppress(ValueError, OSError):
+            process.kill()
+
+
+def _stage_process_alive(process: SpawnProcess) -> bool:
+    try:
+        return process.is_alive()
+    except (AssertionError, ValueError, OSError):
+        return False
+
+
 def _stop(worker: _Worker) -> None:
     """Kill a worker, but only while it is still this pool's to kill."""
     if worker.retired or not worker.alive():
@@ -676,6 +1229,8 @@ def worker_config(settings: object) -> WorkerConfig:
         data_dir=settings.data_dir,
         cache_dir=settings.cache_dir,
         parser_fallbacks=dict(settings.parser_fallbacks),
+        chunker=settings.rag.chunker,
+        middleware=settings.plugins.middleware,
         plugins_enabled=settings.plugins.enabled,
         plugins_disabled=settings.plugins.disabled,
         plugin_config=settings.plugins.config,
@@ -688,9 +1243,11 @@ __all__ = [
     "AttemptResult",
     "InProcessRunner",
     "ParseRunner",
+    "StageResult",
     "WorkerConfig",
     "WorkerPool",
     "attempt_one",
     "default_worker_count",
+    "retained_size",
     "worker_config",
 ]
