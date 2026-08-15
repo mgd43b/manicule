@@ -129,9 +129,9 @@ VERSION = "confluence_version"
 VERSION_TOKEN = "version_token"  # noqa: S105 - a metadata key name, not a credential
 """Metadata key carrying the version the body **actually** came back with.
 
-Distinct from ``VERSION``, which is what discovery reported. They differ exactly when the
-source served a body older than the one it had just described, and the pipeline stores this
-one so that the next sync notices."""
+Distinct from ``VERSION``, which is what discovery reported. A fetched body may be newer when
+the page changes during a sync; an older body is refused rather than certified by the discovery
+token the ingest pipeline persists."""
 DOWNLOAD = "confluence_download"
 ANCESTORS = "ancestors"
 """Metadata key the chunker reads to build the breadcrumb prefixed to every chunk.
@@ -901,11 +901,9 @@ class ConfluenceConnector:
         compared with the one discovery saw, and a disagreement is retried once and then
         answered from storage format, which is a different code path on the source's side.
 
-        If every attempt still disagrees, the body is used **with the version it actually
-        carries** rather than the one that was asked for. That is what makes it self-healing:
-        the stored token is now behind what the next discovery reports, so the next sync fetches
-        the page again instead of concluding it is unchanged. Recording the requested version
-        against older bytes would make the document permanently, invisibly stale.
+        If every attempt is still older, the fetch fails closed. The ingest pipeline persists
+        discovery's version token, not this method's metadata, so accepting older bytes would
+        certify them as current and make the document permanently, invisibly stale.
         """
         if not self._is_cloud:
             return await self._storage_body(page_id)
@@ -917,14 +915,47 @@ class ConfluenceConnector:
             # on the source's side, which is exactly the situation it exists for; anything
             # else — a 429, a rejected credential — must not be retried through a second
             # endpoint, which is why only this failure is caught.
-            return await self._storage_body(page_id)
+            return await self._checked_storage_body(
+                page_id, expected, adf_versions=(), adf_unavailable=True
+            )
         if expected is None or body.version >= expected:
             return body
-        retried = await self._adf_body(page_id)
+        try:
+            retried = await self._adf_body(page_id)
+        except BodyUnavailableError:
+            return await self._checked_storage_body(
+                page_id, expected, adf_versions=(body.version,), adf_unavailable=True
+            )
         if retried.version >= expected:
             return retried
+        return await self._checked_storage_body(
+            page_id, expected, adf_versions=(body.version, retried.version)
+        )
+
+    async def _checked_storage_body(
+        self,
+        page_id: str,
+        expected: int | None,
+        *,
+        adf_versions: Sequence[int],
+        adf_unavailable: bool = False,
+    ) -> _Body:
+        """The Cloud fallback, subject to the same freshness boundary as ADF."""
         fallback = await self._storage_body(page_id)
-        return fallback if fallback.version >= expected else retried
+        if expected is None or fallback.version >= expected:
+            return fallback
+        if not adf_versions:
+            adf_detail = "Atlassian Document Format was unavailable"
+        else:
+            versions = ", ".join(str(version) for version in adf_versions)
+            label = "version" if len(adf_versions) == 1 else "versions"
+            suffix = " before becoming unavailable" if adf_unavailable else ""
+            adf_detail = f"Atlassian Document Format returned {label} {versions}{suffix}"
+        msg = (
+            f"page {page_id} was discovered at version {expected}, but {adf_detail} and storage "
+            f"format returned version {fallback.version}; refusing stale content"
+        )
+        raise BodyUnavailableError(msg)
 
     def _macros_in(self, body: _Body) -> list[MacroTarget]:
         """The include macros in a body nobody is going to expand, so they can be recorded."""

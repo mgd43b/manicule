@@ -138,6 +138,14 @@ class FakePage:
     from the page being empty and wants a different answer.
     """
 
+    adf_available_calls: int | None = None
+    """How many initial ADF requests return a body before the format becomes unavailable.
+
+    ``None`` follows :attr:`adf_available` on every call. One models a stale first response whose
+    retry loses the representation, so fallback is exercised at that transition rather than only
+    when ADF is absent from the beginning.
+    """
+
     storage_version: int | None = None
     """Version the storage-format endpoint reports. ``None`` means it agrees with search.
 
@@ -581,8 +589,13 @@ class FakeConfluence:
         if tail == "ancestors":
             return httpx.Response(200, json={"results": self._ancestor_rows(page)})
         version = self._served_version(page)
+        within_available_calls = (
+            page.adf_available_calls is None or self.body_calls[page.id] <= page.adf_available_calls
+        )
         body: dict[str, object] = (
-            {"atlas_doc_format": {"value": json.dumps(page.adf)}} if page.adf_available else {}
+            {"atlas_doc_format": {"value": json.dumps(page.adf)}}
+            if page.adf_available and within_available_calls
+            else {}
         )
         # Cloud's v2 page carries two timestamps at two levels: the page's own `createdAt`, and
         # the current version's `createdAt`, which is when the page was last edited. Omitted

@@ -22,7 +22,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from manicule.connectors.confluence import MODIFIED_AT, VERSION_TOKEN
+from manicule.connectors import BodyUnavailableError
+from manicule.connectors.confluence import MODIFIED_AT
 from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
 from manicule.core.sources import DocRef
 from manicule.parsers.config import ADF_MEDIA_TYPE, CONFLUENCE_MEDIA_TYPE
@@ -205,12 +206,8 @@ async def test_the_record_carries_no_local_clock_at_all() -> None:
 # --- the stale-body defense --------------------------------------------------------------------
 
 
-async def test_a_stale_body_is_cited_at_the_version_of_the_bytes_that_were_kept() -> None:
-    """Provenance describes what this index holds, never what it asked for.
-
-    Recording the expected version against older bytes would publish a claim to be holding a
-    revision that was never retrieved — and the version is the field a reader would use to check.
-    """
+async def test_an_entirely_stale_body_produces_no_provenance_claim() -> None:
+    """Refused bytes cannot acquire a citation that makes them look authoritative."""
     instance = _cloud(
         pages=[_page(version=5, served_version=4, storage_version=4, created=CREATED)]
     )
@@ -218,15 +215,10 @@ async def test_a_stale_body_is_cited_at_the_version_of_the_bytes_that_were_kept(
     connector = await connected(instance, config)
     try:
         found = await drain(connector.discover(None))
-        raw = await connector.fetch(found[0].ref)
+        with pytest.raises(BodyUnavailableError, match="refusing stale content"):
+            await connector.fetch(found[0].ref)
     finally:
         await connector.teardown()
-
-    record = _source(Provenance.from_metadata(raw.metadata))
-    assert record.version == "4", "the version of the bytes that were retained"
-    assert raw.metadata[VERSION_TOKEN] == "4"
-    # The diagnostic survives beside the record rather than being smoothed over by it.
-    assert raw.metadata["version_disagreement"] == {"discovered": 5, "fetched": 4}
 
 
 async def test_the_fallback_body_supplies_the_timestamp_that_goes_with_its_own_bytes() -> None:
