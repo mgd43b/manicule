@@ -275,6 +275,10 @@ WRITERS: frozenset[str] = frozenset(
         "document_reindex_stale",
         "import",
         "index_path",
+        "lifecycle_cleanup_generations",
+        "lifecycle_delete_snapshot",
+        "lifecycle_release_history",
+        "lifecycle_reset_derived",
         "plugin_add",
         "plugin_remove",
         "reembed_abandon",
@@ -574,7 +578,16 @@ def test_every_command_is_accounted_for_by_the_classification_or_named_as_an_exc
     # `index` emits `index_path` when given a path and `index_status` when not; `backup` emits
     # `restore` for `--restore`. Each is one command over two operations, so its own name
     # matches neither — and both operations are classified individually above.
-    aliases = {"index", "backup", "reembed-execute", "reembed-inspect"}
+    aliases = {
+        "index",
+        "backup",
+        "reembed-execute",
+        "reembed-inspect",
+        "cleanup-derived-generations",
+        "release-source-history",
+        "reset-derived",
+        "snapshot-delete",
+    }
     exceptions = {_normalized(name) for name in NO_RUNTIME_COMMANDS}
     unaccounted = commands - classified - exceptions - aliases
     assert not unaccounted, (

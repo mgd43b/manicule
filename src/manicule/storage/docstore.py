@@ -42,6 +42,7 @@ from manicule.storage.scoped import (
     CrossWorkspaceCollisionError,
     WorkspaceScoped,
 )
+from manicule.storage.source_lifecycle import SourceLifecycleMixin
 from manicule.storage.types import UtcDateTime, next_observation, utcnow
 
 if TYPE_CHECKING:
@@ -118,6 +119,7 @@ reached.
 
 
 class SqliteDocStore(
+    SourceLifecycleMixin,
     AcquisitionJournalMixin,
     ReconciliationJournalMixin,
     CollectionsMixin,

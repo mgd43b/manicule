@@ -685,9 +685,35 @@ def render_export(out: Console, payload: r.ExportReport) -> None:
 
 
 def render_reset(out: Console, payload: r.ResetReport) -> None:
-    out.print(f"removed {payload.documents} document(s) and {payload.chunks} chunk(s)")
+    out.print(
+        f"reset derived state for {payload.documents} document(s); "
+        f"removed {payload.chunks} chunk(s)"
+    )
+    out.print(f"[dim]{payload.snapshots_retained} durable snapshot item(s) retained[/dim]")
     if not payload.vectors_removed:
         out.print("[dim]no vectors to remove[/dim]")
+
+
+def render_lifecycle(out: Console, payload: r.LifecycleReport) -> None:
+    action = "dry run" if payload.dry_run else "completed"
+    out.print(f"[bold]{escape(payload.operation)}[/bold] · {action}")
+    if payload.dry_run:
+        out.print(
+            f"eligible: {payload.eligible_items} item(s), {payload.eligible_bytes} bytes; "
+            f"protected: {payload.protected_items} item(s)"
+        )
+        if payload.operation == "delete_snapshot":
+            out.print(
+                f"snapshot: {payload.snapshot_items} item(s); locally unrecoverable: "
+                f"{payload.unrecoverable_items} item(s), {payload.unrecoverable_bytes} bytes"
+            )
+            if payload.confirmation:
+                out.print(f"confirmation: [bold]{escape(payload.confirmation)}[/bold]")
+    else:
+        out.print(
+            f"removed: {payload.removed_items} item(s); released: {payload.released_bytes} bytes"
+        )
+        out.print("[dim]source contacted: no[/dim]")
 
 
 def render_init(out: Console, payload: r.InitReport) -> None:
@@ -977,6 +1003,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.RestoreReport: lambda out, p: render_restore(out, _as(r.RestoreReport, p)),
     r.ExportReport: lambda out, p: render_export(out, _as(r.ExportReport, p)),
     r.ResetReport: lambda out, p: render_reset(out, _as(r.ResetReport, p)),
+    r.LifecycleReport: lambda out, p: render_lifecycle(out, _as(r.LifecycleReport, p)),
     r.InitReport: lambda out, p: render_init(out, _as(r.InitReport, p)),
     r.ServerAddress: lambda out, p: render_address(out, _as(r.ServerAddress, p)),
     r.UpgradeReport: lambda out, p: render_upgrade(out, _as(r.UpgradeReport, p)),

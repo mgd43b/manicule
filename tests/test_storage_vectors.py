@@ -790,6 +790,18 @@ async def test_a_content_addressed_publication_is_physically_immutable(tmp_path:
     assert found[0].score == pytest.approx(1.0)
 
 
+async def test_terminal_publication_cleanup_is_exact_and_idempotent(tmp_path: Path) -> None:
+    store = await prepared(tmp_path / "publication-cleanup")
+    obsolete = chunk("obsolete")
+    published = chunk("published")
+    await store.upsert([obsolete], [spread(4, 0)], publication_id="obsolete-generation")
+    await store.upsert([published], [spread(4, 1)], publication_id="published-generation")
+
+    assert await store.delete_publication("obsolete-generation") == 1
+    assert await store.delete_publication("obsolete-generation") == 0
+    assert await store.publication_row_count("published-generation") == 1
+
+
 async def test_generation_validation_scopes_all_documents_to_the_exact_publication(
     tmp_path: Path,
 ) -> None:

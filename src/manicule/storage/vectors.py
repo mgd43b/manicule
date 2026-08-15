@@ -829,6 +829,17 @@ class LanceVectorStore:
             return 0
         return await table.count_rows(f"{PUBLICATION_COLUMN} = {quote(publication_id)}")
 
+    async def delete_publication(self, publication_id: str) -> int:
+        """Delete one non-live physical publication and return its prior row count."""
+        table = await self._existing_table()
+        if table is None:
+            return 0
+        predicate = f"{PUBLICATION_COLUMN} = {quote(publication_id)}"
+        rows = await table.count_rows(predicate)
+        if rows:
+            await table.delete(predicate)
+        return rows
+
     async def publication_page_is_complete(
         self,
         publication_id: str,
@@ -1258,6 +1269,11 @@ class PublishedLanceVectorStore:
         """Count a rebuild namespace in the currently pinned live generation."""
         async with self._operation() as store:
             return await store.publication_row_count(publication_id)
+
+    async def delete_publication(self, publication_id: str) -> int:
+        """Delete a terminal non-live publication through the pinned live store."""
+        async with self._operation() as store:
+            return await store.delete_publication(publication_id)
 
     async def publication_page_is_complete(
         self,

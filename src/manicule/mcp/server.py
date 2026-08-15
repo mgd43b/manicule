@@ -1,4 +1,4 @@
-"""The MCP server: twenty-nine tools, each a few lines over the application service.
+"""The MCP server: thirty-three tools, each a few lines over the application service.
 
 FastMCP derives every tool's schema from the function's type hints and its description from
 the docstring, so what an assistant sees is what the signature says. There is no protocol
@@ -42,6 +42,7 @@ mechanism ``tests/mcp/test_annotations.py`` already holds the hints to.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
@@ -206,6 +207,10 @@ TOOL_NAMES: tuple[str, ...] = (
     "document_reindex",
     "index_status",
     "reembed_status",
+    "lifecycle_reset_derived",
+    "lifecycle_cleanup_generations",
+    "lifecycle_release_history",
+    "lifecycle_delete_snapshot",
     "stats",
     "doctor",
     "connector_list",
@@ -500,7 +505,9 @@ def build_server(service: ApplicationService, *, read_only: bool = False) -> Fas
     return build_surface(service, read_only=read_only).server
 
 
-def build_surface(service: ApplicationService, *, read_only: bool = False) -> Surface:
+def build_surface(  # noqa: PLR0915 - flat registrations are the auditable authority surface
+    service: ApplicationService, *, read_only: bool = False
+) -> Surface:
     """Register the tools this surface offers against ``service`` and return it.
 
     Takes the service rather than building one, so the suites drive the real FastMCP tool
@@ -787,6 +794,48 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
         return await dispatch("reembed_status", lambda: service.reembed_status(run_id))
 
     @register.tool(READS)
+    async def lifecycle_reset_derived() -> dict[str, Any]:
+        """Dry-run the derived-only reset. Source manifests and retained bytes are protected."""
+        return await dispatch(
+            "lifecycle_reset_derived",
+            lambda: service.lifecycle_reset_derived(dry_run=True),
+        )
+
+    @register.tool(READS)
+    async def lifecycle_cleanup_generations() -> dict[str, Any]:
+        """Dry-run cleanup of terminal obsolete derived generations."""
+        return await dispatch(
+            "lifecycle_cleanup_generations",
+            lambda: service.lifecycle_cleanup_generations(dry_run=True),
+        )
+
+    @register.tool(READS)
+    async def lifecycle_release_history(before: str) -> dict[str, Any]:
+        """Dry-run historical source-version release before an ISO-8601 timestamp.
+
+        Args:
+            before: Policy cutoff with a UTC offset, such as 2026-07-01T00:00:00Z.
+        """
+        return await dispatch(
+            "lifecycle_release_history",
+            lambda: service.lifecycle_release_history(
+                datetime.fromisoformat(before.replace("Z", "+00:00")), dry_run=True
+            ),
+        )
+
+    @register.tool(READS)
+    async def lifecycle_delete_snapshot(run_id: str) -> dict[str, Any]:
+        """Report aggregate local data loss for snapshot deletion; never performs deletion.
+
+        Args:
+            run_id: Opaque promoted acquisition-run identity reported by snapshot status.
+        """
+        return await dispatch(
+            "lifecycle_delete_snapshot",
+            lambda: service.lifecycle_delete_snapshot(run_id, dry_run=True),
+        )
+
+    @register.tool(READS)
     async def stats() -> dict[str, Any]:
         """Count documents and chunks, grouped by source, media type and status."""
         return await dispatch("stats", service.stats)
@@ -935,6 +984,10 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
             document_reindex,
             index_status,
             reembed_status,
+            lifecycle_reset_derived,
+            lifecycle_cleanup_generations,
+            lifecycle_release_history,
+            lifecycle_delete_snapshot,
             stats,
             doctor,
             connector_list,

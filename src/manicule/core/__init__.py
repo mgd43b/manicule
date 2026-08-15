@@ -121,6 +121,12 @@ from manicule.core.protocols import (
     VersionStore,
 )
 from manicule.core.retrieval import Candidate, Context, Filter, Query, RetrievalProfile
+from manicule.core.source_lifecycle import (
+    LifecycleOperation,
+    LifecycleOutcome,
+    LifecyclePlan,
+    LifecycleRefusalError,
+)
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
 from manicule.core.version import CORE_VERSION
 
@@ -184,6 +190,10 @@ __all__ = [
     "HealthState",
     "IncompatiblePluginError",
     "Lifecycle",
+    "LifecycleOperation",
+    "LifecycleOutcome",
+    "LifecyclePlan",
+    "LifecycleRefusalError",
     "LineAnchor",
     "ManiculeError",
     "Metadata",

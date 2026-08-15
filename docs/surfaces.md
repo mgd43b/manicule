@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Twenty-nine MCP tools and twenty-two CLI commands. They are not a one-to-one mapping: some
+Thirty-three MCP tools and twenty-six CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -274,6 +274,10 @@ server and the built command tree.
 | `reembed_status` | ✓ | `reembed status` / `reembed inspect` | private-safe aggregate durable progress |
 | `reembed_abandon` | — | `reembed abandon` | terminal state without a live-pointer change |
 | `reembed_cleanup` | — | `reembed cleanup` | whether terminal non-live storage was removed |
+| `lifecycle_reset_derived` | ✓ dry-run only | `reset-derived --dry-run/--yes` | aggregate derived rows removed; source roots retained |
+| `lifecycle_cleanup_generations` | ✓ dry-run only | `cleanup-derived-generations [--yes]` | eligible/protected generations and temporary bytes |
+| `lifecycle_release_history` | ✓ dry-run only | `release-source-history BEFORE [--yes]` | policy-eligible history and uniquely released bytes |
+| `lifecycle_delete_snapshot` | ✓ dry-run only | `snapshot-delete RUN_ID [--confirm TOKEN]` | aggregate unrecoverable item/byte impact and confirmation token |
 | `doctor` | ✓ | `doctor` | diagnostics |
 | `connector_list` | ✓ | `connector list` | configured sources |
 | `connector_sync` | ✓ | `connector sync` | run counters |
@@ -299,7 +303,7 @@ server and the built command tree.
 | `backup` / `restore` | — | `backup` | where it went, what it holds |
 | `export` | — | `export` | a portable archive |
 | `import` | — | `import` | run counters |
-| `reset_index` | — | `reset-index --yes` | what was removed |
+| `reset_index` | — | `reset-index --yes` | derived state removed and durable snapshot items retained |
 | `init` | — | `init` | what was written and decided |
 | `upgrade` | — | `upgrade` | current, target, and the command to run |
 | `start` / `stop` | — | `start` / `stop` | the address, and whether it is loopback |
@@ -313,7 +317,7 @@ server and the built command tree.
 corpus-scanning `reembed` operations and the `auth` verbs are
 command-line only. Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
-assistant can call unattended should not be able to do any of that. The twenty-nine tools read
+assistant can call unattended should not be able to do any of that. The thirty-three tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
 surface. Four of these absences are asserted by name in `tests/app/test_surface_parity.py` —
 `collection_orphans`, `connector_sidecar`, `connector_login` and `document_reindex_stale`,
@@ -341,7 +345,7 @@ secret as a parameter, and a session cookie in a tool call is a session cookie i
 ### 4.1 What each tool says it does, and why that is not permission
 
 Every tool publishes the four hints MCP defines — `readOnlyHint`, `destructiveHint`,
-`idempotentHint`, `openWorldHint` — in `tools/list`. Fourteen of the twenty-nine say they only
+`idempotentHint`, `openWorldHint` — in `tools/list`. Eighteen of the thirty-three say they only
 read.
 
 **They are a description, and nothing in manicule reads them back.** No tool is gated on its own
@@ -1041,7 +1045,7 @@ unattended caller reaches, so each of them is absent rather than merely guarded:
 | Absent | Why |
 |---|---|
 | `document delete --hard` | Unrecoverable. The route soft-deletes, and `POST /documents/{id}/restore` undoes it |
-| `reset-index` | Empties the workspace with no restore path |
+| `reset-index` | Resets derived search state while retaining durable source and history roots |
 | `backup` / `restore` | One writes wherever the caller names; the other overwrites the live data directory |
 | `import` / `export` | The same, over a corpus archive |
 | `upgrade` | Fetching and executing code |

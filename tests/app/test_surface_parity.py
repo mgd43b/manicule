@@ -106,12 +106,12 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
 # --- the surfaces offer what they say they offer ---------------------------------------------
 
 
-def test_the_server_offers_exactly_twenty_nine_tools(service: ApplicationService) -> None:
-    """Twenty-nine, named, and matching the declared surface."""
+def test_the_server_offers_exactly_thirty_three_tools(service: ApplicationService) -> None:
+    """Thirty-three, named, and matching the declared surface."""
     server = build_server(service)
     offered = sorted(tool.name for tool in asyncio.run(server.list_tools()))
     assert offered == sorted(TOOL_NAMES)
-    assert len(offered) == 29
+    assert len(offered) == 33
 
 
 def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:
@@ -179,7 +179,7 @@ def test_only_private_safe_reembed_status_is_an_mcp_tool() -> None:
     }.isdisjoint(TOOL_NAMES)
 
 
-def test_the_command_line_offers_exactly_twenty_two_commands() -> None:
+def test_the_command_line_offers_exactly_twenty_six_commands() -> None:
     """Counted from the built command tree rather than from the source.
 
     A command registered on a sub-application and never attached would be in the file and not
@@ -199,6 +199,7 @@ def test_the_command_line_offers_exactly_twenty_two_commands() -> None:
         "ask",
         "auth",
         "backup",
+        "cleanup-derived-generations",
         "collection",
         "completion",
         "config",
@@ -211,15 +212,18 @@ def test_the_command_line_offers_exactly_twenty_two_commands() -> None:
         "init",
         "plugin",
         "reembed",
+        "release-source-history",
+        "reset-derived",
         "reset-index",
         "search",
         "serve",
+        "snapshot-delete",
         "start",
         "stop",
         "upgrade",
         "workspace",
     ]
-    assert len(names) == 22
+    assert len(names) == 26
 
 
 def test_only_the_command_line_can_ask_doctor_to_repair_anything(
@@ -378,6 +382,38 @@ PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
         {"run_id": "missing-run"},
         ["reembed", "status", "missing-run"],
         ("GET", "/api/v1/admin/reembed/missing-run", {}),
+        None,
+    ),
+    (
+        "lifecycle_reset_derived",
+        {},
+        ["reset-derived", "--dry-run"],
+        ("GET", "/api/v1/admin/lifecycle/reset-derived", {}),
+        None,
+    ),
+    (
+        "lifecycle_cleanup_generations",
+        {},
+        ["cleanup-derived-generations"],
+        ("GET", "/api/v1/admin/lifecycle/derived-generations", {}),
+        None,
+    ),
+    (
+        "lifecycle_release_history",
+        {"before": "2026-07-01T00:00:00Z"},
+        ["release-source-history", "2026-07-01T00:00:00Z"],
+        (
+            "GET",
+            "/api/v1/admin/lifecycle/source-history",
+            {"params": {"before": "2026-07-01T00:00:00Z"}},
+        ),
+        None,
+    ),
+    (
+        "lifecycle_delete_snapshot",
+        {"run_id": "snapshot-run"},
+        ["snapshot-delete", "snapshot-run"],
+        ("GET", "/api/v1/admin/lifecycle/snapshots/snapshot-run", {}),
         None,
     ),
     (

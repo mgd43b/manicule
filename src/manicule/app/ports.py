@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
     from manicule.core.protocols import Connector
     from manicule.core.retrieval import Filter, Query
+    from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
     from manicule.generation.history import Turn
     from manicule.generation.ports import (
         ConversationRecord,
@@ -277,8 +278,24 @@ class Maintenance(Protocol):
     async def restore(self, source: Path, *, force: bool = False) -> Mapping[str, object]: ...
 
     async def reset_index(self) -> tuple[int, int, bool]:
-        """Empty the index. Returns documents removed, chunks removed, vectors removed."""
+        """Reset derived state; return documents affected, chunks removed, vectors removed."""
         ...
+
+    async def plan_reset_derived(self) -> LifecyclePlan: ...
+
+    async def reset_derived(self) -> LifecycleOutcome: ...
+
+    async def plan_derived_generation_cleanup(self) -> LifecyclePlan: ...
+
+    async def cleanup_derived_generations(self) -> LifecycleOutcome: ...
+
+    async def plan_source_history_release(self, cutoff: datetime) -> LifecyclePlan: ...
+
+    async def release_source_history(self, cutoff: datetime) -> LifecycleOutcome: ...
+
+    async def plan_snapshot_deletion(self, run_id: str) -> LifecyclePlan: ...
+
+    async def delete_snapshot(self, run_id: str, *, confirmation: str) -> LifecycleOutcome: ...
 
     async def export_corpus(
         self, target: Path, *, allow_insecure_target: bool = False

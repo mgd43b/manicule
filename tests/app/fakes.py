@@ -40,6 +40,11 @@ from manicule.core.organization import Collection as DocumentCollection
 from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
 from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.core.retrieval import Candidate, Confidence, ConfidenceBand, Context, Query
+from manicule.core.source_lifecycle import (
+    LifecycleOperation,
+    LifecycleOutcome,
+    LifecyclePlan,
+)
 from manicule.generation.answers import AnswerEnvelope, AnswerEvent, EventKind
 from manicule.generation.history import Turn
 from manicule.generation.ports import (
@@ -1022,6 +1027,38 @@ class FakeMaintenance:
     async def reset_index(self) -> tuple[int, int, bool]:
         self.resets += 1
         return self.reset
+
+    async def plan_reset_derived(self) -> LifecyclePlan:
+        return LifecyclePlan(operation=LifecycleOperation.RESET_DERIVED)
+
+    async def reset_derived(self) -> LifecycleOutcome:
+        self.resets += 1
+        return LifecycleOutcome(operation=LifecycleOperation.RESET_DERIVED)
+
+    async def plan_derived_generation_cleanup(self) -> LifecyclePlan:
+        return LifecyclePlan(operation=LifecycleOperation.CLEANUP_DERIVED_GENERATIONS)
+
+    async def cleanup_derived_generations(self) -> LifecycleOutcome:
+        return LifecycleOutcome(operation=LifecycleOperation.CLEANUP_DERIVED_GENERATIONS)
+
+    async def plan_source_history_release(self, cutoff: datetime) -> LifecyclePlan:
+        del cutoff
+        return LifecyclePlan(operation=LifecycleOperation.RELEASE_SOURCE_HISTORY)
+
+    async def release_source_history(self, cutoff: datetime) -> LifecycleOutcome:
+        del cutoff
+        return LifecycleOutcome(operation=LifecycleOperation.RELEASE_SOURCE_HISTORY)
+
+    async def plan_snapshot_deletion(self, run_id: str) -> LifecyclePlan:
+        del run_id
+        return LifecyclePlan(
+            operation=LifecycleOperation.DELETE_SNAPSHOT,
+            confirmation="fake-confirmation",
+        )
+
+    async def delete_snapshot(self, run_id: str, *, confirmation: str) -> LifecycleOutcome:
+        del run_id, confirmation
+        return LifecycleOutcome(operation=LifecycleOperation.DELETE_SNAPSHOT)
 
     async def export_corpus(
         self, target: Path, *, allow_insecure_target: bool = False

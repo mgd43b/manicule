@@ -715,6 +715,24 @@ class ReembedCleanupReport(Payload):
     removed: bool
 
 
+class LifecycleReport(Payload):
+    """Aggregate-only plan or outcome for one explicit retention boundary."""
+
+    operation: str
+    dry_run: bool
+    eligible_items: int = Field(default=0, ge=0)
+    eligible_bytes: int = Field(default=0, ge=0)
+    protected_items: int = Field(default=0, ge=0)
+    protected_bytes: int = Field(default=0, ge=0)
+    snapshot_items: int = Field(default=0, ge=0)
+    unrecoverable_items: int = Field(default=0, ge=0)
+    unrecoverable_bytes: int = Field(default=0, ge=0)
+    removed_items: int = Field(default=0, ge=0)
+    released_bytes: int = Field(default=0, ge=0)
+    confirmation: str | None = None
+    source_contacted: bool = False
+
+
 class StaleReparseReport(Payload):
     """What a corpus-wide re-parse of stale documents did.
 
@@ -1695,11 +1713,12 @@ class ImportReport(Payload):
 
 
 class ResetReport(Payload):
-    """What ``reset-index`` removed."""
+    """What ``reset-index`` rebuilt while retaining authoritative source state."""
 
     documents: int = Field(default=0, ge=0)
     chunks: int = Field(default=0, ge=0)
     vectors_removed: bool = False
+    snapshots_retained: int = Field(default=0, ge=0)
 
 
 class InitReport(Payload):

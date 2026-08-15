@@ -58,12 +58,14 @@ if TYPE_CHECKING:
     from manicule.config.settings import Settings
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.protocols import Connector, Embedder, Parser, VectorStore
+    from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
     from manicule.ingest.ports import IngestStore
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
+    from manicule.storage.docstore import SqliteDocStore
     from manicule.storage.reembed import (
         LanceShadowGenerations,
         SqliteReembedCorpus,
@@ -1597,7 +1599,7 @@ class _Maintenance:
         return restore_backup(source, settings.data_dir, force=force)
 
     async def reset_index(self) -> tuple[int, int, bool]:
-        """Delete every document, chunk and vector this workspace owns.
+        """Delete derived chunks and vectors while retaining source manifests and documents.
 
         Vectors are removed **per document, here**, rather than left to the tombstone sweep.
         A reset that returned with the vectors still present would leave a search answering
@@ -1612,8 +1614,9 @@ class _Maintenance:
         vectors = await self._runtime.vectors()
         removed = False
         selector = Filter(workspace_ids=frozenset({self._runtime.workspace}))
+        offset = 0
         while True:
-            page = await store.list_documents(selector, limit=200)
+            page = await store.list_documents(selector, limit=200, offset=offset)
             if not page:
                 break
             for document in page:
@@ -1626,8 +1629,74 @@ class _Maintenance:
                     removed = removed or False
                 else:
                     removed = True
-                await store.delete_document(document.id)
+            offset += len(page)
+        lifecycle = self._source_lifecycle(store)
+        await lifecycle.reset_derived()
         return documents, chunks, removed
+
+    async def plan_reset_derived(self) -> LifecyclePlan:
+        return await self._source_lifecycle(await self._runtime.documents()).plan_reset_derived()
+
+    async def reset_derived(self) -> LifecycleOutcome:
+        from manicule.core.source_lifecycle import (  # noqa: PLC0415
+            LifecycleOperation,
+            LifecycleOutcome,
+        )
+
+        plan = await self.plan_reset_derived()
+        await self.reset_index()
+        return LifecycleOutcome(
+            operation=LifecycleOperation.RESET_DERIVED,
+            removed_items=plan.eligible_items,
+            snapshot_items=plan.snapshot_items,
+        )
+
+    async def plan_derived_generation_cleanup(self) -> LifecyclePlan:
+        return await self._source_lifecycle(
+            await self._runtime.documents()
+        ).plan_derived_generation_cleanup()
+
+    async def cleanup_derived_generations(self) -> LifecycleOutcome:
+        lifecycle = self._source_lifecycle(await self._runtime.documents())
+        vectors = await self._runtime.vectors()
+        remover = getattr(vectors, "delete_publication", None)
+        if remover is None:
+            raise ManiculeError(
+                "derived-generation cleanup requires a vector backend with named publications"
+            )
+        for publication in await lifecycle.obsolete_vector_publications():
+            await remover(publication)
+        return await lifecycle.cleanup_derived_generations()
+
+    async def plan_source_history_release(self, cutoff: datetime) -> LifecyclePlan:
+        return await self._source_lifecycle(
+            await self._runtime.documents()
+        ).plan_source_history_release(cutoff)
+
+    async def release_source_history(self, cutoff: datetime) -> LifecycleOutcome:
+        return await self._source_lifecycle(await self._runtime.documents()).release_source_history(
+            cutoff
+        )
+
+    async def plan_snapshot_deletion(self, run_id: str) -> LifecyclePlan:
+        return await self._source_lifecycle(await self._runtime.documents()).plan_snapshot_deletion(
+            run_id
+        )
+
+    async def delete_snapshot(self, run_id: str, *, confirmation: str) -> LifecycleOutcome:
+        return await self._source_lifecycle(await self._runtime.documents()).delete_snapshot(
+            run_id, confirmation=confirmation
+        )
+
+    @staticmethod
+    def _source_lifecycle(store: DocumentSurface) -> SqliteDocStore:
+        from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+        if not isinstance(store, SqliteDocStore):
+            raise ManiculeError(
+                "source lifecycle operations require the built-in workspace-scoped SQLite store"
+            )
+        return store
 
     async def export_corpus(
         self, target: Path, *, allow_insecure_target: bool = False
