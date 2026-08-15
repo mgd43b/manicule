@@ -67,10 +67,12 @@ from pydantic import create_model
 
 from manicule.core.content import LEGACY_PUBLICATION, Chunk
 from manicule.core.embedding import (
+    FLOAT32_EPSILON,
     UNRECORDED_IDENTITY,
     EmbedFingerprint,
     StoredVector,
     VectorState,
+    canonical_stored_vector,
     choose_stored_vector,
     classify_stored_vector,
     embedding_input_identity,
@@ -238,14 +240,6 @@ def predicate_for(filter: Filter | None) -> str | None:  # noqa: A002 - the doma
     if filter.langs:
         terms.append(membership("lang", filter.langs))
     return " AND ".join(terms) if terms else None
-
-
-FLOAT32_EPSILON: Final = 2.0**-23
-"""The spacing of :class:`float` values either side of 1.0 in the column's own precision.
-
-The vector column is ``fixed_size_list<float32, dimension>``, so ``float32`` is what this
-module stores in and the smallest difference it can represent near 1.0 is this.
-"""
 
 
 def _embed_text_of(record: dict[str, Any]) -> str | None:
@@ -576,11 +570,18 @@ class LanceVectorStore:
         if table is None or fingerprint is None:
             return verdicts
         schema = await table.schema()
-        has_identity = IDENTITY_COLUMN in {str(field.name) for field in schema}
+        columns = {str(field.name) for field in schema}
+        has_identity = IDENTITY_COLUMN in columns
+        logical_id_column = CHUNK_ID_COLUMN if CHUNK_ID_COLUMN in columns else ID_COLUMN
 
         by_id = {chunk.id: chunk for chunk in chunks}
-        for record in await self._rows_for(table, sorted(by_id), has_identity=has_identity):
-            chunk = by_id.get(str(record[CHUNK_ID_COLUMN]))
+        for record in await self._rows_for(
+            table,
+            sorted(by_id),
+            logical_id_column=logical_id_column,
+            has_identity=has_identity,
+        ):
+            chunk = by_id.get(str(record[logical_id_column]))
             if chunk is None:  # pragma: no cover - the predicate asked for these ids only
                 continue
             found = self._verdict(chunk, record, fingerprint)
@@ -606,7 +607,12 @@ class LanceVectorStore:
         return verdicts
 
     async def _rows_for(
-        self, table: AsyncTable, chunk_ids: Sequence[str], *, has_identity: bool
+        self,
+        table: AsyncTable,
+        chunk_ids: Sequence[str],
+        *,
+        logical_id_column: str,
+        has_identity: bool,
     ) -> list[dict[str, Any]]:
         """Every stored row among ``chunk_ids``, read in bounded pages.
 
@@ -621,7 +627,7 @@ class LanceVectorStore:
         A row from a table without the identity column reads as
         :data:`~manicule.core.embedding.UNRECORDED_IDENTITY`, which is what it is.
         """
-        columns = [CHUNK_ID_COLUMN, VECTOR_COLUMN, CHUNK_COLUMN]
+        columns = [logical_id_column, VECTOR_COLUMN, CHUNK_COLUMN]
         if has_identity:
             columns.append(IDENTITY_COLUMN)
 
@@ -631,7 +637,7 @@ class LanceVectorStore:
             listed = ", ".join(quote(chunk_id) for chunk_id in page)
             found = (
                 await table.query()
-                .where(f"{CHUNK_ID_COLUMN} IN ({listed})")
+                .where(f"{logical_id_column} IN ({listed})")
                 .select(columns)
                 .to_list()
             )
@@ -664,7 +670,7 @@ class LanceVectorStore:
             found = (
                 await table.query()
                 .where(f"{IDENTITY_COLUMN} IN ({listed})")
-                .select([CHUNK_ID_COLUMN, VECTOR_COLUMN, CHUNK_COLUMN, IDENTITY_COLUMN])
+                .select([VECTOR_COLUMN, CHUNK_COLUMN, IDENTITY_COLUMN])
                 .to_list()
             )
             for record in found:
@@ -723,7 +729,7 @@ class LanceVectorStore:
                 "in cosine distance, so the vector was refused before storage."
             )
             raise ValueError(msg)
-        values = unit(vector)
+        values = canonical_stored_vector(vector)
         if len(values) != fingerprint.dimension:
             msg = (
                 f"chunk {chunk.id!r} was offered a {len(values)}-dimension vector but the "

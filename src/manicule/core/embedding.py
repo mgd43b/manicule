@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import struct
 from collections.abc import Iterator, Sequence
 from enum import StrEnum
 from typing import ClassVar, Final, Protocol, override, runtime_checkable
@@ -32,6 +33,23 @@ type Vector = Sequence[float]
 Deliberately a plain sequence: vectors cross a storage boundary, where a concrete,
 serializable value is what is wanted. Backends holding native arrays convert at the seam.
 """
+
+FLOAT32_EPSILON: Final = 2.0**-23
+"""The spacing of float32 values either side of one."""
+
+
+def canonical_stored_vector(vector: Vector) -> tuple[float, ...]:
+    """Return the exact normalized float32 values a vector backend persists.
+
+    Publication identities are computed before Lance writes and reused vectors are read after
+    it writes. Canonicalizing at both boundaries prevents normalization and float32 rounding
+    from turning an identical retry into a different publication.
+    """
+    values = [float(value) for value in vector]
+    norm = math.sqrt(math.fsum(value * value for value in values))
+    if norm != 0.0 and abs(norm - 1.0) >= FLOAT32_EPSILON:
+        values = [value / norm for value in values]
+    return tuple(struct.unpack("!f", struct.pack("!f", value))[0] for value in values)
 
 
 def is_finite_vector(vector: Vector) -> bool:

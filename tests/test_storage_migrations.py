@@ -121,6 +121,13 @@ async def test_a_migration_over_a_populated_database_keeps_the_rows(data_dir: Pa
         assert await _document_values(engine, "publication_id") == {"publication_id": "legacy"}, (
             "pre-publication documents must retain vectors under the legacy generation"
         )
+        async with engine.connect() as connection:
+            migrated_vector_ids = (
+                await connection.execute(text("SELECT count(*) FROM chunks WHERE vector_id = id"))
+            ).scalar_one()
+        assert migrated_vector_ids == before["chunks"], (
+            "every legacy chunk's logical id was also its physical vector id"
+        )
         assert await _row_counts(engine) == before, (
             "a migration must not delete rows it was not asked to delete"
         )

@@ -450,7 +450,7 @@ produce bytes that never passed the check. An unusable record reads as *absent*,
 that document's citation to its filename: exactly where it would have been with no manifest, and
 one malformed row cannot break every listing that touches it.
 
-**Nothing is copied onto a chunk.** A chunk resolves its citation through `document_id`, so for a
+**No citation metadata is copied onto a chunk.** A chunk resolves its citation through `document_id`, so for a
 document of two hundred chunks that is one copy of the canonical title rather than two hundred.
 What is genuinely chunk-level is already on the chunk: `heading_path` is where the *passage* sits
 inside the document, and the record's `section_path` is where the *document* sits in its source.
@@ -474,6 +474,7 @@ class Chunk(Base):
 
     seq:          Mapped[int] = mapped_column(Integer, primary_key=True)   # rowid alias
     id:           Mapped[str] = mapped_column(Text, unique=True)
+    vector_id:    Mapped[str]                       # publication + id; cascade tombstone key
     document_id:  Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
 
     text:         Mapped[str]                     # cited and shown
@@ -496,6 +497,12 @@ today, and that is exactly the problem: the derivation rule is code, code change
 changed rule silently produces different vectors from the same chunks. The fingerprint guard
 in §6.3 is only meaningful if the embedder's actual input is recoverable. Storing it also
 puts rung 2 of the ladder entirely inside SQLite.
+
+**`vector_id` makes cleanup a database invariant.** It is the exact physical Lance key for this
+chunk's active publication. The delete trigger can therefore tombstone the right vector whether
+the chunk is replaced directly or deleted by a document, container-member or workspace cascade;
+it never has to reproduce the application hash in SQL. Migrated rows receive their legacy
+logical `id`, which was also their physical vector key.
 
 **`heading_text` alongside `heading_path` is a deliberate small redundancy.** FTS5 indexes a
 string, and joining a JSON array of arbitrary length is not expressible in a SQLite generated
@@ -887,8 +894,10 @@ collision would have to survive that check as well. Assumed rather than argued a
 so the next reader knows which it is.
 
 **Migration is one `add_columns` and no re-embedding.** An existing table gains the identity,
-logical-chunk and publication columns in `ensure_ready`. Existing rows use their former `id` as
-`chunk_id`, receive the `legacy` publication, and read as *identity not recorded*. Such a row is
+logical-chunk and publication columns in `ensure_ready`. Before that migration runs,
+`stored_vectors` detects the old schema and uses `id` as the logical chunk id, so startup's
+reuse preflight does not depend on the lifecycle call it precedes. Existing rows use their former
+`id` as `chunk_id`, receive the `legacy` publication, and read as *identity not recorded*. Such a row is
 reconstructed rather than distrusted: `upsert` wrote its `chunk_json`
 from the same object, in the same call, as the vector beside it, so `chunk_json.embed_text` is
 the exact prior embedding input rather than a guess at one. An existing corpus therefore keeps
@@ -1381,7 +1390,8 @@ disclosure itself is discharged here.
 ### 8.2 Ingest write order, and every crash window
 
 1. Derive a content-addressed publication id from the document, chunks, vectors and stage
-   fingerprints.
+   fingerprints. Vector values are normalized and rounded to the exact float32 representation
+   Lance persists before hashing, so a reused vector's read/write round trip keeps the same id.
 2. Write vector tombstones for that publication's physical row ids, then stage every vector.
    The logical chunk id remains stable; the physical id includes the publication, so changed
    `embed_text` cannot overwrite the vector the active revision still uses.
@@ -1399,15 +1409,18 @@ disclosure itself is discharged here.
 - **Crash after 3** — the new publication is complete. Retired vectors may still exist, but
   their publication no longer matches the document and the tombstone sweep reclaims them.
 
-The zero-chunk path uses step 3 too. It stages no vectors, but it still performs the same
+Every non-failed zero-chunk conclusion uses step 3 too: parser-empty, container, unsupported,
+middleware-skipped and chunker-empty. It stages no vectors, but it still performs the same
 compare-and-swap and atomic relational flip; an empty result is not an escape hatch around the
 publication boundary.
 
 **Deletion is deferred, always.** Soft-deleting a document sets `deleted_at` and touches
 nothing else: chunks stay, vectors stay, FTS rows stay, and all of them become invisible at
 the join. Restore is clearing the timestamp — no re-embed, no re-parse, no re-fetch. Hard
-deletion cascades to `chunks`, whose `AFTER DELETE` trigger writes the IDs into
-`vector_tombstones`, and a sweep removes them from LanceDB later.
+deletion cascades to `chunks`, whose `AFTER DELETE` trigger records each row's stored physical
+`vector_id`. That includes container-member and workspace cascades. A pre-existing legacy logical
+tombstone is never cleared while publications turn over, because it may still name an old row
+awaiting its first sweep. The sweep removes every named row from LanceDB later.
 
 **Soft delete is idempotent and does not restart the clock.** A second delete of an
 already-deleted document leaves the original `deleted_at` alone. This is not politeness: §11.2
@@ -1443,7 +1456,7 @@ table so the over-fetch factor can be set against a measured number.
 ```sql
 CREATE TRIGGER chunks_ad_tomb AFTER DELETE ON chunks BEGIN
   INSERT OR IGNORE INTO vector_tombstones(chunk_id, deleted_at)
-    VALUES (old.id, datetime('now'));
+    VALUES (old.vector_id, datetime('now'));
 END;
 ```
 

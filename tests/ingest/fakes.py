@@ -248,7 +248,12 @@ class MemoryIngestStore:
         await self.upsert_document(document)
         await self.replace_chunks(document.id, chunks)
         self.lineage[document.id] = (chunk_fp, embed_fp)
-        if parse_fp is not None:
+        if parse_fp is None:
+            self.parse_lineage.pop(document.id, None)
+            self.documents[document.id] = self.documents[document.id].model_copy(
+                update={"parse_fp": None}
+            )
+        else:
             self.parse_lineage[document.id] = parse_fp
             self.documents[document.id] = self.documents[document.id].model_copy(
                 update={"parse_fp": parse_fp}

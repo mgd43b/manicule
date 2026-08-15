@@ -14,7 +14,8 @@ and retrieval-inspection console, not the primary knowledge-work interface.
 Re-indexing is copy-on-write at the document boundary: vectors are staged under a publication
 id, then the document, chunks, glossary and lineage become active in one relational transaction.
 A failed or interrupted refresh keeps the previous indexed revision searchable; unpublished
-vectors are filtered during hydration and reclaimed by the normal sweep.
+vectors are filtered during hydration and reclaimed by the normal sweep. The same atomic flip
+applies when parsing, middleware or chunking concludes that a document has no chunks.
 
 > **Early, and runnable.** All four surfaces work today: point it at a directory, search it, ask
 > it questions, read it in a browser, hand the same operations to an assistant over MCP, or serve

@@ -931,13 +931,15 @@ they are library verbs with tests and no command. Stated rather than left implic
 day one of them gets a surface is the day it needs an expected revision, and the omission would
 otherwise have to be rediscovered.
 
-**Where the check is.** In the relational publication transaction, not before it. The comparison
-and the replacement are one operation — a conditional `UPDATE` takes SQLite's write lock, then
+**Where the check is.** In the relational publication transaction, not before it. On an
+expected-revision path the conditional `UPDATE` is the transaction's first SQL statement, so it
+takes SQLite's write lock before any snapshot read can go stale; then
 the same transaction replaces chunks and glossary rows, advances lineage and flips the active
 publication. A `SELECT` followed by those writes would have a gap exactly as wide as the one
 being closed. Vectors are deliberately staged before this check: a losing run may leave inert
 rows, but cannot replace any row in the active publication, and tombstones make those rows
-reclaimable. The zero-chunk branch calls the same guarded transaction.
+reclaimable. Parser-empty, container, unsupported, middleware-skipped and chunker-empty branches
+all call the same guarded transaction.
 
 **What an operator does about a `superseded` result: nothing.** It is not a failure and it is
 not work left undone. It says a connector sync committed newer bytes for that document while
@@ -1041,7 +1043,9 @@ every re-sync — which is the very bug this section exists to prevent, arriving
 **Terminal no-content statuses still store the document.** `parsing.md` §6.4 requires it, and
 the pipeline is what has to resist the temptation to treat "zero chunks" as "nothing to do".
 Storing the failure is what makes it re-queryable, skippable on the next sync, and reachable by
-`document reindex --status no_extractable_text` the day OCR lands.
+`document reindex --status no_extractable_text` the day OCR lands. Every non-failed terminal
+conclusion publishes the document, empty chunks, empty glossary and lineage in one transaction;
+none first exposes a new row and clears its derivatives afterwards.
 
 ---
 

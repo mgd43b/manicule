@@ -248,7 +248,7 @@ class SqliteDocStore(
                 .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
             )
 
-    async def publish_document(  # noqa: PLR0912 - each branch is one optional publication part
+    async def publish_document(
         self,
         document: Document,
         chunks: Sequence[Chunk],
@@ -263,12 +263,9 @@ class SqliteDocStore(
     ) -> Commit:
         """Flip the active publication and every relational derivative in one transaction."""
         async with self._sessions.begin() as session:
-            row = await session.get(models.Document, document.id)
-            if row is not None and row.workspace_id != self._workspace_id:
-                raise CrossWorkspaceCollisionError(
-                    _cross_workspace(document.id, row.workspace_id, self._workspace_id)
-                )
             if expected is not None:
+                # This must be the transaction's first SQL statement. The conditional write
+                # takes SQLite's writer lock before any snapshot read can go stale beneath it.
                 matched = cast(
                     "CursorResult[Any]",
                     await session.execute(
@@ -287,6 +284,10 @@ class SqliteDocStore(
                     ),
                 )
                 row = await session.get(models.Document, document.id, populate_existing=True)
+                if row is not None and row.workspace_id != self._workspace_id:
+                    raise CrossWorkspaceCollisionError(
+                        _cross_workspace(document.id, row.workspace_id, self._workspace_id)
+                    )
                 stored = None if row is None else to_document(row)
                 if (
                     matched.rowcount != 1
@@ -294,18 +295,12 @@ class SqliteDocStore(
                     or stored.provenance != expected.source_record
                 ):
                     return Commit(committed=False, stored=stored)
-            old_publication = row.publication_id if row is not None else None
-            old_chunk_ids = (
-                list(
-                    (
-                        await session.execute(
-                            select(models.Chunk.id).where(models.Chunk.document_id == document.id)
-                        )
-                    ).scalars()
-                )
-                if row is not None
-                else []
-            )
+            else:
+                row = await session.get(models.Document, document.id)
+                if row is not None and row.workspace_id != self._workspace_id:
+                    raise CrossWorkspaceCollisionError(
+                        _cross_workspace(document.id, row.workspace_id, self._workspace_id)
+                    )
             await self._write_document(session, document)
             row = await session.get(models.Document, document.id)
             if row is None:  # pragma: no cover - _write_document creates or returns this row
@@ -317,29 +312,8 @@ class SqliteDocStore(
             )
             await session.flush()
             for chunk in chunks:
-                session.add(from_chunk(chunk, document.id))
+                session.add(from_chunk(chunk, document.id, document.publication_id))
             await session.flush()
-
-            if old_publication is not None and old_chunk_ids:
-                if old_publication != "legacy":
-                    await session.execute(
-                        delete(models.VectorTombstone).where(
-                            models.VectorTombstone.chunk_id.in_(old_chunk_ids)
-                        )
-                    )
-                await session.execute(
-                    sqlite_insert(models.VectorTombstone)
-                    .values(
-                        [
-                            {
-                                "chunk_id": vector_id(old_publication, chunk_id),
-                                "deleted_at": utcnow(),
-                            }
-                            for chunk_id in old_chunk_ids
-                        ]
-                    )
-                    .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
-                )
             if chunks:
                 await session.execute(
                     delete(models.VectorTombstone).where(
@@ -353,12 +327,9 @@ class SqliteDocStore(
                 await self._replace_entries(session, document.id, glossary_entries)
             if glossary_fp is not None:
                 row.glossary_fp = glossary_fp
-            if chunk_fp is not None:
-                row.chunk_fp = chunk_fp
-            if embed_fp is not None:
-                row.embed_fp = embed_fp
-            if parse_fp is not None:
-                row.parse_fp = parse_fp
+            row.chunk_fp = chunk_fp
+            row.embed_fp = embed_fp
+            row.parse_fp = parse_fp
             await session.flush()
             return Commit(committed=True, stored=to_document(row))
 
@@ -460,9 +431,9 @@ class SqliteDocStore(
     async def delete_document(self, document_id: str) -> None:
         """Hard-delete a document and everything hanging off it. Idempotent.
 
-        The cascade reaches ``chunks``, whose delete trigger removes the FTS rows and records
-        vector tombstones — so the derived stores are cleaned by the database rather than by
-        whichever caller remembered to.
+        The cascade reaches ``chunks``, whose delete trigger removes FTS rows and records each
+        row's physical publication vector id. Because the id lives on the chunk, the same rule
+        holds when this delete cascades through container members or begins at a workspace.
         """
         async with self._sessions.begin() as session:
             await session.execute(
@@ -843,37 +814,17 @@ class SqliteDocStore(
         """
         async with self._sessions.begin() as session:
             document = await session.get(models.Document, document_id)
-            old_ids = list(
-                (
-                    await session.execute(
-                        select(models.Chunk.id).where(models.Chunk.document_id == document_id)
-                    )
-                ).scalars()
-            )
             await session.execute(
                 delete(models.Chunk).where(models.Chunk.document_id == document_id)
             )
-            if document is not None and document.publication_id != "legacy" and old_ids:
-                await session.execute(
-                    delete(models.VectorTombstone).where(
-                        models.VectorTombstone.chunk_id.in_(old_ids)
-                    )
-                )
-                await session.execute(
-                    sqlite_insert(models.VectorTombstone)
-                    .values(
-                        [
-                            {
-                                "chunk_id": vector_id(document.publication_id, chunk_id),
-                                "deleted_at": utcnow(),
-                            }
-                            for chunk_id in old_ids
-                        ]
-                    )
-                    .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
-                )
             for chunk in chunks:
-                session.add(from_chunk(chunk, document_id))
+                session.add(
+                    from_chunk(
+                        chunk,
+                        document_id,
+                        document.publication_id if document is not None else "legacy",
+                    )
+                )
 
     async def get_chunks(self, chunk_ids: Sequence[str]) -> Sequence[Chunk]:
         if not chunk_ids:

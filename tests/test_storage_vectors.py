@@ -37,9 +37,11 @@ from manicule.core.errors import FingerprintMismatchError
 from manicule.core.protocols import VectorStore
 from manicule.core.retrieval import Filter
 from manicule.storage.vectors import (
+    CHUNK_ID_COLUMN,
     EXEMPT_FILTER_FIELDS,
     IDENTITY_COLUMN,
     META_TABLE,
+    PUBLICATION_COLUMN,
     LanceVectorStore,
     VectorStoreStateError,
     predicate_for,
@@ -823,6 +825,27 @@ async def test_a_table_written_before_the_identity_column_keeps_every_vector_it_
     )
 
 
+async def test_a_legacy_table_is_readable_before_generation_columns_are_migrated(
+    tmp_path: Path,
+) -> None:
+    """stored_vectors is a preflight read, so it cannot depend on ensure_ready migration."""
+    directory = tmp_path / "vectors"
+    original = chunk("legacy-chunk")
+    vector = spread(4, 2)
+    writer = LanceVectorStore(directory)
+    await writer.ensure_ready(fingerprint())
+    await writer.upsert([original], [vector])
+    await writer.teardown()
+    await _drop_generation_columns(directory, fingerprint())
+
+    reopened = LanceVectorStore(directory)
+    verdict = (await reopened.stored_vectors([original]))[original.id]
+
+    assert verdict.state is VectorState.READABLE
+    assert verdict.vector
+    await reopened.teardown()
+
+
 async def test_a_chunk_refiled_under_a_new_id_still_finds_its_vector(
     store: LanceVectorStore,
 ) -> None:
@@ -901,4 +924,12 @@ async def _drop_identity_column(directory: Path, embed: EmbedFingerprint) -> Non
     connection = await lancedb.connect_async(directory)
     table = await connection.open_table(table_name(embed))
     await table.drop_columns([IDENTITY_COLUMN])
+    connection.close()
+
+
+async def _drop_generation_columns(directory: Path, embed: EmbedFingerprint) -> None:
+    """Recreate the schema shape written before publication generations existed."""
+    connection = await lancedb.connect_async(directory)
+    table = await connection.open_table(table_name(embed))
+    await table.drop_columns([CHUNK_ID_COLUMN, PUBLICATION_COLUMN])
     connection.close()

@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING, Any, cast
 from pydantic import TypeAdapter
 
 from manicule.core.anchors import Anchor
-from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus
+from manicule.core.content import LEGACY_PUBLICATION, BlockKind, Chunk, Document, DocumentStatus
+from manicule.core.ids import vector_id
 from manicule.storage import models
 from manicule.storage.types import utcnow
 
@@ -79,9 +80,12 @@ def apply_document(row: models.Document, document: Document) -> None:
         row.indexed_at = utcnow()
 
 
-def from_chunk(chunk: Chunk, document_id: str) -> models.Chunk:
+def from_chunk(
+    chunk: Chunk, document_id: str, publication_id: str = LEGACY_PUBLICATION
+) -> models.Chunk:
     return models.Chunk(
         id=chunk.id,
+        vector_id=vector_id(publication_id, chunk.id),
         document_id=document_id,
         text=chunk.text,
         embed_text=chunk.embed_text,

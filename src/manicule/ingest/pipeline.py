@@ -60,6 +60,7 @@ from manicule.core.content import (
     RawDocument,
     Retention,
 )
+from manicule.core.embedding import canonical_stored_vector
 from manicule.core.errors import (
     ChunkingError,
     ContextOverflowError,
@@ -1191,6 +1192,7 @@ class IngestPipeline:
                 identifier=identifier,
                 existing=existing,
                 expected=expected,
+                retention=retention,
             )
             return skipped, ()
         raw = transformed
@@ -1226,15 +1228,12 @@ class IngestPipeline:
                 # `_nothing_to_index` states: a document with no chunks states no definitions,
                 # and saying so explicitly rather than leaving it to the chunk cascade is what
                 # keeps it a property of the pipeline instead of a property of one store's
-                # schema. `_store_record` above has already emptied the chunks; a store holding
-                # them elsewhere would otherwise keep a whole glossary for a page that no longer
-                # has any text in it — and, now, keep it behind a lineage nothing ever advances.
-                glossary_detail = await self._store_definitions(document, [])
-                await self._store.set_lineage(
-                    document.id,
-                    chunk_fp=None,
-                    embed_fp=None,
-                    parse_fp=self._parse_lineage_of(document),
+                # schema. The shared publication below empties both chunks and glossary; doing
+                # either in a separate write would expose half of the conclusion.
+                document, glossary_detail = await self._publish_chunkless(
+                    document,
+                    expected=expected,
+                    retention=retention,
                 )
             await self._observe(document)
             return (
@@ -1491,23 +1490,11 @@ class IngestPipeline:
             attempts=result.attempts,
         )
         settled_document = _with_status(document, settled)
-        publication = self._publication_of(settled_document, [])
-        settled_document = settled_document.model_copy(update={"publication_id": publication})
-        entries, glossary_fp, glossary_detail = self._derive_definitions(settled_document, [])
-        committed = await self._store.publish_document(
+        stored, glossary_detail = await self._publish_chunkless(
             settled_document,
-            [],
             expected=expected,
-            chunk_fp=None,
-            embed_fp=None,
-            parse_fp=self._parse_lineage_of(document),
-            glossary_entries=entries,
-            glossary_fp=glossary_fp,
-            original_omitted_reason=retention.omitted_reason,
+            retention=retention,
         )
-        if not committed.committed or committed.stored is None:
-            raise _SupersededError(committed.stored)
-        stored = committed.stored
         await self._observe(stored)
         return DocumentOutcome(
             source_id=raw.source_id,
@@ -1516,6 +1503,38 @@ class IngestPipeline:
             detail=settled.status_detail,
             glossary_detail=glossary_detail,
         )
+
+    async def _publish_chunkless(
+        self,
+        document: Document,
+        *,
+        expected: DocumentRevision | None,
+        retention: Retention,
+    ) -> tuple[Document, str]:
+        """Atomically publish every successful conclusion that has no chunks.
+
+        Parser-empty, container, unsupported, middleware-skipped and chunker-empty outcomes
+        all replace the same derived state: document, empty chunks, empty glossary and settled
+        lineage. Keeping one path is what prevents a newly added terminal status from quietly
+        reintroducing the old sequence of independently visible writes.
+        """
+        publication = self._publication_of(document, [])
+        settled = document.model_copy(update={"publication_id": publication})
+        entries, glossary_fp, glossary_detail = self._derive_definitions(settled, [])
+        committed = await self._store.publish_document(
+            settled,
+            [],
+            expected=expected,
+            chunk_fp=None,
+            embed_fp=None,
+            parse_fp=self._parse_lineage_of(settled),
+            glossary_entries=entries,
+            glossary_fp=glossary_fp,
+            original_omitted_reason=retention.omitted_reason,
+        )
+        if not committed.committed or committed.stored is None:
+            raise _SupersededError(committed.stored)
+        return committed.stored, glossary_detail
 
     async def _commit(
         self,
@@ -1675,7 +1694,7 @@ class IngestPipeline:
                     self._parse_lineage_of(document) or "",
                     self._glossary_lineage or "",
                     *(chunk.model_dump_json() for chunk in chunks),
-                    *(repr(tuple(vector)) for vector in vectors),
+                    *(repr(canonical_stored_vector(vector)) for vector in vectors),
                 )
             )
         )
@@ -1899,8 +1918,8 @@ class IngestPipeline:
 
         A successful parse is constructed here but not written. Its source record joins chunks,
         glossary and lineage only at the atomic publication boundary; until then an existing
-        indexed row remains the active revision. Chunk-less terminal conclusions still publish
-        here or through :meth:`_nothing_to_index`, using the caller's guard.
+        indexed row remains the active revision. Chunk-less terminal conclusions are returned
+        unwritten and go through the shared atomic boundary with the caller's guard.
 
         Raises:
             _SupersededError: The stored document is no longer ``expected``, so nothing was written.
@@ -1983,14 +2002,12 @@ class IngestPipeline:
             failed_stage=result.failed_stage,
             metadata=metadata,
         )
-        if result.status is DocumentStatus.PARSED:
+        if result.status is not DocumentStatus.FAILED:
             return document
         stored = await self._publish(document, expected=expected)
         await self._store.set_original(
             stored.id, ref=retention.ref, omitted_reason=retention.omitted_reason
         )
-        if result.status in {DocumentStatus.CONTAINER, DocumentStatus.NO_EXTRACTABLE_TEXT}:
-            await self._store.replace_chunks(stored.id, [])
         return stored
 
     @staticmethod
@@ -2015,7 +2032,9 @@ class IngestPipeline:
         identifier: str,
         existing: Document | None,
         expected: DocumentRevision | None = None,
+        retention: Retention | None = None,
     ) -> DocumentOutcome:
+        retention = retention or Retention(omitted_reason="not retained: the document was skipped")
         document = await self._store_record(
             result,
             raw=raw,
@@ -2025,15 +2044,23 @@ class IngestPipeline:
             title=title,
             identifier=identifier,
             existing=existing,
-            retention=Retention(omitted_reason="not retained: the document was skipped"),
+            retention=retention,
             expected=expected,
         )
+        glossary_detail = ""
+        if result.status is not DocumentStatus.FAILED:
+            document, glossary_detail = await self._publish_chunkless(
+                document,
+                expected=expected,
+                retention=retention,
+            )
         await self._observe(document)
         return DocumentOutcome(
             source_id=raw.source_id,
             status=document.status,
             document_id=document.id,
             detail=result.status_detail,
+            glossary_detail=glossary_detail,
         )
 
     async def _advance(self, existing: Document | None, status: DocumentStatus) -> None:

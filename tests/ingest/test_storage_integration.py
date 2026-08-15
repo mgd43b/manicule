@@ -17,9 +17,9 @@ import pytest
 from sqlalchemy import text
 
 from manicule.connectors import CursorExpiredError
-from manicule.core.content import IN_FLIGHT, DocumentStatus, Retention
+from manicule.core.content import IN_FLIGHT, Commit, DocumentStatus, RawDocument, Retention
 from manicule.core.embedding import IndexFingerprints
-from manicule.core.ids import content_hash, document_id
+from manicule.core.ids import content_hash, document_id, vector_id
 from manicule.core.sources import Watermark
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
@@ -387,6 +387,127 @@ async def test_deleting_chunks_tombstones_their_vectors_and_the_sweep_removes_th
     await vectors.teardown()
 
 
+async def test_hard_delete_tombstones_the_active_physical_vectors(
+    store: SqliteDocStore,
+    data_dir: Path,
+    engine: AsyncEngine,
+) -> None:
+    """Every document and workspace cascade carries the exact generation-keyed Lance id."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
+
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    await _pipeline(store, vectors).run(fakes.DictConnector({"a": "alpha\nbeta"}))
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    chunks = list(await store.document_chunks(document.id))
+    physical = {vector_id(document.publication_id, chunk.id) for chunk in chunks}
+    other = SqliteDocStore(engine, workspace_id="other")
+    await other.ensure_workspace()
+    await other.delete_document(document.id)
+    assert await store.get_document(document.id) is not None, "another workspace cannot delete it"
+
+    doomed = SqliteDocStore(engine, workspace_id="doomed")
+    await doomed.ensure_workspace()
+    doomed_document = make_document(
+        source="memory", source_id="workspace-member", workspace_id="doomed"
+    ).model_copy(update={"publication_id": "workspace-publication"})
+    doomed_document = await doomed.upsert_document(doomed_document)
+    doomed_chunk = make_chunk(doomed_document, 0, "workspace body")
+    await doomed.replace_chunks(doomed_document.id, [doomed_chunk])
+    await vectors.upsert(
+        [doomed_chunk],
+        [[0.3] * HashEmbedder().fingerprint.dimension],
+        publication_id=doomed_document.publication_id,
+    )
+    physical.add(vector_id(doomed_document.publication_id, doomed_chunk.id))
+    async with engine.begin() as connection:
+        await connection.execute(text("DELETE FROM workspaces WHERE id = 'doomed'"))
+
+    await store.delete_document(document.id)
+    tombstones = set(await store.take_tombstones(20))
+    assert physical <= tombstones
+    await sweep_vectors(store, vectors)
+    assert await vectors.count() == 0
+    await vectors.teardown()
+
+
+async def test_a_legacy_tombstone_survives_a_publication_to_publication_flip(
+    store: SqliteDocStore,
+    data_dir: Path,
+    engine: AsyncEngine,
+) -> None:
+    """P1 cleanup must not erase evidence for a still-present pre-publication vector."""
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(store, vectors)
+    connector = fakes.DictConnector({"a": "unchanged body"})
+    await pipeline.run(connector)
+    first = await store.find_document("memory", "a")
+    assert first is not None
+    chunks = list(await store.document_chunks(first.id))
+    assert len(chunks) == 1
+    legacy_id = chunks[0].id
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO vector_tombstones (chunk_id, deleted_at) "
+                "VALUES (:chunk_id, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING"
+            ),
+            {"chunk_id": legacy_id},
+        )
+
+    await pipeline.ingest_raw(
+        RawDocument(
+            source_id="a",
+            uri="memory://a",
+            media_type=fakes.MEDIA_TYPE,
+            content="unchanged body",
+            metadata={"revision_note": "metadata-only publication change"},
+        ),
+        source="memory",
+        force=True,
+        expected=first.revision,
+    )
+
+    second = await store.find_document("memory", "a")
+    assert second is not None
+    assert second.publication_id != first.publication_id
+    assert [chunk.id for chunk in await store.document_chunks(second.id)] == [legacy_id]
+    assert legacy_id in await store.take_tombstones(20)
+    await vectors.teardown()
+
+
+async def test_real_lance_retry_keeps_the_publication_after_float32_round_trip(
+    store: SqliteDocStore,
+    data_dir: Path,
+) -> None:
+    """Reused normalized float32 values identify the same publication as raw model output."""
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(store, vectors)
+    raw = RawDocument(source_id="a", uri="memory://a", media_type=fakes.MEDIA_TYPE, content="alpha")
+    first_outcome = await pipeline.ingest_raw(raw, source="memory", force=True)
+    first = await store.get_document(first_outcome[0].document_id)
+    assert first is not None
+
+    second_outcome = await pipeline.ingest_raw(
+        raw,
+        source="memory",
+        force=True,
+        expected=first.revision,
+    )
+    second = await store.get_document(second_outcome[0].document_id)
+    assert second is not None
+    assert second.publication_id == first.publication_id
+    assert await vectors.count() == 1
+    tombstones = set(await store.take_tombstones(20))
+    chunks = await store.document_chunks(second.id)
+    assert vector_id(second.publication_id, chunks[0].id) not in tombstones
+    await vectors.teardown()
+
+
 async def test_failure_inside_relational_publication_rolls_back_every_derived_row(
     store: SqliteDocStore,
     data_dir: Path,
@@ -737,6 +858,48 @@ async def test_the_stores_guard_reads_an_absent_field_as_absent_rather_than_as_n
     assert miss.stored is not None
     assert miss.stored.title == moved.title, "and the row is left exactly as the winner wrote it"
     assert miss.stored.content_hash == moved.content_hash
+
+
+async def test_atomic_publication_cas_has_one_winner_across_two_real_sessions(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+) -> None:
+    """The conditional UPDATE is the first statement, so no stale read precedes the lock."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    original = await store.upsert_document(
+        make_document(source="memory", source_id="publication-race")
+    )
+    contenders = [
+        SqliteDocStore(engine),
+        SqliteDocStore(engine),
+    ]
+    replacements = [
+        original.model_copy(update={"title": title, "publication_id": publication})
+        for title, publication in (("left", "publication-left"), ("right", "publication-right"))
+    ]
+
+    async def publish(index: int) -> Commit:
+        return await contenders[index].publish_document(
+            replacements[index],
+            [],
+            expected=original.revision,
+            chunk_fp=None,
+            embed_fp=None,
+            parse_fp=None,
+            glossary_entries=None,
+            glossary_fp=None,
+            original_omitted_reason=None,
+        )
+
+    results = await asyncio.gather(publish(0), publish(1))
+
+    assert [result.committed for result in results].count(True) == 1
+    miss = next(result for result in results if not result.committed)
+    winner = next(result for result in results if result.committed)
+    assert miss.stored == winner.stored
+    assert await store.get_document(original.id) == winner.stored
 
 
 async def test_the_stores_guard_refuses_on_a_corrected_record_over_bytes_that_never_moved(
