@@ -108,6 +108,12 @@ the only placement that covers every connection the pool will ever open. A test 
 web request produce `SQLITE_BUSY` immediately rather than after a wait. WAL permits many
 readers with one writer; manicule keeps a single write path and lets readers run concurrently.
 
+Blob filenames are content addresses, while compression is a property of their stored
+representation. Concurrent writers publish with an atomic no-clobber hard link and then read the
+winning representation before recording its descriptor. This remains coherent across processes:
+every contender fsyncs the destination directory before its SQLite write, and all contenders
+derive the same compression and stored-size fields from the one immutable file.
+
 **Minimum SQLite 3.35**, checked at startup and reported by `doctor`, along with a probe that
 actually creates a temporary FTS5 table. Python's `sqlite3` links against whatever the
 platform provides, and a build without FTS5 fails at the first query rather than at install.

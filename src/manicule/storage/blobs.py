@@ -9,15 +9,19 @@ and the one whose result is not reproducible.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gzip
 import hashlib
 import json
 import os
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from sqlalchemy import delete, select, union
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.acquisition import AcquiredSource
 from manicule.core.content import RawDocument, Retention
@@ -41,6 +45,8 @@ with a stated reason, visible in diagnostics, never a silent partial success.
 
 _COMPRESSIBLE_PREFIXES = ("text/", "application/json", "application/xml")
 _COMPRESSIBLE_SUFFIXES = ("+json", "+xml")
+STAGING_PARTIAL_STALE_SECONDS = 24 * 60 * 60
+STAGING_PARTIAL_CLEANUP_LIMIT = 1_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +64,15 @@ class OmittedBlob:
     """What was not retained, and why."""
 
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class StagingCleanup:
+    """Bounded, privacy-preserving result of abandoned staging-file cleanup."""
+
+    scanned: int
+    removed: int
+    truncated: bool
 
 
 def should_compress(media_type: str | None) -> bool:
@@ -142,6 +157,104 @@ class BlobStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    @classmethod
+    def _publish_durable(cls, destination: Path, payload: bytes) -> bytes:
+        """Publish once across processes and return the representation that won.
+
+        A hard link is the POSIX no-clobber analogue of an atomic rename: exactly one
+        temporary inode can acquire ``destination``. Every contender then syncs the parent
+        before it may create a database reference, including one that observed another
+        process's newly linked name before that process reached its own directory sync.
+        """
+        cls._mkdir_durable(destination.parent)
+        temporary = destination.with_name(f"{destination.name}.{uuid4().hex}.partial")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.chmod(0o600)
+            with contextlib.suppress(FileExistsError):
+                os.link(temporary, destination)
+            cls._fsync_directory(destination.parent)
+            return destination.read_bytes()
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    async def _durable_thread_call[T](call: Callable[[], T]) -> T:
+        """Join an irreversible thread call before propagating task cancellation."""
+        work = asyncio.create_task(asyncio.to_thread(call))
+        cancellation: asyncio.CancelledError | None = None
+        while not work.done():
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError as error:
+                # Cancellation cannot stop an OS thread. Repeated requests still wait for
+                # this irreversible call to reach a known endpoint before returning.
+                cancellation = error
+        result = work.result()
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    @classmethod
+    def _published_blob(
+        cls, destination: Path, data: bytes, digest: str, compression: str
+    ) -> StoredBlob:
+        proposed = gzip.compress(data, mtime=0) if compression == "gzip" else data
+        published = cls._publish_durable(destination, proposed)
+        if published == data:
+            actual_compression = "none"
+        else:
+            try:
+                decoded = gzip.decompress(published)
+            except (OSError, EOFError) as error:
+                msg = f"retained blob {digest} has an unrecognized representation"
+                raise OSError(msg) from error
+            if decoded != data:
+                msg = f"retained blob {digest} does not match its content address"
+                raise OSError(msg)
+            actual_compression = "gzip"
+        return StoredBlob(
+            hash=digest,
+            size_bytes=len(data),
+            stored_bytes=len(published),
+            compression=actual_compression,
+        )
+
+    async def _record_blob(self, stored: StoredBlob, media_type: str | None) -> None:
+        """Make SQLite describe the immutable representation that is already on disk."""
+        async with self._sessions.begin() as session:
+            await session.execute(
+                sqlite_insert(models.Blob)
+                .values(
+                    hash=stored.hash,
+                    algo="blake2b",
+                    media_type=media_type,
+                    size_bytes=stored.size_bytes,
+                    stored_bytes=stored.stored_bytes,
+                    compression=stored.compression,
+                )
+                .on_conflict_do_update(
+                    index_elements=[models.Blob.hash],
+                    set_={
+                        "size_bytes": stored.size_bytes,
+                        "stored_bytes": stored.stored_bytes,
+                        "compression": stored.compression,
+                    },
+                )
+            )
+
+    async def _store_blob(self, data: bytes, media_type: str | None) -> StoredBlob:
+        digest = content_hash(data)
+        compression = "gzip" if should_compress(media_type) else "none"
+        stored = await self._durable_thread_call(
+            lambda: self._published_blob(self.path_for(digest), data, digest, compression)
+        )
+        await self._record_blob(stored, media_type)
+        return stored
+
     async def put(self, data: bytes, media_type: str | None = None) -> StoredBlob | OmittedBlob:
         """Retain bytes, or say why they were not retained.
 
@@ -165,33 +278,7 @@ class BlobStore:
                 )
             )
 
-        digest = content_hash(data)
-        destination = self.path_for(digest)
-        compression = "gzip" if should_compress(media_type) else "none"
-        payload = gzip.compress(data, mtime=0) if compression == "gzip" else data
-
-        if not destination.exists():
-            self._write_durable(destination, payload)
-
-        stored = StoredBlob(
-            hash=digest,
-            size_bytes=len(data),
-            stored_bytes=len(payload),
-            compression=compression,
-        )
-        async with self._sessions.begin() as session:
-            if await session.get(models.Blob, digest) is None:
-                session.add(
-                    models.Blob(
-                        hash=digest,
-                        algo="blake2b",
-                        media_type=media_type,
-                        size_bytes=stored.size_bytes,
-                        stored_bytes=stored.stored_bytes,
-                        compression=compression,
-                    )
-                )
-        return stored
+        return await self._store_blob(data, media_type)
 
     async def retain(self, data: bytes, media_type: str | None = None) -> Retention:
         """:meth:`put`, expressed in the vocabulary the ingest pipeline speaks.
@@ -210,30 +297,70 @@ class BlobStore:
         self, key: str, raw: RawDocument
     ) -> tuple[Retention, AcquiredSource]:
         """Durably stage a complete source envelope so a pre-association crash can resume."""
+        await self.cleanup_staging_partials()
         acquired = AcquiredSource.from_raw(raw)
         data = raw.as_bytes()
         if len(data) > self._max_bytes:
             return await self.retain(data, raw.media_type), acquired
-        destination = self.path_for(acquired.content_hash)
         compression = "gzip" if should_compress(raw.media_type) else "none"
-        stored_payload = gzip.compress(data, mtime=0) if compression == "gzip" else data
-        if not destination.exists():
-            await asyncio.to_thread(self._write_durable, destination, stored_payload)
+        stored = await self._durable_thread_call(
+            lambda: self._published_blob(
+                self.path_for(acquired.content_hash),
+                data,
+                acquired.content_hash,
+                compression,
+            )
+        )
         payload = json.dumps(
             {
                 "blob_ref": acquired.content_hash,
-                "compression": compression,
+                "compression": stored.compression,
                 "acquired_source": acquired.model_dump(mode="json"),
             },
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        await asyncio.to_thread(self._write_durable, self._stage_path(key), payload)
-        retained = await self.retain(data, raw.media_type)
-        return retained, acquired
+        await self._durable_thread_call(lambda: self._write_durable(self._stage_path(key), payload))
+        await self._record_blob(stored, raw.media_type)
+        return Retention(ref=stored.hash), acquired
+
+    async def cleanup_staging_partials(
+        self,
+        *,
+        stale_after_seconds: float = STAGING_PARTIAL_STALE_SECONDS,
+        limit: int = STAGING_PARTIAL_CLEANUP_LIMIT,
+    ) -> StagingCleanup:
+        """Remove only old abandoned staging writes, reporting aggregate counts."""
+        root = self._root / "acquisition-staging"
+        if not root.exists() or limit <= 0:
+            return StagingCleanup(scanned=0, removed=0, truncated=False)
+        cutoff = time.time() - stale_after_seconds
+        candidates: list[Path] = []
+        scanned = 0
+        truncated = False
+        for path in root.iterdir():
+            if scanned == limit:
+                truncated = True
+                break
+            scanned += 1
+            if not path.is_file() or not path.name.endswith(".partial"):
+                continue
+            candidates.append(path)
+        removed = 0
+        for path in candidates:
+            try:
+                if path.stat().st_mtime <= cutoff:
+                    path.unlink()
+                    removed += 1
+            except FileNotFoundError:
+                continue
+        if removed:
+            await self._durable_thread_call(lambda: self._fsync_directory(root))
+        return StagingCleanup(scanned=scanned, removed=removed, truncated=truncated)
 
     async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None:
         """Recover a staged blob/envelope pair without contacting its source."""
+        await self.cleanup_staging_partials()
         path = self._stage_path(key)
         if not path.exists():
             return None
@@ -265,6 +392,7 @@ class BlobStore:
         await asyncio.to_thread(self._fsync_directory, path.parent)
 
     async def _staged_blob_refs(self) -> set[str]:
+        await self.cleanup_staging_partials()
         root = self._root / "acquisition-staging"
         if not root.exists():
             return set()
@@ -371,4 +499,11 @@ class BlobStore:
         return [path for path in blob_root.rglob("*") if path.is_file() and path.name not in known]
 
 
-__all__ = ["MAX_ORIGINAL_BYTES", "BlobStore", "OmittedBlob", "StoredBlob", "should_compress"]
+__all__ = [
+    "MAX_ORIGINAL_BYTES",
+    "BlobStore",
+    "OmittedBlob",
+    "StagingCleanup",
+    "StoredBlob",
+    "should_compress",
+]

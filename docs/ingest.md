@@ -810,6 +810,10 @@ Blob retention also writes a run-and-record-keyed staging envelope before the jo
 if the process stops in that narrow window, takeover recovers the staged hash and fetched source
 envelope instead of downloading the body again. The marker is removed only after the fenced
 `ACQUIRED` transition commits and pins the same blob.
+Durable staging writes are joined before task cancellation returns. A process death can still
+leave a temporary staging file; acquisition startup and blob inventory remove only day-old
+partials, in bounded batches whose report contains aggregate counts rather than source names,
+URIs or envelope contents.
 Authentication loss before that point leaves a typed retry and withholds the watermark;
 authentication loss afterwards cannot block parsing, embedding or publication because those
 phases make no connector calls. Missing, stale and deleted source bodies likewise remain typed

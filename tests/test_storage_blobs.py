@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import stat
+import threading
 from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy import text
 
+from manicule.core.content import RawDocument
 from manicule.core.ids import content_hash
 from manicule.storage.blobs import BlobStore, OmittedBlob, StoredBlob, should_compress
 from manicule.storage.docstore import SqliteDocStore
@@ -40,6 +44,54 @@ async def test_identical_bytes_are_stored_once(engine: AsyncEngine, data_dir: Pa
     assert isinstance(second, StoredBlob)
     assert first.hash == second.hash
     assert sum(1 for path in blobs.root.rglob("*") if path.is_file()) == 1
+
+
+async def test_concurrent_media_types_reuse_one_coherent_blob_representation(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same content address cannot let file bytes and SQLite compression disagree."""
+    blobs = BlobStore(engine, data_dir)
+    barrier = threading.Barrier(2)
+    original = BlobStore._publish_durable  # pyright: ignore[reportPrivateUsage]
+
+    def gated_publish(destination: Path, payload: bytes) -> bytes:
+        barrier.wait(timeout=5)
+        return original(destination, payload)
+
+    monkeypatch.setattr(BlobStore, "_publish_durable", staticmethod(gated_publish))
+    shared = b"the same source bytes " * 200
+    text_raw = RawDocument(
+        source_id="text-copy",
+        uri="https://private.invalid/text-copy",
+        media_type="text/plain",
+        content=shared,
+    )
+    binary_raw = text_raw.model_copy(
+        update={
+            "source_id": "binary-copy",
+            "uri": "https://private.invalid/binary-copy",
+            "media_type": "application/pdf",
+        }
+    )
+
+    text_result, binary_result = await asyncio.gather(
+        blobs.retain_acquisition("run\0text-copy", text_raw),
+        blobs.retain_acquisition("run\0binary-copy", binary_raw),
+    )
+    monkeypatch.setattr(BlobStore, "_publish_durable", staticmethod(original))
+
+    assert text_result[0].ref == binary_result[0].ref == content_hash(shared)
+    assert await blobs.get(content_hash(shared)) == shared
+    assert await blobs.verify(content_hash(shared))
+    stage_compressions = {
+        json.loads(path.read_text())["compression"]
+        for path in (blobs.root / "acquisition-staging").iterdir()
+    }
+    assert len(stage_compressions) == 1
+    assert (await blobs.resume_acquisition("run\0text-copy")) == text_result
+    assert (await blobs.resume_acquisition("run\0binary-copy")) == binary_result
 
 
 async def test_blob_file_and_destination_directory_are_fsynced_before_database_reference(
@@ -82,6 +134,71 @@ async def test_directory_fsync_failure_creates_no_database_reference(
     async with engine.connect() as connection:
         count = (await connection.execute(text("SELECT COUNT(*) FROM blobs"))).scalar_one()
     assert count == 0
+
+
+async def test_cancelled_staging_write_is_joined_before_cancellation_returns(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker thread cannot create a sensitive marker after its task has returned."""
+    blobs = BlobStore(engine, data_dir)
+    entered = threading.Event()
+    release = threading.Event()
+    original = BlobStore._write_durable  # pyright: ignore[reportPrivateUsage]
+
+    def gated_write(destination: Path, payload: bytes) -> None:
+        if destination.parent.name == "acquisition-staging":
+            entered.set()
+            assert release.wait(timeout=5)
+        original(destination, payload)
+
+    monkeypatch.setattr(BlobStore, "_write_durable", staticmethod(gated_write))
+    raw = RawDocument(
+        source_id="private-id",
+        uri="https://private.invalid/cancelled",
+        media_type="text/plain",
+        content="sensitive body",
+    )
+    task = asyncio.create_task(blobs.retain_acquisition("run\0private-id", raw))
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done(), "cancellation returned while the durable write thread was live"
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done(), "repeated cancellation detached the durable write thread"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    staging = blobs.root / "acquisition-staging"
+    assert not list(staging.glob("*.partial"))
+    assert len([path for path in staging.iterdir() if path.is_file()]) == 1
+
+
+async def test_stale_staging_partial_cleanup_is_bounded_and_aggregate_only(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Abandoned metadata is removed without inventory output disclosing its identity."""
+    blobs = BlobStore(engine, data_dir)
+    staging = blobs.root / "acquisition-staging"
+    staging.mkdir(parents=True)
+    for index in range(3):
+        path = staging / f"opaque-{index}.partial"
+        path.write_text(f"secret-uri-{index}")
+        os.utime(path, (1, 1))
+
+    report = await blobs.cleanup_staging_partials(stale_after_seconds=60, limit=2)
+
+    assert report.scanned == 2
+    assert report.removed == 2
+    assert report.truncated
+    assert "secret" not in repr(report)
+    fresh = staging / "active.partial"
+    fresh.write_text("still being written")
+    await blobs.cleanup_staging_partials(stale_after_seconds=60, limit=10)
+    assert fresh.exists()
 
 
 async def test_text_is_compressed_and_binary_is_not(engine: AsyncEngine, data_dir: Path) -> None:
