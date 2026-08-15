@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import os
+import socket
 import sys
 import threading
 import time
@@ -44,6 +45,7 @@ from manicule.ingest.workers import (
     default_worker_count,
 )
 from manicule.parsers.chain import Outcome, run_chain
+from tests.embedding_support import write_tokenizer
 from tests.ingest import fakes
 from tests.storage_helpers import make_document
 
@@ -684,6 +686,62 @@ async def test_middleware_and_chunker_output_never_materializes_in_serving_paren
     assert result.value is None
     if parent_before is not None and parent_after is not None:
         assert parent_after - parent_before < 8 * MEGABYTE
+
+
+async def test_stage_session_never_attempts_model_discovery_network(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chunking uses a local resolved tokenizer, never an embedder factory or HF discovery."""
+    del manicule_environment
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.settimeout(0.05)
+    attempted = threading.Event()
+    stopped = threading.Event()
+
+    def observe() -> None:
+        while not stopped.is_set():
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            attempted.set()
+            connection.close()
+
+    observer = threading.Thread(target=observe, name="stage-network-observer", daemon=True)
+    observer.start()
+    port = listener.getsockname()[1]
+    monkeypatch.setenv("HF_ENDPOINT", f"http://127.0.0.1:{port}")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty-hf-home"))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    tokenizer_file = tmp_path / "resolved-model" / "tokenizer.json"
+    write_tokenizer(tokenizer_file)
+    config = _config(
+        tmp_path,
+        stage_tokenizer_file=tokenizer_file,
+        stage_tokenizer_id="local-test-tokenizer",
+        stage_max_tokens=512,
+        stage_overlap_tokens=64,
+    )
+    try:
+        async with WorkerPool(config, workers=1, timeout_s=10.0) as pool:
+            result = await pool.run_before_parse(
+                _raw("text/plain"),
+                max_output_bytes=MEGABYTE,
+                memory_limit_bytes=1024 * MEGABYTE,
+            )
+    finally:
+        stopped.set()
+        listener.close()
+        observer.join(timeout=1)
+
+    assert result.reason is None
+    assert not attempted.is_set(), "the isolated offline stage opened a network socket"
 
 
 async def test_one_production_stage_session_preserves_stateful_middleware_parity(

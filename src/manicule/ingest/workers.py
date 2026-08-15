@@ -51,7 +51,7 @@ from multiprocessing.context import SpawnContext, SpawnProcess
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, Self, cast, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from manicule.ingest.limits import (
     ADDRESS_SPACE_HEADROOM,
@@ -66,6 +66,7 @@ if TYPE_CHECKING:
 
     from manicule.container.container import Container
     from manicule.core.content import Document, ParsedBlock, RawDocument
+    from manicule.core.fingerprints import ChunkFingerprint
     from manicule.core.protocols import Chunker
     from manicule.ingest.middleware import MiddlewareRunner
 
@@ -297,6 +298,36 @@ class WorkerConfig(BaseModel):
     plugins_disabled: tuple[str, ...] = ()
     plugin_config: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
     memory_limit_bytes: int = Field(default=1024 * MEGABYTE, ge=MEGABYTE)
+    stage_tokenizer_file: Path | None = None
+    stage_tokenizer_id: str | None = None
+    stage_max_tokens: int | None = Field(default=None, gt=0)
+    stage_overlap_tokens: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _complete_stage_tokenizer(self) -> Self:
+        """Refuse a partial local tokenizer binding rather than silently using a stand-in."""
+        values = (
+            self.stage_tokenizer_file,
+            self.stage_tokenizer_id,
+            self.stage_max_tokens,
+            self.stage_overlap_tokens,
+        )
+        if any(value is not None for value in values) and not all(
+            value is not None for value in values
+        ):
+            raise ValueError("the isolated stage tokenizer binding must be complete")
+        return self
+
+    def resolved_stage_tokenizer(self) -> tuple[Path, str, int, int] | None:
+        """Return the complete local tokenizer binding, if the serving runtime supplied it."""
+        if self.stage_tokenizer_file is None:
+            return None
+        return (
+            self.stage_tokenizer_file,
+            cast("str", self.stage_tokenizer_id),
+            cast("int", self.stage_max_tokens),
+            cast("int", self.stage_overlap_tokens),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,9 +477,10 @@ def _parser_builder(config: WorkerConfig) -> ParserBuilder:
 
 async def _stage_components(config: WorkerConfig) -> tuple[object, object, object]:
     """Construct one document-scoped production middleware/chunker session."""
+    from manicule.chunking import StructuralChunker, TokenCounter  # noqa: PLC0415
     from manicule.config.settings import Settings  # noqa: PLC0415 - child-only imports
-    from manicule.container import keys  # noqa: PLC0415
     from manicule.container.container import Container  # noqa: PLC0415
+    from manicule.embedding.runtimes.tokenization import FastTokenizer  # noqa: PLC0415
     from manicule.ingest.middleware import MiddlewareRunner  # noqa: PLC0415
     from manicule.plugins.registry import discover  # noqa: PLC0415
 
@@ -473,19 +505,38 @@ async def _stage_components(config: WorkerConfig) -> tuple[object, object, objec
     container = Container(settings, found.registry, discovery=found)
     try:
         middleware = MiddlewareRunner(await container.middleware())
-        # Chunk construction needs the configured embedder's tokenizer identity, not its model
-        # weights. ``aget`` would set up every construction dependency and load the platform's
-        # default embedding runtime inside this parse/chunk-only child (MLX on a Linux runner),
-        # turning a valid offline stage into CONFIGURATION and leaking its partially started
-        # lifecycle. ``get`` preserves the production chunker factory and exact token counter
-        # while keeping the zero-embedding boundary explicit.
-        chunker = container.get(keys.CHUNKER)
+        _require_structural_stage_chunker(config.chunker)
+        binding = config.resolved_stage_tokenizer()
+        if binding is not None:
+            tokenizer_file, tokenizer_id, max_tokens, overlap_tokens = binding
+            tokenizer = FastTokenizer(tokenizer_file)
+            counter = TokenCounter(
+                tokenizer_id,
+                lambda text: len(tokenizer.content_ids(text)),
+                provisional=False,
+            )
+            chunker = StructuralChunker(
+                counter,
+                max_tokens=max_tokens,
+                overlap_tokens=overlap_tokens,
+            )
+        else:
+            # Parse-only/test pools have no serving embedder to bind. The vocabulary loader is
+            # deliberately cache-only; unlike constructing the embedder component, it cannot
+            # discover a model card or contact Hugging Face.
+            chunker = StructuralChunker(TokenCounter.provisionally())
     except BaseException:
         with contextlib.suppress(BaseException):
             await container.aclose()
         raise
     else:
         return middleware, chunker, container
+
+
+def _require_structural_stage_chunker(name: str) -> None:
+    """Refuse a component that has no serializable, network-free stage construction yet."""
+    if name != "structural":
+        raise ValueError("offline stage isolation currently requires the structural chunker")
 
 
 async def _stage_in_child(
@@ -1452,7 +1503,9 @@ def _read_reply(connection: Connection) -> _Reply | _Killed:
     return _Killed(f"unexpected reply: {type(message).__name__}")
 
 
-def worker_config(settings: object) -> WorkerConfig:
+def worker_config(
+    settings: object, *, chunker: object | None = None, embedder: object | None = None
+) -> WorkerConfig:
     """Build a worker's configuration from the application's settings.
 
     Takes the settings object structurally so that this module — and therefore the pipeline
@@ -1464,6 +1517,26 @@ def worker_config(settings: object) -> WorkerConfig:
     if not isinstance(settings, Settings):  # pragma: no cover - a wiring mistake, not a path
         msg = f"expected Settings, got {type(settings).__name__}"
         raise TypeError(msg)
+    stage_tokenizer_file: Path | None = None
+    stage_tokenizer_id: str | None = None
+    stage_max_tokens: int | None = None
+    stage_overlap_tokens: int | None = None
+    fingerprint = getattr(chunker, "fingerprint", None)
+    card = getattr(embedder, "card", None)
+    if (
+        getattr(fingerprint, "chunker", None) == "structural"
+        and card is not None
+        and getattr(card, "path", None) is not None
+    ):
+        tokenizer_file = Path(card.path) / "tokenizer.json"
+        if not tokenizer_file.is_file():
+            msg = f"resolved embedding tokenizer is missing: {tokenizer_file}"
+            raise ValueError(msg)
+        resolved_fingerprint = cast("ChunkFingerprint", fingerprint)
+        stage_tokenizer_file = tokenizer_file
+        stage_tokenizer_id = resolved_fingerprint.tokenizer_id
+        stage_max_tokens = resolved_fingerprint.max_tokens
+        stage_overlap_tokens = resolved_fingerprint.overlap_tokens
     return WorkerConfig(
         workspace=settings.workspace,
         data_dir=settings.data_dir,
@@ -1475,6 +1548,10 @@ def worker_config(settings: object) -> WorkerConfig:
         plugins_disabled=settings.plugins.disabled,
         plugin_config=settings.plugins.config,
         memory_limit_bytes=settings.ingest.parse_memory_limit_mb * MEGABYTE,
+        stage_tokenizer_file=stage_tokenizer_file,
+        stage_tokenizer_id=stage_tokenizer_id,
+        stage_max_tokens=stage_max_tokens,
+        stage_overlap_tokens=stage_overlap_tokens,
     )
 
 
