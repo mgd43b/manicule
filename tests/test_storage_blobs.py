@@ -253,6 +253,30 @@ async def test_cancelled_staging_write_is_joined_before_cancellation_returns(
     assert len([path for path in staging.iterdir() if path.is_file()]) == 1
 
 
+async def test_durable_thread_failure_takes_precedence_over_cancellation() -> None:
+    """A storage refusal is not hidden by cancellation received while joining its thread."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def refusing_write() -> None:
+        entered.set()
+        assert release.wait(timeout=5)
+        msg = "synthetic durable write refusal"
+        raise OSError(msg)
+
+    task = asyncio.create_task(
+        BlobStore._durable_thread_call(refusing_write)  # pyright: ignore[reportPrivateUsage]
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+
+    with pytest.raises(OSError, match="durable write refusal"):
+        await task
+
+
 async def test_cancelled_marker_completion_waits_for_parent_fsync(
     engine: AsyncEngine,
     data_dir: Path,

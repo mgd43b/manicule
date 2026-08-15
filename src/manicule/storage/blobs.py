@@ -193,14 +193,20 @@ class BlobStore:
     async def _durable_thread_call[T](call: Callable[[], T]) -> T:
         """Join an irreversible thread call before propagating task cancellation."""
         work = asyncio.create_task(asyncio.to_thread(call))
+        current = asyncio.current_task()
         cancellation: asyncio.CancelledError | None = None
         while not work.done():
             try:
                 await asyncio.shield(work)
             except asyncio.CancelledError as error:
                 # Cancellation cannot stop an OS thread. Repeated requests still wait for
-                # this irreversible call to reach a known endpoint before returning.
+                # this irreversible call to reach a known endpoint before returning. Clear the
+                # request while joining so the next shield can suspend instead of spinning.
                 cancellation = error
+                if current is not None:
+                    current.uncancel()
+        # A durability failure is more informative than the cancellation that happened while
+        # it was in flight. Only restore cancellation after a successful, known endpoint.
         result = work.result()
         if cancellation is not None:
             raise cancellation
