@@ -21,6 +21,7 @@ from manicule.connectors import CursorExpiredError, NotFoundError, SessionExpire
 from manicule.core.acquisition import (
     AcquiredSource,
     AcquisitionFailureCode,
+    AcquisitionFence,
     AcquisitionRecord,
     AcquisitionRecordState,
     AcquisitionRunState,
@@ -50,13 +51,13 @@ from tests.fakes import HashEmbedder
 from tests.ingest import fakes
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
     from pathlib import Path
     from typing import Any
 
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-    from manicule.core.content import Chunk, Document
+    from manicule.core.content import Chunk, Document, ParsedBlock
     from manicule.core.sources import DiscoveredDoc, DocRef
     from manicule.storage.docstore import SqliteDocStore
 
@@ -1220,8 +1221,78 @@ async def test_expired_worker_is_fenced_before_publication_after_takeover(
     stored = await store.find_document(connector.name, "public-fenced-document")
 
     assert report.indexed == 0
-    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert report.error_type == "AcquisitionLeaseLostError"
     assert stored is None, "the expired generation made no document revision servable"
+
+
+async def test_takeover_after_the_pipeline_check_is_refused_inside_publication_transaction(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The relational write validates ownership again after any awaited dispatch gap."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    class GatedPublicationStore(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.arrived = asyncio.Event()
+            self.release = asyncio.Event()
+
+        @override
+        async def _fence_acquisition_mutation(
+            self, session: AsyncSession, fence: AcquisitionFence
+        ) -> None:
+            self.arrived.set()
+            await self.release.wait()
+            await super()._fence_acquisition_mutation(session, fence)
+
+    class EmptyChunker(fakes.BlockChunker):
+        @override
+        def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+            del document, blocks
+            return []
+
+    store = GatedPublicationStore()
+    await store.ensure_workspace()
+    lease_clock = fakes.ManualLeaseClock()
+    connector = fakes.DictConnector(
+        {"public-race": "public synthetic line"}, name="transaction-fenced-source"
+    )
+    chunker = EmptyChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=1,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await store.arrived.wait()
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    lease_clock.advance(2)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-after-check",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=1),
+    )
+    assert successor is not None
+    store.release.set()
+
+    report = await task
+
+    assert report.error_type == "AcquisitionLeaseLostError"
+    assert await store.find_document(connector.name, "public-race") is None
 
 
 @pytest.mark.parametrize(
@@ -1300,7 +1371,7 @@ async def test_takeover_fences_fetch_side_last_seen_and_status_writes(
     report = await task
     after = await store.find_document(source, source_id)
 
-    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert report.error_type == "AcquisitionLeaseLostError"
     assert after == before, "the stale worker changed last-seen/version metadata or status"
 
 
@@ -1377,7 +1448,7 @@ async def test_takeover_fences_hash_skip_and_failure_demotion(
     report = await task
     after = await store.find_document(connector.name, source_id)
 
-    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert report.error_type == "AcquisitionLeaseLostError"
     assert after == before, "the stale worker changed version/last-seen data or failure state"
 
 
@@ -1395,8 +1466,10 @@ async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_writ
             self.release_stage = asyncio.Event()
 
         @override
-        async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
-            await super().stage_vectors(publication_id, chunks)
+        async def fenced_stage_vectors(
+            self, fence: AcquisitionFence, publication_id: str, chunks: Sequence[Chunk]
+        ) -> None:
+            await super().fenced_stage_vectors(fence, publication_id, chunks)
             self.staged.set()
             await self.release_stage.wait()
 
@@ -1440,7 +1513,7 @@ async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_writ
 
     report = await task
 
-    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert report.error_type == "AcquisitionLeaseLostError"
     assert vectors.rows == {}, "the stale worker wrote vectors after its staged-store await"
 
     fetches = list(connector.fetches)
@@ -2494,8 +2567,6 @@ async def test_stale_retained_failure_cannot_overwrite_an_indexed_winners_origin
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Failure retention and its guarded row are one commit, not a trailing setter."""
-    from sqlalchemy.ext.asyncio import AsyncSession  # noqa: PLC0415
-
     from manicule.core.content import DocumentRevision  # noqa: PLC0415
     from manicule.storage import models  # noqa: PLC0415
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
@@ -2608,8 +2679,6 @@ async def test_initial_failure_rolls_back_retained_reference_with_its_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The expected=None path cannot expose half of its retention decision."""
-    from sqlalchemy.ext.asyncio import AsyncSession  # noqa: PLC0415
-
     from tests.storage_helpers import make_document  # noqa: PLC0415
 
     retained_ref = (await BlobStore(engine, data_dir).retain(b"failed source", "text/plain")).ref

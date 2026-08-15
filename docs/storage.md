@@ -1419,10 +1419,16 @@ disclosure itself is discharged here.
    Lance persists before hashing, so a reused vector's read/write round trip keeps the same id.
 2. Write vector tombstones for that publication's physical row ids, then stage every vector.
    The logical chunk id remains stable; the physical id includes the publication, so changed
-   `embed_text` cannot overwrite the vector the active revision still uses.
+   `embed_text` cannot overwrite the vector the active revision still uses. Non-legacy rows are
+   insert-only: because the publication id hashes the normalized vector values too, a stale
+   generation completing an external Lance write after takeover cannot replace a successor's
+   row. It can only leave an inert, tombstoned row that no relational pointer selects.
 3. In one SQLite transaction, replace the document, chunks, glossary and lineage; set
    `documents.publication_id`; retire the old publication's vector ids; and clear the new
-   publication's tombstones.
+   publication's tombstones. For durable connector attempts, the transaction's first statement
+   is a conditional write validating the exact workspace/run/owner/generation and unexpired,
+   unsettled, non-superseded lease. It holds SQLite's writer lock through the complete flip, so
+   takeover and publication are ordered rather than separated by an awaited guard.
 
 - **Crash before or during 2** — SQLite still points to the old publication, so its document,
   chunks, glossary, lineage and vectors remain wholly servable. Any staged rows are rejected by

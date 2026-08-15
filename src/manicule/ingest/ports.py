@@ -20,12 +20,13 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from manicule.core.acquisition import UNSET, UnsetValue
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Collection, Sequence
+    from collections.abc import AsyncIterator, Collection, Mapping, Sequence
     from datetime import datetime
 
     from manicule.core.acquisition import (
         AcquiredSource,
         AcquisitionDiagnostic,
+        AcquisitionFence,
         AcquisitionRecord,
         AcquisitionRecordState,
         AcquisitionRun,
@@ -456,6 +457,63 @@ class AcquisitionStore(Protocol):
 
 
 @runtime_checkable
+class FencedIngestStore(Protocol):
+    """Attempt-owned writes whose lease guard is inside their storage transaction."""
+
+    async def fenced_record_seen(
+        self,
+        fence: AcquisitionFence,
+        document_id: str,
+        *,
+        version_token: str | None = None,
+    ) -> None: ...
+
+    async def fenced_set_status(
+        self, fence: AcquisitionFence, document_id: str, status: DocumentStatus, detail: str = ""
+    ) -> None: ...
+
+    async def fenced_annotate(
+        self, fence: AcquisitionFence, document_id: str, updates: Mapping[str, object]
+    ) -> None: ...
+
+    async def fenced_publish_failure(
+        self,
+        fence: AcquisitionFence,
+        document: Document,
+        *,
+        expected: DocumentRevision | None,
+        original_omitted_reason: str | None,
+    ) -> Commit: ...
+
+    async def fenced_publish_document(
+        self,
+        fence: AcquisitionFence,
+        document: Document,
+        chunks: Sequence[Chunk],
+        *,
+        expected: DocumentRevision | None,
+        chunk_fp: str | None,
+        embed_fp: str | None,
+        parse_fp: str | None,
+        glossary_entries: Sequence[GlossaryEntry] | None,
+        glossary_fp: str | None,
+        original_omitted_reason: str | None,
+    ) -> Commit: ...
+
+    async def fenced_publish_record(
+        self,
+        fence: AcquisitionFence,
+        document: Document,
+        *,
+        expected: DocumentRevision | None,
+    ) -> Commit: ...
+
+    async def fenced_stage_vectors(
+        self, fence: AcquisitionFence, publication_id: str, chunks: Sequence[Chunk]
+    ) -> None: ...
+
+
+@runtime_checkable
 class GlossaryWriter(Protocol):
     """A store that can hold the definitions a document states.
 
@@ -521,4 +579,10 @@ class GlossaryStore(GlossaryWriter, Protocol):
         ...
 
 
-__all__ = ["AcquisitionStore", "GlossaryStore", "GlossaryWriter", "IngestStore"]
+__all__ = [
+    "AcquisitionStore",
+    "FencedIngestStore",
+    "GlossaryStore",
+    "GlossaryWriter",
+    "IngestStore",
+]

@@ -65,6 +65,7 @@ from manicule.core.acquisition import (
     AcquiredSource,
     AcquisitionDiagnostic,
     AcquisitionFailureCode,
+    AcquisitionFence,
     AcquisitionRecord,
     AcquisitionRecordState,
     AcquisitionRunState,
@@ -82,6 +83,7 @@ from manicule.core.content import (
 )
 from manicule.core.embedding import canonical_stored_vector
 from manicule.core.errors import (
+    AcquisitionLeaseLostError,
     ChunkingError,
     ContextOverflowError,
     MiddlewareViolationError,
@@ -92,7 +94,7 @@ from manicule.core.sources import DiscoveredDoc
 from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
 from manicule.ingest.glossary_lineage import glossary_fingerprint
-from manicule.ingest.ports import AcquisitionStore, GlossaryWriter
+from manicule.ingest.ports import AcquisitionStore, FencedIngestStore, GlossaryWriter
 from manicule.ingest.refusals import require_measured
 from manicule.ingest.stages import Conveyor, CountedLock, Gauge, StageReport
 from manicule.ingest.workers import AttemptResult, default_worker_count
@@ -130,7 +132,7 @@ turns that into a frame on its own tick, which is what keeps a slow reader from 
 backpressure on the pipeline.
 """
 
-type _PublicationFence = Callable[[], Awaitable[None]]
+type _PublicationFence = Callable[[], Awaitable[AcquisitionFence]]
 
 
 _publication_fence: ContextVar[_PublicationFence | None] = ContextVar(
@@ -150,10 +152,6 @@ class _StageError(Exception):
         super().__init__(detail)
         self.stage = stage
         self.detail = detail
-
-
-class _LostAcquisitionLeaseError(RuntimeError):
-    """The current acquisition attempt no longer owns its fencing generation."""
 
 
 class _AcquisitionRetentionError(RuntimeError):
@@ -661,6 +659,12 @@ class IngestPipeline:
         # stores and unit tests. Production wires the SQLite acquisition store here, making the
         # blob-backed snapshot path the normal connector topology rather than structural guesswork.
         self._acquisitions = acquisitions
+        self._fenced_store = (
+            store if acquisitions is not None and isinstance(store, FencedIngestStore) else None
+        )
+        if acquisitions is not None and self._fenced_store is None:
+            msg = "durable acquisition requires transaction-fenced document publication"
+            raise TypeError(msg)
         self._acquisition_lease_s = max(1.0, acquisition_lease_s)
         self._acquisition_clock = acquisition_clock or (lambda: datetime.now(UTC))
         self._acquisition_history_s = max(0.0, acquisition_history_s)
@@ -976,7 +980,7 @@ class IngestPipeline:
         )
         if not released:
             msg = "the unfinished acquisition lease changed before orderly release"
-            raise _LostAcquisitionLeaseError(msg)
+            raise AcquisitionLeaseLostError(msg)
 
     async def _drive(self, run: _Sync) -> None:
         """Start every stage, and return when discovery is spent and every acceptance is done.
@@ -1255,13 +1259,19 @@ class IngestPipeline:
             _raise_lost_acquisition_lease(run.acquisition_run_id)
         run.lease_expires_at = expires_at
 
-    async def _fence_acquisition_publication(self, run: _Sync) -> None:
+    async def _fence_acquisition_publication(self, run: _Sync) -> AcquisitionFence:
         """Prove ownership immediately before a journal consumer makes bytes servable."""
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover - callback exists only for journal runs
-            return
-        await self._keep_acquisition_lease_live(
-            run, acquisitions, self._acquisition_clock(), force=True
+            msg = "an acquisition publication fence was requested outside a durable run"
+            raise RuntimeError(msg)
+        now = self._acquisition_clock()
+        await self._keep_acquisition_lease_live(run, acquisitions, now, force=True)
+        return AcquisitionFence(
+            run_id=run.acquisition_run_id,
+            owner=run.lease_owner,
+            generation=run.lease_generation,
+            now=now,
         )
 
     async def _acquire_journal(self, run: _Sync) -> bool:
@@ -1376,8 +1386,7 @@ class IngestPipeline:
                     blob_ref=existing.original_ref if existing is not None else None,
                     fetched_version_token=record.source.version_token,
                 )
-                await self._fence_acquisition_publication(run)
-                await self._store.record_seen(existing.id)  # pyright: ignore[reportOptionalMemberAccess]
+                await self._record_seen(existing.id)  # pyright: ignore[reportOptionalMemberAccess]
                 run.report.record(
                     DocumentOutcome(
                         source_id=record.source.source_id,
@@ -2032,8 +2041,7 @@ class IngestPipeline:
         existing = await self._store.find_document(source, source_id)
 
         if self._unchanged_by_token(existing, discovered):
-            await self._check_publication_fence()
-            await self._store.record_seen(existing.id)  # pyright: ignore[reportOptionalMemberAccess]
+            await self._record_seen(existing.id)  # pyright: ignore[reportOptionalMemberAccess]
             return DocumentOutcome(
                 source_id=source_id,
                 status=existing.status,  # pyright: ignore[reportOptionalMemberAccess]
@@ -2148,13 +2156,15 @@ class IngestPipeline:
             existing = await self._store.find_document(source, raw.source_id)
 
         if not force and self._unchanged_by_hash(existing, digest, raw):
-            await self._check_publication_fence()
-            await self._store.record_seen(existing.id, version_token=version_token)  # pyright: ignore[reportOptionalMemberAccess]
+            if existing is None:  # pragma: no cover - the predicate rejects absence
+                msg = "hash-unchanged requires an existing document"
+                raise RuntimeError(msg)
+            await self._record_seen(existing.id, version_token=version_token)
             return (
                 DocumentOutcome(
                     source_id=raw.source_id,
-                    status=existing.status,  # pyright: ignore[reportOptionalMemberAccess]
-                    document_id=existing.id,  # pyright: ignore[reportOptionalMemberAccess]
+                    status=existing.status,
+                    document_id=existing.id,
                     skipped="hash",
                 ),
                 (),
@@ -2589,18 +2599,34 @@ class IngestPipeline:
         publication = self._publication_of(document, [])
         settled = document.model_copy(update={"publication_id": publication})
         entries, glossary_fp, glossary_detail = self._derive_definitions(settled, [])
-        await self._check_publication_fence()
-        committed = await self._store.publish_document(
-            settled,
-            [],
-            expected=expected,
-            chunk_fp=None,
-            embed_fp=None,
-            parse_fp=self._parse_lineage_of(settled),
-            glossary_entries=entries,
-            glossary_fp=glossary_fp,
-            original_omitted_reason=retention.omitted_reason,
-        )
+        fence = await self._publication_authority()
+        publisher = self._fenced_store if fence is not None else None
+        publish = publisher.fenced_publish_document if publisher is not None else None
+        if fence is not None and publish is not None:
+            committed = await publish(
+                fence,
+                settled,
+                [],
+                expected=expected,
+                chunk_fp=None,
+                embed_fp=None,
+                parse_fp=self._parse_lineage_of(settled),
+                glossary_entries=entries,
+                glossary_fp=glossary_fp,
+                original_omitted_reason=retention.omitted_reason,
+            )
+        else:
+            committed = await self._store.publish_document(
+                settled,
+                [],
+                expected=expected,
+                chunk_fp=None,
+                embed_fp=None,
+                parse_fp=self._parse_lineage_of(settled),
+                glossary_entries=entries,
+                glossary_fp=glossary_fp,
+                original_omitted_reason=retention.omitted_reason,
+            )
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
         return committed.stored, glossary_detail
@@ -2638,25 +2664,44 @@ class IngestPipeline:
                     "failed_stage": None,
                 }
             )
-            await self._check_publication_fence()
+            fence = await self._publication_authority()
+            publisher = self._fenced_store if fence is not None else None
             if existing is None or existing.publication_id != publication:
-                await self._store.stage_vectors(publication, chunks)
+                if fence is not None and publisher is not None:
+                    await publisher.fenced_stage_vectors(fence, publication, chunks)
+                else:
+                    await self._store.stage_vectors(publication, chunks)
             await self._check_publication_fence()
             await self._vectors.upsert(chunks, vectors, publication_id=publication)
             entries, glossary_fp, glossary_detail = self._derive_definitions(document, chunks)
-            await self._check_publication_fence()
-            committed = await self._store.publish_document(
-                indexed_document,
-                chunks,
-                expected=expected,
-                chunk_fp=self._chunk_fingerprint.canonical(),
-                embed_fp=self._embedder.fingerprint.canonical(),
-                parse_fp=self._parse_lineage_of(document),
-                glossary_entries=entries,
-                glossary_fp=glossary_fp,
-                original_omitted_reason=retention.omitted_reason,
-            )
-        except _LostAcquisitionLeaseError:
+            fence = await self._publication_authority()
+            publisher = self._fenced_store if fence is not None else None
+            if fence is not None and publisher is not None:
+                committed = await publisher.fenced_publish_document(
+                    fence,
+                    indexed_document,
+                    chunks,
+                    expected=expected,
+                    chunk_fp=self._chunk_fingerprint.canonical(),
+                    embed_fp=self._embedder.fingerprint.canonical(),
+                    parse_fp=self._parse_lineage_of(document),
+                    glossary_entries=entries,
+                    glossary_fp=glossary_fp,
+                    original_omitted_reason=retention.omitted_reason,
+                )
+            else:
+                committed = await self._store.publish_document(
+                    indexed_document,
+                    chunks,
+                    expected=expected,
+                    chunk_fp=self._chunk_fingerprint.canonical(),
+                    embed_fp=self._embedder.fingerprint.canonical(),
+                    parse_fp=self._parse_lineage_of(document),
+                    glossary_entries=entries,
+                    glossary_fp=glossary_fp,
+                    original_omitted_reason=retention.omitted_reason,
+                )
+        except AcquisitionLeaseLostError:
             raise
         except Exception as exc:  # noqa: BLE001 - a store failure is this document's
             return await self._demote(
@@ -2685,67 +2730,33 @@ class IngestPipeline:
         Raises:
             _SupersededError: The stored document is no longer ``expected``, so nothing was written.
         """
-        await self._check_publication_fence()
-        if expected is None:
+        fence = await self._publication_authority()
+        publisher = self._fenced_store if fence is not None else None
+        if fence is not None and publisher is not None:
+            committed = await publisher.fenced_publish_record(fence, document, expected=expected)
+        elif expected is None:
             return await self._store.upsert_document(document)
-        committed = await self._store.commit_document(document, expected=expected)
+        else:
+            committed = await self._store.commit_document(document, expected=expected)
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
         return committed.stored
 
+    async def _publication_authority(self) -> AcquisitionFence | None:
+        fence = _publication_fence.get()
+        return None if fence is None else await fence()
+
     async def _check_publication_fence(self) -> None:
         """Run the task-local acquisition fence at the last point before publication."""
-        fence = _publication_fence.get()
-        if fence is not None:
-            await fence()
+        await self._publication_authority()
 
-    async def _store_definitions(self, document: Document, chunks: Sequence[Chunk]) -> str:
-        """Read this document's glossary definitions and make them its stored ones.
-
-        **Unconditionally a replace, including with an empty list.** A document that used to
-        define three terms and now defines none has to end up with none — writing only when
-        something was found would leave the old three answering queries, cited to a page that
-        no longer says them. That is the failure this whole feature could most easily
-        introduce: a definition that is wrong, confident, and looks exactly like a right one.
-
-        **The write carries its own lineage**, so the entries and the statement of what produced
-        them are one transaction. That is what makes an empty glossary a derived result rather
-        than an absence: a document with no entries and a recorded fingerprint has been read by
-        the current detector, and one with no entries and no fingerprint has not.
-
-        **A detector failure fails closed and says so.** ``detect_entries`` is regular
-        expressions over lines and has no model to be unavailable, so it raising means a bug in
-        this repository — and the two things that must not happen then are the two that would be
-        automatic. Nothing is written, so the entries a working detector produced stay exactly
-        where they are and stay servable; and the fingerprint is not advanced, so this document
-        remains selected by ``document reindex --stale-glossary`` and by ``doctor`` until the
-        fix ships. The rest of the ingest is unaffected: chunks, vectors and the other three
-        lineages are this document's index, and a glossary bug is not allowed to cost them.
-
-        Returns:
-            Why detection did not produce this document's entries, or the empty string when it
-            did — or when there was nothing for it to do.
-        """
-        entries, fingerprint, detail = self._derive_definitions(document, chunks)
-        if fingerprint is None:
-            return detail
-        if entries is None:
-            # Detection is switched off. The rows are left exactly as they are, which is what
-            # `rag.glossary.detect_on_ingest` promises an operator investigating a detector that
-            # is producing rubbish — and the lineage records that no detector ran, which is a
-            # value in the column rather than an absence somebody has to interpret. Switching
-            # detection back on changes the installed fingerprint, so every document stamped
-            # this way is selected by the next survey.
-            await self._check_publication_fence()
-            await self._store.set_lineage(
-                document.id, chunk_fp=None, embed_fp=None, glossary_fp=fingerprint
-            )
-            return detail
-        if self._glossary is None:  # pragma: no cover - entries imply an installed writer
-            return detail
-        await self._check_publication_fence()
-        await self._glossary.replace_glossary_entries(document.id, entries, fingerprint=fingerprint)
-        return detail
+    async def _record_seen(self, document_id: str, *, version_token: str | None = None) -> None:
+        fence = await self._publication_authority()
+        publisher = self._fenced_store if fence is not None else None
+        if fence is not None and publisher is not None:
+            await publisher.fenced_record_seen(fence, document_id, version_token=version_token)
+            return
+        await self._store.record_seen(document_id, version_token=version_token)
 
     def _derive_definitions(
         self, document: Document, chunks: Sequence[Chunk]
@@ -3104,12 +3115,21 @@ class IngestPipeline:
         )
         if result.status is not DocumentStatus.FAILED:
             return document
-        await self._check_publication_fence()
-        committed = await self._store.publish_failure(
-            document,
-            expected=expected,
-            original_omitted_reason=retention.omitted_reason,
-        )
+        fence = await self._publication_authority()
+        publisher = self._fenced_store if fence is not None else None
+        if fence is not None and publisher is not None:
+            committed = await publisher.fenced_publish_failure(
+                fence,
+                document,
+                expected=expected,
+                original_omitted_reason=retention.omitted_reason,
+            )
+        else:
+            committed = await self._store.publish_failure(
+                document,
+                expected=expected,
+                original_omitted_reason=retention.omitted_reason,
+            )
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
         return committed.stored
@@ -3177,18 +3197,25 @@ class IngestPipeline:
         """
         if existing is None or existing.status is DocumentStatus.INDEXED:
             return
-        await self._check_publication_fence()
-        await self._store.set_status(existing.id, status)
+        fence = await self._publication_authority()
+        publisher = self._fenced_store if fence is not None else None
+        if fence is not None and publisher is not None:
+            await publisher.fenced_set_status(fence, existing.id, status)
+        else:
+            await self._store.set_status(existing.id, status)
 
     async def _observe(self, document: Document) -> None:
         """Let hooks see a committed document. Their failure is theirs, not the document's."""
         try:
             await self._middleware.after_store(document)
         except Exception as exc:  # noqa: BLE001 - the document is already committed
-            await self._check_publication_fence()
-            await self._store.annotate(
-                document.id, {"last_after_store_error": f"{type(exc).__name__}: {exc}"}
-            )
+            updates: Metadata = {"last_after_store_error": f"{type(exc).__name__}: {exc}"}
+            fence = await self._publication_authority()
+            publisher = self._fenced_store if fence is not None else None
+            if fence is not None and publisher is not None:
+                await publisher.fenced_annotate(fence, document.id, updates)
+            else:
+                await self._store.annotate(document.id, updates)
 
     async def _fail(
         self,
@@ -3245,10 +3272,13 @@ class IngestPipeline:
         does not cost anybody a document that was working five minutes ago.
         """
         was_indexed = existing is not None and existing.status is DocumentStatus.INDEXED
-        await self._check_publication_fence()
-        await self._store.annotate(
-            document.id, {"last_ingest_error": {"stage": stage.value, "detail": detail}}
-        )
+        updates: Metadata = {"last_ingest_error": {"stage": stage.value, "detail": detail}}
+        fence = await self._publication_authority()
+        publisher = self._fenced_store if fence is not None else None
+        if fence is not None and publisher is not None:
+            await publisher.fenced_annotate(fence, document.id, updates)
+        else:
+            await self._store.annotate(document.id, updates)
         if was_indexed:
             return DocumentOutcome(
                 source_id=document.source_id,
@@ -3257,16 +3287,21 @@ class IngestPipeline:
                 detail=detail,
                 failed_stage=stage,
             )
-        await self._check_publication_fence()
-        await self._store.upsert_document(
-            document.model_copy(
-                update={
-                    "status": DocumentStatus.FAILED,
-                    "status_detail": detail,
-                    "failed_stage": stage,
-                }
-            )
+        failed = document.model_copy(
+            update={
+                "status": DocumentStatus.FAILED,
+                "status_detail": detail,
+                "failed_stage": stage,
+            }
         )
+        fence = await self._publication_authority()
+        publisher = self._fenced_store if fence is not None else None
+        if fence is not None and publisher is not None:
+            committed = await publisher.fenced_publish_record(fence, failed, expected=None)
+            if not committed.committed:
+                raise _SupersededError(committed.stored)
+        else:
+            await self._store.upsert_document(failed)
         return DocumentOutcome(
             source_id=document.source_id,
             status=DocumentStatus.FAILED,
@@ -3355,7 +3390,7 @@ def _writer_of(store: object) -> GlossaryWriter | None:
 
 def _raise_lost_acquisition_lease(run_id: str) -> None:
     msg = f"acquisition lease for run {run_id!r} was lost"
-    raise _LostAcquisitionLeaseError(msg)
+    raise AcquisitionLeaseLostError(msg)
 
 
 def _with_status(document: Document, result: ChainResult) -> Document:

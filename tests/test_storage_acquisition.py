@@ -440,6 +440,40 @@ async def test_claim_or_create_serializes_repeated_sync_requests(
     assert sum(run is not None for run in persisted) == 1
 
 
+async def test_claim_reconciles_every_legacy_overlap_to_one_authoritative_safe_run(
+    store: SqliteDocStore,
+) -> None:
+    older = await _claimed_run(store, "older-safe", "wiki", "older-owner")
+    newer = await _claimed_run(store, "newer-safe", "wiki", "newer-owner")
+
+    blocked = await store.claim_or_create_acquisition_run(
+        "wiki",
+        "unused",
+        "third-owner",
+        now=_NOW,
+        expires_at=_NOW + timedelta(minutes=1),
+    )
+
+    assert blocked is None, "the authoritative newer run still has a live owner"
+    authoritative = await store.get_acquisition_run(newer.id)
+    superseded = await store.get_acquisition_run(older.id)
+    assert authoritative is not None
+    assert authoritative.superseded_at is None
+    assert superseded is not None
+    assert superseded.superseded_by == authoritative.id
+    assert superseded.lease_generation == older.lease_generation + 1
+    assert (
+        await store.renew_acquisition_lease(
+            older.id,
+            "older-owner",
+            older.lease_generation,
+            now=_NOW,
+            expires_at=_NOW + timedelta(minutes=2),
+        )
+        is False
+    )
+
+
 async def test_an_active_connector_does_not_block_an_independent_connector(
     store: SqliteDocStore,
 ) -> None:

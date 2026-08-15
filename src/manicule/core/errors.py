@@ -91,6 +91,10 @@ class ChunkingError(ManiculeError):
     """A chunker could not produce chunks from a document's blocks."""
 
 
+class AcquisitionLeaseLostError(ManiculeError):
+    """An attempt-owned mutation no longer holds its persisted fencing generation."""
+
+
 class NameInUseError(ManiculeError):
     """A workspace already has a collection or a tag under the name that was asked for.
 
@@ -274,6 +278,7 @@ class TokenStateError(ManiculeError):
 
 
 __all__ = [
+    "AcquisitionLeaseLostError",
     "ChunkingError",
     "CircularDependencyError",
     "ConfigError",

@@ -15,6 +15,7 @@ from manicule.core.acquisition import (
     AcquiredSource,
     AcquisitionDiagnostic,
     AcquisitionFailureCode,
+    AcquisitionFence,
     AcquisitionRecord,
     AcquisitionRecordState,
     AcquisitionRun,
@@ -23,7 +24,7 @@ from manicule.core.acquisition import (
     AcquisitionStage,
     UnsetValue,
 )
-from manicule.core.errors import ManiculeError, UnknownEntityError
+from manicule.core.errors import AcquisitionLeaseLostError, ManiculeError, UnknownEntityError
 from manicule.core.sources import Watermark
 from manicule.storage import models
 from manicule.storage.scoped import WorkspaceScoped
@@ -273,40 +274,45 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             if connector_row is None:
                 msg = f"connector {connector!r} is unavailable"
                 raise AcquisitionConflictError(msg)
-            rows = (
-                await session.execute(
-                    select(models.AcquisitionRun)
-                    .where(
-                        models.AcquisitionRun.workspace_id == self._workspace_id,
-                        models.AcquisitionRun.connector_id == connector_row.id,
-                        models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
-                        models.AcquisitionRun.superseded_at.is_(None),
-                    )
-                    .order_by(
-                        models.AcquisitionRun.created_at.desc(), models.AcquisitionRun.id.desc()
+            candidates = (
+                (
+                    await session.execute(
+                        select(models.AcquisitionRun)
+                        .where(
+                            models.AcquisitionRun.workspace_id == self._workspace_id,
+                            models.AcquisitionRun.connector_id == connector_row.id,
+                            models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                            models.AcquisitionRun.superseded_at.is_(None),
+                        )
+                        .order_by(
+                            models.AcquisitionRun.created_at.desc(), models.AcquisitionRun.id.desc()
+                        )
                     )
                 )
-            ).scalars()
-            row: models.AcquisitionRun | None = None
-            superseded: list[models.AcquisitionRun] = []
-            for candidate in rows:
+                .scalars()
+                .all()
+            )
+            safe: list[models.AcquisitionRun] = []
+            for candidate in candidates:
                 base_is_current = candidate.base_watermark == connector_row.watermark
                 committed_is_current = (
                     candidate.watermark_committed_at is not None
                     and candidate.candidate_watermark == connector_row.watermark
                 )
                 if base_is_current or committed_is_current:
-                    row = candidate
-                    break
-                # A newer successful run moved the connector past this one. Make that decision
-                # durable and bump the fence before considering a new run; an old process can
-                # no longer mutate it even if its wall-clock lease has time remaining.
+                    safe.append(candidate)
+            # Ordering above makes the first safe run authoritative. Every other overlap is
+            # fenced in this same writer transaction, including an older live owner with the
+            # same base watermark. Leaving it active would preserve the duplicate-run race this
+            # API exists to reconcile on upgraded databases.
+            row = safe[0] if safe else None
+            superseded = [candidate for candidate in candidates if candidate is not row]
+            for candidate in superseded:
                 candidate.superseded_at = utcnow()
                 candidate.lease_owner = None
                 candidate.lease_expires_at = None
                 candidate.lease_generation += 1
                 candidate.updated_at = utcnow()
-                superseded.append(candidate)
             if row is None:
                 row = models.AcquisitionRun(
                     id=run_id,
@@ -877,6 +883,35 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 ),
             )
             return result.rowcount
+
+    async def _fence_acquisition_mutation(
+        self, session: AsyncSession, fence: AcquisitionFence
+    ) -> None:
+        """Take SQLite's writer lock while validating the exact durable generation.
+
+        Fenced document helpers call this as their transaction's first statement. Therefore a
+        takeover either commits before this check (and the mutation is refused) or waits until
+        the guarded mutation commits; there is no check-then-await window between the two.
+        """
+        result = cast(
+            "CursorResult[Any]",
+            await session.execute(
+                update(models.AcquisitionRun)
+                .where(
+                    models.AcquisitionRun.id == fence.run_id,
+                    models.AcquisitionRun.workspace_id == self._workspace_id,
+                    models.AcquisitionRun.lease_owner == fence.owner,
+                    models.AcquisitionRun.lease_generation == fence.generation,
+                    models.AcquisitionRun.lease_expires_at > fence.now,
+                    models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                    models.AcquisitionRun.superseded_at.is_(None),
+                )
+                .values(lease_generation=models.AcquisitionRun.lease_generation)
+            ),
+        )
+        if result.rowcount != 1:
+            msg = f"acquisition run {fence.run_id!r} lease changed or expired"
+            raise AcquisitionLeaseLostError(msg)
 
     async def _ensure_connector(self, session: AsyncSession, connector: str) -> models.Connector:
         row = (

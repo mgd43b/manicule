@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
     from sqlalchemy.sql.elements import ColumnElement
 
+    from manicule.core.acquisition import AcquisitionFence
     from manicule.core.content import Chunk
     from manicule.core.glossary import GlossaryEntry
 
@@ -234,21 +235,53 @@ class SqliteDocStore(
                 return Commit(committed=False, stored=stored)
             return Commit(committed=True, stored=await self._write_document(session, document))
 
+    async def fenced_publish_record(
+        self,
+        fence: AcquisitionFence,
+        document: Document,
+        *,
+        expected: DocumentRevision | None,
+    ) -> Commit:
+        """Publish one document row under the run fence and optional revision CAS."""
+        async with self._sessions.begin() as session:
+            await self._fence_acquisition_mutation(session, fence)
+            _, refused = await self._publication_target(session, document, expected)
+            if refused is not None:
+                return refused
+            stored = await self._write_document(session, document)
+            return Commit(committed=True, stored=stored)
+
     async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
         """Write cleanup records before a publication's vectors can exist."""
         if not chunks:
             return
         async with self._sessions.begin() as session:
-            await session.execute(
-                sqlite_insert(models.VectorTombstone)
-                .values(
-                    [
-                        {"chunk_id": vector_id(publication_id, chunk.id), "deleted_at": utcnow()}
-                        for chunk in chunks
-                    ]
-                )
-                .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
+            await self._stage_vectors_in(session, publication_id, chunks)
+
+    async def fenced_stage_vectors(
+        self, fence: AcquisitionFence, publication_id: str, chunks: Sequence[Chunk]
+    ) -> None:
+        """Stage cleanup evidence in the same transaction that validates ownership."""
+        async with self._sessions.begin() as session:
+            await self._fence_acquisition_mutation(session, fence)
+            await self._stage_vectors_in(session, publication_id, chunks)
+
+    @staticmethod
+    async def _stage_vectors_in(
+        session: AsyncSession, publication_id: str, chunks: Sequence[Chunk]
+    ) -> None:
+        if not chunks:
+            return
+        await session.execute(
+            sqlite_insert(models.VectorTombstone)
+            .values(
+                [
+                    {"chunk_id": vector_id(publication_id, chunk.id), "deleted_at": utcnow()}
+                    for chunk in chunks
+                ]
             )
+            .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
+        )
 
     async def publish_document(
         self,
@@ -265,40 +298,93 @@ class SqliteDocStore(
     ) -> Commit:
         """Flip the active publication and every relational derivative in one transaction."""
         async with self._sessions.begin() as session:
-            row, refused = await self._publication_target(session, document, expected)
-            if refused is not None:
-                return refused
-            await self._write_document(session, document)
-            row = await session.get(models.Document, document.id)
-            if row is None:  # pragma: no cover - _write_document creates or returns this row
-                msg = f"document {document.id!r} vanished inside its publication transaction"
-                raise RuntimeError(msg)
-            row.original_omitted_reason = original_omitted_reason
-            await session.execute(
-                delete(models.Chunk).where(models.Chunk.document_id == document.id)
+            return await self._publish_document_in(
+                session,
+                document,
+                chunks,
+                expected=expected,
+                chunk_fp=chunk_fp,
+                embed_fp=embed_fp,
+                parse_fp=parse_fp,
+                glossary_entries=glossary_entries,
+                glossary_fp=glossary_fp,
+                original_omitted_reason=original_omitted_reason,
             )
-            await session.flush()
-            for chunk in chunks:
-                session.add(from_chunk(chunk, document.id, document.publication_id))
-            await session.flush()
-            if chunks:
-                await session.execute(
-                    delete(models.VectorTombstone).where(
-                        models.VectorTombstone.chunk_id.in_(
-                            [vector_id(document.publication_id, chunk.id) for chunk in chunks]
-                        )
+
+    async def fenced_publish_document(
+        self,
+        fence: AcquisitionFence,
+        document: Document,
+        chunks: Sequence[Chunk],
+        *,
+        expected: DocumentRevision | None,
+        chunk_fp: str | None,
+        embed_fp: str | None,
+        parse_fp: str | None,
+        glossary_entries: Sequence[GlossaryEntry] | None,
+        glossary_fp: str | None,
+        original_omitted_reason: str | None,
+    ) -> Commit:
+        async with self._sessions.begin() as session:
+            await self._fence_acquisition_mutation(session, fence)
+            return await self._publish_document_in(
+                session,
+                document,
+                chunks,
+                expected=expected,
+                chunk_fp=chunk_fp,
+                embed_fp=embed_fp,
+                parse_fp=parse_fp,
+                glossary_entries=glossary_entries,
+                glossary_fp=glossary_fp,
+                original_omitted_reason=original_omitted_reason,
+            )
+
+    async def _publish_document_in(
+        self,
+        session: AsyncSession,
+        document: Document,
+        chunks: Sequence[Chunk],
+        *,
+        expected: DocumentRevision | None,
+        chunk_fp: str | None,
+        embed_fp: str | None,
+        parse_fp: str | None,
+        glossary_entries: Sequence[GlossaryEntry] | None,
+        glossary_fp: str | None,
+        original_omitted_reason: str | None,
+    ) -> Commit:
+        row, refused = await self._publication_target(session, document, expected)
+        if refused is not None:
+            return refused
+        await self._write_document(session, document)
+        row = await session.get(models.Document, document.id)
+        if row is None:  # pragma: no cover - _write_document creates or returns this row
+            msg = f"document {document.id!r} vanished inside its publication transaction"
+            raise RuntimeError(msg)
+        row.original_omitted_reason = original_omitted_reason
+        await session.execute(delete(models.Chunk).where(models.Chunk.document_id == document.id))
+        await session.flush()
+        for chunk in chunks:
+            session.add(from_chunk(chunk, document.id, document.publication_id))
+        await session.flush()
+        if chunks:
+            await session.execute(
+                delete(models.VectorTombstone).where(
+                    models.VectorTombstone.chunk_id.in_(
+                        [vector_id(document.publication_id, chunk.id) for chunk in chunks]
                     )
                 )
-
-            if glossary_entries is not None:
-                await self._replace_entries(session, document.id, glossary_entries)
-            if glossary_fp is not None:
-                row.glossary_fp = glossary_fp
-            row.chunk_fp = chunk_fp
-            row.embed_fp = embed_fp
-            row.parse_fp = parse_fp
-            await session.flush()
-            return Commit(committed=True, stored=to_document(row))
+            )
+        if glossary_entries is not None:
+            await self._replace_entries(session, document.id, glossary_entries)
+        if glossary_fp is not None:
+            row.glossary_fp = glossary_fp
+        row.chunk_fp = chunk_fp
+        row.embed_fp = embed_fp
+        row.parse_fp = parse_fp
+        await session.flush()
+        return Commit(committed=True, stored=to_document(row))
 
     async def publish_failure(
         self,
@@ -309,17 +395,49 @@ class SqliteDocStore(
     ) -> Commit:
         """Publish a failed row and retention outcome as one guarded transaction."""
         async with self._sessions.begin() as session:
-            _, refused = await self._publication_target(session, document, expected)
-            if refused is not None:
-                return refused
-            stored = await self._write_document(session, document)
-            row = await session.get(models.Document, document.id)
-            if row is None:  # pragma: no cover - _write_document creates or returns this row
-                msg = f"document {document.id!r} vanished inside its failure transaction"
-                raise RuntimeError(msg)
-            row.original_omitted_reason = original_omitted_reason
-            await session.flush()
-            return Commit(committed=True, stored=stored)
+            return await self._publish_failure_in(
+                session,
+                document,
+                expected=expected,
+                original_omitted_reason=original_omitted_reason,
+            )
+
+    async def fenced_publish_failure(
+        self,
+        fence: AcquisitionFence,
+        document: Document,
+        *,
+        expected: DocumentRevision | None,
+        original_omitted_reason: str | None,
+    ) -> Commit:
+        async with self._sessions.begin() as session:
+            await self._fence_acquisition_mutation(session, fence)
+            return await self._publish_failure_in(
+                session,
+                document,
+                expected=expected,
+                original_omitted_reason=original_omitted_reason,
+            )
+
+    async def _publish_failure_in(
+        self,
+        session: AsyncSession,
+        document: Document,
+        *,
+        expected: DocumentRevision | None,
+        original_omitted_reason: str | None,
+    ) -> Commit:
+        _, refused = await self._publication_target(session, document, expected)
+        if refused is not None:
+            return refused
+        stored = await self._write_document(session, document)
+        row = await session.get(models.Document, document.id)
+        if row is None:  # pragma: no cover - _write_document creates or returns this row
+            msg = f"document {document.id!r} vanished inside its failure transaction"
+            raise RuntimeError(msg)
+        row.original_omitted_reason = original_omitted_reason
+        await session.flush()
+        return Commit(committed=True, stored=stored)
 
     async def _publication_target(
         self,
@@ -431,6 +549,23 @@ class SqliteDocStore(
             if status is DocumentStatus.INDEXED:
                 row.indexed_at = utcnow()
 
+    async def fenced_set_status(
+        self, fence: AcquisitionFence, document_id: str, status: DocumentStatus, detail: str = ""
+    ) -> None:
+        if status is DocumentStatus.FAILED:
+            msg = "fenced_set_status cannot record 'failed'; publish the complete document"
+            raise ValueError(msg)
+        async with self._sessions.begin() as session:
+            await self._fence_acquisition_mutation(session, fence)
+            row = await self._live_document(session, document_id)
+            if row is None:
+                return
+            row.status = status
+            row.status_detail = detail or None
+            row.failed_stage = None
+            if status is DocumentStatus.INDEXED:
+                row.indexed_at = utcnow()
+
     async def list_documents(
         self,
         filter: Filter | None = None,  # noqa: A002 - mirrors the protocol
@@ -496,6 +631,22 @@ class SqliteDocStore(
             if version_token is not None:
                 row.version_token = version_token
 
+    async def fenced_record_seen(
+        self,
+        fence: AcquisitionFence,
+        document_id: str,
+        *,
+        version_token: str | None = None,
+    ) -> None:
+        async with self._sessions.begin() as session:
+            await self._fence_acquisition_mutation(session, fence)
+            row = await self._live_document(session, document_id)
+            if row is None:
+                return
+            row.last_seen_at = utcnow()
+            if version_token is not None:
+                row.version_token = version_token
+
     async def annotate(self, document_id: str, updates: Mapping[str, Any]) -> None:
         """Merge keys into a document's metadata, leaving everything else alone.
 
@@ -504,6 +655,18 @@ class SqliteDocStore(
         other.
         """
         async with self._sessions.begin() as session:
+            row = await self._live_document(session, document_id)
+            if row is None:
+                return
+            merged: dict[str, Any] = dict(cast("Any", row.doc_metadata) or {})
+            merged.update(updates)
+            row.doc_metadata = cast("Any", merged)
+
+    async def fenced_annotate(
+        self, fence: AcquisitionFence, document_id: str, updates: Mapping[str, Any]
+    ) -> None:
+        async with self._sessions.begin() as session:
+            await self._fence_acquisition_mutation(session, fence)
             row = await self._live_document(session, document_id)
             if row is None:
                 return

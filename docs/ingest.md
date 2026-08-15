@@ -1664,13 +1664,23 @@ documents happened to publish before the process stopped:
    complete inventory and candidate.
 
 Recovery is automatic at the production pipeline boundary. Selection and claim are one SQLite
-write transaction: the newest unfinished run is claimed, or a new run is created and claimed,
-but two simultaneous sync requests cannot both observe absence and open independent source
-cursors. A live lease makes the second caller a clean loser. An expired or orderly-released
-lease increments the generation; every later journal mutation and every publication boundary is
-fenced by that generation. A source call left in `acquiring` becomes retry work at takeover,
-while `indexing` remains the exact checkpoint needed to replay partially expanded containers
-from retained bytes without source access.
+write transaction: the newest safe unfinished run is authoritative, every other overlapping
+legacy run is superseded and generation-fenced in that same transaction, or a new run is created
+and claimed. Two simultaneous sync requests therefore cannot both observe absence and open
+independent source cursors, and an upgraded database cannot retain an older live owner beside
+the selected run. A live lease on the one authoritative run makes the second caller a clean
+loser. An expired or orderly-released lease increments the generation; every later journal
+mutation and every publication boundary is fenced by that generation. A source call left in
+`acquiring` becomes retry work at takeover, while `indexing` remains the exact checkpoint needed
+to replay partially expanded containers from retained bytes without source access.
+
+The pipeline's renewal immediately before publication is only a fast failure and lease refresh;
+it is not the publication lock. Every attempt-owned relational mutation starts its own SQLite
+transaction with a conditional write that validates workspace, run, owner, generation, expiry,
+unsettled state and non-supersession. That first statement takes the writer lock through the
+document, status, annotation, lineage, glossary or tombstone mutation. A takeover therefore
+commits before the guard and the stale write is refused, or waits until the guarded transaction
+commits—there is no awaited check-then-write gap.
 
 Enumeration, acquisition and indexing each run with an independent lease heartbeat. Their task
 groups are children of the sync call, cancellation stops admission and joins every task within

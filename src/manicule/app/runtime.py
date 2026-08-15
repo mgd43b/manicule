@@ -548,7 +548,10 @@ class Runtime:
 
     async def _build_pipeline(self) -> IngestPipeline:
         from manicule.ingest.pipeline import IngestPipeline  # noqa: PLC0415
-        from manicule.ingest.ports import AcquisitionStore as AcquisitionSurface  # noqa: PLC0415
+        from manicule.ingest.ports import (  # noqa: PLC0415
+            AcquisitionStore as AcquisitionSurface,
+        )
+        from manicule.ingest.ports import FencedIngestStore  # noqa: PLC0415
         from manicule.ingest.refusals import check_before_run  # noqa: PLC0415
         from manicule.ingest.workers import WorkerPool, worker_config  # noqa: PLC0415
 
@@ -560,11 +563,13 @@ class Runtime:
             # satisfy the application surfaces without implementing that separate protocol;
             # refuse them at assembly rather than failing inside a live ingest with an
             # AttributeError after source work has begun.
-            if not isinstance(store, AcquisitionSurface):
+            if not isinstance(store, AcquisitionSurface) or not isinstance(
+                store, FencedIngestStore
+            ):
                 msg = (
                     f"the configured document store {type(store).__name__} does not provide "
                     "durable source acquisition; disable source-byte retention or configure "
-                    "a store that implements AcquisitionStore"
+                    "a store that implements AcquisitionStore and FencedIngestStore"
                 )
                 raise AssemblyError(msg)
             acquisitions = store
