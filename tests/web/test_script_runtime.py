@@ -154,6 +154,7 @@ class Element {
 }
 const thread = new Element(); const form = new Element(); const turns = new Element();
 const live = new Element(); live.hidden = true;
+live.firstElementChild = new Element();
 const answer = new Element(); const citations = new Element(); const verdict = new Element();
 const rate = new Element(); const rated = new Element(); const status = new Element();
 const profile = new Element(); profile.value = "precise"; const question = new Element();
@@ -209,10 +210,29 @@ const failed = new ReadableStream({start(controller) {
 pending[2].resolve({ok: true, status: 200, body: failed, json: () => Promise.resolve({})});
 await new Promise(resolve => setImmediate(resolve));
 await new Promise(resolve => setImmediate(resolve));
+const terminalStatus = status.textContent;
+const retryOffered = !retry.hidden;
+const disabled = submit.disabled;
+question.value = "partial request";
+form.listeners.submit(submitEvent);
+const partial = new ReadableStream({start(controller) {
+  controller.enqueue(new TextEncoder().encode(
+    'event: delta\ndata: {"text":"unfinished words"}\n\n'
+  ));
+  controller.close();
+}});
+pending[3].resolve({ok: true, status: 200, body: partial, json: () => Promise.resolve({})});
+await new Promise(resolve => setImmediate(resolve));
+await new Promise(resolve => setImmediate(resolve));
+const turnsBeforeFresh = turns.children.length;
+question.value = "a fresh question";
+form.listeners.submit(submitEvent);
+const freshTurnDelta = turns.children.length - turnsBeforeFresh;
 console.log(JSON.stringify({callsBeforeStop, aborted, sameBody, staleIgnored,
-  callsAfterRetry: 2, completed, disabled: submit.disabled,
+  callsAfterRetry: 2, completed, disabled,
   turnsBeforeFailure, preservedDraft,
-  terminalStatus: status.textContent, retryOffered: !retry.hidden}));
+  terminalStatus, retryOffered,
+  freshTurnDelta, partialWasDiscarded: answer.textContent === ""}));
 """
     )
     assert result == {
@@ -227,4 +247,6 @@ console.log(JSON.stringify({callsBeforeStop, aborted, sameBody, staleIgnored,
         "preservedDraft": "must not overlap",
         "terminalStatus": "generation: model refused",
         "retryOffered": True,
+        "freshTurnDelta": 1,
+        "partialWasDiscarded": True,
     }

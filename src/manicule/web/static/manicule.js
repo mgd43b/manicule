@@ -342,6 +342,7 @@
     var requestNumber = 0;
     var currentRequest = null;
     var retryRequest = null;
+    var liveComplete = false;
 
     function setRequestState(state) {
       requestState = state;
@@ -423,6 +424,7 @@
         conversation = data.conversation_id;
         thread.setAttribute("data-conversation", conversation);
       }
+      liveComplete = true;
       actionState(status, "success", "Answer complete.");
     }
 
@@ -471,7 +473,7 @@
      * is dropped from the copy: cloning does not carry its listener, so a button that looked
      * live and did nothing is worse than no button. */
     function keepPreviousAnswer() {
-      if (live.hidden || !answer.textContent) { return; }
+      if (!liveComplete || live.hidden || !answer.textContent) { return; }
       var finished = live.firstElementChild;
       if (!finished) { return; }
       var copy = finished.cloneNode(true);
@@ -487,6 +489,7 @@
         addAsked(saved.text);
       }
       live.hidden = false;
+      liveComplete = false;
       rate.hidden = true;
       answer.textContent = "";
       citations.textContent = "";

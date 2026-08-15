@@ -57,7 +57,8 @@ one another's result; network failures and non-JSON refusals are reported there 
 one longer-lived request: while an answer is streaming another cannot start, Stop aborts its
 request, and Retry manually sends the exact original body. A stream is complete only after it
 ends with exactly one `final` event. A partial answer remains visible when that contract is
-broken, but it is named as incomplete rather than presented as a finished answer.
+broken, but it is named as incomplete and is never archived into the finished conversation when
+the operator asks something else.
 
 **If this is revisited**, the question to ask is not "is a SPA nicer" but "has the no-toolchain
 requirement changed". It is the whole of the argument, and it is the one thing a future
