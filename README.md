@@ -115,6 +115,22 @@ ollama pull qwen2.5:14b
 manicule ask "what does an anchor carry when the location is unknown?"
 ```
 
+An installed, already-authenticated Codex or Claude CLI can answer instead. Select the built-in
+`cli` generator once; both `manicule ask` and browser chat then use it through the same retrieval,
+redaction and citation-verification path:
+
+```bash
+manicule config set llm.generator cli
+manicule config set llm.provider codex       # or: claude
+manicule config set llm.model default        # keep the CLI's configured model
+manicule config set llm.context_window 32768 # use a conservative value the model supports
+manicule ask "what does an anchor carry when the location is unknown?"
+```
+
+The executable must be on the `PATH` of the process running manicule. Restart a running server
+after changing these settings. The CLI owns its own login, but its destination is treated as
+remote for data-policy purposes because manicule cannot inspect where the command sends a prompt.
+
 `manicule doctor` reports what is wrong and what to do about it, and it is the first thing to run
 when something does not work. `manicule doctor --fix` repairs what it can: the grammars and the
 vocabularies, from an offline bundle when one is installed and from upstream otherwise. It is the

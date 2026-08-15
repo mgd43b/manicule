@@ -65,6 +65,50 @@ def test_local_providers_are_not_asked_for_a_credential() -> None:
     assert resolved["ollama"].base_url == "http://localhost:11434"
 
 
+def test_authenticated_local_clis_are_not_asked_for_a_second_credential() -> None:
+    """The command owns login, while its opaque destination remains conservatively remote."""
+    for provider in ("codex", "claude"):
+        assert needs_credential(provider), "the provider name alone carries no exemption"
+        assert egress_for(provider) is Egress.REMOTE
+        configured = Settings.model_validate(
+            {
+                "llm": {
+                    "generator": "cli",
+                    "provider": provider,
+                    "model": "default",
+                    "context_window": 32_768,
+                },
+                "embedding": {"provider": "mlx"},
+            }
+        )
+        assert not any("has no API key" in problem for problem in configured.policy_problems())
+
+
+def test_cli_auth_exemption_does_not_leak_to_other_component_selections() -> None:
+    configured = Settings.model_validate(
+        {
+            "llm": {"generator": "litellm", "provider": "codex", "model": "default"},
+            "embedding": {"provider": "mlx"},
+        }
+    )
+    problems = configured.policy_problems()
+    assert any("provider 'codex'" in problem for problem in problems)
+    assert any("llm.generator to 'cli'" in problem for problem in problems)
+
+    configured = Settings.model_validate(
+        {
+            "llm": {
+                "generator": "cli",
+                "provider": "codex",
+                "model": "default",
+                "context_window": 32_768,
+            },
+            "embedding": {"provider": "codex"},
+        }
+    )
+    assert any("provider 'codex'" in problem for problem in configured.policy_problems())
+
+
 # --- egress ------------------------------------------------------------------------------
 
 

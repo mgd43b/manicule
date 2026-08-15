@@ -12,6 +12,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 GENERATOR_NAME = "litellm"
+CLI_GENERATOR_NAME = "cli"
 
 
 class GeneratorConfig(BaseModel):
@@ -34,4 +35,16 @@ class GeneratorConfig(BaseModel):
     )
 
 
-__all__ = ["GENERATOR_NAME", "GeneratorConfig"]
+class CliGeneratorConfig(BaseModel):
+    """Configuration for the built-in Codex and Claude command-line adapter.
+
+    The command is intentionally selected by ``llm.provider`` rather than accepted as an
+    arbitrary argv here.  Besides keeping configuration small, that lets the adapter put the
+    two supported CLIs into their non-interactive, non-writing modes without an extra argument
+    quietly undoing those guarantees.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+__all__ = ["CLI_GENERATOR_NAME", "GENERATOR_NAME", "CliGeneratorConfig", "GeneratorConfig"]

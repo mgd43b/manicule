@@ -15,7 +15,12 @@ from typing import TYPE_CHECKING
 
 from manicule.container import keys
 from manicule.core.errors import ConfigError
-from manicule.generation.config import GENERATOR_NAME, GeneratorConfig
+from manicule.generation.config import (
+    CLI_GENERATOR_NAME,
+    GENERATOR_NAME,
+    CliGeneratorConfig,
+    GeneratorConfig,
+)
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
 
 if TYPE_CHECKING:
@@ -61,6 +66,38 @@ def _build(context: BuildContext) -> Generator:
     )
 
 
+def _build_cli(context: BuildContext) -> Generator:
+    """Build the local command adapter without importing subprocess machinery at discovery."""
+    from manicule.config.profiles import profile_config  # noqa: PLC0415
+    from manicule.config.providers import ModelRole  # noqa: PLC0415
+    from manicule.generation.budget import TokenEstimator  # noqa: PLC0415
+    from manicule.generation.cli_provider import CliGenerator, cli_system_prompt  # noqa: PLC0415
+    from manicule.generation.prompt import system_message  # noqa: PLC0415
+
+    config = context.config
+    if not isinstance(config, CliGeneratorConfig):
+        msg = (
+            f"a generator was built with {type(config).__name__} where it declares "
+            f"{CliGeneratorConfig.__name__}"
+        )
+        raise ConfigError(msg)
+
+    settings = context.settings
+    llm = settings.llm
+    endpoint = next(point for point in settings.selected_endpoints if point.role is ModelRole.LLM)
+    profile = profile_config(settings.rag.profile, settings.rag.overrides)
+    estimator = TokenEstimator(safety_factor=llm.token_safety_factor)
+    system_prompt = cli_system_prompt(system_message(llm.system_prompt_extra)["content"])
+    system_prompt_tokens = estimator.count(system_prompt)
+    return CliGenerator(
+        llm,
+        base_url=endpoint.base_url,
+        profile=profile,
+        profile_name=settings.rag.profile.value,
+        system_prompt_tokens=system_prompt_tokens,
+    )
+
+
 class GenerationPlugin:
     """The plugin object the ``generation`` entry point resolves to."""
 
@@ -68,7 +105,7 @@ class GenerationPlugin:
         name="generation",
         version="0.1.0",
         core_version=">=0.1,<0.2",
-        summary="One provider interface for local and hosted models, reached by base_url.",
+        summary="One generator interface for provider APIs and authenticated local CLIs.",
     )
 
     def register(self, registry: ComponentRegistry) -> None:
@@ -78,6 +115,13 @@ class GenerationPlugin:
             config_model=GeneratorConfig,
             summary="Streams from Ollama or any hosted provider through one call. Citation "
             "verification sits above it and is not pluggable.",
+        )
+        registry.add(
+            keys.GENERATOR.named(CLI_GENERATOR_NAME),
+            _build_cli,
+            config_model=CliGeneratorConfig,
+            summary="Asks an installed Codex or Claude CLI in non-interactive mode. The same "
+            "generator serves the command line, API and browser chat.",
         )
 
 

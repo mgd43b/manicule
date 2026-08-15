@@ -5,6 +5,7 @@ from __future__ import annotations
 from manicule.config.loader import load_settings, save_settings
 from manicule.config.profiles import PROFILES, ProfileConfig, profile_config
 from manicule.config.providers import (
+    CLI_AUTH_PROVIDERS,
     DEFAULT_BASE_URLS,
     IN_PROCESS_PROVIDERS,
     KEYLESS_PROVIDERS,
@@ -58,6 +59,7 @@ from manicule.config.settings import (
 
 __all__ = [
     "APP_NAME",
+    "CLI_AUTH_PROVIDERS",
     "DEFAULT_BASE_URLS",
     "ENV_PREFIX",
     "IN_PROCESS_PROVIDERS",

@@ -35,6 +35,7 @@ from pydantic_settings import (
 )
 
 from manicule.config.providers import (
+    CLI_AUTH_PROVIDERS,
     Endpoint,
     ModelRole,
     ProviderSettings,
@@ -640,10 +641,10 @@ class LlmSettings(Section):
     provider: str = Field(
         default="ollama",
         min_length=1,
-        description="Which **vendor** serves the model: ``ollama``, ``openai``, "
-        "``anthropic``. This is what decides which credential is needed and whether the "
-        "endpoint leaves this machine — not which component is built. One dependency speaks "
-        "to all of them, and it is named by ``generator``.",
+        description="Which **vendor or authenticated local CLI** serves the model: ``ollama``, "
+        "``openai``, ``anthropic``, ``codex`` or ``claude``. This is what decides which "
+        "credential is needed and whether the endpoint leaves this machine — not which "
+        "component is built. Select generator ``cli`` for the Codex and Claude commands.",
     )
     generator: str = Field(
         default="litellm",
@@ -651,8 +652,9 @@ class LlmSettings(Section):
         description="Which registered generator **component** to build. Separate from "
         "``provider`` because the two answer different questions and conflating them made "
         "the default configuration unrunnable: one implementation reaches every vendor "
-        "through a base_url, so the component is not a function of the vendor. Change this "
-        "only to select a third-party generator.",
+        "through a base_url, so the component is not a function of the vendor. Use ``cli`` "
+        "to ask through an installed Codex or Claude command; other values select "
+        "third-party generators.",
     )
     model: str = Field(default="qwen2.5:14b", min_length=1)
     base_url: str | None = None
@@ -1179,11 +1181,22 @@ class Settings(BaseSettings):
                 )
 
         for name in sorted(self.selected_providers):
-            if needs_credential(name) and not self.provider(name).has_key:
+            cli_owns_auth = (
+                self.llm.generator.strip().lower() == "cli"
+                and self.llm.provider.strip().lower() == name
+                and self.embedding.provider.strip().lower() != name
+                and name in CLI_AUTH_PROVIDERS
+            )
+            if needs_credential(name) and not (cli_owns_auth or self.provider(name).has_key):
                 expected = " or ".join(env_var_names(name))
+                cli_hint = (
+                    " To use its existing local CLI login instead, set llm.generator to 'cli'."
+                    if name in CLI_AUTH_PROVIDERS
+                    else ""
+                )
                 problems.append(
                     f"provider {name!r} is selected but has no API key. Set {expected}, or "
-                    f"providers.{name}.api_key."
+                    f"providers.{name}.api_key.{cli_hint}"
                 )
 
         transport = self.security.transport
