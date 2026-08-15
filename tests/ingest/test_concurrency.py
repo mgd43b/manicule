@@ -300,8 +300,9 @@ BLOCKED_BODIES = 6
 async def test_the_legacy_nonjournal_source_still_obeys_the_local_queue_bound() -> None:
     """Protocol-only stores retain the old bounded fallback.
 
-    Production SQLite has the durable journal boundary. In-memory protocol doubles without that
-    optional surface still use direct discovery, and must remain bounded while callers migrate.
+    Production SQLite has the durable journal boundary. In-memory protocol implementations that
+    lack the optional acquisition surface still use direct discovery and must remain bounded
+    while callers migrate.
 
     **The stop is proven, not timed.** Once the embedder is parked, every stage behind it is
     blocked on a full hand-off, and discovery is inside a ``put`` that cannot return until the

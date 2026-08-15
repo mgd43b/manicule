@@ -519,8 +519,7 @@ class _Sync:
     """
 
     stop: asyncio.Event = field(default_factory=asyncio.Event)
-    """Set on cancellation. Discovery is the only stage that reads it, because stopping
-    discovery is what brings every stage behind it down in order."""
+    """Set on cancellation so discovery or journal reading stops admitting new work."""
 
 
 class IngestPipeline:
@@ -882,6 +881,7 @@ class IngestPipeline:
             run.acquisitions is not None
             and run.report.enumeration_completed
             and run.report.complete
+            and not run.stop.is_set()
         ):
             now = self._acquisition_clock()
             await self._keep_acquisition_lease_live(run, run.acquisitions, now, force=True)
@@ -1070,8 +1070,10 @@ class IngestPipeline:
             return
         after: int | None = None
         try:
-            while True:
+            while not run.stop.is_set():
                 await refs.wait_for_room()
+                if run.stop.is_set():
+                    return
                 records = await acquisitions.list_acquisition_records(
                     run.acquisition_run_id,
                     states=(
@@ -1083,6 +1085,8 @@ class IngestPipeline:
                     limit=1,
                 )
                 if not records:
+                    return
+                if run.stop.is_set():
                     return
                 record = records[0]
                 run.discovery_records_held.enter()

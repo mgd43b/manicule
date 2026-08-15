@@ -950,7 +950,7 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
             resolve_chain=lambda _: ["lines"],
             middleware=MiddlewareRunner(()),
             chunk_fingerprint=chunker.fingerprint,
-            shutdown_grace_s=0,
+            shutdown_grace_s=30,
             detect_glossary=False,
             acquisition_clock=lease_clock,
         )
@@ -958,16 +958,22 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
     task = asyncio.create_task(pipeline().run(connector))
     await store.reader_arrived.wait()
     task.cancel()
+    # Deliver cancellation first so the graceful stop is visible before the blocked journal
+    # read returns. No newly read record may be admitted during the drain window.
+    await asyncio.sleep(0)
+    store.release_reader.set()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    store.release_reader.set()
     durable = await store.latest_unsettled_acquisition_run(connector.name)
     assert durable is not None
     assert durable.discovered_count == 10
     assert durable.enumeration_completed_at is not None
     assert durable.candidate_watermark == connector.watermark
-    assert len(await store.list_acquisition_records(durable.id)) == 10
+    records = await store.list_acquisition_records(durable.id)
+    assert len(records) == 10
+    assert {record.state for record in records} == {AcquisitionRecordState.DISCOVERED}
+    assert await store.list_documents() == []
     assert await store.get_watermark(connector.name) is None
 
     pages_before_resume = connector.pages_requested
