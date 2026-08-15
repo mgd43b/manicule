@@ -1013,7 +1013,10 @@ adds two rules.
 **A failed re-ingest must not demote a working document.** If a document is `indexed` and a
 re-ingest fails at any stage, it stays `indexed` with its existing chunks and vectors, and the
 failure is recorded in `error_message` and `metadata.last_ingest_error`. The new status is
-applied only when there is something to replace the old content with.
+applied only when there is something to replace the old content with. A parse failure preserves
+the indexed source revision wholesale — token, content hash, retained-byte reference, routing and
+provenance — because adopting the failed fetch's token would make the next healthy sync skip bytes
+the document does not hold. The error is the only new fact that attempt established.
 
 **A terminal *determination* does replace it, and that is not a softening of the rule.**
 Implementation forced the distinction: `failed` means we do not know whether the new bytes hold
