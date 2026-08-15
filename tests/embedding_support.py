@@ -132,25 +132,44 @@ def requires_mlx(model_id: str) -> None:
     pytest.skip("MLX is not usable on this machine")
 
 
-def requires_metal() -> None:
-    """Skip unless MLX is executing on **Metal**, not on its CPU device.
+def requires_metal_allocator() -> None:
+    """Skip unless the **Metal allocator** is the one MLX is allocating through.
 
-    :func:`requires_mlx` is a different question and does not answer this one. It asks whether
-    ``mx.eval`` works, and it works on MLX's CPU device too. So do the memory counters: with
-    ``mx.set_default_device(mx.cpu)``, a 16 MiB allocation reports ``get_active_memory() ==
-    16777216``, indistinguishable from the Metal figure. A test that asserted "MLX reports
-    non-zero memory" would therefore pass on a machine with no GPU **having exercised the wrong
-    allocator entirely** — green while checking nothing, which is the failure mode this module
-    exists to prevent.
+    Named for what it checks, which is narrower than "MLX is executing on the GPU". It cannot
+    check that, and the distinction turned out to be the interesting part.
 
-    It matters because the thing being guarded is specifically a Metal phenomenon: the
-    unbounded free-buffer cache is the Metal allocator's, the memory it retains is unified
-    memory, and the reason ``ps`` cannot see it is that Metal buffers are not ordinary resident
-    pages. None of that is true of the CPU device.
+    :func:`requires_mlx` does not answer this. It asks whether ``mx.eval`` works, and that
+    succeeds on MLX's CPU device too — so a green job proves MLX *evaluates*, not that Metal was
+    involved. Neither do the memory counters, which is the trap worth recording here: with
+    ``mx.set_default_device(mx.cpu)``, a 16 MiB allocation reports ``mx.get_active_memory() ==
+    16777216``, the same shape of figure Metal gives. **Anyone reaching for a memory counter as
+    proof that Metal ran will get a confident wrong answer.**
+
+    **The default device is deliberately not checked, and that is a measured decision rather
+    than an omission.** MLX allocates through one process-wide allocator, chosen by whether
+    Metal is present, and *not* by which device an operation executes on — unified memory is
+    the whole point. Measured on this repository's workload shape, 200 varying-size allocations
+    freed each iteration:
+
+    ==================  =====================  =====================
+    default device      cache after 200        after set_cache_limit
+    ==================  =====================  =====================
+    ``Device(gpu, 0)``  2,364,575,760 bytes    20,463,624 bytes
+    ``Device(cpu, 0)``  2,364,442,632 bytes    20,463,620 bytes
+    ==================  =====================  =====================
+
+    The same allocator, the same unbounded growth, the same bound — within 0.006%. So a run with
+    the default device set to CPU still exercises the allocator these tests assert about, and
+    refusing it would skip a test that was measuring exactly the right thing. What decides the
+    allocator is the row this function checks, not the column.
 
     A skip rather than a failure, because this is a property of the hardware rather than of a
-    pre-seed somebody forgot — there is no action that would fix it on a machine without a GPU.
-    The reason names the device so a CI log says which allocator actually ran.
+    pre-seed somebody forgot — no action fixes it on a machine without Metal. The reason names
+    the device so a CI log says what actually ran instead of leaving it to be assumed.
+
+    Not verified here: what MLX does on a Mac with no Metal at all, since this machine has it.
+    ``set_cache_limit`` may be inert against a non-Metal allocator, which is the case this skip
+    exists to keep out of the results rather than to characterize.
     """
     from manicule.embedding.runtimes import mlx_core  # noqa: PLC0415 - an embeddings extra
 
@@ -158,8 +177,8 @@ def requires_metal() -> None:
     if mx.metal.is_available():
         return
     pytest.skip(
-        f"MLX is running on {mx.default_device()}, not Metal, so the Metal allocator this "
-        f"asserts about was never exercised"
+        f"MLX has no Metal here and is on {mx.default_device()}, so the Metal allocator these "
+        f"tests assert about is not the one in use"
     )
 
 
@@ -273,7 +292,7 @@ __all__ = [
     "model_available",
     "onnx_weights_available",
     "require_model",
-    "requires_metal",
+    "requires_metal_allocator",
     "requires_mlx",
     "write_model",
     "write_tokenizer",
