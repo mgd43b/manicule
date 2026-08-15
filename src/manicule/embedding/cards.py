@@ -102,7 +102,9 @@ class ModelCard(BaseModel):
     )
     path: Path = Field(description="Local directory holding the declaration files.")
 
-    def fingerprint(self, *, backend: str, weights_ref: str = "") -> EmbedFingerprint:
+    def fingerprint(
+        self, *, backend: str, weights_ref: str = "", weights_identity: str = ""
+    ) -> EmbedFingerprint:
         """The identity every vector this model produces is written against.
 
         ``normalized`` is always ``True``: normalization is applied in
@@ -118,6 +120,7 @@ class ModelCard(BaseModel):
             max_sequence_length=self.max_sequence_length,
             backend=backend,
             weights_ref=weights_ref,
+            weights_identity=weights_identity,
         )
 
 

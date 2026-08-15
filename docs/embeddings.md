@@ -57,8 +57,9 @@ So quantization is **refused at load**, by the one component positioned to see i
 Apple-hardware principle drawn precisely: use Metal, use fp16 storage, use whatever is fastest,
 and stop at anything that moves the vectors.
 
-The artifact that ran is recorded in `EmbedFingerprint.weights_ref` (§5) so a vector can be
-traced to its bytes.
+The artifact that ran is recorded as an exact repository commit or local SHA-256 digest in
+`EmbedFingerprint.weights_ref` (§5), so a vector can be traced to its bytes. Its separate
+`weights_identity` participates in compatibility.
 
 ### 1.1 The license gate moved, and it moved the whole section
 
@@ -185,6 +186,7 @@ provider = "mlx"               # or "onnx"
 
 [plugins.config."embedder.mlx"]
 weights = ""                   # the artifact to execute, when it is not the model's own repo
+weights_revision = ""          # required immutable commit for an explicit remote artifact
 pooling = ""                   # only for a model that declares none; contradicting one is refused
 max_sequence_length = 0        # only for a model that declares none, in usable content tokens
 cache_limit_mb = 2048          # ceiling on MLX's retained Metal buffers (§3.5)
@@ -487,7 +489,7 @@ silent truncation, so the type does not permit expressing it.
 ## 5. `EmbedFingerprint`
 
 The type ships in `manicule.core.embedding`. Its identity set is `model_id`, `revision`,
-`dimension`, `pooling`, `normalized`, `tokenizer_id`, compared as canonical bytes
+`dimension`, `pooling`, `normalized`, `tokenizer_id`, `weights_identity`, compared as canonical bytes
 ([`storage.md`](storage.md) §4.6). For BGE-M3:
 
 ```
@@ -499,7 +501,8 @@ normalized          true
 tokenizer_id        BAAI/bge-m3
 max_sequence_length 8190      # recorded, excluded from identity
 backend             mlx|onnx  # recorded, excluded from identity — §3.3
-weights_ref         mlx-community/bge-m3-mlx-fp16   # recorded, excluded from identity — §1.0
+weights_ref         hf:mlx-community/bge-m3-mlx-fp16@<commit> # exact provenance, excluded
+weights_identity    qualified:BAAI/bge-m3@<model commit>       # identity — §1.0
 ```
 
 **`revision` is pinned rather than left unset.** The type permits `None` and records it
@@ -509,15 +512,22 @@ fingerprint noticing — the exact silent-degradation this whole document is abo
 Three exclusions carry reasoning that must not be lost, and all three are stated in the
 shipped docstring: `max_sequence_length` is excluded because including it would force a
 re-embed whenever the limit *rises*, and the property that matters is checked directly by
-`require_within_context`; `backend` is excluded on the parity bet §3.3 now measures;
-`weights_ref` is excluded for the same reason and rests on the same measurement, with the one
-re-encoding that *does* move the vectors — quantization — refused at load rather than absorbed
-here (§1.0).
+`require_within_context`; `backend` and `weights_ref` are excluded because
+`weights_identity` enforces their compatibility boundary.
 
-**`weights_ref` is added by this ticket**, additively and outside identity, so no stored
-fingerprint changes meaning. It exists because §1.0 turned out to be true: the artifact that
-runs is frequently not the repository named in `model_id`, and an index that cannot say which
-bytes made its vectors is not diagnosable.
+**Trust is narrow and explicit.** Only the exact built-in ONNX/MLX repository commits covered
+by the parity suite share a qualified identity. An explicit hub override must name an immutable
+40-character commit and receives a backend-specific identity; a local override is hashed and
+also backend-specific. Changing either forces re-embedding. A mutable or unresolved artifact
+is refused before weights load. Thus a model name, matching dimensions, or a conversion repo
+name can never accidentally opt into portability.
+
+Local artifacts use a digest of the complete executable directory tree, and setup rechecks it
+before opening the runtime. The directory is therefore configuration, not a live deployment
+target: do not mutate it while manicule is running. A concurrent writer can race any
+path-based model loader after the check; publish a new immutable directory and restart instead.
+`index status` (including the MCP surface) exposes both `weights_ref` and `weights_identity`,
+so the exact commit or local digest remains inspectable after the corpus is built.
 
 **`architecture` is still not an identity field, and implementation settled the case against
 adding it.** The concern was that architecture decides which tensor the extraction path reads,

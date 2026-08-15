@@ -26,7 +26,7 @@ import numpy as np
 
 from manicule.core.errors import ConfigError
 from manicule.core.lifecycle import HealthReport, Metric
-from manicule.embedding.artifacts import mlx_repo, mlx_weights
+from manicule.embedding.artifacts import mlx_weights, resolve_artifact
 from manicule.embedding.base import PooledEmbedder
 from manicule.embedding.cards import ModelCard
 from manicule.embedding.pooling import as_float32
@@ -59,18 +59,23 @@ class MlxEmbedder(PooledEmbedder):
         card: ModelCard,
         *,
         weights: str = "",
+        weights_revision: str = "",
         batch_size: int = 32,
         cache_entries: int = 10_000,
         cache_limit_bytes: int = DEFAULT_CACHE_LIMIT_BYTES,
     ) -> None:
+        artifact = resolve_artifact(
+            BACKEND, card.model_id, card.revision, override=weights, revision=weights_revision
+        )
         super().__init__(
             card,
             backend=BACKEND,
-            weights_ref=mlx_repo(card.model_id, override=weights),
+            weights_ref=artifact.ref,
+            weights_identity=artifact.identity,
             batch_size=batch_size,
             cache_entries=cache_entries,
         )
-        self._weights_override = weights
+        self._artifact = artifact
         self._cache_limit_bytes = cache_limit_bytes
         self._model: Any | None = None  # mlx-embeddings ships no type information
         # Whether this embedder has reached MLX's allocator at all. Read by `_unload`, which
@@ -110,7 +115,7 @@ class MlxEmbedder(PooledEmbedder):
         mx.set_cache_limit(self._cache_limit_bytes)
         self._allocator_configured = True
 
-        weights = mlx_weights(self.card.model_id, override=self._weights_override)
+        weights = mlx_weights(self._artifact)
         if weights.describe() != self.fingerprint.weights_ref:
             # Only reachable if resolution stopped being a pure function of the same inputs.
             # Worth catching: the fingerprint is already fixed, so a divergence here would

@@ -27,7 +27,7 @@ import numpy as np
 
 from manicule.core.errors import ConfigError, TokenStateError
 from manicule.core.lifecycle import HealthReport
-from manicule.embedding.artifacts import onnx_repo, onnx_weights
+from manicule.embedding.artifacts import onnx_weights, resolve_artifact
 from manicule.embedding.base import PooledEmbedder
 from manicule.embedding.cards import ModelCard
 from manicule.embedding.pooling import TOKEN_STATE_RANK
@@ -54,17 +54,22 @@ class OnnxEmbedder(PooledEmbedder):
         card: ModelCard,
         *,
         weights: str = "",
+        weights_revision: str = "",
         batch_size: int = 32,
         cache_entries: int = 10_000,
     ) -> None:
+        artifact = resolve_artifact(
+            BACKEND, card.model_id, card.revision, override=weights, revision=weights_revision
+        )
         super().__init__(
             card,
             backend=BACKEND,
-            weights_ref=onnx_repo(card.model_id, override=weights),
+            weights_ref=artifact.ref,
+            weights_identity=artifact.identity,
             batch_size=batch_size,
             cache_entries=cache_entries,
         )
-        self._weights_override = weights
+        self._artifact = artifact
         self._session: ort.InferenceSession | None = None
         self._inputs: frozenset[str] = frozenset()
 
@@ -73,7 +78,7 @@ class OnnxEmbedder(PooledEmbedder):
         """Download the export and open a session, on the thread that will run it."""
         import onnxruntime as ort  # noqa: PLC0415 - loaded with the backend, not with manicule
 
-        weights, graph = onnx_weights(self.card.model_id, override=self._weights_override)
+        weights, graph = onnx_weights(self._artifact)
         if weights.describe() != self.fingerprint.weights_ref:
             msg = (
                 f"the ONNX weights resolved to {weights.describe()} at setup but "

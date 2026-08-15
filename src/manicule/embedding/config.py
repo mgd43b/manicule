@@ -33,6 +33,11 @@ class EmbedderConfig(BaseModel):
         "the model's own files where the backend can read them, and the recorded unquantized "
         "conversion where it cannot. A quantized artifact is refused whichever way it arrives.",
     )
+    weights_revision: str = Field(
+        default="",
+        description="Immutable 40-character commit for an explicit remote weights repository. "
+        "Required with remote `weights`; rejected for local paths. Built-in routes are pinned.",
+    )
     pooling: Pooling | None = Field(
         default=None,
         description="The reduction, for a model that declares none. Consulted only in that "

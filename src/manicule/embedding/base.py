@@ -57,6 +57,7 @@ class PooledEmbedder(Lifecycle, ABC):
         *,
         backend: str,
         weights_ref: str,
+        weights_identity: str,
         batch_size: int = 32,
         cache_entries: int = 10_000,
     ) -> None:
@@ -70,7 +71,7 @@ class PooledEmbedder(Lifecycle, ABC):
         """
         self.card = card
         self.fingerprint: EmbedFingerprint = card.fingerprint(
-            backend=backend, weights_ref=weights_ref
+            backend=backend, weights_ref=weights_ref, weights_identity=weights_identity
         )
         self.backend = backend
         self._batch_size = batch_size

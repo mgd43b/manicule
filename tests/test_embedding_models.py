@@ -16,7 +16,14 @@ import pytest
 from manicule.config.settings import ENV_PREFIX
 from manicule.core.embedding import Pooling
 from manicule.core.errors import ConfigError
-from manicule.embedding.artifacts import MLX_WEIGHTS, mlx_repo, mlx_weights, onnx_weights
+from manicule.embedding.artifacts import (
+    MLX_WEIGHTS,
+    mlx_repo,
+    mlx_weights,
+    onnx_weights,
+    planned_weights,
+    resolve_artifact,
+)
 from manicule.embedding.cards import load_tokenizer, read_card
 from tests.embedding_support import (
     REQUIRE_MODELS_ENV,
@@ -264,6 +271,182 @@ def test_an_unquantized_artifact_is_accepted(tmp_path: Path) -> None:
     (directory / "model.safetensors").write_bytes(b"not really weights")
 
     assert mlx_weights(str(directory)).repo == str(directory)
+
+
+def test_exact_weights_revision_reaches_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The commit recorded before setup is the commit the hub is asked to materialize."""
+    revision = "1" * 40
+    artifact = resolve_artifact(
+        "mlx", "acme/model", "2" * 40, override="acme/conversion", revision=revision
+    )
+    directory = tmp_path / "snapshot"
+    directory.mkdir()
+    (directory / "model.safetensors").write_bytes(b"weights")
+    seen: list[tuple[str, tuple[str, ...], str | None]] = []
+
+    def snapshot(repo: str, patterns: tuple[str, ...], commit: str | None = None) -> Path:
+        seen.append((repo, patterns, commit))
+        return directory
+
+    monkeypatch.setattr("manicule.embedding.runtimes.hub.snapshot", snapshot)
+
+    loaded = mlx_weights(artifact)
+
+    assert seen == [("acme/conversion", ("*.safetensors", "*.json"), revision)]
+    assert loaded.describe() == f"hf:acme/conversion@{revision}"
+
+
+def test_exact_onnx_revision_reaches_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "3" * 40
+    artifact = resolve_artifact(
+        "onnx", "acme/model", "2" * 40, override="acme/export", revision=revision
+    )
+    directory = tmp_path / "snapshot"
+    (directory / "onnx").mkdir(parents=True)
+    (directory / "onnx" / "model.onnx").write_bytes(b"graph")
+    seen: list[str | None] = []
+
+    def snapshot(repo: str, patterns: tuple[str, ...], commit: str | None = None) -> Path:
+        del repo, patterns
+        seen.append(commit)
+        return directory
+
+    monkeypatch.setattr("manicule.embedding.runtimes.hub.snapshot", snapshot)
+
+    loaded, _ = onnx_weights(artifact)
+
+    assert seen == [revision]
+    assert loaded.describe() == f"hf:acme/export@{revision}"
+
+
+def test_only_the_exact_allowlisted_pair_is_backend_portable() -> None:
+    model = "BAAI/bge-m3"
+    model_revision = "5617a9f61b028005a4858fdac845db406aefb181"
+    mlx = resolve_artifact("mlx", model, model_revision)
+    onnx = resolve_artifact("onnx", model, model_revision)
+
+    assert mlx.identity == onnx.identity
+    assert mlx.ref != onnx.ref
+
+    wrong_mlx = resolve_artifact(
+        "mlx",
+        model,
+        model_revision,
+        override="mlx-community/bge-m3-mlx-fp16",
+        revision="0" * 40,
+    )
+    wrong_onnx = resolve_artifact("onnx", model, model_revision, override=model, revision="0" * 40)
+    wrong_model_revision = resolve_artifact("onnx", model, "9" * 40)
+    wrong_repo = resolve_artifact(
+        "onnx", model, model_revision, override="mirror/bge-m3", revision=onnx.revision or ""
+    )
+    assert wrong_mlx.identity != wrong_onnx.identity
+    assert wrong_mlx.identity != mlx.identity
+    assert wrong_model_revision.identity != onnx.identity
+    assert wrong_repo.identity != onnx.identity
+
+
+def test_qualified_identity_is_bound_to_both_artifact_commits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from manicule.embedding import artifacts  # noqa: PLC0415
+
+    model = "BAAI/bge-m3"
+    model_revision = "5617a9f61b028005a4858fdac845db406aefb181"
+    before = resolve_artifact("onnx", model, model_revision).identity
+    monkeypatch.setitem(
+        artifacts._BUILTIN_REVISIONS,  # pyright: ignore[reportPrivateUsage] - qualification seam
+        (model, "mlx"),
+        "f" * 40,
+    )
+
+    changed_mlx = resolve_artifact("mlx", model, model_revision)
+    changed_onnx = resolve_artifact("onnx", model, model_revision)
+    assert changed_mlx.identity == changed_onnx.identity
+    assert changed_onnx.identity != before
+
+
+def test_remote_override_without_immutable_revision_is_refused() -> None:
+    with pytest.raises(ConfigError, match="40-character commit"):
+        resolve_artifact("onnx", "acme/model", "1" * 40, override="acme/export")
+
+
+def test_weights_revision_without_override_is_refused() -> None:
+    with pytest.raises(ConfigError, match="requires an explicit"):
+        resolve_artifact("onnx", "BAAI/bge-m3", "1" * 40, revision="2" * 40)
+
+
+def test_weight_plan_probes_the_pinned_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str | None] = []
+
+    def is_cached(repo: str, patterns: tuple[str, ...], revision: str | None = None) -> bool:
+        del repo, patterns
+        seen.append(revision)
+        return True
+
+    monkeypatch.setattr("manicule.embedding.runtimes.hub.is_cached", is_cached)
+
+    plan = planned_weights("onnx", "BAAI/bge-m3")
+
+    assert plan.revision == "5617a9f61b028005a4858fdac845db406aefb181"
+    assert seen == [plan.revision]
+
+
+def test_local_weight_bytes_change_identity(tmp_path: Path) -> None:
+    directory = write_model(tmp_path / "local")
+    weights = directory / "model.safetensors"
+    weights.write_bytes(b"first")
+    first = resolve_artifact("mlx", str(directory), None)
+    weights.write_bytes(b"second")
+    second = resolve_artifact("mlx", str(directory), None)
+
+    assert first.ref != second.ref
+    assert first.identity != second.identity
+
+
+def test_local_weights_cannot_change_between_fingerprint_and_load(tmp_path: Path) -> None:
+    directory = write_model(tmp_path / "local-race")
+    weights = directory / "model.safetensors"
+    weights.write_bytes(b"fingerprinted")
+    artifact = resolve_artifact("mlx", str(directory), None)
+    weights.write_bytes(b"executed instead")
+
+    with pytest.raises(ConfigError, match="changed after their fingerprint"):
+        mlx_weights(artifact)
+
+
+def test_local_digest_frames_file_names_and_contents(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    for directory in (first, second):
+        (directory / "model.safetensors").write_bytes(b"same")
+    (first / "a.json").write_bytes(b"b.jsonC")
+    (second / "a.json").write_bytes(b"")
+    (second / "b.json").write_bytes(b"C")
+
+    assert (
+        resolve_artifact("mlx", str(first), None).identity
+        != resolve_artifact("mlx", str(second), None).identity
+    )
+
+
+def test_local_onnx_nested_sidecars_are_identity_bearing(tmp_path: Path) -> None:
+    directory = tmp_path / "onnx-local"
+    (directory / "onnx" / "data").mkdir(parents=True)
+    (directory / "onnx" / "model.onnx").write_bytes(b"graph")
+    sidecar = directory / "onnx" / "data" / "weights.bin"
+    sidecar.write_bytes(b"first")
+    first = resolve_artifact("onnx", str(directory), None)
+    sidecar.write_bytes(b"second")
+    second = resolve_artifact("onnx", str(directory), None)
+
+    assert first.identity != second.identity
 
 
 def test_a_repository_with_no_onnx_export_is_refused(tmp_path: Path) -> None:

@@ -24,6 +24,8 @@ whatever runs fastest — and stop at anything that moves the vectors.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +44,32 @@ MLX_WEIGHTS: Final[dict[str, str]] = {
 Only for models whose own repository MLX cannot load. A model publishing safetensors is
 loaded from its own repository, which is the case that needs no table and no trust.
 """
+
+_BUILTIN_REVISIONS: Final[dict[tuple[str, str], str]] = {
+    ("BAAI/bge-small-en-v1.5", "mlx"): "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+    ("BAAI/bge-small-en-v1.5", "onnx"): "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+    ("BAAI/bge-m3", "mlx"): "a37eddded9a6a1273a87fb8b0da0d1cdbd98aeec",
+    ("BAAI/bge-m3", "onnx"): "5617a9f61b028005a4858fdac845db406aefb181",
+}
+"""Exact executable commits covered by the cross-backend parity qualification."""
+
+_QUALIFIED_MODEL_REVISIONS: Final[dict[str, str]] = {
+    "BAAI/bge-small-en-v1.5": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+    "BAAI/bge-m3": "5617a9f61b028005a4858fdac845db406aefb181",
+}
+
+_COMMIT = re.compile(r"[0-9a-f]{40}")
+
+
+def builtin_revision(model_id: str, provider: str) -> str | None:
+    """Pinned executable commit for a parity-qualified built-in route, if one exists."""
+    return _BUILTIN_REVISIONS.get((model_id, provider.strip().lower()))
+
+
+def builtin_model_revision(model_id: str) -> str | None:
+    """Pinned canonical declaration commit paired with built-in executable artifacts."""
+    return _QUALIFIED_MODEL_REVISIONS.get(model_id)
+
 
 ONNX_SUBDIR: Final = "onnx"
 """Where a Sentence-Transformers repository conventionally puts its export."""
@@ -79,10 +107,130 @@ class WeightsRef(BaseModel):
 
     repo: str = Field(min_length=1, description="Repository id, or a local path.")
     path: Path = Field(description="Local directory the weights were read from.")
+    revision: str | None = None
+    identity: str = Field(min_length=1)
 
     def describe(self) -> str:
         """What goes into :attr:`~manicule.core.embedding.EmbedFingerprint.weights_ref`."""
-        return self.repo
+        if self.revision:
+            return f"hf:{self.repo}@{self.revision}"
+        path = Path(self.repo).expanduser().resolve()
+        digest = self.identity.rsplit(":", 1)[-1]
+        return f"local:{path}#sha256:{digest}"
+
+
+class WeightArtifact(BaseModel):
+    """Resolved executable identity, fixed before a backend is constructed."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider: str
+    repo: str
+    revision: str | None
+    ref: str
+    identity: str
+
+
+def resolve_artifact(
+    provider: str,
+    model_id: str,
+    model_revision: str | None,
+    *,
+    override: str = "",
+    revision: str = "",
+) -> WeightArtifact:
+    """Resolve exact provenance and vector-space identity without fetching remote weights."""
+    provider = provider.strip().lower()
+    if provider not in {"mlx", "onnx"}:
+        raise ConfigError(f"no built-in weight artifact contract exists for {provider!r}")
+    repo = (
+        mlx_repo(model_id, override=override)
+        if provider == "mlx"
+        else onnx_repo(model_id, override=override)
+    )
+    local = Path(repo).expanduser()
+    if local.is_dir():
+        if revision:
+            raise ConfigError(
+                "`weights_revision` cannot describe local weights; their bytes are hashed"
+            )
+        digest = _directory_digest(local, provider)
+        ref = f"local:{local.resolve()}#sha256:{digest}"
+        return WeightArtifact(
+            provider=provider,
+            repo=repo,
+            revision=None,
+            ref=ref,
+            identity=f"artifact:{provider}:sha256:{digest}",
+        )
+
+    if revision and not override:
+        raise ConfigError("`weights_revision` requires an explicit `weights` repository")
+    resolved = revision
+    if not override:
+        resolved = _BUILTIN_REVISIONS.get((model_id, provider), model_revision or "")
+    if not _COMMIT.fullmatch(resolved):
+        raise ConfigError(
+            f"{provider} weights {repo!r} have no immutable artifact identity. Set "
+            "`weights_revision` to the exact 40-character commit; branches, tags and HEAD "
+            "can change bytes without changing an index fingerprint."
+        )
+    ref = f"hf:{repo}@{resolved}"
+    qualified = (
+        model_revision == _QUALIFIED_MODEL_REVISIONS.get(model_id)
+        and resolved == _BUILTIN_REVISIONS.get((model_id, provider))
+        and repo == (mlx_repo(model_id) if provider == "mlx" else onnx_repo(model_id))
+    )
+    identity = (
+        _qualified_identity(model_id, model_revision) if qualified else f"artifact:{provider}:{ref}"
+    )
+    return WeightArtifact(
+        provider=provider, repo=repo, revision=resolved, ref=ref, identity=identity
+    )
+
+
+def _directory_digest(path: Path, provider: str) -> str:
+    """Hash the executable file set of a local artifact, names and bytes."""
+    if provider == "onnx":
+        _graph_file(str(path), path)
+        # ONNX external-data names are graph-defined and may have no conventional suffix.
+        # The tokenizer/card can also live in this directory when it is the local model, so
+        # hash the complete tree rather than claim to know every file either consumer opens.
+        files = sorted(item for item in path.rglob("*") if item.is_file())
+    else:
+        files = sorted(
+            {
+                item
+                for pattern in _MLX_WEIGHT_PATTERNS
+                for item in path.glob(pattern)
+                if item.is_file()
+            }
+        )
+    if not files:
+        raise ConfigError(f"local {provider} weights {path} contain no executable artifact files")
+    digest = hashlib.sha256()
+    for item in files:
+        name = item.relative_to(path).as_posix().encode()
+        digest.update(len(name).to_bytes(8, "big"))
+        digest.update(name)
+        file_digest = hashlib.sha256()
+        with item.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                file_digest.update(block)
+        digest.update(file_digest.digest())
+    return digest.hexdigest()
+
+
+def _qualified_identity(model_id: str, model_revision: str | None) -> str:
+    """One identity bound to both exact artifacts in a qualified backend pair."""
+    pair = "\n".join(
+        (
+            f"model:{model_id}@{model_revision}",
+            f"mlx:{mlx_repo(model_id)}@{_BUILTIN_REVISIONS[(model_id, 'mlx')]}",
+            f"onnx:{onnx_repo(model_id)}@{_BUILTIN_REVISIONS[(model_id, 'onnx')]}",
+        )
+    )
+    return f"qualified:{model_id}:sha256:{hashlib.sha256(pair.encode()).hexdigest()}"
 
 
 def mlx_repo(model_id: str, *, override: str = "") -> str:
@@ -134,6 +282,7 @@ class WeightsPlan:
     repo: str
     patterns: tuple[str, ...]
     present: bool
+    revision: str | None = None
     approximate_bytes: int | None = None
 
     @property
@@ -144,7 +293,9 @@ class WeightsPlan:
         return f"about {self.approximate_bytes / 1_000_000_000:.1f} GB"
 
 
-def planned_weights(provider: str, model_id: str, *, override: str = "") -> WeightsPlan:
+def planned_weights(
+    provider: str, model_id: str, *, override: str = "", revision: str = ""
+) -> WeightsPlan:
     """What ``provider`` will load for ``model_id``, and whether it is already here.
 
     Args:
@@ -169,16 +320,18 @@ def planned_weights(provider: str, model_id: str, *, override: str = "") -> Weig
 
     from manicule.embedding.runtimes.hub import is_cached  # noqa: PLC0415 - an embeddings extra
 
+    resolved_revision = revision if override else builtin_revision(model_id, provider)
     return WeightsPlan(
         provider=provider,
         repo=repo,
         patterns=patterns,
-        present=is_cached(repo, patterns),
+        present=is_cached(repo, patterns, resolved_revision),
+        revision=resolved_revision,
         approximate_bytes=APPROXIMATE_WEIGHT_BYTES.get((provider.strip().lower(), repo)),
     )
 
 
-def mlx_weights(model_id: str, *, override: str = "") -> WeightsRef:
+def mlx_weights(artifact: WeightArtifact | str) -> WeightsRef:
     """Resolve, download and vet the MLX weights for ``model_id``.
 
     Args:
@@ -189,11 +342,13 @@ def mlx_weights(model_id: str, *, override: str = "") -> WeightsRef:
         ConfigError: No artifact is known, the artifact ships no safetensors, or it is
             quantized.
     """
-    repo = mlx_repo(model_id, override=override)
-    path = _materialize(repo, _MLX_WEIGHT_PATTERNS)
+    if isinstance(artifact, str):
+        artifact = resolve_artifact("mlx", artifact, None)
+    repo = artifact.repo
+    path = _materialize(artifact, _MLX_WEIGHT_PATTERNS)
 
     if not any(path.glob("*.safetensors")):
-        known = MLX_WEIGHTS.get(model_id)
+        known = MLX_WEIGHTS.get(artifact.repo)
         remedy = (
             f"Set `weights` under this embedder's configuration to a conversion that does — "
             f"{known!r} for this model."
@@ -205,10 +360,10 @@ def mlx_weights(model_id: str, *, override: str = "") -> WeightsRef:
         raise ConfigError(msg)
 
     _refuse_quantized(repo, path)
-    return WeightsRef(repo=repo, path=path)
+    return WeightsRef(repo=repo, path=path, revision=artifact.revision, identity=artifact.identity)
 
 
-def onnx_weights(model_id: str, *, override: str = "") -> tuple[WeightsRef, Path]:
+def onnx_weights(artifact: WeightArtifact | str) -> tuple[WeightsRef, Path]:
     """Resolve and download the ONNX export for ``model_id``, and the graph file within it.
 
     Returns:
@@ -222,9 +377,12 @@ def onnx_weights(model_id: str, *, override: str = "") -> tuple[WeightsRef, Path
         ConfigError: The repository publishes no ONNX export, or more than one and none named
             conventionally.
     """
-    repo = onnx_repo(model_id, override=override)
-    path = _materialize(repo, _ONNX_PATTERNS)
-    return WeightsRef(repo=repo, path=path), _graph_file(repo, path)
+    if isinstance(artifact, str):
+        artifact = resolve_artifact("onnx", artifact, None)
+    repo = artifact.repo
+    path = _materialize(artifact, _ONNX_PATTERNS)
+    ref = WeightsRef(repo=repo, path=path, revision=artifact.revision, identity=artifact.identity)
+    return ref, _graph_file(repo, path)
 
 
 def _graph_file(repo: str, path: Path) -> Path:
@@ -297,27 +455,40 @@ def _refuse_quantized(repo: str, path: Path) -> None:
         raise ConfigError(msg)
 
 
-def _materialize(repo: str, patterns: tuple[str, ...]) -> Path:
+def _materialize(artifact: WeightArtifact, patterns: tuple[str, ...]) -> Path:
     """The artifact on local disk, downloaded if it is a repository id."""
-    local = Path(repo).expanduser()
+    local = Path(artifact.repo).expanduser()
     if local.is_dir():
+        live_identity = (
+            f"artifact:{artifact.provider}:sha256:{_directory_digest(local, artifact.provider)}"
+        )
+        if live_identity != artifact.identity:
+            raise ConfigError(
+                f"local {artifact.provider} weights {local} changed after their fingerprint "
+                "was constructed. Refusing to attribute the new bytes to the old digest; "
+                "restart so configuration and the executable artifact are resolved together."
+            )
         return local
 
     # Deferred: huggingface-hub is only needed when the artifact is not already on disk.
     from manicule.embedding.runtimes.hub import snapshot  # noqa: PLC0415
 
-    return snapshot(repo, patterns)
+    return snapshot(artifact.repo, patterns, artifact.revision)
 
 
 __all__ = [
     "APPROXIMATE_WEIGHT_BYTES",
     "MLX_WEIGHTS",
     "ONNX_SUBDIR",
+    "WeightArtifact",
     "WeightsPlan",
     "WeightsRef",
+    "builtin_model_revision",
+    "builtin_revision",
     "mlx_repo",
     "mlx_weights",
     "onnx_repo",
     "onnx_weights",
     "planned_weights",
+    "resolve_artifact",
 ]

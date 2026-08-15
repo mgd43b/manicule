@@ -842,7 +842,9 @@ A stored vector may be reused **if and only if all three hold**:
 1. **The same complete embedding fingerprint** — `EmbedFingerprint.canonical()`, which is
    manicule's own definition of vector-space compatibility. The fields are
    `EmbedFingerprint.IDENTITY_FIELDS` and are named here as it names them: `model_id`,
-   `revision`, `dimension`, `pooling`, `normalized`, `tokenizer_id`. Deferring to that tuple
+   `revision`, `dimension`, `pooling`, `normalized`, `tokenizer_id`, `weights_identity`.
+   `weights_identity` is the exact artifact identity, shared across runtimes only by an
+   explicitly pinned parity-qualified built-in pair. Deferring to that tuple
    rather than describing it is deliberate — a prose list is a second definition, and the one
    that goes stale is always the prose.
 2. **The same embedding input, for that document** — the exact post-middleware `embed_text`,
@@ -974,29 +976,19 @@ keys on model identity:
 decide comparability — in the canonical form pinned in §4.6, compared for byte equality. Not
 field-by-field, so a field added to that subset later cannot be silently ignored by a
 comparison that predates it. As shipped in `manicule.core.embedding`, identity is `model_id`,
-`revision`, `dimension`, `pooling`, `normalized` and `tokenizer_id`.
+`revision`, `dimension`, `pooling`, `normalized`, `tokenizer_id` and `weights_identity`.
 
-**Three fields are recorded but deliberately excluded, and two of them rest on one
-measurement.** `max_sequence_length` is out because including it would force a full re-embed
+**Three fields are recorded but deliberately excluded.** `max_sequence_length` is out because including it would force a full re-embed
 whenever the limit *rises*, which changes nothing about the stored vectors; what matters is
 whether any text was truncated, and `require_within_context` checks that against the actual
 batch — in particular on the re-embed path, which reads stored `embed_text` without re-chunking
 and so never runs the chunker's own budget refusal.
 
-`backend` is out because the same model under MLX and under ONNX produces interchangeable
-vectors, which keeps a corpus portable between machines. That was an assumption when this was
-written and is now a measurement: cosine 1.000000 with a largest component difference of
-1.8 × 10⁻⁵ on `bge-m3`, asserted per run in `tests/test_embedding_backends.py`
-([`embeddings.md`](embeddings.md) §3.3). **If parity ever stops holding, moving `backend` into
-the identity set is the correction** — it makes a runtime change a loud error with a re-embed
-path, which is right if the vectors really do differ.
-
-`weights_ref` is out on the same measurement and needs the same care. A backend rarely runs the
-canonical repository's own files — `BAAI/bge-m3` publishes no safetensors, so MLX executes a
-community conversion — and recording which one ran is what makes an index diagnosable. The one
-re-encoding that *does* move the vectors is quantization, and that is refused at load rather
-than absorbed here: 4-bit `bge-m3` sits at cosine 0.92–0.97 to the same model in fp16
-([`embeddings.md`](embeddings.md) §1.0).
+`backend` and `weights_ref` are diagnostic provenance. Compatibility is enforced instead by
+`weights_identity`: exact built-in commits share it only when the ONNX/MLX pair is explicitly
+allowlisted and covered by parity tests. Every arbitrary hub commit and local digest is
+backend-specific. A changed artifact therefore refuses reuse and requires `reindex --re-embed`;
+an artifact whose immutable identity cannot be established is refused before loading.
 
 **`architecture` is not currently an identity field, and there is an argument that it should
 be.** `mlx-embeddings` binds `last_hidden_state` to the *pooled* vector on some architectures

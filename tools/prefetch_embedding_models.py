@@ -43,31 +43,39 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from manicule.embedding.artifacts import mlx_repo  # noqa: E402
+from manicule.embedding.artifacts import (  # noqa: E402
+    builtin_model_revision,
+    builtin_revision,
+    mlx_repo,
+)
 from manicule.embedding.cards import CARD_FILES  # noqa: E402
 
 PARITY_MODEL = "BAAI/bge-small-en-v1.5"
 FULL_MODEL = "BAAI/bge-m3"
 
 
-def fetch(repo: str, patterns: list[str]) -> Path:
+def fetch(repo: str, patterns: list[str], revision: str | None) -> Path:
     from huggingface_hub import snapshot_download  # noqa: PLC0415
 
-    print(f"  {repo}  {patterns}")
-    return Path(snapshot_download(repo, allow_patterns=patterns))
+    print(f"  {repo}@{revision or 'HEAD'}  {patterns}")
+    return Path(snapshot_download(repo, revision=revision, allow_patterns=patterns))
 
 
 def prefetch(model_id: str, *, mlx: bool) -> None:
     print(f"{model_id}:")
     # The declaration, always: pooling, dimension and sequence length are read from the
     # canonical repository even when the weights come from a conversion.
-    fetch(model_id, [*CARD_FILES])
+    fetch(model_id, [*CARD_FILES], builtin_model_revision(model_id))
     # `onnx/*` rather than `onnx/model.onnx`: bge-m3's graph is a few hundred kilobytes of
     # structure pointing at its weights in a sibling `model.onnx_data`, and opening the graph
     # without the sidecar loads a model with no parameters in it.
-    fetch(model_id, ["onnx/*"])
+    fetch(model_id, ["onnx/*"], builtin_revision(model_id, "onnx"))
     if mlx:
-        fetch(mlx_repo(model_id), ["*.safetensors", "*.json"])
+        fetch(
+            mlx_repo(model_id),
+            ["*.safetensors", "*.json"],
+            builtin_revision(model_id, "mlx"),
+        )
 
 
 def for_backend(model_id: str, backend: str) -> None:
@@ -79,11 +87,15 @@ def for_backend(model_id: str, backend: str) -> None:
     index has a download in front of it.
     """
     print(f"{model_id} for the {backend} backend:")
-    fetch(model_id, [*CARD_FILES])
+    fetch(model_id, [*CARD_FILES], builtin_model_revision(model_id))
     if backend == "mlx":
-        fetch(mlx_repo(model_id), ["*.safetensors", "*.json"])
+        fetch(
+            mlx_repo(model_id),
+            ["*.safetensors", "*.json"],
+            builtin_revision(model_id, "mlx"),
+        )
     else:
-        fetch(model_id, ["onnx/*", "*.json"])
+        fetch(model_id, ["onnx/*", "*.json"], builtin_revision(model_id, "onnx"))
 
 
 def main() -> int:

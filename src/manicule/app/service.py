@@ -1314,6 +1314,8 @@ class ApplicationService:
             # one is for a person deciding whether this is the model they meant, the other is
             # the string a re-embed compares and must not be prettied.
             embed_fingerprint=fingerprints.embed.canonical() if fingerprints.embed else None,
+            weights_ref=fingerprints.embed.weights_ref if fingerprints.embed else None,
+            weights_identity=fingerprints.embed.weights_identity if fingerprints.embed else None,
             chunk_fingerprint=fingerprints.chunk.canonical() if fingerprints.chunk else None,
             # The fourth stage, reported beside the other three. There is no corpus-wide
             # committed value to read out of `index_state` for this one — detection is compared
@@ -2665,7 +2667,15 @@ class ApplicationService:
         settings = self.settings
         chosen = provider or settings.embedding.provider
         try:
-            return planned_weights(chosen, settings.embedding.model)
+            config = settings.component_config("embedder", chosen)
+            weights = config.get("weights", "")
+            revision = config.get("weights_revision", "")
+            return planned_weights(
+                chosen,
+                settings.embedding.model,
+                override=weights if isinstance(weights, str) else "",
+                revision=revision if isinstance(revision, str) else "",
+            )
         except ImportError:
             return None
 

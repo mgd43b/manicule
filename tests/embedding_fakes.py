@@ -39,6 +39,7 @@ class StubEmbedder(PooledEmbedder):
             card,
             backend="stub",
             weights_ref="",
+            weights_identity="test:stub-token-states-v1",
             batch_size=batch_size,
             cache_entries=cache_entries,
         )

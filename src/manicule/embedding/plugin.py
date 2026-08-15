@@ -40,6 +40,7 @@ def _card(context: BuildContext) -> tuple[ModelCard, EmbedderConfig]:
     """
     # Deferred: cards.py reaches for `tokenizers` and huggingface-hub, and registration must
     # stay free of both.
+    from manicule.embedding.artifacts import builtin_model_revision  # noqa: PLC0415
     from manicule.embedding.cards import read_card  # noqa: PLC0415
 
     settings = context.config
@@ -53,9 +54,10 @@ def _card(context: BuildContext) -> tuple[ModelCard, EmbedderConfig]:
         raise ConfigError(msg)
 
     embedding = context.settings.embedding
+    revision = embedding.revision or builtin_model_revision(embedding.model)
     card = read_card(
         embedding.model,
-        revision=embedding.revision,
+        revision=revision,
         pooling_override=settings.pooling,
         max_sequence_length_override=settings.max_sequence_length,
     )
@@ -82,6 +84,7 @@ def _build_mlx(context: BuildContext) -> Embedder:
     return MlxEmbedder(
         card,
         weights=config.weights,
+        weights_revision=config.weights_revision,
         batch_size=embedding.batch_size,
         cache_entries=embedding.cache_entries,
         cache_limit_bytes=config.cache_limit_mb * MEGABYTE,
@@ -97,6 +100,7 @@ def _build_onnx(context: BuildContext) -> Embedder:
     return OnnxEmbedder(
         card,
         weights=config.weights,
+        weights_revision=config.weights_revision,
         batch_size=embedding.batch_size,
         cache_entries=embedding.cache_entries,
     )
