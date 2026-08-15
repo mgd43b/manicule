@@ -83,17 +83,19 @@ async def _recover_reembed_runs(
     from manicule.ingest.reembed import ReembedRecovery  # noqa: PLC0415
 
     recovered = 0
-    failure_types: list[str] = []
+    failures = 0
+    failure_types: set[str] = set()
     for run_id in run_ids:
         try:
             await resume(run_id)
         except Exception as error:  # noqa: BLE001 - each durable run is an isolation boundary
-            failure_types.append(type(error).__name__)
+            failures += 1
+            failure_types.add(type(error).__name__)
         else:
             recovered += 1
     return ReembedRecovery(
         recovered=recovered,
-        failures=len(failure_types),
+        failures=failures,
         failure_types=tuple(sorted(failure_types)),
     )
 

@@ -62,6 +62,17 @@ async def test_reembed_restart_recovery_continues_after_one_run_refuses() -> Non
     assert "private" not in repr(outcome)
 
 
+async def test_reembed_restart_recovery_deduplicates_failure_classes() -> None:
+    async def resume(_run_id: str) -> None:
+        raise RuntimeError("synthetic private failure")
+
+    outcome = await _recover_reembed_runs(("private-one", "private-two"), resume)
+
+    assert outcome.recovered == 0
+    assert outcome.failures == 2
+    assert outcome.failure_types == ("RuntimeError",)
+
+
 async def test_reembed_restart_recovery_does_not_swallow_cancellation() -> None:
     async def resume(_run_id: str) -> None:
         raise asyncio.CancelledError

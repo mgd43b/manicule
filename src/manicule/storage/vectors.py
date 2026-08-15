@@ -60,6 +60,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Final
@@ -1143,7 +1144,7 @@ class PublishedLanceVectorStore:
         """Pin and revalidate one pointer before exposing its store to an operation."""
         while True:
             pointer = await self._pointer()
-            key = pointer if pointer and pointer.startswith("reembed-") else "legacy"
+            key = _published_generation_key(pointer)
             directory = (
                 self._directory / "generations" / key if key != "legacy" else self._directory
             )
@@ -1192,6 +1193,18 @@ class PublishedLanceVectorStore:
             if fingerprint is not None:
                 await store.ensure_ready(fingerprint, embed_text_middleware=self._middleware)
         return store
+
+
+def _published_generation_key(pointer: str | None) -> str:
+    """Map a database pointer to one safe local directory component."""
+    if pointer is None or not pointer.startswith("reembed-"):
+        return "legacy"
+    if re.fullmatch(r"reembed-[A-Za-z0-9._-]+", pointer) is None:
+        raise VectorStoreStateError(
+            "the published vector generation pointer is invalid; repair index state before "
+            "searching or writing vectors"
+        )
+    return pointer
 
 
 __all__ = [

@@ -783,6 +783,33 @@ async def test_missing_published_generation_is_fatal_and_is_not_recreated(
 
 
 @pytest.mark.parametrize(
+    "pointer",
+    ["reembed-../outside", "reembed-private/generation", r"reembed-private\generation"],
+)
+async def test_invalid_published_generation_pointer_never_becomes_a_path(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path, pointer: str
+) -> None:
+    del store
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(models.IndexState).values(
+                id=1,
+                vector_table=pointer,
+                embed_fingerprint=HashEmbedder(dimension=4).fingerprint.model_dump_json(),
+                vector_inventory_digest="synthetic-inventory",
+                created_at=utcnow(),
+                updated_at=utcnow(),
+            )
+        )
+    live = PublishedLanceVectorStore(data_dir / VECTORS_DIRNAME, engine)
+
+    with pytest.raises(VectorStoreStateError, match="generation pointer is invalid"):
+        await live.fingerprint()
+
+    assert not (data_dir / VECTORS_DIRNAME / "outside").exists()
+
+
+@pytest.mark.parametrize(
     ("column", "corrupt_value"),
     [
         ("id", "wrong-physical-key"),
