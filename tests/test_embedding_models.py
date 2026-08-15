@@ -197,12 +197,35 @@ def test_a_model_without_a_fast_tokenizer_is_refused(tmp_path: Path) -> None:
         read_card(str(directory))
 
 
-def test_a_local_model_records_no_revision(tmp_path: Path) -> None:
-    """There is no commit to pin, and inventing one is a fingerprint claiming a guarantee."""
-    card = read_card(str(write_model(tmp_path / "model")))
+def test_a_local_model_records_its_input_digest(tmp_path: Path) -> None:
+    directory = write_model(tmp_path / "model")
+    card = read_card(str(directory))
 
-    assert card.revision is None
-    assert card.fingerprint(backend="stub").revision is None
+    assert card.revision is not None
+    assert card.revision.startswith("local-sha256:")
+    assert card.fingerprint(backend="stub").revision == card.revision
+
+    tokenizer = directory / "tokenizer.json"
+    tokenizer.write_text(tokenizer.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    changed = read_card(str(directory))
+    separate_weights = resolve_artifact(
+        "onnx",
+        str(directory),
+        card.revision,
+        override="acme/export",
+        revision="1" * 40,
+    )
+    assert changed.revision != card.revision
+    assert not changed.fingerprint(
+        backend="onnx", weights_identity=separate_weights.identity
+    ).matches(card.fingerprint(backend="onnx", weights_identity=separate_weights.identity))
+
+
+def test_a_local_model_refuses_a_revision_claim(tmp_path: Path) -> None:
+    directory = write_model(tmp_path / "model")
+
+    with pytest.raises(ConfigError, match="local directory"):
+        read_card(str(directory), revision="claimed-commit")
 
 
 def test_the_tokenizer_pads_with_the_model_s_own_pad_token(tmp_path: Path) -> None:
@@ -393,7 +416,46 @@ def test_weight_plan_probes_the_pinned_revision(monkeypatch: pytest.MonkeyPatch)
     plan = planned_weights("onnx", "BAAI/bge-m3")
 
     assert plan.revision == "5617a9f61b028005a4858fdac845db406aefb181"
-    assert seen == [plan.revision]
+    assert seen == [plan.revision, plan.revision]
+
+
+def test_weight_plan_is_pending_when_override_is_cached_but_card_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commit = "6" * 40
+
+    def is_cached(repo: str, patterns: tuple[str, ...], revision: str | None = None) -> bool:
+        del patterns, revision
+        return repo == "acme/export"
+
+    monkeypatch.setattr("manicule.embedding.runtimes.hub.is_cached", is_cached)
+
+    plan = planned_weights(
+        "onnx",
+        "acme/model",
+        model_revision=commit,
+        override="acme/export",
+        revision="7" * 40,
+    )
+
+    assert plan.ref == f"hf:acme/export@{'7' * 40}"
+    assert plan.card_present is False
+    assert plan.present is False
+
+
+def test_builtin_plan_is_pending_when_weights_are_cached_but_card_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def is_cached(repo: str, patterns: tuple[str, ...], revision: str | None = None) -> bool:
+        del patterns, revision
+        return repo == "mlx-community/bge-m3-mlx-fp16"
+
+    monkeypatch.setattr("manicule.embedding.runtimes.hub.is_cached", is_cached)
+
+    plan = planned_weights("mlx", "BAAI/bge-m3")
+
+    assert plan.card_present is False
+    assert plan.present is False
 
 
 def test_local_weight_bytes_change_identity(tmp_path: Path) -> None:

@@ -34,7 +34,7 @@ from typing import Final, cast
 from pydantic import BaseModel, ConfigDict, Field
 
 from manicule.core.errors import ConfigError
-from manicule.embedding.cards import read_json_if_present
+from manicule.embedding.cards import CARD_FILES, read_json_if_present
 
 MLX_WEIGHTS: Final[dict[str, str]] = {
     "BAAI/bge-m3": "mlx-community/bge-m3-mlx-fp16",
@@ -282,7 +282,10 @@ class WeightsPlan:
     repo: str
     patterns: tuple[str, ...]
     present: bool
+    card_present: bool | None = None
     revision: str | None = None
+    ref: str | None = None
+    error: str | None = None
     approximate_bytes: int | None = None
 
     @property
@@ -294,7 +297,12 @@ class WeightsPlan:
 
 
 def planned_weights(
-    provider: str, model_id: str, *, override: str = "", revision: str = ""
+    provider: str,
+    model_id: str,
+    *,
+    model_revision: str | None = None,
+    override: str = "",
+    revision: str = "",
 ) -> WeightsPlan:
     """What ``provider`` will load for ``model_id``, and whether it is already here.
 
@@ -309,6 +317,7 @@ def planned_weights(
         because "manicule does not know how this one loads its weights" must not be rendered
         as "this machine is missing something".
     """
+    model_revision = model_revision or builtin_model_revision(model_id)
     routes: Mapping[str, tuple[str, tuple[str, ...]]] = {
         "mlx": (mlx_repo(model_id, override=override), _MLX_WEIGHT_PATTERNS),
         "onnx": (onnx_repo(model_id, override=override), _ONNX_PATTERNS),
@@ -318,16 +327,41 @@ def planned_weights(
         return WeightsPlan(provider=provider, repo=model_id, patterns=(), present=True)
     repo, patterns = chosen
 
+    # A custom model's HEAD/tag is resolved by read_card before runtime construction. Doctor
+    # is cache-only, so when that card is not cached yet it cannot honestly invent the commit;
+    # report the pending fetch without claiming a ref. The service supplies the cached resolved
+    # commit here whenever one exists.
+    if not override and not _COMMIT.fullmatch(model_revision or ""):
+        return WeightsPlan(
+            provider=provider,
+            repo=repo,
+            patterns=patterns,
+            present=False,
+            card_present=False,
+            approximate_bytes=APPROXIMATE_WEIGHT_BYTES.get((provider.strip().lower(), repo)),
+        )
+
+    artifact = resolve_artifact(
+        provider,
+        model_id,
+        model_revision,
+        override=override,
+        revision=revision,
+    )
+
     from manicule.embedding.runtimes.hub import is_cached  # noqa: PLC0415 - an embeddings extra
 
-    resolved_revision = revision if override else builtin_revision(model_id, provider)
+    card_present = is_cached(model_id, CARD_FILES, model_revision)
+    weights_present = is_cached(artifact.repo, patterns, artifact.revision)
     return WeightsPlan(
         provider=provider,
-        repo=repo,
+        repo=artifact.repo,
         patterns=patterns,
-        present=is_cached(repo, patterns, resolved_revision),
-        revision=resolved_revision,
-        approximate_bytes=APPROXIMATE_WEIGHT_BYTES.get((provider.strip().lower(), repo)),
+        present=card_present and weights_present,
+        card_present=card_present,
+        revision=artifact.revision,
+        ref=artifact.ref,
+        approximate_bytes=APPROXIMATE_WEIGHT_BYTES.get((provider.strip().lower(), artifact.repo)),
     )
 
 

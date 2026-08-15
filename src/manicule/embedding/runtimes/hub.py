@@ -170,6 +170,25 @@ def is_cached(repo: str, patterns: Sequence[str], revision: str | None = None) -
     return True
 
 
+def cached_revision(repo: str, patterns: Sequence[str], revision: str | None = None) -> str | None:
+    """Resolved cached commit for ``revision``, without touching the network."""
+    local = Path(repo).expanduser()
+    if local.is_dir():
+        return None
+
+    from huggingface_hub import snapshot_download  # noqa: PLC0415 - kept out of import time
+
+    try:
+        path = Path(
+            snapshot_download(
+                repo, revision=revision, allow_patterns=list(patterns), local_files_only=True
+            )
+        )
+    except Exception:  # noqa: BLE001 - cache probe must never escape as a diagnostic failure
+        return None
+    return path.name if path.parent.name == "snapshots" else revision
+
+
 def _unavailable(repo: str, patterns: Sequence[str], exc: Exception) -> str:
     """What a query says when the model it needs was never put on this machine."""
     return (
@@ -183,4 +202,11 @@ def _unavailable(repo: str, patterns: Sequence[str], exc: Exception) -> str:
     )
 
 
-__all__ = ["OFFLINE_ENV", "PROGRESS_ENV", "ModelUnavailableError", "is_cached", "snapshot"]
+__all__ = [
+    "OFFLINE_ENV",
+    "PROGRESS_ENV",
+    "ModelUnavailableError",
+    "cached_revision",
+    "is_cached",
+    "snapshot",
+]

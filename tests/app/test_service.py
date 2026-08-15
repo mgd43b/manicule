@@ -15,6 +15,7 @@ from pathlib import Path
 
 import huggingface_hub
 import pytest
+from pydantic import ValidationError
 
 from manicule import vocabularies
 from manicule.app import results as r
@@ -1288,6 +1289,146 @@ async def test_doctor_is_quiet_about_weights_that_are_already_here(
 
     assert check.state == "ok"
     assert "no download is pending" in check.detail
+    assert check.facts["revision"] == "a37eddded9a6a1273a87fb8b0da0d1cdbd98aeec"
+    assert check.facts["ref"] == (
+        "hf:mlx-community/bge-m3-mlx-fp16@a37eddded9a6a1273a87fb8b0da0d1cdbd98aeec"
+    )
+
+
+async def test_doctor_refuses_a_mutable_remote_weights_revision(backend: FakeBackend) -> None:
+    backend.settings = Settings(
+        plugins={  # pyright: ignore[reportArgumentType] - validated settings fixture
+            "config": {
+                "embedder.mlx": {
+                    "weights": "acme/conversion",
+                    "weights_revision": "main",
+                }
+            }
+        }
+    )
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "failing"
+    assert "40-character commit" in check.detail
+    assert "40-character commit" in (check.remedy or "")
+    assert check.facts["configuration_valid"] is False
+
+
+async def test_doctor_refuses_a_non_string_weights_revision(backend: FakeBackend) -> None:
+    backend.settings = Settings(
+        plugins={  # pyright: ignore[reportArgumentType] - malformed raw plugin config is the case
+            "config": {"embedder.mlx": {"weights_revision": 123}}
+        }
+    )
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "failing"
+    assert "weights_revision" in check.detail
+    assert check.facts["configuration_valid"] is False
+
+
+def test_an_empty_model_revision_is_invalid_for_every_model() -> None:
+    for model in ("BAAI/bge-m3", "acme/custom", "fixtures/local-model"):
+        with pytest.raises(ValidationError):
+            Settings(
+                embedding={  # pyright: ignore[reportArgumentType] - invalid value under test
+                    "model": model,
+                    "revision": "",
+                }
+            )
+
+
+async def test_doctor_uses_a_custom_model_s_cached_resolved_revision(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = "4" * 40
+    backend.settings = Settings(
+        embedding={  # pyright: ignore[reportArgumentType] - validated settings fixture
+            "model": "acme/custom",
+            "revision": "stable",
+        }
+    )
+
+    def cached_revision(repo: str, patterns: Sequence[str], revision: str | None = None) -> str:
+        del repo, patterns, revision
+        return commit
+
+    def is_cached(repo: str, patterns: Sequence[str], revision: str | None = None) -> bool:
+        del repo, patterns, revision
+        return True
+
+    monkeypatch.setattr(hub, "cached_revision", cached_revision)
+    monkeypatch.setattr(hub, "is_cached", is_cached)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "ok"
+    assert check.facts["revision"] == commit
+    assert check.facts["ref"] == f"hf:acme/custom@{commit}"
+
+
+async def test_doctor_reports_an_uncached_custom_model_as_pending_not_invalid(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend.settings = Settings(
+        embedding={"model": "acme/custom"}  # pyright: ignore[reportArgumentType]
+    )
+
+    def missing_revision(repo: str, patterns: Sequence[str], revision: str | None = None) -> None:
+        del repo, patterns, revision
+
+    monkeypatch.setattr(hub, "cached_revision", missing_revision)
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "ok"
+    assert "not on this machine yet" in check.detail
+    assert check.facts["revision"] is None
+    assert check.facts["ref"] is None
+
+
+async def test_doctor_refuses_a_revision_claim_for_local_weights(
+    backend: FakeBackend, tmp_path: Path
+) -> None:
+    backend.settings = Settings(
+        plugins={  # pyright: ignore[reportArgumentType] - validated settings fixture
+            "config": {
+                "embedder.mlx": {
+                    "weights": str(tmp_path),
+                    "weights_revision": "1" * 40,
+                }
+            }
+        }
+    )
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "failing"
+    assert "cannot describe local weights" in check.detail
+
+
+async def test_doctor_refuses_a_revision_claim_for_a_local_model(
+    backend: FakeBackend, tmp_path: Path
+) -> None:
+    backend.settings = Settings(
+        embedding={"model": str(tmp_path), "revision": "claimed"}  # pyright: ignore[reportArgumentType]
+    )
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(check for check in diagnosis.checks if check.name == "models")
+
+    assert check.state == "failing"
+    assert "local inputs use a content digest" in check.detail
+    assert check.remedy == check.detail.removeprefix(
+        "the configured embedding artifact is invalid: "
+    )
 
 
 async def test_weights_that_cannot_be_fetched_and_are_not_here_is_a_failure(

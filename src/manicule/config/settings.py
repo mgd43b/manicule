@@ -615,7 +615,7 @@ class EmbeddingSettings(Section):
         default="mlx", min_length=1, description="Which embedder implementation to use."
     )
     model: str = Field(default="BAAI/bge-m3", min_length=1)
-    revision: str | None = None
+    revision: str | None = Field(default=None, min_length=1)
     batch_size: int = Field(default=32, ge=1)
     cache_entries: int = Field(
         default=10_000,

@@ -502,7 +502,7 @@ tokenizer_id        BAAI/bge-m3
 max_sequence_length 8190      # recorded, excluded from identity
 backend             mlx|onnx  # recorded, excluded from identity — §3.3
 weights_ref         hf:mlx-community/bge-m3-mlx-fp16@<commit> # exact provenance, excluded
-weights_identity    qualified:BAAI/bge-m3@<model commit>       # identity — §1.0
+weights_identity    qualified:BAAI/bge-m3:sha256:<pair digest> # identity — §1.0
 ```
 
 **`revision` is pinned rather than left unset.** The type permits `None` and records it
@@ -522,12 +522,30 @@ also backend-specific. Changing either forces re-embedding. A mutable or unresol
 is refused before weights load. Thus a model name, matching dimensions, or a conversion repo
 name can never accidentally opt into portability.
 
+This adds an identity field to every built-in live fingerprint. Corpora built before this
+contract—remote built-ins as well as local/custom models—lack it and must run
+`reindex --re-embed` once. Reusing vectors whose executable artifact was never identified
+would preserve the ambiguity this migration removes.
+
 Local artifacts use a digest of the complete executable directory tree, and setup rechecks it
 before opening the runtime. The directory is therefore configuration, not a live deployment
 target: do not mutate it while manicule is running. A concurrent writer can race any
 path-based model loader after the check; publish a new immutable directory and restart instead.
+When `embedding.model` itself is local, its card, pooling configuration and tokenizer inputs
+receive a separate content digest in `revision`, even if `weights` points somewhere else.
+Setting `embedding.revision` for a local directory is refused because it would be an unverifiable
+claim beside mutable bytes.
+Existing corpora built from local models predate this digest and will refuse the new fingerprint;
+run `reindex --re-embed` once so their vectors are attributed to the local inputs that made them.
 `index status` (including the MCP surface) exposes both `weights_ref` and `weights_identity`,
 so the exact commit or local digest remains inspectable after the corpus is built.
+
+`doctor` and `init` resolve this same artifact contract before reporting cache readiness. An
+invalid remote commit or a `weights_revision` attached to local weights is a failing check with
+the same remedy runtime construction would give; a cached artifact with invalid identity
+configuration cannot report green. Runtime content vetting (including quantization refusal)
+still occurs when the backend opens it. The check facts include the immutable revision and
+resolved `weights_ref` when the model card commit is already known.
 
 **`architecture` is still not an identity field, and implementation settled the case against
 adding it.** The concern was that architecture decides which tensor the extraction path reads,

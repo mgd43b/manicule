@@ -97,6 +97,8 @@ executed hub commit (or a digest for local weights) is recorded with the index. 
 built-in ONNX/MLX artifact pairs covered by the parity suite are portable across backends;
 custom remote weights must set an immutable `weights_revision`, and changing any artifact
 requires `reindex --re-embed` rather than reusing incomparable vectors.
+Local model card/tokenizer inputs are content-addressed too, including when weights are separate;
+local `embedding.revision` claims are rejected.
 The MCP `index_status` result exposes the exact `weights_ref` and its compatibility identity.
 
 **`ask` additionally needs a generator**, where `search` needs only the embedder. The default
