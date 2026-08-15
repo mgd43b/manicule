@@ -55,7 +55,8 @@ it for the answer.
         │ redaction      │    │ citation verification  │  starts here: it needs
         ├────────────────┤    │ (concurrent)           │  no model output
         │ Generator      │    └───────────┬────────────┘
-        │   └─ litellm   │                │
+        │   ├─ litellm   │                │
+        │   └─ local CLI │                │
         ├────────────────┤                │
         │ citation binder│ ◄──────────────┘  marker → slot → verified Citation
         └───────┬────────┘
@@ -470,6 +471,32 @@ alive.
 litellm's exception classes are converted inside the adapter into `Token`, `Usage`,
 `FinishReason` and `manicule.core.errors` types. Nothing above the adapter imports litellm,
 and `tests/test_import_boundary.py` keeps it out of `import manicule`.
+
+#### The local command adapter
+
+`llm.generator = "cli"` selects a second built-in adapter. With `llm.provider = "codex"` it
+runs `codex exec`; with `"claude"` it runs `claude --print`. The already-built, redacted
+system message is passed as Codex developer instructions or Claude's system prompt; the remaining
+user/assistant transcript is serialized as JSON on stdin. Both command-line and browser questions
+therefore retain the prompt's authority, history, citation binder and persistence behavior. The
+commands run in a fresh empty directory. Codex ignores user configuration and rules, is
+ephemeral and read-only, and has its shell tool disabled. Claude runs in safe mode with session
+persistence and tools disabled. Neither command is given manicule's workspace as its working
+directory.
+
+These CLIs own their authentication, so manicule does not require a second API key. That does
+not make them local model runtimes: their destination is opaque to the parent process and is
+classified `REMOTE`, conservatively, so the ordinary cloud-content policy and redaction path
+remain in force. A configured `base_url` is refused because the adapter would ignore it.
+
+The CLIs do not expose model metadata through these commands, so `llm.context_window` is
+required. `llm.model = "default"` leaves the CLI's configured model selected; any other value
+is passed through `--model`. The subprocess is bounded by `llm.timeout_s`, terminated when a
+browser or CLI caller cancels, and the whole process group is terminated with it. Its final
+response is emitted as one `Token` rather than pretending process stdout is a provider token
+stream. Because neither CLI exposes the provider's finish reason or output-token limit, manicule
+fits the completed text to its conservative token estimate itself and reports `length` when it
+had to truncate.
 
 ### 4.2 Model selection, and the `ollama_chat/` trap
 

@@ -46,7 +46,12 @@ from manicule.generation.budget import (
     drift_problem,
     usable_prompt_tokens,
 )
-from manicule.generation.config import GENERATOR_NAME, GeneratorConfig
+from manicule.generation.config import (
+    CLI_GENERATOR_NAME,
+    GENERATOR_NAME,
+    CliGeneratorConfig,
+    GeneratorConfig,
+)
 from manicule.generation.history import HistoryPlan, Turn, fit_history, neutralize_markers
 from manicule.generation.markers import (
     ATTEMPT_PREFIX,
@@ -94,6 +99,7 @@ __all__ = [
     "ATTEMPT_PREFIX",
     "BUILTIN_DETECTORS",
     "CITATION_PROTOCOL",
+    "CLI_GENERATOR_NAME",
     "GENERATION_ENCODING",
     "GENERATOR_NAME",
     "MARKER_MAX_LEN",
@@ -112,6 +118,7 @@ __all__ = [
     "CitationDrop",
     "CitationLabel",
     "CitationVerifier",
+    "CliGeneratorConfig",
     "ConversationStore",
     "Detector",
     "DropReason",

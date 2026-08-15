@@ -63,6 +63,14 @@ that an unset ``base_url`` should be read as loopback; it settles nothing about 
 configured endpoint actually is. :func:`egress_for` decides that.
 """
 
+CLI_AUTH_PROVIDERS: frozenset[str] = frozenset({"codex", "claude"})
+"""Provider names whose matching CLI can own authentication when that adapter is selected.
+
+They are deliberately absent from :data:`KEYLESS_PROVIDERS`: a provider name alone does not
+prove that the CLI generator is in use. The settings-level credential check has both facts and
+applies this exemption only to that combination.
+"""
+
 KEYLESS_PROVIDERS: frozenset[str] = IN_PROCESS_PROVIDERS | SELF_HOSTED_PROVIDERS
 """Providers that need no credential.
 
@@ -351,6 +359,7 @@ def resolve_provider_keys(
 
 
 __all__ = [
+    "CLI_AUTH_PROVIDERS",
     "DEFAULT_BASE_URLS",
     "IN_PROCESS_PROVIDERS",
     "KEYLESS_PROVIDERS",

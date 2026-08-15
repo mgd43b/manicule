@@ -10,7 +10,13 @@ import pytest
 
 from manicule.container import keys
 from manicule.core.protocols import Generator, generating
-from manicule.generation.config import GENERATOR_NAME, GeneratorConfig
+from manicule.generation.cli_provider import CliGenerator
+from manicule.generation.config import (
+    CLI_GENERATOR_NAME,
+    GENERATOR_NAME,
+    CliGeneratorConfig,
+    GeneratorConfig,
+)
 from manicule.generation.plugin import PLUGIN
 from manicule.generation.provider import LitellmGenerator
 from manicule.plugins import ComponentRegistry
@@ -37,6 +43,17 @@ def test_the_built_in_generator_matches_the_protocol_signature() -> None:
 
 
 @pytest.mark.contract
+def test_the_cli_generator_matches_the_protocol_signature() -> None:
+    generator = CliGenerator(
+        settings(llm={"provider": "codex", "model": "default", "context_window": 32_768}).llm
+    )
+
+    assert_protocol_signatures(generator, Generator)
+    assert isinstance(generator, Generator)
+    assert generator.model_id == "codex-cli/default"
+
+
+@pytest.mark.contract
 def test_a_generator_written_strictly_to_the_protocol_also_conforms() -> None:
     assert_protocol_signatures(ProtocolOnlyGenerator(), Generator)
 
@@ -51,6 +68,10 @@ def test_the_generation_plugin_registers_a_generator_with_a_config_model() -> No
 
     assert record.config_model is GeneratorConfig
     assert record.summary
+
+    cli = registry.record(keys.GENERATOR.named(CLI_GENERATOR_NAME))
+    assert cli.config_model is CliGeneratorConfig
+    assert cli.summary
 
 
 async def test_generating_closes_the_stream_on_every_exit_path() -> None:
