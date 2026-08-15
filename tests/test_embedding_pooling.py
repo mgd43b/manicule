@@ -164,7 +164,7 @@ def test_non_finite_embedding_output_is_refused_with_its_origin_named(value: flo
     broken = states(1, 4, 3)
     broken[0, 0, 0] = value
 
-    with np.errstate(invalid="ignore"), pytest.raises(TokenStateError) as raised:
+    with pytest.raises(TokenStateError) as raised:
         pool_token_states(
             TokenStates(
                 states=broken,
