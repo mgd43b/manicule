@@ -51,6 +51,14 @@ person on loopback: a page load against a local process is a few milliseconds, a
 answer — the one interaction where latency is visible — is streamed, over the SSE endpoint the
 API already publishes.
 
+Every mutation has one status region that reports its pending, successful or refused state. A
+status region serializes the controls that share it, so two row actions cannot race to replace
+one another's result; network failures and non-JSON refusals are reported there too. Chat is the
+one longer-lived request: while an answer is streaming another cannot start, Stop aborts its
+request, and Retry manually sends the exact original body. A stream is complete only after it
+ends with exactly one `final` event. A partial answer remains visible when that contract is
+broken, but it is named as incomplete rather than presented as a finished answer.
+
 **If this is revisited**, the question to ask is not "is a SPA nicer" but "has the no-toolchain
 requirement changed". It is the whole of the argument, and it is the one thing a future
 implementation has to answer.

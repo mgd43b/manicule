@@ -48,7 +48,7 @@
     <button type="submit">Mint</button>
   </form>
   <p class="secret" data-secret hidden></p>
-  <p class="muted" data-key-status></p>
+  <p class="muted" data-key-status role="status" aria-live="polite"></p>
 
   {% if panels.api_keys.ok %}
     {% if panels.api_keys.data.keys %}
