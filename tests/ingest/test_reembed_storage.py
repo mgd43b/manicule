@@ -30,6 +30,7 @@ from manicule.storage.types import utcnow
 from manicule.storage.vectors import (
     LanceVectorStore,
     PublishedLanceVectorStore,
+    VectorStoreReprepareRequiredError,
     VectorStoreStateError,
     quote,
     table_name,
@@ -160,6 +161,12 @@ async def test_on_disk_shadow_validates_publishes_and_runtime_follows_pointer(
     assert str(revision) == run.commitment.snapshot.revision
     with pytest.raises(ReembedError, match="sealed shadow generation"):
         await shadows.upsert(generation, [source], [vector], lease=lease)
+    with pytest.raises(VectorStoreReprepareRequiredError, match="prepare this handle"):
+        await live.search(vector, 1)
+    with pytest.raises(VectorStoreReprepareRequiredError, match="prepare this handle"):
+        await live.upsert([source.chunk], [vector], publication_id=source.publication_id)
+    await live.ensure_ready(HashEmbedder(dimension=4).fingerprint)
+    await live.upsert([source.chunk], [vector], publication_id=source.publication_id)
     rows = await live.search(vector, 1)
     assert len(rows) == 1
     assert rows[0].publication_id == source.publication_id
@@ -622,3 +629,73 @@ async def test_new_publication_supersedes_a_prior_publish_before_checkpoint_winn
         ).scalar_one()
     assert first_state == ReembedState.SUPERSEDED.value
     assert first_shadow_state == "superseded"
+
+
+async def test_cleanup_waits_for_an_in_flight_search_pinned_to_the_old_generation(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    clock = Clock()
+    authority, shadows, first, _, _, source, vector, corpus = await seeded_run(
+        engine, store, data_dir, clock, run_id="pinned-old-reader"
+    )
+    embedder = HashEmbedder(dimension=4)
+    first = await resume_reembed(
+        first.id,
+        owner_token="owner-a",  # noqa: S106 - synthetic lease identity, not a credential
+        corpus=corpus,
+        embedder=embedder,
+        journal=authority,
+        shadow=shadows,
+        publisher=authority,
+        lease_ttl_seconds=30.0,
+    )
+    assert first.shadow_generation_id is not None
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    blocking = False
+
+    async def operation_barrier() -> None:
+        if blocking:
+            entered.set()
+            await release.wait()
+
+    live = PublishedLanceVectorStore(
+        data_dir / VECTORS_DIRNAME,
+        engine,
+        operation_hook=operation_barrier,
+    )
+    await live.ensure_ready(embedder.fingerprint)
+    blocking = True
+    searching = asyncio.create_task(live.search(vector, 1))
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+    second = await start_reembed(
+        "new-winner-over-pinned-reader",
+        owner_token="owner-b",  # noqa: S106 - synthetic lease identity, not a credential
+        corpus=corpus,
+        target=embedder.fingerprint,
+        journal=authority,
+        lease_ttl_seconds=30.0,
+    )
+    second = await resume_reembed(
+        second.id,
+        owner_token="owner-b",  # noqa: S106 - synthetic lease identity, not a credential
+        corpus=corpus,
+        embedder=embedder,
+        journal=authority,
+        shadow=shadows,
+        publisher=authority,
+        lease_ttl_seconds=30.0,
+    )
+    assert second.state is ReembedState.PUBLISHED
+
+    cleanup = asyncio.create_task(shadows.cleanup_terminal(first.id))
+    await asyncio.sleep(0.05)
+    assert not cleanup.done(), "cleanup must wait on the old reader's shared generation pin"
+    release.set()
+    rows = await asyncio.wait_for(searching, timeout=2.0)
+    assert [row.chunk.id for row in rows] == [source.chunk.id]
+    assert await asyncio.wait_for(cleanup, timeout=2.0)
+    assert not shadows.directory(first.shadow_generation_id).exists()
+    await live.teardown()

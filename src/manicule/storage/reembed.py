@@ -47,7 +47,7 @@ from manicule.ingest.reembed import (
 from manicule.storage import models
 from manicule.storage.rows import to_chunk, to_document
 from manicule.storage.types import utcnow
-from manicule.storage.vectors import LanceVectorStore
+from manicule.storage.vectors import LanceVectorStore, generation_pin
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -1048,20 +1048,21 @@ class LanceShadowGenerations:
     async def cleanup_terminal(self, run_id: str) -> bool:
         """Delete a failed or superseded generation; published/live generations are refused."""
         async with self._authority.cleanup_guard(run_id) as (connection, generation_id):
-            store = self._stores.pop(generation_id, None)
-            if store is not None:
-                await store.teardown()
             path = self.directory(generation_id)
-            removed = path.exists()
-            if removed:
-                shutil.rmtree(path)
-            await connection.execute(
-                delete(models.ReembedShadowGeneration).where(
-                    models.ReembedShadowGeneration.id == generation_id,
-                    models.ReembedShadowGeneration.run_id == run_id,
+            async with generation_pin(path, exclusive=True):
+                store = self._stores.pop(generation_id, None)
+                if store is not None:
+                    await store.teardown()
+                removed = path.exists()
+                if removed:
+                    shutil.rmtree(path)
+                await connection.execute(
+                    delete(models.ReembedShadowGeneration).where(
+                        models.ReembedShadowGeneration.id == generation_id,
+                        models.ReembedShadowGeneration.run_id == run_id,
+                    )
                 )
-            )
-            return removed
+                return removed
 
     def _store(self, generation_id: str) -> LanceVectorStore:
         return self._stores.setdefault(
