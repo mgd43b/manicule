@@ -88,7 +88,7 @@ async def test_append_is_durable_idempotent_and_run_scoped(store: SqliteDocStore
     )
     repeated = await store.append_acquisition_record(
         run.id,
-        0,
+        99,
         _source(),
         lease_owner="worker",
         lease_generation=run.lease_generation,
@@ -112,6 +112,35 @@ async def test_append_is_durable_idempotent_and_run_scoped(store: SqliteDocStore
             lease_generation=run.lease_generation,
             now=_NOW,
         )
+
+
+async def test_records_page_forward_by_sequence_without_loading_the_run(
+    store: SqliteDocStore,
+) -> None:
+    run = await _claimed_run(store)
+    for sequence in range(5):
+        await store.append_acquisition_record(
+            run.id,
+            sequence,
+            _source(f"page-{sequence}"),
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+
+    first = await store.list_acquisition_records(run.id, limit=2)
+    second = await store.list_acquisition_records(
+        run.id, after_sequence=first[-1].sequence, limit=2
+    )
+    third = await store.list_acquisition_records(
+        run.id, after_sequence=second[-1].sequence, limit=2
+    )
+
+    assert [[record.sequence for record in page] for page in (first, second, third)] == [
+        [0, 1],
+        [2, 3],
+        [4],
+    ]
 
 
 async def test_run_identity_and_records_do_not_cross_workspaces(

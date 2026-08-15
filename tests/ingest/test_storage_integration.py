@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import text
 
 from manicule.connectors import CursorExpiredError
+from manicule.core.acquisition import AcquisitionRecord, AcquisitionRecordState, AcquisitionRunState
 from manicule.core.content import (
     IN_FLIGHT,
     LEGACY_PUBLICATION,
@@ -42,12 +43,14 @@ from tests.fakes import HashEmbedder
 from tests.ingest import fakes
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Mapping, Sequence
     from pathlib import Path
+    from typing import Any
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    from manicule.core.sources import DiscoveredDoc
+    from manicule.core.content import Chunk, Document
+    from manicule.core.sources import DiscoveredDoc, DocRef
     from manicule.storage.docstore import SqliteDocStore
 
 
@@ -788,6 +791,663 @@ async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(
     await vectors.teardown()
 
 
+async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(
+    store: SqliteDocStore,
+) -> None:
+    """A 1,000-record source reaches its true end while embedding is still parked.
+
+    Ten synthetic page responses each take 19 ms on a manual clock, below the 500 ms cursor
+    lifetime. Journal pages and both in-memory hand-offs are smaller than the corpus. The model
+    gate proves indexing has not drained anything to make enumeration succeed.
+    """
+    clock = fakes.ManualClock()
+    embedder = fakes.ClockedGatedEmbedder(clock, seconds_per_document=0.05)
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=embedder,
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        fetch_concurrency=2,
+        parse_workers=1,
+        queue_depth_factor=1,
+        detect_glossary=False,
+    )
+    connector = fakes.ExpiringCursorConnector(
+        {
+            f"synthetic-doc-{number:04d}": f"public synthetic line {number}"
+            for number in range(1_000)
+        },
+        clock=clock,
+        page_size=100,
+        cursor_lifetime_seconds=0.5,
+        response_seconds=0.019,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await connector.enumeration_completed.wait()
+    await embedder.gate.wait_for(1)
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.discovered_count == 1_000
+    assert durable.enumeration_completed_at is not None
+    assert durable.candidate_watermark == connector.watermark
+    assert connector.pages_requested == 10
+    assert clock.now == pytest.approx(0.19)
+    assert len(await store.list_acquisition_records(durable.id, limit=3)) == 3
+
+    embedder.gate.open()
+    report = await task
+    indexed = {source_id async for source_id in store.known_source_ids(connector.name)}
+
+    assert report.error_type == ""
+    assert report.enumeration_completed
+    assert report.indexed == 1_000
+    assert len(indexed) == 1_000
+    assert report.watermark_advanced
+    assert await store.get_watermark(connector.name) == connector.watermark
+    assert report.stages.fetch_queue.capacity == 2
+    assert report.stages.fetch_queue.peak_depth <= 2
+    assert report.stages.peak_discovery_records == 2
+    assert report.stages.parse_queue.peak_depth <= report.stages.parse_queue.capacity
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+    settled = await store.get_acquisition_run(durable.id)
+    assert settled is not None
+    assert settled.state is AcquisitionRunState.SETTLED
+    records = await store.list_acquisition_records(durable.id)
+    assert {record.state for record in records} == {AcquisitionRecordState.SETTLED}
+
+
+async def test_crash_during_enumeration_keeps_only_the_committed_prefix(
+    store: SqliteDocStore,
+) -> None:
+    connector = fakes.PausedEnumerationConnector(
+        {f"public-doc-{number}": f"line {number}" for number in range(10)},
+        pause_after=3,
+    )
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await connector.paused.wait()
+    task.cancel()
+    connector.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.discovered_count == 3
+    assert durable.enumeration_completed_at is None
+    assert durable.candidate_watermark is None
+    assert len(await store.list_acquisition_records(durable.id)) == 3
+    assert await store.get_watermark(connector.name) is None
+
+
+async def test_crash_after_enumeration_preserves_the_marker_records_and_candidate(
+    engine: AsyncEngine,
+) -> None:
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    class GatedJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.reader_arrived = asyncio.Event()
+            self.release_reader = asyncio.Event()
+
+        @override
+        async def list_acquisition_records(
+            self,
+            run_id: str,
+            *,
+            states: Sequence[AcquisitionRecordState] | None = None,
+            after_sequence: int | None = None,
+            limit: int = 100,
+        ) -> Sequence[AcquisitionRecord]:
+            self.reader_arrived.set()
+            await self.release_reader.wait()
+            return await super().list_acquisition_records(
+                run_id, states=states, after_sequence=after_sequence, limit=limit
+            )
+
+    store = GatedJournal()
+    await store.ensure_workspace()
+    clock = fakes.ManualClock()
+    lease_clock = fakes.ManualLeaseClock()
+    connector = fakes.ExpiringCursorConnector(
+        {f"public-doc-{number}": f"line {number}" for number in range(10)},
+        clock=clock,
+        page_size=5,
+        cursor_lifetime_seconds=0.5,
+    )
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            shutdown_grace_s=30,
+            detect_glossary=False,
+            acquisition_clock=lease_clock,
+        )
+
+    task = asyncio.create_task(pipeline().run(connector))
+    await store.reader_arrived.wait()
+    task.cancel()
+    # Deliver cancellation first so the graceful stop is visible before the blocked journal
+    # read returns. No newly read record may be admitted during the drain window.
+    await asyncio.sleep(0)
+    store.release_reader.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.discovered_count == 10
+    assert durable.enumeration_completed_at is not None
+    assert durable.candidate_watermark == connector.watermark
+    records = await store.list_acquisition_records(durable.id)
+    assert len(records) == 10
+    assert {record.state for record in records} == {AcquisitionRecordState.DISCOVERED}
+    assert await store.list_documents() == []
+    assert await store.get_watermark(connector.name) is None
+
+    pages_before_resume = connector.pages_requested
+    with pytest.raises(RuntimeError, match="could not be claimed"):
+        await pipeline().run(connector)
+    assert connector.pages_requested == pages_before_resume
+
+    lease_clock.advance(301)
+    resumed = await pipeline().run(connector)
+
+    assert connector.pages_requested == pages_before_resume, "the source was rediscovered"
+    assert resumed.indexed == 10
+    assert resumed.watermark_advanced
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+    settled = await store.get_acquisition_run(durable.id)
+    assert settled is not None
+    assert settled.state is AcquisitionRunState.SETTLED
+    assert await store.get_watermark(connector.name) == durable.candidate_watermark
+
+
+async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
+    store: SqliteDocStore,
+) -> None:
+    class DuplicateSource(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__({"public-a": "alpha", "public-b": "beta"})
+            self.enumerated = asyncio.Event()
+            self.release = asyncio.Event()
+
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return Watermark(value="duplicate-position", observed_at=datetime.now(UTC))
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            async for discovered in super().discover(watermark):
+                durable = discovered.model_copy(
+                    update={
+                        "ref": discovered.ref.model_copy(
+                            update={
+                                "uri": (
+                                    f"https://source.example.test/documents/{discovered.source_id}"
+                                )
+                            }
+                        )
+                    }
+                )
+                yield durable
+                if durable.source_id == "public-a":
+                    yield durable
+            self.enumerated.set()
+            await self.release.wait()
+
+    connector = DuplicateSource()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await connector.enumerated.wait()
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.discovered_count == 2
+    records = await store.list_acquisition_records(durable.id)
+    assert [record.source.source_id for record in records] == ["public-a", "public-b"]
+
+    connector.release.set()
+    report = await task
+
+    assert report.indexed == 2
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+
+
+async def test_expired_worker_is_fenced_before_publication_after_takeover(
+    store: SqliteDocStore,
+) -> None:
+    """An embed begun by one generation cannot publish after a successor takes the run."""
+    lease_clock = fakes.ManualLeaseClock()
+    embedder = fakes.GatedEmbedder()
+    chunker = fakes.BlockChunker()
+    connector = fakes.DictConnector(
+        {"public-fenced-document": "public synthetic line"}, name="fenced-synthetic-source"
+    )
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=embedder,
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=1,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await embedder.gate.wait_for(1)
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+
+    lease_clock.advance(2)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=1),
+    )
+    assert successor is not None
+    assert successor.lease_generation > durable.lease_generation
+
+    embedder.gate.open()
+    report = await task
+    stored = await store.find_document(connector.name, "public-fenced-document")
+
+    assert report.indexed == 0
+    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert stored is None, "the expired generation made no document revision servable"
+
+
+@pytest.mark.parametrize(
+    ("unchanged", "status"),
+    [(True, DocumentStatus.INDEXED), (False, DocumentStatus.PARSING)],
+)
+async def test_takeover_fences_fetch_side_last_seen_and_status_writes(
+    engine: AsyncEngine, *, unchanged: bool, status: DocumentStatus
+) -> None:
+    """A slow lookup cannot let an expired fetch worker mutate the document it found."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    class GatedFindStore(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.arm = False
+            self.found = asyncio.Event()
+            self.release = asyncio.Event()
+
+        @override
+        async def find_document(self, source: str, source_id: str) -> Document | None:
+            document = await super().find_document(source, source_id)
+            if self.arm:
+                self.arm = False
+                self.found.set()
+                await self.release.wait()
+            return document
+
+    store = GatedFindStore()
+    await store.ensure_workspace()
+    source = "fenced-fetch-source"
+    source_id = "public-fetch-document"
+    stored = make_document(
+        source=source,
+        source_id=source_id,
+        status=status,
+        media_type=fakes.MEDIA_TYPE,
+        body=b"public synthetic line",
+    ).model_copy(update={"version_token": "same-token" if unchanged else "old-token"})
+    before = await store.upsert_document(stored)
+    connector = fakes.DictConnector({source_id: "public synthetic line"}, name=source)
+    connector.tokens[source_id] = "same-token" if unchanged else "new-token"
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    store.arm = True
+    task = asyncio.create_task(pipeline.run(connector))
+    await store.found.wait()
+    durable = await store.latest_unsettled_acquisition_run(source)
+    assert durable is not None
+    lease_clock.advance(301)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-fetch-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=300),
+    )
+    assert successor is not None
+    store.release.set()
+
+    report = await task
+    after = await store.find_document(source, source_id)
+
+    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert after == before, "the stale worker changed last-seen/version metadata or status"
+
+
+@pytest.mark.parametrize("fetch_fails", [False, True])
+async def test_takeover_fences_hash_skip_and_failure_demotion(
+    store: SqliteDocStore, *, fetch_fails: bool
+) -> None:
+    """Neither a hash skip nor a fetch failure may mutate after lease takeover."""
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    class GatedFailureConnector(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "public-failure-document": (
+                        "replacement line" if fetch_fails else "original line"
+                    )
+                },
+                name="fenced-failure-source",
+            )
+            self.tokens["public-failure-document"] = "replacement-token"
+            self.fetch_arrived = asyncio.Event()
+            self.release_fetch = asyncio.Event()
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            self.fetch_arrived.set()
+            await self.release_fetch.wait()
+            if fetch_fails:
+                raise RuntimeError("synthetic fetch failure")
+            return await super().fetch(ref)
+
+    connector = GatedFailureConnector()
+    source_id = "public-failure-document"
+    before = await store.upsert_document(
+        make_document(
+            source=connector.name,
+            source_id=source_id,
+            media_type=fakes.MEDIA_TYPE,
+            body=b"original line",
+        ).model_copy(update={"version_token": "original-token"})
+    )
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await connector.fetch_arrived.wait()
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    lease_clock.advance(301)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-failure-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=300),
+    )
+    assert successor is not None
+    connector.release_fetch.set()
+
+    report = await task
+    after = await store.find_document(connector.name, source_id)
+
+    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert after == before, "the stale worker changed version/last-seen data or failure state"
+
+
+async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_write(
+    engine: AsyncEngine,
+) -> None:
+    """A valid tombstone stage is not authority for a later vector write after takeover."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    class GatedVectorStageStore(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.staged = asyncio.Event()
+            self.release_stage = asyncio.Event()
+
+        @override
+        async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
+            await super().stage_vectors(publication_id, chunks)
+            self.staged.set()
+            await self.release_stage.wait()
+
+    store = GatedVectorStageStore()
+    await store.ensure_workspace()
+    vectors = fakes.MemoryVectors()
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+    connector = fakes.DictConnector(
+        {"public-vector-document": "public synthetic line"}, name="fenced-vector-source"
+    )
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=vectors,
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await store.staged.wait()
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    lease_clock.advance(301)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-vector-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=300),
+    )
+    assert successor is not None
+    store.release_stage.set()
+
+    report = await task
+
+    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert vectors.rows == {}, "the stale worker wrote vectors after its staged-store await"
+
+
+async def test_takeover_between_failure_annotation_and_upsert_fences_the_status_write(
+    engine: AsyncEngine,
+) -> None:
+    """A valid failure annotation is not authority for a later failed-status upsert."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    class GatedAnnotationStore(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.annotated = asyncio.Event()
+            self.release_annotation = asyncio.Event()
+
+        @override
+        async def annotate(self, document_id: str, updates: Mapping[str, Any]) -> None:
+            await super().annotate(document_id, updates)
+            self.annotated.set()
+            await self.release_annotation.wait()
+
+    store = GatedAnnotationStore()
+    await store.ensure_workspace()
+    connector = fakes.DictConnector(
+        {"public-demotion-document": "replacement line"}, name="fenced-demotion-source"
+    )
+    connector.tokens["public-demotion-document"] = "replacement-token"
+    connector.fail_fetch.add("public-demotion-document")
+    existing = await store.upsert_document(
+        make_document(
+            source=connector.name,
+            source_id="public-demotion-document",
+            status=DocumentStatus.PARSING,
+            media_type=fakes.MEDIA_TYPE,
+            body=b"original line",
+        ).model_copy(update={"version_token": "original-token"})
+    )
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await store.annotated.wait()
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    lease_clock.advance(301)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-demotion-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=300),
+    )
+    assert successor is not None
+    store.release_annotation.set()
+
+    report = await task
+    after = await store.get_document(existing.id)
+
+    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert after is not None
+    assert after.status is DocumentStatus.FETCHING
+    assert "last_ingest_error" in after.metadata
+
+
+async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
+    store: SqliteDocStore,
+) -> None:
+    connector = fakes.PausedEnumerationConnector(
+        {f"public-doc-{number}": f"line {number}" for number in range(10)},
+        pause_after=9,
+    )
+    chunker = fakes.BlockChunker()
+    lease_clock = fakes.ManualLeaseClock()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+        acquisition_clock=lease_clock,
+    )
+
+    report = await pipeline.run(connector, limit=3)
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert report.limited
+    assert not report.enumeration_completed
+    assert report.indexed == 3
+    assert durable is not None
+    assert durable.discovered_count == 3
+    assert durable.enumeration_completed_at is None
+    assert durable.candidate_watermark is None
+    assert await store.get_watermark(connector.name) is None
+
+    lease_clock.advance(301)
+    repeated = await pipeline.run(connector, limit=3)
+    same_run = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert repeated.limited
+    assert repeated.indexed == 0
+    assert connector.yields == 3, "a satisfied limit must not even open the source iterator"
+    assert same_run is not None
+    assert same_run.id == durable.id
+    assert same_run.discovered_count == 3
+    assert len(await store.list_acquisition_records(durable.id)) == 3
+
+
 async def test_a_re_parse_reads_retained_bytes_rather_than_the_network(
     store: SqliteDocStore,
     data_dir: Path,
@@ -959,7 +1619,7 @@ async def test_stale_retained_failure_cannot_overwrite_an_indexed_winners_origin
     """Failure retention and its guarded row are one commit, not a trailing setter."""
     from sqlalchemy.ext.asyncio import AsyncSession  # noqa: PLC0415
 
-    from manicule.core.content import Document, DocumentRevision  # noqa: PLC0415
+    from manicule.core.content import DocumentRevision  # noqa: PLC0415
     from manicule.storage import models  # noqa: PLC0415
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
     from tests.storage_helpers import make_document  # noqa: PLC0415
@@ -1073,7 +1733,6 @@ async def test_initial_failure_rolls_back_retained_reference_with_its_row(
     """The expected=None path cannot expose half of its retention decision."""
     from sqlalchemy.ext.asyncio import AsyncSession  # noqa: PLC0415
 
-    from manicule.core.content import Document  # noqa: PLC0415
     from tests.storage_helpers import make_document  # noqa: PLC0415
 
     retained_ref = (await BlobStore(engine, data_dir).retain(b"failed source", "text/plain")).ref

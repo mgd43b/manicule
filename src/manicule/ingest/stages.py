@@ -11,13 +11,12 @@ is a sentinel counted out one per consumer, and a concurrency bound is a gauge t
 comes down. Nothing is inferred from a task set, and nothing depends on the order in which
 tasks happen to be scheduled.
 
-**Backpressure is the reason a hand-off is bounded**, and it is a correctness requirement rather
-than a memory optimization. An unbounded queue turns a slow embedder into unbounded memory
-growth *and* lets discovery race ahead of durable progress until the source's pagination cursors
-expire — a failure that looks like a connector bug and is actually a missing bound
-(``docs/ingest.md`` §8.3, ``docs/connectors/confluence.md`` §2). :attr:`Conveyor.blocked_puts` is
-what makes it observable: it counts the times a producer had to wait, which is the only direct
-evidence that backpressure reached the producer rather than merely being configured.
+**Backpressure is why each local hand-off is bounded.** With acquisition journaling enabled,
+discovery writes the durable journal before these stages begin, so a slow embedder cannot age
+its pagination cursor. The journal reader can still outrun fetch, and fetch can outrun parse;
+bounding both prevents that decoupling from becoming corpus-sized memory. The compatibility
+fallback instead feeds bounded hand-offs directly from discovery. :attr:`Conveyor.blocked_puts`
+makes both modes' local bounds observable (``docs/ingest.md`` §8.3).
 """
 
 from __future__ import annotations
@@ -61,10 +60,9 @@ class QueueReport:
     blocked_puts: int
     """How many times a producer found this hand-off full and had to wait.
 
-    **The direct evidence that backpressure reached the producer.** A bound that is configured
-    and never reached proves nothing; a bound that made somebody wait is the thing the design
-    claims. Zero is a real answer — it means the consumer kept up — and it is why the test for
-    backpressure blocks the consumer on purpose rather than hoping for contention.
+    **Direct evidence that a local producer reached its bound.** A configured bound that never
+    filled proves only its capacity; a blocked put proves the journal reader or fetch worker
+    really waited. Zero is a real answer — it means the consumer kept up.
     """
 
     def as_metadata(self) -> Metadata:
@@ -132,6 +130,18 @@ class Conveyor[T]:
         self._depth += 1
         self.peak_depth = max(self.peak_depth, self._depth)
         self._items.put_nowait(item)
+
+    async def wait_for_room(self) -> None:
+        """Wait until one item could be admitted, without reserving the slot.
+
+        Used by a single journal reader before it allocates the next page record. With one
+        producer there is nobody who can steal the observed room before its following
+        :meth:`put`; consumers can only create more room.
+        """
+        if self._room.locked():
+            self.blocked_puts += 1
+        await self._room.acquire()
+        self._room.release()
 
     async def take(self) -> T | None:
         """The next item, or ``None`` when this consumer has reached the end of the stream.
@@ -271,7 +281,7 @@ class StageReport:
     """
 
     accepted: int = 0
-    """Top-level documents discovery handed downstream. What ``--limit`` bounds."""
+    """Top-level source identities accepted; durably committed in journal mode."""
 
     fetch_queue: QueueReport = field(
         default_factory=lambda: QueueReport(name="fetch", capacity=0, peak_depth=0, blocked_puts=0)
@@ -293,6 +303,9 @@ class StageReport:
     what "do not accumulate the complete fetched corpus" means in a number.
     """
 
+    peak_discovery_records: int = 0
+    """Journal records held by the read page and fetch hand-off together."""
+
     def as_metadata(self) -> Metadata:
         return {
             "accepted": self.accepted,
@@ -302,6 +315,7 @@ class StageReport:
             "peak_parses": self.peak_parses,
             "peak_embeds": self.peak_embeds,
             "peak_bodies": self.peak_bodies,
+            "peak_discovery_records": self.peak_discovery_records,
         }
 
 

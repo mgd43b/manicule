@@ -221,12 +221,14 @@ def test_a_stage_report_carries_counts_and_nothing_a_document_said() -> None:
         peak_parses=3,
         peak_embeds=1,
         peak_bodies=11,
+        peak_discovery_records=7,
     )
 
     recorded = report.as_metadata()
 
     assert recorded["accepted"] == 12
     assert recorded["fetch_queue"] == {"capacity": 8, "peak_depth": 8, "blocked_puts": 3}
+    assert recorded["peak_discovery_records"] == 7
     assert all(isinstance(value, (int, dict)) for value in recorded.values()), (
         "every field is a count or a record of counts, so no document content can reach here"
     )
