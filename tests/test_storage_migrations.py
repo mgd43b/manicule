@@ -220,6 +220,32 @@ async def test_downgrade_refuses_to_expose_retired_real_vector_generations(
 
 
 @pytest.mark.contract
+async def test_durable_reembed_downgrade_refuses_saved_or_published_state(
+    data_dir: Path,
+) -> None:
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO reembed_corpus_snapshots "
+                    "(id, revision, live_json, complete, document_count, chunk_count, created_at) "
+                    "VALUES ('private-snapshot-id', '1', '{}', 0, 0, 0, "
+                    "'2026-01-01T00:00:00+00:00')"
+                )
+            )
+
+        with pytest.raises(
+            RuntimeError, match="refusing to downgrade durable re-embedding"
+        ) as caught:
+            await downgrade(engine, "6e31b7d592ac")
+        assert "private-snapshot-id" not in str(caught.value)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
 async def test_parse_lineage_arrives_empty_and_leaves_the_rest_alone(data_dir: Path) -> None:
     """``documents.parse_fp`` over a database with documents already in it.
 

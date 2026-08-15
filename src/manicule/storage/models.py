@@ -1146,6 +1146,46 @@ class ReembedRunRecord(Base):
     )
 
 
+class ReembedCorpusSnapshot(Base):
+    """A complete durable copy of the local corpus rows a rebuild is bound to."""
+
+    __tablename__ = "reembed_corpus_snapshots"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    revision: Mapped[str] = mapped_column(Text, nullable=False)
+    live_json: Mapped[str] = mapped_column(Text, nullable=False)
+    complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    document_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+
+class ReembedSnapshotDocument(Base):
+    __tablename__ = "reembed_snapshot_documents"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("reembed_corpus_snapshots.id", ondelete="CASCADE"), primary_key=True
+    )
+    document_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (WITHOUT_ROWID,)
+
+
+class ReembedSnapshotChunk(Base):
+    __tablename__ = "reembed_snapshot_chunks"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("reembed_corpus_snapshots.id", ondelete="CASCADE"), primary_key=True
+    )
+    document_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chunk_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (WITHOUT_ROWID,)
+
+
 class ReembedShadowGeneration(Base):
     """Immutable identity of one named Lance shadow generation."""
 
@@ -1158,6 +1198,8 @@ class ReembedShadowGeneration(Base):
     fingerprint_json: Mapped[str] = mapped_column(Text, nullable=False)
     fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
     inventory_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False, default="building")
+    seal_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
 
@@ -1228,9 +1270,12 @@ __all__ = [
     "ReconciliationCandidate",
     "ReconciliationInventoryItem",
     "ReconciliationRun",
+    "ReembedCorpusSnapshot",
     "ReembedPublicationReceipt",
     "ReembedRunRecord",
     "ReembedShadowGeneration",
+    "ReembedSnapshotChunk",
+    "ReembedSnapshotDocument",
     "Tag",
     "VectorTombstone",
     "Workspace",

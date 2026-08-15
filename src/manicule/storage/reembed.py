@@ -12,7 +12,8 @@ import hashlib
 import math
 import shutil
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+import uuid
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
@@ -20,12 +21,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from pydantic import TypeAdapter
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, insert, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from manicule.core.content import Chunk
-from manicule.core.embedding import EmbedFingerprint, Vector
+from manicule.core.embedding import EmbedFingerprint, Vector, embedding_input_identity
 from manicule.core.ids import vector_id
 from manicule.ingest.reembed import (
+    ChunkKey,
+    CorpusSnapshot,
     LivePublication,
     PublicationReceipt,
     PublishOutcome,
@@ -38,8 +42,10 @@ from manicule.ingest.reembed import (
     ShadowInspection,
     SnapshotChunk,
     SnapshotChunkDigester,
+    SnapshotDocument,
 )
 from manicule.storage import models
+from manicule.storage.rows import to_chunk, to_document
 from manicule.storage.types import utcnow
 from manicule.storage.vectors import LanceVectorStore
 
@@ -49,9 +55,14 @@ if TYPE_CHECKING:
 _RUN = TypeAdapter(ReembedRun)
 _COMMITMENT = TypeAdapter(ReembedCommitment)
 _RECEIPT = TypeAdapter(PublicationReceipt)
+_INSPECTION = TypeAdapter(ShadowInspection)
+_SNAPSHOT_DOCUMENT = TypeAdapter(SnapshotDocument)
+_SNAPSHOT_CHUNK = TypeAdapter(SnapshotChunk)
+_LIVE = TypeAdapter(LivePublication)
 _INDEX_STATE_ID: Final = 1
 _CORPUS_REVISION_ID: Final = 1
 GENERATIONS_DIRNAME: Final = "generations"
+SNAPSHOT_PAGE: Final = 256
 
 
 def _json(adapter: TypeAdapter[Any], value: object) -> str:
@@ -60,6 +71,260 @@ def _json(adapter: TypeAdapter[Any], value: object) -> str:
 
 def _generation_id(run_id: str) -> str:
     return f"reembed-{hashlib.sha256(run_id.encode('utf-8')).hexdigest()}"
+
+
+class SqliteReembedCorpus:
+    """Complete, durable, connector-free corpus snapshots over authoritative SQLite rows."""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+
+    async def begin_snapshot(self) -> CorpusSnapshot:
+        snapshot_id = f"snapshot-{uuid.uuid4().hex}"
+        connection = await self._engine.connect()
+        try:
+            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            revision = str(
+                (
+                    await connection.execute(
+                        select(models.CorpusRevision.revision).where(
+                            models.CorpusRevision.id == _CORPUS_REVISION_ID
+                        )
+                    )
+                ).scalar_one()
+            )
+            state = (
+                (
+                    await connection.execute(
+                        select(models.IndexState.__table__).where(
+                            models.IndexState.id == _INDEX_STATE_ID
+                        )
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if state is None or state.vector_table is None or state.embed_fingerprint is None:
+                raise ReembedError(  # noqa: TRY301 - transaction rollback belongs to this scope
+                    "the index has no complete live vector publication"
+                )
+            fingerprint = EmbedFingerprint.model_validate_json(state.embed_fingerprint).canonical()
+            await connection.execute(
+                insert(models.ReembedCorpusSnapshot).values(
+                    id=snapshot_id,
+                    revision=revision,
+                    live_json="",
+                    complete=False,
+                    document_count=0,
+                    chunk_count=0,
+                    created_at=utcnow(),
+                )
+            )
+            session = AsyncSession(bind=connection, expire_on_commit=False)
+            try:
+                documents_count, chunks_count, inventory = await self._materialize(
+                    connection, session, snapshot_id
+                )
+            finally:
+                await session.close()
+            live = LivePublication(state.vector_table, fingerprint, inventory)
+            await connection.execute(
+                update(models.IndexState)
+                .where(models.IndexState.id == _INDEX_STATE_ID)
+                .values(vector_inventory_digest=inventory, updated_at=utcnow())
+            )
+            await connection.execute(
+                update(models.ReembedCorpusSnapshot)
+                .where(models.ReembedCorpusSnapshot.id == snapshot_id)
+                .values(
+                    live_json=_json(_LIVE, live),
+                    complete=True,
+                    document_count=documents_count,
+                    chunk_count=chunks_count,
+                )
+            )
+            await connection.commit()
+            return CorpusSnapshot(snapshot_id, revision, live)
+        except BaseException:
+            await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+
+    async def documents(
+        self, snapshot: CorpusSnapshot, *, after: str | None, limit: int
+    ) -> Sequence[SnapshotDocument]:
+        await self._require_snapshot(snapshot)
+        statement = select(models.ReembedSnapshotDocument.payload_json).where(
+            models.ReembedSnapshotDocument.snapshot_id == snapshot.id
+        )
+        if after is not None:
+            statement = statement.where(models.ReembedSnapshotDocument.document_id > after)
+        async with self._engine.connect() as connection:
+            values = (
+                (
+                    await connection.execute(
+                        statement.order_by(models.ReembedSnapshotDocument.document_id).limit(limit)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [_SNAPSHOT_DOCUMENT.validate_json(value) for value in values]
+
+    async def document(self, snapshot: CorpusSnapshot, document_id: str) -> SnapshotDocument | None:
+        await self._require_snapshot(snapshot)
+        async with self._engine.connect() as connection:
+            value = (
+                await connection.execute(
+                    select(models.ReembedSnapshotDocument.payload_json).where(
+                        models.ReembedSnapshotDocument.snapshot_id == snapshot.id,
+                        models.ReembedSnapshotDocument.document_id == document_id,
+                    )
+                )
+            ).scalar_one_or_none()
+        return None if value is None else _SNAPSHOT_DOCUMENT.validate_json(value)
+
+    async def chunks(
+        self,
+        snapshot: CorpusSnapshot,
+        document_id: str,
+        *,
+        after: ChunkKey | None,
+        limit: int,
+    ) -> Sequence[SnapshotChunk]:
+        await self._require_snapshot(snapshot)
+        statement = select(models.ReembedSnapshotChunk.payload_json).where(
+            models.ReembedSnapshotChunk.snapshot_id == snapshot.id,
+            models.ReembedSnapshotChunk.document_id == document_id,
+        )
+        if after is not None:
+            statement = statement.where(
+                (models.ReembedSnapshotChunk.position > after.position)
+                | (
+                    (models.ReembedSnapshotChunk.position == after.position)
+                    & (models.ReembedSnapshotChunk.chunk_id > after.id)
+                )
+            )
+        async with self._engine.connect() as connection:
+            values = (
+                (
+                    await connection.execute(
+                        statement.order_by(
+                            models.ReembedSnapshotChunk.position,
+                            models.ReembedSnapshotChunk.chunk_id,
+                        ).limit(limit)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [_SNAPSHOT_CHUNK.validate_json(value) for value in values]
+
+    async def _materialize(
+        self, connection: AsyncConnection, session: AsyncSession, snapshot_id: str
+    ) -> tuple[int, int, str]:
+        document_after: str | None = None
+        documents_count = chunks_count = 0
+        digest = SnapshotChunkDigester()
+        while True:
+            statement = select(models.Document).where(models.Document.deleted_at.is_(None))
+            if document_after is not None:
+                statement = statement.where(models.Document.id > document_after)
+            page = (
+                (await session.execute(statement.order_by(models.Document.id).limit(SNAPSHOT_PAGE)))
+                .scalars()
+                .all()
+            )
+            if not page:
+                break
+            for row in page:
+                stored_document = SnapshotDocument(
+                    workspace_id=row.workspace_id,
+                    document=to_document(row),
+                    original_omitted_reason=row.original_omitted_reason,
+                    chunk_fingerprint=row.chunk_fp,
+                    embed_fingerprint=row.embed_fp,
+                    glossary_fingerprint=row.glossary_fp,
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                    last_seen_at=row.last_seen_at,
+                    deleted_at=row.deleted_at,
+                )
+                await connection.execute(
+                    insert(models.ReembedSnapshotDocument).values(
+                        snapshot_id=snapshot_id,
+                        document_id=row.id,
+                        payload_json=_json(_SNAPSHOT_DOCUMENT, stored_document),
+                    )
+                )
+                chunk_after: tuple[int, str] | None = None
+                while True:
+                    chunks = select(models.Chunk).where(models.Chunk.document_id == row.id)
+                    if chunk_after is not None:
+                        position, chunk_id = chunk_after
+                        chunks = chunks.where(
+                            (models.Chunk.position > position)
+                            | ((models.Chunk.position == position) & (models.Chunk.id > chunk_id))
+                        )
+                    chunk_page = (
+                        (
+                            await session.execute(
+                                chunks.order_by(models.Chunk.position, models.Chunk.id).limit(
+                                    SNAPSHOT_PAGE
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    if not chunk_page:
+                        break
+                    for chunk_row in chunk_page:
+                        stored_chunk = SnapshotChunk(
+                            chunk=to_chunk(chunk_row),
+                            vector_id=chunk_row.vector_id,
+                            publication_id=row.publication_id,
+                            sequence=chunk_row.seq,
+                            created_at=chunk_row.created_at,
+                        )
+                        digest.add(stored_chunk)
+                        await connection.execute(
+                            insert(models.ReembedSnapshotChunk).values(
+                                snapshot_id=snapshot_id,
+                                document_id=row.id,
+                                position=chunk_row.position,
+                                chunk_id=chunk_row.id,
+                                payload_json=_json(_SNAPSHOT_CHUNK, stored_chunk),
+                            )
+                        )
+                        chunks_count += 1
+                    last = chunk_page[-1]
+                    chunk_after = (last.position, last.id)
+                documents_count += 1
+            document_after = page[-1].id
+        return documents_count, chunks_count, digest.hexdigest()
+
+    async def _require_snapshot(self, snapshot: CorpusSnapshot) -> None:
+        async with self._engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        select(models.ReembedCorpusSnapshot.__table__).where(
+                            models.ReembedCorpusSnapshot.id == snapshot.id
+                        )
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if (
+            row is None
+            or not row.complete
+            or row.revision != snapshot.revision
+            or _LIVE.validate_json(row.live_json) != snapshot.live
+        ):
+            raise ReembedError("the durable complete-corpus snapshot is missing or mismatched")
 
 
 class SqliteReembedStore:
@@ -77,6 +342,7 @@ class SqliteReembedStore:
             await connection.exec_driver_sql("BEGIN IMMEDIATE")
             await self._require_lease(connection, run_id, lease)
             yield connection
+            await self._require_lease(connection, run_id, lease)
             await connection.commit()
         except BaseException:
             await connection.rollback()
@@ -189,7 +455,19 @@ class SqliteReembedStore:
                 .where(models.ReembedRunRecord.id == run_id)
                 .values(lease_expires_at=renewed.expires_at, updated_at=utcnow())
             )
+            await self._require_lease(connection, run_id, renewed)
             return renewed
+
+    async def assert_current(self, run_id: str, lease: ReembedLease) -> None:
+        """Check a fence without holding it across subsequent non-SQLite work."""
+        async with self._immediate() as connection:
+            await self._require_lease(connection, run_id, lease)
+
+    async def assert_locked(
+        self, connection: AsyncConnection, run_id: str, lease: ReembedLease
+    ) -> None:
+        """Recheck a fence inside a caller's already-held SQLite write transaction."""
+        await self._require_lease(connection, run_id, lease)
 
     async def save(
         self, run: ReembedRun, *, expected_revision: int, lease: ReembedLease
@@ -225,6 +503,7 @@ class SqliteReembedStore:
             )
             if result.rowcount != 1:
                 raise ReembedError("stale journal revision")
+            await self._require_lease(connection, run.id, lease)
             return saved
 
     async def abandon(self, run_id: str, *, lease: ReembedLease) -> ReembedRun:
@@ -265,6 +544,8 @@ class SqliteReembedStore:
             if prior is not None:
                 return _RECEIPT.validate_json(prior)
 
+            await self._require_bound_snapshot(connection, run)
+
             observed = await self._live(connection)
             corpus_revision = str(
                 (
@@ -301,18 +582,16 @@ class SqliteReembedStore:
                     or generation.inventory_digest != run.commitment.chunk_inventory_digest
                 ):
                     raise ReembedError("publication generation does not match the immutable run")
-                await connection.execute(
-                    update(models.Document)
-                    .where(models.Document.deleted_at.is_(None))
-                    .values(publication_id=generation.id, embed_fp=generation.fingerprint)
-                )
-                chunk_ids = (await connection.execute(select(models.Chunk.id))).scalars().all()
-                for chunk_id in chunk_ids:
-                    await connection.execute(
-                        update(models.Chunk)
-                        .where(models.Chunk.id == chunk_id)
-                        .values(vector_id=vector_id(generation.id, str(chunk_id)))
-                    )
+                if shadow.state != "sealed" or shadow.seal_json is None:
+                    raise ReembedError("publication requires the exact sealed shadow generation")
+                seal = _INSPECTION.validate_json(shadow.seal_json)
+                if (
+                    seal.inventory_digest != generation.inventory_digest
+                    or seal.fingerprint != generation.fingerprint
+                    or not seal.retrieval_ready
+                    or not seal.lineage_valid
+                ):
+                    raise ReembedError("the durable shadow seal is not publishable")
                 fingerprint_json = shadow.fingerprint_json
                 result = await connection.execute(
                     update(models.IndexState)
@@ -330,6 +609,12 @@ class SqliteReembedStore:
                 )
                 if result.rowcount != 1:
                     raise ReembedError("live publication changed inside its fenced transaction")
+                await self._supersede_prior_winner(connection, run.id)
+                await connection.execute(
+                    update(models.ReembedShadowGeneration)
+                    .where(models.ReembedShadowGeneration.id == generation.id)
+                    .values(state="published")
+                )
                 outcome = PublishOutcome.PUBLISHED
                 published_generation_id = generation.id
                 winner = LivePublication(
@@ -350,6 +635,76 @@ class SqliteReembedStore:
             )
             return receipt
 
+    async def _require_bound_snapshot(self, connection: AsyncConnection, run: ReembedRun) -> None:
+        row = (
+            (
+                await connection.execute(
+                    select(models.ReembedCorpusSnapshot.__table__).where(
+                        models.ReembedCorpusSnapshot.id == run.commitment.snapshot.id
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        snapshot = run.commitment.snapshot
+        if (
+            row is None
+            or not row.complete
+            or row.revision != snapshot.revision
+            or _LIVE.validate_json(row.live_json) != snapshot.live
+            or row.document_count != run.commitment.plan.documents
+            or row.chunk_count != run.commitment.plan.chunks
+        ):
+            raise ReembedError("publication is not bound to a durable complete-corpus snapshot")
+
+    async def _supersede_prior_winner(
+        self, connection: AsyncConnection, current_run_id: str
+    ) -> None:
+        rows = (
+            await connection.execute(
+                select(
+                    models.ReembedRunRecord.id,
+                    models.ReembedRunRecord.checkpoint_json,
+                    models.ReembedRunRecord.revision,
+                )
+                .join(
+                    models.ReembedShadowGeneration,
+                    models.ReembedShadowGeneration.run_id == models.ReembedRunRecord.id,
+                )
+                .where(
+                    or_(
+                        models.ReembedRunRecord.state == ReembedState.PUBLISHED.value,
+                        models.ReembedShadowGeneration.state == "published",
+                    ),
+                    models.ReembedRunRecord.id != current_run_id,
+                )
+            )
+        ).all()
+        for row in rows:
+            prior = _RUN.validate_json(row.checkpoint_json)
+            superseded = replace(
+                prior, state=ReembedState.SUPERSEDED, revision=int(row.revision) + 1
+            )
+            await connection.execute(
+                update(models.ReembedRunRecord)
+                .where(
+                    models.ReembedRunRecord.id == row.id,
+                    models.ReembedRunRecord.revision == row.revision,
+                )
+                .values(
+                    state=ReembedState.SUPERSEDED.value,
+                    checkpoint_json=_json(_RUN, superseded),
+                    revision=superseded.revision,
+                    updated_at=utcnow(),
+                )
+            )
+            await connection.execute(
+                update(models.ReembedShadowGeneration)
+                .where(models.ReembedShadowGeneration.run_id == row.id)
+                .values(state="superseded")
+            )
+
     async def _live(self, connection: AsyncConnection) -> LivePublication:
         row = (
             (
@@ -365,8 +720,6 @@ class SqliteReembedStore:
         if row is None or row.vector_table is None or row.embed_fingerprint is None:
             raise ReembedError("the index has no complete live vector publication")
         fingerprint = EmbedFingerprint.model_validate_json(row.embed_fingerprint).canonical()
-        if row.vector_inventory_digest is None:
-            raise ReembedError("the live vector publication has no inventory digest")
         return LivePublication(row.vector_table, fingerprint, row.vector_inventory_digest)
 
     async def _acquire(
@@ -489,6 +842,7 @@ class LanceShadowGenerations:
                         fingerprint_json=fingerprint.model_dump_json(),
                         fingerprint=offered.fingerprint,
                         inventory_digest=inventory_digest,
+                        state="building",
                         created_at=utcnow(),
                     )
                 )
@@ -499,7 +853,11 @@ class LanceShadowGenerations:
                 )
                 if generation != offered:
                     raise ReembedError("shadow identity is immutable")
-            await self._store(generation.id).ensure_ready(fingerprint)
+            store = self._store(generation.id)
+            if existing is not None and existing.state != "building":
+                await store.open_existing(fingerprint)
+            else:
+                await store.ensure_ready(fingerprint)
             return generation
 
     async def upsert(
@@ -512,10 +870,20 @@ class LanceShadowGenerations:
     ) -> None:
         async with self._authority.fenced(generation.run_id, lease) as connection:
             store = self._store(generation.id)
-            await store.ensure_ready(await self._fingerprint(connection, generation))
+            await store.ensure_ready(
+                await self._fingerprint(connection, generation, require_building=True)
+            )
             if self._mutation_hook is not None:
                 await self._mutation_hook()
+            await self._authority.assert_locked(connection, generation.run_id, lease)
             await store.upsert_snapshot(chunks, vectors, publication_id=generation.id)
+            try:
+                await self._authority.assert_locked(connection, generation.run_id, lease)
+            except ReembedError:
+                await store.delete_chunks(
+                    [vector_id(generation.id, stored.chunk.id) for stored in chunks]
+                )
+                raise
 
     async def inspect(
         self, generation: ShadowGeneration, *, lease: ReembedLease
@@ -523,24 +891,33 @@ class LanceShadowGenerations:
         async with self._authority.fenced(generation.run_id, lease) as connection:
             store = self._store(generation.id)
             await store.ensure_ready(await self._fingerprint(connection, generation))
-            fingerprint = await store.fingerprint()
-            rows = await store.inspection_rows()
-            stored_rows: list[SnapshotChunk] = []
-            dimensions: set[int] = set()
-            finite = True
-            lineage_valid = True
-            for row in rows:
+        revision = await store.storage_revision()
+        fingerprint = await store.fingerprint()
+        rows_count = valid_rows = 0
+        dimensions: set[int] = set()
+        finite = True
+        lineage_valid = True
+        digest = SnapshotChunkDigester()
+        async for page in store.inspection_pages():
+            for row in page:
+                rows_count += 1
                 try:
                     chunk = Chunk.model_validate_json(str(row["chunk_json"]))
                     source_vector_id = row["source_vector_id"]
+                    source_publication_id = row["source_publication_id"]
                     source_sequence = row["source_sequence"]
-                    if source_vector_id is None or source_sequence is None:
+                    if (
+                        source_vector_id is None
+                        or source_publication_id is None
+                        or source_sequence is None
+                    ):
                         lineage_valid = False
                         finite = False
                         continue
                     stored = SnapshotChunk(
                         chunk=chunk,
                         vector_id=str(source_vector_id),
+                        publication_id=str(source_publication_id),
                         sequence=int(source_sequence),
                         created_at=(
                             None
@@ -549,39 +926,91 @@ class LanceShadowGenerations:
                         ),
                     )
                     vector = [float(value) for value in row["vector"]]
+                    digest.add(stored)
                 except (KeyError, TypeError, ValueError):
                     lineage_valid = False
                     finite = False
                     continue
-                stored_rows.append(stored)
+                valid_rows += 1
                 dimensions.add(len(vector))
                 finite = finite and all(math.isfinite(value) for value in vector)
-                lineage_valid = lineage_valid and (
-                    str(row["id"]) == vector_id(generation.id, chunk.id)
-                    and str(row["publication_id"]) == generation.id
+                lineage_valid = lineage_valid and self._row_lineage(
+                    row, generation, stored, fingerprint
                 )
-            stored_rows.sort(
-                key=lambda item: (
-                    item.chunk.document_id,
-                    item.chunk.position,
-                    item.chunk.id,
-                    item.vector_id,
-                    item.sequence,
+        if await store.storage_revision() != revision:
+            raise ReembedError("shadow changed during inspection")
+        await self._authority.assert_current(generation.run_id, lease)
+        return ShadowInspection(
+            rows=rows_count,
+            unique_chunks=valid_rows if lineage_valid else 0,
+            dimension=dimensions.pop() if len(dimensions) == 1 else 0,
+            finite=finite,
+            fingerprint="" if fingerprint is None else fingerprint.canonical(),
+            inventory_digest=digest.hexdigest(),
+            lineage_valid=lineage_valid,
+            retrieval_ready=fingerprint is not None,
+            storage_revision=revision,
+        )
+
+    async def seal(
+        self,
+        generation: ShadowGeneration,
+        inspection: ShadowInspection,
+        *,
+        lease: ReembedLease,
+    ) -> None:
+        async with self._authority.fenced(generation.run_id, lease) as connection:
+            fingerprint = await self._fingerprint(connection, generation)
+            commitment_json = (
+                await connection.execute(
+                    select(models.ReembedRunRecord.commitment_json).where(
+                        models.ReembedRunRecord.id == generation.run_id
+                    )
                 )
+            ).scalar_one()
+            commitment = _COMMITMENT.validate_json(commitment_json)
+            if (
+                inspection.rows != commitment.plan.chunks
+                or inspection.unique_chunks != commitment.plan.chunks
+                or inspection.dimension != fingerprint.dimension
+                or not inspection.finite
+                or inspection.fingerprint != generation.fingerprint
+                or inspection.inventory_digest != generation.inventory_digest
+                or not inspection.lineage_valid
+                or not inspection.retrieval_ready
+                or not inspection.storage_revision
+            ):
+                raise ReembedError("only an exact validated shadow generation can be sealed")
+            store = self._store(generation.id)
+            await store.open_existing()
+            if await store.storage_revision() != inspection.storage_revision:
+                raise ReembedError("shadow changed between inspection and seal")
+            current = (
+                (
+                    await connection.execute(
+                        select(models.ReembedShadowGeneration.__table__).where(
+                            models.ReembedShadowGeneration.id == generation.id
+                        )
+                    )
+                )
+                .mappings()
+                .one()
             )
-            digest = SnapshotChunkDigester()
-            for stored in stored_rows:
-                digest.add(stored)
-            return ShadowInspection(
-                rows=len(rows),
-                unique_chunks=len({stored.chunk.id for stored in stored_rows}),
-                dimension=dimensions.pop() if len(dimensions) == 1 else 0,
-                finite=finite,
-                fingerprint="" if fingerprint is None else fingerprint.canonical(),
-                inventory_digest=digest.hexdigest(),
-                lineage_valid=lineage_valid,
-                retrieval_ready=fingerprint is not None,
+            seal_json = _json(_INSPECTION, inspection)
+            if current.state == "sealed" and current.seal_json == seal_json:
+                return
+            if current.state != "building":
+                raise ReembedError("shadow seal is immutable")
+            result = await connection.execute(
+                update(models.ReembedShadowGeneration)
+                .where(
+                    models.ReembedShadowGeneration.id == generation.id,
+                    models.ReembedShadowGeneration.state == "building",
+                )
+                .values(state="sealed", seal_json=seal_json)
             )
+            if result.rowcount != 1:
+                raise ReembedError("shadow generation could not be sealed atomically")
 
     async def cleanup_terminal(self, run_id: str) -> bool:
         """Delete a failed or superseded generation; published/live generations are refused."""
@@ -607,7 +1036,11 @@ class LanceShadowGenerations:
         )
 
     async def _fingerprint(
-        self, connection: AsyncConnection, generation: ShadowGeneration
+        self,
+        connection: AsyncConnection,
+        generation: ShadowGeneration,
+        *,
+        require_building: bool = False,
     ) -> EmbedFingerprint:
         row = (
             (
@@ -628,7 +1061,38 @@ class LanceShadowGenerations:
             or row.inventory_digest != generation.inventory_digest
         ):
             raise ReembedError("shadow identity is immutable")
+        if require_building and row.state != "building":
+            raise ReembedError("sealed shadow generation is immutable")
         return EmbedFingerprint.model_validate_json(row.fingerprint_json)
 
+    def _row_lineage(
+        self,
+        row: Mapping[str, object],
+        generation: ShadowGeneration,
+        stored: SnapshotChunk,
+        fingerprint: EmbedFingerprint | None,
+    ) -> bool:
+        chunk = stored.chunk
+        return bool(
+            str(row["id"]) == vector_id(generation.id, chunk.id)
+            and str(row["chunk_id"]) == chunk.id
+            and str(row["publication_id"]) == stored.publication_id
+            and str(row["document_id"]) == chunk.document_id
+            and str(row["kind"]) == chunk.kind.value
+            and (None if row["lang"] is None else str(row["lang"])) == chunk.lang
+            and int(str(row["position"])) == chunk.position
+            and fingerprint is not None
+            and str(row["embed_identity"])
+            == embedding_input_identity(
+                chunk.embed_text, document_id=chunk.document_id, embed=fingerprint
+            )
+        )
 
-__all__ = ["GENERATIONS_DIRNAME", "LanceShadowGenerations", "SqliteReembedStore"]
+
+__all__ = [
+    "GENERATIONS_DIRNAME",
+    "SNAPSHOT_PAGE",
+    "LanceShadowGenerations",
+    "SqliteReembedCorpus",
+    "SqliteReembedStore",
+]

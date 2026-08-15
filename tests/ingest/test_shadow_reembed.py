@@ -64,6 +64,7 @@ class Authority:
         self.leases: dict[str, ReembedLease] = {}
         self.highest_fence: dict[str, int] = {}
         self.generations: dict[str, ShadowGeneration] = {}
+        self.seals: dict[str, ShadowInspection] = {}
         self.rows: dict[str, dict[str, tuple[SnapshotChunk, tuple[float, ...]]]] = {}
         self.receipts: dict[str, PublicationReceipt] = {}
         self.prepare_calls = 0
@@ -181,6 +182,8 @@ class Authority:
         lease: ReembedLease,
     ) -> None:
         self._assert_lease(generation.run_id, lease)
+        if generation.id in self.seals:
+            raise ReembedError("sealed shadow generation is immutable")
         if self.pause_first_upsert and not self.upsert_entered.is_set():
             self.upsert_entered.set()
             await self.release_upsert.wait()
@@ -214,6 +217,7 @@ class Authority:
                 item.chunk.position,
                 item.chunk.id,
                 item.vector_id,
+                item.publication_id,
                 item.sequence,
             ),
         )
@@ -234,6 +238,21 @@ class Authority:
             retrieval_ready=True,
         )
 
+    async def seal(
+        self,
+        generation: ShadowGeneration,
+        inspection: ShadowInspection,
+        *,
+        lease: ReembedLease,
+    ) -> None:
+        self._assert_lease(generation.run_id, lease)
+        actual = await self.inspect(generation, lease=lease)
+        if actual != inspection:
+            raise ReembedError("shadow changed between inspection and seal")
+        existing = self.seals.setdefault(generation.id, inspection)
+        if existing != inspection:
+            raise ReembedError("shadow seal is immutable")
+
     async def publish(
         self,
         run: ReembedRun,
@@ -244,6 +263,8 @@ class Authority:
         lease: ReembedLease,
     ) -> PublicationReceipt:
         self._assert_lease(run.id, lease)
+        if self.seals.get(generation.id) is None:
+            raise ReembedError("shadow generation is not sealed")
         existing = self.receipts.get(run.id)
         if existing is not None:
             return existing
@@ -333,6 +354,7 @@ class Corpus:
             SnapshotChunk(
                 chunk=chunk,
                 vector_id=f"{document.publication_id}:{chunk.id}",
+                publication_id=document.publication_id,
                 sequence=chunk.position + 1,
             )
             for chunk in page
@@ -517,7 +539,7 @@ async def test_prepare_refuses_to_rebind_an_existing_shadow_identity() -> None:
     )
     raw = corpus.raw_chunks(run.commitment.snapshot, make_document().id)[0]
     authority.rows[original.id]["sentinel"] = (
-        SnapshotChunk(raw, f"legacy:{raw.id}", raw.position + 1),
+        SnapshotChunk(raw, f"legacy:{raw.id}", "legacy", raw.position + 1),
         (1.0,),
     )
 
@@ -583,7 +605,7 @@ async def test_expired_owner_is_fenced_from_shadow_journal_and_publication_after
     lease_b = await authority.acquire(run.id, "owner-b", ttl_seconds=10.0)
     assert lease_b.generation > lease_a.generation
     chunk = corpus.raw_chunks(run.commitment.snapshot, make_document().id)[0]
-    stored_chunk = SnapshotChunk(chunk, f"legacy:{chunk.id}", chunk.position + 1)
+    stored_chunk = SnapshotChunk(chunk, f"legacy:{chunk.id}", "legacy", chunk.position + 1)
 
     with pytest.raises(ReembedError, match="stale or expired"):
         await authority.renew(run.id, lease_a, ttl_seconds=5.0)
@@ -622,7 +644,7 @@ async def test_takeover_while_upsert_waits_refuses_stale_physical_write() -> Non
         lease=lease_a,
     )
     chunk = corpus.raw_chunks(run.commitment.snapshot, make_document().id)[0]
-    stored_chunk = SnapshotChunk(chunk, f"legacy:{chunk.id}", chunk.position + 1)
+    stored_chunk = SnapshotChunk(chunk, f"legacy:{chunk.id}", "legacy", chunk.position + 1)
     authority.pause_first_upsert = True
 
     stale_write = asyncio.create_task(

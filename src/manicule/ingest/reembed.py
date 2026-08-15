@@ -1,8 +1,8 @@
 """Resumable shadow-generation re-embedding from an immutable local corpus snapshot.
 
 This module is the storage-independent orchestration contract. The built-in SQLite journal,
-fenced publisher, and named Lance generations live in :mod:`manicule.storage.reembed`; a
-durable SQLite implementation of :class:`ReembedCorpus` and operator surfaces remain separate
+durable corpus snapshots, fenced publisher, and named Lance generations live in
+:mod:`manicule.storage.reembed`. Operator-facing service and CLI surfaces remain separate
 issue #187 work.
 
 The protocols expose no connector, parser, or blob fallback. A rebuild reads only stored
@@ -62,7 +62,7 @@ class LivePublication:
 
     generation_id: str
     fingerprint: str
-    inventory_digest: str
+    inventory_digest: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +102,7 @@ class SnapshotChunk:
 
     chunk: Chunk
     vector_id: str
+    publication_id: str
     sequence: int
     created_at: datetime | None = None
 
@@ -111,7 +112,7 @@ class SnapshotChunkDigester:
 
     def __init__(self) -> None:
         self._digest = hashlib.sha256()
-        self._previous: tuple[str, int, str, str, int] | None = None
+        self._previous: tuple[str, int, str, str, str, int] | None = None
 
     def add(self, stored: SnapshotChunk) -> None:
         key = (
@@ -119,6 +120,7 @@ class SnapshotChunkDigester:
             stored.chunk.position,
             stored.chunk.id,
             stored.vector_id,
+            stored.publication_id,
             stored.sequence,
         )
         if self._previous is not None and key <= self._previous:
@@ -233,6 +235,7 @@ class ShadowInspection:
     inventory_digest: str
     lineage_valid: bool
     retrieval_ready: bool
+    storage_revision: str = ""
 
 
 class ReembedError(ManiculeError):
@@ -335,6 +338,16 @@ class ShadowVectorGeneration(Protocol):
         """Read and recompute validation facts from physical rows under the lease fence."""
         ...
 
+    async def seal(
+        self,
+        generation: ShadowGeneration,
+        inspection: ShadowInspection,
+        *,
+        lease: ReembedLease,
+    ) -> None:
+        """Atomically make the exact inspected generation immutable and publishable."""
+        ...
+
 
 class ReembedPublisher(Protocol):
     """Atomic publication CAS with a durable receipt and lease fence."""
@@ -366,7 +379,11 @@ async def plan_reembed(
     target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
     chunks_per_second: float = DEFAULT_CHUNKS_PER_SECOND,
 ) -> ReembedPlan:
-    """Price a rebuild from an immutable local snapshot without writing or embedding."""
+    """Price a rebuild without connectors, parsing, embedding, or live-publication mutation.
+
+    A concrete corpus may persist an immutable local snapshot so a later rebuild can resume
+    from exactly what was priced.
+    """
     _validate_knobs(document_page, target_batch_tokens, chunks_per_second)
     snapshot = await corpus.begin_snapshot()
     commitment = await _plan_snapshot(
@@ -482,7 +499,7 @@ async def resume_reembed(
         )
     if run.state is ReembedState.VALIDATING:
         try:
-            await _validate(
+            inspection = await _validate(
                 run,
                 generation=generation,
                 corpus=corpus,
@@ -491,6 +508,7 @@ async def resume_reembed(
                 target_batch_tokens=target_batch_tokens,
                 lease=lease,
             )
+            await shadow.seal(generation, inspection, lease=lease)
         except ReembedValidationError as exc:
             await _save(
                 journal,
@@ -621,7 +639,7 @@ async def _validate(
     document_page: int,
     target_batch_tokens: int,
     lease: ReembedLease,
-) -> None:
+) -> ShadowInspection:
     target = EmbedFingerprint.model_validate_json(run.commitment.target_config)
     current = await _plan_snapshot(
         corpus,
@@ -658,6 +676,7 @@ async def _validate(
         failures.append("the shadow failed its retrieval-readiness probe")
     if failures:
         raise ReembedValidationError("; ".join(failures))
+    return inspection
 
 
 async def _plan_snapshot(
@@ -788,6 +807,7 @@ def _canonical_document(stored: SnapshotDocument) -> bytes:
 def _canonical_chunk(stored: SnapshotChunk) -> bytes:
     value = stored.chunk.model_dump(mode="json", exclude_none=False)
     value["vector_id"] = stored.vector_id
+    value["publication_id"] = stored.publication_id
     value["sequence"] = stored.sequence
     value["created_at"] = _datetime(stored.created_at)
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
