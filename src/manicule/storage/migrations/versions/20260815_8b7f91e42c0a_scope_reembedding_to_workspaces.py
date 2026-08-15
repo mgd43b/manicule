@@ -105,7 +105,11 @@ def _backfill() -> None:
             "UPDATE reembed_runs SET commitment_json = json_set(commitment_json, "
             "'$.snapshot.workspace_id', workspace_id), checkpoint_json = json_set("
             "checkpoint_json, '$.workspace_id', workspace_id, "
-            "'$.commitment.snapshot.workspace_id', workspace_id) "
+            "'$.commitment.snapshot.workspace_id', workspace_id, "
+            "'$.workspace_documents_completed', "
+            "json_extract(checkpoint_json, '$.documents_completed'), "
+            "'$.workspace_chunks_completed', "
+            "json_extract(checkpoint_json, '$.chunks_completed')) "
             "WHERE workspace_id IS NOT NULL"
         )
     )

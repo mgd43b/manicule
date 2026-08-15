@@ -87,7 +87,7 @@ async def _recover_reembed_runs(
     for run_id in run_ids:
         try:
             await resume(run_id)
-        except (ManiculeError, ValueError, OSError) as error:
+        except Exception as error:  # noqa: BLE001 - each durable run is an isolation boundary
             failure_types.append(type(error).__name__)
         else:
             recovered += 1

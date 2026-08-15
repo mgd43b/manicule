@@ -12,6 +12,7 @@ none of them has any business loading a multi-gigabyte model to answer.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 from pathlib import Path
@@ -30,7 +31,6 @@ from manicule.container import keys
 from manicule.container.container import build_container, check_wiring
 from manicule.core.errors import InsecureTargetError
 from manicule.generation.config import GENERATOR_NAME
-from manicule.ingest.reembed import ReembedError
 from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
 from manicule.plugins.manifest import ComponentKind
 from manicule.plugins.registry import discover
@@ -51,15 +51,23 @@ async def test_reembed_restart_recovery_continues_after_one_run_refuses() -> Non
     async def resume(run_id: str) -> None:
         attempted.append(run_id)
         if run_id == "private-corrupt-id":
-            raise ReembedError("synthetic private failure with /private/path")
+            raise RuntimeError("synthetic private failure with /private/path")
 
     outcome = await _recover_reembed_runs(("private-corrupt-id", "private-healthy-id"), resume)
 
     assert attempted == ["private-corrupt-id", "private-healthy-id"]
     assert outcome.recovered == 1
     assert outcome.failures == 1
-    assert outcome.failure_types == ("ReembedError",)
+    assert outcome.failure_types == ("RuntimeError",)
     assert "private" not in repr(outcome)
+
+
+async def test_reembed_restart_recovery_does_not_swallow_cancellation() -> None:
+    async def resume(_run_id: str) -> None:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _recover_reembed_runs(("private-run-id",), resume)
 
 
 @pytest.fixture
