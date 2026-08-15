@@ -782,6 +782,31 @@ async def test_missing_published_generation_is_fatal_and_is_not_recreated(
     assert not (data_dir / VECTORS_DIRNAME / "generations" / missing).exists()
 
 
+async def test_published_handle_keeps_rebuild_namespaces_inside_one_pinned_pointer(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    del store
+    embed = fingerprint(dimension=4)
+    live = PublishedLanceVectorStore(data_dir / VECTORS_DIRNAME, engine)
+    await live.ensure_ready(embed)
+    original = make_chunk(make_document(), 0, "rebuild vector")
+    await live.upsert(
+        [original],
+        [[1.0, 0.0, 0.0, 0.0]],
+        publication_id="rebuild-source",
+    )
+
+    assert await live.publication_is_complete(
+        "rebuild-source", [original], embedding_fingerprint=embed.canonical()
+    )
+    await live.copy_publication("rebuild-source", "rebuild-takeover", [original])
+    assert await live.publication_row_count("rebuild-takeover") == 1
+    assert await live.publication_page_is_complete(
+        "rebuild-takeover", [original], embedding_fingerprint=embed.canonical()
+    )
+    await live.teardown()
+
+
 @pytest.mark.parametrize(
     "pointer",
     ["reembed-../outside", "reembed-private/generation", r"reembed-private\generation"],

@@ -1254,6 +1254,55 @@ class PublishedLanceVectorStore:
         async with self._operation() as store:
             return await store.stored_vectors(chunks)
 
+    async def publication_row_count(self, publication_id: str) -> int:
+        """Count a rebuild namespace in the currently pinned live generation."""
+        async with self._operation() as store:
+            return await store.publication_row_count(publication_id)
+
+    async def publication_page_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        """Validate one rebuild page without crossing the live pointer boundary."""
+        async with self._operation() as store:
+            return await store.publication_page_is_complete(
+                publication_id,
+                chunks,
+                embedding_fingerprint=embedding_fingerprint,
+            )
+
+    async def publication_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        """Validate an exact rebuild namespace in one pinned live generation."""
+        async with self._operation() as store:
+            return await store.publication_is_complete(
+                publication_id,
+                chunks,
+                embedding_fingerprint=embedding_fingerprint,
+            )
+
+    async def copy_publication(
+        self,
+        source_publication_id: str,
+        target_publication_id: str,
+        chunks: Sequence[Chunk],
+    ) -> None:
+        """Replay takeover vectors without accidentally crossing a #187 pointer swap."""
+        async with self._operation() as store:
+            await store.copy_publication(
+                source_publication_id,
+                target_publication_id,
+                chunks,
+            )
+
     @asynccontextmanager
     async def _operation(self) -> AsyncGenerator[LanceVectorStore]:
         """Pin and revalidate one pointer before exposing its store to an operation."""

@@ -18,7 +18,12 @@ from manicule.core.content import Chunk, DocumentStatus, RawDocument
 from manicule.core.embedding import EmbedFingerprint, Pooling
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import chunk_id, content_hash
-from manicule.core.rebuild import DerivedReplacement, RebuildState, RebuildTarget
+from manicule.core.rebuild import (
+    DerivedReplacement,
+    RebuildRefusalCode,
+    RebuildState,
+    RebuildTarget,
+)
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.storage import models
 from manicule.storage.blobs import BlobStore, StoredBlob
@@ -37,11 +42,18 @@ NOW = datetime(2026, 8, 15, 12, tzinfo=UTC)
 
 
 async def promoted_snapshot(
-    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    *,
+    run_id: str = "promoted-run",
+    connector: str = "wiki",
+    scope_fingerprint: str = "scope-v1",
+    source_id: str = "page-1",
 ) -> tuple[str, str, RawDocument]:
     raw = RawDocument(
-        source_id="page-1",
-        uri="https://source.invalid/page-1",
+        source_id=source_id,
+        uri=f"https://source.invalid/{source_id}",
         media_type="text/plain",
         content="replacement searchable text",
     )
@@ -54,7 +66,10 @@ async def promoted_snapshot(
         )
     )
     run = await store.create_acquisition_run(
-        "promoted-run", "wiki", source_scope="space:eng", scope_fingerprint="scope-v1"
+        run_id,
+        connector,
+        source_scope=f"scope:{scope_fingerprint}",
+        scope_fingerprint=scope_fingerprint,
     )
     claimed = await store.claim_acquisition_run(
         run.id, "worker", now=NOW, expires_at=NOW + timedelta(minutes=5)
@@ -106,12 +121,89 @@ async def promoted_snapshot(
     )
     await store.promote_snapshot_and_commit_watermark(
         run.id,
-        expected_scope_fingerprint="scope-v1",
+        expected_scope_fingerprint=scope_fingerprint,
         lease_owner="worker",
         lease_generation=claimed.lease_generation,
         now=NOW,
     )
     return run.id, blob.hash, raw
+
+
+async def test_second_connector_promotion_fences_a_single_scope_rebuild(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    first_run, _, _ = await promoted_snapshot(store, engine, data_dir)
+    embed = EmbedFingerprint(
+        model_id="test/embed",
+        dimension=4,
+        pooling=Pooling.MEAN,
+        normalized=True,
+        tokenizer_id="test/tokenizer",
+        max_sequence_length=128,
+    )
+    target = RebuildTarget(
+        parser_routing="routing-v2",
+        parser_set=("plain@2",),
+        chunk_fingerprint="chunk-v2",
+        embedding_fingerprint=embed.canonical(),
+        glossary_fingerprint="glossary-v2",
+        fts_tokenizer="unicode61",
+        batch_documents=1,
+        max_memory_bytes=1_000_000,
+        max_temporary_bytes=1_000_000,
+    )
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    first = await rebuilds.plan_rebuild(first_run, target, missing_limit=10)
+    assert first.runnable
+    claimed = await rebuilds.claim_generation(
+        first.generation_id,
+        "first-worker",
+        now=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+
+    second_run, _, _ = await promoted_snapshot(
+        store,
+        engine,
+        data_dir,
+        run_id="drive-promoted-run",
+        connector="drive",
+        scope_fingerprint="folder-v1",
+        source_id="drive-page-1",
+    )
+    refused_first = await rebuilds.plan_rebuild(first_run, target, missing_limit=10)
+    refused_second = await rebuilds.plan_rebuild(second_run, target, missing_limit=10)
+    assert refused_first.refusal is RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
+    assert refused_second.refusal is RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
+    with pytest.raises(RebuildLeaseConflictError, match="workspace_scope_changed"):
+        await rebuilds.assert_generation_lease(
+            first.generation_id,
+            "first-worker",
+            claimed.lease_generation,
+            now=NOW,
+        )
+    await rebuilds.begin_validation(
+        first.generation_id,
+        owner="first-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    with pytest.raises(RuntimeError, match="workspace_scope_changed"):
+        await rebuilds.publish_generation(
+            first.generation_id,
+            owner="first-worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
 
 
 async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # noqa: PLR0915
@@ -226,10 +318,43 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         now=NOW,
     )
     await rebuilds.validate_generation(estimate.generation_id)
+    sessions = session_factory(engine)
+
+    # A #187 pointer swap after staging must win the CAS without publishing relational rows.
+    async with sessions.begin() as session:
+        index_state = await session.get(models.IndexState, 1)
+        index_state_was_missing = index_state is None
+        expected_vector_table = None if index_state is None else index_state.vector_table
+        expected_inventory = None if index_state is None else index_state.vector_inventory_digest
+        if index_state is None:
+            session.add(
+                models.IndexState(
+                    id=1,
+                    vector_table="reembed-interleaving-winner",
+                    vector_inventory_digest="interleaving-inventory",
+                )
+            )
+        else:
+            index_state.vector_table = "reembed-interleaving-winner"
+            index_state.vector_inventory_digest = "interleaving-inventory"
+    with pytest.raises(RebuildLeaseConflictError, match="live vector publication changed"):
+        await rebuilds.publish_generation(
+            estimate.generation_id,
+            owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+    async with sessions.begin() as session:
+        index_state = await session.get(models.IndexState, 1)
+        assert index_state is not None
+        if index_state_was_missing:
+            await session.delete(index_state)
+        else:
+            index_state.vector_table = expected_vector_table
+            index_state.vector_inventory_digest = expected_inventory
 
     # Validation is not a trust boundary by itself: publication rechecks the canonical
     # promoted manifest inside the same transaction as the relational flip.
-    sessions = session_factory(engine)
     async with sessions.begin() as session:
         record = (
             await session.execute(
@@ -296,7 +421,14 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
                 text("SELECT sql FROM sqlite_master WHERE name = 'chunks_fts'")
             )
         ).scalar_one()
+        inventory = (
+            await connection.execute(
+                select(models.IndexState.vector_inventory_digest).where(models.IndexState.id == 1)
+            )
+        ).scalar_one()
     assert "tokenize='unicode61'" in fts_sql
+    assert inventory is not None
+    assert inventory != expected_inventory
 
     # Idempotent retries do not create another generation or duplicate derived rows.
     repeated = await rebuilds.publish_generation(

@@ -24,6 +24,7 @@ from manicule.core.rebuild import (
     SnapshotRebuildInput,
     vector_publication_id,
 )
+from manicule.ingest.reembed import SnapshotChunk, SnapshotChunkDigester
 from manicule.storage import models
 from manicule.storage.acquisition import AcquisitionJournalMixin, snapshot_manifest_matches
 from manicule.storage.fts import (
@@ -34,7 +35,7 @@ from manicule.storage.fts import (
     REBUILD_FTS,
     create_fts,
 )
-from manicule.storage.rows import apply_document, from_chunk
+from manicule.storage.rows import apply_document, from_chunk, to_chunk
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import utcnow
 
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
 
 _REPLACEMENT = TypeAdapter(DerivedReplacement)
 _EVIDENCE_PAGE = 1
+_INVENTORY_PAGE = 100
 
 
 class BlobInventory(Protocol):
@@ -187,6 +189,18 @@ class SqliteRebuildStore(WorkspaceScoped):
             return self._refused_estimate(
                 snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
             )
+        async with self._sessions() as session:
+            if not await self._is_only_promoted_scope(
+                session, run.connector, run.scope_fingerprint
+            ):
+                return self._refused_estimate(
+                    snapshot_run_id, target, RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
+                )
+            index_state = await session.get(models.IndexState, 1)
+            expected_vector_table = None if index_state is None else index_state.vector_table
+            expected_vector_inventory_digest = (
+                None if index_state is None else index_state.vector_inventory_digest
+            )
 
         missing: list[MissingSnapshotInput] = []
         missing_count = 0
@@ -245,6 +259,8 @@ class SqliteRebuildStore(WorkspaceScoped):
                     vectors_reused=0,
                     vectors_embedded=0,
                     vector_publication_id=None,
+                    expected_vector_table=expected_vector_table,
+                    expected_vector_inventory_digest=expected_vector_inventory_digest,
                     lease_generation=0,
                     diagnostic_count=0,
                     created_at=now,
@@ -262,6 +278,8 @@ class SqliteRebuildStore(WorkspaceScoped):
             if (
                 generation.snapshot_membership_hash != run.membership_hash
                 or generation.expected_item_count != documents
+                or generation.expected_vector_table != expected_vector_table
+                or generation.expected_vector_inventory_digest != expected_vector_inventory_digest
             ):
                 raise RuntimeError("an existing rebuild plan names different snapshot evidence")
 
@@ -400,6 +418,12 @@ class SqliteRebuildStore(WorkspaceScoped):
             self._require_lease(generation, owner, lease_generation, now)
             if generation.state not in {RebuildState.BUILDING, RebuildState.VALIDATING}:
                 raise RebuildLeaseConflictError("generation is not accepting fenced work")
+            run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
+            if run is None or not await self._is_only_promoted_scope(
+                session, run.connector_name, run.scope_fingerprint
+            ):
+                raise RebuildLeaseConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED.value)
+            await self._require_live_vector_binding(session, generation)
 
     async def copy_checkpointed_vectors(
         self,
@@ -717,6 +741,11 @@ class SqliteRebuildStore(WorkspaceScoped):
             ).scalar_one_or_none()
             if newer != run.id:
                 raise RuntimeError("a newer promoted snapshot superseded this rebuild")
+            if not await self._is_only_promoted_scope(
+                session, run.connector_name, run.scope_fingerprint
+            ):
+                raise RuntimeError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED.value)
+            await self._require_live_vector_binding(session, generation)
 
             highest_fence = (
                 await session.execute(
@@ -809,11 +838,108 @@ class SqliteRebuildStore(WorkspaceScoped):
             state.chunk_fingerprint = target.chunk_fingerprint
             state.embed_fingerprint = target.embedding_fingerprint
             state.fts_tokenizer = target.fts_tokenizer
+            state.vector_inventory_digest = await self._live_chunk_inventory_digest(session)
             generation.state = RebuildState.PUBLISHED
             generation.published_at = now
             generation.updated_at = now
             await session.flush()
             return _checkpoint(generation)
+
+    async def _require_live_vector_binding(
+        self, session: AsyncSession, generation: models.DerivedGeneration
+    ) -> None:
+        state = await session.get(models.IndexState, 1)
+        observed_table = None if state is None else state.vector_table
+        observed_inventory = None if state is None else state.vector_inventory_digest
+        if (
+            observed_table != generation.expected_vector_table
+            or observed_inventory != generation.expected_vector_inventory_digest
+        ):
+            raise RebuildLeaseConflictError(
+                "live vector publication changed after rebuild planning"
+            )
+
+    async def _is_only_promoted_scope(
+        self, session: AsyncSession, connector_name: str, scope_fingerprint: str
+    ) -> bool:
+        """The explicit safe boundary until one generation can cover several manifests."""
+        scopes = (
+            await session.execute(
+                select(
+                    models.AcquisitionRun.connector_name,
+                    models.AcquisitionRun.scope_fingerprint,
+                )
+                .where(
+                    models.AcquisitionRun.workspace_id == self._workspace_id,
+                    models.AcquisitionRun.promoted_at.is_not(None),
+                )
+                .group_by(
+                    models.AcquisitionRun.connector_name,
+                    models.AcquisitionRun.scope_fingerprint,
+                )
+                .limit(2)
+            )
+        ).all()
+        if [tuple(row) for row in scopes] != [(connector_name, scope_fingerprint)]:
+            return False
+        foreign_live_document = (
+            await session.execute(
+                select(models.Document.id)
+                .where(
+                    models.Document.deleted_at.is_(None),
+                    (models.Document.workspace_id != self._workspace_id)
+                    | (models.Document.source != connector_name),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return foreign_live_document is None
+
+    async def _live_chunk_inventory_digest(self, session: AsyncSession) -> str:
+        """Recompute #187's exact active-corpus vector inventory after relational mutation."""
+        digest = SnapshotChunkDigester()
+        after: tuple[str, int, str] | None = None
+        while True:
+            statement = (
+                select(models.Chunk, models.Document.publication_id)
+                .join(models.Document, models.Document.id == models.Chunk.document_id)
+                .where(models.Document.deleted_at.is_(None))
+            )
+            if after is not None:
+                document, position, chunk = after
+                statement = statement.where(
+                    (models.Chunk.document_id > document)
+                    | (
+                        (models.Chunk.document_id == document)
+                        & (
+                            (models.Chunk.position > position)
+                            | ((models.Chunk.position == position) & (models.Chunk.id > chunk))
+                        )
+                    )
+                )
+            rows = (
+                await session.execute(
+                    statement.order_by(
+                        models.Chunk.document_id,
+                        models.Chunk.position,
+                        models.Chunk.id,
+                    ).limit(_INVENTORY_PAGE)
+                )
+            ).all()
+            if not rows:
+                return digest.hexdigest()
+            for row, publication_id in rows:
+                digest.add(
+                    SnapshotChunk(
+                        chunk=to_chunk(row),
+                        vector_id=row.vector_id,
+                        publication_id=publication_id,
+                        sequence=row.seq,
+                        created_at=row.created_at,
+                    )
+                )
+            last = rows[-1][0]
+            after = (last.document_id, last.position, last.id)
 
     async def _publish_item(
         self,

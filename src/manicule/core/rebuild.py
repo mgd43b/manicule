@@ -28,6 +28,7 @@ class RebuildRefusalCode(StrEnum):
 
     SNAPSHOT_NOT_PROMOTED = "snapshot_not_promoted"
     SNAPSHOT_CHANGED = "snapshot_changed"
+    WORKSPACE_SCOPE_CHANGED = "workspace_scope_changed"
     MISSING_LOCAL_INPUT = "missing_local_input"
     MEMORY_BOUND = "memory_bound"
     TEMP_DISK_BOUND = "temp_disk_bound"

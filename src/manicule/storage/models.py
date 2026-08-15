@@ -1348,6 +1348,8 @@ class DerivedGeneration(Base):
     vectors_reused: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     vectors_embedded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     vector_publication_id: Mapped[str | None] = mapped_column(Text)
+    expected_vector_table: Mapped[str | None] = mapped_column(Text)
+    expected_vector_inventory_digest: Mapped[str | None] = mapped_column(Text)
     fence_generation: Mapped[int | None] = mapped_column(Integer)
     lease_owner: Mapped[str | None] = mapped_column(Text)
     lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

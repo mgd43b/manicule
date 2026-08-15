@@ -1508,6 +1508,13 @@ allocating or fully decompressing it, and returns only
 aggregate counts plus bounded manifest sequence numbers for missing inputs. A missing or corrupt
 blob is a typed refusal; it is never permission to contact the source.
 
+`index_state` and its named vector directory are installation-wide, while an acquisition manifest
+names one connector scope. Until a coordinator can bind several promoted manifests into one
+generation, the explicit safe boundary is an installation with exactly one promoted connector
+scope and no live documents outside that workspace/source. Planning refuses broader installations
+with `workspace_scope_changed`, and lease checks plus the publication transaction repeat the gate;
+a second connector promoted after planning therefore cannot create mixed global fingerprints.
+
 `derived_generations` records the immutable snapshot and target identities, its canonical
 membership hash and expected item count, resource bounds, forward-only state and checkpoint
 counters. Planning remains `PLANNED`; only a successful owner claim enters `BUILDING`, and dry
@@ -1558,7 +1565,13 @@ manifest for its connector scope, ties every replacement back to that manifest's
 and acquired-source envelope, replaces documents, chunks and glossary rows, rebuilds FTS when
 its tokenizer changed, and runs the external-content FTS integrity check before advancing index
 identity and marking the generation published. Tokenizer syntax is probed before any live row is
-changed. Existing WAL
+changed. The plan also persists the exact #187 live `vector_table` and
+`vector_inventory_digest`. Every external vector mutation checks that binding, and publication
+compares it again inside the writer transaction. A concurrent named-generation pointer swap wins
+and leaves all relational rows unchanged. Successful publication keeps the bound physical pointer
+and recomputes #187's canonical active-chunk inventory digest in bounded keyset pages before the
+commit; the corpus-revision triggers then prevent an older re-embed snapshot from publishing over
+those changed chunks. Existing WAL
 readers retain their old database snapshot until they finish. A crash, cancellation or validation
 failure leaves the old generation active and the new rows inert. Publication is a joined
 irreversible task: cancellation waits for its atomic outcome instead of abandoning a background

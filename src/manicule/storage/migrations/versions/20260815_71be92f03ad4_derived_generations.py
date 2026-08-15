@@ -54,6 +54,8 @@ def upgrade() -> None:
         sa.Column("vectors_reused", sa.Integer(), nullable=False),
         sa.Column("vectors_embedded", sa.Integer(), nullable=False),
         sa.Column("vector_publication_id", sa.Text(), nullable=True),
+        sa.Column("expected_vector_table", sa.Text(), nullable=True),
+        sa.Column("expected_vector_inventory_digest", sa.Text(), nullable=True),
         sa.Column("fence_generation", sa.Integer(), nullable=True),
         sa.Column("lease_owner", sa.Text(), nullable=True),
         sa.Column("lease_generation", sa.Integer(), nullable=False),
