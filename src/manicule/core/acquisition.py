@@ -193,6 +193,8 @@ class AcquisitionRun(BaseModel):
     candidate_watermark: Watermark | None = None
     enumeration_completed_at: datetime | None = None
     watermark_committed_at: datetime | None = None
+    superseded_at: datetime | None = None
+    superseded_by: str | None = None
     lease_owner: str | None = None
     lease_generation: int = Field(ge=0)
     lease_expires_at: datetime | None = None

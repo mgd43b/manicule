@@ -647,6 +647,8 @@ class IngestPipeline:
         acquisitions: AcquisitionStore | None = None,
         acquisition_lease_s: float = 300.0,
         acquisition_clock: Callable[[], datetime] | None = None,
+        acquisition_history_s: float = 30 * 24 * 3600.0,
+        acquisition_cleanup_batch: int = 100,
     ) -> None:
         # Second of the two places this is refused, and not a redundant one.
         # `check_before_run` is the once-per-run boundary and is what an operator meets; this
@@ -661,6 +663,8 @@ class IngestPipeline:
         self._acquisitions = acquisitions
         self._acquisition_lease_s = max(1.0, acquisition_lease_s)
         self._acquisition_clock = acquisition_clock or (lambda: datetime.now(UTC))
+        self._acquisition_history_s = max(0.0, acquisition_history_s)
+        self._acquisition_cleanup_batch = max(1, acquisition_cleanup_batch)
         self._chunker = chunker
         self._embedder = embedder
         self._vectors = vectors
@@ -778,43 +782,35 @@ class IngestPipeline:
         acquisitions = self._acquisitions
         if acquisitions is None:
             return _AcquisitionStart(watermark=watermark)
-        selected = await acquisitions.latest_unsettled_acquisition_run(connector.name)
         owner = f"pipeline:{uuid4().hex}"
-        if selected is None:
-            run_id = uuid4().hex
-            selected = await acquisitions.create_acquisition_run(run_id, connector.name)
-        else:
-            if selected.state not in {
-                AcquisitionRunState.ENUMERATING,
-                AcquisitionRunState.ACQUIRING,
-                AcquisitionRunState.INDEXING,
-            }:
-                msg = (
-                    f"acquisition run {selected.id!r} is {selected.state}; the direct journal "
-                    "consumer cannot take over indexing orchestration"
-                )
-                raise RuntimeError(msg)
-            run_id = selected.id
         now = self._acquisition_clock()
-        claimed = await acquisitions.claim_acquisition_run(
-            run_id,
+        claimed = await acquisitions.claim_or_create_acquisition_run(
+            connector.name,
+            uuid4().hex,
             owner,
             now=now,
             expires_at=now + timedelta(seconds=self._acquisition_lease_s),
         )
         if claimed is None:
-            msg = f"acquisition run {run_id!r} could not be claimed"
+            msg = f"an active acquisition run for connector {connector.name!r} could not be claimed"
+            raise RuntimeError(msg)
+        if claimed.state not in {
+            AcquisitionRunState.ENUMERATING,
+            AcquisitionRunState.ACQUIRING,
+            AcquisitionRunState.INDEXING,
+        }:
+            msg = f"acquisition run {claimed.id!r} is not resumable from {claimed.state}"
             raise RuntimeError(msg)
         return _AcquisitionStart(
-            run_id=run_id,
+            run_id=claimed.id,
             owner=owner,
             generation=claimed.lease_generation,
             expires_at=claimed.lease_expires_at,
-            resume_completed=selected.enumeration_completed_at is not None,
-            candidate_watermark=selected.candidate_watermark,
-            accepted=selected.discovered_count,
-            watermark=selected.base_watermark,
-            state=selected.state,
+            resume_completed=claimed.enumeration_completed_at is not None,
+            candidate_watermark=claimed.candidate_watermark,
+            accepted=claimed.discovered_count,
+            watermark=claimed.base_watermark,
+            state=claimed.state,
         )
 
     async def run(
@@ -871,6 +867,16 @@ class IngestPipeline:
                 ingest worker, so it must not block and must not raise — the one implementation
                 appends to a list. ``None`` is the ordinary case and costs a branch per document.
         """
+        if self._acquisitions is not None:
+            # Settled journal rows are diagnostic history, not recovery input. Bound this pass
+            # so starting one connector cannot monopolize the workspace writer; positive-state
+            # cleanup guarantees no incomplete inventory, retry, or retained indexing input is
+            # ever aged out. Blob collection remains its own mark-and-sweep operation.
+            now = self._acquisition_clock()
+            await self._acquisitions.cleanup_acquisition_history(
+                now - timedelta(seconds=self._acquisition_history_s),
+                limit=self._acquisition_cleanup_batch,
+            )
         watermark = await self._store.get_watermark(connector.name)
         acquisition = await self._start_acquisition(connector, watermark)
 
@@ -1008,7 +1014,7 @@ class IngestPipeline:
             if run.resume_completed:
                 run.report.enumeration_completed = True
             else:
-                await self._enumerate_to_journal(run)
+                await owned(self._enumerate_to_journal(run), "journal-enumeration")
             if not run.report.enumeration_completed:
                 # A bounded/incomplete run may still make its durable prefix useful, but it can
                 # never publish the candidate watermark or claim complete source coverage.

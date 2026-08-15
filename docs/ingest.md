@@ -1663,10 +1663,31 @@ documents happened to publish before the process stopped:
 3. A crash before that point leaves the run visibly incomplete; a crash after it preserves the
    complete inventory and candidate.
 
-Claiming an old lease and deciding whether to resume an incomplete enumeration or continue a
-completed run is recovery orchestration, not part of cursor decoupling. A fresh invocation may
-still re-enumerate from the committed connector watermark; change detection makes that safe.
-The durable rows ensure this is an explicit policy choice rather than lost process memory.
+Recovery is automatic at the production pipeline boundary. Selection and claim are one SQLite
+write transaction: the newest unfinished run is claimed, or a new run is created and claimed,
+but two simultaneous sync requests cannot both observe absence and open independent source
+cursors. A live lease makes the second caller a clean loser. An expired or orderly-released
+lease increments the generation; every later journal mutation and every publication boundary is
+fenced by that generation. A source call left in `acquiring` becomes retry work at takeover,
+while `indexing` remains the exact checkpoint needed to replay partially expanded containers
+from retained bytes without source access.
+
+Enumeration, acquisition and indexing each run with an independent lease heartbeat. Their task
+groups are children of the sync call, cancellation stops admission and joins every task within
+the configured grace period, and no worker survives return. Different connectors hold different
+run leases and can progress independently; every claim and record predicate remains workspace
+scoped.
+
+The retention policy is positive-state and deliberately asymmetric. Incomplete enumeration,
+`retry`, `acquired`, and `indexing` records are retained without an age cutoff because they are
+recovery input. When a newer successful run has already advanced beyond an older unfinished
+base watermark, recovery records `superseded_at` and the replacement run id, then increments the
+older generation before starting from the current position. Superseded history is eligible for
+the same 30-day cleanup only when it contains no retry or local-derivation backlog. Settled
+journal history is retained for 30 days and removed in bounded batches at sync startup. Deleting
+a settled run releases only its acquisition references. Blob GC still
+uses its full publication/version/acquisition mark set, so a blob is removed only after no live
+publication, history row, acquisition record, or staging marker names it.
 
 **Where the new watermark comes from, which this document did not say.** `Connector.discover`
 *took* a position and nothing returned one, so a pipeline written to the protocol alone could

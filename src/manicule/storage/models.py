@@ -249,6 +249,8 @@ class AcquisitionRun(Base):
     candidate_watermark: Mapped[JsonValue | None] = mapped_column(JSON)
     enumeration_completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     watermark_committed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    superseded_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    superseded_by: Mapped[str | None] = mapped_column(Text)
     lease_owner: Mapped[str | None] = mapped_column(Text)
     lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
@@ -274,6 +276,26 @@ class AcquisitionRun(Base):
         UniqueConstraint("id", "workspace_id", "connector_id"),
         Index(
             "ix_acquisition_runs_workspace_connector_state", "workspace_id", "connector_id", "state"
+        ),
+        Index(
+            "ix_acquisition_runs_workspace_connector_recovery",
+            "workspace_id",
+            "connector_id",
+            "superseded_at",
+            "state",
+            "created_at",
+        ),
+        Index(
+            "ix_acquisition_runs_workspace_state_updated",
+            "workspace_id",
+            "state",
+            "updated_at",
+        ),
+        Index(
+            "ix_acquisition_runs_workspace_superseded_updated",
+            "workspace_id",
+            "superseded_at",
+            "updated_at",
         ),
         CheckConstraint("lease_generation >= 0", name="lease_generation_is_not_negative"),
         CheckConstraint(

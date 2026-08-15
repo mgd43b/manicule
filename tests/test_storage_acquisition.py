@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -413,6 +414,233 @@ async def test_lifecycle_edges_and_lease_generation_are_compare_and_swap_guarded
         now=now + timedelta(seconds=11),
     )
     assert settled.state is AcquisitionRunState.SETTLED
+
+
+async def test_claim_or_create_serializes_repeated_sync_requests(
+    store: SqliteDocStore,
+) -> None:
+    """Two callers cannot both turn a missing run into independent enumerations."""
+    expiry = _NOW + timedelta(minutes=1)
+    first, second = await asyncio.gather(
+        store.claim_or_create_acquisition_run(
+            "wiki", "first", "owner-a", now=_NOW, expires_at=expiry
+        ),
+        store.claim_or_create_acquisition_run(
+            "wiki", "second", "owner-b", now=_NOW, expires_at=expiry
+        ),
+    )
+
+    winners = [run for run in (first, second) if run is not None]
+    assert len(winners) == 1
+    assert (await store.latest_unsettled_acquisition_run("wiki")) == winners[0]
+    persisted = [
+        await store.get_acquisition_run("first"),
+        await store.get_acquisition_run("second"),
+    ]
+    assert sum(run is not None for run in persisted) == 1
+
+
+async def test_an_active_connector_does_not_block_an_independent_connector(
+    store: SqliteDocStore,
+) -> None:
+    expiry = _NOW + timedelta(minutes=1)
+    first = await store.claim_or_create_acquisition_run(
+        "wiki", "wiki-run", "wiki-owner", now=_NOW, expires_at=expiry
+    )
+    independent = await store.claim_or_create_acquisition_run(
+        "drive", "drive-run", "drive-owner", now=_NOW, expires_at=expiry
+    )
+    blocked = await store.claim_or_create_acquisition_run(
+        "wiki", "duplicate", "other-owner", now=_NOW, expires_at=expiry
+    )
+
+    assert first is not None
+    assert independent is not None
+    assert independent.connector == "drive"
+    assert blocked is None
+
+
+async def test_takeover_normalizes_in_flight_records_to_their_durable_inputs(
+    store: SqliteDocStore,
+) -> None:
+    run = await _claimed_run(store)
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        _source("fetching"),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        "fetching",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+
+    takeover = await store.claim_or_create_acquisition_run(
+        "wiki",
+        "must-not-be-created",
+        "successor",
+        now=_NOW + timedelta(minutes=2),
+        expires_at=_NOW + timedelta(minutes=3),
+    )
+
+    assert takeover is not None
+    assert takeover.id == run.id
+    assert takeover.lease_generation == run.lease_generation + 1
+    record = (await store.list_acquisition_records(run.id))[0]
+    assert record.state is AcquisitionRecordState.RETRY
+    assert record.diagnostic is not None
+    assert record.diagnostic.code.value == "interrupted"
+
+
+async def test_recovery_supersedes_a_run_from_an_obsolete_connector_position(
+    store: SqliteDocStore,
+) -> None:
+    obsolete = await _claimed_run(store, "obsolete", "wiki", "old-owner")
+    winner = await _claimed_run(store, "winner", "wiki", "winning-owner")
+    await store.complete_acquisition_enumeration(
+        winner.id,
+        _watermark("new-position"),
+        lease_owner="winning-owner",
+        lease_generation=winner.lease_generation,
+        now=_NOW,
+    )
+    await store.commit_acquisition_watermark(
+        winner.id,
+        lease_owner="winning-owner",
+        lease_generation=winner.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_run(
+        winner.id,
+        AcquisitionRunState.ACQUIRING,
+        AcquisitionRunState.SETTLED,
+        lease_owner="winning-owner",
+        lease_generation=winner.lease_generation,
+        now=_NOW,
+    )
+
+    recovered = await store.claim_or_create_acquisition_run(
+        "wiki",
+        "successor",
+        "new-owner",
+        now=_NOW,
+        expires_at=_NOW + timedelta(minutes=1),
+    )
+
+    assert recovered is not None
+    assert recovered.id == "successor"
+    assert recovered.base_watermark == _watermark("new-position")
+    superseded = await store.get_acquisition_run(obsolete.id)
+    assert superseded is not None
+    assert superseded.superseded_at is not None
+    assert superseded.superseded_by == "successor"
+    assert superseded.lease_generation == obsolete.lease_generation + 1
+    with pytest.raises(AcquisitionConflictError, match="lease changed or expired"):
+        await store.append_acquisition_record(
+            obsolete.id,
+            0,
+            _source("stale-mutation"),
+            lease_owner="old-owner",
+            lease_generation=obsolete.lease_generation,
+            now=_NOW,
+        )
+    assert (
+        await store.claim_acquisition_run(
+            obsolete.id,
+            "reviver",
+            now=_NOW + timedelta(minutes=2),
+            expires_at=_NOW + timedelta(minutes=3),
+        )
+        is None
+    )
+
+
+async def test_settled_cleanup_is_bounded_and_never_discards_retry_work(
+    store: SqliteDocStore,
+) -> None:
+    settled = await _claimed_run(store, "settled", "finished")
+    await store.complete_acquisition_enumeration(
+        settled.id,
+        None,
+        lease_owner="worker",
+        lease_generation=settled.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_run(
+        settled.id,
+        AcquisitionRunState.ACQUIRING,
+        AcquisitionRunState.SETTLED,
+        lease_owner="worker",
+        lease_generation=settled.lease_generation,
+        now=_NOW,
+    )
+    retry = await _claimed_run(store, "retry", "unfinished", "retry-owner")
+    await store.append_acquisition_record(
+        retry.id,
+        0,
+        _source("durable-retry"),
+        lease_owner="retry-owner",
+        lease_generation=retry.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        retry.id,
+        "durable-retry",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="retry-owner",
+        lease_generation=retry.lease_generation,
+        now=_NOW,
+    )
+    winner = await _claimed_run(store, "winner", "unfinished", "winner-owner")
+    await store.complete_acquisition_enumeration(
+        winner.id,
+        _watermark("winner"),
+        lease_owner="winner-owner",
+        lease_generation=winner.lease_generation,
+        now=_NOW,
+    )
+    await store.commit_acquisition_watermark(
+        winner.id,
+        lease_owner="winner-owner",
+        lease_generation=winner.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_run(
+        winner.id,
+        AcquisitionRunState.ACQUIRING,
+        AcquisitionRunState.SETTLED,
+        lease_owner="winner-owner",
+        lease_generation=winner.lease_generation,
+        now=_NOW,
+    )
+    replacement = await store.claim_or_create_acquisition_run(
+        "unfinished",
+        "replacement",
+        "replacement-owner",
+        now=_NOW,
+        expires_at=_NOW + timedelta(minutes=1),
+    )
+    assert replacement is not None
+    retry = await store.get_acquisition_run(retry.id)
+    assert retry is not None
+    assert retry.superseded_at is not None
+
+    removed = await store.cleanup_acquisition_history(datetime(2100, 1, 1, tzinfo=UTC), limit=1)
+
+    assert removed == 1
+    assert await store.get_acquisition_run(settled.id) is None
+    assert await store.get_acquisition_run(retry.id) is not None
+    records = await store.list_acquisition_records(retry.id)
+    assert len(records) == 1
+    assert records[0].state is AcquisitionRecordState.RETRY
 
 
 async def test_orderly_release_is_generation_fenced_and_immediately_claimable(
@@ -1125,6 +1353,6 @@ async def test_acquired_envelope_downgrade_refuses_with_aggregate_redacted_count
         assert secret_id not in message
         assert secret_uri not in message
         assert body.decode() not in message
-        assert await current(engine) == "c41d7ea923b8"
+        assert await current(engine) == "b7e4d921ac60"
     finally:
         await engine.dispose()

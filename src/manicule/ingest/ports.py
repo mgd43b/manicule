@@ -348,6 +348,18 @@ class AcquisitionStore(Protocol):
 
     async def latest_unsettled_acquisition_run(self, connector: str) -> AcquisitionRun | None: ...
 
+    async def claim_or_create_acquisition_run(
+        self,
+        connector: str,
+        run_id: str,
+        owner: str,
+        *,
+        now: datetime,
+        expires_at: datetime,
+    ) -> AcquisitionRun | None:
+        """Claim the newest unfinished run, or create its successor, atomically."""
+        ...
+
     async def append_acquisition_record(
         self,
         run_id: str,
@@ -437,6 +449,10 @@ class AcquisitionStore(Protocol):
         lease_generation: int,
         now: datetime,
     ) -> bool: ...
+
+    async def cleanup_acquisition_history(self, cutoff: datetime, *, limit: int = 100) -> int:
+        """Discard bounded terminal history; never unfinished or retryable work."""
+        ...
 
 
 @runtime_checkable

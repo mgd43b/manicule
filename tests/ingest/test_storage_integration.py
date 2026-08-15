@@ -1101,6 +1101,77 @@ async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
     assert set(vectors.rows) == vector_ids
 
 
+async def test_enumeration_renews_its_lease_while_the_source_cursor_is_blocked(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The heartbeat is independent of source yields, so a slow page cannot age ownership."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    class ObservedJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.renewed = asyncio.Event()
+
+        @override
+        async def renew_acquisition_lease(
+            self,
+            run_id: str,
+            owner: str,
+            generation: int,
+            *,
+            now: datetime,
+            expires_at: datetime,
+        ) -> bool:
+            result = await super().renew_acquisition_lease(
+                run_id, owner, generation, now=now, expires_at=expires_at
+            )
+            self.renewed.set()
+            return result
+
+    class PausedDiscovery(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__({"public-page": "public text"}, name="slow-enumeration")
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            self.entered.set()
+            await self.release.wait()
+            async for discovered in super().discover(watermark):
+                yield discovered
+
+    store = ObservedJournal()
+    await store.ensure_workspace()
+    connector = PausedDiscovery()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=1,
+        acquisition_clock=fakes.ManualLeaseClock(),
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await connector.entered.wait()
+    await asyncio.wait_for(store.renewed.wait(), timeout=2)
+    connector.release.set()
+    report = await task
+
+    assert report.indexed == 1
+    assert report.error_type == ""
+
+
 async def test_expired_worker_is_fenced_before_publication_after_takeover(
     store: SqliteDocStore,
     engine: AsyncEngine,
