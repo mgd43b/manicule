@@ -52,6 +52,7 @@ STAGING_PARTIAL_STALE_SECONDS = 24 * 60 * 60
 STAGING_PARTIAL_CLEANUP_LIMIT = 1_000
 STAGING_MARKER_RECONCILE_LIMIT = 100
 LEGACY_MARKER_RETENTION = timedelta(days=30)
+DURABLE_LOCK_SHARDS = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,10 +299,11 @@ class BlobStore:
     async def _store_blob(self, data: bytes, media_type: str | None) -> StoredBlob:
         digest = content_hash(data)
         compression = "gzip" if should_compress(media_type) else "none"
-        stored = await self._durable_thread_call(
-            lambda: self._published_blob(self.path_for(digest), data, digest, compression)
-        )
-        await self._record_blob(stored, media_type)
+        async with self._durable_locks([f"blob:{digest}"]):
+            stored = await self._durable_thread_call(
+                lambda: self._published_blob(self.path_for(digest), data, digest, compression)
+            )
+            await self._record_blob(stored, media_type)
         return stored
 
     async def put(self, data: bytes, media_type: str | None = None) -> StoredBlob | OmittedBlob:
@@ -361,7 +363,9 @@ class BlobStore:
             "source_id": source_id if separator else None,
         }
         name = self._stage_name(key)
-        async with self._marker_locks([name]):
+        async with self._durable_locks(
+            [f"marker:{name}", f"blob:{acquired.content_hash}"]
+        ):
             await self._record_marker(name, marker, legacy=False)
             stored = await self._durable_thread_call(
                 lambda: self._published_blob(
@@ -380,7 +384,9 @@ class BlobStore:
             try:
                 await self._durable_thread_call(
                     lambda: self._write_durable(
-                        self._stage_path(key), payload, temporary_dir=self._stage_partial_root()
+                        self._stage_path(key),
+                        payload,
+                        temporary_dir=self._stage_partial_root(),
                     )
                 )
             except BaseException:
@@ -392,16 +398,28 @@ class BlobStore:
 
     @contextlib.asynccontextmanager
     async def _marker_locks(self, names: Sequence[str]) -> AsyncGenerator[None]:
-        """Cross-process per-marker locks spanning inventory and physical publication."""
-        unique_names = sorted(set(names))
+        """Cross-process marker ordering backed by a fixed-size sharded lock pool."""
+        async with self._durable_locks([f"marker:{name}" for name in names]):
+            yield
+
+    @contextlib.asynccontextmanager
+    async def _durable_locks(self, keys: Sequence[str]) -> AsyncGenerator[None]:
+        """Lock stable shards so cardinality cannot turn recovery metadata into an inode leak."""
+        shards = sorted(
+            {
+                int.from_bytes(hashlib.blake2b(key.encode(), digest_size=2).digest())
+                % DURABLE_LOCK_SHARDS
+                for key in keys
+            }
+        )
 
         def acquire() -> list[int]:
             root = self._root / "acquisition-locks"
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
             descriptors: list[int] = []
             try:
-                for name in unique_names:
-                    descriptor = os.open(root / name, os.O_CREAT | os.O_RDWR, 0o600)
+                for shard in shards:
+                    descriptor = os.open(root / f"{shard:02x}.lock", os.O_CREAT | os.O_RDWR, 0o600)
                     fcntl.flock(descriptor, fcntl.LOCK_EX)
                     descriptors.append(descriptor)
             except BaseException:
@@ -536,17 +554,7 @@ class BlobStore:
         )
         async with self._sessions.begin() as session:
             await session.execute(
-                statement.on_conflict_do_update(
-                    index_elements=[models.AcquisitionMarker.name],
-                    set_={
-                        "run_id": statement.excluded.run_id,
-                        "source_id": statement.excluded.source_id,
-                        "blob_ref": statement.excluded.blob_ref,
-                        "acquired_source": statement.excluded.acquired_source,
-                        "legacy": statement.excluded.legacy,
-                        "created_at": statement.excluded.created_at,
-                    },
-                )
+                statement.on_conflict_do_nothing(index_elements=[models.AcquisitionMarker.name])
             )
 
     async def _forget_markers(self, names: Sequence[str]) -> None:
@@ -878,18 +886,19 @@ class BlobStore:
 
     async def _delete_unreferenced_blob(self, digest: str) -> bool:
         """Delete one candidate only if every durable root is still absent atomically."""
-        statement = delete(models.Blob).where(
-            models.Blob.hash == digest,
-            ~exists().where(models.Document.original_ref == digest),
-            ~exists().where(models.DocumentVersion.original_ref == digest),
-            ~exists().where(models.AcquisitionRecord.blob_ref == digest),
-            ~exists().where(models.AcquisitionMarker.blob_ref == digest),
-        )
-        async with self._sessions.begin() as session:
-            result = await session.execute(statement)
-        if cast("Any", result).rowcount != 1:
-            return False
-        return await self._unlink_blob_if_still_unreferenced(digest)
+        async with self._durable_locks([f"blob:{digest}"]):
+            statement = delete(models.Blob).where(
+                models.Blob.hash == digest,
+                ~exists().where(models.Document.original_ref == digest),
+                ~exists().where(models.DocumentVersion.original_ref == digest),
+                ~exists().where(models.AcquisitionRecord.blob_ref == digest),
+                ~exists().where(models.AcquisitionMarker.blob_ref == digest),
+            )
+            async with self._sessions.begin() as session:
+                result = await session.execute(statement)
+            if cast("Any", result).rowcount != 1:
+                return False
+            return await self._unlink_blob_if_still_unreferenced(digest)
 
     async def _unlink_blob_if_still_unreferenced(self, digest: str) -> bool:
         """Serialize the physical unlink against roots arriving after row deletion."""
