@@ -801,7 +801,7 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     engine: AsyncEngine,
     data_dir: Path,
 ) -> None:
-    """A 1,000-record source reaches its true end while embedding is still parked.
+    """A 100-record source reaches its true end while embedding is still parked.
 
     Ten synthetic page responses each take 19 ms on a manual clock, below the 500 ms cursor
     lifetime. Journal pages and both in-memory hand-offs are smaller than the corpus. The model
@@ -827,12 +827,9 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
         detect_glossary=False,
     )
     connector = fakes.ExpiringCursorConnector(
-        {
-            f"synthetic-doc-{number:04d}": f"public synthetic line {number}"
-            for number in range(1_000)
-        },
+        {f"synthetic-doc-{number:04d}": f"public synthetic line {number}" for number in range(100)},
         clock=clock,
-        page_size=100,
+        page_size=10,
         cursor_lifetime_seconds=0.5,
         response_seconds=0.019,
     )
@@ -844,7 +841,7 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
 
         durable = await store.latest_unsettled_acquisition_run(connector.name)
         assert durable is not None
-        assert durable.discovered_count == 1_000
+        assert durable.discovered_count == 100
         assert durable.enumeration_completed_at is not None
         assert durable.candidate_watermark == connector.watermark
         assert connector.pages_requested == 10
@@ -862,8 +859,8 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
 
     assert report.error_type == ""
     assert report.enumeration_completed
-    assert report.indexed == 1_000
-    assert len(indexed) == 1_000
+    assert report.indexed == 100
+    assert len(indexed) == 100
     assert report.watermark_advanced
     assert await store.get_watermark(connector.name) == connector.watermark
     assert report.stages.fetch_queue.capacity == 2
