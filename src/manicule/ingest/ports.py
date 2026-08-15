@@ -432,6 +432,7 @@ class AcquisitionStore(Protocol):
     ) -> bool:
         """Publish diagnostics, optionally releasing, under the exact run generation."""
         ...
+
     async def transition_acquisition_run(
         self,
         run_id: str,

@@ -545,7 +545,9 @@ async def test_a_leased_run_remains_discoverable_after_its_document_disappears(
     assert deferred.deferred == 1
 
     await store.delete_document(row.id)
-    await store.release_acquisition_lease(run.id, "dead-process", claimed.lease_generation)
+    await store.release_acquisition_lease(
+        run.id, "dead-process", claimed.lease_generation, now=utcnow()
+    )
     resumed = await migrate_legacy_snapshots(store, blobs)
 
     assert (resumed.connectors, resumed.resumed, resumed.missing, resumed.promoted) == (1, 1, 0, 1)

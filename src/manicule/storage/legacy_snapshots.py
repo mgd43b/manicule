@@ -606,7 +606,7 @@ async def _migrate_connector(  # noqa: PLR0912, PLR0915 - resumable lifecycle di
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat_task
-        await store.release_acquisition_lease(run_id, owner, generation)
+        await store.release_acquisition_lease(run_id, owner, generation, now=utcnow())
 
 
 async def migrate_legacy_snapshots(
