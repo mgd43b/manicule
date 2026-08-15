@@ -1266,8 +1266,11 @@ class WorkerPool:
         Retiring without returning the permit shrinks the pool silently, and a pool that loses
         a permit per failure ends a long run blocked on an empty queue with nothing said.
         """
-        await self._retire(worker)
         async with self._lifecycle:
+            # Removal from `_live` and process termination are one lifecycle operation.
+            # Otherwise teardown can snapshot the list in between them, return with the old
+            # child still being reaped, and let setup overlap two physical generations.
+            await self._retire(worker)
             if not self._started or generation != self._generation:
                 return
             # Teardown cannot snapshot between append-to-live and permit publication.

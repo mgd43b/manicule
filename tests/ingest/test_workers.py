@@ -517,6 +517,53 @@ async def test_repeated_cancel_at_completed_checkout_handoff_restores_exact_widt
         assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
 
 
+async def test_teardown_joins_replacement_retirement_before_exact_width_restart(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removal from `_live` cannot expose an old child beyond teardown's endpoint."""
+    del manicule_environment
+    baseline = {child.pid for child in multiprocessing.active_children()}
+    pool = WorkerPool(_config(tmp_path), workers=1, timeout_s=5.0, max_documents=1)
+    await pool.setup()
+    assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+    old_pid = pool._live[0].pid  # pyright: ignore[reportPrivateUsage]
+    terminating = threading.Event()
+    release = threading.Event()
+    original = worker_module._Worker.terminate  # pyright: ignore[reportPrivateUsage]
+
+    def held_old_terminate(worker: worker_module._Worker) -> None:  # pyright: ignore[reportPrivateUsage]
+        if worker.pid == old_pid:
+            terminating.set()
+            release.wait(timeout=10)
+        original(worker)
+
+    monkeypatch.setattr(worker_module._Worker, "terminate", held_old_terminate)  # pyright: ignore[reportPrivateUsage]
+    attempt = asyncio.create_task(pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)))
+    assert await asyncio.to_thread(terminating.wait, 10)
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
+
+    stopping = asyncio.create_task(pool.teardown())
+    await asyncio.sleep(0)
+    assert not stopping.done(), "teardown must join the removed worker's retirement"
+    release.set()
+    result = await asyncio.wait_for(attempt, timeout=10)
+    assert result.attempt.outcome is Outcome.PARSED
+    await asyncio.wait_for(stopping, timeout=10)
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 0  # pyright: ignore[reportPrivateUsage]
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+    monkeypatch.setattr(worker_module._Worker, "terminate", original)  # pyright: ignore[reportPrivateUsage]
+    await pool.setup()
+    assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
+    assert len({child.pid for child in multiprocessing.active_children()} - baseline) == 1
+    await pool.teardown()
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+
 def test_the_default_worker_count_leaves_a_core_for_the_parent() -> None:
     """The parent does the embedding and every write, so it is not a spare."""
     count = default_worker_count()
