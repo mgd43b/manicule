@@ -33,8 +33,8 @@ from manicule.storage.legacy_snapshots import (
     LEGACY_SCOPE,
     LEGACY_SCOPE_PREFIX,
     LegacySnapshotMigration,
-    _run_id,
-    _scope_fingerprint,
+    legacy_scope_fingerprint,
+    legacy_snapshot_run_id,
     migrate_legacy_snapshots,
 )
 from manicule.storage.migrator import upgrade
@@ -361,14 +361,12 @@ async def test_migration_is_workspace_and_connector_isolated(
     await migrate_legacy_snapshots(second, blobs, page_size=1)
     second_run = await _legacy_run(second, "wiki")
     records = await second.list_acquisition_records(second_run.id)
+    first_records = await first.list_acquisition_records((await _legacy_run(first, "wiki")).id)
     assert len(records) == 1
+    assert len(first_records) == 1
     assert records[0].acquired_source is not None
-    assert (
-        records[0].acquired_source.content_hash
-        != (await first.list_acquisition_records((await _legacy_run(first, "wiki")).id))[
-            0
-        ].acquired_source.content_hash
-    )  # type: ignore[union-attr]
+    assert first_records[0].acquired_source is not None
+    assert records[0].acquired_source.content_hash != first_records[0].acquired_source.content_hash
 
 
 @pytest.mark.contract
@@ -522,12 +520,12 @@ async def test_a_leased_run_remains_discoverable_after_its_document_disappears(
     await store.ensure_workspace()
     blobs = BlobStore(engine, data_dir)
     row, _ = await _legacy_document(store, blobs, "leased", b"owned only after resume")
-    run_id = _run_id(store.workspace_id, "wiki")
+    run_id = legacy_snapshot_run_id(store.workspace_id, "wiki")
     run = await store.create_acquisition_run(
         run_id,
         "wiki",
         source_scope=LEGACY_SCOPE,
-        scope_fingerprint=_scope_fingerprint(store.workspace_id, "wiki"),
+        scope_fingerprint=legacy_scope_fingerprint(store.workspace_id, "wiki"),
         scope_inventory_complete=False,
         promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
     )

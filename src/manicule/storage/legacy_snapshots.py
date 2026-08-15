@@ -77,11 +77,13 @@ def _identity(prefix: str, workspace: str, connector: str) -> str:
     return f"{prefix}{hashlib.blake2b(payload, digest_size=20).hexdigest()}"
 
 
-def _scope_fingerprint(workspace: str, connector: str) -> str:
+def legacy_scope_fingerprint(workspace: str, connector: str) -> str:
+    """Return the stable partial-snapshot scope identity for a legacy connector."""
     return _identity(LEGACY_SCOPE_PREFIX, workspace, connector)
 
 
-def _run_id(workspace: str, connector: str) -> str:
+def legacy_snapshot_run_id(workspace: str, connector: str) -> str:
+    """Return the stable migration run identity for a legacy connector."""
     return _identity("legacy-snapshot-v1-", workspace, connector)
 
 
@@ -395,8 +397,8 @@ async def _migrate_connector(  # noqa: PLR0912, PLR0915 - resumable lifecycle di
     store: SqliteDocStore, blobs: BlobStore, connector: str, *, page_size: int
 ) -> LegacySnapshotMigration:
     workspace = store.workspace_id
-    run_id = _run_id(workspace, connector)
-    scope_fingerprint = _scope_fingerprint(workspace, connector)
+    run_id = legacy_snapshot_run_id(workspace, connector)
+    scope_fingerprint = legacy_scope_fingerprint(workspace, connector)
     prior = await store.get_acquisition_run(run_id)
     verification_cache: dict[str, bool] = {}
     if prior is None and not await _connector_has_uncovered_document(
