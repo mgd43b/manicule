@@ -652,8 +652,8 @@ class LlmSettings(Section):
         description="Which registered generator **component** to build. Separate from "
         "``provider`` because the two answer different questions and conflating them made "
         "the default configuration unrunnable: one implementation reaches every vendor "
-        "through a base_url, so the component is not a function of the vendor. Change this "
-        "Use ``cli`` to ask through an installed Codex or Claude command; other values select "
+        "through a base_url, so the component is not a function of the vendor. Use ``cli`` "
+        "to ask through an installed Codex or Claude command; other values select "
         "third-party generators.",
     )
     model: str = Field(default="qwen2.5:14b", min_length=1)
