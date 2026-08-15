@@ -25,28 +25,7 @@ from tests.storage_helpers import make_document
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-EXPECTED_TABLES = {
-    "api_keys",
-    "audit_logs",
-    "blobs",
-    "chunk_relations",
-    "chunks",
-    "collection_documents",
-    "collections",
-    "connectors",
-    "conversations",
-    "document_tags",
-    "document_versions",
-    "documents",
-    "index_state",
-    "messages",
-    "plugins",
-    "query_logs",
-    "tags",
-    "vector_tombstones",
-    "workspace_members",
-    "workspaces",
-}
+EXPECTED_TABLES = frozenset(models.Base.metadata.tables)
 
 
 async def test_the_migration_creates_every_table_the_models_declare(engine: AsyncEngine) -> None:

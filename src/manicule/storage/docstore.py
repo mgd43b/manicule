@@ -29,6 +29,7 @@ from manicule.core.ids import vector_id
 from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import SourceId, Watermark
 from manicule.storage import models
+from manicule.storage.acquisition import AcquisitionJournalMixin
 from manicule.storage.fts import SEARCH_SQL, escape_match_query
 from manicule.storage.glossary import GlossaryMixin
 from manicule.storage.history import TrashMixin, VersionsMixin
@@ -115,6 +116,7 @@ reached.
 
 
 class SqliteDocStore(
+    AcquisitionJournalMixin,
     CollectionsMixin,
     TagsMixin,
     VersionsMixin,

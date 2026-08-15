@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, union
 
 from manicule.core.content import Retention
 from manicule.core.ids import content_hash
@@ -205,11 +205,20 @@ class BlobStore:
             referenced_versions = select(models.DocumentVersion.original_ref).where(
                 models.DocumentVersion.original_ref.is_not(None)
             )
+            referenced_acquisitions = select(models.AcquisitionRecord.blob_ref).where(
+                models.AcquisitionRecord.blob_ref.is_not(None)
+            )
             unreferenced = (
                 (
                     await session.execute(
                         select(models.Blob.hash).where(
-                            models.Blob.hash.not_in(referenced_documents.union(referenced_versions))
+                            models.Blob.hash.not_in(
+                                union(
+                                    referenced_documents,
+                                    referenced_versions,
+                                    referenced_acquisitions,
+                                )
+                            )
                         )
                     )
                 )

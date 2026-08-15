@@ -8,6 +8,18 @@ enforced by a test rather than by convention.
 
 from __future__ import annotations
 
+from manicule.core.acquisition import (
+    UNSET,
+    AcquisitionDiagnostic,
+    AcquisitionFailureCode,
+    AcquisitionRecord,
+    AcquisitionRecordState,
+    AcquisitionRun,
+    AcquisitionRunState,
+    AcquisitionSource,
+    AcquisitionStage,
+    UnsetValue,
+)
 from manicule.core.anchors import (
     EDGE_TOLERANCE,
     Anchor,
@@ -118,6 +130,15 @@ __all__ = [
     "IN_FLIGHT",
     "NEEDS_ATTENTION",
     "SETTLED",
+    "UNSET",
+    "AcquisitionDiagnostic",
+    "AcquisitionFailureCode",
+    "AcquisitionRecord",
+    "AcquisitionRecordState",
+    "AcquisitionRun",
+    "AcquisitionRunState",
+    "AcquisitionSource",
+    "AcquisitionStage",
     "Anchor",
     "BlockKind",
     "Candidate",
@@ -202,6 +223,7 @@ __all__ = [
     "UnknownComponentError",
     "UnknownEntityError",
     "Unlocated",
+    "UnsetValue",
     "Usage",
     "Vector",
     "VectorStore",
