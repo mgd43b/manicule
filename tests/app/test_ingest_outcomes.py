@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
@@ -17,6 +18,7 @@ from manicule.app.results import Envelope
 from manicule.app.served import ControlHandler, Scheduler
 from manicule.app.service import ApplicationService
 from manicule.cli import main as cli
+from manicule.cli import proxy
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors.sessions import SessionVault
 from manicule.ingest.pipeline import RunReport
@@ -25,6 +27,7 @@ from tests.api.support import client_for
 from tests.app.fakes import FakeBackend, FakeStore
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 
@@ -45,6 +48,7 @@ def _incomplete() -> RunReport:
         error="CursorExpiredError: the search cursor expired",
         error_type="CursorExpiredError",
         error_message="the search cursor expired",
+        enumeration_completed=False,
     )
 
 
@@ -150,6 +154,46 @@ async def test_control_socket_preserves_partial_failure_data(tmp_path: Path) -> 
     assert envelope["ok"] is False
     assert data["outcome"] == "incomplete"
     assert data["discovered"] == 200
+
+
+def test_json_cli_exits_nonzero_for_an_incomplete_result_from_the_running_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _ = _service(_incomplete())
+    path = control.socket_path(tmp_path)
+    server = control.ControlServer(path, ControlHandler(service, SessionVault()))
+
+    def listening(overrides: Mapping[str, Any]) -> Path:
+        del overrides
+        return path
+
+    monkeypatch.setattr(proxy, "listening", listening)
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def serve() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(server.start())
+        ready.set()
+        loop.run_forever()
+        loop.run_until_complete(server.aclose())
+        loop.close()
+
+    thread = threading.Thread(target=serve, name="incomplete-control-server")
+    thread.start()
+    try:
+        assert ready.wait(timeout=5), "the control server did not start"
+        result = CliRunner().invoke(cli.app, ["--json", "connector", "sync", "synthetic-wiki"])
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "the control server did not stop"
+
+    assert result.exit_code == 1
+    envelope = cast("dict[str, Any]", json.loads(result.stdout))
+    assert envelope["ok"] is False
+    assert cast("dict[str, Any]", envelope["data"])["outcome"] == "incomplete"
+    assert cast("dict[str, Any]", envelope["error"])["type"] == "CursorExpiredError"
 
 
 def test_http_and_mcp_report_the_same_incomplete_outcome() -> None:

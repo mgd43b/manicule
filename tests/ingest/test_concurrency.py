@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
 
+from manicule.connectors import CursorExpiredError
 from manicule.core.content import Chunk, Document, DocumentStatus, RawDocument
 from manicule.core.ids import content_hash
 from manicule.ingest.middleware import MiddlewareRunner
@@ -554,7 +555,7 @@ class _Positioned(fakes.ObservedConnector):
         async for found in super().discover(watermark):
             if self.fail_after is not None and emitted >= self.fail_after:
                 msg = "the search cursor expired"
-                raise RuntimeError(msg)
+                raise CursorExpiredError(msg)
             emitted += 1
             yield found
 
@@ -594,7 +595,7 @@ async def test_a_partial_discovery_does_not_advance_the_watermark() -> None:
     assert recorded["outcome"] == "incomplete"
     assert recorded["enumeration_completed"] is False
     assert recorded["retry_required"] is True
-    assert recorded["error_type"] == "RuntimeError"
+    assert recorded["error_type"] == "CursorExpiredError"
     assert store.watermarks == {}, "a run that did not finish enumerating has no position to save"
 
 

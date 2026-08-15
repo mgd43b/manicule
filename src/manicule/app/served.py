@@ -395,6 +395,10 @@ class Scheduler:
                 record.failures += 1
                 announce(f"scheduled sync of {name!r} failed: {exc}")
             else:
+                # A returned report proves this source got past session acquisition. Keeping a
+                # prior missing-session flag raised would send the operator to sign in for a
+                # later cursor or store failure that needs a retry instead.
+                record.awaiting_sign_in = False
                 record.last_outcome = report.outcome
                 record.retry_required = report.retry_required
                 record.last_error_type = (
@@ -414,7 +418,6 @@ class Scheduler:
                     )
                 else:
                     record.runs += 1
-                    record.awaiting_sign_in = False
 
 
 def announce(message: str) -> None:

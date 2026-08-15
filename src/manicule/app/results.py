@@ -77,6 +77,33 @@ class Envelope(BaseModel):
     data: dict[str, JsonValue] | None = None
     error: ErrorInfo | None = None
 
+    @model_validator(mode="after")
+    def one_outcome_shape(self) -> Self:
+        """Hold the data/error invariant at every constructor, not only in the helpers."""
+        if self.ok:
+            if self.data is None or self.error is not None:
+                msg = "a successful envelope requires data and forbids error"
+                raise ValueError(msg)
+            return self
+        if self.error is None:
+            msg = "a failed envelope requires error"
+            raise ValueError(msg)
+        if self.data is None:
+            return self
+        partial = IngestReport.model_validate(self.data)
+        if (
+            self.op not in {"index_path", "connector_sync", "import"}
+            or partial.outcome != "incomplete"
+            or not partial.retry_required
+            or partial.incomplete_reason != self.error
+        ):
+            msg = (
+                "a failed envelope may retain data only for a retry-required incomplete "
+                "IngestReport whose reason matches error"
+            )
+            raise ValueError(msg)
+        return self
+
     def as_json(self) -> dict[str, Any]:
         """The envelope as plain JSON-safe data.
 
@@ -94,7 +121,7 @@ def succeeded(op: str, workspace: str, payload: Payload) -> Envelope:
 
 
 def failed(
-    op: str, workspace: str, error: ErrorInfo, *, payload: Payload | None = None
+    op: str, workspace: str, error: ErrorInfo, *, payload: IngestReport | None = None
 ) -> Envelope:
     """Wrap a failure, retaining a partial result when the operation produced one."""
     return Envelope(

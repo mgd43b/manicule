@@ -291,6 +291,42 @@ async def test_the_source_waiting_to_be_signed_in_to_is_a_state_and_not_only_a_l
     capsys.readouterr()
 
 
+async def test_a_returned_incomplete_run_clears_a_prior_missing_session_state(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Reaching the pipeline proves authentication succeeded, whatever stopped the run later."""
+    from manicule.ingest.pipeline import RunReport  # noqa: PLC0415
+
+    service, ingestion = service_with({"handbook": source(schedule_s=600)})
+    ingestion.failure = SessionMissingError("no Confluence browser session is held")
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        assert scheduler.scheduled["handbook"].awaiting_sign_in is True
+
+        ingestion.failure = None
+        ingestion.report = RunReport(
+            connector="handbook",
+            error="CursorExpiredError: the search cursor expired",
+            error_type="CursorExpiredError",
+            error_message="the search cursor expired",
+            enumeration_completed=False,
+        )
+        await clock.tick()
+        record = scheduler.scheduled["handbook"]
+        assert record.awaiting_sign_in is False
+        assert record.last_outcome == "incomplete"
+        assert record.failures == 2
+        assert record.runs == 0
+    finally:
+        await scheduler.aclose()
+    capsys.readouterr()
+
+
 async def test_an_unreachable_instance_is_not_reported_as_a_missing_session(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

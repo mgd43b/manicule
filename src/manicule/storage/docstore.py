@@ -909,7 +909,17 @@ class SqliteDocStore(
             row = await self._connector_row(session, connector)
             if row is None:
                 return {}
-            return dict(cast("Any", row.run_metadata) or {})
+            metadata = dict(cast("Any", row.run_metadata) or {})
+            metadata.update(
+                {
+                    "last_synced_at": (
+                        row.last_synced_at.isoformat() if row.last_synced_at is not None else None
+                    ),
+                    "status": row.status,
+                    "error_message": row.error_message or "",
+                }
+            )
+            return metadata
 
     async def record_connector_metadata(self, connector: str, updates: Mapping[str, Any]) -> None:
         """Merge keys into a connector's metadata, dropping any set to ``None``.
