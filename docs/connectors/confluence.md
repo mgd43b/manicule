@@ -765,6 +765,15 @@ failure falls back: a 429 or a rejected credential answered by trying a second e
 double the load on a source that has just said stop, and report the wrong problem when it
 failed again.
 
+**A storage-format body may be explicitly empty, but it may not be absent.** Server and Data
+Center can legitimately return `body.storage.value: ""` for an empty page, and that indexes as
+an empty document. A successful response with no `body.storage.value`, a null value or a
+non-string value says nothing about the page's content; treating any of those as the empty string
+would erase an indexed revision while advancing its version token. They therefore fail as
+`BodyUnavailableError`, just as a missing Cloud representation does. A first fetch leaves no
+document or watermark behind, while a failed refresh preserves the last indexed revision so the
+source can be retried without publishing guessed content.
+
 **Known Cloud bugs to guard against:** batch page-version endpoints have returned 500 with
 ADF requested (CONFCLOUD-80964), and there are reports of ADF returning stale page
 content. Validate that the returned `version.number` matches what discovery reported; if

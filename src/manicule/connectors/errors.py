@@ -78,12 +78,13 @@ class CursorExpiredError(ConnectorError):
 
 
 class BodyUnavailableError(ConnectorError):
-    """The page exists but did not come back in the body format that was asked for.
+    """The page exists but has no usable value in the body format that was asked for.
 
-    Narrower than :class:`ConnectorError` on purpose, because it is the one failure the caller
-    answers by asking for a different format. Falling back on *any* error would retry through a
-    second endpoint after a 429 or a rejected credential, doubling the load on a source that
-    has just said stop and hiding which of the two problems it was.
+    Narrower than :class:`ConnectorError` on purpose. Cloud answers an unavailable ADF body by
+    asking for storage format; an unavailable storage body has no alternative and fails closed.
+    Falling back on *any* error would retry through a second endpoint after a 429 or a rejected
+    credential, doubling the load on a source that has just said stop and hiding which of the two
+    problems it was.
     """
 
 
