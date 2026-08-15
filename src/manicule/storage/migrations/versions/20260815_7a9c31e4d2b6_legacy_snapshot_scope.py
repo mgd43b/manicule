@@ -40,9 +40,7 @@ def downgrade() -> None:
     incomplete = (
         op.get_bind()
         .execute(
-            sa.text(
-                "SELECT COUNT(*) FROM acquisition_runs WHERE scope_inventory_complete = 0"
-            )
+            sa.text("SELECT COUNT(*) FROM acquisition_runs WHERE scope_inventory_complete = 0")
         )
         .scalar_one()
     )
@@ -54,7 +52,5 @@ def downgrade() -> None:
         )
         raise RuntimeError(msg)
     with op.batch_alter_table("acquisition_runs") as batch:
-        batch.drop_constraint(
-            "committed_watermark_has_complete_scope_inventory", type_="check"
-        )
+        batch.drop_constraint("committed_watermark_has_complete_scope_inventory", type_="check")
         batch.drop_column("scope_inventory_complete")

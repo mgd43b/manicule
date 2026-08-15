@@ -1294,8 +1294,13 @@ class BlobStore:
         path = self.path_for(digest)
         if not path.exists():
             return None
+        return await asyncio.to_thread(self._read_blob, path, row.compression)
+
+    @staticmethod
+    def _read_blob(path: Path, compression: str) -> bytes:
+        """Keep filesystem latency and decompression CPU off the acquisition event loop."""
         raw = path.read_bytes()
-        return gzip.decompress(raw) if row.compression == "gzip" else raw
+        return gzip.decompress(raw) if compression == "gzip" else raw
 
     async def verify(self, digest: str) -> bool:
         """Whether the stored bytes still hash to their own name."""

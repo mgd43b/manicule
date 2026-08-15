@@ -474,10 +474,16 @@ class Runtime:
             )
 
             if isinstance(store, SqliteDocStore):
-                await migrate_legacy_snapshots(
+                migrated = await migrate_legacy_snapshots(
                     store,
                     BlobStore(engine, self._settings.data_dir),
                 )
+                if migrated.deferred:
+                    msg = (
+                        "legacy retained-source ownership is still leased by another process; "
+                        "writer startup refused"
+                    )
+                    raise RuntimeError(msg)
             return
         if not self._migrated:
             if await self._storage_needs_initializing(engine):

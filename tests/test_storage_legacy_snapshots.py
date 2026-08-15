@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from manicule.core.acquisition import (
     AcquiredSource,
@@ -18,6 +20,7 @@ from manicule.core.acquisition import (
     AcquisitionSource,
     SnapshotCompleteness,
     SnapshotItemOutcome,
+    SnapshotPromotionPolicy,
 )
 from manicule.core.content import DocumentStatus
 from manicule.core.sources import DocRef
@@ -27,7 +30,11 @@ from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.engine import create_engine
 from manicule.storage.legacy_snapshots import (
     LEASE_DURATION,
+    LEGACY_SCOPE,
     LEGACY_SCOPE_PREFIX,
+    LegacySnapshotMigration,
+    _run_id,
+    _scope_fingerprint,
     migrate_legacy_snapshots,
 )
 from manicule.storage.migrator import upgrade
@@ -35,8 +42,6 @@ from manicule.storage.types import utcnow
 from tests.storage_helpers import make_document
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 
@@ -47,6 +52,7 @@ async def _legacy_document(
     body: bytes,
     *,
     source: str = "wiki",
+    version_token: str | None = None,
 ) -> tuple[models.Document, StoredBlob]:
     retained = await blobs.put(body, "text/markdown")
     assert isinstance(retained, StoredBlob)
@@ -55,7 +61,7 @@ async def _legacy_document(
     ).model_copy(
         update={
             "original_ref": retained.hash,
-            "version_token": f"version-{source_id}",
+            "version_token": version_token or f"version-{source_id}",
             "metadata": {
                 "citation": "synthetic",
                 "_source": {
@@ -69,9 +75,7 @@ async def _legacy_document(
     await store.upsert_document(document)
     async with store.sessions() as session:
         row = (
-            await session.execute(
-                select(models.Document).where(models.Document.id == document.id)
-            )
+            await session.execute(select(models.Document).where(models.Document.id == document.id))
         ).scalar_one()
     return row, retained
 
@@ -90,6 +94,78 @@ async def _legacy_run(store: SqliteDocStore, connector: str) -> AcquisitionRun:
     run = await store.get_acquisition_run(run_id)
     assert run is not None
     return run
+
+
+async def _promote_current_document(
+    store: SqliteDocStore, row: models.Document, retained: StoredBlob, *, run_id: str
+) -> None:
+    created = await store.create_acquisition_run(run_id, row.source, scope_fingerprint="all")
+    now = utcnow()
+    claimed = await store.claim_acquisition_run(
+        created.id, "worker", now=now, expires_at=now + LEASE_DURATION
+    )
+    assert claimed is not None
+    await store.append_acquisition_record(
+        claimed.id,
+        0,
+        AcquisitionSource(
+            ref=DocRef(source_id=row.source_id, uri=row.uri),
+            version_token=row.version_token,
+            media_type=row.media_type,
+        ),
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=utcnow(),
+    )
+    await store.complete_acquisition_enumeration(
+        claimed.id,
+        None,
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=utcnow(),
+    )
+    await store.transition_acquisition_record(
+        claimed.id,
+        row.source_id,
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=utcnow(),
+    )
+    await store.transition_acquisition_record(
+        claimed.id,
+        row.source_id,
+        AcquisitionRecordState.ACQUIRING,
+        AcquisitionRecordState.ACQUIRED,
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=utcnow(),
+        blob_ref=retained.hash,
+        acquired_source=AcquiredSource(
+            source_id=row.source_id,
+            uri=row.uri,
+            media_type=row.media_type,
+            encoding="utf-8",
+            text_content=False,
+            content_hash=retained.hash,
+            byte_length=retained.size_bytes,
+        ),
+        fetched_version_token=row.version_token,
+    )
+    await store.complete_snapshot_acquisition(
+        claimed.id,
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=utcnow(),
+    )
+    await store.promote_snapshot_and_commit_watermark(
+        claimed.id,
+        expected_scope_fingerprint="all",
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=utcnow(),
+    )
 
 
 @pytest.mark.contract
@@ -140,17 +216,11 @@ async def test_retained_missing_and_corrupt_originals_migrate_without_changing_p
 
     async with store.sessions() as session:
         rows = (
-            (
-                await session.execute(
-                    select(models.Document).where(models.Document.id.in_(before))
-                )
-            )
+            (await session.execute(select(models.Document).where(models.Document.id.in_(before))))
             .scalars()
             .all()
         )
-    assert {
-        row.id: (row.publication_id, row.status, row.content_hash) for row in rows
-    } == before
+    assert {row.id: (row.publication_id, row.status, row.content_hash) for row in rows} == before
     assert all(row.status is DocumentStatus.INDEXED for row in rows)
 
     # Snapshot ownership, not the derived publication, now keeps the healthy original alive.
@@ -264,19 +334,27 @@ async def test_migration_is_workspace_and_connector_isolated(
     assert (migrated.connectors, migrated.promoted) == (2, 2)
     async with first.sessions() as session:
         first_runs = (
-            await session.execute(
-                select(models.AcquisitionRun).where(
-                    models.AcquisitionRun.workspace_id == "first"
+            (
+                await session.execute(
+                    select(models.AcquisitionRun).where(
+                        models.AcquisitionRun.workspace_id == "first"
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         second_runs = (
-            await session.execute(
-                select(models.AcquisitionRun).where(
-                    models.AcquisitionRun.workspace_id == "second"
+            (
+                await session.execute(
+                    select(models.AcquisitionRun).where(
+                        models.AcquisitionRun.workspace_id == "second"
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert {run.connector_name for run in first_runs} == {"wiki", "drive"}
     assert second_runs == []
 
@@ -285,9 +363,12 @@ async def test_migration_is_workspace_and_connector_isolated(
     records = await second.list_acquisition_records(second_run.id)
     assert len(records) == 1
     assert records[0].acquired_source is not None
-    assert records[0].acquired_source.content_hash != (
-        await first.list_acquisition_records((await _legacy_run(first, "wiki")).id)
-    )[0].acquired_source.content_hash  # type: ignore[union-attr]
+    assert (
+        records[0].acquired_source.content_hash
+        != (await first.list_acquisition_records((await _legacy_run(first, "wiki")).id))[
+            0
+        ].acquired_source.content_hash
+    )  # type: ignore[union-attr]
 
 
 @pytest.mark.contract
@@ -377,6 +458,139 @@ async def test_a_real_promoted_inventory_is_not_shadowed_by_a_legacy_manifest(
             )
         ).scalar_one()
     assert legacy == 0
+
+
+@pytest.mark.contract
+async def test_an_old_promoted_version_does_not_cover_the_current_retained_original(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    blobs = BlobStore(engine, data_dir)
+    old_row, old_blob = await _legacy_document(store, blobs, "changed", b"old bytes")
+    await _promote_current_document(store, old_row, old_blob, run_id="old-real-run")
+
+    current_row, current_blob = await _legacy_document(
+        store,
+        blobs,
+        "changed",
+        b"new bytes",
+        version_token="version-changed-new",  # noqa: S106 - source revision, not a credential
+    )
+    assert current_blob.hash != old_blob.hash
+    migrated = await migrate_legacy_snapshots(store, blobs)
+
+    assert (migrated.retained, migrated.promoted) == (1, 1)
+    records = await store.list_acquisition_records((await _legacy_run(store, "wiki")).id)
+    assert len(records) == 1
+    assert records[0].blob_ref == current_blob.hash
+    assert records[0].fetched_version_token == current_row.version_token
+
+
+@pytest.mark.contract
+async def test_retained_documents_attach_ownership_to_a_connector_tombstone(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    blobs = BlobStore(engine, data_dir)
+    await _legacy_document(store, blobs, "survivor", b"survives connector deletion")
+    seed = await store.create_acquisition_run("pre-delete-run", "wiki")
+    async with store.sessions.begin() as session:
+        await session.execute(
+            update(models.Connector)
+            .where(models.Connector.id == seed.connector_id)
+            .values(deleted_at=utcnow())
+        )
+
+    migrated = await migrate_legacy_snapshots(store, blobs)
+
+    assert (migrated.retained, migrated.promoted) == (1, 1)
+    run = await _legacy_run(store, "wiki")
+    assert run.connector_id == seed.connector_id
+    async with store.sessions() as session:
+        tombstone = await session.get(models.Connector, seed.connector_id)
+    assert tombstone is not None
+    assert tombstone.deleted_at is not None
+
+
+@pytest.mark.contract
+async def test_a_leased_run_remains_discoverable_after_its_document_disappears(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    blobs = BlobStore(engine, data_dir)
+    row, _ = await _legacy_document(store, blobs, "leased", b"owned only after resume")
+    run_id = _run_id(store.workspace_id, "wiki")
+    run = await store.create_acquisition_run(
+        run_id,
+        "wiki",
+        source_scope=LEGACY_SCOPE,
+        scope_fingerprint=_scope_fingerprint(store.workspace_id, "wiki"),
+        scope_inventory_complete=False,
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+    now = utcnow()
+    claimed = await store.claim_acquisition_run(
+        run.id, "dead-process", now=now, expires_at=now + timedelta(minutes=5)
+    )
+    assert claimed is not None
+    deferred = await migrate_legacy_snapshots(store, blobs)
+    assert deferred.deferred == 1
+
+    await store.delete_document(row.id)
+    await store.release_acquisition_lease(run.id, "dead-process", claimed.lease_generation)
+    resumed = await migrate_legacy_snapshots(store, blobs)
+
+    assert (resumed.connectors, resumed.resumed, resumed.missing, resumed.promoted) == (1, 1, 0, 1)
+    settled = await store.get_acquisition_run(run.id)
+    assert settled is not None
+    assert settled.state is AcquisitionRunState.SETTLED
+
+
+async def test_writer_runtime_refuses_to_serve_while_legacy_ownership_is_deferred(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.app.runtime import Runtime  # noqa: PLC0415 - exercises startup boundary
+    from manicule.storage import legacy_snapshots  # noqa: PLC0415
+
+    async def deferred(*args: object, **kwargs: object) -> LegacySnapshotMigration:
+        del args, kwargs
+        return LegacySnapshotMigration(deferred=1)
+
+    monkeypatch.setattr(legacy_snapshots, "migrate_legacy_snapshots", deferred)
+    async with Runtime.open(data_dir=data_dir) as runtime:
+        with pytest.raises(RuntimeError, match="writer startup refused"):
+            await runtime.documents()
+
+
+@pytest.mark.contract
+async def test_slow_validation_is_kept_alive_by_an_independent_lease_heartbeat(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from manicule.storage import legacy_snapshots  # noqa: PLC0415
+
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    blobs = BlobStore(engine, data_dir)
+    _, retained = await _legacy_document(store, blobs, "slow", b"slow but still owned")
+    target = blobs.path_for(retained.hash)
+    read_bytes = Path.read_bytes
+
+    def blocking_read(path: Path) -> bytes:
+        if path == target:
+            time.sleep(0.12)
+        return read_bytes(path)
+
+    monkeypatch.setattr(legacy_snapshots, "LEASE_DURATION", timedelta(milliseconds=60))
+    monkeypatch.setattr(Path, "read_bytes", blocking_read)
+    migrated = await migrate_legacy_snapshots(store, blobs)
+
+    assert (migrated.retained, migrated.promoted, migrated.deferred) == (1, 1, 0)
+    assert await store.verify_snapshot_manifest((await _legacy_run(store, "wiki")).id)
 
 
 @pytest.mark.contract

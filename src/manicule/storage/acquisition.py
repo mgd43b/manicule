@@ -402,6 +402,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         scope_fingerprint: str = "",
         scope_inventory_complete: bool = True,
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
+        _allow_connector_tombstone: bool = False,
     ) -> AcquisitionRun:
         """Create an immutable run identity, idempotently for the same connector."""
         if not run_id or not connector:
@@ -441,7 +442,9 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     )
                 return _run(existing)
             self._require_disk_headroom(requested_bytes=1)
-            connector_row = await self._ensure_connector(session, connector)
+            connector_row = await self._ensure_connector(
+                session, connector, allow_tombstone=_allow_connector_tombstone
+            )
             statement = (
                 sqlite_insert(models.AcquisitionRun)
                 .values(
@@ -2004,7 +2007,9 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             msg = f"acquisition run {fence.run_id!r} lease changed or expired"
             raise AcquisitionLeaseLostError(msg)
 
-    async def _ensure_connector(self, session: AsyncSession, connector: str) -> models.Connector:
+    async def _ensure_connector(
+        self, session: AsyncSession, connector: str, *, allow_tombstone: bool = False
+    ) -> models.Connector:
         row = (
             await session.execute(
                 select(models.Connector).where(
@@ -2014,6 +2019,17 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 )
             )
         ).scalar_one_or_none()
+        if row is None and allow_tombstone:
+            # Pre-journal documents deliberately outlive connector deletion.  The one-time
+            # ownership migration may attach its immutable, non-watermark-bearing run to that
+            # tombstone, but must never reactivate it or manufacture a colliding connector id.
+            tombstone = await session.get(models.Connector, f"{self._workspace_id}:{connector}")
+            if (
+                tombstone is not None
+                and tombstone.workspace_id == self._workspace_id
+                and tombstone.name == connector
+            ):
+                row = tombstone
         if row is None:
             row = models.Connector(
                 id=f"{self._workspace_id}:{connector}",

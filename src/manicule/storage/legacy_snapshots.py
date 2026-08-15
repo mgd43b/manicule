@@ -8,14 +8,16 @@ published-document inventory, not a complete enumeration of the remote source sc
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import exists, select, union
 from sqlalchemy.sql.elements import ColumnElement
 
 from manicule.core.acquisition import (
@@ -27,6 +29,7 @@ from manicule.core.acquisition import (
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
+    SnapshotItemOutcome,
     SnapshotPromotionPolicy,
 )
 from manicule.core.content import Metadata
@@ -99,19 +102,90 @@ async def _document_page(
             models.Document.source == connector,
             models.Document.deleted_at.is_(None),
             models.Document.original_ref.is_not(None),
-            ~_covered_by_promoted_manifest(),
         )
         if after_source_id is not None:
             statement = statement.where(models.Document.source_id > after_source_id)
         return (
+            (await session.execute(statement.order_by(models.Document.source_id).limit(page_size)))
+            .scalars()
+            .all()
+        )
+
+
+async def _covered_by_verified_promoted_manifest(
+    store: SqliteDocStore,
+    row: models.Document,
+    verification_cache: dict[str, bool],
+) -> bool:
+    """Require exact current evidence in a still-canonical promoted manifest."""
+    async with store.sessions() as session:
+        run_ids = (
             (
                 await session.execute(
-                    statement.order_by(models.Document.source_id).limit(page_size)
+                    select(models.AcquisitionRun.id)
+                    .join(
+                        models.AcquisitionRecord,
+                        models.AcquisitionRecord.run_id == models.AcquisitionRun.id,
+                    )
+                    .where(
+                        models.AcquisitionRun.workspace_id == row.workspace_id,
+                        models.AcquisitionRun.connector_name == row.source,
+                        models.AcquisitionRun.promoted_at.is_not(None),
+                        models.AcquisitionRun.acquisition_completed_at.is_not(None),
+                        models.AcquisitionRun.membership_hash.is_not(None),
+                        models.AcquisitionRecord.source_id == row.source_id,
+                        models.AcquisitionRecord.blob_ref == row.original_ref,
+                        models.AcquisitionRecord.fetched_version_token.is_not_distinct_from(
+                            row.version_token
+                        ),
+                        models.AcquisitionRecord.snapshot_outcome.in_(
+                            (
+                                SnapshotItemOutcome.RETAINED,
+                                SnapshotItemOutcome.REUSED,
+                            )
+                        ),
+                        models.AcquisitionRecord.source_record["ref"]["source_id"].as_string()
+                        == row.source_id,
+                        models.AcquisitionRecord.source_record["version_token"]
+                        .as_string()
+                        .is_not_distinct_from(row.version_token),
+                        models.AcquisitionRecord.acquired_source["source_id"].as_string()
+                        == row.source_id,
+                        models.AcquisitionRecord.acquired_source["uri"].as_string() == row.uri,
+                        models.AcquisitionRecord.acquired_source["media_type"].as_string()
+                        == row.media_type,
+                        models.AcquisitionRecord.acquired_source["content_hash"].as_string()
+                        == row.original_ref,
+                    )
                 )
             )
             .scalars()
             .all()
         )
+    for run_id in run_ids:
+        verified = verification_cache.get(run_id)
+        if verified is None:
+            verified = await store.verify_snapshot_manifest(run_id)
+            verification_cache[run_id] = verified
+        if verified:
+            return True
+    return False
+
+
+async def _connector_has_uncovered_document(
+    store: SqliteDocStore, connector: str, verification_cache: dict[str, bool]
+) -> bool:
+    after: str | None = None
+    while True:
+        rows = await _document_page(
+            store, connector, after_source_id=after, page_size=DEFAULT_PAGE_SIZE
+        )
+        if not rows:
+            return False
+        for row in rows:
+            after = row.source_id
+            if not await _covered_by_verified_promoted_manifest(store, row, verification_cache):
+                return True
 
 
 async def _document(
@@ -317,13 +391,18 @@ async def _settle_records(
             after = record.sequence
 
 
-async def _migrate_connector(  # noqa: PLR0912 - resumable lifecycle dispatch
+async def _migrate_connector(  # noqa: PLR0912, PLR0915 - resumable lifecycle dispatch
     store: SqliteDocStore, blobs: BlobStore, connector: str, *, page_size: int
 ) -> LegacySnapshotMigration:
     workspace = store.workspace_id
     run_id = _run_id(workspace, connector)
     scope_fingerprint = _scope_fingerprint(workspace, connector)
     prior = await store.get_acquisition_run(run_id)
+    verification_cache: dict[str, bool] = {}
+    if prior is None and not await _connector_has_uncovered_document(
+        store, connector, verification_cache
+    ):
+        return LegacySnapshotMigration()
     run = await store.create_acquisition_run(
         run_id,
         connector,
@@ -331,6 +410,7 @@ async def _migrate_connector(  # noqa: PLR0912 - resumable lifecycle dispatch
         scope_fingerprint=scope_fingerprint,
         scope_inventory_complete=False,
         promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+        _allow_connector_tombstone=True,
     )
     if run.state is AcquisitionRunState.SETTLED:
         return LegacySnapshotMigration(connectors=1, resumed=int(prior is not None))
@@ -343,6 +423,38 @@ async def _migrate_connector(  # noqa: PLR0912 - resumable lifecycle dispatch
         return LegacySnapshotMigration(connectors=1, deferred=1)
     generation = claimed.lease_generation
     result = LegacySnapshotMigration(connectors=1, resumed=int(prior is not None))
+    work = asyncio.current_task()
+    if work is None:  # pragma: no cover - every awaited coroutine has an owning task
+        msg = "legacy snapshot migration requires an owning task"
+        raise RuntimeError(msg)
+    lease_lost = asyncio.Event()
+
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(LEASE_DURATION.total_seconds() / 3)
+            heartbeat_at = utcnow()
+            try:
+                renewed = await store.renew_acquisition_lease(
+                    run_id,
+                    owner,
+                    generation,
+                    now=heartbeat_at,
+                    expires_at=heartbeat_at + LEASE_DURATION,
+                )
+            except Exception:
+                lease_lost.set()
+                work.cancel()
+                raise
+            if renewed:
+                continue
+            current = await store.get_acquisition_run(run_id)
+            if current is not None and current.state is AcquisitionRunState.SETTLED:
+                return
+            lease_lost.set()
+            work.cancel()
+            return
+
+    heartbeat_task = asyncio.create_task(heartbeat(), name=f"{run_id}-lease-heartbeat")
     try:
         if claimed.state is AcquisitionRunState.ENUMERATING:
             # First finish any record whose journal append committed before cancellation.
@@ -391,6 +503,9 @@ async def _migrate_connector(  # noqa: PLR0912 - resumable lifecycle dispatch
                 if not rows:
                     break
                 for row in rows:
+                    after = row.source_id
+                    if await _covered_by_verified_promoted_manifest(store, row, verification_cache):
+                        continue
                     source = _source(row, None)
                     record = await store.append_acquisition_record(
                         run_id,
@@ -412,14 +527,17 @@ async def _migrate_connector(  # noqa: PLR0912 - resumable lifecycle dispatch
                         )
                     )
                     sequence += 1
-                    after = row.source_id
-                await store.renew_acquisition_lease(
+                renewed = await store.renew_acquisition_lease(
                     run_id,
                     owner,
                     generation,
                     now=utcnow(),
                     expires_at=utcnow() + LEASE_DURATION,
                 )
+                if not renewed:
+                    lease_lost.set()
+                    msg = f"legacy snapshot migration lost lease for run {run_id!r}"
+                    raise RuntimeError(msg)
             claimed = await store.complete_acquisition_enumeration(
                 run_id,
                 None,
@@ -472,8 +590,16 @@ async def _migrate_connector(  # noqa: PLR0912 - resumable lifecycle dispatch
                 now=utcnow(),
                 diagnostic=_diagnostic(AcquisitionFailureCode.LEGACY_UNVERIFIED),
             )
-        return result
+        return result  # noqa: TRY300 - cancellation distinguishes a lost lease below
+    except asyncio.CancelledError:
+        if lease_lost.is_set():
+            msg = f"legacy snapshot migration lost lease for run {run_id!r}"
+            raise RuntimeError(msg) from None
+        raise
     finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
         await store.release_acquisition_lease(run_id, owner, generation)
 
 
@@ -492,24 +618,23 @@ async def migrate_legacy_snapshots(
     while True:
         async with store.sessions() as session:
             legacy = _legacy_manifest_exists(settled=None)
-            resumable = _legacy_manifest_exists(settled=False)
-            statement = (
-                select(models.Document.source)
-                .where(
+            candidates = union(
+                select(models.Document.source.label("source")).where(
                     models.Document.workspace_id == store.workspace_id,
                     models.Document.deleted_at.is_(None),
                     models.Document.original_ref.is_not(None),
-                    or_(
-                        and_(~_covered_by_promoted_manifest(), ~legacy),
-                        resumable,
-                    ),
-                )
-                .distinct()
-                .order_by(models.Document.source)
-                .limit(page_size)
-            )
+                    ~legacy,
+                ),
+                select(models.AcquisitionRun.connector_name.label("source")).where(
+                    models.AcquisitionRun.workspace_id == store.workspace_id,
+                    models.AcquisitionRun.source_scope == LEGACY_SCOPE,
+                    models.AcquisitionRun.scope_inventory_complete.is_(False),
+                    models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                ),
+            ).subquery()
+            statement = select(candidates.c.source).order_by(candidates.c.source).limit(page_size)
             if after is not None:
-                statement = statement.where(models.Document.source > after)
+                statement = statement.where(candidates.c.source > after)
             sources = (await session.execute(statement)).scalars().all()
         if not sources:
             return result
@@ -518,25 +643,6 @@ async def migrate_legacy_snapshots(
                 await _migrate_connector(store, blobs, connector, page_size=page_size)
             )
             after = connector
-
-
-def _covered_by_promoted_manifest() -> ColumnElement[bool]:
-    """Whether this correlated document already has immutable promoted byte ownership."""
-    return exists(
-        select(models.AcquisitionRecord.id)
-        .join(
-            models.AcquisitionRun,
-            models.AcquisitionRun.id == models.AcquisitionRecord.run_id,
-        )
-        .where(
-            models.AcquisitionRun.workspace_id == models.Document.workspace_id,
-            models.AcquisitionRun.connector_name == models.Document.source,
-            models.AcquisitionRun.promoted_at.is_not(None),
-            models.AcquisitionRecord.source_id == models.Document.source_id,
-            models.AcquisitionRecord.blob_ref.is_not(None),
-            models.AcquisitionRecord.acquired_source.is_not(None),
-        )
-    )
 
 
 def _legacy_manifest_exists(*, settled: bool | None) -> ColumnElement[bool]:
