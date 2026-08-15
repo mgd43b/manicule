@@ -383,6 +383,15 @@ class AcquisitionStore(Protocol):
         expires_at: datetime,
     ) -> bool: ...
 
+    async def release_acquisition_lease(
+        self,
+        run_id: str,
+        owner: str,
+        generation: int,
+        *,
+        now: datetime,
+    ) -> bool: ...
+
     async def transition_acquisition_run(
         self,
         run_id: str,

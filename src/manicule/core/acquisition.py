@@ -58,6 +58,8 @@ class AcquisitionFailureCode(StrEnum):
     CURSOR_EXPIRED = "cursor_expired"
     FETCH_FAILED = "fetch_failed"
     MISSING_BODY = "missing_body"
+    SNAPSHOT_MISSING = "snapshot_missing"
+    SNAPSHOT_CORRUPT = "snapshot_corrupt"
     SOURCE_DELETED = "source_deleted"
     STALE_BODY = "stale_body"
     PARSE_FAILED = "parse_failed"

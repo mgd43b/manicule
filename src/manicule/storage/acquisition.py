@@ -386,6 +386,33 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             )
             return result.rowcount == 1
 
+    async def release_acquisition_lease(
+        self,
+        run_id: str,
+        owner: str,
+        generation: int,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Release an unfinished run only while its exact live generation is still owned."""
+        async with self._sessions.begin() as session:
+            result = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.AcquisitionRun)
+                    .where(
+                        models.AcquisitionRun.id == run_id,
+                        models.AcquisitionRun.workspace_id == self._workspace_id,
+                        models.AcquisitionRun.lease_owner == owner,
+                        models.AcquisitionRun.lease_generation == generation,
+                        models.AcquisitionRun.lease_expires_at > now,
+                        models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                    )
+                    .values(lease_owner=None, lease_expires_at=None, updated_at=utcnow())
+                ),
+            )
+            return result.rowcount == 1
+
     async def transition_acquisition_run(
         self,
         run_id: str,

@@ -548,11 +548,26 @@ class Runtime:
 
     async def _build_pipeline(self) -> IngestPipeline:
         from manicule.ingest.pipeline import IngestPipeline  # noqa: PLC0415
+        from manicule.ingest.ports import AcquisitionStore as AcquisitionSurface  # noqa: PLC0415
         from manicule.ingest.refusals import check_before_run  # noqa: PLC0415
         from manicule.ingest.workers import WorkerPool, worker_config  # noqa: PLC0415
 
         settings = self._settings
         store = await self.documents()
+        acquisitions: AcquisitionSurface | None = None
+        if settings.storage.retain_source_bytes:
+            # Retention enables the durable journal path. Third-party document stores may
+            # satisfy the application surfaces without implementing that separate protocol;
+            # refuse them at assembly rather than failing inside a live ingest with an
+            # AttributeError after source work has begun.
+            if not isinstance(store, AcquisitionSurface):
+                msg = (
+                    f"the configured document store {type(store).__name__} does not provide "
+                    "durable source acquisition; disable source-byte retention or configure "
+                    "a store that implements AcquisitionStore"
+                )
+                raise AssemblyError(msg)
+            acquisitions = store
         chunker = await self._container.aget(keys.CHUNKER)
         embedder = await self._container.aget(keys.EMBEDDER)
         vectors = await self.prepared_vectors()
@@ -591,6 +606,7 @@ class Runtime:
         )
         return IngestPipeline(
             store=store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
+            acquisitions=acquisitions,
             chunker=chunker,
             embedder=embedder,
             vectors=vectors,

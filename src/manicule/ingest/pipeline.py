@@ -160,6 +160,14 @@ class _AcquisitionRetentionError(RuntimeError):
     """Fetched bytes could not become a durable snapshot input."""
 
 
+class _MissingAcquisitionSnapshotError(RuntimeError):
+    """A journal record no longer has the local snapshot it promises."""
+
+
+class _CorruptAcquisitionSnapshotError(RuntimeError):
+    """A journal-owned local snapshot failed integrity or envelope validation."""
+
+
 class _UnprovenSourceRevisionError(RuntimeError):
     """Fetched bytes do not prove they are at least the discovered source revision."""
 
@@ -185,6 +193,16 @@ def _acquisition_diagnostic(exc: Exception) -> AcquisitionDiagnostic:
     else:
         code = AcquisitionFailureCode.FETCH_FAILED
     return AcquisitionDiagnostic(stage=AcquisitionStage.ACQUISITION, code=code)
+
+
+def _snapshot_diagnostic(exc: Exception) -> AcquisitionDiagnostic:
+    """Classify failures reopening already-acquired bytes as local indexing failures."""
+    code = (
+        AcquisitionFailureCode.SNAPSHOT_MISSING
+        if isinstance(exc, _MissingAcquisitionSnapshotError)
+        else AcquisitionFailureCode.SNAPSHOT_CORRUPT
+    )
+    return AcquisitionDiagnostic(stage=AcquisitionStage.INDEXING, code=code)
 
 
 class _SupersededError(Exception):
@@ -302,6 +320,7 @@ class DocumentOutcome:
     status: DocumentStatus
     document_id: str = ""
     detail: str = ""
+    failed_stage: PipelineStage | None = None
     chunks: int = 0
     skipped: str = ""
     """``version`` or ``hash`` when change detection stopped early, otherwise empty."""
@@ -415,6 +434,9 @@ class RunReport:
     watermark_advanced: bool = False
     """Whether this run persisted a new connector position."""
 
+    pending_derivation: bool = False
+    """Whether retained local work remains after this invocation returned normally."""
+
     @property
     def indexed(self) -> int:
         return self.by_status.get(DocumentStatus.INDEXED.value, 0)
@@ -435,7 +457,14 @@ class RunReport:
         position to describe more than what actually landed, and the watermark is a promise that
         it does not.
         """
-        return self.clean and not self.limited and self.unrecorded == 0
+        return (
+            self.clean and not self.limited and self.unrecorded == 0 and not self.pending_derivation
+        )
+
+    @property
+    def retry_required(self) -> bool:
+        """Whether callers must treat this report as incomplete and invoke it again."""
+        return bool(self.error or self.unrecorded or self.pending_derivation)
 
     def record(self, outcome: DocumentOutcome, *, expanded: bool = False) -> None:
         """Count one outcome. Called from every fetch and ingest worker of a staged run.
@@ -495,14 +524,14 @@ class RunReport:
                 "unrecorded": self.unrecorded,
                 "outcome": (
                     "incomplete"
-                    if self.error or self.unrecorded
+                    if self.retry_required
                     else "bounded"
                     if self.limited
                     else "complete"
                 ),
                 "enumeration_completed": self.enumeration_completed,
                 "watermark_advanced": self.watermark_advanced,
-                "retry_required": bool(self.error or self.unrecorded),
+                "retry_required": self.retry_required,
                 "glossary_failures": list(self.glossary_failures),
                 "stages": self.stages.as_metadata(),
             }
@@ -523,6 +552,8 @@ class _Fetched:
     discovered: DiscoveredDoc
     existing: Document | None
     acquisition_record: AcquisitionRecord | None = None
+    retention: Retention | None = None
+    force: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,9 +655,9 @@ class IngestPipeline:
         # a stand-in vocabulary must not be able to reach a store at all.
         require_measured(chunk_fingerprint)
         self._store = store
-        # Explicit until acquisition workers (#177) replace this transitional direct-fetch
-        # consumer. Merely noticing that SQLite implements the protocol would enable a partial
-        # multi-issue feature in production before its source-byte coverage path exists.
+        # Explicit protocol injection keeps the legacy bounded path available to protocol-only
+        # stores and unit tests. Production wires the SQLite acquisition store here, making the
+        # blob-backed snapshot path the normal connector topology rather than structural guesswork.
         self._acquisitions = acquisitions
         self._acquisition_lease_s = max(1.0, acquisition_lease_s)
         self._acquisition_clock = acquisition_clock or (lambda: datetime.now(UTC))
@@ -877,6 +908,7 @@ class IngestPipeline:
             gauge.rebase()
 
         stages = asyncio.create_task(self._drive(run), name=f"ingest:{connector.name}")
+        crashed = False
         try:
             # Shielded so that a cancellation arriving here does not tear the stages down before
             # anything has had a chance to finish the document it is holding. The stages are
@@ -893,6 +925,7 @@ class IngestPipeline:
             # Documents that were mid-write when it happened are in a non-terminal status, which
             # is what the recovery sweep (`docs/ingest.md` §6.4) exists to finish.
             first, detail = _first_failure(failures)
+            crashed = True
             run.report.error_type = type(first).__name__
             run.report.error_message = str(first)
             run.report.error = detail
@@ -911,8 +944,33 @@ class IngestPipeline:
                 run.report.error_type = type(exc).__name__
                 run.report.error_message = str(exc)
                 run.report.error = f"{type(exc).__name__}: {exc}"
+        if run.acquisitions is not None and not crashed:
+            try:
+                await self._release_orderly_acquisition(run)
+            except Exception as exc:  # noqa: BLE001 - an unreleased lease makes this run incomplete
+                run.report.error_type = type(exc).__name__
+                run.report.error_message = str(exc)
+                run.report.error = f"{type(exc).__name__}: {exc}"
         await self._store.record_connector_metadata(connector.name, run.report.as_metadata())
         return run.report
+
+    async def _release_orderly_acquisition(self, run: _Sync) -> None:
+        """Release normal unfinished work; crashes never reach this fenced operation."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - caller checks the durable path
+            return
+        durable = await acquisitions.get_acquisition_run(run.acquisition_run_id)
+        if durable is None or durable.state is AcquisitionRunState.SETTLED:
+            return
+        released = await acquisitions.release_acquisition_lease(
+            run.acquisition_run_id,
+            run.lease_owner,
+            run.lease_generation,
+            now=self._acquisition_clock(),
+        )
+        if not released:
+            msg = "the unfinished acquisition lease changed before orderly release"
+            raise _LostAcquisitionLeaseError(msg)
 
     async def _drive(self, run: _Sync) -> None:
         """Start every stage, and return when discovery is spent and every acceptance is done.
@@ -958,6 +1016,7 @@ class IngestPipeline:
                 if run.stop.is_set():
                     return
                 await owned(self._index_acquired(run), "journal-indexing")
+                await self._mark_pending_derivation(run, acquisitions)
                 return
             run.acquisition_state = AcquisitionRunState.ACQUIRING
         else:
@@ -988,6 +1047,11 @@ class IngestPipeline:
 
         await owned(self._index_acquired(run), "journal-indexing")
         if run.acquisition_state is AcquisitionRunState.INDEXING and not run.stop.is_set():
+            if await self._mark_pending_derivation(run, acquisitions):
+                # A local document failure is durable work, not permission to call the source
+                # again and not a run-level crash. Leave INDEXING visible and let takeover retry
+                # the retained snapshot on the next invocation.
+                return
             now = self._acquisition_clock()
             await self._keep_acquisition_lease_live(run, acquisitions, now, force=True)
             await acquisitions.transition_acquisition_run(
@@ -998,6 +1062,20 @@ class IngestPipeline:
                 lease_generation=run.lease_generation,
                 now=now,
             )
+
+    async def _mark_pending_derivation(self, run: _Sync, acquisitions: AcquisitionStore) -> bool:
+        """Expose any retained or retryable local backlog on the invocation report."""
+        pending = await acquisitions.list_acquisition_records(
+            run.acquisition_run_id,
+            states=(
+                AcquisitionRecordState.ACQUIRED,
+                AcquisitionRecordState.INDEXING,
+                AcquisitionRecordState.RETRY,
+            ),
+            limit=1,
+        )
+        run.report.pending_derivation = bool(pending)
+        return run.report.pending_derivation
 
     async def _owned_acquisition(self, run: _Sync, work: Awaitable[bool]) -> bool:
         """Run a bool-returning acquisition phase with the same independent lease heartbeat."""
@@ -1502,6 +1580,10 @@ class IngestPipeline:
                     continue
                 run.discovery_records_held.leave()
                 record = work
+                retrying = record.state in {
+                    AcquisitionRecordState.INDEXING,
+                    AcquisitionRecordState.RETRY,
+                }
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now)
                 if record.state in {
@@ -1520,7 +1602,7 @@ class IngestPipeline:
                 try:
                     raw = await self._raw_from_acquisition(record)
                 except Exception as exc:  # noqa: BLE001 - safe typed retry outcome
-                    diagnostic = _acquisition_diagnostic(exc)
+                    diagnostic = _snapshot_diagnostic(exc)
                     await acquisitions.transition_acquisition_record(
                         run.acquisition_run_id,
                         record.source.source_id,
@@ -1549,6 +1631,8 @@ class IngestPipeline:
                         ),
                         existing=existing,
                         acquisition_record=record,
+                        retention=Retention(ref=record.blob_ref),
+                        force=retrying,
                     )
                 )
         finally:
@@ -1556,11 +1640,22 @@ class IngestPipeline:
 
     async def _raw_from_acquisition(self, record: AcquisitionRecord) -> RawDocument:
         """Load and verify a journal-owned blob before local derivation sees it."""
-        data = await self._blobs.get(record.blob_ref or "")
-        if data is None or record.acquired_source is None:
+        if record.blob_ref is None or record.acquired_source is None:
             msg = "the acquired source snapshot is unavailable"
-            raise _AcquisitionRetentionError(msg)
-        return record.acquired_source.raw(data)
+            raise _MissingAcquisitionSnapshotError(msg)
+        try:
+            data = await self._blobs.get(record.blob_ref)
+        except Exception as exc:
+            msg = "the acquired source snapshot could not be read"
+            raise _CorruptAcquisitionSnapshotError(msg) from exc
+        if data is None:
+            msg = "the acquired source snapshot is unavailable"
+            raise _MissingAcquisitionSnapshotError(msg)
+        try:
+            return record.acquired_source.raw(data)
+        except Exception as exc:
+            msg = "the acquired source snapshot failed validation"
+            raise _CorruptAcquisitionSnapshotError(msg) from exc
 
     async def _journal_into(
         self, run: _Sync, refs: Conveyor[DiscoveredDoc | AcquisitionRecord]
@@ -1739,6 +1834,9 @@ class IngestPipeline:
                     version_token=fetched.discovered.version_token,
                     title=fetched.discovered.title,
                     existing=fetched.existing,
+                    retention=fetched.retention,
+                    force=fetched.force,
+                    force_members=fetched.force,
                 )
             finally:
                 if fence_token is not None:
@@ -1752,28 +1850,45 @@ class IngestPipeline:
                 # the inside of it.
                 run.report.record(outcome, expanded=position > 0)
             if fetched.acquisition_record is not None:
-                await self._settle_indexed_record(run, fetched.acquisition_record, outcomes[0])
+                await self._settle_indexed_record(run, fetched.acquisition_record, outcomes)
             # After the whole document, not per outcome: a container that expanded into five
             # hundred members is one thing that happened to somebody watching, and five hundred
             # lines of it is not progress.
             _report_progress(run)
 
     async def _settle_indexed_record(
-        self, run: _Sync, record: AcquisitionRecord, outcome: DocumentOutcome
+        self, run: _Sync, record: AcquisitionRecord, outcomes: Sequence[DocumentOutcome]
     ) -> None:
         """Persist derivation outcome without weakening the independent byte snapshot."""
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover
             return
+        retryable = [outcome for outcome in outcomes if _retryable_derivation(outcome)]
+        outcome = retryable[0] if retryable else outcomes[0]
         target = (
-            AcquisitionRecordState.SETTLED if outcome.document_id else AcquisitionRecordState.RETRY
+            AcquisitionRecordState.SETTLED
+            if outcomes[0].document_id and not retryable
+            else AcquisitionRecordState.RETRY
         )
         diagnostic = (
             None
             if target is AcquisitionRecordState.SETTLED
             else AcquisitionDiagnostic(
                 stage=AcquisitionStage.INDEXING,
-                code=AcquisitionFailureCode.PUBLICATION_FAILED,
+                code=(
+                    AcquisitionFailureCode.EMBED_FAILED
+                    if outcome.failed_stage is PipelineStage.EMBED
+                    else (
+                        AcquisitionFailureCode.PARSE_FAILED
+                        if outcome.failed_stage
+                        in {
+                            PipelineStage.MIDDLEWARE,
+                            PipelineStage.PARSE,
+                            PipelineStage.CHUNK,
+                        }
+                        else AcquisitionFailureCode.PUBLICATION_FAILED
+                    )
+                ),
             )
         )
         now = self._acquisition_clock()
@@ -1940,6 +2055,8 @@ class IngestPipeline:
         existing: Document | None = None,
         force: bool = False,
         expected: DocumentRevision | None = None,
+        retention: Retention | None = None,
+        force_members: bool = False,
     ) -> list[DocumentOutcome]:
         """Everything from fetched bytes onwards, including anything found inside.
 
@@ -1958,10 +2075,20 @@ class IngestPipeline:
         unchanged still expands to the same members, and re-parsing those is a decision about
         each of them rather than a consequence of touching the archive.
 
+        ``force_members`` is narrower and used only when retrying a journal snapshot whose
+        earlier local derivation failed. It prevents a failed container member from hash-skipping
+        forever when the retained parent is expanded again; ordinary re-parse keeps its existing
+        per-member change-detection behavior.
+
         ``expected`` guards the *top-level* document only, and for the same reason ``force``
         does: it is a statement about the snapshot **this caller** read, and a member found
         inside the archive is a document the caller never saw. A caller with newer bytes than
         anything stored — every connector sync — passes nothing and is guarded against nobody.
+
+        ``retention`` identifies bytes the caller already loaded from the blob store. Durable
+        acquisition and re-parse pass it so this shared derivation path never retains the same
+        top-level snapshot twice. Container members are new derived documents and retain their
+        own bytes normally.
         """
         outcome, members = await self._ingest_one(
             raw,
@@ -1971,6 +2098,7 @@ class IngestPipeline:
             existing=existing,
             force=force,
             expected=expected,
+            retention=retention,
         )
         outcomes = [outcome]
         queue: list[MemberOutcome] = list(members)
@@ -1979,8 +2107,17 @@ class IngestPipeline:
             if isinstance(member, MemberFailure):
                 outcomes.append(await self._record_member_failure(member, source))
                 continue
+            member_raw = _member_raw(member)
+            member_existing = await self._store.find_document(source, member_raw.source_id)
+            retry_member = force_members and _document_requires_local_retry(
+                member_existing, member_raw
+            )
             inner, deeper = await self._ingest_one(
-                _member_raw(member), source=source, title=_member_title(member)
+                member_raw,
+                source=source,
+                title=_member_title(member),
+                existing=member_existing,
+                force=retry_member,
             )
             outcomes.append(inner)
             queue.extend(deeper)
@@ -1996,6 +2133,7 @@ class IngestPipeline:
         existing: Document | None = None,
         force: bool = False,
         expected: DocumentRevision | None = None,
+        retention: Retention | None = None,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """One document, and whatever it turned out to contain."""
         source_bytes = raw.as_bytes()
@@ -2036,6 +2174,7 @@ class IngestPipeline:
                     identifier=identifier,
                     existing=existing,
                     expected=expected,
+                    retention=retention,
                 )
             except _SupersededError as moved:
                 # Nothing was written, by construction: the guard fires on the first write this
@@ -2064,6 +2203,7 @@ class IngestPipeline:
         identifier: str,
         existing: Document | None,
         expected: DocumentRevision | None,
+        retention: Retention | None,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """The part of one document's ingest that writes, under the lock and the guard.
 
@@ -2080,7 +2220,8 @@ class IngestPipeline:
         # this same path, hooks included — so retaining the transformed bytes would apply
         # `before_parse` twice, and a hook that is not idempotent would compound on every
         # repair. What is kept is the original, exactly as fetched.
-        retention = await self._retain(raw, source_bytes)
+        if retention is None:
+            retention = await self._retain(raw, source_bytes)
 
         try:
             transformed = await self._middleware.before_parse(raw)
@@ -2162,6 +2303,7 @@ class IngestPipeline:
                     status=document.status,
                     document_id=document.id,
                     detail=result.status_detail,
+                    failed_stage=result.failed_stage,
                     glossary_detail=glossary_detail,
                     members=tuple(member.source_id for member in members),
                 ),
@@ -3016,6 +3158,7 @@ class IngestPipeline:
             status=document.status,
             document_id=document.id,
             detail=result.status_detail,
+            failed_stage=result.failed_stage,
             glossary_detail=glossary_detail,
         )
 
@@ -3060,7 +3203,12 @@ class IngestPipeline:
         if raw is None:
             # Nothing was fetched, so there is no content hash and no row to write. The
             # document is simply not indexed, and the next sync rediscovers it.
-            return DocumentOutcome(source_id=source_id, status=DocumentStatus.FAILED, detail=detail)
+            return DocumentOutcome(
+                source_id=source_id,
+                status=DocumentStatus.FAILED,
+                detail=detail,
+                failed_stage=stage,
+            )
         return await self._settle(
             ChainResult(
                 blocks=[],
@@ -3101,6 +3249,7 @@ class IngestPipeline:
                 status=DocumentStatus.INDEXED,
                 document_id=document.id,
                 detail=detail,
+                failed_stage=stage,
             )
         await self._check_publication_fence()
         await self._store.upsert_document(
@@ -3117,7 +3266,27 @@ class IngestPipeline:
             status=DocumentStatus.FAILED,
             document_id=document.id,
             detail=detail,
+            failed_stage=stage,
         )
+
+
+def _retryable_derivation(outcome: DocumentOutcome) -> bool:
+    """Whether local work failed while a safe old publication may still be served."""
+    return outcome.status is DocumentStatus.FAILED or (
+        outcome.status is DocumentStatus.INDEXED and bool(outcome.detail) and not outcome.superseded
+    )
+
+
+def _document_requires_local_retry(document: Document | None, raw: RawDocument) -> bool:
+    """Select only failed container members when re-expanding a retained parent snapshot."""
+    return (
+        document is None
+        or document.status is DocumentStatus.FAILED
+        or (
+            bool(document.metadata.get("last_ingest_error"))
+            and document.content_hash != content_hash(raw.as_bytes())
+        )
+    )
 
 
 def _report_progress(run: _Sync) -> None:
