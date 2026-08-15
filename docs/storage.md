@@ -233,7 +233,7 @@ Sixteen carry over from the shape `PLAN.md` §2 names. Eight are additions, each
 one of the sixteen cannot do. `alembic_version` and the FTS5 shadow tables also exist and are
 managed, not modeled.
 
-### 4.1 The eight additions
+### 4.1 The nine additions
 
 | Table | Why it must exist |
 |---|---|
@@ -243,6 +243,7 @@ managed, not modeled.
 | `vector_tombstones` | Chunk IDs deleted from SQLite whose vectors have not yet been swept from LanceDB. §8.2. |
 | `acquisition_runs` | Durable connector-run lifecycle, base and candidate watermarks, generation-fenced lease, completion markers and bounded aggregate counters, including unchanged source coverage separately from indexed work. It separates discovering source coverage from publishing derived content. |
 | `acquisition_records` | One idempotent source identity per run, with the validated fetched envelope, acquisition/indexing state and retained-blob reference. Acquired and indexing states require the blob; the acquired transition also stores the fetched URI, media type, encoding, metadata, byte length and content hash atomically. Unchanged remains a distinct terminal provenance state. A discovery record is acknowledged only after this row commits. |
+| `acquisition_markers` | Indexed inventory of filesystem recovery markers. It blocks history cleanup until marker ownership is reconciled and contributes blob hashes to GC without a directory-wide scan. |
 | `glossary_entries` | Definitions detected in document chunks, with their display form, expansion, location and confidence. The document/chunk foreign keys keep citations authoritative. |
 | `glossary_aliases` | Normalized alternate lookup keys for glossary entries. A composite key prevents duplicate aliases and cascading deletion keeps them tied to their definition. |
 
@@ -1419,10 +1420,16 @@ disclosure itself is discharged here.
    Lance persists before hashing, so a reused vector's read/write round trip keeps the same id.
 2. Write vector tombstones for that publication's physical row ids, then stage every vector.
    The logical chunk id remains stable; the physical id includes the publication, so changed
-   `embed_text` cannot overwrite the vector the active revision still uses.
+   `embed_text` cannot overwrite the vector the active revision still uses. Non-legacy rows are
+   insert-only: because the publication id hashes the normalized vector values too, a stale
+   generation completing an external Lance write after takeover cannot replace a successor's
+   row. It can only leave an inert, tombstoned row that no relational pointer selects.
 3. In one SQLite transaction, replace the document, chunks, glossary and lineage; set
    `documents.publication_id`; retire the old publication's vector ids; and clear the new
-   publication's tombstones.
+   publication's tombstones. For durable connector attempts, the transaction's first statement
+   is a conditional write validating the exact workspace/run/owner/generation and unexpired,
+   unsettled, non-superseded lease. It holds SQLite's writer lock through the complete flip, so
+   takeover and publication are ordered rather than separated by an awaited guard.
 
 - **Crash before or during 2** — SQLite still points to the old publication, so its document,
   chunks, glossary, lineage and vectors remain wholly servable. Any staged rows are rejected by
@@ -1853,9 +1860,27 @@ created one level at a time and their parents are fsynced; after the temporary f
 and atomically renamed, the destination directory is fsynced before a blob row or acquisition
 staging marker can certify it. A directory-fsync failure may leak a file but creates no database
 reference, preserving the rule that storage failures cost space rather than correctness.
-Once all work is settled it may discard that completed diagnostic journal history; publications
-and retained bytes referenced by them remain governed by their own tables. This makes rollback
-possible without ever turning it into an implicit deletion of durable backlog. `alembic check`
+Once all work is settled, production retains the completed diagnostic journal for 30 days and
+then discards it in bounded batches. Obsolete overlap is recorded with `superseded_at` and the
+replacement run id after incrementing its lease fence. It can be cleaned after the same window
+even when discovery, acquisition, retry or derivation state remains: its generation fence makes
+that obsolete work permanently ineligible to resume. The cleanup query rejects live record
+states only for settled, non-superseded history. Age alone can therefore never erase the
+authoritative run's incomplete enumeration, retry, acquired, or indexing work, while a fenced
+overlap cannot pin blob references forever. Cascading record deletion merely releases
+acquisition references. Publications and retained bytes remain governed by their own tables,
+and blob mark-and-sweep includes marker references through the indexed
+`acquisition_markers` table. A marker root commits before either physical blob or envelope is
+published, and a sweep rechecks all roots atomically with candidate deletion. Reconciliation
+and legacy-file admission are bounded pages with
+batched database reads. History cleanup excludes runs still named by the inventory and is
+deferred entirely until the bounded legacy scanner completes one pass, so association evidence
+cannot disappear before its marker decision. Exact committed associations are redundant;
+superseded pre-association markers are unrecoverable by definition and are removed;
+authoritative pre-association markers remain. Markers whose explicit owning run disappeared are
+removed; unmatched legacy markers receive a 30-day safe
+harbor before expiring. This ordering prevents either crash window from pinning a blob forever
+without turning cleanup into an implicit deletion of resumable backlog. `alembic check`
 continues to enforce model/migration parity.
 
 ---

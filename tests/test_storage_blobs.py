@@ -7,13 +7,17 @@ import json
 import os
 import stat
 import threading
-from typing import TYPE_CHECKING
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, override
 
 import pytest
 from sqlalchemy import text
 
+from manicule.core.acquisition import AcquiredSource, AcquisitionRecordState, AcquisitionSource
 from manicule.core.content import RawDocument
 from manicule.core.ids import content_hash
+from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.storage.blobs import (
     BlobStore,
     OmittedBlob,
@@ -49,24 +53,15 @@ async def test_identical_bytes_are_stored_once(engine: AsyncEngine, data_dir: Pa
     assert isinstance(first, StoredBlob)
     assert isinstance(second, StoredBlob)
     assert first.hash == second.hash
-    assert sum(1 for path in blobs.root.rglob("*") if path.is_file()) == 1
+    assert sum(1 for path in (blobs.root / "blake2b").rglob("*") if path.is_file()) == 1
 
 
 async def test_concurrent_media_types_reuse_one_coherent_blob_representation(
     engine: AsyncEngine,
     data_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Same content address cannot let file bytes and SQLite compression disagree."""
     blobs = BlobStore(engine, data_dir)
-    barrier = threading.Barrier(2)
-    original = BlobStore._publish_durable  # pyright: ignore[reportPrivateUsage]
-
-    def gated_publish(destination: Path, payload: bytes) -> bytes:
-        barrier.wait(timeout=5)
-        return original(destination, payload)
-
-    monkeypatch.setattr(BlobStore, "_publish_durable", staticmethod(gated_publish))
     shared = b"the same source bytes " * 200
     text_raw = RawDocument(
         source_id="text-copy",
@@ -86,7 +81,6 @@ async def test_concurrent_media_types_reuse_one_coherent_blob_representation(
         blobs.retain_acquisition("run\0text-copy", text_raw),
         blobs.retain_acquisition("run\0binary-copy", binary_raw),
     )
-    monkeypatch.setattr(BlobStore, "_publish_durable", staticmethod(original))
 
     assert text_result[0].ref == binary_result[0].ref == content_hash(shared)
     assert await blobs.get(content_hash(shared)) == shared
@@ -459,6 +453,439 @@ async def test_the_sweep_reclaims_only_unreferenced_blobs(
     assert collected == [dropped.hash]
     assert await blobs.get(kept.hash) == b"referenced bytes"
     assert await blobs.get(dropped.hash) is None
+
+
+async def test_sweep_atomically_rechecks_marker_created_after_candidate_selection(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """A collector cannot delete a blob after acquisition establishes its durable root."""
+    candidate_selected = asyncio.Event()
+    release_delete = asyncio.Event()
+
+    class GatedBlobStore(BlobStore):
+        @override
+        async def _unlink_blob_if_still_unreferenced(self, digest: str) -> bool:
+            candidate_selected.set()
+            await release_delete.wait()
+            return await super()._unlink_blob_if_still_unreferenced(digest)
+
+    blobs = GatedBlobStore(engine, data_dir)
+    raw = RawDocument(
+        source_id="raced-source",
+        uri="memory:raced-source",
+        media_type="text/plain",
+        content=b"raced bytes",
+    )
+    stored = await blobs.put(raw.as_bytes(), raw.media_type)
+    assert isinstance(stored, StoredBlob)
+
+    collection = asyncio.create_task(blobs.collect_garbage())
+    await asyncio.wait_for(candidate_selected.wait(), timeout=5)
+    async with engine.connect() as connection:
+        assert (
+            await connection.execute(
+                text("SELECT count(*) FROM blobs WHERE hash = :digest"),
+                {"digest": stored.hash},
+            )
+        ).scalar_one() == 0
+    acquired = AcquiredSource.from_raw(raw)
+    name = blobs._stage_name("raced-run\0raced-source")  # pyright: ignore[reportPrivateUsage]
+    async with blobs._marker_locks([name]):  # pyright: ignore[reportPrivateUsage]
+        await blobs._record_marker(  # pyright: ignore[reportPrivateUsage]
+            name,
+            {
+                "run_id": "raced-run",
+                "source_id": "raced-source",
+                "blob_ref": stored.hash,
+                "compression": stored.compression,
+                "acquired_source": acquired.model_dump(mode="json"),
+            },
+            legacy=False,
+        )
+    release_delete.set()
+
+    assert await collection == []
+    retained, _ = await blobs.retain_acquisition("raced-run\0raced-source", raw)
+    assert retained.ref == stored.hash
+    assert await blobs.get(stored.hash) == raw.as_bytes()
+
+
+async def test_sweep_final_lock_rechecks_blob_row_recreated_by_ordinary_put(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """A normal put recreating the row in the delete/unlink gap keeps the physical bytes."""
+    row_deleted = asyncio.Event()
+    release_unlink = asyncio.Event()
+
+    class GatedBlobStore(BlobStore):
+        @override
+        async def _unlink_blob_if_still_unreferenced(self, digest: str) -> bool:
+            row_deleted.set()
+            await release_unlink.wait()
+            return await super()._unlink_blob_if_still_unreferenced(digest)
+
+    blobs = GatedBlobStore(engine, data_dir)
+    payload = b"ordinary put race"
+    stored = await blobs.put(payload, "text/plain")
+    assert isinstance(stored, StoredBlob)
+
+    collection = asyncio.create_task(blobs.collect_garbage())
+    await asyncio.wait_for(row_deleted.wait(), timeout=5)
+    recreation = asyncio.create_task(blobs.put(payload, "text/plain"))
+    await asyncio.sleep(0)
+    assert not recreation.done(), "put read the file while GC owned its digest lock"
+    release_unlink.set()
+
+    assert await collection == [stored.hash]
+    recreated = await recreation
+    assert isinstance(recreated, StoredBlob)
+    assert await blobs.get(stored.hash) == payload
+
+
+async def test_cross_process_lock_files_are_bounded_by_fixed_shard_pool(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    keys = [f"marker-{index}" for index in range(5_000)]
+
+    async with blobs._marker_locks(keys):  # pyright: ignore[reportPrivateUsage]
+        pass
+
+    lock_root = blobs.root / "acquisition-locks"
+    assert len(list(lock_root.iterdir())) <= 256
+
+
+async def test_conflicting_marker_retry_preserves_durable_evidence_and_repairs_stale_inventory(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    key = "retry-run\0retry-source"
+    old = RawDocument(
+        source_id="retry-source",
+        uri="memory:retry-source",
+        media_type="text/plain",
+        content=b"old bytes",
+    )
+    new = old.model_copy(update={"content": b"new bytes"})
+    old_result = await blobs.retain_acquisition(key, old)
+
+    with pytest.raises(RuntimeError, match="conflicts with durable recovery evidence"):
+        await blobs.retain_acquisition(key, new)
+    assert await blobs.resume_acquisition(key) == old_result
+
+    new_blob = await blobs.put(new.as_bytes(), new.media_type)
+    assert isinstance(new_blob, StoredBlob)
+    new_acquired = AcquiredSource.from_raw(new)
+    path = blobs._stage_path(key)  # pyright: ignore[reportPrivateUsage]
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": "retry-run",
+                "source_id": "retry-source",
+                "blob_ref": new_blob.hash,
+                "compression": new_blob.compression,
+                "acquired_source": new_acquired.model_dump(mode="json"),
+            }
+        )
+    )
+
+    repaired = await blobs.retain_acquisition(key, new)
+    assert repaired[0].ref == new_blob.hash
+    async with engine.connect() as connection:
+        inventory_ref = (
+            await connection.execute(
+                text("SELECT blob_ref FROM acquisition_markers WHERE run_id = 'retry-run'")
+            )
+        ).scalar_one()
+    assert inventory_ref == new_blob.hash
+
+
+async def test_inventory_only_crash_allows_newer_serialized_retry(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    key = "inventory-only-run\0inventory-only-source"
+    old = RawDocument(
+        source_id="inventory-only-source",
+        uri="memory:inventory-only-source",
+        media_type="text/plain",
+        content=b"inventory old",
+    )
+    new = old.model_copy(update={"content": b"inventory new"})
+    await blobs.retain_acquisition(key, old)
+    marker = blobs._stage_path(key)  # pyright: ignore[reportPrivateUsage]
+    marker.unlink()
+
+    retained = await blobs.retain_acquisition(key, new)
+
+    assert retained[0].ref == content_hash(b"inventory new")
+    assert await blobs.resume_acquisition(key) == retained
+
+
+async def test_old_missing_marker_for_authoritative_run_survives_reconcile_retry_race(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    await store.create_acquisition_run("authoritative-run", "authoritative-connector")
+    key = "authoritative-run\0authoritative-source"
+    old = RawDocument(
+        source_id="authoritative-source",
+        uri="memory:authoritative-source",
+        media_type="text/plain",
+        content=b"authoritative old",
+    )
+    new = old.model_copy(update={"content": b"authoritative new"})
+    await blobs.retain_acquisition(key, old)
+    blobs._stage_path(key).unlink()  # pyright: ignore[reportPrivateUsage]
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE acquisition_markers SET created_at = :old "
+                "WHERE run_id = 'authoritative-run'"
+            ),
+            {"old": "2020-01-01 00:00:00.000000"},
+        )
+
+    retried, _reconciled = await asyncio.gather(
+        blobs.retain_acquisition(key, new),
+        blobs.reconcile_acquisition_markers(),
+    )
+
+    assert retried[0].ref == content_hash(b"authoritative new")
+    assert await blobs.resume_acquisition(key) == retried
+
+
+async def test_preassociation_marker_supersession_releases_only_the_fenced_blob(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    now = datetime(2026, 8, 15, 12, tzinfo=UTC)
+
+    async def staged_run(run_id: str, connector: str, body: bytes) -> tuple[str, str]:
+        await store.create_acquisition_run(run_id, connector)
+        run = await store.claim_acquisition_run(
+            run_id, "owner", now=now, expires_at=now + timedelta(minutes=1)
+        )
+        assert run is not None
+        source_id = f"{run_id}-source"
+        source = DiscoveredDoc(ref=DocRef(source_id=source_id, uri=f"memory:{source_id}"))
+        await store.append_acquisition_record(
+            run_id,
+            0,
+            AcquisitionSource.from_discovered(source),
+            lease_owner="owner",
+            lease_generation=run.lease_generation,
+            now=now,
+        )
+        await store.transition_acquisition_record(
+            run_id,
+            source_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="owner",
+            lease_generation=run.lease_generation,
+            now=now,
+        )
+        raw = RawDocument(
+            source_id=source_id, uri=f"memory:{source_id}", media_type="text/plain", content=body
+        )
+        retained, _ = await blobs.retain_acquisition(f"{run_id}\0{source_id}", raw)
+        assert retained.ref is not None
+        return source_id, retained.ref
+
+    stale_source, stale_ref = await staged_run("stale-run", "stale", b"stale bytes")
+    live_source, live_ref = await staged_run("live-run", "live", b"live bytes")
+    live_path = blobs._stage_path(  # pyright: ignore[reportPrivateUsage]
+        f"live-run\0{live_source}"
+    )
+    legacy_payload = json.loads(live_path.read_text())
+    legacy_payload.pop("run_id")
+    legacy_payload.pop("source_id")
+    live_path.write_text(json.dumps(legacy_payload))
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("DELETE FROM acquisition_markers WHERE name = :name"),
+            {"name": live_path.name},
+        )
+    await store.set_watermark("stale", Watermark(value="new", observed_at=now))
+    replacement = await store.claim_or_create_acquisition_run(
+        "stale",
+        "replacement",
+        "replacement-owner",
+        now=now + timedelta(minutes=2),
+        expires_at=now + timedelta(minutes=3),
+    )
+    assert replacement is not None
+
+    restarted = BlobStore(engine, data_dir)
+    assert not await restarted.reconcile_acquisition_markers()
+    assert await restarted.reconcile_acquisition_markers()
+    assert await restarted.resume_acquisition(f"stale-run\0{stale_source}") is None
+    assert await restarted.resume_acquisition(f"live-run\0{live_source}") is not None
+    assert await store.cleanup_acquisition_history(datetime(2100, 1, 1, tzinfo=UTC), limit=10) == 1
+    assert await restarted.collect_garbage() == [stale_ref]
+    assert await restarted.get(live_ref) == b"live bytes"
+
+
+async def test_legacy_marker_is_inferred_or_expires_without_blocking_forever(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    stored = await blobs.put(b"legacy orphan", "text/plain")
+    assert isinstance(stored, StoredBlob)
+    key = "missing-run\0legacy-source"
+    path = blobs._stage_path(key)  # pyright: ignore[reportPrivateUsage]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_raw = RawDocument(
+        source_id="legacy-source",
+        uri="memory:legacy-source",
+        media_type="text/plain",
+        content=b"legacy orphan",
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "blob_ref": stored.hash,
+                "compression": "none",
+                "acquired_source": AcquiredSource.from_raw(legacy_raw).model_dump(mode="json"),
+            }
+        )
+    )
+    old = (datetime.now(UTC) - timedelta(days=31)).timestamp()
+    os.utime(path, (old, old))
+
+    restarted = BlobStore(engine, data_dir)
+    assert not await restarted.reconcile_acquisition_markers()
+    assert not path.exists()
+    assert await restarted.reconcile_acquisition_markers()
+    assert await restarted.collect_garbage() == [stored.hash]
+
+
+async def test_explicit_marker_is_removed_when_its_cascaded_run_owner_disappears(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    await store.create_acquisition_run("vanished-run", "vanished-connector")
+    raw = RawDocument(
+        source_id="vanished-source",
+        uri="memory:vanished-source",
+        media_type="text/plain",
+        content=b"vanished bytes",
+    )
+    retained, _ = await blobs.retain_acquisition("vanished-run\0vanished-source", raw)
+    assert retained.ref is not None
+    marker = blobs._stage_path(  # pyright: ignore[reportPrivateUsage]
+        "vanished-run\0vanished-source"
+    )
+    async with engine.begin() as connection:
+        await connection.execute(text("DELETE FROM acquisition_runs WHERE id = 'vanished-run'"))
+
+    await blobs.reconcile_acquisition_markers()
+
+    assert not marker.exists()
+    assert await blobs.collect_garbage() == [retained.ref]
+
+
+async def test_large_forged_marker_directory_reconciles_in_bounded_pages(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    staging = blobs.root / "acquisition-staging"
+    staging.mkdir(parents=True)
+    for index in range(250):
+        (staging / f"forged-{index:04d}").write_text("{}")
+
+    assert not await blobs.reconcile_acquisition_markers()
+    async with engine.connect() as connection:
+        first = (
+            await connection.execute(text("SELECT count(*) FROM acquisition_markers"))
+        ).scalar_one()
+    assert first == 100
+    assert not await blobs.reconcile_acquisition_markers()
+    assert not await blobs.reconcile_acquisition_markers()
+    assert await blobs.reconcile_acquisition_markers()
+    async with engine.connect() as connection:
+        final = (
+            await connection.execute(text("SELECT count(*) FROM acquisition_markers"))
+        ).scalar_one()
+    assert final == 250
+
+    async with engine.connect() as connection:
+        plan = (
+            await connection.execute(
+                text(
+                    "EXPLAIN QUERY PLAN SELECT run_id, source_id, marker_name "
+                    "FROM acquisition_records WHERE marker_name IN ('forged-0000')"
+                )
+            )
+        ).all()
+    assert any("ix_acquisition_records_marker_name" in str(row) for row in plan)
+
+
+async def test_legacy_admission_cannot_overwrite_concurrent_new_marker_registration(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    admission_ready = asyncio.Event()
+    release_admission = asyncio.Event()
+
+    class GatedLegacyStore(BlobStore):
+        @override
+        async def _record_markers(
+            self,
+            markers: Sequence[tuple[str, dict[str, object], bool, datetime]],
+        ) -> None:
+            admission_ready.set()
+            await release_admission.wait()
+            await super()._record_markers(markers)
+
+    legacy_store = GatedLegacyStore(engine, data_dir)
+    newer_store = BlobStore(engine, data_dir)
+    await newer_store._cleanup_staging_once()  # pyright: ignore[reportPrivateUsage]
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    await store.create_acquisition_run("concurrent-run", "concurrent-connector")
+    key = "concurrent-run\0concurrent-source"
+    old = RawDocument(
+        source_id="concurrent-source",
+        uri="memory:concurrent-source",
+        media_type="text/plain",
+        content=b"legacy bytes",
+    )
+    new = old.model_copy(update={"content": b"new bytes"})
+    old_blob = await legacy_store.put(old.as_bytes(), old.media_type)
+    assert isinstance(old_blob, StoredBlob)
+    marker = legacy_store._stage_path(key)  # pyright: ignore[reportPrivateUsage]
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps(
+            {
+                "blob_ref": old_blob.hash,
+                "compression": old_blob.compression,
+                "acquired_source": AcquiredSource.from_raw(old).model_dump(mode="json"),
+            }
+        )
+    )
+
+    admission = asyncio.create_task(legacy_store.reconcile_acquisition_markers())
+    await asyncio.wait_for(admission_ready.wait(), timeout=5)
+    retained, _ = await newer_store.retain_acquisition(key, new)
+    release_admission.set()
+    await admission
+
+    async with engine.connect() as connection:
+        inventory_ref = (
+            await connection.execute(
+                text("SELECT blob_ref FROM acquisition_markers WHERE name = :name"),
+                {"name": marker.name},
+            )
+        ).scalar_one()
+    assert inventory_ref == retained.ref == content_hash(b"new bytes")
 
 
 async def test_a_leaked_file_is_found_by_the_directory_scan(

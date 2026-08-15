@@ -774,6 +774,22 @@ async def test_publications_keep_two_vectors_for_one_stable_chunk_id(tmp_path: P
     }
 
 
+async def test_a_content_addressed_publication_is_physically_immutable(tmp_path: Path) -> None:
+    """A stale generation cannot overwrite a successor's row after losing its DB lease."""
+    store = LanceVectorStore(tmp_path / "vectors")
+    await store.ensure_ready(fingerprint())
+    original = chunk("stable")
+    conflicting = original.model_copy(update={"document_id": "stale-writer"})
+
+    await store.upsert([original], [spread(4, 0)], publication_id="content-addressed")
+    await store.upsert([conflicting], [spread(4, 1)], publication_id="content-addressed")
+
+    assert await store.count() == 1
+    found = await store.search(spread(4, 0), k=1)
+    assert found[0].chunk.document_id == original.document_id
+    assert found[0].score == pytest.approx(1.0)
+
+
 async def test_a_reused_vector_is_the_stored_vector_to_the_last_bit(
     store: LanceVectorStore,
 ) -> None:

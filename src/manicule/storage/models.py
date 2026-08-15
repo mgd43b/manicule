@@ -183,6 +183,25 @@ class Blob(Base):
     )
 
 
+class AcquisitionMarker(Base):
+    """Durable inventory for a filesystem acquisition-recovery marker."""
+
+    __tablename__ = "acquisition_markers"
+
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    run_id: Mapped[str | None] = mapped_column(Text)
+    source_id: Mapped[str | None] = mapped_column(Text)
+    blob_ref: Mapped[str | None] = mapped_column(Text)
+    acquired_source: Mapped[JsonValue | None] = mapped_column(JSON)
+    legacy: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        Index("ix_acquisition_markers_run_id", "run_id"),
+        Index("ix_acquisition_markers_blob_ref", "blob_ref"),
+    )
+
+
 # --- connectors --------------------------------------------------------------------------
 
 
@@ -249,6 +268,8 @@ class AcquisitionRun(Base):
     candidate_watermark: Mapped[JsonValue | None] = mapped_column(JSON)
     enumeration_completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     watermark_committed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    superseded_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    superseded_by: Mapped[str | None] = mapped_column(Text)
     lease_owner: Mapped[str | None] = mapped_column(Text)
     lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
@@ -275,6 +296,26 @@ class AcquisitionRun(Base):
         Index(
             "ix_acquisition_runs_workspace_connector_state", "workspace_id", "connector_id", "state"
         ),
+        Index(
+            "ix_acquisition_runs_workspace_connector_recovery",
+            "workspace_id",
+            "connector_id",
+            "superseded_at",
+            "state",
+            "created_at",
+        ),
+        Index(
+            "ix_acquisition_runs_workspace_state_updated",
+            "workspace_id",
+            "state",
+            "updated_at",
+        ),
+        Index(
+            "ix_acquisition_runs_workspace_superseded_updated",
+            "workspace_id",
+            "superseded_at",
+            "updated_at",
+        ),
         CheckConstraint("lease_generation >= 0", name="lease_generation_is_not_negative"),
         CheckConstraint(
             "discovered_count >= 0 AND acquired_count >= 0 AND indexed_count >= 0 "
@@ -300,6 +341,7 @@ class AcquisitionRecord(Base):
     connector_id: Mapped[str] = mapped_column(Text, nullable=False)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     source_id: Mapped[str] = mapped_column(Text, nullable=False)
+    marker_name: Mapped[str | None] = mapped_column(Text)
     source_record: Mapped[JsonValue] = mapped_column(JSON, nullable=False)
     state: Mapped[AcquisitionRecordState] = mapped_column(
         _acquisition_record_state_enum(),
@@ -329,6 +371,7 @@ class AcquisitionRecord(Base):
         UniqueConstraint("run_id", "source_id"),
         UniqueConstraint("run_id", "sequence"),
         Index("ix_acquisition_records_run_state_sequence", "run_id", "state", "sequence"),
+        Index("ix_acquisition_records_marker_name", "marker_name", unique=True),
         CheckConstraint(
             "sequence >= 0 AND attempts >= 0", name="acquisition_record_numbers_are_not_negative"
         ),

@@ -88,6 +88,24 @@ class AcquisitionDiagnostic(BaseModel):
     retryable: bool = True
 
 
+class AcquisitionFence(BaseModel):
+    """The persisted ownership generation authorizing one attempt-owned mutation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    run_id: str = Field(min_length=1)
+    owner: str = Field(min_length=1)
+    generation: int = Field(ge=1)
+    now: datetime
+
+    @model_validator(mode="after")
+    def _now_is_aware(self) -> Self:
+        if self.now.tzinfo is None:
+            msg = "acquisition fence time must be timezone-aware"
+            raise ValueError(msg)
+        return self
+
+
 class AcquisitionSource(BaseModel):
     """Everything learned at discovery that later acquisition/publication needs."""
 
@@ -193,6 +211,8 @@ class AcquisitionRun(BaseModel):
     candidate_watermark: Watermark | None = None
     enumeration_completed_at: datetime | None = None
     watermark_committed_at: datetime | None = None
+    superseded_at: datetime | None = None
+    superseded_by: str | None = None
     lease_owner: str | None = None
     lease_generation: int = Field(ge=0)
     lease_expires_at: datetime | None = None
@@ -231,6 +251,7 @@ __all__ = [
     "AcquiredSource",
     "AcquisitionDiagnostic",
     "AcquisitionFailureCode",
+    "AcquisitionFence",
     "AcquisitionRecord",
     "AcquisitionRecordState",
     "AcquisitionRun",

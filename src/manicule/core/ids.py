@@ -28,6 +28,11 @@ def content_hash(data: bytes | str) -> str:
     return _digest(data)
 
 
+def acquisition_marker_id(run_id: str, source_id: str) -> str:
+    """Filesystem/inventory key for one run-owned acquisition recovery marker."""
+    return hashlib.blake2b(f"{run_id}\0{source_id}".encode(), digest_size=20).hexdigest()
+
+
 def document_id(workspace_id: str, source: str, source_id: str) -> str:
     """A document's id: stable across re-ingest, unique across workspaces and connectors.
 
@@ -79,4 +84,11 @@ def glossary_entry_id(chunk_id_: str, acronym: str, expansion: str) -> str:
     return _digest("glossary", chunk_id_, acronym, expansion)
 
 
-__all__ = ["chunk_id", "content_hash", "document_id", "glossary_entry_id", "vector_id"]
+__all__ = [
+    "acquisition_marker_id",
+    "chunk_id",
+    "content_hash",
+    "document_id",
+    "glossary_entry_id",
+    "vector_id",
+]

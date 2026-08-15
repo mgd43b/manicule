@@ -7,28 +7,32 @@ import json
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.acquisition import (
     UNSET,
     AcquiredSource,
     AcquisitionDiagnostic,
+    AcquisitionFailureCode,
+    AcquisitionFence,
     AcquisitionRecord,
     AcquisitionRecordState,
     AcquisitionRun,
     AcquisitionRunState,
     AcquisitionSource,
+    AcquisitionStage,
     UnsetValue,
 )
-from manicule.core.errors import ManiculeError, UnknownEntityError
+from manicule.core.errors import AcquisitionLeaseLostError, ManiculeError, UnknownEntityError
+from manicule.core.ids import acquisition_marker_id
 from manicule.core.sources import Watermark
 from manicule.storage import models
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import utcnow
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from datetime import datetime
 
     from sqlalchemy import CursorResult
@@ -117,6 +121,8 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
         ),
         enumeration_completed_at=row.enumeration_completed_at,
         watermark_committed_at=row.watermark_committed_at,
+        superseded_at=row.superseded_at,
+        superseded_by=row.superseded_by,
         lease_owner=row.lease_owner,
         lease_generation=row.lease_generation,
         lease_expires_at=row.lease_expires_at,
@@ -208,6 +214,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         models.AcquisitionRun.workspace_id == self._workspace_id,
                         models.AcquisitionRun.connector_name == connector,
                         models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                        models.AcquisitionRun.superseded_at.is_(None),
                     )
                     .order_by(
                         models.AcquisitionRun.created_at.desc(), models.AcquisitionRun.id.desc()
@@ -216,6 +223,149 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 )
             ).scalar_one_or_none()
             return None if row is None else _run(row)
+
+    async def claim_or_create_acquisition_run(
+        self,
+        connector: str,
+        run_id: str,
+        owner: str,
+        *,
+        now: datetime,
+        expires_at: datetime,
+    ) -> AcquisitionRun | None:
+        """Select recovery work and acquire it in the same SQLite write transaction.
+
+        The idempotent connector write is the serialization point. Without it two processes can
+        both observe no unfinished run and create two enumerations from the same watermark.
+        Keeping selection, creation and claim behind one write lock makes a repeated sync either
+        the owner of the newest durable run or a clean loser.
+        """
+        if not connector or not run_id or not owner:
+            msg = "connector, run_id and owner must not be empty"
+            raise ValueError(msg)
+        if expires_at <= now:
+            msg = "lease expiry must be after now"
+            raise ValueError(msg)
+        async with self._sessions.begin() as session:
+            connector_id = f"{self._workspace_id}:{connector}"
+            # The insert is also the serialization point when this is the connector's first
+            # ever sync. A read followed by `_ensure_connector` would let both callers observe
+            # absence before either held SQLite's write lock.
+            await session.execute(
+                sqlite_insert(models.Connector)
+                .values(
+                    id=connector_id,
+                    workspace_id=self._workspace_id,
+                    name=connector,
+                    type=connector,
+                    config={},
+                )
+                .on_conflict_do_nothing(index_elements=[models.Connector.id])
+            )
+            connector_row = (
+                await session.execute(
+                    select(models.Connector).where(
+                        models.Connector.id == connector_id,
+                        models.Connector.workspace_id == self._workspace_id,
+                        models.Connector.name == connector,
+                        models.Connector.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if connector_row is None:
+                msg = f"connector {connector!r} is unavailable"
+                raise AcquisitionConflictError(msg)
+            candidates = (
+                (
+                    await session.execute(
+                        select(models.AcquisitionRun)
+                        .where(
+                            models.AcquisitionRun.workspace_id == self._workspace_id,
+                            models.AcquisitionRun.connector_id == connector_row.id,
+                            models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                            models.AcquisitionRun.superseded_at.is_(None),
+                        )
+                        .order_by(
+                            models.AcquisitionRun.created_at.desc(), models.AcquisitionRun.id.desc()
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            safe: list[models.AcquisitionRun] = []
+            for candidate in candidates:
+                base_is_current = candidate.base_watermark == connector_row.watermark
+                committed_is_current = (
+                    candidate.watermark_committed_at is not None
+                    and candidate.candidate_watermark == connector_row.watermark
+                )
+                if base_is_current or committed_is_current:
+                    safe.append(candidate)
+            # Ordering above makes the first safe run authoritative. Every other overlap is
+            # fenced in this same writer transaction, including an older live owner with the
+            # same base watermark. Leaving it active would preserve the duplicate-run race this
+            # API exists to reconcile on upgraded databases.
+            row = safe[0] if safe else None
+            superseded = [candidate for candidate in candidates if candidate is not row]
+            for candidate in superseded:
+                candidate.superseded_at = utcnow()
+                candidate.lease_owner = None
+                candidate.lease_expires_at = None
+                candidate.lease_generation += 1
+                candidate.updated_at = utcnow()
+            if row is None:
+                row = models.AcquisitionRun(
+                    id=run_id,
+                    workspace_id=self._workspace_id,
+                    connector_id=connector_row.id,
+                    connector_name=connector,
+                    state=AcquisitionRunState.ENUMERATING,
+                    base_watermark=connector_row.watermark,
+                    lease_owner=owner,
+                    lease_generation=1,
+                    lease_expires_at=expires_at,
+                    created_at=utcnow(),
+                    updated_at=utcnow(),
+                )
+                session.add(row)
+                for obsolete in superseded:
+                    obsolete.superseded_by = row.id
+                await session.flush()
+                return _run(row)
+            for obsolete in superseded:
+                obsolete.superseded_by = row.id
+            if row.lease_owner is not None and (
+                row.lease_expires_at is None or row.lease_expires_at > now
+            ):
+                return None
+            row.lease_owner = owner
+            row.lease_generation += 1
+            row.lease_expires_at = expires_at
+            row.updated_at = utcnow()
+            # A source call interrupted before it committed has no durable outcome, so replay it
+            # as retry work. INDEXING is already a precise recovery state and stays untouched:
+            # container indexing uses it to force re-expansion of partially published members.
+            interrupted = AcquisitionDiagnostic(
+                stage=AcquisitionStage.ACQUISITION,
+                code=AcquisitionFailureCode.INTERRUPTED,
+            ).model_dump(mode="json")
+            await session.execute(
+                update(models.AcquisitionRecord)
+                .where(
+                    models.AcquisitionRecord.run_id == row.id,
+                    models.AcquisitionRecord.workspace_id == self._workspace_id,
+                    models.AcquisitionRecord.state == AcquisitionRecordState.ACQUIRING,
+                )
+                .values(
+                    state=AcquisitionRecordState.RETRY,
+                    diagnostic=interrupted,
+                    updated_at=utcnow(),
+                )
+            )
+            await self._refresh_counters(session, row)
+            await session.flush()
+            return _run(row)
 
     async def append_acquisition_record(
         self,
@@ -253,6 +403,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         connector_id=run.connector_id,
                         sequence=sequence,
                         source_id=source.source_id,
+                        marker_name=acquisition_marker_id(run_id, source.source_id),
                         source_record=source_json,
                         state=AcquisitionRecordState.DISCOVERED,
                         created_at=utcnow(),
@@ -338,6 +489,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         models.AcquisitionRun.id == run_id,
                         models.AcquisitionRun.workspace_id == self._workspace_id,
                         models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                        models.AcquisitionRun.superseded_at.is_(None),
                         or_(
                             models.AcquisitionRun.lease_owner.is_(None),
                             models.AcquisitionRun.lease_expires_at <= now,
@@ -380,6 +532,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         models.AcquisitionRun.lease_generation == generation,
                         models.AcquisitionRun.lease_expires_at > now,
                         models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                        models.AcquisitionRun.superseded_at.is_(None),
                     )
                     .values(lease_expires_at=expires_at, updated_at=utcnow())
                 ),
@@ -407,11 +560,61 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         models.AcquisitionRun.lease_generation == generation,
                         models.AcquisitionRun.lease_expires_at > now,
                         models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                        models.AcquisitionRun.superseded_at.is_(None),
                     )
                     .values(lease_owner=None, lease_expires_at=None, updated_at=utcnow())
                 ),
             )
             return result.rowcount == 1
+
+    async def record_acquisition_run_metadata(
+        self,
+        run_id: str,
+        owner: str,
+        generation: int,
+        *,
+        now: datetime,
+        updates: Mapping[str, Any],
+        release: bool,
+    ) -> bool:
+        """Order connector diagnostics and optional release behind the run generation."""
+        values: dict[str, object] = {
+            "lease_generation": models.AcquisitionRun.lease_generation,
+            "updated_at": utcnow(),
+        }
+        if release:
+            values.update(lease_owner=None, lease_expires_at=None)
+        async with self._sessions.begin() as session:
+            matched = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.AcquisitionRun)
+                    .where(
+                        models.AcquisitionRun.id == run_id,
+                        models.AcquisitionRun.workspace_id == self._workspace_id,
+                        models.AcquisitionRun.lease_owner == owner,
+                        models.AcquisitionRun.lease_generation == generation,
+                        models.AcquisitionRun.lease_expires_at > now,
+                        models.AcquisitionRun.superseded_at.is_(None),
+                    )
+                    .values(**values)
+                ),
+            )
+            if matched.rowcount != 1:
+                return False
+            run = await self._required_run_row(session, run_id)
+            connector = await session.get(models.Connector, run.connector_id)
+            if connector is None:  # pragma: no cover - acquisition FK guarantees it
+                msg = f"connector for acquisition run {run_id!r} vanished"
+                raise RuntimeError(msg)
+            merged: dict[str, Any] = dict(cast("Any", connector.run_metadata) or {})
+            for key, value in updates.items():
+                if value is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
+            connector.run_metadata = cast("Any", merged)
+            return True
 
     async def transition_acquisition_run(
         self,
@@ -451,6 +654,11 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 if active:
                     msg = f"acquisition run {run_id!r} still has {active} active records"
                     raise AcquisitionConflictError(msg)
+            values: dict[str, object] = {
+                "state": target,
+                "diagnostic": (None if diagnostic is None else diagnostic.model_dump(mode="json")),
+                "updated_at": utcnow(),
+            }
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(
@@ -463,13 +671,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         models.AcquisitionRun.lease_generation == lease_generation,
                         models.AcquisitionRun.lease_expires_at > now,
                     )
-                    .values(
-                        state=target,
-                        diagnostic=(
-                            None if diagnostic is None else diagnostic.model_dump(mode="json")
-                        ),
-                        updated_at=utcnow(),
-                    )
+                    .values(**values)
                 ),
             )
             if result.rowcount != 1:
@@ -598,6 +800,78 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             ).scalar_one()
             return _record(row)
 
+    async def settle_unchanged_acquisition_record(
+        self,
+        run_id: str,
+        source_id: str,
+        document_id: str,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+        blob_ref: str | None = None,
+        fetched_version_token: str | None = None,
+    ) -> AcquisitionRecord:
+        """Commit unchanged coverage and presence under one generation-fenced writer lock."""
+        fence = AcquisitionFence(
+            run_id=run_id,
+            owner=lease_owner,
+            generation=lease_generation,
+            now=now,
+        )
+        async with self._sessions.begin() as session:
+            await self._fence_acquisition_mutation(session, fence)
+            values: dict[str, object] = {
+                "state": AcquisitionRecordState.UNCHANGED,
+                "fetched_version_token": fetched_version_token,
+                "diagnostic": None,
+                "updated_at": utcnow(),
+            }
+            if blob_ref is not None:
+                values["blob_ref"] = blob_ref
+            transitioned = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.AcquisitionRecord)
+                    .where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        models.AcquisitionRecord.workspace_id == self._workspace_id,
+                        models.AcquisitionRecord.source_id == source_id,
+                        models.AcquisitionRecord.state == AcquisitionRecordState.ACQUIRING,
+                    )
+                    .values(**values)
+                ),
+            )
+            if transitioned.rowcount != 1:
+                msg = f"acquisition record {source_id!r} state changed"
+                raise AcquisitionConflictError(msg)
+            seen = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.Document)
+                    .where(
+                        models.Document.id == document_id,
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.deleted_at.is_(None),
+                    )
+                    .values(last_seen_at=utcnow())
+                ),
+            )
+            if seen.rowcount != 1:
+                msg = f"unchanged document {document_id!r} is no longer live"
+                raise AcquisitionConflictError(msg)
+            run = await self._required_run_row(session, run_id)
+            await self._refresh_counters(session, run)
+            row = (
+                await session.execute(
+                    select(models.AcquisitionRecord).where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        models.AcquisitionRecord.source_id == source_id,
+                    )
+                )
+            ).scalar_one()
+            return _record(row)
+
     async def commit_acquisition_watermark(
         self,
         run_id: str,
@@ -670,6 +944,105 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 msg = "acquisition watermark commit raced another writer"
                 raise AcquisitionConflictError(msg)
             return True
+
+    async def cleanup_acquisition_history(self, cutoff: datetime, *, limit: int = 100) -> int:
+        """Remove old settled/superseded journal history in bounded batches.
+
+        Deleting a run cascades to its records. A retained blob becomes eligible for the
+        existing mark-and-sweep collector only when publications and version history also no
+        longer reference it. Active records exclude an authoritative settled run from cleanup;
+        they do not preserve a superseded run forever because its fenced work cannot progress.
+        """
+        if limit < 1:
+            msg = "cleanup limit must be positive"
+            raise ValueError(msg)
+        async with self._sessions.begin() as session:
+            run_ids = (
+                (
+                    await session.execute(
+                        select(models.AcquisitionRun.id)
+                        .where(
+                            models.AcquisitionRun.workspace_id == self._workspace_id,
+                            models.AcquisitionRun.updated_at < cutoff,
+                            ~exists(
+                                select(models.AcquisitionMarker.name).where(
+                                    models.AcquisitionMarker.run_id == models.AcquisitionRun.id
+                                )
+                            ),
+                            or_(
+                                models.AcquisitionRun.superseded_at.is_not(None),
+                                and_(
+                                    models.AcquisitionRun.state == AcquisitionRunState.SETTLED,
+                                    ~exists(
+                                        select(models.AcquisitionRecord.id).where(
+                                            models.AcquisitionRecord.run_id
+                                            == models.AcquisitionRun.id,
+                                            models.AcquisitionRecord.state.in_(
+                                                (
+                                                    AcquisitionRecordState.DISCOVERED,
+                                                    AcquisitionRecordState.ACQUIRING,
+                                                    AcquisitionRecordState.ACQUIRED,
+                                                    AcquisitionRecordState.INDEXING,
+                                                    AcquisitionRecordState.RETRY,
+                                                )
+                                            ),
+                                        )
+                                    ),
+                                ),
+                            ),
+                        )
+                        .order_by(models.AcquisitionRun.updated_at, models.AcquisitionRun.id)
+                        .limit(limit)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not run_ids:
+                return 0
+            result = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    delete(models.AcquisitionRun).where(
+                        models.AcquisitionRun.workspace_id == self._workspace_id,
+                        models.AcquisitionRun.id.in_(run_ids),
+                        or_(
+                            models.AcquisitionRun.state == AcquisitionRunState.SETTLED,
+                            models.AcquisitionRun.superseded_at.is_not(None),
+                        ),
+                    )
+                ),
+            )
+            return result.rowcount
+
+    async def _fence_acquisition_mutation(
+        self, session: AsyncSession, fence: AcquisitionFence
+    ) -> None:
+        """Take SQLite's writer lock while validating the exact durable generation.
+
+        Fenced document helpers call this as their transaction's first statement. Therefore a
+        takeover either commits before this check (and the mutation is refused) or waits until
+        the guarded mutation commits; there is no check-then-await window between the two.
+        """
+        result = cast(
+            "CursorResult[Any]",
+            await session.execute(
+                update(models.AcquisitionRun)
+                .where(
+                    models.AcquisitionRun.id == fence.run_id,
+                    models.AcquisitionRun.workspace_id == self._workspace_id,
+                    models.AcquisitionRun.lease_owner == fence.owner,
+                    models.AcquisitionRun.lease_generation == fence.generation,
+                    models.AcquisitionRun.lease_expires_at > fence.now,
+                    models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                    models.AcquisitionRun.superseded_at.is_(None),
+                )
+                .values(lease_generation=models.AcquisitionRun.lease_generation)
+            ),
+        )
+        if result.rowcount != 1:
+            msg = f"acquisition run {fence.run_id!r} lease changed or expired"
+            raise AcquisitionLeaseLostError(msg)
 
     async def _ensure_connector(self, session: AsyncSession, connector: str) -> models.Connector:
         row = (
@@ -760,7 +1133,8 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         now: datetime,
     ) -> None:
         if (
-            run.lease_owner != owner
+            run.superseded_at is not None
+            or run.lease_owner != owner
             or run.lease_generation != generation
             or run.lease_expires_at is None
             or run.lease_expires_at <= now

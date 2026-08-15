@@ -428,12 +428,15 @@ class LanceVectorStore:
             self._row(chunk, vector, fingerprint, publication_id)
             for chunk, vector in zip(chunks, vectors, strict=True)
         ]
-        await (
-            table.merge_insert(ID_COLUMN)
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(rows)
-        )
+        merge = table.merge_insert(ID_COLUMN)
+        if publication_id == LEGACY_PUBLICATION:
+            # Compatibility callers reuse logical ids and therefore still require replacement.
+            merge = merge.when_matched_update_all()
+        # Content-addressed publication ids include the vectors themselves. Their physical rows
+        # are immutable: a stale acquisition generation may finish an external write after
+        # takeover, but it can neither overwrite the successor's identical generation nor make
+        # the row servable without the transaction-fenced relational pointer flip.
+        await merge.when_not_matched_insert_all().execute(rows)
 
     async def delete_document(self, document_id: str) -> None:
         """Remove every vector belonging to a document. Idempotent."""

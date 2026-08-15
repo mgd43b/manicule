@@ -813,6 +813,24 @@ Blob retention also writes a run-and-record-keyed staging envelope before the jo
 if the process stops in that narrow window, takeover recovers the staged hash and fetched source
 envelope instead of downloading the body again. The marker is removed only after the fenced
 `ACQUIRED` transition commits and pins the same blob.
+Every new marker is registered in an indexed relational inventory before either its blob or
+marker file can exist. Blob sweep conditionally rechecks every relational root in the same
+transaction that deletes a candidate, closing the candidate-selection race. If
+the process dies after association but before unlink, a bounded reconciliation page compares
+run/source identity, blob hash and acquired envelope with the journal; an exact match makes the
+marker redundant. A superseded run's marker is removed even when the association never
+committed, because its incremented generation can never resume. History cleanup excludes every
+run still named by the inventory, so it cannot erase the evidence before either decision.
+Authoritative pre-association markers remain resumable; explicit markers whose owning run has
+been cascade-deleted are removed rather than becoming permanent GC roots.
+
+Older marker files are admitted to the inventory in bounded directory pages and matched to
+journal records in one batched query, including legacy payloads without run/source fields by
+checking their hashed run-and-source key. Until a complete legacy pass finishes, history cleanup
+and blob collection fail closed. Unmatched legacy files receive a 30-day safe-harbor entry and
+then expire; indexed marker blob references participate directly in GC's SQL mark set. No sync
+or inventory call walks the directory or performs one query per marker. Legacy ownership is
+looked up by the marker-name index, so one page cannot expand into unbounded source history.
 Durable staging writes are joined before task cancellation returns. A process death can still
 leave a temporary staging file; acquisition startup and blob inventory remove only day-old
 partials from a partial-only directory, in genuinely bounded batches whose report contains
@@ -1663,10 +1681,49 @@ documents happened to publish before the process stopped:
 3. A crash before that point leaves the run visibly incomplete; a crash after it preserves the
    complete inventory and candidate.
 
-Claiming an old lease and deciding whether to resume an incomplete enumeration or continue a
-completed run is recovery orchestration, not part of cursor decoupling. A fresh invocation may
-still re-enumerate from the committed connector watermark; change detection makes that safe.
-The durable rows ensure this is an explicit policy choice rather than lost process memory.
+Recovery is automatic at the production pipeline boundary. Selection and claim are one SQLite
+write transaction: the newest safe unfinished run is authoritative, every other overlapping
+legacy run is superseded and generation-fenced in that same transaction, or a new run is created
+and claimed. Two simultaneous sync requests therefore cannot both observe absence and open
+independent source cursors, and an upgraded database cannot retain an older live owner beside
+the selected run. A live lease on the one authoritative run makes the second caller a clean
+loser. An expired or orderly-released lease increments the generation; every later journal
+mutation and every publication boundary is fenced by that generation. A source call left in
+`acquiring` becomes retry work at takeover, while `indexing` remains the exact checkpoint needed
+to replay partially expanded containers from retained bytes without source access.
+
+An unchanged-token result is one fenced transaction too: it moves the journal record to
+`unchanged` and refreshes the indexed document's `last_seen_at` under the same writer lock. A
+takeover cannot land between durable coverage and presence bookkeeping. The public `last_run`
+diagnostic is likewise written under the exact run generation; on an orderly return that write
+and lease release are one transaction. A stale worker may return its own in-memory report, but
+it cannot overwrite the successor's connector diagnostic.
+
+The pipeline's renewal immediately before publication is only a fast failure and lease refresh;
+it is not the publication lock. Every attempt-owned relational mutation starts its own SQLite
+transaction with a conditional write that validates workspace, run, owner, generation, expiry,
+unsettled state and non-supersession. That first statement takes the writer lock through the
+document, status, annotation, lineage, glossary or tombstone mutation. A takeover therefore
+commits before the guard and the stale write is refused, or waits until the guarded transaction
+commits—there is no awaited check-then-write gap.
+
+Enumeration, acquisition and indexing each run with an independent lease heartbeat. Their task
+groups are children of the sync call, cancellation stops admission and joins every task within
+the configured grace period, and no worker survives return. Different connectors hold different
+run leases and can progress independently; every claim and record predicate remains workspace
+scoped.
+
+The retention policy is positive-state and deliberately asymmetric. Incomplete enumeration,
+`retry`, `acquired`, and `indexing` records on the authoritative run are retained without an age
+cutoff because they are recovery input. When a newer successful run has already advanced beyond
+an older unfinished base watermark, recovery records `superseded_at` and the replacement run
+id, then increments the older generation before starting from the current position. That older
+backlog can never progress after fencing, so superseded history becomes eligible for bounded
+30-day cleanup even when its records have active-state names. Settled journal history has the
+same retention period, but a malformed settled run with active records is preserved. Deleting
+eligible history releases only its acquisition references. Blob GC still
+uses its full publication/version/acquisition mark set, so a blob is removed only after no live
+publication, history row, acquisition record, or staging marker names it.
 
 **Where the new watermark comes from, which this document did not say.** `Connector.discover`
 *took* a position and nothing returned one, so a pipeline written to the protocol alone could
