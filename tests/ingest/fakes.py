@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import override
 
+from manicule.connectors import CursorExpiredError
 from manicule.core.anchors import LineAnchor
 from manicule.core.content import (
     BlockKind,
@@ -1052,6 +1053,89 @@ class ObservedConnector(DictConnector):
     async def fetch(self, ref: DocRef) -> RawDocument:
         async with self.fetching.holding():
             return await super().fetch(ref)
+
+
+class ManualClock:
+    """A monotonic clock advanced by a test, never by wall time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Move time forward by exactly ``seconds`` without sleeping."""
+        self.now += seconds
+
+
+class ExpiringCursorConnector(ObservedConnector):
+    """A paginated source whose next cursor expires while its consumer is suspended.
+
+    This is deliberately a source-level fixture rather than a Confluence fake. It isolates the
+    contract at the pipeline boundary: a page response issues its next cursor, yielding the
+    page suspends inside ``discover``, and asking for the following page validates how long the
+    consumer held that cursor. The manual clock and :attr:`cursor_issued` event make every
+    transition test-controlled.
+    """
+
+    def __init__(
+        self,
+        documents: Mapping[str, str],
+        *,
+        clock: ManualClock,
+        page_size: int,
+        cursor_lifetime_seconds: float,
+    ) -> None:
+        super().__init__(documents, name="synthetic-cursor-source")
+        self.clock = clock
+        self.page_size = page_size
+        self.cursor_lifetime_seconds = cursor_lifetime_seconds
+        self.cursor_issued = asyncio.Event()
+        self.cursors_issued = 0
+
+    @property
+    @override
+    def watermark(self) -> Watermark:
+        return Watermark(
+            value="synthetic-position-1",
+            observed_at=datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
+        )
+
+    @override
+    async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+        del watermark
+        source_ids = sorted(self.documents)
+        for start in range(0, len(source_ids), self.page_size):
+            page = source_ids[start : start + self.page_size]
+            has_next = start + self.page_size < len(source_ids)
+            received_at = self.clock()
+            if has_next:
+                self.cursors_issued += 1
+                self.cursor_issued.set()
+
+            for source_id in page:
+                self.yields += 1
+                self.yielded.release()
+                yield DiscoveredDoc(
+                    ref=DocRef(
+                        source_id=source_id,
+                        uri=f"https://source.example.test/documents/{source_id}",
+                    ),
+                    version_token=self.tokens.get(
+                        source_id, content_hash(self.documents[source_id])
+                    ),
+                    media_type=self.media_types.get(source_id, MEDIA_TYPE),
+                )
+
+            if has_next:
+                held = self.clock() - received_at
+                if held > self.cursor_lifetime_seconds:
+                    msg = (
+                        f"a synthetic search cursor was held for {held:.0f}s, longer than its "
+                        f"{self.cursor_lifetime_seconds:.0f}s lifetime"
+                    )
+                    raise CursorExpiredError(msg)
 
 
 # --- middleware --------------------------------------------------------------------------------

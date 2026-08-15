@@ -334,6 +334,51 @@ async def test_discovery_stops_pulling_the_source_when_the_stages_are_full() -> 
     )
 
 
+async def test_downstream_backpressure_expires_the_cursor_before_the_next_page() -> None:
+    """Characterize the coupling that durable source acquisition must remove.
+
+    The first page has more records than the bounded stages can hold. Once embedding is parked,
+    discovery is suspended while holding the cursor for page two. Advancing a manual clock past
+    its lifetime and opening the embed gate proves that ordinary downstream backpressure becomes
+    a typed source-enumeration failure. No scheduler timing participates in the result.
+
+    When issue #175's durable journal boundary lands, this test should be extended to prove that
+    admission continues independently of indexing and inverted to require a complete run.
+    """
+    clock = fakes.ManualClock()
+    embedder = fakes.GatedEmbedder()
+    pipeline, store, _ = build(
+        embedder=embedder, fetch_concurrency=2, parse_workers=1, queue_depth_factor=1
+    )
+    connector = fakes.ExpiringCursorConnector(
+        corpus(40, prefix="synthetic-doc"),
+        clock=clock,
+        page_size=16,
+        cursor_lifetime_seconds=60.0,
+    )
+
+    run = asyncio.create_task(pipeline.run(connector))
+    await connector.cursor_issued.wait()
+    await embedder.gate.wait_for(1)
+    for _ in range(BLOCKED_YIELDS):
+        await connector.yielded.acquire()
+
+    assert connector.yields == BLOCKED_YIELDS
+    clock.advance(61.0)
+    embedder.gate.open()
+    report = await run
+
+    assert report.error_type == "CursorExpiredError"
+    assert report.error_message == (
+        "a synthetic search cursor was held for 61s, longer than its 60s lifetime"
+    )
+    assert not report.enumeration_completed
+    assert not report.watermark_advanced
+    assert report.stages.fetch_queue.blocked_puts > 0
+    assert store.watermarks == {}
+    assert connector.cursors_issued == 1
+
+
 async def test_the_documents_held_in_memory_stay_within_the_configured_bounds() -> None:
     """ "Do not accumulate the complete fetched corpus in memory", as a number.
 
