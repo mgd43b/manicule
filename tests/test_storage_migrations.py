@@ -65,6 +65,35 @@ async def test_the_models_and_the_migrations_agree(engine: AsyncEngine) -> None:
 
 
 @pytest.mark.contract
+async def test_marker_name_index_upgrades_from_already_applied_inventory_revision(
+    data_dir: Path,
+) -> None:
+    """The successor must upgrade a database that already recorded e83 as applied."""
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="e83a21f96c40")
+        async with engine.connect() as connection:
+            before = (
+                await connection.execute(text("PRAGMA table_info(acquisition_records)"))
+            ).all()
+        assert "marker_name" not in {row[1] for row in before}
+
+        await upgrade(engine)
+        async with engine.connect() as connection:
+            after = (
+                await connection.execute(text("PRAGMA table_info(acquisition_records)"))
+            ).all()
+            indexes = (
+                await connection.execute(text("PRAGMA index_list(acquisition_records)"))
+            ).all()
+        assert "marker_name" in {row[1] for row in after}
+        assert "ix_acquisition_records_marker_name" in {row[1] for row in indexes}
+        assert await current(engine) == head_revision()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
 async def test_every_revision_downgrades_and_upgrades_back_to_the_same_schema(
     data_dir: Path,
 ) -> None:

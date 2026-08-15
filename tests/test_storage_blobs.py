@@ -505,6 +505,35 @@ async def test_sweep_atomically_rechecks_marker_created_after_candidate_selectio
     assert await blobs.get(stored.hash) == raw.as_bytes()
 
 
+async def test_sweep_final_lock_rechecks_blob_row_recreated_by_ordinary_put(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """A normal put recreating the row in the delete/unlink gap keeps the physical bytes."""
+    row_deleted = asyncio.Event()
+    release_unlink = asyncio.Event()
+
+    class GatedBlobStore(BlobStore):
+        @override
+        async def _unlink_blob_if_still_unreferenced(self, digest: str) -> bool:
+            row_deleted.set()
+            await release_unlink.wait()
+            return await super()._unlink_blob_if_still_unreferenced(digest)
+
+    blobs = GatedBlobStore(engine, data_dir)
+    payload = b"ordinary put race"
+    stored = await blobs.put(payload, "text/plain")
+    assert isinstance(stored, StoredBlob)
+
+    collection = asyncio.create_task(blobs.collect_garbage())
+    await asyncio.wait_for(row_deleted.wait(), timeout=5)
+    recreated = await blobs.put(payload, "text/plain")
+    assert isinstance(recreated, StoredBlob)
+    release_unlink.set()
+
+    assert await collection == []
+    assert await blobs.get(stored.hash) == payload
+
+
 async def test_conflicting_marker_retry_preserves_durable_evidence_and_repairs_stale_inventory(
     engine: AsyncEngine, data_dir: Path
 ) -> None:
@@ -548,6 +577,63 @@ async def test_conflicting_marker_retry_preserves_durable_evidence_and_repairs_s
             )
         ).scalar_one()
     assert inventory_ref == new_blob.hash
+
+
+async def test_inventory_only_crash_allows_newer_serialized_retry(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    key = "inventory-only-run\0inventory-only-source"
+    old = RawDocument(
+        source_id="inventory-only-source",
+        uri="memory:inventory-only-source",
+        media_type="text/plain",
+        content=b"inventory old",
+    )
+    new = old.model_copy(update={"content": b"inventory new"})
+    await blobs.retain_acquisition(key, old)
+    marker = blobs._stage_path(key)  # pyright: ignore[reportPrivateUsage]
+    marker.unlink()
+
+    retained = await blobs.retain_acquisition(key, new)
+
+    assert retained[0].ref == content_hash(b"inventory new")
+    assert await blobs.resume_acquisition(key) == retained
+
+
+async def test_old_missing_marker_for_authoritative_run_survives_reconcile_retry_race(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    await store.create_acquisition_run("authoritative-run", "authoritative-connector")
+    key = "authoritative-run\0authoritative-source"
+    old = RawDocument(
+        source_id="authoritative-source",
+        uri="memory:authoritative-source",
+        media_type="text/plain",
+        content=b"authoritative old",
+    )
+    new = old.model_copy(update={"content": b"authoritative new"})
+    await blobs.retain_acquisition(key, old)
+    blobs._stage_path(key).unlink()  # pyright: ignore[reportPrivateUsage]
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE acquisition_markers SET created_at = :old "
+                "WHERE run_id = 'authoritative-run'"
+            ),
+            {"old": "2020-01-01 00:00:00.000000"},
+        )
+
+    retried, _reconciled = await asyncio.gather(
+        blobs.retain_acquisition(key, new),
+        blobs.reconcile_acquisition_markers(),
+    )
+
+    assert retried[0].ref == content_hash(b"authoritative new")
+    assert await blobs.resume_acquisition(key) == retried
 
 
 async def test_preassociation_marker_supersession_releases_only_the_fenced_blob(

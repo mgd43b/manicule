@@ -7,7 +7,6 @@ Create Date: 2026-08-15
 
 from __future__ import annotations
 
-import hashlib
 from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
@@ -25,34 +24,6 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.add_column("acquisition_records", sa.Column("marker_name", sa.Text(), nullable=True))
-    connection = op.get_bind()
-    cursor = ""
-    while True:
-        records = connection.execute(
-            sa.text(
-                "SELECT id, run_id, source_id FROM acquisition_records "
-                "WHERE id > :cursor ORDER BY id LIMIT 1000"
-            ),
-            {"cursor": cursor},
-        ).fetchall()
-        if not records:
-            break
-        for record_id, run_id, source_id in records:
-            marker_name = hashlib.blake2b(
-                f"{run_id}\0{source_id}".encode(), digest_size=20
-            ).hexdigest()
-            connection.execute(
-                sa.text("UPDATE acquisition_records SET marker_name = :marker WHERE id = :id"),
-                {"marker": marker_name, "id": record_id},
-            )
-        cursor = records[-1][0]
-    op.create_index(
-        "ix_acquisition_records_marker_name",
-        "acquisition_records",
-        ["marker_name"],
-        unique=True,
-    )
     op.create_table(
         "acquisition_markers",
         sa.Column("name", sa.Text(), nullable=False),
@@ -78,5 +49,3 @@ def downgrade() -> None:
     op.drop_index("ix_acquisition_markers_blob_ref", table_name="acquisition_markers")
     op.drop_index("ix_acquisition_markers_run_id", table_name="acquisition_markers")
     op.drop_table("acquisition_markers")
-    op.drop_index("ix_acquisition_records_marker_name", table_name="acquisition_records")
-    op.drop_column("acquisition_records", "marker_name")

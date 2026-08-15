@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import gzip
 import hashlib
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice
@@ -268,25 +269,31 @@ class BlobStore:
     async def _record_blob(self, stored: StoredBlob, media_type: str | None) -> None:
         """Make SQLite describe the immutable representation that is already on disk."""
         async with self._sessions.begin() as session:
-            await session.execute(
-                sqlite_insert(models.Blob)
-                .values(
-                    hash=stored.hash,
-                    algo="blake2b",
-                    media_type=media_type,
-                    size_bytes=stored.size_bytes,
-                    stored_bytes=stored.stored_bytes,
-                    compression=stored.compression,
-                )
-                .on_conflict_do_update(
-                    index_elements=[models.Blob.hash],
-                    set_={
-                        "size_bytes": stored.size_bytes,
-                        "stored_bytes": stored.stored_bytes,
-                        "compression": stored.compression,
-                    },
-                )
+            await self._record_blob_in_session(session, stored, media_type)
+
+    @staticmethod
+    async def _record_blob_in_session(
+        session: AsyncSession, stored: StoredBlob, media_type: str | None
+    ) -> None:
+        await session.execute(
+            sqlite_insert(models.Blob)
+            .values(
+                hash=stored.hash,
+                algo="blake2b",
+                media_type=media_type,
+                size_bytes=stored.size_bytes,
+                stored_bytes=stored.stored_bytes,
+                compression=stored.compression,
             )
+            .on_conflict_do_update(
+                index_elements=[models.Blob.hash],
+                set_={
+                    "size_bytes": stored.size_bytes,
+                    "stored_bytes": stored.stored_bytes,
+                    "compression": stored.compression,
+                },
+            )
+        )
 
     async def _store_blob(self, data: bytes, media_type: str | None) -> StoredBlob:
         digest = content_hash(data)
@@ -353,35 +360,74 @@ class BlobStore:
             "run_id": run_id if separator else None,
             "source_id": source_id if separator else None,
         }
-        await self._record_marker(self._stage_name(key), marker, legacy=False)
-        stored = await self._durable_thread_call(
-            lambda: self._published_blob(
-                self.path_for(acquired.content_hash),
-                data,
-                acquired.content_hash,
-                compression,
-            )
-        )
-        marker["compression"] = stored.compression
-        payload = json.dumps(
-            marker,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        try:
-            await self._durable_thread_call(
-                lambda: self._write_durable(
-                    self._stage_path(key), payload, temporary_dir=self._stage_partial_root()
+        name = self._stage_name(key)
+        async with self._marker_locks([name]):
+            await self._record_marker(name, marker, legacy=False)
+            stored = await self._durable_thread_call(
+                lambda: self._published_blob(
+                    self.path_for(acquired.content_hash),
+                    data,
+                    acquired.content_hash,
+                    compression,
                 )
             )
-        except BaseException:
-            # Cancellation is propagated only after the joined thread reaches a known endpoint.
-            # If it published the marker, its inventory must survive the canceled coroutine.
-            if not self._stage_path(key).exists():
-                await self._forget_markers([self._stage_name(key)])
-            raise
-        await self._record_blob(stored, raw.media_type)
+            marker["compression"] = stored.compression
+            payload = json.dumps(
+                marker,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            try:
+                await self._durable_thread_call(
+                    lambda: self._write_durable(
+                        self._stage_path(key), payload, temporary_dir=self._stage_partial_root()
+                    )
+                )
+            except BaseException:
+                if not self._stage_path(key).exists():
+                    await self._forget_markers([name])
+                raise
+            await self._record_blob(stored, raw.media_type)
         return Retention(ref=stored.hash), acquired
+
+    @contextlib.asynccontextmanager
+    async def _marker_locks(self, names: Sequence[str]) -> AsyncGenerator[None]:
+        """Cross-process per-marker locks spanning inventory and physical publication."""
+        unique_names = sorted(set(names))
+
+        def acquire() -> list[int]:
+            root = self._root / "acquisition-locks"
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptors: list[int] = []
+            try:
+                for name in unique_names:
+                    descriptor = os.open(root / name, os.O_CREAT | os.O_RDWR, 0o600)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    descriptors.append(descriptor)
+            except BaseException:
+                self._release_marker_locks(descriptors)
+                raise
+            return descriptors
+
+        work = asyncio.create_task(asyncio.to_thread(acquire))
+        try:
+            descriptors = await asyncio.shield(work)
+        except asyncio.CancelledError:
+            descriptors = await work
+            await asyncio.to_thread(self._release_marker_locks, descriptors)
+            raise
+        try:
+            yield
+        finally:
+            await asyncio.to_thread(self._release_marker_locks, descriptors)
+
+    @staticmethod
+    def _release_marker_locks(descriptors: Sequence[int]) -> None:
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
     async def _record_marker(
         self,
@@ -391,47 +437,60 @@ class BlobStore:
         legacy: bool,
         created_at: datetime | None = None,
     ) -> None:
+        async with self._sessions.begin() as session:
+            await self._record_marker_in_session(
+                session, name, payload, legacy=legacy, created_at=created_at
+            )
+
+    async def _record_marker_in_session(
+        self,
+        session: AsyncSession,
+        name: str,
+        payload: dict[str, object],
+        *,
+        legacy: bool,
+        created_at: datetime | None,
+    ) -> None:
         proposed = self._marker_identity(payload)
         path = self._root / "acquisition-staging" / name
-        async with self._sessions.begin() as session:
-            # A no-op conditional write is the serialization point for retries of one key.
-            await session.execute(
-                update(models.AcquisitionMarker)
-                .where(models.AcquisitionMarker.name == name)
-                .values(name=models.AcquisitionMarker.name)
-            )
-            existing = await session.get(models.AcquisitionMarker, name)
-            if existing is None:
-                session.add(
-                    models.AcquisitionMarker(
-                        name=name,
-                        run_id=cast("str | None", payload.get("run_id")),
-                        source_id=cast("str | None", payload.get("source_id")),
-                        blob_ref=cast("str | None", payload.get("blob_ref")),
-                        acquired_source=cast("Any", payload.get("acquired_source")),
-                        legacy=legacy,
-                        created_at=created_at or datetime.now(UTC),
-                    )
+        # A no-op conditional write is the serialization point for retries of one key.
+        await session.execute(
+            update(models.AcquisitionMarker)
+            .where(models.AcquisitionMarker.name == name)
+            .values(name=models.AcquisitionMarker.name)
+        )
+        existing = await session.get(models.AcquisitionMarker, name)
+        if existing is None:
+            session.add(
+                models.AcquisitionMarker(
+                    name=name,
+                    run_id=cast("str | None", payload.get("run_id")),
+                    source_id=cast("str | None", payload.get("source_id")),
+                    blob_ref=cast("str | None", payload.get("blob_ref")),
+                    acquired_source=cast("Any", payload.get("acquired_source")),
+                    legacy=legacy,
+                    created_at=created_at or datetime.now(UTC),
                 )
-                return
-            current = (
-                existing.run_id,
-                existing.source_id,
-                existing.blob_ref,
-                cast("object", existing.acquired_source),
             )
-            if current == proposed:
-                return
-            disk = await self._physical_marker_identity(path)
-            if disk != proposed:
-                msg = f"acquisition marker {name!r} conflicts with durable recovery evidence"
-                raise RuntimeError(msg)
-            existing.run_id = cast("str | None", payload.get("run_id"))
-            existing.source_id = cast("str | None", payload.get("source_id"))
-            existing.blob_ref = cast("str | None", payload.get("blob_ref"))
-            existing.acquired_source = cast("Any", payload.get("acquired_source"))
-            existing.legacy = legacy
-            existing.created_at = created_at or datetime.now(UTC)
+            return
+        current = (
+            existing.run_id,
+            existing.source_id,
+            existing.blob_ref,
+            cast("object", existing.acquired_source),
+        )
+        if current == proposed:
+            return
+        disk = await self._physical_marker_identity(path)
+        if disk is not None and disk != proposed:
+            msg = f"acquisition marker {name!r} conflicts with durable recovery evidence"
+            raise RuntimeError(msg)
+        existing.run_id = cast("str | None", payload.get("run_id"))
+        existing.source_id = cast("str | None", payload.get("source_id"))
+        existing.blob_ref = cast("str | None", payload.get("blob_ref"))
+        existing.acquired_source = cast("Any", payload.get("acquired_source"))
+        existing.legacy = legacy
+        existing.created_at = created_at or datetime.now(UTC)
 
     @staticmethod
     def _marker_identity(
@@ -635,60 +694,74 @@ class BlobStore:
 
     async def _reconcile_marker_page(self) -> None:
         async with self._sessions() as session:
-            rows = (
+            names = (
                 await session.execute(
-                    select(
-                        models.AcquisitionMarker,
-                        models.AcquisitionRun.id,
-                        models.AcquisitionRun.superseded_at,
-                        models.AcquisitionRecord.blob_ref,
-                        models.AcquisitionRecord.acquired_source,
-                    )
-                    .outerjoin(
-                        models.AcquisitionRun,
-                        models.AcquisitionRun.id == models.AcquisitionMarker.run_id,
-                    )
-                    .outerjoin(
-                        models.AcquisitionRecord,
-                        and_(
-                            models.AcquisitionRecord.run_id == models.AcquisitionMarker.run_id,
-                            models.AcquisitionRecord.source_id
-                            == models.AcquisitionMarker.source_id,
-                        ),
-                    )
+                    select(models.AcquisitionMarker.name)
                     .where(models.AcquisitionMarker.name > self._marker_cursor)
                     .order_by(models.AcquisitionMarker.name)
                     .limit(STAGING_MARKER_RECONCILE_LIMIT)
                 )
-            ).all()
-        if not rows:
+            ).scalars().all()
+        if not names:
             self._marker_cursor = ""
             return
-        remove: list[str] = []
-        cutoff = datetime.now(UTC) - LEGACY_MARKER_RETENTION
-        for marker, joined_run_id, superseded_at, record_blob_ref, record_acquired_source in rows:
-            path = self._root / "acquisition-staging" / marker.name
-            exact_association = (
-                marker.blob_ref is not None
-                and marker.blob_ref == record_blob_ref
-                and cast("object", marker.acquired_source) == record_acquired_source
-            )
-            expired_orphan = marker.run_id is None and marker.created_at < cutoff
-            missing_owner = marker.run_id is not None and joined_run_id is None
-            expired_missing_file = not path.exists() and marker.created_at < cutoff
-            removable = (
-                missing_owner
-                or superseded_at is not None
-                or exact_association
-                or expired_orphan
-                or expired_missing_file
-            )
-            if not removable:
-                continue
-            await self._durable_thread_call(lambda path=path: self._unlink_durable(path))
-            remove.append(marker.name)
-        await self._forget_markers(remove)
-        self._marker_cursor = rows[-1][0].name
+        async with self._marker_locks(names):
+            async with self._sessions() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            models.AcquisitionMarker,
+                            models.AcquisitionRun.id,
+                            models.AcquisitionRun.superseded_at,
+                            models.AcquisitionRecord.blob_ref,
+                            models.AcquisitionRecord.acquired_source,
+                        )
+                        .outerjoin(
+                            models.AcquisitionRun,
+                            models.AcquisitionRun.id == models.AcquisitionMarker.run_id,
+                        )
+                        .outerjoin(
+                            models.AcquisitionRecord,
+                            and_(
+                                models.AcquisitionRecord.run_id
+                                == models.AcquisitionMarker.run_id,
+                                models.AcquisitionRecord.source_id
+                                == models.AcquisitionMarker.source_id,
+                            ),
+                        )
+                        .where(models.AcquisitionMarker.name.in_(names))
+                        .order_by(models.AcquisitionMarker.name)
+                    )
+                ).all()
+            remove: list[str] = []
+            cutoff = datetime.now(UTC) - LEGACY_MARKER_RETENTION
+            for (
+                marker,
+                joined_run_id,
+                superseded_at,
+                record_blob_ref,
+                record_acquired_source,
+            ) in rows:
+                path = self._root / "acquisition-staging" / marker.name
+                exact_association = (
+                    marker.blob_ref is not None
+                    and marker.blob_ref == record_blob_ref
+                    and cast("object", marker.acquired_source) == record_acquired_source
+                )
+                expired_orphan = marker.run_id is None and marker.created_at < cutoff
+                missing_owner = marker.run_id is not None and joined_run_id is None
+                removable = (
+                    missing_owner
+                    or superseded_at is not None
+                    or exact_association
+                    or expired_orphan
+                )
+                if not removable:
+                    continue
+                await self._durable_thread_call(lambda path=path: self._unlink_durable(path))
+                remove.append(marker.name)
+            await self._forget_markers(remove)
+        self._marker_cursor = names[-1]
 
     async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None:
         """Recover a staged blob/envelope pair without contacting its source."""
@@ -836,6 +909,7 @@ class BlobStore:
                         exists().where(models.DocumentVersion.original_ref == digest),
                         exists().where(models.AcquisitionRecord.blob_ref == digest),
                         exists().where(models.AcquisitionMarker.blob_ref == digest),
+                        exists().where(models.Blob.hash == digest),
                     )
                 )
             ).one()
