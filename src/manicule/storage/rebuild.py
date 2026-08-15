@@ -93,9 +93,19 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
-def _generation_id(workspace_id: str, snapshot_run_id: str, target_digest: str) -> str:
+def _generation_id(
+    workspace_id: str,
+    snapshot_run_id: str,
+    target_digest: str,
+    publication_identity_digest: str = "",
+) -> str:
     digest = hashlib.blake2b(digest_size=20)
-    for value in (workspace_id, snapshot_run_id, target_digest):
+    for value in (
+        workspace_id,
+        snapshot_run_id,
+        target_digest,
+        publication_identity_digest,
+    ):
         encoded = value.encode()
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
@@ -177,7 +187,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             engine, workspace_id=workspace_id, sessions=sessions
         )
 
-    async def plan_rebuild(
+    async def plan_rebuild(  # noqa: PLR0912 - bounded plan validates each refusal boundary
         self, snapshot_run_id: str, target: RebuildTarget, *, missing_limit: int
     ) -> RebuildEstimate:
         run = await self._acquisition.get_acquisition_run(snapshot_run_id)
@@ -239,47 +249,91 @@ class SqliteRebuildStore(WorkspaceScoped):
 
         target_json = target.model_dump(mode="json")
         target_digest = hashlib.sha256(_canonical(target_json)).hexdigest()
-        generation_id = _generation_id(self._workspace_id, snapshot_run_id, target_digest)
+        publication_identity_digest = hashlib.sha256(
+            _canonical(
+                {
+                    "vector_table": expected_vector_table,
+                    "vector_inventory_digest": expected_vector_inventory_digest,
+                }
+            )
+        ).hexdigest()
+        generation_id = _generation_id(
+            self._workspace_id,
+            snapshot_run_id,
+            target_digest,
+            publication_identity_digest,
+        )
         now = utcnow()
         async with self._sessions.begin() as session:
-            await session.execute(
-                sqlite_insert(models.DerivedGeneration)
-                .values(
-                    id=generation_id,
-                    workspace_id=self._workspace_id,
-                    snapshot_run_id=snapshot_run_id,
-                    target_digest=target_digest,
-                    target=target_json,
-                    snapshot_membership_hash=run.membership_hash,
-                    expected_item_count=documents,
-                    state=RebuildState.PLANNED,
-                    next_sequence=0,
-                    documents_built=0,
-                    chunks_built=0,
-                    vectors_reused=0,
-                    vectors_embedded=0,
-                    vector_publication_id=None,
-                    expected_vector_table=expected_vector_table,
-                    expected_vector_inventory_digest=expected_vector_inventory_digest,
-                    lease_generation=0,
-                    diagnostic_count=0,
-                    created_at=now,
-                    updated_at=now,
+            # A successful publication changes the live inventory digest by design. Recognize
+            # that exact resulting corpus before constructing a new identity, so repeating the
+            # same dry-run or run is idempotent instead of conflicting with its own result.
+            published = (
+                await session.execute(
+                    select(models.DerivedGeneration)
+                    .where(
+                        models.DerivedGeneration.workspace_id == self._workspace_id,
+                        models.DerivedGeneration.snapshot_run_id == snapshot_run_id,
+                        models.DerivedGeneration.target_digest == target_digest,
+                        models.DerivedGeneration.state == RebuildState.PUBLISHED,
+                        models.DerivedGeneration.expected_vector_table == expected_vector_table,
+                        models.DerivedGeneration.published_vector_inventory_digest
+                        == expected_vector_inventory_digest,
+                    )
+                    .order_by(models.DerivedGeneration.published_at.desc())
+                    .limit(1)
                 )
-                .on_conflict_do_nothing(
-                    index_elements=[
-                        models.DerivedGeneration.workspace_id,
-                        models.DerivedGeneration.snapshot_run_id,
-                        models.DerivedGeneration.target_digest,
-                    ]
+            ).scalar_one_or_none()
+            if published is not None:
+                generation_id = published.id
+            else:
+                await session.execute(
+                    sqlite_insert(models.DerivedGeneration)
+                    .values(
+                        id=generation_id,
+                        workspace_id=self._workspace_id,
+                        snapshot_run_id=snapshot_run_id,
+                        target_digest=target_digest,
+                        publication_identity_digest=publication_identity_digest,
+                        target=target_json,
+                        snapshot_membership_hash=run.membership_hash,
+                        expected_item_count=documents,
+                        state=RebuildState.PLANNED,
+                        next_sequence=0,
+                        documents_built=0,
+                        chunks_built=0,
+                        vectors_reused=0,
+                        vectors_embedded=0,
+                        vector_publication_id=None,
+                        expected_vector_table=expected_vector_table,
+                        expected_vector_inventory_digest=expected_vector_inventory_digest,
+                        lease_generation=0,
+                        diagnostic_count=0,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=[
+                            models.DerivedGeneration.workspace_id,
+                            models.DerivedGeneration.snapshot_run_id,
+                            models.DerivedGeneration.target_digest,
+                            models.DerivedGeneration.publication_identity_digest,
+                        ]
+                    )
                 )
-            )
             generation = await self._required_generation(session, generation_id)
             if (
                 generation.snapshot_membership_hash != run.membership_hash
                 or generation.expected_item_count != documents
-                or generation.expected_vector_table != expected_vector_table
-                or generation.expected_vector_inventory_digest != expected_vector_inventory_digest
+                or (
+                    generation.state is not RebuildState.PUBLISHED
+                    and (
+                        generation.expected_vector_table != expected_vector_table
+                        or generation.expected_vector_inventory_digest
+                        != expected_vector_inventory_digest
+                        or generation.publication_identity_digest != publication_identity_digest
+                    )
+                )
             ):
                 raise RuntimeError("an existing rebuild plan names different snapshot evidence")
 
@@ -839,6 +893,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             state.embed_fingerprint = target.embedding_fingerprint
             state.fts_tokenizer = target.fts_tokenizer
             state.vector_inventory_digest = await self._live_chunk_inventory_digest(session)
+            generation.published_vector_inventory_digest = state.vector_inventory_digest
             generation.state = RebuildState.PUBLISHED
             generation.published_at = now
             generation.updated_at = now

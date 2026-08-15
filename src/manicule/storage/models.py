@@ -1338,6 +1338,7 @@ class DerivedGeneration(Base):
     snapshot_membership_hash: Mapped[str] = mapped_column(Text, nullable=False)
     expected_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
     target_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    publication_identity_digest: Mapped[str] = mapped_column(Text, nullable=False)
     target: Mapped[JsonValue] = mapped_column(JSON, nullable=False)
     state: Mapped[RebuildState] = mapped_column(
         _rebuild_state_enum(), nullable=False, default=RebuildState.PLANNED
@@ -1350,6 +1351,7 @@ class DerivedGeneration(Base):
     vector_publication_id: Mapped[str | None] = mapped_column(Text)
     expected_vector_table: Mapped[str | None] = mapped_column(Text)
     expected_vector_inventory_digest: Mapped[str | None] = mapped_column(Text)
+    published_vector_inventory_digest: Mapped[str | None] = mapped_column(Text)
     fence_generation: Mapped[int | None] = mapped_column(Integer)
     lease_owner: Mapped[str | None] = mapped_column(Text)
     lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -1364,7 +1366,11 @@ class DerivedGeneration(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "workspace_id", "snapshot_run_id", "target_digest", name="uq_derived_generation_plan"
+            "workspace_id",
+            "snapshot_run_id",
+            "target_digest",
+            "publication_identity_digest",
+            name="uq_derived_generation_plan",
         ),
         Index("ix_derived_generations_workspace_state", "workspace_id", "state"),
         Index(

@@ -1517,7 +1517,12 @@ a second connector promoted after planning therefore cannot create mixed global 
 
 `derived_generations` records the immutable snapshot and target identities, its canonical
 membership hash and expected item count, resource bounds, forward-only state and checkpoint
-counters. Planning remains `PLANNED`; only a successful owner claim enters `BUILDING`, and dry
+counters. Its unique plan identity also includes the bound live vector table and inventory
+digest, so a #187 pointer swap leaves a pristine stale plan inert and a retry can create a new
+generation against the winner. Publication records the resulting inventory digest; while that
+exact result remains live, repeating the same dry run or run returns the published generation
+idempotently rather than planning its own output again. Planning remains `PLANNED`; only a
+successful owner claim enters `BUILDING`, and dry
 run or missing-input refusal never claims a worker lease. Each claim has an expiry, renewable
 owner token, lease generation and monotonically allocated scope fence. An expired lease may be
 taken over, but its former owner cannot checkpoint or publish; publication also refuses any

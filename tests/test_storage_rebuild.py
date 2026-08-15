@@ -14,17 +14,19 @@ from manicule.core.acquisition import (
     AcquisitionSource,
 )
 from manicule.core.anchors import Unlocated
-from manicule.core.content import Chunk, DocumentStatus, RawDocument
+from manicule.core.content import Chunk, Document, DocumentStatus, RawDocument
 from manicule.core.embedding import EmbedFingerprint, Pooling
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import chunk_id, content_hash
 from manicule.core.rebuild import (
     DerivedReplacement,
+    RebuildCheckpoint,
     RebuildRefusalCode,
     RebuildState,
     RebuildTarget,
 )
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
+from manicule.ingest.rebuild import OfflineDeriver, OfflineGenerationRebuilder
 from manicule.storage import models
 from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.storage.docstore import SqliteDocStore
@@ -127,6 +129,159 @@ async def promoted_snapshot(
         now=NOW,
     )
     return run.id, blob.hash, raw
+
+
+async def publish_one_replacement(
+    rebuilds: SqliteRebuildStore,
+    vectors: LanceVectorStore,
+    *,
+    estimate_id: str,
+    target: RebuildTarget,
+    document: Document,
+    raw: RawDocument,
+    blob_ref: str,
+    owner: str,
+) -> RebuildCheckpoint:
+    """Stage and publish one retained snapshot member for composition regressions."""
+    claimed = await rebuilds.claim_generation(
+        estimate_id,
+        owner,
+        now=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    replacement_document = document.model_copy(
+        update={
+            "publication_id": estimate_id,
+            "content_hash": content_hash(raw.as_bytes()),
+            "version_token": "v2",
+            "status": DocumentStatus.INDEXED,
+            "original_ref": blob_ref,
+        }
+    )
+    replacement_chunk = Chunk(
+        id=chunk_id(replacement_document.id, 0, raw.as_text()),
+        document_id=replacement_document.id,
+        text=raw.as_text(),
+        embed_text=raw.as_text(),
+        anchor=Unlocated(reason="plain text"),
+        position=0,
+        token_count=3,
+    )
+    replacement = DerivedReplacement(
+        document=replacement_document,
+        chunks=(replacement_chunk,),
+        parse_fingerprint="plain@2",
+        vector_embedded=1,
+    )
+    await vectors.upsert(
+        [replacement_chunk],
+        [[1.0, 0.0, 0.0, 0.0]],
+        publication_id=claimed.vector_publication_id,
+    )
+    await rebuilds.stage_replacements(
+        estimate_id,
+        [(0, replacement)],
+        expected_next_sequence=0,
+        owner=owner,
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    await rebuilds.begin_validation(
+        estimate_id,
+        owner=owner,
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    await rebuilds.validate_generation(estimate_id)
+    return await rebuilds.publish_generation(
+        estimate_id,
+        owner=owner,
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+
+
+async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempotent(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run_id, blob_ref, raw = await promoted_snapshot(store, engine, data_dir)
+    old = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=b"old text",
+        uri=raw.uri,
+        media_type=raw.media_type,
+    ).model_copy(update={"original_ref": blob_ref})
+    await store.upsert_document(old)
+    await store.replace_chunks(old.id, [make_chunk(old, 0, "old text")])
+    embed = EmbedFingerprint(
+        model_id="test/embed",
+        dimension=4,
+        pooling=Pooling.MEAN,
+        normalized=True,
+        tokenizer_id="test/tokenizer",
+        max_sequence_length=128,
+    )
+    target = RebuildTarget(
+        parser_routing="routing-v2",
+        parser_set=("plain@2",),
+        chunk_fingerprint="chunk-v2",
+        embedding_fingerprint=embed.canonical(),
+        glossary_fingerprint="glossary-v2",
+        fts_tokenizer="unicode61",
+        batch_documents=1,
+        max_memory_bytes=1_000_000,
+        max_temporary_bytes=1_000_000,
+    )
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    stale = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    sessions = session_factory(engine)
+    async with sessions.begin() as session:
+        state = await session.get(models.IndexState, 1)
+        if state is None:
+            session.add(
+                models.IndexState(
+                    id=1,
+                    vector_table="reembed-winner",
+                    vector_inventory_digest="winner-inventory",
+                )
+            )
+        else:
+            state.vector_table = "reembed-winner"
+            state.vector_inventory_digest = "winner-inventory"
+
+    winner = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    assert winner.generation_id != stale.generation_id
+    published = await publish_one_replacement(
+        rebuilds,
+        vectors,
+        estimate_id=winner.generation_id,
+        target=target,
+        document=old,
+        raw=raw,
+        blob_ref=blob_ref,
+        owner="winner-worker",
+    )
+    assert published.state is RebuildState.PUBLISHED
+
+    runner = OfflineGenerationRebuilder(
+        store=rebuilds,
+        blobs=BlobStore(engine, data_dir),
+        deriver=cast("OfflineDeriver", object()),
+    )
+    repeated = await runner.dry_run(run_id, target, missing_limit=10)
+    assert repeated.generation_id == winner.generation_id
+    replay = await runner.run(run_id, target, owner="replay-worker")
+    assert replay.state is RebuildState.PUBLISHED
 
 
 async def test_second_connector_promotion_fences_a_single_scope_rebuild(

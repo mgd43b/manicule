@@ -1,7 +1,7 @@
 """durable derived-generation rebuilds
 
 Revision ID: 71be92f03ad4
-Revises: 4d8f12a6bc91
+Revises: 7a9c31e4d2b6
 Create Date: 2026-08-15
 """
 
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 revision: str = "71be92f03ad4"
-down_revision: str | Sequence[str] | None = "4d8f12a6bc91"
+down_revision: str | Sequence[str] | None = "7a9c31e4d2b6"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -32,6 +32,7 @@ def upgrade() -> None:
         sa.Column("snapshot_membership_hash", sa.Text(), nullable=False),
         sa.Column("expected_item_count", sa.Integer(), nullable=False),
         sa.Column("target_digest", sa.Text(), nullable=False),
+        sa.Column("publication_identity_digest", sa.Text(), nullable=False),
         sa.Column("target", sa.JSON(), nullable=False),
         sa.Column(
             "state",
@@ -56,6 +57,7 @@ def upgrade() -> None:
         sa.Column("vector_publication_id", sa.Text(), nullable=True),
         sa.Column("expected_vector_table", sa.Text(), nullable=True),
         sa.Column("expected_vector_inventory_digest", sa.Text(), nullable=True),
+        sa.Column("published_vector_inventory_digest", sa.Text(), nullable=True),
         sa.Column("fence_generation", sa.Integer(), nullable=True),
         sa.Column("lease_owner", sa.Text(), nullable=True),
         sa.Column("lease_generation", sa.Integer(), nullable=False),
@@ -85,6 +87,7 @@ def upgrade() -> None:
             "workspace_id",
             "snapshot_run_id",
             "target_digest",
+            "publication_identity_digest",
             name="uq_derived_generation_plan",
         ),
     )
