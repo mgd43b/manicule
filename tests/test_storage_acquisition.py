@@ -11,11 +11,13 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from manicule.core.acquisition import (
+    AcquiredSource,
     AcquisitionRecordState,
     AcquisitionRun,
     AcquisitionRunState,
     AcquisitionSource,
 )
+from manicule.core.content import RawDocument
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.storage.acquisition import (
     AcquisitionConflictError,
@@ -56,6 +58,17 @@ def _source(source_id: str = "page-1", *, uri: str | None = None) -> Acquisition
         discovered,
         source_modified_at=datetime(2026, 8, 15, 12, tzinfo=UTC),
         provenance={"source_kind": "synthetic"},
+    )
+
+
+def _acquired(data: bytes, source_id: str = "page-1") -> AcquiredSource:
+    return AcquiredSource.from_raw(
+        RawDocument(
+            source_id=source_id,
+            uri=f"https://example.test/pages/{source_id}",
+            media_type="text/html",
+            content=data,
+        )
     )
 
 
@@ -659,6 +672,7 @@ async def test_acquired_blob_is_not_garbage_and_does_not_publish_a_document(
         lease_generation=lease.lease_generation,
         now=_NOW,
         blob_ref=stored.hash,
+        acquired_source=_acquired(b"new unpublished revision"),
         fetched_version_token="v1",  # noqa: S106 - source revision, not a credential
     )
 

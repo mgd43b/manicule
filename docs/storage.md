@@ -232,7 +232,7 @@ managed, not modeled.
 | `index_state` | One row recording the fingerprints and the derived-index names this data directory was built with. §6.3. |
 | `vector_tombstones` | Chunk IDs deleted from SQLite whose vectors have not yet been swept from LanceDB. §8.2. |
 | `acquisition_runs` | Durable connector-run lifecycle, base and candidate watermarks, generation-fenced lease, completion markers and bounded aggregate counters, including unchanged source coverage separately from indexed work. It separates discovering source coverage from publishing derived content. |
-| `acquisition_records` | One idempotent source identity per run, with the validated fetch snapshot, acquisition/indexing state and retained-blob reference. Acquired and indexing states require that reference; unchanged remains a distinct terminal provenance state. A source record is acknowledged only after this row commits. |
+| `acquisition_records` | One idempotent source identity per run, with the validated fetched envelope, acquisition/indexing state and retained-blob reference. Acquired and indexing states require the blob; the acquired transition also stores the fetched URI, media type, encoding, metadata, byte length and content hash atomically. Unchanged remains a distinct terminal provenance state. A discovery record is acknowledged only after this row commits. |
 | `glossary_entries` | Definitions detected in document chunks, with their display form, expansion, location and confidence. The document/chunk foreign keys keep citations authoritative. |
 | `glossary_aliases` | Normalized alternate lookup keys for glossary entries. A composite key prevents duplicate aliases and cascading deletion keeps them tied to their definition. |
 
@@ -1830,7 +1830,10 @@ into an answer by the side door.
 The original twenty tables, their constraints and their indexes shipped with the initial
 schema. Later revisions add lineage and publication state, and the durable-acquisition revision
 adds `acquisition_runs` and `acquisition_records` without synthesizing backlog for an existing
-index. Its downgrade refuses while any run is unsettled or any record remains active/retryable.
+index. A following additive revision gives each acquired record its validated source envelope;
+the body remains in content-addressed storage while the envelope preserves the fetched URI,
+media type, encoding, metadata, byte length and hash needed to reconstruct `RawDocument`
+offline. Its downgrade refuses while any run is unsettled or any record remains active/retryable.
 Once all work is settled it may discard that completed diagnostic journal history; publications
 and retained bytes referenced by them remain governed by their own tables. This makes rollback
 possible without ever turning it into an implicit deletion of durable backlog. `alembic check`

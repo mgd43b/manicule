@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from manicule.core.acquisition import (
     UNSET,
+    AcquiredSource,
     AcquisitionDiagnostic,
     AcquisitionFailureCode,
     AcquisitionRecord,
@@ -131,6 +132,7 @@ __all__ = [
     "NEEDS_ATTENTION",
     "SETTLED",
     "UNSET",
+    "AcquiredSource",
     "AcquisitionDiagnostic",
     "AcquisitionFailureCode",
     "AcquisitionRecord",

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, override
 import pytest
 from sqlalchemy import text
 
-from manicule.connectors import CursorExpiredError
+from manicule.connectors import CursorExpiredError, NotFoundError, SessionExpiredError
 from manicule.core.acquisition import AcquisitionRecord, AcquisitionRecordState, AcquisitionRunState
 from manicule.core.content import (
     IN_FLIGHT,
@@ -793,6 +793,8 @@ async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(
 
 async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(
     store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
 ) -> None:
     """A 1,000-record source reaches its true end while embedding is still parked.
 
@@ -806,6 +808,7 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     pipeline = IngestPipeline(
         store=store,
         acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
         chunker=chunker,
         embedder=embedder,
         vectors=fakes.MemoryVectors(),
@@ -841,6 +844,9 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     assert connector.pages_requested == 10
     assert clock.now == pytest.approx(0.19)
     assert len(await store.list_acquisition_records(durable.id, limit=3)) == 3
+    assert await store.get_watermark(connector.name) == connector.watermark, (
+        "source coverage is checkpointed before the parked embedder completes"
+    )
 
     embedder.gate.open()
     report = await task
@@ -866,6 +872,8 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
 
 async def test_crash_during_enumeration_keeps_only_the_committed_prefix(
     store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
 ) -> None:
     connector = fakes.PausedEnumerationConnector(
         {f"public-doc-{number}": f"line {number}" for number in range(10)},
@@ -875,6 +883,7 @@ async def test_crash_during_enumeration_keeps_only_the_committed_prefix(
     pipeline = IngestPipeline(
         store=store,
         acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
         chunker=chunker,
         embedder=HashEmbedder(),
         vectors=fakes.MemoryVectors(),
@@ -903,6 +912,7 @@ async def test_crash_during_enumeration_keeps_only_the_committed_prefix(
 
 async def test_crash_after_enumeration_preserves_the_marker_records_and_candidate(
     engine: AsyncEngine,
+    data_dir: Path,
 ) -> None:
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
 
@@ -938,11 +948,13 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
         cursor_lifetime_seconds=0.5,
     )
     chunker = fakes.BlockChunker()
+    blobs = BlobStore(engine, data_dir)
 
     def pipeline() -> IngestPipeline:
         return IngestPipeline(
             store=store,
             acquisitions=store,
+            blobs=blobs,
             chunker=chunker,
             embedder=HashEmbedder(),
             vectors=fakes.MemoryVectors(),
@@ -996,6 +1008,8 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
 
 async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
     store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
 ) -> None:
     class DuplicateSource(fakes.DictConnector):
         def __init__(self) -> None:
@@ -1033,6 +1047,7 @@ async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
     pipeline = IngestPipeline(
         store=store,
         acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
         chunker=chunker,
         embedder=HashEmbedder(),
         vectors=fakes.MemoryVectors(),
@@ -1060,6 +1075,8 @@ async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
 
 async def test_expired_worker_is_fenced_before_publication_after_takeover(
     store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
 ) -> None:
     """An embed begun by one generation cannot publish after a successor takes the run."""
     lease_clock = fakes.ManualLeaseClock()
@@ -1071,6 +1088,7 @@ async def test_expired_worker_is_fenced_before_publication_after_takeover(
     pipeline = IngestPipeline(
         store=store,
         acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
         chunker=chunker,
         embedder=embedder,
         vectors=fakes.MemoryVectors(),
@@ -1266,6 +1284,7 @@ async def test_takeover_fences_hash_skip_and_failure_demotion(
 
 async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_write(
     engine: AsyncEngine,
+    data_dir: Path,
 ) -> None:
     """A valid tombstone stage is not authority for a later vector write after takeover."""
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
@@ -1293,6 +1312,7 @@ async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_writ
     pipeline = IngestPipeline(
         store=store,
         acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
         chunker=chunker,
         embedder=HashEmbedder(),
         vectors=vectors,
@@ -1325,10 +1345,10 @@ async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_writ
     assert vectors.rows == {}, "the stale worker wrote vectors after its staged-store await"
 
 
-async def test_takeover_between_failure_annotation_and_upsert_fences_the_status_write(
+async def test_acquisition_failure_does_not_mutate_the_prior_document(
     engine: AsyncEngine,
 ) -> None:
-    """A valid failure annotation is not authority for a later failed-status upsert."""
+    """Source failure belongs to the journal; the published document is not a fetch ledger."""
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
     from tests.storage_helpers import make_document  # noqa: PLC0415
 
@@ -1336,13 +1356,11 @@ async def test_takeover_between_failure_annotation_and_upsert_fences_the_status_
         def __init__(self) -> None:
             super().__init__(engine)
             self.annotated = asyncio.Event()
-            self.release_annotation = asyncio.Event()
 
         @override
         async def annotate(self, document_id: str, updates: Mapping[str, Any]) -> None:
             await super().annotate(document_id, updates)
             self.annotated.set()
-            await self.release_annotation.wait()
 
     store = GatedAnnotationStore()
     await store.ensure_workspace()
@@ -1360,7 +1378,6 @@ async def test_takeover_between_failure_annotation_and_upsert_fences_the_status_
             body=b"original line",
         ).model_copy(update={"version_token": "original-token"})
     )
-    lease_clock = fakes.ManualLeaseClock()
     chunker = fakes.BlockChunker()
     pipeline = IngestPipeline(
         store=store,
@@ -1372,36 +1389,28 @@ async def test_takeover_between_failure_annotation_and_upsert_fences_the_status_
         resolve_chain=lambda _: ["lines"],
         middleware=MiddlewareRunner(()),
         chunk_fingerprint=chunker.fingerprint,
-        acquisition_lease_s=300,
-        acquisition_clock=lease_clock,
         detect_glossary=False,
     )
 
-    task = asyncio.create_task(pipeline.run(connector))
-    await store.annotated.wait()
+    report = await pipeline.run(connector)
     durable = await store.latest_unsettled_acquisition_run(connector.name)
     assert durable is not None
-    lease_clock.advance(301)
-    successor = await store.claim_acquisition_run(
-        durable.id,
-        "successor-demotion-attempt",
-        now=lease_clock(),
-        expires_at=lease_clock() + timedelta(seconds=300),
-    )
-    assert successor is not None
-    store.release_annotation.set()
-
-    report = await task
     after = await store.get_document(existing.id)
+    record = (await store.list_acquisition_records(durable.id))[0]
 
-    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert report.error_type == ""
+    assert not store.annotated.is_set()
+    assert record.state is AcquisitionRecordState.RETRY
+    assert record.diagnostic is not None
+    assert record.diagnostic.code.value == "fetch_failed"
     assert after is not None
-    assert after.status is DocumentStatus.FETCHING
-    assert "last_ingest_error" in after.metadata
+    assert after == existing
 
 
 async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
     store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
 ) -> None:
     connector = fakes.PausedEnumerationConnector(
         {f"public-doc-{number}": f"line {number}" for number in range(10)},
@@ -1412,6 +1421,7 @@ async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
     pipeline = IngestPipeline(
         store=store,
         acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
         chunker=chunker,
         embedder=HashEmbedder(),
         vectors=fakes.MemoryVectors(),
@@ -1446,6 +1456,141 @@ async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
     assert same_run.id == durable.id
     assert same_run.discovered_count == 3
     assert len(await store.list_acquisition_records(durable.id)) == 3
+
+
+async def test_crash_after_snapshot_association_resumes_without_source_access(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """Once ACQUIRED is durable, even a crash during embedding cannot cause a re-download."""
+    connector = fakes.DictConnector(
+        {"public-resumable": "public retained source bytes"}, name="resumable-source"
+    )
+    lease_clock = fakes.ManualLeaseClock()
+    blobs = BlobStore(engine, data_dir)
+    gated = fakes.GatedEmbedder()
+    chunker = fakes.BlockChunker()
+
+    def pipeline(embedder: HashEmbedder | fakes.GatedEmbedder) -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=blobs,
+            chunker=chunker,
+            embedder=embedder,
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            acquisition_clock=lease_clock,
+            acquisition_lease_s=1,
+            shutdown_grace_s=0,
+            detect_glossary=False,
+        )
+
+    task = asyncio.create_task(pipeline(gated).run(connector))
+    await gated.gate.wait_for(1)
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    records = await store.list_acquisition_records(durable.id)
+    assert len(records) == 1
+    assert records[0].blob_ref is not None
+    assert records[0].acquired_source is not None
+    fetches_before = list(connector.fetches)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    connector.fail_fetch.add("public-resumable")
+    lease_clock.advance(2)
+
+    resumed = await pipeline(HashEmbedder()).run(connector)
+
+    assert connector.fetches == fetches_before
+    assert resumed.indexed == 1
+    stored = await store.find_document(connector.name, "public-resumable")
+    assert stored is not None
+    assert stored.original_ref == records[0].blob_ref
+
+
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        (SessionExpiredError("synthetic session expired"), "authentication"),
+        (NotFoundError("synthetic source document disappeared"), "source_deleted"),
+    ],
+)
+async def test_typed_acquisition_failures_block_source_coverage_without_publication(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    failure: Exception,
+    code: str,
+) -> None:
+    class RefusingConnector(fakes.DictConnector):
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            del ref
+            raise failure
+
+    connector = RefusingConnector({"public-refused": "never returned"}, name="refusing-source")
+    chunker = fakes.BlockChunker()
+    report = await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    ).run(connector)
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    record = (await store.list_acquisition_records(durable.id))[0]
+    assert record.state is AcquisitionRecordState.RETRY
+    assert record.diagnostic is not None
+    assert record.diagnostic.code.value == code
+    assert record.blob_ref is None
+    assert not report.watermark_advanced
+    assert await store.find_document(connector.name, "public-refused") is None
+
+
+async def test_fetched_newer_revision_is_the_snapshot_and_publication_version(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    connector = fakes.DictConnector({"public-moving": "newer public bytes"}, name="moving-source")
+    connector.tokens["public-moving"] = "revision-4"
+    connector.metadata["public-moving"] = {"version_token": "revision-5"}
+    chunker = fakes.BlockChunker()
+    report = await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    ).run(connector)
+
+    stored = await store.find_document(connector.name, "public-moving")
+    assert report.indexed == 1
+    assert stored is not None
+    assert stored.version_token == "revision-5"  # noqa: S105 - synthetic source revision
+    runs = await store.latest_unsettled_acquisition_run(connector.name)
+    assert runs is None
 
 
 async def test_a_re_parse_reads_retained_bytes_rather_than_the_network(

@@ -12,6 +12,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.acquisition import (
     UNSET,
+    AcquiredSource,
     AcquisitionDiagnostic,
     AcquisitionRecord,
     AcquisitionRecordState,
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
 
 _WATERMARK = TypeAdapter(Watermark)
 _SOURCE = TypeAdapter(AcquisitionSource)
+_ACQUIRED_SOURCE = TypeAdapter(AcquiredSource)
 _DIAGNOSTIC = TypeAdapter(AcquisitionDiagnostic)
 
 _RUN_TRANSITIONS: dict[AcquisitionRunState, set[AcquisitionRunState]] = {
@@ -140,6 +142,11 @@ def _record(row: models.AcquisitionRecord) -> AcquisitionRecord:
         source=_SOURCE.validate_python(row.source_record),
         state=row.state,
         blob_ref=row.blob_ref,
+        acquired_source=(
+            None
+            if row.acquired_source is None
+            else _ACQUIRED_SOURCE.validate_python(row.acquired_source)
+        ),
         fetched_version_token=row.fetched_version_token,
         attempts=row.attempts,
         diagnostic=(
@@ -472,7 +479,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             ).scalars()
             return [_record(row) for row in rows]
 
-    async def transition_acquisition_record(
+    async def transition_acquisition_record(  # noqa: PLR0912 - validates one atomic state edge
         self,
         run_id: str,
         source_id: str,
@@ -483,6 +490,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         lease_generation: int,
         now: datetime,
         blob_ref: str | None = None,
+        acquired_source: AcquiredSource | None = None,
         fetched_version_token: str | UnsetValue | None = UNSET,
         diagnostic: AcquisitionDiagnostic | None = None,
     ) -> AcquisitionRecord:
@@ -493,6 +501,16 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         if target is AcquisitionRecordState.ACQUIRED and blob_ref is None:
             msg = "an acquired record requires a retained blob reference"
             raise InvalidAcquisitionTransitionError(msg)
+        if target is AcquisitionRecordState.ACQUIRED and acquired_source is None:
+            msg = "an acquired record requires its complete retained source envelope"
+            raise InvalidAcquisitionTransitionError(msg)
+        if acquired_source is not None:
+            if acquired_source.source_id != source_id:
+                msg = "the acquired source identity does not match the journal record"
+                raise InvalidAcquisitionTransitionError(msg)
+            if blob_ref is not None and acquired_source.content_hash != blob_ref:
+                msg = "the acquired source hash does not match its retained blob"
+                raise InvalidAcquisitionTransitionError(msg)
         async with self._sessions.begin() as session:
             run = await self._required_run_row(session, run_id)
             self._require_live_lease(run, lease_owner, lease_generation, now)
@@ -524,6 +542,8 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 values["attempts"] = models.AcquisitionRecord.attempts + 1
             if blob_ref is not None:
                 values["blob_ref"] = blob_ref
+            if acquired_source is not None:
+                values["acquired_source"] = acquired_source.model_dump(mode="json")
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(

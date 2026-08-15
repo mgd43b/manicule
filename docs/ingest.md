@@ -736,15 +736,13 @@ is the quantity that actually maps to memory.
 > ever overlapped was **one**. `queue_depth_factor` and `shutdown_grace_s` were configurable and
 > read by nothing. What follows is what the code now does.
 
-**Durable enumeration, then three local stages joined by two bounded hand-offs.** Every bound
+**Durable enumeration, bounded acquisition, then local derivation.** Every bound
 below comes from configuration; none is derived from how many tasks happen to exist.
 
-The journal path is explicitly wired through the pipeline's `acquisitions` handle. SQLite
-implementing that protocol does not enable it by structural detection: until retained-byte
-acquisition replaces the transitional direct-fetch consumer, automatic activation would expose
-a half-complete multi-step rollout. The explicit path is complete for the work it performs: it
-resumes completed inventories, settles processed records and closes the run before publishing
-the legacy post-index watermark.
+The journal path is explicitly wired through the pipeline's `acquisitions` handle. Its source
+checkpoint is independent of parsing and publication: every current revision is either proved
+unchanged or retained and associated with its complete fetched source envelope before the
+candidate watermark can become the connector watermark.
 
 ```
 discover → acquisition journal             one task; commit before advancing
@@ -752,6 +750,10 @@ discover → acquisition journal             one task; commit before advancing
    │  fetch hand-off      depth = queue_depth_factor × fetch_concurrency
    ▼
 fetch × fetch_concurrency                  change detection (level 1), then the network
+   │  fsync + hash + journal association
+   ▼
+acquired source snapshot                  committed source watermark after full coverage
+   │  bounded local blob reader
    │  parse hand-off      depth = queue_depth_factor × ingest workers
    ▼
 ingest × (parse_workers + 1)               parse in the pool, chunk, embed under one
@@ -773,9 +775,11 @@ sits idle behind it for the length of every forward pass. Not `+ 2` or more: pas
 extra workers only queue for the same accelerator, and each one is holding a fetched body in
 memory while it waits.
 
-**Level-1 change detection sits in the fetch stage, after durable discovery.** It is what avoids
-the fetch, so it belongs on the same side of the journal boundary as fetch. An unchanged corpus
-moves through this stage at the speed of the store and never reaches the parse hand-off.
+**Level-1 change detection sits in acquisition, after durable discovery.** It is what avoids the
+fetch. Changed bytes are content-addressed, fsynced and bound to the journal record before the
+record becomes acquired. The fetched URI, media type, encoding, metadata, byte length and hash
+are stored with that record, so later derivation reconstructs the connector result without the
+connector. A fetched revision newer than discovery is recorded as the acquired revision.
 
 **One document is never in two stages.** The concurrency is between documents. A document's
 record, chunks, glossary and vectors are published under the keyed lock in §8.4 and guarded by
@@ -795,10 +799,17 @@ the next record. On true iterator exhaustion it atomically records the completio
 the connector's candidate watermark. A limit, cancellation, cursor/source failure or journal
 admission failure leaves that marker absent.
 
-Only after enumeration stops does a sequence-paged journal reader feed the local pipeline. When
-embed falls behind, the ingest workers block on the embedding lock, the parse hand-off fills,
-the fetch workers block on `put`, and the journal reader blocks on the fetch hand-off. The source
-cursor is already gone. Slow local work therefore cannot turn into an expired pagination cursor.
+Only after enumeration stops does a sequence-paged journal reader feed bounded acquisition
+workers. Once every item has coverage, `commit_acquisition_watermark` atomically checks the
+complete inventory and publishes the candidate watermark. A second bounded reader then loads
+and verifies journal-owned blobs for parsing. When embed falls behind, only this local reader is
+blocked; the source cursor is already gone and the source checkpoint is already safe.
+
+A crash after the acquired record commits resumes from its blob without another body request.
+Authentication loss before that point leaves a typed retry and withholds the watermark;
+authentication loss afterwards cannot block parsing, embedding or publication because those
+phases make no connector calls. Missing, stale and deleted source bodies likewise remain typed
+acquisition retries and cannot publish older bytes.
 
 **The most a run holds in memory**, with the defaults on a four-core machine — where
 `default_worker_count()` is `min(4, cpu_count - 1)` = 3, so there are four ingest workers:
