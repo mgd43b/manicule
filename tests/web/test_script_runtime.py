@@ -25,6 +25,7 @@ globalThis.location = {reload() {}};
 let source = fs.readFileSync(process.argv[1], "utf8");
 const start = "  startTheme();\n  startPalette();\n  startChat();\n  startActions();";
 const expose = "  globalThis.hooks = { json: json, runAction: runAction, " +
+               "reloadAfterChange: reloadAfterChange, " +
                "readEventStream: readEventStream, startChat: startChat };";
 if (!source.includes(start)) { throw new Error("script startup marker moved"); }
 source = source.replace(start, expose);
@@ -135,6 +136,62 @@ console.log(JSON.stringify({
     }
 
 
+def test_a_later_queued_failure_preserves_an_earlier_successful_reload() -> None:
+    """A committed mutation is refreshed only after the later refusal has remained visible."""
+    result = run_javascript(
+        r"""
+const delays = [];
+let reloads = 0;
+window.location.reload = () => { reloads += 1; };
+window.setTimeout = (callback, delay) => {
+  delays.push(delay);
+  queueMicrotask(callback);
+  return delays.length;
+};
+window.clearTimeout = () => {};
+function element() {
+  return {
+    attrs: {}, disabled: false, textContent: "",
+    setAttribute(k, v) { this.attrs[k] = v; },
+    getAttribute(k) { return this.attrs[k] || null; },
+    removeAttribute(k) { delete this.attrs[k]; },
+  };
+}
+const status = element();
+const first = element();
+const second = element();
+const history = [];
+let visible = "";
+Object.defineProperty(status, "textContent", {
+  get() { return visible; },
+  set(value) { visible = value; history.push(value); }
+});
+const succeeded = hooks.runAction(first, status, "First…", () => Promise.resolve({
+  status: 200, envelope: {ok: true}
+}), (response, node) => hooks.reloadAfterChange(response, node, "First changed."));
+const failed = hooks.runAction(second, status, "Second…", () => Promise.resolve({
+  status: 409, envelope: {ok: false, error: {type: "conflict", message: "second refused"}}
+}), () => {});
+await Promise.all([succeeded, failed]);
+await new Promise(resolve => setImmediate(resolve));
+console.log(JSON.stringify({delays, reloads, history}));
+"""
+    )
+    assert result == {
+        "delays": [250, 250, 4000],
+        "reloads": 1,
+        "history": [
+            "First…",
+            "First changed. Reloading…",
+            "Second…",
+            (
+                "conflict: second refused An earlier change succeeded; "
+                "reloading in a few seconds to show it."
+            ),
+        ],
+    }
+
+
 def test_stream_requires_one_terminal_frame_and_flushes_an_undelimited_tail() -> None:
     """A clean socket close is not success unless exactly one final envelope arrived."""
     result = run_javascript(
@@ -161,7 +218,9 @@ const duplicate = await refusal(
 const after = await refusal(
   "event: final\ndata: {\"ok\":true}\n\nevent: delta\ndata: {\"text\":\"late\"}\n\n"
 );
-console.log(JSON.stringify({events, final, missing, duplicate, after}));
+const malformed = await refusal("event: delta\ndata: {not-json}\n\n");
+const wrongShape = await refusal("event: final\ndata: null\n\n");
+console.log(JSON.stringify({events, final, missing, duplicate, after, malformed, wrongShape}));
 """
     )
     assert result["events"] == [["delta", "hello"]]
@@ -169,6 +228,8 @@ console.log(JSON.stringify({events, final, missing, duplicate, after}));
     assert "exactly one final frame" in str(result["missing"])
     assert "exactly one final frame" in str(result["duplicate"])
     assert "continued after its final frame" in str(result["after"])
+    assert "malformed JSON" in str(result["malformed"])
+    assert "non-object event" in str(result["wrongShape"])
 
 
 def test_chat_stops_overlaps_retries_exactly_and_ignores_the_old_request() -> None:
@@ -265,11 +326,20 @@ const turnsBeforeFresh = turns.children.length;
 question.value = "a fresh question";
 form.listeners.submit(submitEvent);
 const freshTurnDelta = turns.children.length - turnsBeforeFresh;
+const partialWasDiscarded = answer.textContent === "";
+const malformed = new ReadableStream({start(controller) {
+  controller.enqueue(new TextEncoder().encode('event: delta\ndata: {not-json}\n\n'));
+  controller.close();
+}});
+pending[4].resolve({ok: true, status: 200, body: malformed, json: () => Promise.resolve({})});
+await new Promise(resolve => setImmediate(resolve));
+await new Promise(resolve => setImmediate(resolve));
 console.log(JSON.stringify({callsBeforeStop, aborted, sameBody, staleIgnored,
   callsAfterRetry: 2, completed, disabled,
   turnsBeforeFailure, preservedDraft,
   terminalStatus, retryOffered,
-  freshTurnDelta, partialWasDiscarded: answer.textContent === ""}));
+  freshTurnDelta, partialWasDiscarded,
+  protocolStatus: status.textContent, protocolRetry: !retry.hidden}));
 """
     )
     assert result == {
@@ -286,4 +356,6 @@ console.log(JSON.stringify({callsBeforeStop, aborted, sameBody, staleIgnored,
         "retryOffered": True,
         "freshTurnDelta": 1,
         "partialWasDiscarded": True,
+        "protocolStatus": "The answer stream contained malformed JSON. Retry the question.",
+        "protocolRetry": True,
     }

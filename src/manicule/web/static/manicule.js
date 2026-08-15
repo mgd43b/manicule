@@ -82,7 +82,13 @@
   function actionQueue(node) {
     var queue = ACTION_QUEUES.get(node);
     if (!queue) {
-      queue = { active: false, pending: [], reloadRequested: false, reloadTimer: null };
+      queue = {
+        active: false,
+        pending: [],
+        reloadRequested: false,
+        reloadTimer: null,
+        reloadDelay: 250,
+      };
       ACTION_QUEUES.set(node, queue);
     }
     return queue;
@@ -94,7 +100,10 @@
     var job = queue.pending.shift();
     if (!job) {
       if (queue.reloadRequested && !queue.reloadTimer) {
-        queue.reloadTimer = window.setTimeout(function () { window.location.reload(); }, 250);
+        queue.reloadTimer = window.setTimeout(
+          function () { window.location.reload(); },
+          queue.reloadDelay
+        );
       }
       return;
     }
@@ -115,16 +124,24 @@
 
     Promise.resolve().then(job.request).then(function (result) {
       if (!result.envelope || !result.envelope.ok) {
-        queue.reloadRequested = false;
-        actionState(node, "error", failure(result));
+        var message = failure(result);
+        if (queue.reloadRequested) {
+          queue.reloadDelay = 4000;
+          message += " An earlier change succeeded; reloading in a few seconds to show it.";
+        }
+        actionState(node, "error", message);
         finish();
         return;
       }
       job.success(result, node);
       finish();
     }).catch(function () {
-      queue.reloadRequested = false;
-      actionState(node, "error", "The service could not be reached. Try again.");
+      var message = "The service could not be reached. Try again.";
+      if (queue.reloadRequested) {
+        queue.reloadDelay = 4000;
+        message += " An earlier change succeeded; reloading in a few seconds to show it.";
+      }
+      actionState(node, "error", message);
       finish();
     });
   }
@@ -158,7 +175,9 @@
    * the server from one envelope; re-rendering it there keeps one description of what a
    * listing is, instead of a second one written in this file that can disagree. */
   function reloadAfterChange(result, node, message) {
-    actionQueue(node).reloadRequested = true;
+    var queue = actionQueue(node);
+    queue.reloadRequested = true;
+    queue.reloadDelay = 250;
     actionState(node, "success", message + " Reloading…");
   }
 
@@ -181,6 +200,12 @@
     var finalEnvelope = null;
     var finalCount = 0;
 
+    function protocolError(message) {
+      var error = new Error(message);
+      error.protocol = true;
+      return error;
+    }
+
     function readFrame(raw) {
       var name = "";
       var payload = "";
@@ -190,7 +215,14 @@
       });
       if (!payload) { return; }
       var parsed;
-      try { parsed = JSON.parse(payload); } catch (error) { return; }
+      try {
+        parsed = JSON.parse(payload);
+      } catch (error) {
+        throw protocolError("The answer stream contained malformed JSON. Retry the question.");
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw protocolError("The answer stream contained a non-object event. Retry the question.");
+      }
       if (finalCount && name !== "final") {
         throw new Error("The answer stream continued after its final frame.");
       }
@@ -583,7 +615,7 @@
         failRequest(
           request,
           request.responseStarted
-            ? error.terminal
+            ? error.terminal || error.protocol
               ? error.message
               : "The answer stream ended before completion. Retry the question."
             : request.responseArrived
