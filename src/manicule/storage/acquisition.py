@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import and_, delete, exists, func, or_, select, update
+from sqlalchemy import and_, case, delete, exists, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.acquisition import (
@@ -22,8 +23,12 @@ from manicule.core.acquisition import (
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
+    SnapshotCompleteness,
+    SnapshotItemOutcome,
+    SnapshotPromotionPolicy,
     UnsetValue,
 )
+from manicule.core.content import JsonValue
 from manicule.core.errors import AcquisitionLeaseLostError, ManiculeError, UnknownEntityError
 from manicule.core.ids import acquisition_marker_id
 from manicule.core.sources import Watermark
@@ -42,6 +47,7 @@ _WATERMARK = TypeAdapter(Watermark)
 _SOURCE = TypeAdapter(AcquisitionSource)
 _ACQUIRED_SOURCE = TypeAdapter(AcquiredSource)
 _DIAGNOSTIC = TypeAdapter(AcquisitionDiagnostic)
+_OMISSION_REASONS = TypeAdapter(dict[AcquisitionFailureCode, int])
 
 _RUN_TRANSITIONS: dict[AcquisitionRunState, set[AcquisitionRunState]] = {
     AcquisitionRunState.ENUMERATING: set(),
@@ -78,8 +84,10 @@ _RECORD_TRANSITIONS: dict[AcquisitionRecordState, set[AcquisitionRecordState]] =
         AcquisitionRecordState.ACQUIRING,
         AcquisitionRecordState.INDEXING,
         AcquisitionRecordState.SETTLED,
+        AcquisitionRecordState.OMITTED,
     },
     AcquisitionRecordState.SETTLED: set(),
+    AcquisitionRecordState.OMITTED: set(),
 }
 
 
@@ -110,19 +118,29 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
         workspace_id=row.workspace_id,
         connector_id=row.connector_id,
         connector=row.connector_name,
+        source_scope=row.source_scope,
+        scope_fingerprint=row.scope_fingerprint,
+        promotion_policy=row.promotion_policy,
         state=row.state,
         base_watermark=(
             None if row.base_watermark is None else _WATERMARK.validate_python(row.base_watermark)
         ),
+        base_watermark_scope_fingerprint=row.base_watermark_scope_fingerprint,
         candidate_watermark=(
             None
             if row.candidate_watermark is None
             else _WATERMARK.validate_python(row.candidate_watermark)
         ),
         enumeration_completed_at=row.enumeration_completed_at,
+        acquisition_completed_at=row.acquisition_completed_at,
+        promoted_at=row.promoted_at,
         watermark_committed_at=row.watermark_committed_at,
         superseded_at=row.superseded_at,
         superseded_by=row.superseded_by,
+        membership_hash=row.membership_hash,
+        completeness=row.completeness,
+        omission_count=row.omission_count,
+        omission_reasons=_OMISSION_REASONS.validate_python(row.omission_reasons),
         lease_owner=row.lease_owner,
         lease_generation=row.lease_generation,
         lease_expires_at=row.lease_expires_at,
@@ -133,9 +151,7 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
         retry_count=row.retry_count,
         metadata_bytes=row.metadata_bytes,
         acquired_blob_bytes=row.acquired_blob_bytes,
-        diagnostic=(
-            None if row.diagnostic is None else _DIAGNOSTIC.validate_python(row.diagnostic)
-        ),
+        diagnostic=_safe_diagnostic(row.diagnostic),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -147,6 +163,9 @@ def _record(row: models.AcquisitionRecord) -> AcquisitionRecord:
         sequence=row.sequence,
         source=_SOURCE.validate_python(row.source_record),
         state=row.state,
+        snapshot_outcome=(
+            None if row.snapshot_outcome is None else SnapshotItemOutcome(row.snapshot_outcome)
+        ),
         blob_ref=row.blob_ref,
         acquired_source=(
             None
@@ -155,18 +174,165 @@ def _record(row: models.AcquisitionRecord) -> AcquisitionRecord:
         ),
         fetched_version_token=row.fetched_version_token,
         attempts=row.attempts,
-        diagnostic=(
-            None if row.diagnostic is None else _DIAGNOSTIC.validate_python(row.diagnostic)
-        ),
+        snapshot_diagnostic=_safe_snapshot_diagnostic(row.snapshot_diagnostic),
+        diagnostic=_safe_diagnostic(row.diagnostic),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
 
 
+def _safe_snapshot_diagnostic(raw: object) -> AcquisitionDiagnostic | None:
+    """Read frozen evidence without ever rendering corrupt legacy or substituted input."""
+    if raw is None:
+        return None
+    diagnostic = _safe_diagnostic(raw)
+    if diagnostic is not None and diagnostic.stage is AcquisitionStage.ACQUISITION:
+        return diagnostic
+    return AcquisitionDiagnostic(
+        stage=AcquisitionStage.ACQUISITION,
+        code=AcquisitionFailureCode.LEGACY_UNVERIFIED,
+    )
+
+
+def _safe_diagnostic(raw: object) -> AcquisitionDiagnostic | None:
+    """Normalize corrupt persisted diagnostics to one bounded, non-sensitive envelope."""
+    if raw is None:
+        return None
+    try:
+        return _DIAGNOSTIC.validate_python(raw)
+    except ValueError:
+        return AcquisitionDiagnostic(
+            stage=AcquisitionStage.ACQUISITION,
+            code=AcquisitionFailureCode.LEGACY_UNVERIFIED,
+        )
+
+
+def _canonical_snapshot_diagnostic(raw: object, *, missing_evidence: bool) -> JsonValue | None:
+    """Canonical frozen omission evidence, never a copy of untrusted persisted JSON."""
+    if not missing_evidence:
+        return None
+    diagnostic = _safe_snapshot_diagnostic(raw) or AcquisitionDiagnostic(
+        stage=AcquisitionStage.ACQUISITION,
+        code=AcquisitionFailureCode.LEGACY_UNVERIFIED,
+    )
+    return cast("JsonValue", diagnostic.model_dump(mode="json"))
+
+
+def _same_canonical_json(raw: object, canonical: object) -> bool:
+    """Compare JSON shapes without Python's ``1 == True`` coercion."""
+    try:
+        return json.dumps(raw, sort_keys=True, separators=(",", ":")) == json.dumps(
+            canonical, sort_keys=True, separators=(",", ":")
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _manifest_member(row: models.AcquisitionRecord) -> dict[str, object]:
+    """Canonical immutable source evidence; derivation state is deliberately excluded."""
+    missing_evidence = row.blob_ref is None or row.acquired_source is None
+    canonical_diagnostic = _canonical_snapshot_diagnostic(
+        row.snapshot_diagnostic, missing_evidence=missing_evidence
+    )
+    if not _same_canonical_json(row.snapshot_diagnostic, canonical_diagnostic):
+        msg = "snapshot diagnostic evidence is not in canonical typed form"
+        raise AcquisitionConflictError(msg)
+    return {
+        "sequence": row.sequence,
+        "source_id": row.source_id,
+        "source": row.source_record,
+        "fetched_version_token": row.fetched_version_token,
+        "blob_ref": row.blob_ref,
+        "acquired_source": row.acquired_source,
+        "snapshot_outcome": (None if row.snapshot_outcome is None else str(row.snapshot_outcome)),
+        "snapshot_diagnostic": canonical_diagnostic,
+    }
+
+
+async def _manifest_digest(session: AsyncSession, run_id: str) -> str:
+    """Hash a manifest in bounded keyset pages after every acquisition outcome is final."""
+    digest = hashlib.blake2b(digest_size=32)
+    after = -1
+    while True:
+        rows = (
+            (
+                await session.execute(
+                    select(models.AcquisitionRecord)
+                    .where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        models.AcquisitionRecord.sequence > after,
+                    )
+                    .order_by(models.AcquisitionRecord.sequence)
+                    .limit(100)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return digest.hexdigest()
+        for record in rows:
+            digest.update(
+                json.dumps(_manifest_member(record), sort_keys=True, separators=(",", ":")).encode()
+            )
+            digest.update(b"\n")
+        after = rows[-1].sequence
+
+
+async def _canonicalize_snapshot_diagnostics(session: AsyncSession, run_id: str) -> None:
+    """Overwrite every frozen diagnostic from its retained-evidence rule, in bounded pages."""
+    after = -1
+    while True:
+        rows = (
+            (
+                await session.execute(
+                    select(models.AcquisitionRecord)
+                    .where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        models.AcquisitionRecord.sequence > after,
+                    )
+                    .order_by(models.AcquisitionRecord.sequence)
+                    .limit(100)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            await session.flush()
+            return
+        for record in rows:
+            missing_evidence = record.blob_ref is None or record.acquired_source is None
+            record.snapshot_diagnostic = cast(
+                "Any",
+                _canonical_snapshot_diagnostic(
+                    record.snapshot_diagnostic, missing_evidence=missing_evidence
+                ),
+            )
+        after = rows[-1].sequence
+
+
+async def _manifest_matches(session: AsyncSession, run_id: str, expected: str) -> bool:
+    """Verify without leaking malformed evidence through a read-only lookup."""
+    try:
+        actual = await _manifest_digest(session, run_id)
+    except AcquisitionConflictError:
+        return False
+    return hmac.compare_digest(expected, actual)
+
+
 class AcquisitionJournalMixin(WorkspaceScoped):
     """Workspace-scoped durable run and record operations."""
 
-    async def create_acquisition_run(self, run_id: str, connector: str) -> AcquisitionRun:
+    async def create_acquisition_run(
+        self,
+        run_id: str,
+        connector: str,
+        *,
+        source_scope: str = "",
+        scope_fingerprint: str = "",
+        promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
+    ) -> AcquisitionRun:
         """Create an immutable run identity, idempotently for the same connector."""
         if not run_id or not connector:
             msg = "run_id and connector must not be empty"
@@ -180,8 +346,12 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     workspace_id=self._workspace_id,
                     connector_id=connector_row.id,
                     connector_name=connector,
+                    source_scope=source_scope,
+                    scope_fingerprint=scope_fingerprint,
+                    promotion_policy=promotion_policy,
                     state=AcquisitionRunState.ENUMERATING,
                     base_watermark=connector_row.watermark,
+                    base_watermark_scope_fingerprint=connector_row.watermark_scope_fingerprint,
                     created_at=utcnow(),
                     updated_at=utcnow(),
                 )
@@ -193,19 +363,40 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 row is None
                 or row.workspace_id != self._workspace_id
                 or row.connector_id != connector_row.id
+                or row.source_scope != source_scope
+                or row.scope_fingerprint != scope_fingerprint
+                or SnapshotPromotionPolicy(row.promotion_policy) is not promotion_policy
             ):
-                msg = (
-                    f"acquisition run {run_id!r} already belongs to another connector or workspace"
-                )
+                msg = f"acquisition run {run_id!r} conflicts with the requested run identity"
                 raise AcquisitionConflictError(msg)
             return _run(row)
 
-    async def get_acquisition_run(self, run_id: str) -> AcquisitionRun | None:
+    async def get_acquisition_watermark(
+        self, connector: str, scope_fingerprint: str
+    ) -> Watermark | None:
+        """Return a cursor only when it was committed for this exact source scope."""
         async with self._sessions() as session:
-            row = await self._run_row(session, run_id)
-            return None if row is None else _run(row)
+            row = (
+                await session.execute(
+                    select(models.Connector).where(
+                        models.Connector.workspace_id == self._workspace_id,
+                        models.Connector.name == connector,
+                        models.Connector.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if (
+                row is None
+                or row.watermark is None
+                or row.watermark_scope_fingerprint != scope_fingerprint
+            ):
+                return None
+            return _WATERMARK.validate_python(row.watermark)
 
-    async def latest_unsettled_acquisition_run(self, connector: str) -> AcquisitionRun | None:
+    async def latest_promoted_snapshot(
+        self, connector: str, scope_fingerprint: str
+    ) -> AcquisitionRun | None:
+        """Return the newest authoritative manifest for this exact connector scope."""
         async with self._sessions() as session:
             row = (
                 await session.execute(
@@ -213,13 +404,145 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     .where(
                         models.AcquisitionRun.workspace_id == self._workspace_id,
                         models.AcquisitionRun.connector_name == connector,
-                        models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
                         models.AcquisitionRun.superseded_at.is_(None),
+                        models.AcquisitionRun.scope_fingerprint == scope_fingerprint,
+                        models.AcquisitionRun.promoted_at.is_not(None),
                     )
                     .order_by(
-                        models.AcquisitionRun.created_at.desc(), models.AcquisitionRun.id.desc()
+                        models.AcquisitionRun.promoted_at.desc(),
+                        models.AcquisitionRun.id.desc(),
                     )
                     .limit(1)
+                )
+            ).scalar_one_or_none()
+            if (
+                row is None
+                or not row.membership_hash
+                or not await _manifest_matches(session, row.id, row.membership_hash)
+            ):
+                return None
+            return _run(row)
+
+    async def reusable_snapshot_record(
+        self,
+        connector: str,
+        scope_fingerprint: str,
+        source_id: str,
+        version_token: str | None,
+    ) -> AcquisitionRecord | None:
+        """Find validated retained bytes for an unchanged revision in the same exact scope."""
+        async with self._sessions() as session:
+            run = (
+                await session.execute(
+                    select(models.AcquisitionRun)
+                    .where(
+                        models.AcquisitionRun.workspace_id == self._workspace_id,
+                        models.AcquisitionRun.connector_name == connector,
+                        models.AcquisitionRun.scope_fingerprint == scope_fingerprint,
+                        models.AcquisitionRun.promoted_at.is_not(None),
+                    )
+                    .order_by(
+                        models.AcquisitionRun.promoted_at.desc(),
+                        models.AcquisitionRun.id.desc(),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if (
+                run is None
+                or not run.membership_hash
+                or not await _manifest_matches(session, run.id, run.membership_hash)
+            ):
+                return None
+
+            row = (
+                await session.execute(
+                    select(models.AcquisitionRecord)
+                    .where(
+                        models.AcquisitionRecord.run_id == run.id,
+                        models.AcquisitionRecord.source_id == source_id,
+                        models.AcquisitionRecord.blob_ref.is_not(None),
+                        models.AcquisitionRecord.acquired_source.is_not(None),
+                        or_(
+                            models.AcquisitionRecord.fetched_version_token == version_token,
+                            models.AcquisitionRecord.source_record["version_token"].as_string()
+                            == version_token,
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return _record(row)
+
+    async def reusable_record_from_verified_snapshot(
+        self,
+        run_id: str,
+        source_id: str,
+        version_token: str | None,
+    ) -> AcquisitionRecord | None:
+        """Look up retained evidence after this operation verified ``run_id`` once."""
+        async with self._sessions() as session:
+            run = await self._run_row(session, run_id)
+            if (
+                run is None
+                or run.workspace_id != self._workspace_id
+                or run.promoted_at is None
+                or not run.membership_hash
+            ):
+                return None
+            row = (
+                await session.execute(
+                    select(models.AcquisitionRecord)
+                    .where(
+                        models.AcquisitionRecord.run_id == run.id,
+                        models.AcquisitionRecord.source_id == source_id,
+                        models.AcquisitionRecord.blob_ref.is_not(None),
+                        models.AcquisitionRecord.acquired_source.is_not(None),
+                        or_(
+                            models.AcquisitionRecord.fetched_version_token == version_token,
+                            models.AcquisitionRecord.source_record["version_token"].as_string()
+                            == version_token,
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            return None if row is None else _record(row)
+
+    async def verify_snapshot_manifest(self, run_id: str) -> bool:
+        """Verify the canonical evidence digest without loading an unbounded manifest."""
+        async with self._sessions() as session:
+            run = await self._required_run_row(session, run_id)
+            if run.acquisition_completed_at is None or not run.membership_hash:
+                return False
+            return await _manifest_matches(session, run_id, run.membership_hash)
+
+    async def get_acquisition_run(self, run_id: str) -> AcquisitionRun | None:
+        async with self._sessions() as session:
+            row = await self._run_row(session, run_id)
+            return None if row is None else _run(row)
+
+    async def latest_unsettled_acquisition_run(
+        self, connector: str, *, scope_fingerprint: str | None = None
+    ) -> AcquisitionRun | None:
+        async with self._sessions() as session:
+            statement = select(models.AcquisitionRun).where(
+                models.AcquisitionRun.workspace_id == self._workspace_id,
+                models.AcquisitionRun.connector_name == connector,
+                models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                models.AcquisitionRun.superseded_at.is_(None),
+            )
+            if scope_fingerprint is not None:
+                statement = statement.where(
+                    models.AcquisitionRun.scope_fingerprint == scope_fingerprint
+                )
+            row = (
+                await session.execute(
+                    statement.order_by(
+                        models.AcquisitionRun.created_at.desc(), models.AcquisitionRun.id.desc()
+                    ).limit(1)
                 )
             ).scalar_one_or_none()
             return None if row is None else _run(row)
@@ -230,6 +553,9 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         run_id: str,
         owner: str,
         *,
+        source_scope: str = "",
+        scope_fingerprint: str = "",
+        promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         now: datetime,
         expires_at: datetime,
     ) -> AcquisitionRun | None:
@@ -295,9 +621,17 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             )
             safe: list[models.AcquisitionRun] = []
             for candidate in candidates:
-                base_is_current = candidate.base_watermark == connector_row.watermark
+                same_scope = candidate.scope_fingerprint == scope_fingerprint
+                base_is_current = (
+                    same_scope
+                    and candidate.base_watermark == connector_row.watermark
+                    and candidate.base_watermark_scope_fingerprint
+                    == connector_row.watermark_scope_fingerprint
+                )
                 committed_is_current = (
-                    candidate.watermark_committed_at is not None
+                    same_scope
+                    and candidate.scope_fingerprint == connector_row.watermark_scope_fingerprint
+                    and candidate.watermark_committed_at is not None
                     and candidate.candidate_watermark == connector_row.watermark
                 )
                 if base_is_current or committed_is_current:
@@ -320,8 +654,12 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     workspace_id=self._workspace_id,
                     connector_id=connector_row.id,
                     connector_name=connector,
+                    source_scope=source_scope,
+                    scope_fingerprint=scope_fingerprint,
+                    promotion_policy=promotion_policy,
                     state=AcquisitionRunState.ENUMERATING,
                     base_watermark=connector_row.watermark,
+                    base_watermark_scope_fingerprint=connector_row.watermark_scope_fingerprint,
                     lease_owner=owner,
                     lease_generation=1,
                     lease_expires_at=expires_at,
@@ -708,7 +1046,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             ).scalars()
             return [_record(row) for row in rows]
 
-    async def transition_acquisition_record(  # noqa: PLR0912 - validates one atomic state edge
+    async def transition_acquisition_record(  # noqa: PLR0912, PLR0915 - one atomic state edge
         self,
         run_id: str,
         source_id: str,
@@ -746,6 +1084,13 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             if run.state is AcquisitionRunState.SETTLED:
                 msg = f"acquisition run {run_id!r} is settled"
                 raise AcquisitionConflictError(msg)
+            if run.acquisition_completed_at is not None and (
+                blob_ref is not None
+                or acquired_source is not None
+                or fetched_version_token is not UNSET
+            ):
+                msg = "snapshot evidence is frozen after acquisition completion"
+                raise AcquisitionConflictError(msg)
             if target is AcquisitionRecordState.INDEXING and blob_ref is None:
                 record = (
                     await session.execute(
@@ -765,6 +1110,19 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 "diagnostic": None if diagnostic is None else diagnostic.model_dump(mode="json"),
                 "updated_at": utcnow(),
             }
+            if run.acquisition_completed_at is None:
+                if target is AcquisitionRecordState.RETRY and expected in {
+                    AcquisitionRecordState.DISCOVERED,
+                    AcquisitionRecordState.ACQUIRING,
+                }:
+                    values["snapshot_diagnostic"] = (
+                        None if diagnostic is None else diagnostic.model_dump(mode="json")
+                    )
+                elif target in {
+                    AcquisitionRecordState.ACQUIRED,
+                    AcquisitionRecordState.UNCHANGED,
+                }:
+                    values["snapshot_diagnostic"] = None
             if fetched_version_token is not UNSET:
                 values["fetched_version_token"] = fetched_version_token
             if target is AcquisitionRecordState.ACQUIRING:
@@ -773,6 +1131,14 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 values["blob_ref"] = blob_ref
             if acquired_source is not None:
                 values["acquired_source"] = acquired_source.model_dump(mode="json")
+            if target is AcquisitionRecordState.ACQUIRED:
+                values["snapshot_outcome"] = SnapshotItemOutcome.RETAINED
+            elif target is AcquisitionRecordState.UNCHANGED:
+                values["snapshot_outcome"] = (
+                    SnapshotItemOutcome.REUSED
+                    if blob_ref is not None and acquired_source is not None
+                    else SnapshotItemOutcome.OMITTED
+                )
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(
@@ -810,6 +1176,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         lease_generation: int,
         now: datetime,
         blob_ref: str | None = None,
+        acquired_source: AcquiredSource | None = None,
         fetched_version_token: str | None = None,
     ) -> AcquisitionRecord:
         """Commit unchanged coverage and presence under one generation-fenced writer lock."""
@@ -829,6 +1196,13 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             }
             if blob_ref is not None:
                 values["blob_ref"] = blob_ref
+            if acquired_source is not None:
+                values["acquired_source"] = acquired_source.model_dump(mode="json")
+            values["snapshot_outcome"] = (
+                SnapshotItemOutcome.REUSED
+                if blob_ref is not None and acquired_source is not None
+                else SnapshotItemOutcome.OMITTED
+            )
             transitioned = cast(
                 "CursorResult[Any]",
                 await session.execute(
@@ -870,6 +1244,192 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             ).scalar_one()
             return _record(row)
 
+    async def complete_snapshot_acquisition(
+        self,
+        run_id: str,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> AcquisitionRun:
+        """Freeze membership and the aggregate acquisition outcome under the run lease.
+
+        This marker is deliberately separate from enumeration and promotion. A strict snapshot
+        with one missing body remains resumable and unmarked; an omission-tolerant snapshot may
+        freeze that same bounded, typed omission set before an atomic promotion decision.
+        """
+        async with self._sessions.begin() as session:
+            run = await self._required_run_row(session, run_id)
+            self._require_live_lease(run, lease_owner, lease_generation, now)
+            if run.acquisition_completed_at is not None:
+                return _run(run)
+            if run.enumeration_completed_at is None:
+                msg = "enumeration is incomplete"
+                raise AcquisitionCoverageError(msg)
+            active = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(models.AcquisitionRecord)
+                    .where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        models.AcquisitionRecord.state.in_(
+                            (
+                                AcquisitionRecordState.DISCOVERED,
+                                AcquisitionRecordState.ACQUIRING,
+                            )
+                        ),
+                    )
+                )
+            ).scalar_one()
+            if active:
+                msg = f"{active} acquisition records are still in progress"
+                raise AcquisitionCoverageError(msg)
+            await _canonicalize_snapshot_diagnostics(session, run_id)
+            omissions = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(models.AcquisitionRecord)
+                    .where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        or_(
+                            models.AcquisitionRecord.blob_ref.is_(None),
+                            models.AcquisitionRecord.acquired_source.is_(None),
+                        ),
+                    )
+                )
+            ).scalar_one()
+            reason_rows = (
+                await session.execute(
+                    select(models.AcquisitionRecord.snapshot_diagnostic, func.count())
+                    .where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        or_(
+                            models.AcquisitionRecord.blob_ref.is_(None),
+                            models.AcquisitionRecord.acquired_source.is_(None),
+                        ),
+                    )
+                    .group_by(models.AcquisitionRecord.snapshot_diagnostic)
+                )
+            ).all()
+            reasons: dict[str, int] = {}
+            for diagnostic, count in reason_rows:
+                code = "unknown" if not diagnostic else str(diagnostic.get("code", "unknown"))
+                reasons[code] = reasons.get(code, 0) + count
+
+            run.omission_count = omissions
+            run.omission_reasons = cast("Any", reasons)
+            policy = SnapshotPromotionPolicy(run.promotion_policy)
+            coverage_error = bool(omissions) and (
+                policy is SnapshotPromotionPolicy.REQUIRE_COMPLETE
+            )
+            if not coverage_error:
+                if policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS:
+                    missing_evidence = or_(
+                        models.AcquisitionRecord.blob_ref.is_(None),
+                        models.AcquisitionRecord.acquired_source.is_(None),
+                    )
+                    await session.execute(
+                        update(models.AcquisitionRecord)
+                        .where(models.AcquisitionRecord.run_id == run_id, missing_evidence)
+                        .values(
+                            snapshot_outcome=SnapshotItemOutcome.OMITTED,
+                            state=case(
+                                (
+                                    models.AcquisitionRecord.state == AcquisitionRecordState.RETRY,
+                                    AcquisitionRecordState.OMITTED,
+                                ),
+                                else_=models.AcquisitionRecord.state,
+                            ),
+                            updated_at=now,
+                        )
+                    )
+                    await self._refresh_counters(session, run)
+                run.acquisition_completed_at = now
+                run.membership_hash = await _manifest_digest(session, run_id)
+            run.updated_at = now
+            result = _run(run)
+        if coverage_error:
+            msg = f"{omissions} required source records lack validated retained bytes"
+            raise AcquisitionCoverageError(msg)
+        return result
+
+    async def promote_snapshot_and_commit_watermark(
+        self,
+        run_id: str,
+        *,
+        expected_scope_fingerprint: str,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> AcquisitionRun:
+        """Atomically make the frozen manifest authoritative and publish its watermark."""
+        async with self._sessions.begin() as session:
+            run = await self._required_run_row(session, run_id)
+            self._require_live_lease(run, lease_owner, lease_generation, now)
+            if run.scope_fingerprint != expected_scope_fingerprint:
+                msg = "snapshot scope fingerprint does not match the promotion request"
+                raise AcquisitionConflictError(msg)
+            if run.acquisition_completed_at is None:
+                msg = "snapshot acquisition is incomplete"
+                raise AcquisitionCoverageError(msg)
+            if (
+                SnapshotPromotionPolicy(run.promotion_policy)
+                is SnapshotPromotionPolicy.REQUIRE_COMPLETE
+                and run.omission_count
+            ):
+                msg = f"{run.omission_count} required source records were omitted"
+                raise AcquisitionCoverageError(msg)
+
+            if not run.membership_hash or not hmac.compare_digest(
+                run.membership_hash, await _manifest_digest(session, run_id)
+            ):
+                msg = "snapshot manifest evidence no longer matches its acquisition digest"
+                raise AcquisitionConflictError(msg)
+            if run.promoted_at is not None:
+                return _run(run)
+
+            promoted_at = now
+
+            committed_at: datetime | None = None
+            if run.candidate_watermark is not None:
+                base_matches = (
+                    models.Connector.watermark.is_(None)
+                    if run.base_watermark is None
+                    else models.Connector.watermark == run.base_watermark
+                )
+                result = cast(
+                    "CursorResult[Any]",
+                    await session.execute(
+                        update(models.Connector)
+                        .where(
+                            models.Connector.id == run.connector_id,
+                            models.Connector.workspace_id == self._workspace_id,
+                            models.Connector.watermark_scope_fingerprint
+                            == run.base_watermark_scope_fingerprint,
+                            base_matches,
+                        )
+                        .values(
+                            watermark=run.candidate_watermark,
+                            watermark_scope_fingerprint=run.scope_fingerprint,
+                            last_synced_at=promoted_at,
+                        )
+                    ),
+                )
+                if result.rowcount != 1:
+                    msg = "connector watermark changed after this snapshot enumeration began"
+                    raise AcquisitionWatermarkConflictError(msg)
+                committed_at = promoted_at
+
+            run.promoted_at = promoted_at
+            run.watermark_committed_at = committed_at
+            run.completeness = (
+                SnapshotCompleteness.PARTIAL
+                if run.omission_count
+                else SnapshotCompleteness.COMPLETE
+            )
+            run.updated_at = promoted_at
+            return _run(run)
+
     async def commit_acquisition_watermark(
         self,
         run_id: str,
@@ -878,7 +1438,23 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         lease_generation: int,
         now: datetime,
     ) -> bool:
-        """Atomically publish the candidate only after every source record has coverage."""
+        """Preserve the pre-promotion API for callers not constructing manifests."""
+        return await self._legacy_commit_acquisition_watermark(
+            run_id,
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+            now=now,
+        )
+
+    async def _legacy_commit_acquisition_watermark(
+        self,
+        run_id: str,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> bool:
+        """Former implementation retained temporarily for migration archaeology."""
         async with self._sessions.begin() as session:
             run = await self._required_run_row(session, run_id)
             self._require_live_lease(run, lease_owner, lease_generation, now)
@@ -905,6 +1481,41 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             if uncovered:
                 msg = f"{uncovered} acquisition records do not have durable source coverage"
                 raise AcquisitionCoverageError(msg)
+            legacy_omissions = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(models.AcquisitionRecord)
+                    .where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        or_(
+                            models.AcquisitionRecord.blob_ref.is_(None),
+                            models.AcquisitionRecord.acquired_source.is_(None),
+                        ),
+                    )
+                )
+            ).scalar_one()
+            await _canonicalize_snapshot_diagnostics(session, run_id)
+            await session.execute(
+                update(models.AcquisitionRecord)
+                .where(models.AcquisitionRecord.run_id == run_id)
+                .values(
+                    snapshot_outcome=case(
+                        (
+                            models.AcquisitionRecord.blob_ref.is_not(None)
+                            & models.AcquisitionRecord.acquired_source.is_not(None)
+                            & (models.AcquisitionRecord.state == AcquisitionRecordState.UNCHANGED),
+                            SnapshotItemOutcome.REUSED,
+                        ),
+                        (
+                            models.AcquisitionRecord.blob_ref.is_not(None)
+                            & models.AcquisitionRecord.acquired_source.is_not(None),
+                            SnapshotItemOutcome.RETAINED,
+                        ),
+                        else_=SnapshotItemOutcome.OMITTED,
+                    )
+                )
+            )
+            membership_hash = await _manifest_digest(session, run_id)
             base_matches = (
                 models.Connector.watermark.is_(None)
                 if run.base_watermark is None
@@ -918,9 +1529,15 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     .where(
                         models.Connector.id == run.connector_id,
                         models.Connector.workspace_id == self._workspace_id,
+                        models.Connector.watermark_scope_fingerprint
+                        == run.base_watermark_scope_fingerprint,
                         base_matches,
                     )
-                    .values(watermark=run.candidate_watermark, last_synced_at=committed_at)
+                    .values(
+                        watermark=run.candidate_watermark,
+                        watermark_scope_fingerprint=run.scope_fingerprint or None,
+                        last_synced_at=committed_at,
+                    )
                 ),
             )
             if result.rowcount != 1:
@@ -935,7 +1552,22 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         models.AcquisitionRun.workspace_id == self._workspace_id,
                         models.AcquisitionRun.watermark_committed_at.is_(None),
                     )
-                    .values(watermark_committed_at=committed_at, updated_at=committed_at)
+                    .values(
+                        acquisition_completed_at=committed_at,
+                        promoted_at=committed_at,
+                        watermark_committed_at=committed_at,
+                        membership_hash=membership_hash,
+                        completeness=(
+                            SnapshotCompleteness.PARTIAL
+                            if legacy_omissions
+                            else SnapshotCompleteness.COMPLETE
+                        ),
+                        omission_count=legacy_omissions,
+                        omission_reasons=(
+                            {"legacy_unverified": legacy_omissions} if legacy_omissions else {}
+                        ),
+                        updated_at=committed_at,
+                    )
                 ),
             )
             if marker.rowcount != 1:  # pragma: no cover - connector update holds the write lock

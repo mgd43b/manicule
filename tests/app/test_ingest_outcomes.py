@@ -75,6 +75,51 @@ async def test_incomplete_sync_keeps_partial_data_in_a_failure_envelope() -> Non
     assert envelope.data["watermark_advanced"] is False
 
 
+async def test_partial_snapshot_omissions_reach_the_shared_operator_envelope() -> None:
+    service, _ = _service(
+        RunReport(
+            connector="synthetic-wiki",
+            discovered=3,
+            snapshot_completeness="partial",
+            snapshot_omissions=2,
+            snapshot_omission_reasons={"authentication": 1, "missing_body": 1},
+        )
+    )
+
+    envelope = await _envelope(service)
+
+    assert envelope.ok is True
+    assert envelope.data is not None
+    assert envelope.data["snapshot_completeness"] == "partial"
+    assert envelope.data["snapshot_omissions"] == 2
+    assert envelope.data["snapshot_omission_reasons"] == {
+        "authentication": 1,
+        "missing_body": 1,
+    }
+
+
+async def test_strict_snapshot_omission_is_an_incomplete_retryable_failure_envelope() -> None:
+    service, _ = _service(
+        RunReport(
+            connector="synthetic-wiki",
+            discovered=1,
+            by_status={"indexed": 1},
+            snapshot_omissions=1,
+            snapshot_omission_reasons={"authentication": 1},
+        )
+    )
+
+    envelope = await _envelope(service)
+
+    assert envelope.ok is False
+    assert envelope.data is not None
+    assert envelope.data["outcome"] == "incomplete"
+    assert envelope.data["retry_required"] is True
+    assert envelope.data["unrecorded"] == 0
+    assert envelope.error is not None
+    assert envelope.error.type == "IncompleteIngestError"
+
+
 async def test_pending_durable_derivation_is_a_retry_required_failure_envelope() -> None:
     service, _ = _service(
         RunReport(

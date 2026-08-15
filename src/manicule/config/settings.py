@@ -45,6 +45,7 @@ from manicule.config.providers import (
     resolve_provider_keys,
     runs_in_process,
 )
+from manicule.core.acquisition import SnapshotPromotionPolicy
 from manicule.core.errors import PolicyError
 from manicule.core.retrieval import RetrievalProfile
 
@@ -506,6 +507,11 @@ class IngestSettings(Section):
 
     fetch_concurrency: int = Field(
         default=8, ge=1, description="In-flight fetches per connector. Bounded by the remote."
+    )
+    snapshot_promotion_policy: SnapshotPromotionPolicy = Field(
+        default=SnapshotPromotionPolicy.REQUIRE_COMPLETE,
+        description="Whether a source watermark requires a fully reproducible retained "
+        "snapshot or may explicitly record typed omissions.",
     )
     parse_workers: int = Field(
         default=0,

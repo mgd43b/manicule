@@ -702,6 +702,7 @@ class Runtime:
             max_fetch_bytes=settings.ingest.max_fetch_bytes,
             target_batch_tokens=settings.ingest.target_batch_tokens,
             max_embed_batch=settings.ingest.max_embed_batch,
+            snapshot_policy=settings.ingest.snapshot_promotion_policy,
             # Passed rather than defaulted, which it had been since the setting shipped. The
             # field is documented as the switch an operator throws while investigating a
             # detector that is producing rubbish, and nothing outside `settings.py` read it: a

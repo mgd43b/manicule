@@ -37,7 +37,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from manicule.core.acquisition import AcquisitionRecordState, AcquisitionRunState
+from manicule.core.acquisition import (
+    AcquisitionRecordState,
+    AcquisitionRunState,
+    SnapshotCompleteness,
+    SnapshotItemOutcome,
+    SnapshotPromotionPolicy,
+)
 from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
 from manicule.core.reconciliation import ReconciliationRunState
 from manicule.storage.types import UtcDateTime, utcnow
@@ -228,6 +234,7 @@ class Connector(Base):
     Separate from ``last_synced_at`` because a watermark is not always a timestamp — it may
     be a page token or a commit SHA.
     """
+    watermark_scope_fingerprint: Mapped[str | None] = mapped_column(Text)
 
     sync_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300)
     last_synced_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
@@ -266,15 +273,29 @@ class AcquisitionRun(Base):
     )
     connector_id: Mapped[str] = mapped_column(Text, nullable=False)
     connector_name: Mapped[str] = mapped_column(Text, nullable=False)
+    source_scope: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    scope_fingerprint: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    promotion_policy: Mapped[SnapshotPromotionPolicy] = mapped_column(
+        Text,
+        nullable=False,
+        default=SnapshotPromotionPolicy.REQUIRE_COMPLETE,
+    )
     state: Mapped[AcquisitionRunState] = mapped_column(
         _acquisition_run_state_enum(), nullable=False, default=AcquisitionRunState.ENUMERATING
     )
     base_watermark: Mapped[JsonValue | None] = mapped_column(JSON)
+    base_watermark_scope_fingerprint: Mapped[str | None] = mapped_column(Text)
     candidate_watermark: Mapped[JsonValue | None] = mapped_column(JSON)
     enumeration_completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    acquisition_completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    promoted_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     watermark_committed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     superseded_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     superseded_by: Mapped[str | None] = mapped_column(Text)
+    membership_hash: Mapped[str | None] = mapped_column(Text)
+    completeness: Mapped[SnapshotCompleteness | None] = mapped_column(Text)
+    omission_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    omission_reasons: Mapped[JsonValue] = mapped_column(JSON, nullable=False, default=dict)
     lease_owner: Mapped[str | None] = mapped_column(Text)
     lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
@@ -321,6 +342,14 @@ class AcquisitionRun(Base):
             "superseded_at",
             "updated_at",
         ),
+        Index(
+            "ix_acquisition_runs_latest_promoted",
+            "workspace_id",
+            "connector_name",
+            "scope_fingerprint",
+            "promoted_at",
+            "id",
+        ),
         CheckConstraint("lease_generation >= 0", name="lease_generation_is_not_negative"),
         CheckConstraint(
             "discovered_count >= 0 AND acquired_count >= 0 AND indexed_count >= 0 "
@@ -331,6 +360,24 @@ class AcquisitionRun(Base):
         CheckConstraint(
             "watermark_committed_at IS NULL OR enumeration_completed_at IS NOT NULL",
             name="committed_watermark_has_complete_enumeration",
+        ),
+        CheckConstraint("omission_count >= 0", name="snapshot_omissions_are_not_negative"),
+        CheckConstraint(
+            "promotion_policy IN ('require_complete', 'allow_omissions')",
+            name="snapshot_promotion_policy_is_known",
+        ),
+        CheckConstraint(
+            "completeness IS NULL OR completeness IN ('complete', 'partial')",
+            name="snapshot_completeness_is_known",
+        ),
+        CheckConstraint(
+            "promoted_at IS NULL OR acquisition_completed_at IS NOT NULL",
+            name="promoted_snapshot_has_complete_acquisition",
+        ),
+        CheckConstraint(
+            "watermark_committed_at IS NULL OR promoted_at IS NOT NULL "
+            "OR membership_hash = 'legacy-unverified'",
+            name="committed_watermark_has_promoted_snapshot",
         ),
     )
 
@@ -353,10 +400,12 @@ class AcquisitionRecord(Base):
         nullable=False,
         default=AcquisitionRecordState.DISCOVERED,
     )
+    snapshot_outcome: Mapped[SnapshotItemOutcome | None] = mapped_column(Text)
     blob_ref: Mapped[str | None] = mapped_column(ForeignKey("blobs.hash", ondelete="RESTRICT"))
     acquired_source: Mapped[JsonValue | None] = mapped_column(JSON)
     fetched_version_token: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    snapshot_diagnostic: Mapped[JsonValue | None] = mapped_column(JSON)
     diagnostic: Mapped[JsonValue | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -377,12 +426,26 @@ class AcquisitionRecord(Base):
         UniqueConstraint("run_id", "sequence"),
         Index("ix_acquisition_records_run_state_sequence", "run_id", "state", "sequence"),
         Index("ix_acquisition_records_marker_name", "marker_name", unique=True),
+        Index(
+            "ix_acquisition_records_run_source_version",
+            "run_id",
+            "source_id",
+            "fetched_version_token",
+        ),
         CheckConstraint(
             "sequence >= 0 AND attempts >= 0", name="acquisition_record_numbers_are_not_negative"
         ),
         CheckConstraint(
             "state NOT IN ('acquired', 'indexing') OR blob_ref IS NOT NULL",
             name="blob_backed_acquisition_states_have_a_blob",
+        ),
+        CheckConstraint(
+            "snapshot_outcome IS NULL OR snapshot_outcome IN ('retained', 'reused', 'omitted')",
+            name="snapshot_item_outcome_is_known",
+        ),
+        CheckConstraint(
+            "snapshot_diagnostic IS NULL OR json_valid(snapshot_diagnostic)",
+            name="snapshot_diagnostic_is_valid_json",
         ),
     )
 

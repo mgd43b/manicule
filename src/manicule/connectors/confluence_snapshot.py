@@ -317,6 +317,11 @@ class ConfluenceSnapshotConnector:
         return self._root
 
     @property
+    def source_scope(self) -> str:
+        """Resolved mirror root whose deterministic membership forms the snapshot scope."""
+        return str(self._root)
+
+    @property
     def watermark(self) -> Watermark | None:
         """When the last **complete** walk finished.
 

@@ -46,13 +46,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
 from manicule.connectors.errors import (
@@ -71,6 +72,8 @@ from manicule.core.acquisition import (
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
+    SnapshotCompleteness,
+    SnapshotPromotionPolicy,
 )
 from manicule.core.content import (
     SETTLED,
@@ -440,6 +443,10 @@ class RunReport:
     pending_derivation: bool = False
     """Whether retained local work remains after this invocation returned normally."""
 
+    snapshot_completeness: Literal["", "complete", "partial"] = ""
+    snapshot_omissions: int = 0
+    snapshot_omission_reasons: dict[str, int] = field(default_factory=dict[str, int])
+
     @property
     def indexed(self) -> int:
         return self.by_status.get(DocumentStatus.INDEXED.value, 0)
@@ -460,14 +467,17 @@ class RunReport:
         position to describe more than what actually landed, and the watermark is a promise that
         it does not.
         """
-        return (
-            self.clean and not self.limited and self.unrecorded == 0 and not self.pending_derivation
-        )
+        return not self.retry_required and not self.limited
 
     @property
     def retry_required(self) -> bool:
-        """Whether callers must treat this report as incomplete and invoke it again."""
-        return bool(self.error or self.unrecorded or self.pending_derivation)
+        """Whether repeating this operation is required to finish its durable work."""
+        strict_snapshot_incomplete = (
+            self.snapshot_omissions > 0 and self.snapshot_completeness != "partial"
+        )
+        return bool(
+            self.error or self.unrecorded or self.pending_derivation or strict_snapshot_incomplete
+        )
 
     def record(self, outcome: DocumentOutcome, *, expanded: bool = False) -> None:
         """Count one outcome. Called from every fetch and ingest worker of a staged run.
@@ -534,6 +544,9 @@ class RunReport:
                 ),
                 "enumeration_completed": self.enumeration_completed,
                 "watermark_advanced": self.watermark_advanced,
+                "snapshot_completeness": self.snapshot_completeness,
+                "snapshot_omissions": self.snapshot_omissions,
+                "snapshot_omission_reasons": dict(self.snapshot_omission_reasons),
                 "retry_required": self.retry_required,
                 "glossary_failures": list(self.glossary_failures),
                 "stages": self.stages.as_metadata(),
@@ -570,6 +583,14 @@ class _AcquisitionStart:
     accepted: int = 0
     watermark: Watermark | None = None
     state: AcquisitionRunState | None = None
+    source_scope: str = ""
+    scope_fingerprint: str = ""
+    promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE
+    completeness: SnapshotCompleteness | None = None
+    omission_count: int = 0
+    omission_reasons: dict[AcquisitionFailureCode, int] = field(
+        default_factory=dict[AcquisitionFailureCode, int]
+    )
 
 
 @dataclass
@@ -598,6 +619,16 @@ class _Sync:
     resume_completed: bool = False
     candidate_watermark: Watermark | None = None
     acquisition_state: AcquisitionRunState | None = None
+    source_scope: str = ""
+    scope_fingerprint: str = ""
+    promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE
+    snapshot_completeness: SnapshotCompleteness | None = None
+    snapshot_omission_count: int = 0
+    snapshot_omission_reasons: dict[AcquisitionFailureCode, int] = field(
+        default_factory=dict[AcquisitionFailureCode, int]
+    )
+    reusable_snapshot_checked: bool = False
+    reusable_snapshot_run_id: str | None = None
     discovery_records_held: Gauge = field(default_factory=lambda: Gauge("discovery-records"))
 
     watching: Watching | None = None
@@ -652,6 +683,7 @@ class IngestPipeline:
         acquisition_clock: Callable[[], datetime] | None = None,
         acquisition_history_s: float = 30 * 24 * 3600.0,
         acquisition_cleanup_batch: int = 100,
+        snapshot_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
     ) -> None:
         # Second of the two places this is refused, and not a redundant one.
         # `check_before_run` is the once-per-run boundary and is what an operator meets; this
@@ -674,6 +706,7 @@ class IngestPipeline:
         self._acquisition_clock = acquisition_clock or (lambda: datetime.now(UTC))
         self._acquisition_history_s = max(0.0, acquisition_history_s)
         self._acquisition_cleanup_batch = max(1, acquisition_cleanup_batch)
+        self._snapshot_policy = snapshot_policy
         self._chunker = chunker
         self._embedder = embedder
         self._vectors = vectors
@@ -791,12 +824,16 @@ class IngestPipeline:
         acquisitions = self._acquisitions
         if acquisitions is None:
             return _AcquisitionStart(watermark=watermark)
+        source_scope, scope_fingerprint = _snapshot_scope(connector)
         owner = f"pipeline:{uuid4().hex}"
         now = self._acquisition_clock()
         claimed = await acquisitions.claim_or_create_acquisition_run(
             connector.name,
             uuid4().hex,
             owner,
+            source_scope=source_scope,
+            scope_fingerprint=scope_fingerprint,
+            promotion_policy=self._snapshot_policy,
             now=now,
             expires_at=now + timedelta(seconds=self._acquisition_lease_s),
         )
@@ -818,8 +855,18 @@ class IngestPipeline:
             resume_completed=claimed.enumeration_completed_at is not None,
             candidate_watermark=claimed.candidate_watermark,
             accepted=claimed.discovered_count,
-            watermark=claimed.base_watermark,
+            watermark=(
+                claimed.base_watermark
+                if claimed.base_watermark_scope_fingerprint == claimed.scope_fingerprint
+                else None
+            ),
             state=claimed.state,
+            source_scope=claimed.source_scope,
+            scope_fingerprint=claimed.scope_fingerprint,
+            promotion_policy=claimed.promotion_policy,
+            completeness=claimed.completeness,
+            omission_count=claimed.omission_count,
+            omission_reasons=dict(claimed.omission_reasons),
         )
 
     async def run(
@@ -888,7 +935,12 @@ class IngestPipeline:
                     now - timedelta(seconds=self._acquisition_history_s),
                     limit=self._acquisition_cleanup_batch,
                 )
-        watermark = await self._store.get_watermark(connector.name)
+            _, scope_fingerprint = _snapshot_scope(connector)
+            watermark = await self._acquisitions.get_acquisition_watermark(
+                connector.name, scope_fingerprint
+            )
+        else:
+            watermark = await self._store.get_watermark(connector.name)
         acquisition = await self._start_acquisition(connector, watermark)
 
         ref_capacity = self._queue_depth_factor * self._fetch_workers
@@ -917,8 +969,20 @@ class IngestPipeline:
             resume_completed=acquisition.resume_completed,
             candidate_watermark=acquisition.candidate_watermark,
             acquisition_state=acquisition.state,
+            source_scope=acquisition.source_scope,
+            scope_fingerprint=acquisition.scope_fingerprint,
+            promotion_policy=acquisition.promotion_policy,
+            snapshot_completeness=acquisition.completeness,
+            snapshot_omission_count=acquisition.omission_count,
+            snapshot_omission_reasons=dict(acquisition.omission_reasons),
             accepted=acquisition.accepted,
         )
+        if run.snapshot_completeness is not None:
+            run.report.snapshot_completeness = run.snapshot_completeness.value
+            run.report.snapshot_omissions = run.snapshot_omission_count
+            run.report.snapshot_omission_reasons = {
+                code.value: count for code, count in run.snapshot_omission_reasons.items()
+            }
         # Peaks only. The active counts belong to whoever is inside the stage right now, and a
         # second operation sharing this pipeline is one of them.
         for gauge in (self._fetches, self._parsing, self._embedding.gauge):
@@ -1012,11 +1076,12 @@ class IngestPipeline:
         refs, bodies = run.refs, run.bodies
         await self._run_local_stages(run, producer, refs, bodies)
 
-    async def _drive_durable(self, run: _Sync) -> None:
+    async def _drive_durable(self, run: _Sync) -> None:  # noqa: PLR0912 - durable state machine
         """Acquire a source snapshot first, then derive only from retained local bytes."""
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover - selected structurally
             return
+        await self._verify_resumed_snapshot(run, acquisitions)
 
         async def owned(work: Coroutine[object, object, None], name: str) -> None:
             async with asyncio.TaskGroup() as ownership:
@@ -1033,9 +1098,11 @@ class IngestPipeline:
             if not run.report.enumeration_completed:
                 # A bounded/incomplete run may still make its durable prefix useful, but it can
                 # never publish the candidate watermark or claim complete source coverage.
-                await self._owned_acquisition(run, self._acquire_journal(run))
+                acquired = await self._owned_acquisition(run, self._acquire_journal(run))
                 if run.stop.is_set():
                     return
+                if not acquired:
+                    await self._report_snapshot_omissions(run)
                 await owned(self._index_acquired(run), "journal-indexing")
                 await self._mark_pending_derivation(run, acquisitions)
                 return
@@ -1047,15 +1114,36 @@ class IngestPipeline:
             acquired = await self._owned_acquisition(run, self._acquire_journal(run))
             if run.stop.is_set():
                 return
-            if acquired:
+            if not acquired:
+                await self._report_snapshot_omissions(run)
+            if acquired or run.promotion_policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS:
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now, force=True)
-                run.report.watermark_advanced = await acquisitions.commit_acquisition_watermark(
+                await acquisitions.complete_snapshot_acquisition(
                     run.acquisition_run_id,
                     lease_owner=run.lease_owner,
                     lease_generation=run.lease_generation,
                     now=now,
                 )
+                promoted = await acquisitions.promote_snapshot_and_commit_watermark(
+                    run.acquisition_run_id,
+                    expected_scope_fingerprint=run.scope_fingerprint,
+                    lease_owner=run.lease_owner,
+                    lease_generation=run.lease_generation,
+                    now=now,
+                )
+                run.report.watermark_advanced = promoted.watermark_committed_at is not None
+                run.report.snapshot_completeness = (
+                    "partial"
+                    if promoted.completeness is SnapshotCompleteness.PARTIAL
+                    else "complete"
+                    if promoted.completeness is SnapshotCompleteness.COMPLETE
+                    else ""
+                )
+                run.report.snapshot_omissions = promoted.omission_count
+                run.report.snapshot_omission_reasons = {
+                    code.value: count for code, count in promoted.omission_reasons.items()
+                }
                 await acquisitions.transition_acquisition_run(
                     run.acquisition_run_id,
                     AcquisitionRunState.ACQUIRING,
@@ -1085,18 +1173,71 @@ class IngestPipeline:
             )
 
     async def _mark_pending_derivation(self, run: _Sync, acquisitions: AcquisitionStore) -> bool:
-        """Expose any retained or retryable local backlog on the invocation report."""
-        pending = await acquisitions.list_acquisition_records(
-            run.acquisition_run_id,
-            states=(
-                AcquisitionRecordState.ACQUIRED,
-                AcquisitionRecordState.INDEXING,
-                AcquisitionRecordState.RETRY,
-            ),
-            limit=1,
-        )
-        run.report.pending_derivation = bool(pending)
-        return run.report.pending_derivation
+        """Expose work that can continue from retained evidence without source contact."""
+        run.report.pending_derivation = False
+        after: int | None = None
+        while True:
+            records = await acquisitions.list_acquisition_records(
+                run.acquisition_run_id,
+                states=(
+                    AcquisitionRecordState.ACQUIRED,
+                    AcquisitionRecordState.INDEXING,
+                    AcquisitionRecordState.RETRY,
+                ),
+                after_sequence=after,
+                limit=100,
+            )
+            if not records:
+                return False
+            for record in records:
+                local_retry = record.diagnostic is not None and (
+                    record.diagnostic.stage is AcquisitionStage.INDEXING
+                )
+                retained = record.blob_ref is not None or record.acquired_source is not None
+                if record.state is not AcquisitionRecordState.RETRY or retained or local_retry:
+                    run.report.pending_derivation = True
+                    return True
+            after = records[-1].sequence
+
+    async def _report_snapshot_omissions(self, run: _Sync) -> None:
+        """Expose a bounded, typed aggregate even when strict policy refuses promotion."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - journal path only
+            return
+        after: int | None = None
+        omissions = 0
+        reasons: dict[str, int] = {}
+        while True:
+            records = await acquisitions.list_acquisition_records(
+                run.acquisition_run_id,
+                after_sequence=after,
+                limit=100,
+            )
+            if not records:
+                break
+            for record in records:
+                if record.blob_ref is not None and record.acquired_source is not None:
+                    continue
+                omissions += 1
+                diagnostic = record.snapshot_diagnostic or record.diagnostic
+                code = (
+                    diagnostic.code.value
+                    if diagnostic is not None
+                    else AcquisitionFailureCode.UNKNOWN.value
+                )
+                reasons[code] = reasons.get(code, 0) + 1
+            after = records[-1].sequence
+        run.report.snapshot_omissions = omissions
+        run.report.snapshot_omission_reasons = reasons
+
+    @staticmethod
+    async def _verify_resumed_snapshot(run: _Sync, acquisitions: AcquisitionStore) -> None:
+        if run.snapshot_completeness is None:
+            return
+        if await acquisitions.verify_snapshot_manifest(run.acquisition_run_id):
+            return
+        msg = "promoted source snapshot failed its canonical evidence verification"
+        raise RuntimeError(msg)
 
     async def _owned_acquisition(self, run: _Sync, work: Awaitable[bool]) -> bool:
         """Run a bool-returning acquisition phase with the same independent lease heartbeat."""
@@ -1383,29 +1524,32 @@ class IngestPipeline:
             existing = await self._store.find_document(run.connector.name, record.source.source_id)
             discovered = self._discovered(record)
             if self._unchanged_by_token(existing, discovered):
-                await self._keep_acquisition_lease_live(
-                    run, acquisitions, self._acquisition_clock(), force=True
-                )
-                await acquisitions.settle_unchanged_acquisition_record(
-                    run.acquisition_run_id,
-                    record.source.source_id,
-                    existing.id,  # pyright: ignore[reportOptionalMemberAccess]
-                    lease_owner=run.lease_owner,
-                    lease_generation=run.lease_generation,
-                    now=self._acquisition_clock(),
-                    blob_ref=existing.original_ref if existing is not None else None,
-                    fetched_version_token=record.source.version_token,
-                )
-                run.report.record(
-                    DocumentOutcome(
-                        source_id=record.source.source_id,
-                        status=existing.status,  # pyright: ignore[reportOptionalMemberAccess]
-                        document_id=existing.id,  # pyright: ignore[reportOptionalMemberAccess]
-                        skipped="version",
+                reusable = await self._validated_reusable_snapshot(run, record)
+                if reusable is not None:
+                    await self._keep_acquisition_lease_live(
+                        run, acquisitions, self._acquisition_clock(), force=True
                     )
-                )
-                _report_progress(run)
-                continue
+                    await acquisitions.settle_unchanged_acquisition_record(
+                        run.acquisition_run_id,
+                        record.source.source_id,
+                        existing.id,  # pyright: ignore[reportOptionalMemberAccess]
+                        lease_owner=run.lease_owner,
+                        lease_generation=run.lease_generation,
+                        now=self._acquisition_clock(),
+                        blob_ref=reusable.blob_ref,
+                        acquired_source=reusable.acquired_source,
+                        fetched_version_token=reusable.fetched_version_token,
+                    )
+                    run.report.record(
+                        DocumentOutcome(
+                            source_id=record.source.source_id,
+                            status=existing.status,  # pyright: ignore[reportOptionalMemberAccess]
+                            document_id=existing.id,  # pyright: ignore[reportOptionalMemberAccess]
+                            skipped="version",
+                        )
+                    )
+                    _report_progress(run)
+                    continue
 
             try:
                 stage_key = f"{run.acquisition_run_id}\0{record.source.source_id}"
@@ -1469,6 +1613,37 @@ class IngestPipeline:
                 fetched_version_token=fetched_version,
             )
             await self._blobs.complete_acquisition(stage_key)
+
+    async def _validated_reusable_snapshot(
+        self, run: _Sync, record: AcquisitionRecord
+    ) -> AcquisitionRecord | None:
+        """Return same-scope retained evidence only while its bytes still validate."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - called only by the journal path
+            return None
+        if not run.reusable_snapshot_checked:
+            promoted = await acquisitions.latest_promoted_snapshot(
+                run.connector.name, run.scope_fingerprint
+            )
+            run.reusable_snapshot_run_id = None if promoted is None else promoted.id
+            run.reusable_snapshot_checked = True
+        if run.reusable_snapshot_run_id is None:
+            return None
+        reusable = await acquisitions.reusable_record_from_verified_snapshot(
+            run.reusable_snapshot_run_id,
+            record.source.source_id,
+            record.source.version_token,
+        )
+        if reusable is None or reusable.acquired_source is None:
+            return None
+        try:
+            reused_data = await self._blobs.get(reusable.blob_ref or "")
+            if reused_data is None:
+                return None
+            reusable.acquired_source.raw(reused_data)
+        except Exception:  # noqa: BLE001 - corrupt reuse falls back to fresh fetch
+            return None
+        return reusable
 
     @staticmethod
     def _discovered(record: AcquisitionRecord) -> DiscoveredDoc:
@@ -3400,6 +3575,19 @@ def _writer_of(store: object) -> GlossaryWriter | None:
 def _raise_lost_acquisition_lease(run_id: str) -> None:
     msg = f"acquisition lease for run {run_id!r} was lost"
     raise AcquisitionLeaseLostError(msg)
+
+
+def _snapshot_scope(connector: Connector) -> tuple[str, str]:
+    """Read a connector's non-secret scope identity, with a safe whole-instance default."""
+    declared = getattr(connector, "source_scope", None)
+    source_scope = (
+        declared if isinstance(declared, str) and declared else f"instance:{connector.name}"
+    )
+    declared_fingerprint = getattr(connector, "scope_fingerprint", None)
+    if isinstance(declared_fingerprint, str) and declared_fingerprint:
+        return source_scope, declared_fingerprint
+    fingerprint = hashlib.blake2b(source_scope.encode(), digest_size=20).hexdigest()
+    return source_scope, fingerprint
 
 
 def _with_status(document: Document, result: ChainResult) -> Document:

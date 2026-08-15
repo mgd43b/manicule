@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -13,12 +14,19 @@ from sqlalchemy.exc import IntegrityError
 
 from manicule.core.acquisition import (
     AcquiredSource,
+    AcquisitionDiagnostic,
+    AcquisitionFailureCode,
     AcquisitionRecordState,
     AcquisitionRun,
     AcquisitionRunState,
     AcquisitionSource,
+    AcquisitionStage,
+    SnapshotCompleteness,
+    SnapshotItemOutcome,
+    SnapshotPromotionPolicy,
 )
-from manicule.core.content import RawDocument
+from manicule.core.content import Metadata, RawDocument
+from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.storage.acquisition import (
     AcquisitionConflictError,
@@ -42,14 +50,19 @@ def _watermark(value: str) -> Watermark:
     return Watermark(value=value, observed_at=datetime(2026, 8, 15, tzinfo=UTC))
 
 
-def _source(source_id: str = "page-1", *, uri: str | None = None) -> AcquisitionSource:
+def _source(
+    source_id: str = "page-1",
+    *,
+    uri: str | None = None,
+    version_token: str = "v1",  # noqa: S107 - source revision, not a credential
+) -> AcquisitionSource:
     discovered = DiscoveredDoc(
         ref=DocRef(
             source_id=source_id,
             uri=uri or f"https://example.test/pages/{source_id}",
             metadata={"opaque_id": source_id},
         ),
-        version_token="v1",  # noqa: S106 - source revision, not a credential
+        version_token=version_token,
         title="A durable title",
         media_type="text/html",
         size_bytes=12,
@@ -60,6 +73,24 @@ def _source(source_id: str = "page-1", *, uri: str | None = None) -> Acquisition
         source_modified_at=datetime(2026, 8, 15, 12, tzinfo=UTC),
         provenance={"source_kind": "synthetic"},
     )
+
+
+def test_discovered_citation_provenance_is_copied_into_the_durable_manifest() -> None:
+    provenance: Metadata = {
+        "source": {"title": "Canonical title", "uri": "https://source.test/p/1"}
+    }
+    discovered = DiscoveredDoc(
+        ref=DocRef(source_id="page-1", uri="https://cache.test/page-1"),
+        version_token="v1",  # noqa: S106 - source revision, not a credential
+        title="Local title",
+        media_type="text/html",
+        metadata={PROVENANCE_KEY: provenance},
+    )
+
+    source = AcquisitionSource.from_discovered(discovered)
+
+    assert source.provenance == provenance
+    assert source.metadata[PROVENANCE_KEY] == provenance
 
 
 def _acquired(data: bytes, source_id: str = "page-1") -> AcquiredSource:
@@ -74,6 +105,43 @@ def _acquired(data: bytes, source_id: str = "page-1") -> AcquiredSource:
 
 
 _NOW = datetime(2026, 8, 15, 13, tzinfo=UTC)
+
+
+async def _retain_record(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    run: AcquisitionRun,
+    *,
+    source_id: str = "page-1",
+    owner: str = "worker",
+    version_token: str = "v1",  # noqa: S107 - source revision, not a credential
+) -> str:
+    body = f"retained {source_id}".encode()
+    blob = await BlobStore(engine, data_dir).put(body, "text/html")
+    assert isinstance(blob, StoredBlob)
+    await store.transition_acquisition_record(
+        run.id,
+        source_id,
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner=owner,
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        source_id,
+        AcquisitionRecordState.ACQUIRING,
+        AcquisitionRecordState.ACQUIRED,
+        lease_owner=owner,
+        lease_generation=run.lease_generation,
+        now=_NOW,
+        blob_ref=blob.hash,
+        acquired_source=_acquired(body, source_id),
+        fetched_version_token=version_token,
+    )
+    return blob.hash
 
 
 async def _claimed_run(
@@ -176,7 +244,7 @@ async def test_run_identity_and_records_do_not_cross_workspaces(
     )
 
     assert await second.get_acquisition_run("same-run") is None
-    with pytest.raises(AcquisitionConflictError, match="another connector or workspace"):
+    with pytest.raises(AcquisitionConflictError, match="requested run identity"):
         await second.create_acquisition_run("same-run", "wiki")
 
 
@@ -953,6 +1021,53 @@ async def test_watermark_commit_is_ordered_cas_and_replay_safe(store: SqliteDocS
     assert await store.connector_metadata("wiki") == first_metadata
 
 
+async def test_snapshot_promotion_rolls_back_its_marker_when_watermark_cas_loses(
+    store: SqliteDocStore,
+) -> None:
+    older = await _claimed_run(store, "older-snapshot")
+    newer = await _claimed_run(store, "newer-snapshot", owner="new-worker")
+    for run, owner, candidate in (
+        (older, "worker", "old"),
+        (newer, "new-worker", "new"),
+    ):
+        await store.complete_acquisition_enumeration(
+            run.id,
+            _watermark(candidate),
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.complete_snapshot_acquisition(
+            run.id,
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+
+    await store.promote_snapshot_and_commit_watermark(
+        newer.id,
+        expected_scope_fingerprint="",
+        lease_owner="new-worker",
+        lease_generation=newer.lease_generation,
+        now=_NOW,
+    )
+    with pytest.raises(AcquisitionWatermarkConflictError, match="changed"):
+        await store.promote_snapshot_and_commit_watermark(
+            older.id,
+            expected_scope_fingerprint="",
+            lease_owner="worker",
+            lease_generation=older.lease_generation,
+            now=_NOW,
+        )
+
+    unpromoted = await store.get_acquisition_run(older.id)
+    assert unpromoted is not None
+    assert unpromoted.acquisition_completed_at is not None
+    assert unpromoted.promoted_at is None
+    assert unpromoted.watermark_committed_at is None
+    assert await store.get_watermark("wiki") == _watermark("new")
+
+
 async def test_failed_append_transaction_acknowledges_nothing(store: SqliteDocStore) -> None:
     lease = await _claimed_run(store)
     await store.append_acquisition_record(
@@ -1237,6 +1352,621 @@ async def test_database_requires_blobs_for_blob_backed_states(
     assert record.blob_ref is None
 
 
+async def test_snapshot_markers_are_distinct_and_promotion_commits_watermark_atomically(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run = await store.create_acquisition_run(
+        "promote-run",
+        "wiki",
+        source_scope="space:ENG",
+        scope_fingerprint="scope-eng-v1",
+    )
+    claimed = await store.claim_acquisition_run(
+        run.id, "worker", now=_NOW, expires_at=_NOW + timedelta(minutes=1)
+    )
+    assert claimed is not None
+    run = claimed
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    enumerated = await store.complete_acquisition_enumeration(
+        run.id,
+        _watermark("candidate"),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert enumerated.enumeration_completed_at is not None
+    assert enumerated.acquisition_completed_at is None
+    assert enumerated.promoted_at is None
+    retained = await _retain_record(store, engine, data_dir, run)
+
+    acquired = await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert acquired.acquisition_completed_at is not None
+    assert acquired.membership_hash
+    assert acquired.promoted_at is None
+    assert await store.get_watermark("wiki") is None
+    resumed_acquisition = await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert resumed_acquisition.acquisition_completed_at == acquired.acquisition_completed_at
+    assert resumed_acquisition.membership_hash == acquired.membership_hash
+
+    promoted = await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint="scope-eng-v1",
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert promoted.promoted_at == promoted.watermark_committed_at
+    assert promoted.completeness is SnapshotCompleteness.COMPLETE
+    resumed_promotion = await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint="scope-eng-v1",
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert resumed_promotion.promoted_at == promoted.promoted_at
+    assert resumed_promotion.watermark_committed_at == promoted.watermark_committed_at
+    assert (await store.list_acquisition_records(run.id))[0].snapshot_outcome is (
+        SnapshotItemOutcome.RETAINED
+    )
+    assert await store.get_watermark("wiki") == _watermark("candidate")
+    assert await BlobStore(engine, data_dir).collect_garbage() == []
+    assert await BlobStore(engine, data_dir).get(retained) is not None
+
+
+async def test_strict_snapshot_omission_is_typed_resumable_and_unpromoted(
+    store: SqliteDocStore,
+) -> None:
+    run = await _claimed_run(store, "strict-run")
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        _watermark("candidate"),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        "page-1",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+        diagnostic=AcquisitionDiagnostic(
+            stage=AcquisitionStage.ACQUISITION,
+            code=AcquisitionFailureCode.AUTHENTICATION,
+        ),
+    )
+
+    with pytest.raises(AcquisitionCoverageError, match="1 required source records"):
+        await store.complete_snapshot_acquisition(
+            run.id,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+    persisted = await store.get_acquisition_run(run.id)
+    assert persisted is not None
+    assert persisted.acquisition_completed_at is None
+    assert persisted.promoted_at is None
+    assert persisted.watermark_committed_at is None
+    assert persisted.omission_count == 1
+    assert persisted.omission_reasons == {AcquisitionFailureCode.AUTHENTICATION: 1}
+    record = (await store.list_acquisition_records(run.id))[0]
+    assert record.diagnostic is not None
+    assert record.diagnostic.code is AcquisitionFailureCode.AUTHENTICATION
+    assert record.snapshot_diagnostic == record.diagnostic
+    assert await store.get_watermark("wiki") is None
+
+
+async def test_manifest_verifier_rejects_revision_and_envelope_substitution(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    created = await store.create_acquisition_run(
+        "verified-run", "wiki", source_scope="space:ENG", scope_fingerprint="eng"
+    )
+    run = await store.claim_acquisition_run(
+        created.id, "worker", now=_NOW, expires_at=_NOW + timedelta(minutes=1)
+    )
+    assert run is not None
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        None,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await _retain_record(store, engine, data_dir, run)
+    await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint="eng",
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert await store.verify_snapshot_manifest(run.id)
+
+    secret = "private-corrupt-diagnostic-do-not-print"  # noqa: S105 - redaction fixture
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE acquisition_records SET snapshot_diagnostic = :diagnostic "
+                "WHERE run_id = 'verified-run'"
+            ),
+            {"diagnostic": json.dumps(secret)},
+        )
+    corrupted = (await store.list_acquisition_records(run.id))[0]
+    assert corrupted.snapshot_diagnostic is not None
+    assert corrupted.snapshot_diagnostic.code is AcquisitionFailureCode.LEGACY_UNVERIFIED
+    assert secret not in str(corrupted)
+    assert not await store.verify_snapshot_manifest(run.id)
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE acquisition_records SET snapshot_diagnostic = NULL "
+                "WHERE run_id = 'verified-run'"
+            )
+        )
+    assert await store.verify_snapshot_manifest(run.id)
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE acquisition_records SET fetched_version_token = 'substituted' "
+                "WHERE run_id = 'verified-run'"
+            )
+        )
+    assert not await store.verify_snapshot_manifest(run.id)
+    assert await store.latest_promoted_snapshot("wiki", "eng") is None
+    assert await store.reusable_snapshot_record("wiki", "eng", "page-1", "substituted") is None
+    with pytest.raises(AcquisitionConflictError, match="evidence"):
+        await store.promote_snapshot_and_commit_watermark(
+            run.id,
+            expected_scope_fingerprint="eng",
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE acquisition_records SET fetched_version_token = 'v1', "
+                "acquired_source = json_set(acquired_source, '$.byte_length', 999) "
+                "WHERE run_id = 'verified-run'"
+            )
+        )
+    assert not await store.verify_snapshot_manifest(run.id)
+
+
+async def test_allow_omissions_promotes_partial_snapshot_with_aggregate_reasons(
+    store: SqliteDocStore,
+) -> None:
+    run = await store.create_acquisition_run(
+        "partial-run",
+        "wiki",
+        source_scope="space:ENG",
+        scope_fingerprint="scope-eng-v1",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+    claimed = await store.claim_acquisition_run(
+        run.id, "worker", now=_NOW, expires_at=_NOW + timedelta(minutes=1)
+    )
+    assert claimed is not None
+    run = claimed
+    for sequence, source_id in enumerate(("missing-1", "missing-2")):
+        await store.append_acquisition_record(
+            run.id,
+            sequence,
+            _source(source_id),
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.transition_acquisition_record(
+            run.id,
+            source_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.RETRY,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+            diagnostic=AcquisitionDiagnostic(
+                stage=AcquisitionStage.ACQUISITION,
+                code=AcquisitionFailureCode.AUTHENTICATION,
+            ),
+        )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        _watermark("partial"),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    acquired = await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert acquired.omission_count == 2
+    assert acquired.omission_reasons == {AcquisitionFailureCode.AUTHENTICATION: 2}
+
+    promoted = await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint="scope-eng-v1",
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert promoted.completeness is SnapshotCompleteness.PARTIAL
+    assert {record.state for record in await store.list_acquisition_records(run.id)} == {
+        AcquisitionRecordState.OMITTED
+    }
+    assert {record.snapshot_outcome for record in await store.list_acquisition_records(run.id)} == {
+        SnapshotItemOutcome.OMITTED
+    }
+    assert {
+        record.snapshot_diagnostic.code
+        for record in await store.list_acquisition_records(run.id)
+        if record.snapshot_diagnostic is not None
+    } == {AcquisitionFailureCode.AUTHENTICATION}
+    assert await store.get_watermark("wiki") == _watermark("partial")
+
+
+@pytest.mark.parametrize(
+    "raw_diagnostic",
+    [
+        '"private-current-scalar-do-not-print"',
+        '["private-current-list-do-not-print"]',
+        "null",
+        None,
+        '{"stage":"acquisition","code":"unknown","retryable":true,"private":"secret"}',
+        '{"source_id":"private-source-shaped","uri":"https://private.invalid"}',
+        '{"stage":"acquisition","code":"not-real","retryable":true}',
+        '{"stage":"indexing","code":"unknown","retryable":true}',
+    ],
+    ids=(
+        "scalar",
+        "list",
+        "json-null",
+        "sql-null",
+        "extra-private",
+        "source-shaped",
+        "unknown-code",
+        "wrong-stage",
+    ),
+)
+async def test_completion_canonicalizes_current_omission_diagnostics_before_promotion(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    raw_diagnostic: str | None,
+) -> None:
+    created = await store.create_acquisition_run(
+        "canonical-current-run",
+        "wiki",
+        source_scope="space:canonical",
+        scope_fingerprint="canonical",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+    run = await store.claim_acquisition_run(
+        created.id, "worker", now=_NOW, expires_at=_NOW + timedelta(minutes=1)
+    )
+    assert run is not None
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        None,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        "page-1",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+        diagnostic=AcquisitionDiagnostic(
+            stage=AcquisitionStage.ACQUISITION,
+            code=AcquisitionFailureCode.UNKNOWN,
+        ),
+    )
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE acquisition_records SET snapshot_diagnostic = :diagnostic "
+                "WHERE run_id = 'canonical-current-run'"
+            ),
+            {"diagnostic": raw_diagnostic},
+        )
+
+    completed = await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert completed.omission_reasons == {AcquisitionFailureCode.LEGACY_UNVERIFIED: 1}
+    record = (await store.list_acquisition_records(run.id))[0]
+    assert record.snapshot_diagnostic is not None
+    assert record.snapshot_diagnostic.code is AcquisitionFailureCode.LEGACY_UNVERIFIED
+    canonical = record.snapshot_diagnostic.model_dump(mode="json")
+    async with engine.connect() as connection:
+        stored_raw = (
+            await connection.execute(
+                text(
+                    "SELECT snapshot_diagnostic FROM acquisition_records "
+                    "WHERE run_id = 'canonical-current-run'"
+                )
+            )
+        ).scalar_one()
+    assert json.loads(stored_raw) == canonical
+    assert "private" not in stored_raw
+
+    await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint="canonical",
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert await store.verify_snapshot_manifest(run.id)
+    assert await store.latest_promoted_snapshot("wiki", "canonical") is not None
+
+    substituted = '{"source_id":"private-post-freeze","uri":"https://private.invalid"}'
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE acquisition_records SET snapshot_diagnostic = :diagnostic "
+                "WHERE run_id = 'canonical-current-run'"
+            ),
+            {"diagnostic": substituted},
+        )
+    assert not await store.verify_snapshot_manifest(run.id)
+    assert await store.latest_promoted_snapshot("wiki", "canonical") is None
+
+
+async def test_promotion_and_reuse_are_isolated_by_workspace_connector_and_scope(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run = await store.create_acquisition_run(
+        "scope-run", "wiki", source_scope="space:ENG", scope_fingerprint="eng"
+    )
+    claimed = await store.claim_acquisition_run(
+        run.id, "worker", now=_NOW, expires_at=_NOW + timedelta(minutes=1)
+    )
+    assert claimed is not None
+    run = claimed
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        None,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await _retain_record(store, engine, data_dir, run)
+    await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    with pytest.raises(AcquisitionConflictError, match="scope fingerprint"):
+        await store.promote_snapshot_and_commit_watermark(
+            run.id,
+            expected_scope_fingerprint="other",
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+    await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint="eng",
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    assert await store.reusable_snapshot_record("wiki", "eng", "page-1", "v1") is not None
+    assert await store.reusable_snapshot_record("wiki", "other", "page-1", "v1") is None
+    assert await store.reusable_snapshot_record("other", "eng", "page-1", "v1") is None
+
+    other = SqliteDocStore(engine, workspace_id="other-workspace")
+    await other.ensure_workspace()
+    assert await other.latest_promoted_snapshot("wiki", "eng") is None
+    assert await other.reusable_snapshot_record("wiki", "eng", "page-1", "v1") is None
+
+
+async def test_reuse_uses_the_same_run_id_tiebreaker_as_latest_promoted_snapshot(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    for run_id, owner in (("same-time-a", "worker-a"), ("same-time-z", "worker-z")):
+        created = await store.create_acquisition_run(
+            run_id,
+            "wiki",
+            source_scope="space:ENG",
+            scope_fingerprint="same-scope",
+        )
+        run = await store.claim_acquisition_run(
+            created.id,
+            owner,
+            now=_NOW,
+            expires_at=_NOW + timedelta(minutes=1),
+        )
+        assert run is not None
+        await store.append_acquisition_record(
+            run.id,
+            0,
+            _source(),
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.complete_acquisition_enumeration(
+            run.id,
+            None,
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await _retain_record(store, engine, data_dir, run, owner=owner)
+        await store.complete_snapshot_acquisition(
+            run.id,
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.promote_snapshot_and_commit_watermark(
+            run.id,
+            expected_scope_fingerprint="same-scope",
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+
+    latest = await store.latest_promoted_snapshot("wiki", "same-scope")
+    reusable = await store.reusable_snapshot_record("wiki", "same-scope", "page-1", "v1")
+
+    assert latest is not None
+    assert reusable is not None
+    assert latest.id == "same-time-z"
+    assert reusable.run_id == latest.id
+
+
+async def test_reuse_never_falls_back_behind_the_authoritative_latest_snapshot(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    for run_id, owner, version_token in (
+        ("a-older-v1", "worker-old", "v1"),
+        ("z-newer-v2", "worker-new", "v2"),
+    ):
+        created = await store.create_acquisition_run(
+            run_id,
+            "wiki",
+            source_scope="space:ENG",
+            scope_fingerprint="versioned-scope",
+        )
+        run = await store.claim_acquisition_run(
+            created.id,
+            owner,
+            now=_NOW,
+            expires_at=_NOW + timedelta(minutes=1),
+        )
+        assert run is not None
+        await store.append_acquisition_record(
+            run.id,
+            0,
+            _source(version_token=version_token),
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.complete_acquisition_enumeration(
+            run.id,
+            None,
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await _retain_record(
+            store,
+            engine,
+            data_dir,
+            run,
+            owner=owner,
+            version_token=version_token,
+        )
+        await store.complete_snapshot_acquisition(
+            run.id,
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.promote_snapshot_and_commit_watermark(
+            run.id,
+            expected_scope_fingerprint="versioned-scope",
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+
+    latest = await store.latest_promoted_snapshot("wiki", "versioned-scope")
+
+    assert latest is not None
+    assert latest.id == "z-newer-v2"
+    assert await store.reusable_snapshot_record("wiki", "versioned-scope", "page-1", "v1") is None
+    reusable = await store.reusable_snapshot_record("wiki", "versioned-scope", "page-1", "v2")
+    assert reusable is not None
+    assert reusable.run_id == latest.id
+
+
 async def test_migration_preserves_publications_and_creates_no_backlog(data_dir: Path) -> None:
     engine = create_engine(data_dir)
     try:
@@ -1252,6 +1982,249 @@ async def test_migration_preserves_publications_and_creates_no_backlog(data_dir:
         assert before is not None
         assert await store.find_document("wiki", "already-indexed") == before
         assert await store.latest_unsettled_acquisition_run("wiki") is None
+    finally:
+        await engine.dispose()
+
+
+async def test_migration_does_not_forge_legacy_unchanged_coverage_into_a_complete_snapshot(
+    data_dir: Path,
+) -> None:
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="c41d7ea923b8")
+        store = SqliteDocStore(engine)
+        await store.ensure_workspace()
+        timestamp = "2026-08-15T13:00:00+00:00"
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO connectors "
+                    "(id, workspace_id, name, type, config, watermark, sync_interval_seconds, "
+                    "status, metadata, created_at) VALUES "
+                    "('default:wiki', 'default', 'wiki', 'wiki', '{}', NULL, 300, "
+                    "'active', '{}', :timestamp)"
+                ),
+                {"timestamp": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO acquisition_runs "
+                    "(id, workspace_id, connector_id, connector_name, state, base_watermark, "
+                    "candidate_watermark, enumeration_completed_at, watermark_committed_at, "
+                    "lease_generation, discovered_count, acquired_count, indexed_count, "
+                    "unchanged_count, retry_count, metadata_bytes, acquired_blob_bytes, "
+                    "created_at, updated_at) VALUES "
+                    "('legacy-run', 'default', 'default:wiki', 'wiki', 'settled', NULL, NULL, "
+                    ":timestamp, :timestamp, 0, 1, 0, 0, 1, 0, 1, 0, :timestamp, :timestamp)"
+                ),
+                {"timestamp": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO acquisition_records "
+                    "(id, run_id, workspace_id, connector_id, sequence, source_id, "
+                    "source_record, state, blob_ref, acquired_source, attempts, created_at, "
+                    "updated_at) VALUES "
+                    "('legacy-record', 'legacy-run', 'default', 'default:wiki', 0, "
+                    "'private-source-do-not-print', '{}', 'unchanged', NULL, NULL, 0, "
+                    ":timestamp, :timestamp)"
+                ),
+                {"timestamp": timestamp},
+            )
+
+        await upgrade(engine)
+
+        migrated = await store.get_acquisition_run("legacy-run")
+        assert migrated is not None
+        assert migrated.acquisition_completed_at is None
+        assert migrated.promoted_at is None
+        assert migrated.completeness is None
+        assert migrated.membership_hash == "legacy-unverified"
+        assert migrated.omission_count == 1
+        assert migrated.omission_reasons == {AcquisitionFailureCode.LEGACY_UNVERIFIED: 1}
+        assert await store.latest_promoted_snapshot("wiki", "") is None
+    finally:
+        await engine.dispose()
+
+
+async def test_migration_redacts_untyped_legacy_record_diagnostics_and_remains_resumable(
+    data_dir: Path,
+) -> None:
+    engine = create_engine(data_dir)
+    secret = "private-diagnostic-sentinel-do-not-print"  # noqa: S105 - redaction fixture
+    try:
+        await upgrade(engine, revision="c41d7ea923b8")
+        store = SqliteDocStore(engine)
+        await store.ensure_workspace()
+        timestamp = "2026-08-15T13:00:00+00:00"
+        diagnostics: list[str | None] = [
+            json.dumps(secret),
+            json.dumps([secret]),
+            None,
+            json.dumps(
+                {
+                    "stage": "acquisition",
+                    "code": "not-a-real-code",
+                    "retryable": True,
+                    "private": secret,
+                }
+            ),
+            json.dumps(
+                {
+                    "source_id": "public-source-shaped-diagnostic",
+                    "uri": f"https://example.test/?private={secret}",
+                    "media_type": "text/plain",
+                }
+            ),
+            f"{{malformed-{secret}",
+            json.dumps({"stage": "acquisition", "code": "authentication", "retryable": True}),
+        ]
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO connectors "
+                    "(id, workspace_id, name, type, config, watermark, sync_interval_seconds, "
+                    "status, metadata, created_at) VALUES "
+                    "('default:legacy-diagnostics', 'default', 'legacy-diagnostics', 'wiki', "
+                    "'{}', NULL, 300, 'active', '{}', :timestamp)"
+                ),
+                {"timestamp": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO acquisition_runs "
+                    "(id, workspace_id, connector_id, connector_name, state, base_watermark, "
+                    "candidate_watermark, enumeration_completed_at, lease_generation, "
+                    "discovered_count, acquired_count, indexed_count, unchanged_count, "
+                    "retry_count, metadata_bytes, acquired_blob_bytes, created_at, updated_at) "
+                    "VALUES ('legacy-diagnostics-run', 'default', "
+                    "'default:legacy-diagnostics', 'legacy-diagnostics', 'acquiring', NULL, NULL, "
+                    ":timestamp, 0, 7, 0, 0, 7, 0, 7, 0, :timestamp, :timestamp)"
+                ),
+                {"timestamp": timestamp},
+            )
+            for sequence, diagnostic in enumerate(diagnostics):
+                await connection.execute(
+                    text(
+                        "INSERT INTO acquisition_records "
+                        "(id, run_id, workspace_id, connector_id, sequence, source_id, "
+                        "source_record, state, blob_ref, acquired_source, attempts, diagnostic, "
+                        "created_at, updated_at) VALUES "
+                        "(:id, 'legacy-diagnostics-run', 'default', "
+                        "'default:legacy-diagnostics', :sequence, :source_id, :source_record, "
+                        "'unchanged', NULL, NULL, 0, :diagnostic, :timestamp, :timestamp)"
+                    ),
+                    {
+                        "id": f"legacy-diagnostic-{sequence}",
+                        "sequence": sequence,
+                        "source_id": f"public-source-{sequence}",
+                        "source_record": json.dumps(
+                            _source(f"public-source-{sequence}").model_dump(mode="json")
+                        ),
+                        "diagnostic": diagnostic,
+                        "timestamp": timestamp,
+                    },
+                )
+
+        await upgrade(engine)
+
+        records = await store.list_acquisition_records("legacy-diagnostics-run")
+        assert len(records) == 7
+        snapshot_diagnostics = [record.snapshot_diagnostic for record in records]
+        assert all(diagnostic is not None for diagnostic in snapshot_diagnostics)
+        assert [
+            diagnostic.code for diagnostic in snapshot_diagnostics if diagnostic is not None
+        ] == [
+            AcquisitionFailureCode.LEGACY_UNVERIFIED,
+            AcquisitionFailureCode.LEGACY_UNVERIFIED,
+            AcquisitionFailureCode.LEGACY_UNVERIFIED,
+            AcquisitionFailureCode.LEGACY_UNVERIFIED,
+            AcquisitionFailureCode.LEGACY_UNVERIFIED,
+            AcquisitionFailureCode.LEGACY_UNVERIFIED,
+            AcquisitionFailureCode.AUTHENTICATION,
+        ]
+        assert secret not in str(records)
+        claimed = await store.claim_acquisition_run(
+            "legacy-diagnostics-run",
+            "worker",
+            now=_NOW,
+            expires_at=_NOW + timedelta(minutes=1),
+        )
+        assert claimed is not None
+        with pytest.raises(AcquisitionCoverageError, match="7 required source records") as refused:
+            await store.complete_snapshot_acquisition(
+                claimed.id,
+                lease_owner="worker",
+                lease_generation=claimed.lease_generation,
+                now=_NOW,
+            )
+        assert secret not in str(refused.value)
+        persisted = await store.get_acquisition_run(claimed.id)
+        assert persisted is not None
+        assert persisted.acquisition_completed_at is None
+        assert persisted.promoted_at is None
+        assert persisted.omission_count == 7
+        assert persisted.omission_reasons == {
+            AcquisitionFailureCode.LEGACY_UNVERIFIED: 6,
+            AcquisitionFailureCode.AUTHENTICATION: 1,
+        }
+        assert not await store.verify_snapshot_manifest(claimed.id)
+        assert await store.latest_promoted_snapshot("legacy-diagnostics", "") is None
+
+        await downgrade(engine, "c41d7ea923b8")
+        assert await current(engine) == "c41d7ea923b8"
+    finally:
+        await engine.dispose()
+
+
+async def test_snapshot_migration_downgrade_refuses_promoted_manifests_with_redacted_count(
+    data_dir: Path,
+) -> None:
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine)
+        store = SqliteDocStore(engine)
+        await store.ensure_workspace()
+        secret_scope = "private-scope-token-do-not-print"  # noqa: S105 - redaction fixture
+        created = await store.create_acquisition_run(
+            "promoted-for-downgrade",
+            "wiki",
+            source_scope=secret_scope,
+            scope_fingerprint="private-fingerprint-do-not-print",
+        )
+        run = await store.claim_acquisition_run(
+            created.id,
+            "worker",
+            now=_NOW,
+            expires_at=_NOW + timedelta(minutes=1),
+        )
+        assert run is not None
+        await store.complete_acquisition_enumeration(
+            run.id,
+            None,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.complete_snapshot_acquisition(
+            run.id,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.promote_snapshot_and_commit_watermark(
+            run.id,
+            expected_scope_fingerprint=run.scope_fingerprint,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+
+        with pytest.raises(RuntimeError, match=r"1 promoted manifest\(s\)") as refused:
+            await downgrade(engine, "c41d7ea923b8")
+        assert secret_scope not in str(refused.value)
+        assert run.scope_fingerprint not in str(refused.value)
+        assert await current(engine) == "4d8f12a6bc91"
     finally:
         await engine.dispose()
 
@@ -1446,6 +2419,7 @@ async def test_acquired_envelope_downgrade_refuses_with_aggregate_redacted_count
         assert secret_id not in message
         assert secret_uri not in message
         assert body.decode() not in message
+        # The envelope migration was isolated before exercising its own downgrade refusal.
         assert await current(engine) == "c41d7ea923b8"
     finally:
         await engine.dispose()

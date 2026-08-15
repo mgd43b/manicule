@@ -8,6 +8,7 @@ untyped dictionaries with the journal.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum, StrEnum
 from typing import Self
@@ -16,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.ids import content_hash
+from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 
 
@@ -38,6 +40,29 @@ class AcquisitionRecordState(StrEnum):
     INDEXING = "indexing"
     SETTLED = "settled"
     RETRY = "retry"
+    OMITTED = "omitted"
+
+
+class SnapshotPromotionPolicy(StrEnum):
+    """Completeness contract applied before a source snapshot becomes authoritative."""
+
+    REQUIRE_COMPLETE = "require_complete"
+    ALLOW_OMISSIONS = "allow_omissions"
+
+
+class SnapshotCompleteness(StrEnum):
+    """How much of the enumerated source a promoted snapshot can reproduce locally."""
+
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+
+
+class SnapshotItemOutcome(StrEnum):
+    """Immutable byte-coverage result for one deterministic manifest member."""
+
+    RETAINED = "retained"
+    REUSED = "reused"
+    OMITTED = "omitted"
 
 
 class AcquisitionStage(StrEnum):
@@ -66,6 +91,7 @@ class AcquisitionFailureCode(StrEnum):
     EMBED_FAILED = "embed_failed"
     PUBLICATION_FAILED = "publication_failed"
     INTERRUPTED = "interrupted"
+    LEGACY_UNVERIFIED = "legacy_unverified"
     UNKNOWN = "unknown"
 
 
@@ -136,6 +162,10 @@ class AcquisitionSource(BaseModel):
         provenance: Metadata | None = None,
     ) -> AcquisitionSource:
         """Build the durable form without asking call sites to reshape connector JSON."""
+        if provenance is None:
+            raw_provenance = discovered.metadata.get(PROVENANCE_KEY)
+            if isinstance(raw_provenance, Mapping):
+                provenance = dict(raw_provenance)
         return cls(
             ref=discovered.ref,
             version_token=discovered.version_token,
@@ -206,13 +236,23 @@ class AcquisitionRun(BaseModel):
     workspace_id: str
     connector_id: str
     connector: str
+    source_scope: str = ""
+    scope_fingerprint: str = ""
+    promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE
     state: AcquisitionRunState
     base_watermark: Watermark | None = None
+    base_watermark_scope_fingerprint: str | None = None
     candidate_watermark: Watermark | None = None
     enumeration_completed_at: datetime | None = None
+    acquisition_completed_at: datetime | None = None
+    promoted_at: datetime | None = None
     watermark_committed_at: datetime | None = None
     superseded_at: datetime | None = None
     superseded_by: str | None = None
+    membership_hash: str | None = None
+    completeness: SnapshotCompleteness | None = None
+    omission_count: int = Field(default=0, ge=0)
+    omission_reasons: dict[AcquisitionFailureCode, int] = Field(default_factory=lambda: {})
     lease_owner: str | None = None
     lease_generation: int = Field(ge=0)
     lease_expires_at: datetime | None = None
@@ -237,10 +277,12 @@ class AcquisitionRecord(BaseModel):
     sequence: int = Field(ge=0)
     source: AcquisitionSource
     state: AcquisitionRecordState
+    snapshot_outcome: SnapshotItemOutcome | None = None
     blob_ref: str | None = None
     acquired_source: AcquiredSource | None = None
     fetched_version_token: str | None = None
     attempts: int = Field(ge=0)
+    snapshot_diagnostic: AcquisitionDiagnostic | None = None
     diagnostic: AcquisitionDiagnostic | None = None
     created_at: datetime
     updated_at: datetime
@@ -258,5 +300,8 @@ __all__ = [
     "AcquisitionRunState",
     "AcquisitionSource",
     "AcquisitionStage",
+    "SnapshotCompleteness",
+    "SnapshotItemOutcome",
+    "SnapshotPromotionPolicy",
     "UnsetValue",
 ]

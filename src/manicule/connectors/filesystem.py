@@ -319,6 +319,11 @@ class FilesystemConnector:
         self._reached: datetime | None = None
 
     @property
+    def source_scope(self) -> str:
+        """Resolved filesystem boundary whose membership this connector enumerates."""
+        return str(self._root)
+
+    @property
     def root(self) -> Path:
         return self._root
 
