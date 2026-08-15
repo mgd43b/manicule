@@ -89,6 +89,14 @@ async def _tools(service: ApplicationService) -> list[Tool]:
         return list(await client.list_tools())
 
 
+async def _instructions(service: ApplicationService) -> str:
+    """Server guidance from the initialization result, as a client receives it."""
+    async with Client(build_server(service)) as client:
+        result = client.initialize_result
+    assert result is not None, "the client never completed initialization"
+    return result.instructions or ""
+
+
 @pytest.fixture
 def service() -> ApplicationService:
     backend = FakeBackend()
@@ -127,6 +135,55 @@ async def test_every_registered_tool_answers_all_four_questions(
         assert tool.annotations is not None, f"{tool.name} publishes no annotations"
         undecided = [hint for hint in HINTS if getattr(tool.annotations, hint) is None]
         assert undecided == [], f"{tool.name} leaves {undecided} unanswered"
+
+
+async def test_the_protocol_explains_how_to_judge_and_recover_from_retrieval(
+    service: ApplicationService,
+) -> None:
+    """A fresh client can act on weak or partial evidence without guessing from a float.
+
+    Read the initialization result rather than :data:`manicule.mcp.server.INSTRUCTIONS`, because
+    guidance assembled in the process and never sent across the protocol buys the client
+    nothing. The assertions name machine fields rather than pinning paragraphs: wording may
+    improve, but losing one of the decisions would make a plausible-looking result ambiguous.
+    """
+    instructions = " ".join((await _instructions(service)).split())
+    for field in (
+        "confidence_band",
+        "confidence_reason",
+        "collections",
+        "truncated",
+        "corpus_consulted",
+        "ungrounded",
+        "context_truncated",
+        "dropped",
+    ):
+        assert field in instructions, f"server instructions do not explain {field}"
+    assert "not probabilities" in instructions
+    assert "Treat `none` and `low` as insufficient support" in instructions
+    assert "not that the corpus does not" in instructions
+    assert "Never remove a scope" in instructions
+    assert "one retry with `precise`" in instructions
+
+
+async def test_retrieval_tools_publish_their_result_decisions_in_tools_list(
+    service: ApplicationService,
+) -> None:
+    """Tool selection can be correct even when a client ignores server-wide instructions.
+
+    Some clients present only ``tools/list`` metadata to the model choosing a call. Checking the
+    published descriptions keeps the recovery contract at that boundary instead of proving
+    only that the Python docstrings contain it.
+    """
+    descriptions = {
+        tool.name: " ".join((tool.description or "").split()) for tool in await _tools(service)
+    }
+    for field in ("confidence_band", "confidence_reason", "collections", "truncated"):
+        assert field in descriptions["search"], f"search does not explain {field}"
+    for field in ("corpus_consulted", "ungrounded", "context_truncated", "dropped"):
+        assert field in descriptions["ask"], f"ask does not explain {field}"
+    assert "not the probability" in descriptions["search"]
+    assert "not the probability" in descriptions["ask"]
 
 
 async def test_no_tool_that_changes_something_reports_itself_read_only(

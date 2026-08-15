@@ -433,6 +433,47 @@ over a `Qualification` is a useful thing to do by hand, and the record of one be
 provider, the model, the reasoning setting, the date and the exact prompt — not in a test that
 would go red when somebody else's sampler changed.
 
+### 4.3 Interpreting retrieval as a client
+
+The MCP initialization and the `search` and `ask` tool descriptions carry the following rules
+because MCP is the primary unattended surface. The fields are already part of the shared payload;
+the guidance adds no MCP-only result shape, and `tests/app/test_surface_parity.py` continues to
+hold search envelopes byte-identical across MCP, HTTP and `--json`.
+
+**Choose the cheapest operation that preserves the evidence.** `search` is the default when a
+client needs passages, needs to test whether the corpus supports a claim, or can do its own
+synthesis. `ask` spends a model call to synthesize prose and bind citations. Omitting `profile`
+uses the configured profile. `fast` fetches fewer candidates and skips the reranker, so its
+confidence ceiling cannot reach `high` **in the shipped definition**; `balanced` reranks a larger
+set; `precise` searches the widest set and costs the most. A profile or
+installation-configuration change means a different pipeline identity, and confidence from
+different pipeline identities is not compared as if it were one measurement.
+
+**Confidence is evidence strength, not answer correctness.** `confidence` and
+`confidence_band` describe how strongly the retrieved passages support the query. They are not a
+calibrated probability that a generated answer is correct. `none` and `low` are insufficient
+support even when `hits[]` contains fluent-looking text; `medium` and `high` still require reading
+the passages. `confidence_reason` is the human explanation and may be reworded, so clients branch
+on the band and the fields below rather than parsing it.
+
+For `search`, a client verifies `collections[]` before using the result and treats
+`truncated: true` as a partial result: ranked candidates were dropped to fit the context budget.
+For `ask`, four fields distinguish states that an empty citation list cannot:
+
+- `corpus_consulted: false` — retrieval did not run, which is not evidence of absence.
+- `ungrounded: true` — passages were found but no citation survived verification.
+- `context_truncated: true` — the answer saw only the passages that fit the context budget.
+- `dropped > 0` — the named number of model-emitted citations failed verification and were
+  removed.
+
+**Recovery preserves scope.** For `none` or `low`, verify the echoed scope and
+`collection_counts`, then ask a more specific or meaningfully different query under that same
+scope. One `precise` retry is reasonable when missing evidence matters; cycling profiles until a
+number rises is not. For truncation, narrow the question or scope, or use `precise` when its cost
+is acceptable. An unknown collection is resolved again with `collection_list`; it is never
+retried unscoped. An `ok: false` envelope is handled from `error.hint` when present rather than by
+blind query changes.
+
 ---
 
 ## 5. Payloads

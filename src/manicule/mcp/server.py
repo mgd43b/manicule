@@ -69,6 +69,14 @@ Every citation resolves to a real location in a real document, and one that coul
 verified is deleted rather than shown — so an answer with no citations means nothing could be
 verified, not that nothing was found.
 
+Prefer `search` when passages are the useful output, when checking whether the corpus supports
+a claim, or before spending a model call. Use `ask` only when synthesis is useful. Omit
+`profile` to use the installation's configured profile. In the shipped definitions, `fast`
+retrieves fewer passages and does not rerank, so it cannot report `high` confidence by design;
+`balanced` reranks a larger set; `precise` searches widest and costs most. Changing profile or
+installation configuration changes the pipeline identity, so do not compare its confidence
+number with one from another pipeline as though they were the same measurement.
+
 ## Scope every question to a collection, and resolve the collection first
 
 1. `collection_list` — find the collection by name. Keep both fields it reports: `id` is
@@ -88,8 +96,30 @@ Correct the name or say you cannot answer. Do not retry the same query without `
 
 **Retrieving nothing is not proof that there is nothing.** `search` returns the top `limit`
 passages of one ranking, so an empty or weak result means the top of that ranking held nothing,
-not that the corpus does not. Say "nothing in <collection> supports this", never "there is no
-such thing"; `collection_counts` is what tells you how much you did not look at.
+not that the corpus does not. Say "this search did not establish support in <collection>", never
+"there is no such thing"; `collection_counts` is what tells you how much you did not look at.
+
+## Read retrieval's result before using its text
+
+`confidence` and `confidence_band` describe how strongly the retrieved passages support the
+query. They are not probabilities that an answer is correct. Treat `none` and `low` as
+insufficient support even when plausible-looking hits were returned; `medium` and `high` still
+require reading the passages. `confidence_reason` explains the judgment to a person — do not
+parse its wording into a state.
+
+For `search`, first verify `data.collections`, then read `data.confidence_band` and
+`data.truncated`. `truncated: true` means ranked candidates were dropped to fit the context
+budget, so the result is partial. For `ask`, distinguish the machine-readable states:
+`corpus_consulted: false` means retrieval did not run; `ungrounded: true` means passages were
+found but no citation survived verification; `context_truncated: true` means the answer saw a
+partial context; and `dropped` counts citations removed because they did not verify.
+
+When support is `none` or `low`, check the echoed scope and collection counts, then try a more
+specific or meaningfully different query under the same scope. If the missing evidence matters,
+one retry with `precise` is reasonable; do not loop through profiles. When a result is truncated,
+narrow the question or scope, or use `precise` if its cost is acceptable. Never remove a scope
+as a recovery step. If `ok` is false, follow `error.hint` when present instead of changing the
+query blindly.
 
 **Keep retrieval small.** Three searches at `limit=4` or `5` answers most questions. Add a
 fourth only to close a gap you can name. Paraphrase what you cite and keep its title, URI and
@@ -516,6 +546,15 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
     ) -> dict[str, Any]:
         """Answer a question from the indexed corpus, with citations that resolve.
 
+        Use ``search`` instead when passages are the useful output or you need to judge the
+        retrieval directly. In this result, confidence describes retrieved evidence, not the
+        probability that the answer is correct. Read the machine fields rather than inferring a
+        state from prose: ``corpus_consulted=false`` means retrieval did not run;
+        ``ungrounded=true`` means passages were found and no citation survived verification;
+        ``context_truncated=true`` means ranked passages were dropped to fit the context budget;
+        and ``dropped`` counts citations removed because they did not verify. In any of those
+        weaker states, do not present the text as corpus-supported without qualifying it.
+
         Args:
             question: What to answer. A natural-language question, not a keyword query.
             profile: ``fast``, ``balanced`` or ``precise``. Omit to use the configured one.
@@ -528,8 +567,14 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
 
         Returns:
             An envelope whose ``data`` carries the answer text, its citations, the retrieval
-            confidence and whether the corpus was consulted at all. ``ungrounded`` means
-            passages were found and none survived verification — a materially weaker answer.
+            confidence and whether the corpus was consulted at all. Confidence describes the
+            retrieved evidence, not the probability that the answer is correct. Read the
+            machine fields rather than inferring a state from prose: ``corpus_consulted=false``
+            means retrieval did not run; ``ungrounded=true`` means passages were found and no
+            citation survived verification; ``context_truncated=true`` means ranked passages
+            were dropped to fit the context budget; and ``dropped`` counts citations removed
+            because they did not verify. In any of those weaker states, do not present the text
+            as corpus-supported without qualifying it.
             ``explicit_definition`` is ``true`` when the question asked what a term means and
             the corpus's own definition of it is in ``expansions`` and was in the context; read
             that boolean rather than parsing ``confidence_reason``, and read it *beside*
@@ -562,6 +607,14 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
         Cheaper and more predictable than ``ask`` when you want the source material rather
         than prose about it, and the right tool when you intend to read the passages yourself.
 
+        Confidence describes support in the returned passages, not the probability that a
+        later answer is correct. ``none`` and ``low`` are insufficient support for an
+        unqualified claim even when hits are present; they do not prove that the corpus lacks
+        the answer. Read ``data.confidence_band`` as the state and
+        ``data.confidence_reason`` as explanatory prose. ``data.truncated=true`` means ranked
+        candidates were dropped to fit the context budget, so the result is partial: narrow the
+        question or scope, or retry once with ``precise`` if its cost is acceptable.
+
         **Name the scope on every call.** Scope comes from this call's `collections` and from
         nothing else: there is no session, so omitting it searches the **whole workspace** no
         matter how the previous call was scoped. `data.collections` repeats the scope this
@@ -591,7 +644,13 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
         Returns:
             An envelope whose ``data.hits`` are ranked passages, each with its document, its
             anchor and the score every pipeline stage gave it. ``data.collections`` repeats
-            the scope the search ran under. ``data.explicit_definition`` is ``true`` when the
+            the scope the search ran under. ``data.confidence`` and ``data.confidence_band``
+            describe support in those passages, not the probability that a later answer is
+            correct; ``none`` and ``low`` are insufficient support even when hits are present.
+            ``data.confidence_reason`` is explanatory prose, not a state to parse.
+            ``data.truncated=true`` means ranked candidates were dropped to fit the context
+            budget, so narrow the question or scope, or retry once with ``precise`` if its cost
+            is acceptable. ``data.explicit_definition`` is ``true`` when the
             query asked what a term means and the corpus's own definition of it is in
             ``data.expansions`` and reached the results; read that boolean rather than parsing
             ``confidence_reason``, and read it *beside* ``confidence`` rather than as a larger
