@@ -378,6 +378,11 @@ class ConfluenceSnapshotConnector:
                 msg = f"cannot read {snapshot.body}: {exc}"
                 raise NotFoundError(msg) from exc
 
+        metadata = self._metadata_for(snapshot, body)
+        fetched_token = _version_token(snapshot)
+        if fetched_token is not None:
+            metadata["version_token"] = fetched_token
+
         return RawDocument(
             source_id=ref.source_id,
             # The body's own location, not the canonical URL. A parse failure must name the file it
@@ -385,7 +390,7 @@ class ConfluenceSnapshotConnector:
             uri=ref.uri,
             media_type=STORAGE_MEDIA_TYPE,
             content=body,
-            metadata=self._metadata_for(snapshot, body),
+            metadata=metadata,
         )
 
     async def reconcile(self) -> AsyncIterator[SourceId]:

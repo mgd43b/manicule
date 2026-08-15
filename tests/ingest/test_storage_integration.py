@@ -18,7 +18,12 @@ import pytest
 from sqlalchemy import text
 
 from manicule.connectors import CursorExpiredError, NotFoundError, SessionExpiredError
-from manicule.core.acquisition import AcquisitionRecord, AcquisitionRecordState, AcquisitionRunState
+from manicule.core.acquisition import (
+    AcquiredSource,
+    AcquisitionRecord,
+    AcquisitionRecordState,
+    AcquisitionRunState,
+)
 from manicule.core.content import (
     IN_FLIGHT,
     LEGACY_PUBLICATION,
@@ -1515,6 +1520,75 @@ async def test_crash_after_snapshot_association_resumes_without_source_access(
     assert stored.original_ref == records[0].blob_ref
 
 
+async def test_crash_after_file_retention_before_journal_association_uses_staging(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    class GatedBlobStore(BlobStore):
+        def __init__(self) -> None:
+            super().__init__(engine, data_dir)
+            self.retained = asyncio.Event()
+            self.release = asyncio.Event()
+            self.pause = True
+
+        @override
+        async def retain_acquisition(
+            self, key: str, raw: RawDocument
+        ) -> tuple[Retention, AcquiredSource]:
+            result = await super().retain_acquisition(key, raw)
+            if self.pause:
+                self.retained.set()
+                await self.release.wait()
+            return result
+
+    connector = fakes.DictConnector({"public-staged": "public staged bytes"}, name="staged-source")
+    blobs = GatedBlobStore()
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=blobs,
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            acquisition_clock=lease_clock,
+            acquisition_lease_s=1,
+            shutdown_grace_s=0,
+            detect_glossary=False,
+        )
+
+    task = asyncio.create_task(pipeline().run(connector))
+    await blobs.retained.wait()
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    before = (await store.list_acquisition_records(durable.id))[0]
+    assert before.state is AcquisitionRecordState.ACQUIRING
+    assert before.blob_ref is None
+    fetches = list(connector.fetches)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    connector.fail_fetch.add("public-staged")
+    blobs.pause = False
+    blobs.release.set()
+    lease_clock.advance(2)
+
+    resumed = await pipeline().run(connector)
+
+    assert connector.fetches == fetches
+    assert resumed.indexed == 1
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+
+
 @pytest.mark.parametrize(
     ("failure", "code"),
     [
@@ -1567,9 +1641,27 @@ async def test_fetched_newer_revision_is_the_snapshot_and_publication_version(
     engine: AsyncEngine,
     data_dir: Path,
 ) -> None:
-    connector = fakes.DictConnector({"public-moving": "newer public bytes"}, name="moving-source")
+    class OrderedRevisionConnector(fakes.DictConnector):
+        @staticmethod
+        def fetched_revision_at_least(discovered: str, fetched: str) -> bool:
+            try:
+                return int(fetched.removeprefix("revision-")) >= int(
+                    discovered.removeprefix("revision-")
+                )
+            except ValueError:
+                return False
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            raw = await super().fetch(ref)
+            return raw.model_copy(
+                update={"metadata": {**raw.metadata, "version_token": "revision-5"}}
+            )
+
+    connector = OrderedRevisionConnector(
+        {"public-moving": "newer public bytes"}, name="moving-source"
+    )
     connector.tokens["public-moving"] = "revision-4"
-    connector.metadata["public-moving"] = {"version_token": "revision-5"}
     chunker = fakes.BlockChunker()
     report = await IngestPipeline(
         store=store,
@@ -1591,6 +1683,64 @@ async def test_fetched_newer_revision_is_the_snapshot_and_publication_version(
     assert stored.version_token == "revision-5"  # noqa: S105 - synthetic source revision
     runs = await store.latest_unsettled_acquisition_run(connector.name)
     assert runs is None
+
+
+@pytest.mark.parametrize("fetched", ["revision-3", "unrelated-token", None])
+async def test_unproven_or_older_fetched_revision_is_retried_without_retention(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    fetched: str | None,
+) -> None:
+    class RefusingRevisionConnector(fakes.DictConnector):
+        @staticmethod
+        def fetched_revision_at_least(discovered: str, actual: str) -> bool:
+            try:
+                return int(actual.removeprefix("revision-")) >= int(
+                    discovered.removeprefix("revision-")
+                )
+            except ValueError:
+                return False
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            raw = await super().fetch(ref)
+            metadata = dict(raw.metadata)
+            if fetched is None:
+                metadata.pop("version_token", None)
+            else:
+                metadata["version_token"] = fetched
+            return raw.model_copy(update={"metadata": metadata})
+
+    connector = RefusingRevisionConnector(
+        {"public-stale": "untrusted public bytes"}, name="stale-revision-source"
+    )
+    connector.tokens["public-stale"] = "revision-4"
+    chunker = fakes.BlockChunker()
+    blobs = BlobStore(engine, data_dir)
+    files_before = {path for path in blobs.root.rglob("blake2b/**/*") if path.is_file()}
+    await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=blobs,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    ).run(connector)
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    record = (await store.list_acquisition_records(durable.id))[0]
+    assert record.state is AcquisitionRecordState.RETRY
+    assert record.diagnostic is not None
+    assert record.diagnostic.code.value == "stale_body"
+    assert record.blob_ref is None
+    assert {path for path in blobs.root.rglob("blake2b/**/*") if path.is_file()} == files_before
 
 
 async def test_a_re_parse_reads_retained_bytes_rather_than_the_network(

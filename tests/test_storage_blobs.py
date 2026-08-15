@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from typing import TYPE_CHECKING
+
+import pytest
+from sqlalchemy import text
 
 from manicule.core.ids import content_hash
 from manicule.storage.blobs import BlobStore, OmittedBlob, StoredBlob, should_compress
@@ -35,6 +40,48 @@ async def test_identical_bytes_are_stored_once(engine: AsyncEngine, data_dir: Pa
     assert isinstance(second, StoredBlob)
     assert first.hash == second.hash
     assert sum(1 for path in blobs.root.rglob("*") if path.is_file()) == 1
+
+
+async def test_blob_file_and_destination_directory_are_fsynced_before_database_reference(
+    engine: AsyncEngine, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rename is not durable until its directory entry is fsynced."""
+    calls: list[str] = []
+    real_fsync = os.fsync
+
+    def observed_fsync(descriptor: int) -> None:
+        calls.append("directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", observed_fsync)
+    stored = await BlobStore(engine, data_dir).put(b"durable bytes", "application/pdf")
+
+    assert isinstance(stored, StoredBlob)
+    assert "file" in calls
+    assert calls[-1] == "directory", "the destination parent was not synced after rename"
+
+
+async def test_directory_fsync_failure_creates_no_database_reference(
+    engine: AsyncEngine, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An orphan file costs space; a blob row pointing at a non-durable name costs correctness."""
+    blobs = BlobStore(engine, data_dir)
+    original = BlobStore._fsync_directory  # pyright: ignore[reportPrivateUsage]
+    destination = blobs.path_for(content_hash(b"fsync refusal"))
+
+    def refusing_final_sync(path: Path) -> None:
+        if path == destination.parent and destination.exists():
+            msg = "synthetic directory fsync refusal"
+            raise OSError(msg)
+        original(path)
+
+    monkeypatch.setattr(BlobStore, "_fsync_directory", staticmethod(refusing_final_sync))
+    with pytest.raises(OSError, match="synthetic directory fsync refusal"):
+        await blobs.put(b"fsync refusal", "application/pdf")
+
+    async with engine.connect() as connection:
+        count = (await connection.execute(text("SELECT COUNT(*) FROM blobs"))).scalar_one()
+    assert count == 0
 
 
 async def test_text_is_compressed_and_binary_is_not(engine: AsyncEngine, data_dir: Path) -> None:

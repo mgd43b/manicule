@@ -1033,3 +1033,66 @@ async def test_downgrade_discards_only_fully_settled_journal_history(data_dir: P
         assert await current(engine) == "6e31b7d592ac"
     finally:
         await engine.dispose()
+
+
+async def test_acquired_envelope_downgrade_refuses_with_aggregate_redacted_count(
+    data_dir: Path,
+) -> None:
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine)
+        store = SqliteDocStore(engine)
+        await store.ensure_workspace()
+        secret_id = "private-source-token-do-not-print"  # noqa: S105 - redaction fixture
+        secret_uri = "https://example.test/private?credential=do-not-print"  # noqa: S105 - fixture
+        body = b"private body text must not appear"
+        blob = await BlobStore(engine, data_dir).put(body, "text/plain")
+        assert isinstance(blob, StoredBlob)
+        run = await _claimed_run(store)
+        await store.append_acquisition_record(
+            run.id,
+            0,
+            _source(secret_id, uri=secret_uri),
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.complete_acquisition_enumeration(
+            run.id,
+            None,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.transition_acquisition_record(
+            run.id,
+            secret_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.transition_acquisition_record(
+            run.id,
+            secret_id,
+            AcquisitionRecordState.ACQUIRING,
+            AcquisitionRecordState.ACQUIRED,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+            blob_ref=blob.hash,
+            acquired_source=_acquired(body, secret_id),
+        )
+
+        with pytest.raises(RuntimeError) as refused:
+            await downgrade(engine, "f7c2a91d4e63")
+
+        message = str(refused.value)
+        assert "1 recoverable snapshot records" in message
+        assert secret_id not in message
+        assert secret_uri not in message
+        assert body.decode() not in message
+        assert await current(engine) == "c41d7ea923b8"
+    finally:
+        await engine.dispose()

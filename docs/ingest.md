@@ -806,10 +806,20 @@ and verifies journal-owned blobs for parsing. When embed falls behind, only this
 blocked; the source cursor is already gone and the source checkpoint is already safe.
 
 A crash after the acquired record commits resumes from its blob without another body request.
+Blob retention also writes a run-and-record-keyed staging envelope before the journal transition;
+if the process stops in that narrow window, takeover recovers the staged hash and fetched source
+envelope instead of downloading the body again. The marker is removed only after the fenced
+`ACQUIRED` transition commits and pins the same blob.
 Authentication loss before that point leaves a typed retry and withholds the watermark;
 authentication loss afterwards cannot block parsing, embedding or publication because those
 phases make no connector calls. Missing, stale and deleted source bodies likewise remain typed
 acquisition retries and cannot publish older bytes.
+
+Fetched revision evidence is source-owned. A versioned discovery record must receive a fetched
+token; opaque token sources require exact equality, while a connector may expose an ordering
+proof (Confluence uses integer page revisions) to accept a body that advanced after discovery.
+Missing, older, malformed or unrelated evidence is a typed stale-body retry and is refused before
+the bytes enter retention.
 
 **The most a run holds in memory**, with the defaults on a four-core machine — where
 `default_worker_count()` is `min(4, cpu_count - 1)` = 3, so there are four ingest workers:

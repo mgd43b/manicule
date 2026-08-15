@@ -160,6 +160,10 @@ class _AcquisitionRetentionError(RuntimeError):
     """Fetched bytes could not become a durable snapshot input."""
 
 
+class _UnprovenSourceRevisionError(RuntimeError):
+    """Fetched bytes do not prove they are at least the discovered source revision."""
+
+
 def _acquisition_diagnostic(exc: Exception) -> AcquisitionDiagnostic:
     """Reduce source failures to a bounded, non-sensitive persisted vocabulary."""
     if isinstance(exc, SessionExpiredError) or (
@@ -168,6 +172,8 @@ def _acquisition_diagnostic(exc: Exception) -> AcquisitionDiagnostic:
         code = AcquisitionFailureCode.AUTHENTICATION
     elif isinstance(exc, NotFoundError):
         code = AcquisitionFailureCode.SOURCE_DELETED
+    elif isinstance(exc, _UnprovenSourceRevisionError):
+        code = AcquisitionFailureCode.STALE_BODY
     elif isinstance(exc, BodyUnavailableError):
         code = (
             AcquisitionFailureCode.STALE_BODY
@@ -209,6 +215,14 @@ class BlobSink(Protocol):
 
     async def get(self, digest: str) -> bytes | None: ...
 
+    async def retain_acquisition(
+        self, key: str, raw: RawDocument
+    ) -> tuple[Retention, AcquiredSource]: ...
+
+    async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None: ...
+
+    async def complete_acquisition(self, key: str) -> None: ...
+
 
 class NoRetention:
     """The blob sink that keeps nothing, and says so.
@@ -227,6 +241,19 @@ class NoRetention:
     async def get(self, digest: str) -> bytes | None:
         del digest
         return None
+
+    async def retain_acquisition(
+        self, key: str, raw: RawDocument
+    ) -> tuple[Retention, AcquiredSource]:
+        del key
+        return await self.retain(raw.as_bytes(), raw.media_type), AcquiredSource.from_raw(raw)
+
+    async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None:
+        del key
+        return None
+
+    async def complete_acquisition(self, key: str) -> None:
+        del key
 
 
 class Change(StrEnum):
@@ -928,6 +955,8 @@ class IngestPipeline:
                 # A bounded/incomplete run may still make its durable prefix useful, but it can
                 # never publish the candidate watermark or claim complete source coverage.
                 await self._owned_acquisition(run, self._acquire_journal(run))
+                if run.stop.is_set():
+                    return
                 await owned(self._index_acquired(run), "journal-indexing")
                 return
             run.acquisition_state = AcquisitionRunState.ACQUIRING
@@ -936,7 +965,9 @@ class IngestPipeline:
 
         if run.acquisition_state is AcquisitionRunState.ACQUIRING:
             acquired = await self._owned_acquisition(run, self._acquire_journal(run))
-            if acquired and not run.stop.is_set():
+            if run.stop.is_set():
+                return
+            if acquired:
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now, force=True)
                 run.report.watermark_advanced = await acquisitions.commit_acquisition_watermark(
@@ -956,10 +987,7 @@ class IngestPipeline:
                 run.acquisition_state = AcquisitionRunState.INDEXING
 
         await owned(self._index_acquired(run), "journal-indexing")
-        if (
-            run.acquisition_state is AcquisitionRunState.INDEXING
-            and not run.stop.is_set()
-        ):
+        if run.acquisition_state is AcquisitionRunState.INDEXING and not run.stop.is_set():
             now = self._acquisition_clock()
             await self._keep_acquisition_lease_live(run, acquisitions, now, force=True)
             await acquisitions.transition_acquisition_run(
@@ -1194,8 +1222,10 @@ class IngestPipeline:
             return
         after: int | None = None
         try:
-            while True:
+            while not run.stop.is_set():
                 await refs.wait_for_room()
+                if run.stop.is_set():
+                    return
                 records = await acquisitions.list_acquisition_records(
                     run.acquisition_run_id,
                     states=(
@@ -1207,6 +1237,8 @@ class IngestPipeline:
                     limit=1,
                 )
                 if not records:
+                    return
+                if run.stop.is_set():
                     return
                 record = records[0]
                 # A retry carrying a blob belongs to local indexing, never another source call.
@@ -1274,10 +1306,23 @@ class IngestPipeline:
                 continue
 
             try:
-                raw = await self._fetch(run.connector, record.source.ref)
-                retained, acquired_source = await self._retain_acquisition(
-                    raw, record.source.source_id
-                )
+                stage_key = f"{run.acquisition_run_id}\0{record.source.source_id}"
+                staged = await self._blobs.resume_acquisition(stage_key)
+                if staged is None:
+                    raw = await self._fetch(run.connector, record.source.ref)
+                    fetched_version = self._validated_fetched_version(
+                        run.connector, record.source, raw
+                    )
+                    retained, acquired_source = await self._retain_acquisition(
+                        stage_key, raw, record.source.source_id
+                    )
+                else:
+                    retained, acquired_source = staged
+                    data = await self._blobs.get(retained.ref or "")
+                    raw = self._staged_raw(acquired_source, data)
+                    fetched_version = self._validated_fetched_version(
+                        run.connector, record.source, raw
+                    )
             except Exception as exc:  # noqa: BLE001 - persisted as a typed safe diagnostic
                 diagnostic = _acquisition_diagnostic(exc)
                 await self._keep_acquisition_lease_live(
@@ -1306,9 +1351,6 @@ class IngestPipeline:
                 _report_progress(run)
                 continue
 
-            fetched_version = raw.metadata.get("version_token", record.source.version_token)
-            if not isinstance(fetched_version, str):
-                fetched_version = record.source.version_token
             await self._keep_acquisition_lease_live(
                 run, acquisitions, self._acquisition_clock(), force=True
             )
@@ -1324,6 +1366,7 @@ class IngestPipeline:
                 acquired_source=acquired_source,
                 fetched_version_token=fetched_version,
             )
+            await self._blobs.complete_acquisition(stage_key)
 
     @staticmethod
     def _discovered(record: AcquisitionRecord) -> DiscoveredDoc:
@@ -1338,22 +1381,50 @@ class IngestPipeline:
         )
 
     async def _retain_acquisition(
-        self, raw: RawDocument, expected_source_id: str
+        self, key: str, raw: RawDocument, expected_source_id: str
     ) -> tuple[Retention, AcquiredSource]:
         """Validate identity, durably retain bytes, and bind the returned digest."""
         if raw.source_id != expected_source_id:
             msg = "the fetched source identity did not match its journal record"
             raise ValueError(msg)
-        source_bytes = raw.as_bytes()
-        retained = await self._blobs.retain(source_bytes, raw.media_type)
+        retained, acquired_source = await self._blobs.retain_acquisition(key, raw)
         if retained.ref is None:
             msg = "source bytes were not retained"
             raise _AcquisitionRetentionError(msg)
-        acquired_source = AcquiredSource.from_raw(raw)
         if retained.ref != acquired_source.content_hash:
             msg = "the blob store returned a reference for different source bytes"
             raise _AcquisitionRetentionError(msg)
         return retained, acquired_source
+
+    @staticmethod
+    def _staged_raw(acquired: AcquiredSource, data: bytes | None) -> RawDocument:
+        if data is None:
+            msg = "the staged source blob is unavailable"
+            raise _AcquisitionRetentionError(msg)
+        return acquired.raw(data)
+
+    @staticmethod
+    def _validated_fetched_version(
+        connector: Connector, discovered: AcquisitionSource, raw: RawDocument
+    ) -> str | None:
+        """Require connector-owned proof that fetched bytes are not older than discovery."""
+        fetched = raw.metadata.get("version_token")
+        fetched_token = fetched if isinstance(fetched, str) and fetched else None
+        expected = discovered.version_token
+        if expected is None:
+            return fetched_token
+        if fetched_token is None:
+            msg = "the fetched body carried no revision proof for a versioned discovery record"
+            raise _UnprovenSourceRevisionError(msg)
+        comparator = getattr(connector, "fetched_revision_at_least", None)
+        if comparator is None:
+            proven = fetched_token == expected
+        else:
+            proven = comparator(expected, fetched_token)
+        if not proven:
+            msg = "the fetched body revision was not proven at least as new as discovery"
+            raise _UnprovenSourceRevisionError(msg)
+        return fetched_token
 
     async def _index_acquired(self, run: _Sync) -> None:
         """Derive from blob-backed journal records without consulting the connector."""
@@ -1388,8 +1459,10 @@ class IngestPipeline:
             return
         after: int | None = None
         try:
-            while True:
+            while not run.stop.is_set():
                 await refs.wait_for_room()
+                if run.stop.is_set():
+                    return
                 records = await acquisitions.list_acquisition_records(
                     run.acquisition_run_id,
                     states=(
@@ -1401,6 +1474,8 @@ class IngestPipeline:
                     limit=1,
                 )
                 if not records:
+                    return
+                if run.stop.is_set():
                     return
                 record = records[0]
                 after = record.sequence

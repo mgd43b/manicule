@@ -1834,6 +1834,15 @@ index. A following additive revision gives each acquired record its validated so
 the body remains in content-addressed storage while the envelope preserves the fetched URI,
 media type, encoding, metadata, byte length and hash needed to reconstruct `RawDocument`
 offline. Its downgrade refuses while any run is unsettled or any record remains active/retryable.
+It also refuses with an aggregate count while any acquired envelope remains, including settled
+history: removing that column would silently discard the only complete recipe for reconstructing
+the retained source bytes. Diagnostics contain counts only, never source ids, URIs or metadata.
+
+Blob durability includes the directory entries, not only file contents. New shard parents are
+created one level at a time and their parents are fsynced; after the temporary file is fsynced
+and atomically renamed, the destination directory is fsynced before a blob row or acquisition
+staging marker can certify it. A directory-fsync failure may leak a file but creates no database
+reference, preserving the rule that storage failures cost space rather than correctness.
 Once all work is settled it may discard that completed diagnostic journal history; publications
 and retained bytes referenced by them remain governed by their own tables. This makes rollback
 possible without ever turning it into an implicit deletion of durable backlog. `alembic check`

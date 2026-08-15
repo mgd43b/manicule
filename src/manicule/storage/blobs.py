@@ -8,14 +8,19 @@ and the one whose result is not reproducible.
 
 from __future__ import annotations
 
+import asyncio
 import gzip
+import hashlib
+import json
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+from uuid import uuid4
 
 from sqlalchemy import delete, select, union
 
-from manicule.core.content import Retention
+from manicule.core.acquisition import AcquiredSource
+from manicule.core.content import RawDocument, Retention
 from manicule.core.ids import content_hash
 from manicule.storage import models
 from manicule.storage.engine import BLOBS_DIRNAME, session_factory
@@ -96,6 +101,47 @@ class BlobStore:
         """Where a blob lives. Sharded two levels, so no directory holds the whole corpus."""
         return self._root / "blake2b" / digest[:2] / digest[2:4] / digest
 
+    def _stage_path(self, key: str) -> Path:
+        name = hashlib.blake2b(key.encode(), digest_size=20).hexdigest()
+        return self._root / "acquisition-staging" / name
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def _mkdir_durable(cls, path: Path) -> None:
+        missing: list[Path] = []
+        cursor = path
+        while not cursor.exists():
+            missing.append(cursor)
+            cursor = cursor.parent
+        for directory in reversed(missing):
+            try:
+                directory.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            cls._fsync_directory(directory.parent)
+
+    @classmethod
+    def _write_durable(cls, destination: Path, payload: bytes) -> None:
+        cls._mkdir_durable(destination.parent)
+        temporary = destination.with_name(f"{destination.name}.{uuid4().hex}.partial")
+        try:
+            with temporary.open("wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.chmod(0o600)
+            temporary.replace(destination)
+            cls._fsync_directory(destination.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     async def put(self, data: bytes, media_type: str | None = None) -> StoredBlob | OmittedBlob:
         """Retain bytes, or say why they were not retained.
 
@@ -125,14 +171,7 @@ class BlobStore:
         payload = gzip.compress(data, mtime=0) if compression == "gzip" else data
 
         if not destination.exists():
-            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            temporary = destination.with_name(destination.name + ".partial")
-            with temporary.open("wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            temporary.chmod(0o600)
-            temporary.replace(destination)
+            self._write_durable(destination, payload)
 
         stored = StoredBlob(
             hash=digest,
@@ -166,6 +205,85 @@ class BlobStore:
         if isinstance(stored, OmittedBlob):
             return Retention(omitted_reason=stored.reason)
         return Retention(ref=stored.hash)
+
+    async def retain_acquisition(
+        self, key: str, raw: RawDocument
+    ) -> tuple[Retention, AcquiredSource]:
+        """Durably stage a complete source envelope so a pre-association crash can resume."""
+        acquired = AcquiredSource.from_raw(raw)
+        data = raw.as_bytes()
+        if len(data) > self._max_bytes:
+            return await self.retain(data, raw.media_type), acquired
+        destination = self.path_for(acquired.content_hash)
+        compression = "gzip" if should_compress(raw.media_type) else "none"
+        stored_payload = gzip.compress(data, mtime=0) if compression == "gzip" else data
+        if not destination.exists():
+            await asyncio.to_thread(self._write_durable, destination, stored_payload)
+        payload = json.dumps(
+            {
+                "blob_ref": acquired.content_hash,
+                "compression": compression,
+                "acquired_source": acquired.model_dump(mode="json"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        await asyncio.to_thread(self._write_durable, self._stage_path(key), payload)
+        retained = await self.retain(data, raw.media_type)
+        return retained, acquired
+
+    async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None:
+        """Recover a staged blob/envelope pair without contacting its source."""
+        path = self._stage_path(key)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(await asyncio.to_thread(path.read_text, "utf-8"))
+            acquired = AcquiredSource.model_validate(payload["acquired_source"])
+            blob_ref = payload["blob_ref"]
+            compression = payload["compression"]
+            if not isinstance(blob_ref, str) or blob_ref != acquired.content_hash:
+                return None
+            if compression not in {"gzip", "none"}:
+                return None
+            raw = await asyncio.to_thread(self.path_for(blob_ref).read_bytes)
+            data = gzip.decompress(raw) if compression == "gzip" else raw
+            acquired.raw(data)
+            retained = await self.retain(data, acquired.media_type)
+            if retained.ref != blob_ref:
+                return None
+        except (KeyError, OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        return retained, acquired
+
+    async def complete_acquisition(self, key: str) -> None:
+        """Remove a staging marker only after the journal association commits."""
+        path = self._stage_path(key)
+        if not path.exists():
+            return
+        await asyncio.to_thread(path.unlink)
+        await asyncio.to_thread(self._fsync_directory, path.parent)
+
+    async def _staged_blob_refs(self) -> set[str]:
+        root = self._root / "acquisition-staging"
+        if not root.exists():
+            return set()
+        refs: set[str] = set()
+        for path in root.iterdir():
+            if not path.is_file() or path.name.endswith(".partial"):
+                continue
+            try:
+                payload = json.loads(await asyncio.to_thread(path.read_text, "utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            ref = (
+                cast("dict[str, object]", payload).get("blob_ref")
+                if isinstance(payload, dict)
+                else None
+            )
+            if isinstance(ref, str):
+                refs.add(ref)
+        return refs
 
     async def get(self, digest: str) -> bytes | None:
         """Read retained bytes back, or ``None`` if they are not held."""
@@ -226,8 +344,11 @@ class BlobStore:
                 .all()
             )
 
+        staged = await self._staged_blob_refs()
         collected: list[str] = []
         for digest in unreferenced:
+            if digest in staged:
+                continue
             async with self._sessions.begin() as session:
                 await session.execute(delete(models.Blob).where(models.Blob.hash == digest))
             self.path_for(digest).unlink(missing_ok=True)
@@ -244,7 +365,10 @@ class BlobStore:
             return []
         async with self._sessions() as session:
             known = set((await session.execute(select(models.Blob.hash))).scalars().all())
-        return [path for path in self._root.rglob("*") if path.is_file() and path.name not in known]
+        blob_root = self._root / "blake2b"
+        if not blob_root.exists():
+            return []
+        return [path for path in blob_root.rglob("*") if path.is_file() and path.name not in known]
 
 
 __all__ = ["MAX_ORIGINAL_BYTES", "BlobStore", "OmittedBlob", "StoredBlob", "should_compress"]

@@ -26,4 +26,17 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    recoverable = (
+        op.get_bind()
+        .execute(
+            sa.text("SELECT COUNT(*) FROM acquisition_records WHERE acquired_source IS NOT NULL")
+        )
+        .scalar_one()
+    )
+    if recoverable:
+        msg = (
+            "cannot downgrade acquired source envelopes while "
+            f"{recoverable} recoverable snapshot records remain"
+        )
+        raise RuntimeError(msg)
     op.drop_column("acquisition_records", "acquired_source")
