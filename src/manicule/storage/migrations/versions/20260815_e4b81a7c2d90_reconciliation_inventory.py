@@ -38,6 +38,7 @@ def upgrade() -> None:
                 "completed",
                 "proposed",
                 "applied",
+                "dry_run",
                 "canceled",
                 name="reconciliation_run_state",
                 native_enum=False,
@@ -115,6 +116,8 @@ def upgrade() -> None:
         sa.Column("connector_id", sa.Text(), nullable=False),
         sa.Column("publication_id", sa.Text(), nullable=False),
         sa.Column("content_hash", sa.Text(), nullable=False),
+        sa.Column("version_token", sa.Text(), nullable=True),
+        sa.Column("last_seen_at", manicule.storage.types.UtcDateTime(), nullable=True),
         sa.ForeignKeyConstraint(
             ["document_id"],
             ["documents.id"],
@@ -131,9 +134,7 @@ def upgrade() -> None:
             name=op.f("fk_reconciliation_candidates_run_id_reconciliation_runs"),
             ondelete="CASCADE",
         ),
-        sa.PrimaryKeyConstraint(
-            "run_id", "document_id", name=op.f("pk_reconciliation_candidates")
-        ),
+        sa.PrimaryKeyConstraint("run_id", "document_id", name=op.f("pk_reconciliation_candidates")),
         sqlite_with_rowid=False,
     )
 

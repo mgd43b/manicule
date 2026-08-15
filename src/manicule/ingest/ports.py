@@ -519,7 +519,7 @@ class ReconciliationStore(Protocol):
     ) -> ReconciliationAssessment: ...
 
     async def confirm_reconciliation_proposal(
-        self, connector: str, *, scope: str | None = None, now: datetime
+        self, connector: str, *, scope: str, now: datetime
     ) -> ReconciliationAssessment | None: ...
 
 

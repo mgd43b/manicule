@@ -42,7 +42,7 @@ from manicule.storage.scoped import (
     CrossWorkspaceCollisionError,
     WorkspaceScoped,
 )
-from manicule.storage.types import UtcDateTime, utcnow
+from manicule.storage.types import UtcDateTime, next_observation, utcnow
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Mapping, Sequence
@@ -512,7 +512,7 @@ class SqliteDocStore(
             # exactly the record that exists to explain the change.
             await self._record_supersession(session, row, document)
         apply_document(row, document)
-        row.last_seen_at = utcnow()
+        row.last_seen_at = next_observation(row.last_seen_at, utcnow())
         await session.flush()
         return to_document(row)
 
@@ -629,7 +629,7 @@ class SqliteDocStore(
             row = await self._live_document(session, document_id)
             if row is None:
                 return
-            row.last_seen_at = utcnow()
+            row.last_seen_at = next_observation(row.last_seen_at, utcnow())
             if version_token is not None:
                 row.version_token = version_token
 
@@ -645,7 +645,7 @@ class SqliteDocStore(
             row = await self._live_document(session, document_id)
             if row is None:
                 return
-            row.last_seen_at = utcnow()
+            row.last_seen_at = next_observation(row.last_seen_at, utcnow())
             if version_token is not None:
                 row.version_token = version_token
 

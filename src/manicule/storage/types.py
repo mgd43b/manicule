@@ -8,7 +8,7 @@ encoding and one place that applies it.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import override
 
 from sqlalchemy import DateTime, Dialect, TypeDecorator
@@ -56,4 +56,18 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-__all__ = ["UtcDateTime", "utcnow"]
+def next_observation(previous: datetime | None, observed: datetime) -> datetime:
+    """Turn a wall-clock observation into a strictly advancing source revision.
+
+    Wall clocks can repeat or move backward. Reconciliation proposals compare this value, so
+    every path that proves a document still exists must advance it even within one clock tick.
+    """
+    if observed.tzinfo is None:
+        msg = "source observation time must be timezone-aware"
+        raise ValueError(msg)
+    if previous is not None and observed <= previous:
+        return previous + timedelta(microseconds=1)
+    return observed
+
+
+__all__ = ["UtcDateTime", "next_observation", "utcnow"]

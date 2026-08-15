@@ -478,6 +478,8 @@ class ReconciliationCandidate(Base):
     connector_id: Mapped[str] = mapped_column(Text, nullable=False)
     publication_id: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    version_token: Mapped[str | None] = mapped_column(Text)
+    last_seen_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
 
     __table_args__ = (
         ForeignKeyConstraint(

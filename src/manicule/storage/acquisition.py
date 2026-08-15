@@ -29,7 +29,7 @@ from manicule.core.ids import acquisition_marker_id
 from manicule.core.sources import Watermark
 from manicule.storage import models
 from manicule.storage.scoped import WorkspaceScoped
-from manicule.storage.types import utcnow
+from manicule.storage.types import next_observation, utcnow
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -845,21 +845,19 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             if transitioned.rowcount != 1:
                 msg = f"acquisition record {source_id!r} state changed"
                 raise AcquisitionConflictError(msg)
-            seen = cast(
-                "CursorResult[Any]",
+            document = (
                 await session.execute(
-                    update(models.Document)
-                    .where(
+                    select(models.Document).where(
                         models.Document.id == document_id,
                         models.Document.workspace_id == self._workspace_id,
                         models.Document.deleted_at.is_(None),
                     )
-                    .values(last_seen_at=utcnow())
-                ),
-            )
-            if seen.rowcount != 1:
+                )
+            ).scalar_one_or_none()
+            if document is None:
                 msg = f"unchanged document {document_id!r} is no longer live"
                 raise AcquisitionConflictError(msg)
+            document.last_seen_at = next_observation(document.last_seen_at, utcnow())
             run = await self._required_run_row(session, run_id)
             await self._refresh_counters(session, run)
             row = (

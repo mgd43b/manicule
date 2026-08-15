@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
+from sqlalchemy import select
 
-from manicule.core.reconciliation import CompletedInventory
-from manicule.ingest.reconcile import PROPOSED_DELETION_KEY, reconcile
+from manicule.core.acquisition import AcquisitionRecordState, AcquisitionSource
+from manicule.core.reconciliation import CompletedInventory, ReconciliationAssessment
+from manicule.core.sources import DiscoveredDoc, DocRef
+from manicule.ingest.reconcile import (
+    PROPOSED_DELETION_KEY,
+    confirm_proposed_deletion,
+    reconcile,
+)
+from manicule.storage import models
 from manicule.storage.docstore import SqliteDocStore
-from manicule.storage.reconciliation import INVENTORY_PAGE_LIMIT, ReconciliationInventoryError
+from manicule.storage.engine import session_factory
+from manicule.storage.reconciliation import (
+    INVENTORY_PAGE_LIMIT,
+    ReconciliationInventoryError,
+    ReconciliationJournalMixin,
+)
 from tests.storage_helpers import make_document
 
 if TYPE_CHECKING:
@@ -44,9 +57,7 @@ async def _complete(
             scope,
             source_ids[offset : offset + INVENTORY_PAGE_LIMIT],
         )
-    return await store.complete_reconciliation_inventory(
-        run_id, connector, scope, now=_NOW
-    )
+    return await store.complete_reconciliation_inventory(run_id, connector, scope, now=_NOW)
 
 
 class _MustNotEnumerate:
@@ -109,9 +120,7 @@ async def test_duplicate_and_large_inventories_are_page_bounded_and_deduplicated
     inserted += await store.append_reconciliation_inventory_page(
         "large", _CONNECTOR, _SCOPE, source_ids[:100]
     )
-    completed = await store.complete_reconciliation_inventory(
-        "large", _CONNECTOR, _SCOPE, now=_NOW
-    )
+    completed = await store.complete_reconciliation_inventory("large", _CONNECTOR, _SCOPE, now=_NOW)
 
     assert inserted == 2_005
     assert completed.seen_count == 2_005
@@ -125,14 +134,10 @@ async def test_completed_handles_are_workspace_and_scope_bound(
     await other.ensure_workspace()
 
     with pytest.raises(ReconciliationInventoryError, match="workspace/connector/scope"):
-        await other.assess_reconciliation_inventory(
-            completed, max_delete_fraction=0.1, now=_NOW
-        )
+        await other.assess_reconciliation_inventory(completed, max_delete_fraction=0.1, now=_NOW)
     wrong_scope = completed.model_copy(update={"scope": "spaces=SECRET"})
     with pytest.raises(ReconciliationInventoryError, match="workspace/connector/scope"):
-        await store.assess_reconciliation_inventory(
-            wrong_scope, max_delete_fraction=0.1, now=_NOW
-        )
+        await store.assess_reconciliation_inventory(wrong_scope, max_delete_fraction=0.1, now=_NOW)
     wrong_connector = completed.model_copy(update={"connector": "private-wiki"})
     with pytest.raises(ReconciliationInventoryError, match="workspace/connector/scope"):
         await store.assess_reconciliation_inventory(
@@ -145,16 +150,12 @@ async def test_incomplete_and_canceled_inventories_cannot_propose_or_delete(
 ) -> None:
     await _documents(store, 3)
     await store.begin_reconciliation_inventory("partial", _CONNECTOR, _SCOPE)
-    await store.append_reconciliation_inventory_page(
-        "partial", _CONNECTOR, _SCOPE, ["page-0"]
-    )
+    await store.append_reconciliation_inventory_page("partial", _CONNECTOR, _SCOPE, ["page-0"])
     assert await store.cancel_reconciliation_inventory("partial", _CONNECTOR, _SCOPE)
 
     assert await store.latest_completed_reconciliation_inventory(_CONNECTOR, _SCOPE) is None
     with pytest.raises(ReconciliationInventoryError, match="active inventory"):
-        await store.complete_reconciliation_inventory(
-            "partial", _CONNECTOR, _SCOPE, now=_NOW
-        )
+        await store.complete_reconciliation_inventory("partial", _CONNECTOR, _SCOPE, now=_NOW)
     for number in range(3):
         assert await store.find_document(_CONNECTOR, f"page-{number}") is not None
     assert PROPOSED_DELETION_KEY not in await store.connector_metadata(_CONNECTOR)
@@ -183,7 +184,7 @@ async def test_auth_and_capacity_failures_never_reach_deletion_logic(
 
 
 async def test_ceiling_records_a_bounded_proposal_and_confirmation_applies_reviewed_revisions(
-    store: SqliteDocStore,
+    store: SqliteDocStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await _documents(store, 10)
     completed = await _complete(store, "proposal", [f"page-{n}" for n in range(5)])
@@ -205,17 +206,72 @@ async def test_ceiling_records_a_bounded_proposal_and_confirmation_applies_revie
     assert "source_ids" not in metadata[PROPOSED_DELETION_KEY]
 
     assert (
-        await store.confirm_reconciliation_proposal(
-            _CONNECTOR, scope="a-different-scope", now=_NOW
-        )
+        await store.confirm_reconciliation_proposal(_CONNECTOR, scope="a-different-scope", now=_NOW)
         is None
     )
 
-    # A document republished after review is no longer the revision the human confirmed.
-    await store.upsert_document(make_document(_CONNECTOR, "page-7", body=b"new revision"))
-    confirmed = await store.confirm_reconciliation_proposal(
-        _CONNECTOR, scope=_SCOPE, now=_NOW
+    # Even an unchanged document observed after review is no longer the absence the human
+    # confirmed. Publication and content identity deliberately remain unchanged here.
+    observed = await store.find_document(_CONNECTOR, "page-7")
+    assert observed is not None
+    publication = observed.publication_id
+    content = observed.content_hash
+    sessions = session_factory(store.engine)
+    async with sessions() as session:
+        previous_seen = (
+            await session.execute(
+                select(models.Document.last_seen_at).where(models.Document.id == observed.id)
+            )
+        ).scalar_one()
+    assert previous_seen is not None
+    run = await store.create_acquisition_run("unchanged-observation", _CONNECTOR)
+    lease = await store.claim_acquisition_run(
+        run.id, "worker", now=_NOW, expires_at=_NOW + timedelta(minutes=1)
     )
+    assert lease is not None
+    source = AcquisitionSource.from_discovered(
+        DiscoveredDoc(ref=DocRef(source_id="page-7", uri="https://example.test/pages/page-7"))
+    )
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        source,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        "page-7",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    import manicule.storage.acquisition as acquisition_module  # noqa: PLC0415
+
+    monkeypatch.setattr(acquisition_module, "utcnow", lambda: previous_seen)
+    await store.settle_unchanged_acquisition_record(
+        run.id,
+        "page-7",
+        observed.id,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    async with sessions() as session:
+        current_seen = (
+            await session.execute(
+                select(models.Document.last_seen_at).where(models.Document.id == observed.id)
+            )
+        ).scalar_one()
+    assert current_seen == previous_seen + timedelta(microseconds=1)
+    observed_again = await store.find_document(_CONNECTOR, "page-7")
+    assert observed_again is not None
+    assert observed_again.publication_id == publication
+    assert observed_again.content_hash == content
+    confirmed = await store.confirm_reconciliation_proposal(_CONNECTOR, scope=_SCOPE, now=_NOW)
 
     assert confirmed is not None
     assert confirmed.applied_count == 4
@@ -233,7 +289,39 @@ async def test_dry_run_never_proposes_or_deletes(store: SqliteDocStore) -> None:
 
     assert result.dry_run
     assert result.missing_count == 3
+    assert await store.latest_completed_reconciliation_inventory(_CONNECTOR, _SCOPE) is None
+    with pytest.raises(ReconciliationInventoryError, match="completed inventory handle"):
+        await store.assess_reconciliation_inventory(completed, max_delete_fraction=1.0, now=_NOW)
     assert PROPOSED_DELETION_KEY not in await store.connector_metadata(_CONNECTOR)
+    for number in range(4):
+        assert await store.find_document(_CONNECTOR, f"page-{number}") is not None
+
+
+async def test_a_crash_during_dry_run_cannot_restore_deletion_authority(
+    store: SqliteDocStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _documents(store, 4)
+    completed = await _complete(store, "crashing-dry-run", ["page-0"])
+
+    async def crash_after_consumption(
+        self: ReconciliationJournalMixin, inventory: CompletedInventory
+    ) -> ReconciliationAssessment:
+        del self, inventory
+        raise RuntimeError("process died while computing preview")
+
+    monkeypatch.setattr(
+        ReconciliationJournalMixin,
+        "_assess_consumed_dry_run",
+        crash_after_consumption,
+    )
+    with pytest.raises(RuntimeError, match="process died"):
+        await store.assess_reconciliation_inventory(
+            completed, max_delete_fraction=0.1, dry_run=True, now=_NOW
+        )
+
+    assert await store.latest_completed_reconciliation_inventory(_CONNECTOR, _SCOPE) is None
+    with pytest.raises(ReconciliationInventoryError, match="completed inventory handle"):
+        await store.assess_reconciliation_inventory(completed, max_delete_fraction=1.0, now=_NOW)
     for number in range(4):
         assert await store.find_document(_CONNECTOR, f"page-{number}") is not None
 
@@ -250,7 +338,22 @@ async def test_a_new_full_inventory_invalidates_an_older_confirmation_question(
 
     await store.begin_reconciliation_inventory("newer-run", _CONNECTOR, "new-scope")
 
-    assert await store.confirm_reconciliation_proposal(_CONNECTOR, now=_NOW) is None
+    assert await store.confirm_reconciliation_proposal(_CONNECTOR, scope=_SCOPE, now=_NOW) is None
     assert PROPOSED_DELETION_KEY not in await store.connector_metadata(_CONNECTOR)
+    for number in range(4):
+        assert await store.find_document(_CONNECTOR, f"page-{number}") is not None
+
+
+async def test_durable_confirmation_rejects_an_omitted_scope(store: SqliteDocStore) -> None:
+    await _documents(store, 4)
+    completed = await _complete(store, "scope-required", ["page-0"])
+    proposed = await store.assess_reconciliation_inventory(
+        completed, max_delete_fraction=0.1, now=_NOW
+    )
+    assert proposed.refused
+
+    with pytest.raises(ValueError, match="requires the current reconciliation scope"):
+        await confirm_proposed_deletion(_CONNECTOR, store, now=_NOW)
+
     for number in range(4):
         assert await store.find_document(_CONNECTOR, f"page-{number}") is not None

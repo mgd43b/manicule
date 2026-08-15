@@ -15,6 +15,7 @@ class ReconciliationRunState(StrEnum):
     COMPLETED = "completed"
     PROPOSED = "proposed"
     APPLIED = "applied"
+    DRY_RUN = "dry_run"
     CANCELED = "canceled"
 
 

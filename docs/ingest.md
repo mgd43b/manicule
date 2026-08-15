@@ -1598,6 +1598,14 @@ Three guards, all required:
 
 Guard 3 is what makes guard 2 tunable rather than terrifying.
 
+A dry-run consumes its completed inventory in the same transaction that computes the preview.
+It cannot later be replayed as deletion authority; an applying run must obtain a fresh full
+inventory. Proposal confirmation likewise requires the caller's current scope token and rejects
+an omitted or mismatched token instead of trusting the proposal's copy. Each proposal candidate
+captures the document's source-observation revision (version token plus a strictly advancing
+`last_seen_at`). A later unchanged `record_seen` therefore invalidates the candidate just as a
+new publication does: evidence that the source exists after the proposal wins over confirmation.
+
 ### 11.2 Interaction with the grace period and the sweep
 
 `storage.md` §8.2 gives soft-deleted documents a grace period (default 30 days) before the

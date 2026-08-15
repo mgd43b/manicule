@@ -159,9 +159,7 @@ async def reconcile(
         )
     if not missing:
         await _record_clean(store, connector.name, now)
-        return Reconciliation(
-            connector=connector.name, seen=len(seen), live_count=len(known)
-        )
+        return Reconciliation(connector=connector.name, seen=len(seen), live_count=len(known))
 
     # Guard 2. Against the live count, not against what the source reported: a source that
     # returned almost nothing is exactly the case the ceiling exists for.
@@ -209,7 +207,7 @@ async def confirm_proposed_deletion(
     store: ReconciliationStore,
     *,
     now: datetime | None = None,
-    scope: str | None = None,
+    scope: str,
 ) -> Reconciliation: ...
 
 
@@ -238,9 +236,10 @@ async def confirm_proposed_deletion(
     """
     moment = now or datetime.now(UTC)
     if isinstance(store, ReconciliationStore):
-        assessed = await store.confirm_reconciliation_proposal(
-            connector, scope=scope, now=moment
-        )
+        if not scope:
+            msg = "durable deletion confirmation requires the current reconciliation scope"
+            raise ValueError(msg)
+        assessed = await store.confirm_reconciliation_proposal(connector, scope=scope, now=moment)
         if assessed is None:
             return []
         return Reconciliation(
