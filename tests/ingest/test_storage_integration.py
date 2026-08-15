@@ -9,10 +9,11 @@ exercises: lineage, tombstones, the recovery sweep, run counters, ``index_state`
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, cast, override
 
 import pytest
 from sqlalchemy import text
@@ -20,12 +21,17 @@ from sqlalchemy import text
 from manicule.connectors import CursorExpiredError, NotFoundError, SessionExpiredError
 from manicule.core.acquisition import (
     AcquiredSource,
+    AcquisitionDiagnostic,
     AcquisitionFailureCode,
     AcquisitionFence,
     AcquisitionRecord,
     AcquisitionRecordState,
     AcquisitionRunState,
+    AcquisitionSource,
     AcquisitionStage,
+    SnapshotCompleteness,
+    SnapshotItemOutcome,
+    SnapshotPromotionPolicy,
 )
 from manicule.core.content import (
     IN_FLIGHT,
@@ -38,14 +44,14 @@ from manicule.core.content import (
 )
 from manicule.core.embedding import IndexFingerprints, Vector
 from manicule.core.ids import content_hash, document_id, vector_id
-from manicule.core.sources import Watermark
+from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
 from manicule.ingest.recovery import requeue_interrupted
 from manicule.ingest.reindex import re_parse, reindex_document
 from manicule.ingest.sweeps import sweep_vectors
 from manicule.ingest.workers import InProcessRunner
-from manicule.storage.blobs import BlobStore
+from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.storage.vectors import LanceVectorStore
 from tests.fakes import HashEmbedder
 from tests.ingest import fakes
@@ -2364,7 +2370,592 @@ async def test_typed_acquisition_failures_block_source_coverage_without_publicat
     assert record.diagnostic.code.value == code
     assert record.blob_ref is None
     assert not report.watermark_advanced
+    assert report.snapshot_completeness == ""
+    assert report.snapshot_omissions == 1
+    assert report.snapshot_omission_reasons == {code: 1}
+    assert str(failure) not in str(report.as_metadata())
     assert await store.find_document(connector.name, "public-refused") is None
+
+
+async def test_strict_omission_with_an_existing_document_is_still_incomplete_and_retryable(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    from tests.storage_helpers import make_document  # noqa: PLC0415 - storage fixture
+
+    class RefusingConnector(fakes.DictConnector):
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            del ref
+            raise SessionExpiredError("synthetic private credential detail")
+
+    connector = RefusingConnector({"existing": "new body"}, name="strict-existing")
+    connector.tokens["existing"] = "v2"
+    await store.upsert_document(
+        make_document(source=connector.name, source_id="existing").model_copy(
+            update={"version_token": "v1"}
+        )
+    )
+    chunker = fakes.BlockChunker()
+    report = await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    ).run(connector)
+
+    assert report.unrecorded == 0
+    assert report.snapshot_omissions == 1
+    assert report.snapshot_omission_reasons == {"authentication": 1}
+    assert report.complete is False
+    last_run = cast("Mapping[str, object]", report.as_metadata()["last_run"])
+    assert last_run["outcome"] == "incomplete"
+    assert last_run["retry_required"] is True
+    assert "private credential" not in str(report.as_metadata())
+
+
+async def test_allow_omissions_reports_partial_snapshot_and_typed_aggregate(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    class RefusingConnector(fakes.DictConnector):
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            del ref
+            raise SessionExpiredError("synthetic private credential detail")
+
+    connector = RefusingConnector(
+        {"public-omitted": "never returned"}, name="partial-snapshot-source"
+    )
+    chunker = fakes.BlockChunker()
+    report = await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+        snapshot_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    ).run(connector)
+
+    assert report.snapshot_completeness == "partial"
+    assert report.snapshot_omissions == 1
+    assert report.snapshot_omission_reasons == {"authentication": 1}
+    assert not report.watermark_advanced, "this source declares no native watermark"
+    assert "private credential" not in str(report.as_metadata())
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+    scope = hashlib.blake2b(f"instance:{connector.name}".encode(), digest_size=20).hexdigest()
+    assert await store.latest_promoted_snapshot(connector.name, scope) is not None
+    assert await store.find_document(connector.name, "public-omitted") is None
+
+
+async def test_unchanged_revision_reuses_promoted_snapshot_without_body_download(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = fakes.DictConnector(
+        {
+            "public-reused-a": "retained public body a",
+            "public-reused-b": "retained public body b",
+        },
+        name="reused-snapshot-source",
+    )
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    first = await pipeline().run(connector)
+    fetches = list(connector.fetches)
+    latest_calls = 0
+    latest_promoted_snapshot = store.latest_promoted_snapshot
+
+    async def counted_latest(connector_name: str, scope_fingerprint: str):  # noqa: ANN202
+        nonlocal latest_calls
+        latest_calls += 1
+        return await latest_promoted_snapshot(connector_name, scope_fingerprint)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "latest_promoted_snapshot", counted_latest)
+        second = await pipeline().run(connector)
+
+    assert first.snapshot_completeness == "complete"
+    assert second.snapshot_completeness == "complete"
+    assert second.skipped_version == 2
+    assert latest_calls == 1, "one run verifies the reusable manifest only once"
+    assert connector.fetches == fetches
+    scope = hashlib.blake2b(f"instance:{connector.name}".encode(), digest_size=20).hexdigest()
+    promoted = await store.latest_promoted_snapshot(connector.name, scope)
+    assert promoted is not None
+    assert all(
+        record.snapshot_outcome is SnapshotItemOutcome.REUSED
+        for record in await store.list_acquisition_records(promoted.id)
+    )
+
+
+async def test_scope_change_resets_discovery_cursor_and_cas_binds_the_new_scope(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    class ScopedConnector(fakes.DictConnector):
+        def __init__(self, documents: Mapping[str, str], *, scope: str) -> None:
+            super().__init__(documents, name="scoped-cursor-source")
+            self.source_scope = scope
+            self.seen_watermarks: list[Watermark | None] = []
+            self._watermark = Watermark(value=f"cursor:{scope}", observed_at=datetime.now(UTC))
+
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return self._watermark
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            self.seen_watermarks.append(watermark)
+            async for discovered in super().discover(watermark):
+                yield discovered
+
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    first = ScopedConnector({"a": "scope a"}, scope="scope:A")
+    await pipeline().run(first)
+    first_fp = hashlib.blake2b(b"scope:A", digest_size=20).hexdigest()
+    assert first.seen_watermarks == [None]
+    assert await store.get_acquisition_watermark(first.name, first_fp) == first.watermark
+
+    second = ScopedConnector({"b": "scope b"}, scope="scope:B")
+    await pipeline().run(second)
+    second_fp = hashlib.blake2b(b"scope:B", digest_size=20).hexdigest()
+    assert second.seen_watermarks == [None]
+    assert await store.get_acquisition_watermark(second.name, second_fp) == second.watermark
+    assert await store.get_acquisition_watermark(second.name, first_fp) is None
+
+
+async def test_resumed_promoted_indexing_reports_persisted_partial_snapshot(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    connector = fakes.DictConnector({}, name="resumed-partial-source")
+    scope = f"instance:{connector.name}"
+    scope_fp = hashlib.blake2b(scope.encode(), digest_size=20).hexdigest()
+    clock = fakes.ManualLeaseClock()
+    created = await store.create_acquisition_run(
+        "resumed-partial-run",
+        connector.name,
+        source_scope=scope,
+        scope_fingerprint=scope_fp,
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+    run = await store.claim_acquisition_run(
+        created.id,
+        "crashed-worker",
+        now=clock(),
+        expires_at=clock() + timedelta(seconds=1),
+    )
+    assert run is not None
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        AcquisitionSource.from_discovered(
+            DiscoveredDoc(ref=DocRef(source_id="omitted", uri="memory://omitted"))
+        ),
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        None,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        "omitted",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+        diagnostic=AcquisitionDiagnostic(
+            stage=AcquisitionStage.ACQUISITION,
+            code=AcquisitionFailureCode.AUTHENTICATION,
+        ),
+    )
+    await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    promoted = await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint=scope_fp,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    assert promoted.completeness is SnapshotCompleteness.PARTIAL
+    await store.transition_acquisition_run(
+        run.id,
+        AcquisitionRunState.ACQUIRING,
+        AcquisitionRunState.INDEXING,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    clock.advance(2)
+    chunker = fakes.BlockChunker()
+    report = await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_clock=clock,
+        acquisition_lease_s=1,
+        detect_glossary=False,
+    ).run(connector)
+
+    assert report.snapshot_completeness == "partial"
+    assert report.snapshot_omissions == 1
+    assert report.snapshot_omission_reasons == {"authentication": 1}
+    assert report.complete is True
+
+
+async def test_post_promotion_blob_failure_does_not_invalidate_manifest_and_resumes_offline(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    connector = fakes.DictConnector(
+        {"offline": "retained offline body"}, name="immutable-snapshot-diagnostic"
+    )
+    scope = f"instance:{connector.name}"
+    scope_fp = hashlib.blake2b(scope.encode(), digest_size=20).hexdigest()
+    clock = fakes.ManualLeaseClock()
+    blobs = BlobStore(engine, data_dir)
+    raw = RawDocument(
+        source_id="offline",
+        uri="memory://offline",
+        media_type=fakes.MEDIA_TYPE,
+        content="retained offline body",
+        metadata={"version_token": "v1"},
+    )
+    stored = await blobs.put(raw.as_bytes(), raw.media_type)
+    assert isinstance(stored, StoredBlob)
+    created = await store.create_acquisition_run(
+        "immutable-diagnostic-run",
+        connector.name,
+        source_scope=scope,
+        scope_fingerprint=scope_fp,
+    )
+    run = await store.claim_acquisition_run(
+        created.id,
+        "crashed-worker",
+        now=clock(),
+        expires_at=clock() + timedelta(seconds=1),
+    )
+    assert run is not None
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        AcquisitionSource.from_discovered(
+            DiscoveredDoc(
+                ref=DocRef(source_id="offline", uri="memory://offline"),
+                version_token="v1",  # noqa: S106 - source revision, not a credential
+                media_type=fakes.MEDIA_TYPE,
+            )
+        ),
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        None,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        "offline",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        "offline",
+        AcquisitionRecordState.ACQUIRING,
+        AcquisitionRecordState.ACQUIRED,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+        blob_ref=stored.hash,
+        acquired_source=AcquiredSource.from_raw(raw),
+        fetched_version_token="v1",  # noqa: S106 - source revision, not a credential
+    )
+    await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint=scope_fp,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    await store.transition_acquisition_run(
+        run.id,
+        AcquisitionRunState.ACQUIRING,
+        AcquisitionRunState.INDEXING,
+        lease_owner="crashed-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    blobs.path_for(stored.hash).unlink()
+    clock.advance(2)
+    connector.fail_fetch.add("offline")
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=blobs,
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            acquisition_clock=clock,
+            acquisition_lease_s=1,
+            detect_glossary=False,
+        )
+
+    failed = await pipeline().run(connector)
+    assert failed.retry_required
+    assert failed.pending_derivation
+    failed_record = (await store.list_acquisition_records(run.id))[0]
+    assert failed_record.state is AcquisitionRecordState.RETRY
+    assert failed_record.snapshot_diagnostic is None
+    assert failed_record.diagnostic is not None
+    assert failed_record.diagnostic.code is AcquisitionFailureCode.SNAPSHOT_MISSING
+    assert await store.verify_snapshot_manifest(run.id)
+    assert await store.latest_promoted_snapshot(connector.name, scope_fp) is not None
+    assert await store.reusable_snapshot_record(connector.name, scope_fp, "offline", "v1")
+
+    restored = await blobs.put(raw.as_bytes(), raw.media_type)
+    assert isinstance(restored, StoredBlob)
+    clock.advance(2)
+    resumed = await pipeline().run(connector)
+
+    assert resumed.indexed == 1
+    assert connector.fetches == []
+    assert await store.verify_snapshot_manifest(run.id)
+    assert await store.latest_promoted_snapshot(connector.name, scope_fp) is not None
+    settled = (await store.list_acquisition_records(run.id))[0]
+    assert settled.state is AcquisitionRecordState.SETTLED
+    assert settled.diagnostic is None
+
+
+async def test_retained_prefix_index_retry_is_canonicalized_and_promoted_without_redownload(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    body = "retained prefix body"
+    connector = fakes.DictConnector({"prefix": body}, name="retained-prefix-retry")
+    connector.fail_fetch.add("prefix")
+    version = content_hash(body)
+    scope = f"instance:{connector.name}"
+    scope_fp = hashlib.blake2b(scope.encode(), digest_size=20).hexdigest()
+    clock = fakes.ManualLeaseClock()
+    blobs = BlobStore(engine, data_dir)
+    raw = RawDocument(
+        source_id="prefix",
+        uri="memory://prefix",
+        media_type=fakes.MEDIA_TYPE,
+        content=body,
+        metadata={"version_token": version},
+    )
+    stored = await blobs.put(raw.as_bytes(), raw.media_type)
+    assert isinstance(stored, StoredBlob)
+    created = await store.create_acquisition_run(
+        "retained-prefix-run",
+        connector.name,
+        source_scope=scope,
+        scope_fingerprint=scope_fp,
+    )
+    run = await store.claim_acquisition_run(
+        created.id,
+        "prefix-worker",
+        now=clock(),
+        expires_at=clock() + timedelta(seconds=1),
+    )
+    assert run is not None
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        AcquisitionSource.from_discovered(
+            DiscoveredDoc(
+                ref=DocRef(source_id="prefix", uri="memory://prefix"),
+                version_token=version,
+                media_type=fakes.MEDIA_TYPE,
+            )
+        ),
+        lease_owner="prefix-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        "prefix",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="prefix-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        "prefix",
+        AcquisitionRecordState.ACQUIRING,
+        AcquisitionRecordState.ACQUIRED,
+        lease_owner="prefix-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+        blob_ref=stored.hash,
+        acquired_source=AcquiredSource.from_raw(raw),
+        fetched_version_token=version,
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        "prefix",
+        AcquisitionRecordState.ACQUIRED,
+        AcquisitionRecordState.INDEXING,
+        lease_owner="prefix-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+    )
+    retried = await store.transition_acquisition_record(
+        run.id,
+        "prefix",
+        AcquisitionRecordState.INDEXING,
+        AcquisitionRecordState.RETRY,
+        lease_owner="prefix-worker",
+        lease_generation=run.lease_generation,
+        now=clock(),
+        diagnostic=AcquisitionDiagnostic(
+            stage=AcquisitionStage.INDEXING,
+            code=AcquisitionFailureCode.PARSE_FAILED,
+        ),
+    )
+    assert retried.blob_ref == stored.hash
+    assert retried.snapshot_diagnostic is None
+    # Simulate a row written by the pre-fix path: completion must repair all retained members.
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE acquisition_records SET snapshot_diagnostic = :diagnostic "
+                "WHERE run_id = 'retained-prefix-run'"
+            ),
+            {
+                "diagnostic": json.dumps(
+                    {
+                        "stage": "indexing",
+                        "code": "parse_failed",
+                        "retryable": True,
+                    }
+                )
+            },
+        )
+    clock.advance(2)
+    chunker = fakes.BlockChunker()
+    report = await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=blobs,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_clock=clock,
+        acquisition_lease_s=1,
+        detect_glossary=False,
+    ).run(connector)
+
+    assert report.indexed == 1
+    assert report.snapshot_completeness == "complete"
+    assert connector.fetches == []
+    assert await store.verify_snapshot_manifest(run.id)
+    assert await store.latest_promoted_snapshot(connector.name, scope_fp) is not None
+    settled = (await store.list_acquisition_records(run.id))[0]
+    assert settled.state is AcquisitionRecordState.SETTLED
+    assert settled.snapshot_diagnostic is None
 
 
 async def test_fetched_newer_revision_is_the_snapshot_and_publication_version(

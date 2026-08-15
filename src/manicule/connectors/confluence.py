@@ -240,6 +240,12 @@ class ConfluenceConnector:
         self._carried: dict[str, str] = {}
         self._enumerated = False
 
+    @property
+    def source_scope(self) -> str:
+        """Stable non-credential identity of the configured spaces and subtree boundary."""
+        spaces = ",".join(sorted(self._config.spaces))
+        return f"spaces={spaces};{self._config.scope_identity}"
+
     # --- lifecycle -----------------------------------------------------------------------
 
     async def setup(self) -> None:

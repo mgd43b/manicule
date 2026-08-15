@@ -1214,6 +1214,7 @@ class SqliteDocStore(
                 )
                 session.add(row)
             row.watermark = watermark.model_dump(mode="json")
+            row.watermark_scope_fingerprint = None
             row.last_synced_at = utcnow()
 
     async def connector_metadata(self, connector: str) -> dict[str, Any]:

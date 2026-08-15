@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from manicule.core.acquisition import UNSET, UnsetValue
+from manicule.core.acquisition import UNSET, SnapshotPromotionPolicy, UnsetValue
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Mapping, Sequence
@@ -344,11 +344,21 @@ class IngestStore(Protocol):
 class AcquisitionStore(Protocol):
     """The durable source boundary, separate from the legacy publication store."""
 
-    async def create_acquisition_run(self, run_id: str, connector: str) -> AcquisitionRun: ...
+    async def create_acquisition_run(
+        self,
+        run_id: str,
+        connector: str,
+        *,
+        source_scope: str = "",
+        scope_fingerprint: str = "",
+        promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
+    ) -> AcquisitionRun: ...
 
     async def get_acquisition_run(self, run_id: str) -> AcquisitionRun | None: ...
 
-    async def latest_unsettled_acquisition_run(self, connector: str) -> AcquisitionRun | None: ...
+    async def latest_unsettled_acquisition_run(
+        self, connector: str, *, scope_fingerprint: str | None = None
+    ) -> AcquisitionRun | None: ...
 
     async def claim_or_create_acquisition_run(
         self,
@@ -356,6 +366,9 @@ class AcquisitionStore(Protocol):
         run_id: str,
         owner: str,
         *,
+        source_scope: str = "",
+        scope_fingerprint: str = "",
+        promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         now: datetime,
         expires_at: datetime,
     ) -> AcquisitionRun | None:
@@ -466,6 +479,7 @@ class AcquisitionStore(Protocol):
         lease_generation: int,
         now: datetime,
         blob_ref: str | None = None,
+        acquired_source: AcquiredSource | None = None,
         fetched_version_token: str | None = None,
     ) -> AcquisitionRecord:
         """Atomically mark durable coverage and refresh the indexed document's presence."""
@@ -483,6 +497,50 @@ class AcquisitionStore(Protocol):
     async def cleanup_acquisition_history(self, cutoff: datetime, *, limit: int = 100) -> int:
         """Discard bounded terminal history; never unfinished or retryable work."""
         ...
+
+    async def complete_snapshot_acquisition(
+        self,
+        run_id: str,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> AcquisitionRun: ...
+
+    async def promote_snapshot_and_commit_watermark(
+        self,
+        run_id: str,
+        *,
+        expected_scope_fingerprint: str,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> AcquisitionRun: ...
+
+    async def latest_promoted_snapshot(
+        self, connector: str, scope_fingerprint: str
+    ) -> AcquisitionRun | None: ...
+
+    async def reusable_snapshot_record(
+        self,
+        connector: str,
+        scope_fingerprint: str,
+        source_id: str,
+        version_token: str | None,
+    ) -> AcquisitionRecord | None: ...
+
+    async def reusable_record_from_verified_snapshot(
+        self,
+        run_id: str,
+        source_id: str,
+        version_token: str | None,
+    ) -> AcquisitionRecord | None: ...
+
+    async def get_acquisition_watermark(
+        self, connector: str, scope_fingerprint: str
+    ) -> Watermark | None: ...
+
+    async def verify_snapshot_manifest(self, run_id: str) -> bool: ...
 
 
 @runtime_checkable

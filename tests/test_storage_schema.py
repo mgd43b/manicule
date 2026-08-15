@@ -49,6 +49,37 @@ async def test_a_migrated_database_is_at_head(engine: AsyncEngine) -> None:
     assert await current(engine) == head_revision()
 
 
+async def test_snapshot_reuse_queries_use_bounded_composite_indexes(engine: AsyncEngine) -> None:
+    async with engine.connect() as connection:
+        latest_plan = (
+            await connection.execute(
+                text(
+                    "EXPLAIN QUERY PLAN SELECT id FROM acquisition_runs "
+                    "WHERE workspace_id = 'default' AND connector_name = 'wiki' "
+                    "AND scope_fingerprint = 'scope' AND promoted_at IS NOT NULL "
+                    "ORDER BY promoted_at DESC, id DESC LIMIT 1"
+                )
+            )
+        ).all()
+        record_indexes = {
+            str(row[1])
+            for row in (
+                await connection.execute(text("PRAGMA index_list('acquisition_records')"))
+            ).all()
+        }
+        run_indexes = {
+            str(row[1])
+            for row in (
+                await connection.execute(text("PRAGMA index_list('acquisition_runs')"))
+            ).all()
+        }
+
+    latest_detail = " ".join(str(row[-1]) for row in latest_plan)
+    assert "ix_acquisition_runs_latest_promoted" in latest_detail
+    assert "ix_acquisition_runs_latest_promoted" in run_indexes
+    assert "ix_acquisition_records_run_source_version" in record_indexes
+
+
 async def test_foreign_keys_are_enforced_on_every_pooled_connection(engine: AsyncEngine) -> None:
     """The single most common way a schema full of REFERENCES enforces nothing.
 

@@ -4747,6 +4747,8 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
                 if report.unrecorded
                 else "retained source snapshots still require local indexing"
                 if report.pending_derivation
+                else f"{report.snapshot_omissions} source snapshot member(s) require retry"
+                if report.snapshot_omissions
                 else report.error
             ),
             hint=(
@@ -4768,6 +4770,9 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         outcome="incomplete" if incomplete else "bounded" if bounded else "complete",
         enumeration_completed=report.enumeration_completed,
         watermark_advanced=report.watermark_advanced,
+        snapshot_completeness=report.snapshot_completeness,
+        snapshot_omissions=report.snapshot_omissions,
+        snapshot_omission_reasons=dict(report.snapshot_omission_reasons),
         retry_required=incomplete,
         intentionally_bounded=bounded,
         unrecorded=report.unrecorded,

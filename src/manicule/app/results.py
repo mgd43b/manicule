@@ -1309,6 +1309,9 @@ class IngestReport(Payload):
     outcome: IngestOutcome = "complete"
     enumeration_completed: bool = True
     watermark_advanced: bool = False
+    snapshot_completeness: Literal["", "complete", "partial"] = ""
+    snapshot_omissions: int = Field(default=0, ge=0)
+    snapshot_omission_reasons: dict[str, int] = Field(default_factory=dict)
     retry_required: bool = False
     intentionally_bounded: bool = False
     unrecorded: int = Field(default=0, ge=0)
