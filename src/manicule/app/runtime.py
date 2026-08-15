@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     from manicule.core.protocols import Connector, Parser, VectorStore
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
-    from manicule.ingest.ports import IngestStore
+    from manicule.ingest.ports import AcquisitionStore, IngestStore
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
 
@@ -591,6 +591,7 @@ class Runtime:
         )
         return IngestPipeline(
             store=store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
+            acquisitions=cast("AcquisitionStore", store),
             chunker=chunker,
             embedder=embedder,
             vectors=vectors,

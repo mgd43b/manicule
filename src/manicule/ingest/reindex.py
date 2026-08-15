@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from manicule.core.content import DocumentStatus, RawDocument
+from manicule.core.content import DocumentStatus, RawDocument, Retention
 from manicule.core.errors import ContextOverflowError, PolicyError
 from manicule.ingest.embedding import EmbeddingWork, embed_chunks, embed_or_reuse
 
@@ -431,6 +431,7 @@ async def re_parse(
             existing=document,
             force=True,
             expected=document.revision,
+            retention=Retention(ref=document.original_ref),
         )
         for outcome in outcomes:
             # Counted before the branching, and that is the point: the embed stage runs before

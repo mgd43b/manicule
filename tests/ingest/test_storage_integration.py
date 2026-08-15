@@ -1049,13 +1049,14 @@ async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
 
     connector = DuplicateSource()
     chunker = fakes.BlockChunker()
+    vectors = fakes.MemoryVectors()
     pipeline = IngestPipeline(
         store=store,
         acquisitions=store,
         blobs=BlobStore(engine, data_dir),
         chunker=chunker,
         embedder=HashEmbedder(),
-        vectors=fakes.MemoryVectors(),
+        vectors=vectors,
         runner=InProcessRunner({"lines": fakes.LineParser()}),
         resolve_chain=lambda _: ["lines"],
         middleware=MiddlewareRunner(()),
@@ -1076,6 +1077,26 @@ async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
 
     assert report.indexed == 2
     assert await store.latest_unsettled_acquisition_run(connector.name) is None
+    documents = await store.list_documents()
+    chunks = {
+        document.id: [chunk.id for chunk in await store.document_chunks(document.id)]
+        for document in documents
+    }
+    vector_ids = set(vectors.rows)
+    fetches = list(connector.fetches)
+
+    repeated = await pipeline.run(connector)
+
+    assert repeated.skipped_version == 2
+    assert connector.fetches == fetches
+    assert [document.id for document in await store.list_documents()] == [
+        document.id for document in documents
+    ]
+    assert {
+        document.id: [chunk.id for chunk in await store.document_chunks(document.id)]
+        for document in documents
+    } == chunks
+    assert set(vectors.rows) == vector_ids
 
 
 async def test_expired_worker_is_fenced_before_publication_after_takeover(
@@ -1349,6 +1370,15 @@ async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_writ
     assert report.error_type == "_LostAcquisitionLeaseError"
     assert vectors.rows == {}, "the stale worker wrote vectors after its staged-store await"
 
+    fetches = list(connector.fetches)
+    connector.fail_fetch.add("public-vector-document")
+    lease_clock.advance(301)
+    resumed = await pipeline.run(connector)
+
+    assert connector.fetches == fetches
+    assert resumed.indexed == 1
+    assert vectors.rows, "resume did not rebuild the staged publication from its retained blob"
+
 
 async def test_acquisition_failure_does_not_mutate_the_prior_document(
     engine: AsyncEngine,
@@ -1518,6 +1548,316 @@ async def test_crash_after_snapshot_association_resumes_without_source_access(
     stored = await store.find_document(connector.name, "public-resumable")
     assert stored is not None
     assert stored.original_ref == records[0].blob_ref
+
+
+async def test_first_index_and_reparse_share_one_retained_snapshot_without_re_retention(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """Acquisition and reparse both derive from one blob instead of writing it again."""
+
+    class CountingBlobs(BlobStore):
+        def __init__(self) -> None:
+            super().__init__(engine, data_dir)
+            self.retain_calls = 0
+            self.acquisition_calls = 0
+
+        @override
+        async def retain(self, data: bytes, media_type: str | None = None) -> Retention:
+            self.retain_calls += 1
+            return await super().retain(data, media_type)
+
+        @override
+        async def retain_acquisition(
+            self, key: str, raw: RawDocument
+        ) -> tuple[Retention, AcquiredSource]:
+            self.acquisition_calls += 1
+            return await super().retain_acquisition(key, raw)
+
+    blobs = CountingBlobs()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=blobs,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+    connector = fakes.DictConnector(
+        {"public-shared-snapshot": "public retained line"}, name="shared-snapshot-source"
+    )
+
+    first = await pipeline.run(connector)
+    document = await store.find_document(connector.name, "public-shared-snapshot")
+
+    assert first.indexed == 1
+    assert document is not None
+    assert document.original_ref is not None
+    assert blobs.acquisition_calls == 1
+    assert blobs.retain_calls == 0, "blob-fed first indexing retained its input a second time"
+
+    reparsed = await re_parse([document], pipeline=pipeline, blobs=blobs)
+
+    assert reparsed.documents == 1
+    assert blobs.retain_calls == 0, "reparse retained an already-retained snapshot again"
+
+
+async def test_failed_local_derivation_retries_from_blob_without_source_access(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """A failed embed remains a blob-backed RETRY and a later invocation needs no fetch."""
+
+    class OnceFailingEmbedder(HashEmbedder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = True
+
+        @override
+        async def embed(self, texts: Sequence[str]) -> list[Vector]:
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("synthetic local embed failure")
+            return await super().embed(texts)
+
+    connector = fakes.DictConnector(
+        {"public-retry-document": "original public line"}, name="local-retry-source"
+    )
+    blobs = BlobStore(engine, data_dir)
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+
+    def pipeline(embedder: HashEmbedder) -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=blobs,
+            chunker=chunker,
+            embedder=embedder,
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            acquisition_lease_s=1,
+            acquisition_clock=lease_clock,
+            detect_glossary=False,
+        )
+
+    seeded = await pipeline(HashEmbedder()).run(connector)
+    original = await store.find_document(connector.name, "public-retry-document")
+    assert seeded.indexed == 1
+    assert original is not None
+
+    connector.documents["public-retry-document"] = "replacement public line"
+    embedder = OnceFailingEmbedder()
+    first = await pipeline(embedder).run(connector)
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    record = (await store.list_acquisition_records(durable.id))[0]
+    assert record.state is AcquisitionRecordState.RETRY, (
+        first.error_type,
+        first.error_message,
+        first.error,
+    )
+    assert record.blob_ref is not None
+    assert record.diagnostic is not None
+    assert record.diagnostic.code.value == "embed_failed"
+    preserved = await store.find_document(connector.name, "public-retry-document")
+    assert preserved is not None
+    assert preserved.status is DocumentStatus.INDEXED
+    assert preserved.publication_id == original.publication_id
+    assert preserved.content_hash == original.content_hash
+    fetches = list(connector.fetches)
+
+    connector.fail_fetch.add("public-retry-document")
+    lease_clock.advance(2)
+    resumed = await pipeline(embedder).run(connector)
+
+    assert connector.fetches == fetches
+    assert resumed.indexed == 1
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+
+
+async def test_offline_snapshot_finishes_from_blob_after_source_authorization_is_removed(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """The offline connector is only an acquisition source; derivation reopens its blob."""
+    from manicule.connectors.confluence_snapshot import (  # noqa: PLC0415
+        ConfluenceSnapshotConnector,
+    )
+
+    class AuthorizedSnapshot(ConfluenceSnapshotConnector):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.authorized = True
+            self.fetches = 0
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            self.fetches += 1
+            if not self.authorized:
+                raise SessionExpiredError("synthetic snapshot authorization removed")
+            return await super().fetch(ref)
+
+    class GatedBlobRead(BlobStore):
+        def __init__(self) -> None:
+            super().__init__(engine, data_dir)
+            self.reading = asyncio.Event()
+            self.release_read = asyncio.Event()
+
+        @override
+        async def get(self, digest: str) -> bytes | None:
+            data = await super().get(digest)
+            self.reading.set()
+            await self.release_read.wait()
+            return data
+
+    corpus = tmp_path / "public-snapshot"
+    corpus.mkdir()
+    _confluence_snapshot(corpus, version=7)
+    connector = AuthorizedSnapshot(corpus)
+    blobs = GatedBlobRead()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=blobs,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"html": fakes.LineParser()}),
+        resolve_chain=lambda _: ["html"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await blobs.reading.wait()
+    fetches = connector.fetches
+    connector.authorized = False
+    blobs.release_read.set()
+    report = await task
+
+    assert report.indexed == 1
+    assert connector.fetches == fetches == 1
+    stored = await store.find_document(connector.name, "123456")
+    assert stored is not None
+    assert stored.original_ref is not None
+    assert stored.provenance is not None
+
+
+async def test_container_expansion_runs_from_the_retained_parent_snapshot(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The source fetches one container; its locally expanded members never touch the source."""
+    connector = fakes.DictConnector(
+        {"public-bundle": "one=alpha\ntwo=beta"}, name="retained-container-source"
+    )
+    connector.media_types["public-bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    chunker = fakes.BlockChunker()
+    report = await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"archive": fakes.FakeArchive(), "lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["archive", "lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    ).run(connector)
+
+    container = await store.find_document(connector.name, "public-bundle")
+    first = await store.find_document(connector.name, "public-bundle!/one")
+    second = await store.find_document(connector.name, "public-bundle!/two")
+
+    assert connector.fetches == ["public-bundle"]
+    assert report.indexed == 2
+    assert report.expanded == 2
+    assert container is not None
+    assert container.status is DocumentStatus.CONTAINER
+    assert first is not None
+    assert first.original_ref is not None
+    assert second is not None
+    assert second.original_ref is not None
+
+
+async def test_failed_container_member_retries_by_reexpanding_the_retained_parent(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """A member failure keeps the parent record retryable and needs no second source fetch."""
+
+    class OnceFailingEmbedder(HashEmbedder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = True
+
+        @override
+        async def embed(self, texts: Sequence[str]) -> list[Vector]:
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("synthetic member embed failure")
+            return await super().embed(texts)
+
+    connector = fakes.DictConnector(
+        {"public-retry-bundle": "one=alpha\ntwo=beta"}, name="retry-container-source"
+    )
+    connector.media_types["public-retry-bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    embedder = OnceFailingEmbedder()
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=embedder,
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"archive": fakes.FakeArchive(), "lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["archive", "lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            acquisition_lease_s=1,
+            acquisition_clock=lease_clock,
+            detect_glossary=False,
+        )
+
+    await pipeline().run(connector)
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    record = (await store.list_acquisition_records(durable.id))[0]
+    assert record.state is AcquisitionRecordState.RETRY
+    assert record.blob_ref is not None
+    fetches = list(connector.fetches)
+
+    connector.fail_fetch.add("public-retry-bundle")
+    lease_clock.advance(2)
+    resumed = await pipeline().run(connector)
+
+    assert connector.fetches == fetches
+    assert resumed.by_status[DocumentStatus.INDEXED.value] == 2
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 
 async def test_crash_after_file_retention_before_journal_association_uses_staging(

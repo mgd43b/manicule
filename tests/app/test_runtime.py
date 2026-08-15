@@ -569,6 +569,16 @@ async def test_the_pipeline_stamps_exactly_what_the_glossary_repair_looks_for(
         assert pipeline.glossary_lineage == declared.canonical()
 
 
+async def test_the_runtime_wires_the_durable_offline_indexing_path(
+    manicule_environment: Path,
+) -> None:
+    """Production connectors must not silently fall back to live-source derivation."""
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        pipeline = await opened.pipeline()
+
+        assert pipeline._acquisitions is not None  # pyright: ignore[reportPrivateUsage]
+
+
 async def test_turning_detection_off_in_configuration_reaches_the_pipeline(
     manicule_environment: Path,
 ) -> None:

@@ -302,6 +302,7 @@ class DocumentOutcome:
     status: DocumentStatus
     document_id: str = ""
     detail: str = ""
+    failed_stage: PipelineStage | None = None
     chunks: int = 0
     skipped: str = ""
     """``version`` or ``hash`` when change detection stopped early, otherwise empty."""
@@ -523,6 +524,8 @@ class _Fetched:
     discovered: DiscoveredDoc
     existing: Document | None
     acquisition_record: AcquisitionRecord | None = None
+    retention: Retention | None = None
+    force: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,9 +627,9 @@ class IngestPipeline:
         # a stand-in vocabulary must not be able to reach a store at all.
         require_measured(chunk_fingerprint)
         self._store = store
-        # Explicit until acquisition workers (#177) replace this transitional direct-fetch
-        # consumer. Merely noticing that SQLite implements the protocol would enable a partial
-        # multi-issue feature in production before its source-byte coverage path exists.
+        # Explicit protocol injection keeps the legacy bounded path available to protocol-only
+        # stores and unit tests. Production wires the SQLite acquisition store here, making the
+        # blob-backed snapshot path the normal connector topology rather than structural guesswork.
         self._acquisitions = acquisitions
         self._acquisition_lease_s = max(1.0, acquisition_lease_s)
         self._acquisition_clock = acquisition_clock or (lambda: datetime.now(UTC))
@@ -988,6 +991,20 @@ class IngestPipeline:
 
         await owned(self._index_acquired(run), "journal-indexing")
         if run.acquisition_state is AcquisitionRunState.INDEXING and not run.stop.is_set():
+            pending = await acquisitions.list_acquisition_records(
+                run.acquisition_run_id,
+                states=(
+                    AcquisitionRecordState.ACQUIRED,
+                    AcquisitionRecordState.INDEXING,
+                    AcquisitionRecordState.RETRY,
+                ),
+                limit=1,
+            )
+            if pending:
+                # A local document failure is durable work, not permission to call the source
+                # again and not a run-level crash. Leave INDEXING visible and let takeover retry
+                # the retained snapshot on the next invocation.
+                return
             now = self._acquisition_clock()
             await self._keep_acquisition_lease_live(run, acquisitions, now, force=True)
             await acquisitions.transition_acquisition_run(
@@ -1502,6 +1519,7 @@ class IngestPipeline:
                     continue
                 run.discovery_records_held.leave()
                 record = work
+                retrying = record.state is AcquisitionRecordState.RETRY
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now)
                 if record.state in {
@@ -1549,6 +1567,8 @@ class IngestPipeline:
                         ),
                         existing=existing,
                         acquisition_record=record,
+                        retention=Retention(ref=record.blob_ref),
+                        force=retrying,
                     )
                 )
         finally:
@@ -1739,6 +1759,9 @@ class IngestPipeline:
                     version_token=fetched.discovered.version_token,
                     title=fetched.discovered.title,
                     existing=fetched.existing,
+                    retention=fetched.retention,
+                    force=fetched.force,
+                    force_members=fetched.force,
                 )
             finally:
                 if fence_token is not None:
@@ -1752,28 +1775,45 @@ class IngestPipeline:
                 # the inside of it.
                 run.report.record(outcome, expanded=position > 0)
             if fetched.acquisition_record is not None:
-                await self._settle_indexed_record(run, fetched.acquisition_record, outcomes[0])
+                await self._settle_indexed_record(run, fetched.acquisition_record, outcomes)
             # After the whole document, not per outcome: a container that expanded into five
             # hundred members is one thing that happened to somebody watching, and five hundred
             # lines of it is not progress.
             _report_progress(run)
 
     async def _settle_indexed_record(
-        self, run: _Sync, record: AcquisitionRecord, outcome: DocumentOutcome
+        self, run: _Sync, record: AcquisitionRecord, outcomes: Sequence[DocumentOutcome]
     ) -> None:
         """Persist derivation outcome without weakening the independent byte snapshot."""
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover
             return
+        retryable = [outcome for outcome in outcomes if _retryable_derivation(outcome)]
+        outcome = retryable[0] if retryable else outcomes[0]
         target = (
-            AcquisitionRecordState.SETTLED if outcome.document_id else AcquisitionRecordState.RETRY
+            AcquisitionRecordState.SETTLED
+            if outcomes[0].document_id and not retryable
+            else AcquisitionRecordState.RETRY
         )
         diagnostic = (
             None
             if target is AcquisitionRecordState.SETTLED
             else AcquisitionDiagnostic(
                 stage=AcquisitionStage.INDEXING,
-                code=AcquisitionFailureCode.PUBLICATION_FAILED,
+                code=(
+                    AcquisitionFailureCode.EMBED_FAILED
+                    if outcome.failed_stage is PipelineStage.EMBED
+                    else (
+                        AcquisitionFailureCode.PARSE_FAILED
+                        if outcome.failed_stage
+                        in {
+                            PipelineStage.MIDDLEWARE,
+                            PipelineStage.PARSE,
+                            PipelineStage.CHUNK,
+                        }
+                        else AcquisitionFailureCode.PUBLICATION_FAILED
+                    )
+                ),
             )
         )
         now = self._acquisition_clock()
@@ -1940,6 +1980,8 @@ class IngestPipeline:
         existing: Document | None = None,
         force: bool = False,
         expected: DocumentRevision | None = None,
+        retention: Retention | None = None,
+        force_members: bool = False,
     ) -> list[DocumentOutcome]:
         """Everything from fetched bytes onwards, including anything found inside.
 
@@ -1958,10 +2000,20 @@ class IngestPipeline:
         unchanged still expands to the same members, and re-parsing those is a decision about
         each of them rather than a consequence of touching the archive.
 
+        ``force_members`` is narrower and used only when retrying a journal snapshot whose
+        earlier local derivation failed. It prevents a failed container member from hash-skipping
+        forever when the retained parent is expanded again; ordinary re-parse keeps its existing
+        per-member change-detection behavior.
+
         ``expected`` guards the *top-level* document only, and for the same reason ``force``
         does: it is a statement about the snapshot **this caller** read, and a member found
         inside the archive is a document the caller never saw. A caller with newer bytes than
         anything stored — every connector sync — passes nothing and is guarded against nobody.
+
+        ``retention`` identifies bytes the caller already loaded from the blob store. Durable
+        acquisition and re-parse pass it so this shared derivation path never retains the same
+        top-level snapshot twice. Container members are new derived documents and retain their
+        own bytes normally.
         """
         outcome, members = await self._ingest_one(
             raw,
@@ -1971,6 +2023,7 @@ class IngestPipeline:
             existing=existing,
             force=force,
             expected=expected,
+            retention=retention,
         )
         outcomes = [outcome]
         queue: list[MemberOutcome] = list(members)
@@ -1980,7 +2033,10 @@ class IngestPipeline:
                 outcomes.append(await self._record_member_failure(member, source))
                 continue
             inner, deeper = await self._ingest_one(
-                _member_raw(member), source=source, title=_member_title(member)
+                _member_raw(member),
+                source=source,
+                title=_member_title(member),
+                force=force_members,
             )
             outcomes.append(inner)
             queue.extend(deeper)
@@ -1996,6 +2052,7 @@ class IngestPipeline:
         existing: Document | None = None,
         force: bool = False,
         expected: DocumentRevision | None = None,
+        retention: Retention | None = None,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """One document, and whatever it turned out to contain."""
         source_bytes = raw.as_bytes()
@@ -2036,6 +2093,7 @@ class IngestPipeline:
                     identifier=identifier,
                     existing=existing,
                     expected=expected,
+                    retention=retention,
                 )
             except _SupersededError as moved:
                 # Nothing was written, by construction: the guard fires on the first write this
@@ -2064,6 +2122,7 @@ class IngestPipeline:
         identifier: str,
         existing: Document | None,
         expected: DocumentRevision | None,
+        retention: Retention | None,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """The part of one document's ingest that writes, under the lock and the guard.
 
@@ -2080,7 +2139,8 @@ class IngestPipeline:
         # this same path, hooks included — so retaining the transformed bytes would apply
         # `before_parse` twice, and a hook that is not idempotent would compound on every
         # repair. What is kept is the original, exactly as fetched.
-        retention = await self._retain(raw, source_bytes)
+        if retention is None:
+            retention = await self._retain(raw, source_bytes)
 
         try:
             transformed = await self._middleware.before_parse(raw)
@@ -3016,6 +3076,7 @@ class IngestPipeline:
             status=document.status,
             document_id=document.id,
             detail=result.status_detail,
+            failed_stage=result.failed_stage,
             glossary_detail=glossary_detail,
         )
 
@@ -3060,7 +3121,12 @@ class IngestPipeline:
         if raw is None:
             # Nothing was fetched, so there is no content hash and no row to write. The
             # document is simply not indexed, and the next sync rediscovers it.
-            return DocumentOutcome(source_id=source_id, status=DocumentStatus.FAILED, detail=detail)
+            return DocumentOutcome(
+                source_id=source_id,
+                status=DocumentStatus.FAILED,
+                detail=detail,
+                failed_stage=stage,
+            )
         return await self._settle(
             ChainResult(
                 blocks=[],
@@ -3101,6 +3167,7 @@ class IngestPipeline:
                 status=DocumentStatus.INDEXED,
                 document_id=document.id,
                 detail=detail,
+                failed_stage=stage,
             )
         await self._check_publication_fence()
         await self._store.upsert_document(
@@ -3117,7 +3184,15 @@ class IngestPipeline:
             status=DocumentStatus.FAILED,
             document_id=document.id,
             detail=detail,
+            failed_stage=stage,
         )
+
+
+def _retryable_derivation(outcome: DocumentOutcome) -> bool:
+    """Whether local work failed while a safe old publication may still be served."""
+    return outcome.status is DocumentStatus.FAILED or (
+        outcome.status is DocumentStatus.INDEXED and bool(outcome.detail) and not outcome.superseded
+    )
 
 
 def _report_progress(run: _Sync) -> None:
