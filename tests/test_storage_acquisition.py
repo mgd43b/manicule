@@ -2419,8 +2419,7 @@ async def test_acquired_envelope_downgrade_refuses_with_aggregate_redacted_count
         assert secret_id not in message
         assert secret_uri not in message
         assert body.decode() not in message
-        # The attempted multi-revision downgrade is transactional: the older envelope guard
-        # rolls the newly-added manifest downgrade back to the current head as well.
-        assert await current(engine) == "4d8f12a6bc91"
+        # The envelope migration was isolated before exercising its own downgrade refusal.
+        assert await current(engine) == "c41d7ea923b8"
     finally:
         await engine.dispose()

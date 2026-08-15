@@ -1098,9 +1098,11 @@ class IngestPipeline:
             if not run.report.enumeration_completed:
                 # A bounded/incomplete run may still make its durable prefix useful, but it can
                 # never publish the candidate watermark or claim complete source coverage.
-                await self._owned_acquisition(run, self._acquire_journal(run))
+                acquired = await self._owned_acquisition(run, self._acquire_journal(run))
                 if run.stop.is_set():
                     return
+                if not acquired:
+                    await self._report_snapshot_omissions(run)
                 await owned(self._index_acquired(run), "journal-indexing")
                 await self._mark_pending_derivation(run, acquisitions)
                 return
@@ -1171,18 +1173,31 @@ class IngestPipeline:
             )
 
     async def _mark_pending_derivation(self, run: _Sync, acquisitions: AcquisitionStore) -> bool:
-        """Expose any retained or retryable local backlog on the invocation report."""
-        pending = await acquisitions.list_acquisition_records(
-            run.acquisition_run_id,
-            states=(
-                AcquisitionRecordState.ACQUIRED,
-                AcquisitionRecordState.INDEXING,
-                AcquisitionRecordState.RETRY,
-            ),
-            limit=1,
-        )
-        run.report.pending_derivation = bool(pending)
-        return run.report.pending_derivation
+        """Expose work that can continue from retained evidence without source contact."""
+        run.report.pending_derivation = False
+        after: int | None = None
+        while True:
+            records = await acquisitions.list_acquisition_records(
+                run.acquisition_run_id,
+                states=(
+                    AcquisitionRecordState.ACQUIRED,
+                    AcquisitionRecordState.INDEXING,
+                    AcquisitionRecordState.RETRY,
+                ),
+                after_sequence=after,
+                limit=100,
+            )
+            if not records:
+                return False
+            for record in records:
+                local_retry = record.diagnostic is not None and (
+                    record.diagnostic.stage is AcquisitionStage.INDEXING
+                )
+                retained = record.blob_ref is not None or record.acquired_source is not None
+                if record.state is not AcquisitionRecordState.RETRY or retained or local_retry:
+                    run.report.pending_derivation = True
+                    return True
+            after = records[-1].sequence
 
     async def _report_snapshot_omissions(self, run: _Sync) -> None:
         """Expose a bounded, typed aggregate even when strict policy refuses promotion."""

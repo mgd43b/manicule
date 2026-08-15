@@ -18,6 +18,9 @@ from typing import TYPE_CHECKING, cast, override
 import pytest
 from sqlalchemy import text
 
+from manicule.app.dispatch import run_op
+from manicule.app.service import ApplicationService
+from manicule.config.settings import ConnectorSettings
 from manicule.connectors import CursorExpiredError, NotFoundError, SessionExpiredError
 from manicule.core.acquisition import (
     AcquiredSource,
@@ -53,6 +56,7 @@ from manicule.ingest.sweeps import sweep_vectors
 from manicule.ingest.workers import InProcessRunner
 from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.storage.vectors import LanceVectorStore
+from tests.app.fakes import FakeBackend
 from tests.fakes import HashEmbedder
 from tests.ingest import fakes
 
@@ -2360,7 +2364,7 @@ async def test_typed_acquisition_failures_block_source_coverage_without_publicat
         middleware=MiddlewareRunner(()),
         chunk_fingerprint=chunker.fingerprint,
         detect_glossary=False,
-    ).run(connector)
+    ).run(connector, limit=1)
 
     durable = await store.latest_unsettled_acquisition_run(connector.name)
     assert durable is not None
@@ -2373,8 +2377,32 @@ async def test_typed_acquisition_failures_block_source_coverage_without_publicat
     assert report.snapshot_completeness == ""
     assert report.snapshot_omissions == 1
     assert report.snapshot_omission_reasons == {code: 1}
+    assert not report.pending_derivation
+    assert report.limited
     assert str(failure) not in str(report.as_metadata())
     assert await store.find_document(connector.name, "public-refused") is None
+
+    backend = FakeBackend()
+    backend.ingestion_.report = report
+    backend.settings.connectors[connector.name] = ConnectorSettings.model_validate(
+        {"type": "filesystem", "options": {"root": "."}}
+    )
+    service = ApplicationService(backend)
+    envelope = await run_op(
+        "connector_sync",
+        service.workspace,
+        lambda: service.connector_sync(connector.name),
+    )
+
+    assert envelope.ok is False
+    assert envelope.data is not None
+    assert envelope.data["outcome"] == "incomplete"
+    assert envelope.data["retry_required"] is True
+    assert envelope.error is not None
+    assert envelope.error.message == "1 source snapshot member(s) require retry"
+    assert envelope.error.hint is not None
+    assert "source acquisition failure" in envelope.error.hint
+    assert "without contacting the source" not in envelope.error.hint
 
 
 async def test_strict_omission_with_an_existing_document_is_still_incomplete_and_retryable(
