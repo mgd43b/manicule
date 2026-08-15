@@ -353,10 +353,18 @@ class VectorStore(Protocol):
         """The fingerprint this store was built with, or ``None`` if it holds nothing yet."""
         ...
 
-    async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
-        """Store vectors against chunks, replacing any existing rows for those chunk ids.
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = "legacy",
+    ) -> None:
+        """Store vectors against chunks in one publication generation.
 
         ``chunks`` and ``vectors`` are parallel and must be the same length.
+        A physical vector row is keyed by ``publication_id`` plus logical chunk id, so staging
+        a replacement cannot overwrite the generation retrieval still serves.
 
         The store records each vector's embedding-input identity alongside it, derived from
         the chunk's ``embed_text``, the fingerprint the store was prepared with, and the

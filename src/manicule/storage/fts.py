@@ -54,7 +54,7 @@ CREATE_TRIGGERS = (
         INSERT INTO chunks_fts(chunks_fts, rowid, text, heading_text)
         VALUES ('delete', old.seq, old.text, old.heading_text);
         INSERT OR IGNORE INTO vector_tombstones(chunk_id, deleted_at)
-        VALUES (old.id, datetime('now'));
+        VALUES (old.vector_id, datetime('now'));
     END
     """,
     """

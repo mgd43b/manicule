@@ -187,13 +187,15 @@ class DenseStage:
         if not rows:
             return []
 
-        visible = await visible_documents(
+        documents = await visible_documents(
             self._docstore, join, [candidate.chunk.document_id for candidate in rows]
         )
-        if not visible:
+        if not documents:
             return []
 
-        ordered = [row for row in rows if row.chunk.document_id in visible]
+        ordered = [
+            row for row in rows if documents.get(row.chunk.document_id) == row.publication_id
+        ]
         stored = {
             chunk.id: chunk
             for chunk in await self._docstore.get_chunks([row.chunk.id for row in ordered])

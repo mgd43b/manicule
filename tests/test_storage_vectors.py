@@ -37,9 +37,11 @@ from manicule.core.errors import FingerprintMismatchError
 from manicule.core.protocols import VectorStore
 from manicule.core.retrieval import Filter
 from manicule.storage.vectors import (
+    CHUNK_ID_COLUMN,
     EXEMPT_FILTER_FIELDS,
     IDENTITY_COLUMN,
     META_TABLE,
+    PUBLICATION_COLUMN,
     LanceVectorStore,
     VectorStoreStateError,
     predicate_for,
@@ -266,6 +268,28 @@ async def test_a_non_finite_vector_is_refused_before_storage(
     assert "non-finite" in message
     assert "test/model" in message
     assert "test-backend" in message
+    assert await store.count() == 0
+
+
+async def test_float32_overflow_is_refused_without_a_warning_or_partial_row(
+    store: LanceVectorStore,
+) -> None:
+    """A finite Python float can still be non-finite in Lance's physical type."""
+    import warnings  # noqa: PLC0415
+
+    embed = fingerprint().model_copy(update={"backend": "overflowing-backend"})
+    await store.ensure_ready(embed)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ValueError, match="non-finite") as raised:
+            await store.upsert(
+                [chunk("overflow")],
+                [[1e39, 0.0, 0.0, 0.0]],
+                publication_id="never-published",
+            )
+
+    assert "overflowing-backend" in str(raised.value)
     assert await store.count() == 0
 
 
@@ -732,6 +756,24 @@ async def test_the_store_answers_reuse_on_the_embedding_input(tmp_path: Path) ->
     await assert_vector_store_reuses_by_embedding_input(make_store, chunks)
 
 
+async def test_publications_keep_two_vectors_for_one_stable_chunk_id(tmp_path: Path) -> None:
+    """Changing only embed_text must not overwrite the vector the active revision still uses."""
+    store = LanceVectorStore(tmp_path / "vectors")
+    await store.ensure_ready(fingerprint())
+    original = chunk("stable")
+    rewritten = original.model_copy(update={"embed_text": f"new heading > {original.text}"})
+
+    await store.upsert([original], [spread(4, 0)], publication_id="old")
+    await store.upsert([rewritten], [spread(4, 1)], publication_id="new")
+
+    assert await store.count() == 2
+    candidates = await store.search([0.0] * 4, 10)
+    assert {(item.chunk.id, item.publication_id) for item in candidates} == {
+        (original.id, "old"),
+        (original.id, "new"),
+    }
+
+
 async def test_a_reused_vector_is_the_stored_vector_to_the_last_bit(
     store: LanceVectorStore,
 ) -> None:
@@ -803,6 +845,27 @@ async def test_a_table_written_before_the_identity_column_keeps_every_vector_it_
     assert all(verdict.identity_recorded for verdict in settled.values()), (
         "writing the rows records their identities, so the backfill happens once"
     )
+
+
+async def test_a_legacy_table_is_readable_before_generation_columns_are_migrated(
+    tmp_path: Path,
+) -> None:
+    """stored_vectors is a preflight read, so it cannot depend on ensure_ready migration."""
+    directory = tmp_path / "vectors"
+    original = chunk("legacy-chunk")
+    vector = spread(4, 2)
+    writer = LanceVectorStore(directory)
+    await writer.ensure_ready(fingerprint())
+    await writer.upsert([original], [vector])
+    await writer.teardown()
+    await _drop_generation_columns(directory, fingerprint())
+
+    reopened = LanceVectorStore(directory)
+    verdict = (await reopened.stored_vectors([original]))[original.id]
+
+    assert verdict.state is VectorState.READABLE
+    assert verdict.vector
+    await reopened.teardown()
 
 
 async def test_a_chunk_refiled_under_a_new_id_still_finds_its_vector(
@@ -883,4 +946,12 @@ async def _drop_identity_column(directory: Path, embed: EmbedFingerprint) -> Non
     connection = await lancedb.connect_async(directory)
     table = await connection.open_table(table_name(embed))
     await table.drop_columns([IDENTITY_COLUMN])
+    connection.close()
+
+
+async def _drop_generation_columns(directory: Path, embed: EmbedFingerprint) -> None:
+    """Recreate the schema shape written before publication generations existed."""
+    connection = await lancedb.connect_async(directory)
+    table = await connection.open_table(table_name(embed))
+    await table.drop_columns([CHUNK_ID_COLUMN, PUBLICATION_COLUMN])
     connection.close()

@@ -138,6 +138,23 @@ async def test_a_pending_document_is_invisible_to_the_leg(store: SqliteDocStore)
     assert produced == []
 
 
+async def test_only_the_active_vector_publication_survives_hydration(
+    store: SqliteDocStore,
+) -> None:
+    """Staged and retired rows may rank, but neither may cross the relational commit point."""
+    document = make_document(source_id="published", status=DocumentStatus.INDEXED).model_copy(
+        update={"publication_id": "current"}
+    )
+    await store.upsert_document(document)
+    chunk = make_chunk(document, 0, "authentication publication")
+    await store.replace_chunks(document.id, [chunk])
+    vectors = ListVectorStore([chunk, chunk], scores=[1.0, 0.9], publications=["staged", "current"])
+
+    produced = await _stage(store, vectors).run(a_query(limit=1), [])
+
+    assert [(item.chunk.id, item.publication_id) for item in produced] == [(chunk.id, "current")]
+
+
 async def test_the_chunk_that_comes_back_is_the_authoritative_one(
     store: SqliteDocStore,
 ) -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, override
 
@@ -17,9 +18,17 @@ import pytest
 from sqlalchemy import text
 
 from manicule.connectors import CursorExpiredError
-from manicule.core.content import IN_FLIGHT, DocumentStatus, Retention
-from manicule.core.embedding import IndexFingerprints
-from manicule.core.ids import content_hash, document_id
+from manicule.core.content import (
+    IN_FLIGHT,
+    LEGACY_PUBLICATION,
+    Commit,
+    DocumentStatus,
+    PipelineStage,
+    RawDocument,
+    Retention,
+)
+from manicule.core.embedding import IndexFingerprints, Vector
+from manicule.core.ids import content_hash, document_id, vector_id
 from manicule.core.sources import Watermark
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
@@ -43,13 +52,16 @@ if TYPE_CHECKING:
 
 
 def _pipeline(
-    docs: SqliteDocStore, vectors: LanceVectorStore, blobs: BlobStore | None = None
+    docs: SqliteDocStore,
+    vectors: LanceVectorStore,
+    blobs: BlobStore | None = None,
+    embedder: HashEmbedder | None = None,
 ) -> IngestPipeline:
     chunker = fakes.BlockChunker()
     return IngestPipeline(
         store=docs,
         chunker=chunker,
-        embedder=HashEmbedder(),
+        embedder=embedder or HashEmbedder(),
         vectors=vectors,
         runner=InProcessRunner({"lines": fakes.LineParser()}),
         resolve_chain=lambda _: ["lines"],
@@ -364,6 +376,42 @@ async def test_a_document_reaches_both_stores_and_is_marked_indexed_last(
     await vectors.teardown()
 
 
+async def test_float32_overflow_never_stages_or_publishes_a_real_vector(
+    store: SqliteDocStore,
+    data_dir: Path,
+) -> None:
+    """A finite backend value outside Lance's range is a contextual document failure."""
+    import warnings  # noqa: PLC0415
+
+    class OverflowEmbedder(HashEmbedder):
+        @override
+        async def embed(self, texts: Sequence[str]) -> list[Vector]:
+            return [[1e39, 0.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    embedder = OverflowEmbedder(model_id="fake/overflowing")
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embedder.fingerprint)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        report = await _pipeline(store, vectors, embedder=embedder).run(
+            fakes.DictConnector({"overflow": "finite in Python, not in float32"})
+        )
+
+    document = await store.find_document("memory", "overflow")
+    assert report.by_status == {DocumentStatus.FAILED.value: 1}
+    assert document is not None
+    assert document.status is DocumentStatus.FAILED
+    assert document.publication_id == LEGACY_PUBLICATION
+    assert document.status_detail is not None
+    assert "non-finite" in document.status_detail
+    assert "fake/overflowing" in document.status_detail
+    assert await store.count_chunks(document.id) == 0
+    assert await vectors.count() == 0
+    assert await store.take_tombstones(10) == []
+    await vectors.teardown()
+
+
 async def test_deleting_chunks_tombstones_their_vectors_and_the_sweep_removes_them(
     store: SqliteDocStore,
     data_dir: Path,
@@ -384,6 +432,169 @@ async def test_deleting_chunks_tombstones_their_vectors_and_the_sweep_removes_th
     assert result.vectors_removed == 2
     assert await vectors.count() == 0
     assert await store.take_tombstones(10) == []
+    await vectors.teardown()
+
+
+async def test_hard_delete_tombstones_the_active_physical_vectors(
+    store: SqliteDocStore,
+    data_dir: Path,
+    engine: AsyncEngine,
+) -> None:
+    """Every document and workspace cascade carries the exact generation-keyed Lance id."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
+
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    await _pipeline(store, vectors).run(fakes.DictConnector({"a": "alpha\nbeta"}))
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    chunks = list(await store.document_chunks(document.id))
+    physical = {vector_id(document.publication_id, chunk.id) for chunk in chunks}
+    other = SqliteDocStore(engine, workspace_id="other")
+    await other.ensure_workspace()
+    await other.delete_document(document.id)
+    assert await store.get_document(document.id) is not None, "another workspace cannot delete it"
+
+    doomed = SqliteDocStore(engine, workspace_id="doomed")
+    await doomed.ensure_workspace()
+    doomed_document = make_document(
+        source="memory", source_id="workspace-member", workspace_id="doomed"
+    ).model_copy(update={"publication_id": "workspace-publication"})
+    doomed_document = await doomed.upsert_document(doomed_document)
+    doomed_chunk = make_chunk(doomed_document, 0, "workspace body")
+    await doomed.replace_chunks(doomed_document.id, [doomed_chunk])
+    await vectors.upsert(
+        [doomed_chunk],
+        [[0.3] * HashEmbedder().fingerprint.dimension],
+        publication_id=doomed_document.publication_id,
+    )
+    physical.add(vector_id(doomed_document.publication_id, doomed_chunk.id))
+    async with engine.begin() as connection:
+        await connection.execute(text("DELETE FROM workspaces WHERE id = 'doomed'"))
+
+    await store.delete_document(document.id)
+    tombstones = set(await store.take_tombstones(20))
+    assert physical <= tombstones
+    await sweep_vectors(store, vectors)
+    assert await vectors.count() == 0
+    await vectors.teardown()
+
+
+async def test_a_legacy_tombstone_survives_a_publication_to_publication_flip(
+    store: SqliteDocStore,
+    data_dir: Path,
+    engine: AsyncEngine,
+) -> None:
+    """P1 cleanup must not erase evidence for a still-present pre-publication vector."""
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(store, vectors)
+    connector = fakes.DictConnector({"a": "unchanged body"})
+    await pipeline.run(connector)
+    first = await store.find_document("memory", "a")
+    assert first is not None
+    chunks = list(await store.document_chunks(first.id))
+    assert len(chunks) == 1
+    legacy_id = chunks[0].id
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO vector_tombstones (chunk_id, deleted_at) "
+                "VALUES (:chunk_id, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING"
+            ),
+            {"chunk_id": legacy_id},
+        )
+
+    await pipeline.ingest_raw(
+        RawDocument(
+            source_id="a",
+            uri="memory://a",
+            media_type=fakes.MEDIA_TYPE,
+            content="unchanged body",
+            metadata={"revision_note": "metadata-only publication change"},
+        ),
+        source="memory",
+        force=True,
+        expected=first.revision,
+    )
+
+    second = await store.find_document("memory", "a")
+    assert second is not None
+    assert second.publication_id != first.publication_id
+    assert [chunk.id for chunk in await store.document_chunks(second.id)] == [legacy_id]
+    assert legacy_id in await store.take_tombstones(20)
+    await vectors.teardown()
+
+
+async def test_real_lance_retry_keeps_the_publication_after_float32_round_trip(
+    store: SqliteDocStore,
+    data_dir: Path,
+) -> None:
+    """Reused normalized float32 values identify the same publication as raw model output."""
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(store, vectors)
+    raw = RawDocument(source_id="a", uri="memory://a", media_type=fakes.MEDIA_TYPE, content="alpha")
+    first_outcome = await pipeline.ingest_raw(raw, source="memory", force=True)
+    first = await store.get_document(first_outcome[0].document_id)
+    assert first is not None
+
+    second_outcome = await pipeline.ingest_raw(
+        raw,
+        source="memory",
+        force=True,
+        expected=first.revision,
+    )
+    second = await store.get_document(second_outcome[0].document_id)
+    assert second is not None
+    assert second.publication_id == first.publication_id
+    assert await vectors.count() == 1
+    tombstones = set(await store.take_tombstones(20))
+    chunks = await store.document_chunks(second.id)
+    assert vector_id(second.publication_id, chunks[0].id) not in tombstones
+    await vectors.teardown()
+
+
+async def test_failure_inside_relational_publication_rolls_back_every_derived_row(
+    store: SqliteDocStore,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after chunks are replaced still leaves the old publication wholly readable."""
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(store, vectors)
+    connector = fakes.DictConnector({"a": "NOW - Network Operations Workspace\nold body"})
+    await pipeline.run(connector)
+    before = await store.find_document("memory", "a")
+    assert before is not None
+    old_chunks = list(await store.document_chunks(before.id))
+    old_glossary = list(await store.glossary_entries(before.id))
+    old_lineage = (before.parse_fp, await store.glossary_lineage(before.id))
+
+    async def fail_between_writes(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("power lost between relational writes")
+
+    monkeypatch.setattr(store, "_replace_entries", fail_between_writes)
+    connector.documents["a"] = "SRE - Site Reliability Engineering\nnew body"
+    report = await pipeline.run(connector)
+
+    after = await store.find_document("memory", "a")
+    assert after is not None
+    assert report.indexed == 1, "the previous indexed revision remains the reported outcome"
+    assert (after.content_hash, after.publication_id, after.status) == (
+        before.content_hash,
+        before.publication_id,
+        DocumentStatus.INDEXED,
+    )
+    assert list(await store.document_chunks(after.id)) == old_chunks
+    assert list(await store.glossary_entries(after.id)) == old_glossary
+    assert (after.parse_fp, await store.glossary_lineage(after.id)) == old_lineage
+    assert await store.take_tombstones(10), "staged vectors stay named for crash-safe cleanup"
+    await sweep_vectors(store, vectors)
+    assert await vectors.count() == len(old_chunks), "cleanup retained every active vector"
     await vectors.teardown()
 
 
@@ -695,6 +906,208 @@ async def test_the_stores_guard_reads_an_absent_field_as_absent_rather_than_as_n
     assert miss.stored is not None
     assert miss.stored.title == moved.title, "and the row is left exactly as the winner wrote it"
     assert miss.stored.content_hash == moved.content_hash
+
+
+async def test_atomic_publication_cas_has_one_winner_across_two_real_sessions(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+) -> None:
+    """The conditional UPDATE is the first statement, so no stale read precedes the lock."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    original = await store.upsert_document(
+        make_document(source="memory", source_id="publication-race")
+    )
+    contenders = [
+        SqliteDocStore(engine),
+        SqliteDocStore(engine),
+    ]
+    replacements = [
+        original.model_copy(update={"title": title, "publication_id": publication})
+        for title, publication in (("left", "publication-left"), ("right", "publication-right"))
+    ]
+
+    async def publish(index: int) -> Commit:
+        return await contenders[index].publish_document(
+            replacements[index],
+            [],
+            expected=original.revision,
+            chunk_fp=None,
+            embed_fp=None,
+            parse_fp=None,
+            glossary_entries=None,
+            glossary_fp=None,
+            original_omitted_reason=None,
+        )
+
+    results = await asyncio.gather(publish(0), publish(1))
+
+    assert [result.committed for result in results].count(True) == 1
+    miss = next(result for result in results if not result.committed)
+    winner = next(result for result in results if result.committed)
+    assert miss.stored == winner.stored
+    assert await store.get_document(original.id) == winner.stored
+
+
+async def test_stale_retained_failure_cannot_overwrite_an_indexed_winners_original(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure retention and its guarded row are one commit, not a trailing setter."""
+    from sqlalchemy.ext.asyncio import AsyncSession  # noqa: PLC0415
+
+    from manicule.core.content import Document, DocumentRevision  # noqa: PLC0415
+    from manicule.storage import models  # noqa: PLC0415
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    blobs = BlobStore(engine, data_dir)
+    old_ref = (await blobs.retain(b"old source", "text/plain")).ref
+    winner_ref = (await blobs.retain(b"winner source", "text/plain")).ref
+    stale_failure_ref = (await blobs.retain(b"stale failed source", "text/plain")).ref
+    assert old_ref
+    assert winner_ref
+    assert stale_failure_ref
+    original = await store.upsert_document(
+        make_document(
+            source="memory",
+            source_id="failure-race",
+            status=DocumentStatus.NO_EXTRACTABLE_TEXT,
+        ).model_copy(update={"original_ref": old_ref})
+    )
+
+    winner_store = SqliteDocStore(engine)
+    loser_store = SqliteDocStore(engine)
+    winner_entered = asyncio.Event()
+    release_winner = asyncio.Event()
+    loser_attempted = asyncio.Event()
+    replace_entries = winner_store._replace_entries  # pyright: ignore[reportPrivateUsage]
+
+    async def pause_winner(*args: object, **kwargs: object) -> None:
+        winner_entered.set()
+        await release_winner.wait()
+        await replace_entries(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    target = loser_store._publication_target  # pyright: ignore[reportPrivateUsage]
+
+    async def observe_loser(
+        session: AsyncSession,
+        document: Document,
+        expected: DocumentRevision | None,
+    ) -> tuple[models.Document | None, Commit | None]:
+        loser_attempted.set()
+        return await target(session, document, expected)
+
+    monkeypatch.setattr(winner_store, "_replace_entries", pause_winner)
+    monkeypatch.setattr(loser_store, "_publication_target", observe_loser)
+    winner_document = original.model_copy(
+        update={
+            "content_hash": content_hash(b"winner source"),
+            "original_ref": winner_ref,
+            "publication_id": "winner-publication",
+            "status": DocumentStatus.INDEXED,
+            "status_detail": None,
+            "failed_stage": None,
+        }
+    )
+    failed_document = original.model_copy(
+        update={
+            "content_hash": content_hash(b"stale failed source"),
+            "original_ref": stale_failure_ref,
+            "status": DocumentStatus.FAILED,
+            "status_detail": "parser crashed",
+            "failed_stage": PipelineStage.PARSE,
+        }
+    )
+
+    winner_task = asyncio.create_task(
+        winner_store.publish_document(
+            winner_document,
+            [],
+            expected=original.revision,
+            chunk_fp=None,
+            embed_fp=None,
+            parse_fp=None,
+            glossary_entries=[],
+            glossary_fp="winner-glossary",
+            original_omitted_reason=None,
+        )
+    )
+    await winner_entered.wait()
+    loser_task = asyncio.create_task(
+        loser_store.publish_failure(
+            failed_document,
+            expected=original.revision,
+            original_omitted_reason=None,
+        )
+    )
+    await loser_attempted.wait()
+    release_winner.set()
+    winner, loser = await asyncio.gather(winner_task, loser_task)
+
+    assert winner.committed
+    assert not loser.committed
+    assert loser.stored == winner.stored
+    async with engine.connect() as connection:
+        retained = (
+            await connection.execute(
+                text(
+                    "SELECT original_ref, original_omitted_reason "
+                    "FROM documents WHERE id = :document_id"
+                ),
+                {"document_id": original.id},
+            )
+        ).one()
+    assert retained == (winner_ref, None)
+
+
+async def test_initial_failure_rolls_back_retained_reference_with_its_row(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The expected=None path cannot expose half of its retention decision."""
+    from sqlalchemy.ext.asyncio import AsyncSession  # noqa: PLC0415
+
+    from manicule.core.content import Document  # noqa: PLC0415
+    from tests.storage_helpers import make_document  # noqa: PLC0415
+
+    retained_ref = (await BlobStore(engine, data_dir).retain(b"failed source", "text/plain")).ref
+    assert retained_ref
+    failed = make_document(
+        source="memory",
+        source_id="initial-failure-rollback",
+        status=DocumentStatus.FAILED,
+    ).model_copy(
+        update={
+            "original_ref": retained_ref,
+            "status_detail": "parser crashed",
+            "failed_stage": PipelineStage.PARSE,
+        }
+    )
+    write_document = store._write_document  # pyright: ignore[reportPrivateUsage]
+
+    async def interrupt_after_row_write(
+        session: AsyncSession,
+        document: Document,
+    ) -> Document:
+        await write_document(session, document)
+        raise RuntimeError("power lost before retention outcome")
+
+    monkeypatch.setattr(store, "_write_document", interrupt_after_row_write)
+
+    with pytest.raises(RuntimeError, match="power lost before retention outcome"):
+        await store.publish_failure(
+            failed,
+            expected=None,
+            original_omitted_reason=None,
+        )
+
+    assert await store.get_document(failed.id) is None
 
 
 async def test_the_stores_guard_refuses_on_a_corrected_record_over_bytes_that_never_moved(

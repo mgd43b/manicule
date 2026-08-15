@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 async def visible_documents(
     docstore: DocStore, join: Filter, document_ids: Collection[str]
-) -> set[str]:
+) -> dict[str, str]:
     """Which of ``document_ids`` this store will show, under ``join``'s restrictions.
 
     The store applies the workspace scope and excludes soft-deleted documents; status is
@@ -38,11 +38,15 @@ async def visible_documents(
     if join.document_ids:
         wanted &= join.document_ids
     if not wanted:
-        return set()
+        return {}
     documents = await docstore.list_documents(
         join.model_copy(update={"document_ids": wanted}), limit=len(wanted)
     )
-    return {document.id for document in documents if document.status is DocumentStatus.INDEXED}
+    return {
+        document.id: document.publication_id
+        for document in documents
+        if document.status is DocumentStatus.INDEXED
+    }
 
 
 __all__ = ["visible_documents"]

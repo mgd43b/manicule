@@ -65,18 +65,20 @@ from lancedb.pydantic import LanceModel
 from lancedb.pydantic import Vector as FixedSizeVector
 from pydantic import create_model
 
-from manicule.core.content import Chunk
+from manicule.core.content import LEGACY_PUBLICATION, Chunk
 from manicule.core.embedding import (
+    FLOAT32_EPSILON,
     UNRECORDED_IDENTITY,
     EmbedFingerprint,
     StoredVector,
     VectorState,
+    canonical_stored_vector,
     choose_stored_vector,
     classify_stored_vector,
     embedding_input_identity,
-    is_finite_vector,
 )
 from manicule.core.errors import ManiculeError
+from manicule.core.ids import vector_id
 from manicule.core.retrieval import Candidate, Filter
 
 if TYPE_CHECKING:
@@ -97,6 +99,8 @@ TABLE_PREFIX: Final = "chunks__"
 FINGERPRINT_HASH_LENGTH: Final = 8
 
 ID_COLUMN: Final = "id"
+CHUNK_ID_COLUMN: Final = "chunk_id"
+PUBLICATION_COLUMN: Final = "publication_id"
 VECTOR_COLUMN: Final = "vector"
 CHUNK_COLUMN: Final = "chunk_json"
 IDENTITY_COLUMN: Final = "embed_identity"
@@ -104,6 +108,14 @@ DISTANCE_COLUMN: Final = "_distance"
 
 IDENTITY_QUERY_PAGE: Final = 512
 """Chunk ids per ``IN`` predicate when reading rows back. See :meth:`LanceVectorStore._rows_for`."""
+
+_VECTOR_STATE_PRIORITY: Final = {
+    VectorState.ABSENT: 0,
+    VectorState.STALE: 1,
+    VectorState.CORRUPT: 2,
+    VectorState.READABLE: 3,
+}
+"""Best evidence across several physical publications of one logical chunk."""
 
 FILTERABLE_COLUMNS: Final = frozenset({"document_id", "kind", "lang", "position"})
 """The promoted columns a predicate may name.
@@ -229,14 +241,6 @@ def predicate_for(filter: Filter | None) -> str | None:  # noqa: A002 - the doma
     return " AND ".join(terms) if terms else None
 
 
-FLOAT32_EPSILON: Final = 2.0**-23
-"""The spacing of :class:`float` values either side of 1.0 in the column's own precision.
-
-The vector column is ``fixed_size_list<float32, dimension>``, so ``float32`` is what this
-module stores in and the smallest difference it can represent near 1.0 is this.
-"""
-
-
 def _embed_text_of(record: dict[str, Any]) -> str | None:
     """The ``embed_text`` of the chunk a row carries, or ``None`` if the row cannot say.
 
@@ -303,6 +307,8 @@ def _row_model(dimension: int) -> type[LanceModel]:
     """
     fields: dict[str, Any] = {
         ID_COLUMN: (str, ...),
+        CHUNK_ID_COLUMN: (str, ...),
+        PUBLICATION_COLUMN: (str, ...),
         VECTOR_COLUMN: (FixedSizeVector(dimension), ...),
         "document_id": (str, ...),
         "kind": (str, ...),
@@ -394,8 +400,14 @@ class LanceVectorStore:
 
     # --- writing -------------------------------------------------------------------------
 
-    async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
-        """Store ``vectors`` against ``chunks``, replacing any rows for those chunk ids.
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = LEGACY_PUBLICATION,
+    ) -> None:
+        """Store ``vectors`` against ``chunks`` within one publication generation.
 
         Raises:
             ValueError: If the two sequences differ in length, or if a vector is not the
@@ -413,7 +425,7 @@ class LanceVectorStore:
         if not chunks:
             return
         rows = [
-            self._row(chunk, vector, fingerprint)
+            self._row(chunk, vector, fingerprint, publication_id)
             for chunk, vector in zip(chunks, vectors, strict=True)
         ]
         await (
@@ -433,10 +445,11 @@ class LanceVectorStore:
     async def delete_chunks(self, chunk_ids: Sequence[str]) -> None:
         """Remove named vectors. Idempotent, and what the tombstone sweep calls.
 
-        By id, from a list the sweep was handed — never by anti-joining the whole table against
+        The historical parameter name is retained by the narrow sweep protocol; its values are
+        physical vector ids, which equal logical chunk ids only for the legacy publication. By
+        id, from a list the sweep was handed — never by anti-joining the whole table against
         ``chunks``. That comparison races concurrent ingest: an id written after the scan began
-        looks like an orphan, and the sweep deletes a live vector. Tombstones exist so this
-        method can only ever name something that was deleted.
+        looks like an orphan, and the sweep deletes a live vector.
         """
         if not chunk_ids:
             return
@@ -492,10 +505,15 @@ class LanceVectorStore:
         search = table.vector_search(query).distance_type("cosine")
         if predicate is not None:
             search = search.where(predicate)
-        records = await search.select([ID_COLUMN, CHUNK_COLUMN, DISTANCE_COLUMN]).limit(k).to_list()
+        records = (
+            await search.select([ID_COLUMN, PUBLICATION_COLUMN, CHUNK_COLUMN, DISTANCE_COLUMN])
+            .limit(k)
+            .to_list()
+        )
         return [
             Candidate(
                 chunk=Chunk.model_validate_json(str(record[CHUNK_COLUMN])),
+                publication_id=str(record[PUBLICATION_COLUMN]),
                 score=min(1.0, max(-1.0, 1.0 - float(record[DISTANCE_COLUMN]))),
             )
             for record in records
@@ -551,14 +569,24 @@ class LanceVectorStore:
         if table is None or fingerprint is None:
             return verdicts
         schema = await table.schema()
-        has_identity = IDENTITY_COLUMN in {str(field.name) for field in schema}
+        columns = {str(field.name) for field in schema}
+        has_identity = IDENTITY_COLUMN in columns
+        logical_id_column = CHUNK_ID_COLUMN if CHUNK_ID_COLUMN in columns else ID_COLUMN
 
         by_id = {chunk.id: chunk for chunk in chunks}
-        for record in await self._rows_for(table, sorted(by_id), has_identity=has_identity):
-            chunk = by_id.get(str(record[ID_COLUMN]))
+        for record in await self._rows_for(
+            table,
+            sorted(by_id),
+            logical_id_column=logical_id_column,
+            has_identity=has_identity,
+        ):
+            chunk = by_id.get(str(record[logical_id_column]))
             if chunk is None:  # pragma: no cover - the predicate asked for these ids only
                 continue
-            verdicts[chunk.id] = self._verdict(chunk, record, fingerprint)
+            found = self._verdict(chunk, record, fingerprint)
+            current = verdicts[chunk.id]
+            if _VECTOR_STATE_PRIORITY[found.state] > _VECTOR_STATE_PRIORITY[current.state]:
+                verdicts[chunk.id] = found
 
         wanted = {
             chunk.id: self._identity_of(chunk, fingerprint)
@@ -578,7 +606,12 @@ class LanceVectorStore:
         return verdicts
 
     async def _rows_for(
-        self, table: AsyncTable, chunk_ids: Sequence[str], *, has_identity: bool
+        self,
+        table: AsyncTable,
+        chunk_ids: Sequence[str],
+        *,
+        logical_id_column: str,
+        has_identity: bool,
     ) -> list[dict[str, Any]]:
         """Every stored row among ``chunk_ids``, read in bounded pages.
 
@@ -587,14 +620,13 @@ class LanceVectorStore:
         is a SQL string megabytes long. The page size is a property of the query, not of the
         work, so it needs no tuning knob.
 
-        ``limit(len(page))`` is exact here rather than defensive: a chunk id is the merge key,
-        so the table holds at most one row per id and a page of *n* ids can match at most *n*
-        rows. :meth:`_rows_by_identity` does not have that property and does not have the limit.
+        A logical chunk id may match several publication rows, so this query has no row limit.
+        Every match is classified and the strongest usable evidence wins.
 
         A row from a table without the identity column reads as
         :data:`~manicule.core.embedding.UNRECORDED_IDENTITY`, which is what it is.
         """
-        columns = [ID_COLUMN, VECTOR_COLUMN, CHUNK_COLUMN]
+        columns = [logical_id_column, VECTOR_COLUMN, CHUNK_COLUMN]
         if has_identity:
             columns.append(IDENTITY_COLUMN)
 
@@ -604,9 +636,8 @@ class LanceVectorStore:
             listed = ", ".join(quote(chunk_id) for chunk_id in page)
             found = (
                 await table.query()
-                .where(f"{ID_COLUMN} IN ({listed})")
+                .where(f"{logical_id_column} IN ({listed})")
                 .select(columns)
-                .limit(len(page))
                 .to_list()
             )
             for record in found:
@@ -638,7 +669,7 @@ class LanceVectorStore:
             found = (
                 await table.query()
                 .where(f"{IDENTITY_COLUMN} IN ({listed})")
-                .select([ID_COLUMN, VECTOR_COLUMN, CHUNK_COLUMN, IDENTITY_COLUMN])
+                .select([VECTOR_COLUMN, CHUNK_COLUMN, IDENTITY_COLUMN])
                 .to_list()
             )
             for record in found:
@@ -669,25 +700,36 @@ class LanceVectorStore:
         query = table.query()
         if predicate is not None:
             query = query.where(predicate)
-        records = await query.select([ID_COLUMN, CHUNK_COLUMN]).limit(k).to_list()
+        records = (
+            await query.select([ID_COLUMN, PUBLICATION_COLUMN, CHUNK_COLUMN]).limit(k).to_list()
+        )
         return [
-            Candidate(chunk=Chunk.model_validate_json(str(record[CHUNK_COLUMN])), score=0.0)
+            Candidate(
+                chunk=Chunk.model_validate_json(str(record[CHUNK_COLUMN])),
+                publication_id=str(record[PUBLICATION_COLUMN]),
+                score=0.0,
+            )
             for record in records
         ]
 
     def _row(
-        self, chunk: Chunk, vector: Vector, fingerprint: EmbedFingerprint
+        self,
+        chunk: Chunk,
+        vector: Vector,
+        fingerprint: EmbedFingerprint,
+        publication_id: str,
     ) -> dict[str, object]:
         """One Lance row: the normalized vector, the promoted columns, the chunk, its identity."""
-        if not is_finite_vector(vector):
-            backend = fingerprint.backend or "an unspecified backend"
+        backend = fingerprint.backend or "an unspecified backend"
+        try:
+            values = canonical_stored_vector(vector)
+        except ValueError as exc:
             msg = (
                 f"chunk {chunk.id!r} was offered a vector with non-finite values for "
                 f"{fingerprint.describe()} from {backend}. NaN and infinity cannot participate "
                 "in cosine distance, so the vector was refused before storage."
             )
-            raise ValueError(msg)
-        values = unit(vector)
+            raise ValueError(msg) from exc
         if len(values) != fingerprint.dimension:
             msg = (
                 f"chunk {chunk.id!r} was offered a {len(values)}-dimension vector but the "
@@ -697,7 +739,9 @@ class LanceVectorStore:
             )
             raise ValueError(msg)
         return {
-            ID_COLUMN: chunk.id,
+            ID_COLUMN: vector_id(publication_id, chunk.id),
+            CHUNK_ID_COLUMN: chunk.id,
+            PUBLICATION_COLUMN: publication_id,
             VECTOR_COLUMN: values,
             "document_id": chunk.document_id,
             "kind": chunk.kind.value,
@@ -778,11 +822,11 @@ class LanceVectorStore:
         name = table_name(fingerprint)
         if name in await self._table_names(connection):
             table = await connection.open_table(name)
-            await self._ensure_identity_column(table)
+            await self._ensure_generation_columns(table)
             return table
         return await connection.create_table(name, schema=_row_model(fingerprint.dimension))
 
-    async def _ensure_identity_column(self, table: AsyncTable) -> None:
+    async def _ensure_generation_columns(self, table: AsyncTable) -> None:
         """Add :data:`IDENTITY_COLUMN` to a table created before it existed.
 
         The whole migration for an existing ``vectors/`` directory, and it is deliberately the
@@ -793,9 +837,16 @@ class LanceVectorStore:
         vector it has. Idempotent, because :meth:`ensure_ready` runs on every process start.
         """
         schema = await table.schema()
-        if IDENTITY_COLUMN in {str(field.name) for field in schema}:
-            return
-        await table.add_columns({IDENTITY_COLUMN: quote(UNRECORDED_IDENTITY)})
+        names = {str(field.name) for field in schema}
+        additions: dict[str, str] = {}
+        if IDENTITY_COLUMN not in names:
+            additions[IDENTITY_COLUMN] = quote(UNRECORDED_IDENTITY)
+        if CHUNK_ID_COLUMN not in names:
+            additions[CHUNK_ID_COLUMN] = ID_COLUMN
+        if PUBLICATION_COLUMN not in names:
+            additions[PUBLICATION_COLUMN] = quote(LEGACY_PUBLICATION)
+        if additions:
+            await table.add_columns(additions)
 
     async def _existing_table(self) -> AsyncTable | None:
         """The vector table if the directory has one, without requiring :meth:`ensure_ready`.

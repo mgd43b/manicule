@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, override
 
 import pytest
 
-from manicule.core.content import DocumentStatus, PipelineStage, RawDocument
+from manicule.core.content import Commit, DocumentStatus, PipelineStage, RawDocument
 from manicule.core.errors import PolicyError
 from manicule.core.fingerprints import ParseFingerprint
 from manicule.core.ids import content_hash
@@ -25,8 +25,10 @@ from tests.fakes import MEDIA_TYPE, HashEmbedder
 from tests.ingest import fakes
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 
+    from manicule.core.content import Chunk, Document, DocumentRevision, ParsedBlock
+    from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Chunker, Embedder, Middleware
 
 
@@ -138,7 +140,29 @@ async def test_the_write_order_marks_a_document_indexed_last() -> None:
     assert document is not None
     assert document.status is DocumentStatus.FAILED
     assert document.failed_stage is PipelineStage.STORE
-    assert store.chunks[document.id], "chunks are written first, and that is not a bug"
+    assert not store.chunks.get(document.id), "failed vectors must publish no relational chunks"
+
+
+async def test_republishing_the_identical_generation_does_not_tombstone_active_vectors() -> None:
+    """A content-addressed retry may reuse its physical rows, so it must not stage their cleanup."""
+    pipeline, store, _ = build()
+    connector = fakes.DictConnector({"a": "alpha"})
+    await pipeline.run(connector)
+    before = await store.find_document("memory", "a")
+    assert before is not None
+    staged = list(store.staged_publications)
+
+    await pipeline.ingest_raw(
+        RawDocument(source_id="a", uri="memory://a", media_type=MEDIA_TYPE, content="alpha"),
+        source="memory",
+        version_token=content_hash("alpha"),
+        force=True,
+    )
+
+    after = await store.find_document("memory", "a")
+    assert after is not None
+    assert after.publication_id == before.publication_id
+    assert store.staged_publications == staged
 
 
 # --- one bad document never aborts a batch ----------------------------------------------------
@@ -268,6 +292,128 @@ async def test_a_document_with_no_extractable_text_is_stored_with_zero_chunks() 
     assert store.chunks[document.id] == []
 
 
+async def test_zero_chunk_publication_loses_its_cas_without_erasing_the_winner() -> None:
+    """The empty branch uses the same guarded relational flip as a vector-bearing revision."""
+    pipeline, store, vectors = build()
+    await pipeline.run(fakes.DictConnector({"a": "old text"}))
+    stale = await store.find_document("memory", "a")
+    assert stale is not None
+    old_chunks = list(store.chunks[stale.id])
+
+    class OvertakingEmptyChunker(fakes.BlockChunker):
+        @override
+        def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+            del document, blocks
+            winner = store.documents[stale.id].model_copy(
+                update={"content_hash": content_hash("winner"), "version_token": "winner"}
+            )
+            store.documents[stale.id] = winner
+            return []
+
+    contender, _, _ = build(store=store, vectors=vectors, chunker=OvertakingEmptyChunker())
+    outcomes = await contender.ingest_raw(
+        RawDocument(
+            source_id="a", uri="memory://a", media_type=MEDIA_TYPE, content="stale replacement"
+        ),
+        source="memory",
+        force=True,
+        expected=stale.revision,
+    )
+
+    assert outcomes[0].superseded
+    assert store.documents[stale.id].content_hash == content_hash("winner")
+    assert store.chunks[stale.id] == old_chunks
+
+
+@pytest.mark.parametrize("conclusion", ["parser-empty", "unsupported", "container", "skipped"])
+async def test_every_chunkless_conclusion_loses_its_cas_without_erasing_the_winner(
+    conclusion: str,
+) -> None:
+    """Every successful zero-chunk exit reaches one guarded publication boundary."""
+
+    class OvertakenStore(fakes.MemoryIngestStore):
+        armed = False
+
+        @override
+        async def publish_document(
+            self,
+            document: Document,
+            chunks: Sequence[Chunk],
+            *,
+            expected: DocumentRevision | None,
+            chunk_fp: str | None,
+            embed_fp: str | None,
+            parse_fp: str | None,
+            glossary_entries: Sequence[GlossaryEntry] | None,
+            glossary_fp: str | None,
+            original_omitted_reason: str | None,
+        ) -> Commit:
+            if self.armed:
+                self.armed = False
+                current = self.documents[document.id]
+                self.documents[document.id] = current.model_copy(
+                    update={"content_hash": content_hash("winner"), "version_token": "winner"}
+                )
+            return await super().publish_document(
+                document,
+                chunks,
+                expected=expected,
+                chunk_fp=chunk_fp,
+                embed_fp=embed_fp,
+                parse_fp=parse_fp,
+                glossary_entries=glossary_entries,
+                glossary_fp=glossary_fp,
+                original_omitted_reason=original_omitted_reason,
+            )
+
+    store = OvertakenStore()
+    healthy, _, vectors = build(store=store)
+    await healthy.run(fakes.DictConnector({"a": "old text"}))
+    stale = await store.find_document("memory", "a")
+    assert stale is not None
+    old_chunks = list(store.chunks[stale.id])
+    store.armed = True
+
+    raw = RawDocument(source_id="a", uri="memory://a", media_type=MEDIA_TYPE, content="replacement")
+    if conclusion == "parser-empty":
+        contender, _, _ = build(
+            store=store,
+            vectors=vectors,
+            parsers={"empty": fakes.EmptyParser()},
+            chain=("empty",),
+        )
+    elif conclusion == "unsupported":
+        contender, _, _ = build(
+            store=store,
+            vectors=vectors,
+            parsers={"decline": fakes.DecliningParser()},
+            chain=("decline",),
+        )
+    elif conclusion == "container":
+        raw = raw.model_copy(
+            update={"media_type": fakes.CONTAINER_MEDIA_TYPE, "content": "member=child text"}
+        )
+        contender, _, _ = build(
+            store=store,
+            vectors=vectors,
+            parsers={"archive": fakes.FakeArchive()},
+            chain=("archive",),
+        )
+    else:
+        contender, _, _ = build(store=store, vectors=vectors, middleware=(fakes.Skipper(),))
+
+    outcomes = await contender.ingest_raw(
+        raw,
+        source="memory",
+        force=True,
+        expected=stale.revision,
+    )
+
+    assert outcomes[0].superseded
+    assert store.documents[stale.id].content_hash == content_hash("winner")
+    assert store.chunks[stale.id] == old_chunks
+
+
 # --- change detection -----------------------------------------------------------------------
 
 
@@ -387,6 +533,9 @@ async def test_a_re_ingest_that_finds_no_text_does_replace_an_indexed_document()
     healthy, _, _ = build(store=store)
     connector = fakes.DictConnector({"a": "alpha"})
     await healthy.run(connector)
+    indexed = await store.find_document("memory", "a")
+    assert indexed is not None
+    store.parse_lineage[indexed.id] = "old-parser"
 
     connector.documents["a"] = "replaced by a scan"
     empty, _, _ = build(store=store, parsers={"empty": fakes.EmptyParser()}, chain=("empty",))
@@ -396,6 +545,8 @@ async def test_a_re_ingest_that_finds_no_text_does_replace_an_indexed_document()
     assert document is not None
     assert document.status is DocumentStatus.NO_EXTRACTABLE_TEXT
     assert store.chunks[document.id] == []
+    assert store.lineage[document.id] == (None, None)
+    assert document.id not in store.parse_lineage
 
 
 async def test_a_document_being_re_ingested_is_never_marked_in_flight() -> None:

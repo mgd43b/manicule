@@ -660,7 +660,9 @@ passes and nobody should meet it by accident.
 - **Normalization may be absent** from a model's declared pipeline even when its card
   recommends it, so it is always applied here rather than assumed.
 - **A well-shaped vector can still be unusable.** Final embedding output is refused if any
-  component is `NaN` or infinite, before a transient numerical failure can enter the index.
+  component is `NaN` or infinite, or if a finite Python value becomes infinite in Lance's
+  float32 representation. The check runs at the shared canonicalization boundary before the
+  vector can influence a publication identity or enter the index.
 - **A conversion is not the model.** `BAAI/bge-m3` ships no safetensors, so MLX runs community
   weights; a quantized one is a different vector space under the same name and is refused at
   load. §1.0.

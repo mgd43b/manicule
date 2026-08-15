@@ -13,7 +13,32 @@ import sqlalchemy as sa
 from alembic import op
 
 import manicule.storage.types
-from manicule.storage.fts import CREATE_FTS, CREATE_TRIGGERS, DROP_TRIGGERS, FTS_TABLE
+from manicule.storage.fts import CREATE_FTS, DROP_TRIGGERS, FTS_TABLE
+
+CREATE_TRIGGERS = (
+    """
+    CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+        INSERT INTO chunks_fts(rowid, text, heading_text)
+        VALUES (new.seq, new.text, new.heading_text);
+    END
+    """,
+    """
+    CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, text, heading_text)
+        VALUES ('delete', old.seq, old.text, old.heading_text);
+        INSERT OR IGNORE INTO vector_tombstones(chunk_id, deleted_at)
+        VALUES (old.id, datetime('now'));
+    END
+    """,
+    """
+    CREATE TRIGGER chunks_au AFTER UPDATE OF text, heading_text ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, text, heading_text)
+        VALUES ('delete', old.seq, old.text, old.heading_text);
+        INSERT INTO chunks_fts(rowid, text, heading_text)
+        VALUES (new.seq, new.text, new.heading_text);
+    END
+    """,
+)
 
 revision: str = "2674752edf52"
 down_revision: str | None = None

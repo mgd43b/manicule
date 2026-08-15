@@ -1028,8 +1028,8 @@ async def test_a_sweep_canceled_before_its_commit_serves_nothing_it_half_wrote()
 
     interrupted = await store.get_document(document.id)
     assert interrupted is not None
-    assert interrupted.status is not DocumentStatus.INDEXED, (
-        "a document caught mid-repair must not be servable while it is one"
+    assert interrupted.status is DocumentStatus.INDEXED, (
+        "a canceled replacement must leave the prior publication servable"
     )
     assert store.chunks[document.id] == chunks, "and nothing derived from the new parse landed"
     assert vectors.rows == rows
@@ -1132,7 +1132,10 @@ async def test_a_document_overtaken_after_its_vectors_were_built_writes_no_deriv
         "the chunks the overtaken re-parse produced were never written, so the ones that were "
         "there are still there"
     )
-    assert vectors.rows == rows, "and no vector row was upserted for a chunk nothing holds"
+    assert all(vectors.rows[chunk_id] == row for chunk_id, row in rows.items()), (
+        "staging a losing publication must not alter any vector in the active publication"
+    )
+    assert store.staged_publications, "the losing staged vectors remain named for cleanup"
     assert store.glossary[document_id] == entries
     assert store.documents[document_id].content_hash == content_hash(NEW), (
         "the row belongs to whoever overtook it; this sweep left it alone"

@@ -231,6 +231,9 @@ class Document(Base):
     __tablename__ = "documents"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
+    publication_id: Mapped[str] = mapped_column(
+        Text, nullable=False, default="legacy", server_default="legacy"
+    )
     workspace_id: Mapped[str] = mapped_column(
         ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
@@ -343,6 +346,8 @@ class Chunk(Base):
 
     seq: Mapped[int] = mapped_column(Integer, primary_key=True)
     id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    vector_id: Mapped[str] = mapped_column(Text, nullable=False)
+    """Physical vector row for this publication; safe for every SQL cascade to tombstone."""
     document_id: Mapped[str] = mapped_column(
         ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
     )

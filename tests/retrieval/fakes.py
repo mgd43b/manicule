@@ -41,13 +41,22 @@ class ListVectorStore:
     nothing about tenancy or liveness, and this reproduces exactly that.
     """
 
-    def __init__(self, chunks: Sequence[Chunk], *, scores: Sequence[float] | None = None) -> None:
+    def __init__(
+        self,
+        chunks: Sequence[Chunk],
+        *,
+        scores: Sequence[float] | None = None,
+        publications: Sequence[str] | None = None,
+    ) -> None:
         self.chunks = list(chunks)
         self.scores = (
             list(scores) if scores is not None else [1.0 - i * 0.01 for i in range(len(chunks))]
         )
         self.requested: list[int] = []
         self.filters: list[Filter | None] = []
+        self.publications = (
+            list(publications) if publications is not None else ["legacy"] * len(chunks)
+        )
 
     async def ensure_ready(
         self, fingerprint: object, *, embed_text_middleware: Sequence[str] = ()
@@ -57,8 +66,14 @@ class ListVectorStore:
     async def fingerprint(self) -> None:
         return None
 
-    async def upsert(self, chunks: Sequence[Chunk], vectors: Sequence[Vector]) -> None:
-        del chunks, vectors
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = "legacy",
+    ) -> None:
+        del chunks, vectors, publication_id
 
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
         # A store that never writes holds nothing to reuse. Answered rather than omitted,
@@ -76,11 +91,16 @@ class ListVectorStore:
         self.requested.append(k)
         self.filters.append(filter)
         admitted = [
-            (chunk, score)
-            for chunk, score in zip(self.chunks, self.scores, strict=True)
+            (chunk, score, publication)
+            for chunk, score, publication in zip(
+                self.chunks, self.scores, self.publications, strict=True
+            )
             if filter is None or not filter.document_ids or chunk.document_id in filter.document_ids
         ]
-        return [Candidate(chunk=chunk, score=score) for chunk, score in admitted[:k]]
+        return [
+            Candidate(chunk=chunk, publication_id=publication, score=score)
+            for chunk, score, publication in admitted[:k]
+        ]
 
     async def delete_document(self, document_id: str) -> None:
         del document_id
