@@ -1559,9 +1559,17 @@ which is why `reconcile` is a separate protocol method rather than an implementa
 for connectors that only ever sync incrementally. Deletion detection that runs only when
 someone remembers is deletion detection that does not run.
 
-**Mechanics.** `reconcile()` yields the `SourceId`s that currently exist. The pipeline diffs
-against stored documents for that connector and soft-deletes the difference. IDs only — no
-bodies, no versions — which is what makes a weekly full enumeration affordable.
+**Mechanics.** `reconcile()` yields the `SourceId`s that currently exist. Storage journals them
+in pages under an immutable workspace, connector and configured-scope identity. Only iterator
+exhaustion atomically marks that run complete and returns the typed completed-inventory handle
+accepted by the diff. The diff is a server-side anti-join and its result is recorded as counts;
+neither the source corpus nor the stored corpus is copied into a process-sized set. IDs only —
+no bodies, no versions — which is what makes a weekly full enumeration affordable.
+
+A crash after the completion transaction does not contact the source again: the next attempt
+finds and applies that completed inventory. A partial or canceled run has no such handle and is
+permanently ineligible. Incremental acquisition uses a different journal, so authentication,
+capacity and cursor failures there cannot accidentally become reconciliation evidence.
 
 ### 11.1 The safety rule: never mass-delete on a partial enumeration
 
@@ -1574,12 +1582,17 @@ everything not yet enumerated as deleted. One transient error, and the corpus is
 
 Three guards, all required:
 
-1. **The diff is applied only on a clean completion.** A `reconcile` that raises produces no
-   deletions at all. Partial results are discarded, not salvaged.
+1. **The diff is applied only on a storage-proved clean completion.** The apply transaction
+   revalidates the handle's workspace, connector, scope, completion time and deduplicated count
+   while holding SQLite's writer lock. A `reconcile` that raises produces no deletions at all.
+   Partial results remain diagnostic rows, not deletion authority.
 2. **A deletion ceiling.** If the diff would delete more than `reconcile_max_delete_fraction`
    (default 10%) of a connector's live documents, the pipeline refuses, records the proposed
-   deletion, and surfaces it for confirmation. A genuine bulk deletion is rare and worth a
-   human; a bug that looks like one is not rare at all.
+   deletion, and surfaces it for confirmation. Candidate document revisions live in a relational
+   proposal rather than an unbounded metadata list. Confirmation applies only those reviewed
+   revisions; a document republished meanwhile is skipped. A newer full inventory invalidates
+   the older question. A genuine bulk deletion is rare and worth a human; a bug that looks like
+   one is not rare at all.
 3. **Soft delete only.** Reconciliation never hard-deletes, so a mistaken reconciliation is
    recoverable by clearing `deleted_at` — free, within the grace period (`storage.md` §8.2).
 

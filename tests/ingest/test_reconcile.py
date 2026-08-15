@@ -122,6 +122,20 @@ async def test_reconciliation_never_hard_deletes() -> None:
     assert len(store.documents) == 20, "the rows are all still there; only a timestamp moved"
 
 
+async def test_a_dry_run_never_records_a_proposal_or_soft_deletes() -> None:
+    store = fakes.MemoryIngestStore()
+    _indexed(store, "memory", ["a", "b", "c"])
+    connector = fakes.DictConnector({"a": "text", "b": "text", "c": "text"})
+    connector.hidden = {"b", "c"}
+
+    result = await reconcile(connector, store, max_delete_fraction=0.1, dry_run=True)
+
+    assert result.dry_run
+    assert result.missing_count == 2
+    assert store.deleted_at == {}
+    assert PROPOSED_DELETION_KEY not in store.connector_meta.get("memory", {})
+
+
 async def test_a_clean_pass_records_when_it_happened() -> None:
     """Deletion detection that runs when somebody remembers is deletion detection that does not."""
     store = fakes.MemoryIngestStore()

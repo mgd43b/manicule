@@ -34,6 +34,7 @@ from manicule.storage.fts import SEARCH_SQL, escape_match_query
 from manicule.storage.glossary import GlossaryMixin
 from manicule.storage.history import TrashMixin, VersionsMixin
 from manicule.storage.organization import CollectionsMixin, TagsMixin
+from manicule.storage.reconciliation import ReconciliationJournalMixin
 from manicule.storage.relations import RelationsMixin
 from manicule.storage.rows import apply_document, from_chunk, to_chunk, to_document
 from manicule.storage.scoped import (
@@ -118,6 +119,7 @@ reached.
 
 class SqliteDocStore(
     AcquisitionJournalMixin,
+    ReconciliationJournalMixin,
     CollectionsMixin,
     TagsMixin,
     VersionsMixin,
