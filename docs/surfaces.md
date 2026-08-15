@@ -269,7 +269,7 @@ server and the built command tree.
 | `document_reindex` | ✓ | `document reindex <id>` | what was repaired |
 | `document_reindex_stale` | — | `document reindex --stale` | counts for a corpus-wide re-parse |
 | `reembed_plan` | — | `reembed plan` | aggregate cost and capacity estimates |
-| `reembed_start` | — | `reembed start` | durable recovery id before embedding begins |
+| `reembed_start` | — | `reembed start <run-id>` | ownerless durable run under an id chosen before the call |
 | `reembed_resume` | — | `reembed execute` / `reembed resume` | aggregate durable progress/publication result |
 | `reembed_status` | ✓ | `reembed status` / `reembed inspect` | private-safe aggregate durable progress |
 | `reembed_abandon` | — | `reembed abandon` | terminal state without a live-pointer change |

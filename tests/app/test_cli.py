@@ -2126,7 +2126,7 @@ MINIMAL: dict[str, list[str]] = {
     "reembed_cleanup": ["reembed", "cleanup", "run-1"],
     "reembed_plan": ["reembed", "plan"],
     "reembed_resume": ["reembed", "resume", "run-1"],
-    "reembed_start": ["reembed", "start"],
+    "reembed_start": ["reembed", "start", "run-1"],
     "reset_index": ["reset-index", "--yes"],
     "restore": ["backup", "--restore", "backup.tar.gz"],
     "upgrade": ["upgrade"],

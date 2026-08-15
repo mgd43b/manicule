@@ -8,19 +8,19 @@ from typing import TYPE_CHECKING, override
 import pytest
 from sqlalchemy import func, insert, select
 
-from manicule.app.runtime import Runtime
+from manicule.app.runtime import AssemblyError, Runtime
 from manicule.app.service import ApplicationService
 from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.core.embedding import Vector
-from manicule.ingest.reembed import ReembedCapacityError, ReembedState
+from manicule.ingest.reembed import ReembedCapacityError, ReembedError, ReembedState
 from manicule.plugins.registry import discover
 from manicule.storage import models
 from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.engine import VECTORS_DIRNAME
 from manicule.storage.types import utcnow
 from manicule.storage.vectors import LanceVectorStore, table_name
-from tests.fakes import HashEmbedder
+from tests.fakes import HashEmbedder, MemoryVectorStore
 from tests.storage_helpers import fingerprint, make_chunk, make_document
 
 if TYPE_CHECKING:
@@ -115,11 +115,30 @@ async def test_start_returns_recovery_id_and_resume_survives_process_restart(
     first = _runtime(data_dir, embedder)
     async with first:
         await _seed_live_generation(first, data_dir)
-        started = await ApplicationService(first).reembed_start()
+        first_service = ApplicationService(first)
+        started = await first_service.reembed_start("restart-run")
         assert started.state == ReembedState.PLANNED
         assert started.retry_required
         assert embedder.texts == 0, "start must return the recovery id before the forward pass"
         run_id = started.run_id
+        replayed = await first_service.reembed_start("restart-run")
+        assert replayed == started, "a lost control reply must be recoverable by replaying start"
+        async with first.require_engine().connect() as connection:
+            row = (
+                await connection.execute(
+                    select(
+                        models.ReembedRunRecord.lease_owner,
+                        models.ReembedRunRecord.lease_expires_at,
+                    ).where(models.ReembedRunRecord.id == run_id)
+                )
+            ).one()
+            snapshots = (
+                await connection.execute(
+                    select(func.count()).select_from(models.ReembedCorpusSnapshot)
+                )
+            ).scalar_one()
+        assert row == (None, None), "start returned while a planning owner still held the run"
+        assert snapshots == 1, "replaying a lost start reply created a private orphan snapshot"
 
     second = _runtime(data_dir, embedder)
     async with second:
@@ -167,7 +186,7 @@ async def test_capacity_refusal_is_typed_and_leaves_no_unreachable_run(
         monkeypatch.setattr("manicule.app.runtime.shutil.disk_usage", no_capacity)
 
         with pytest.raises(ReembedCapacityError, match="free local disk space"):
-            await ApplicationService(runtime).reembed_start()
+            await ApplicationService(runtime).reembed_start("capacity-run")
 
         assert embedder.texts == 0
         async with runtime.require_engine().connect() as connection:
@@ -180,3 +199,29 @@ async def test_capacity_refusal_is_typed_and_leaves_no_unreachable_run(
                 await connection.execute(select(func.count()).select_from(models.ReembedRunRecord))
             ).scalar_one()
         assert (snapshots, runs) == (0, 0)
+
+
+@pytest.mark.parametrize("operation", ["plan", "start"])
+async def test_custom_vector_backend_is_refused_before_snapshot_model_or_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    data_dir = tmp_path / "data"
+    embedder = CountingEmbedder()
+    async with _runtime(data_dir, embedder) as runtime:
+
+        async def custom_vectors() -> MemoryVectorStore:
+            return MemoryVectorStore()
+
+        async def refuse_model() -> HashEmbedder:
+            pytest.fail("an unsupported vector backend constructed the embedding model")
+
+        monkeypatch.setattr(runtime, "vectors", custom_vectors)
+        monkeypatch.setattr(runtime, "embedder", refuse_model)
+        service = ApplicationService(runtime)
+        call = service.reembed_plan() if operation == "plan" else service.reembed_start("known-run")
+
+        with pytest.raises(ReembedError, match="SQLite/Lance vector backend"):
+            await call
+
+        with pytest.raises(AssemblyError, match="engine has not been opened"):
+            runtime.require_engine()

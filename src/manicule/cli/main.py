@@ -951,15 +951,22 @@ def reembed_plan() -> None:
 
 
 @reembed_app.command("start")
-def reembed_start() -> None:
-    """Create a durable migration and return its recovery id before embedding begins."""
-    submit(Command("reembed_start"))
+def reembed_start(
+    run_id: Annotated[
+        str,
+        typer.Argument(
+            help="Operator-chosen recovery id; rerun the same command after a lost reply."
+        ),
+    ],
+) -> None:
+    """Create an immediately resumable migration under a recovery id you already know."""
+    submit(Command("reembed_start", {"run_id": run_id}))
 
 
 @reembed_app.command("execute")
 @reembed_app.command("resume")
 def reembed_resume(
-    run_id: Annotated[str, typer.Argument(help="Run id returned by `reembed start`.")],
+    run_id: Annotated[str, typer.Argument(help="Run id chosen for `reembed start`.")],
 ) -> None:
     """Execute or resume a run after a crash or transient refusal."""
     submit(Command("reembed_resume", {"run_id": run_id}))
@@ -968,7 +975,7 @@ def reembed_resume(
 @reembed_app.command("inspect")
 @reembed_app.command("status")
 def reembed_status(
-    run_id: Annotated[str, typer.Argument(help="Run id returned by `reembed start`.")],
+    run_id: Annotated[str, typer.Argument(help="Run id chosen for `reembed start`.")],
 ) -> None:
     """Show aggregate durable progress without source identifiers or paths."""
     emit("reembed_status", lambda service: service.reembed_status(run_id))

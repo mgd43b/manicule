@@ -73,7 +73,6 @@ class Authority:
         self.live_during_upsert: list[str] = []
         self.inspection_override: ShadowInspection | None = None
         self.fail_chunk_checkpoint_once = False
-        self.fail_terminal_checkpoint_once = False
         self.pause_first_upsert = False
         self.upsert_entered = asyncio.Event()
         self.release_upsert = asyncio.Event()
@@ -111,8 +110,28 @@ class Authority:
             existing = run
         return existing, lease
 
+    async def create_released(self, run_id: str, commitment: ReembedCommitment) -> ReembedRun:
+        run = ReembedRun(id=run_id, commitment=commitment)
+        existing = self.runs.get(run_id)
+        if existing is not None and existing.commitment != commitment:
+            raise ReembedError("run id already belongs to another immutable plan")
+        if existing is None:
+            self.runs[run_id] = run
+            existing = run
+        self.leases.pop(run_id, None)
+        return existing
+
     async def get(self, run_id: str) -> ReembedRun | None:
-        return self.runs.get(run_id)
+        run = self.runs.get(run_id)
+        receipt = self.receipts.get(run_id)
+        if run is None or receipt is None:
+            return run
+        terminal = (
+            ReembedState.PUBLISHED
+            if receipt.outcome is PublishOutcome.PUBLISHED
+            else ReembedState.SUPERSEDED
+        )
+        return replace(run, state=terminal, receipt=receipt, failure="")
 
     async def acquire(self, run_id: str, owner_token: str, *, ttl_seconds: float) -> ReembedLease:
         current = self.leases.get(run_id)
@@ -135,8 +154,14 @@ class Authority:
         return renewed
 
     async def release(self, run_id: str, lease: ReembedLease) -> None:
-        self._assert_lease(run_id, lease)
-        self.leases[run_id] = replace(lease, expires_at=self.now)
+        current = self.leases.get(run_id)
+        if (
+            current is None
+            or current.owner_token != lease.owner_token
+            or current.generation != lease.generation
+        ):
+            raise ReembedError("stale or expired re-embedding lease")
+        self.leases[run_id] = replace(current, expires_at=self.now)
 
     async def save(
         self, run: ReembedRun, *, expected_revision: int, lease: ReembedLease
@@ -148,9 +173,6 @@ class Authority:
         if self.fail_chunk_checkpoint_once and run.chunk_after is not None:
             self.fail_chunk_checkpoint_once = False
             raise OSError("synthetic chunk checkpoint crash")
-        if self.fail_terminal_checkpoint_once and run.state is ReembedState.PUBLISHED:
-            self.fail_terminal_checkpoint_once = False
-            raise OSError("synthetic publish checkpoint crash")
         saved = replace(run, revision=run.revision + 1)
         self.runs[run.id] = saved
         return saved
@@ -291,7 +313,24 @@ class Authority:
             published_generation_id=published,
         )
         self.receipts[run.id] = receipt
+        self.runs[run.id] = replace(
+            run,
+            state=(
+                ReembedState.PUBLISHED
+                if receipt.outcome is PublishOutcome.PUBLISHED
+                else ReembedState.SUPERSEDED
+            ),
+            receipt=receipt,
+            revision=run.revision + 1,
+        )
         return receipt
+
+
+class ReleaseFailAuthority(Authority):
+    @override
+    async def release(self, run_id: str, lease: ReembedLease) -> None:
+        del run_id, lease
+        raise OSError("synthetic release failure")
 
 
 class Corpus:
@@ -321,6 +360,11 @@ class Corpus:
             self.authority.corpus_revision,
             self.authority.live,
         )
+
+    async def discard_snapshot(self, snapshot_id: str) -> None:
+        if snapshot_id != self.current_view:
+            self.versions.pop(snapshot_id, None)
+            self.lineage_versions.pop(snapshot_id, None)
 
     async def documents(
         self, snapshot: CorpusSnapshot, *, after: str | None, limit: int
@@ -473,6 +517,22 @@ async def test_dry_run_is_aggregate_only_and_prices_combined_bounded_memory() ->
     assert set(asdict(plan)) < set(plan.public_facts())
 
 
+async def test_start_is_atomic_and_never_depends_on_a_followup_release() -> None:
+    authority = ReleaseFailAuthority()
+    corpus = synthetic_corpus(authority, 1)
+
+    run = await start_reembed(
+        "known-before-call",
+        owner_token="planning-owner",  # noqa: S106 - synthetic fence identity
+        corpus=corpus,
+        target=HashEmbedder().fingerprint,
+        journal=authority,
+    )
+
+    assert run.id == "known-before-call"
+    assert run.id not in authority.leases
+
+
 async def test_protocol_keyset_pages_huge_document_and_keeps_old_winner_until_swap() -> None:
     authority = Authority()
     corpus = synthetic_corpus(authority, 130)
@@ -566,12 +626,10 @@ async def test_publish_receipt_prevents_retry_from_rolling_newer_generation_back
     corpus = synthetic_corpus(authority, 1)
     embedder = CountingEmbedder()
     run = await prepare_run(authority, corpus, embedder)
-    authority.fail_terminal_checkpoint_once = True
-
-    with pytest.raises(OSError, match="publish checkpoint crash"):
-        await execute(run, authority, corpus, embedder)
+    completed = await execute(run, authority, corpus, embedder)
     first_receipt = authority.receipts[run.id]
     assert first_receipt.outcome is PublishOutcome.PUBLISHED
+    authority.runs[run.id] = replace(completed, state=ReembedState.READY, receipt=None)
     authority.install_competing_winner("generation-b")
 
     completed = await execute(run, authority, corpus, embedder)

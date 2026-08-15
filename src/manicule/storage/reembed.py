@@ -438,6 +438,42 @@ class SqliteReembedStore:
             lease = await self._acquire(connection, run_id, owner_token, ttl_seconds)
             return run, lease
 
+    async def create_released(self, run_id: str, commitment: ReembedCommitment) -> ReembedRun:
+        """Create-or-read a run with no lease owner in the same durable transaction."""
+        commitment_json = _json(_COMMITMENT, commitment)
+        async with self._immediate() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        select(models.ReembedRunRecord.__table__).where(
+                            models.ReembedRunRecord.id == run_id
+                        )
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is not None:
+                if row.commitment_json != commitment_json:
+                    raise ReembedError("run id already belongs to another immutable plan")
+                return await self._reconciled(connection, _RUN.validate_json(row.checkpoint_json))
+            run = ReembedRun(id=run_id, commitment=commitment)
+            await connection.execute(
+                insert(models.ReembedRunRecord).values(
+                    id=run_id,
+                    commitment_json=commitment_json,
+                    state=run.state.value,
+                    checkpoint_json=_json(_RUN, run),
+                    revision=0,
+                    lease_owner=None,
+                    lease_generation=0,
+                    lease_expires_at=None,
+                    created_at=utcnow(),
+                    updated_at=utcnow(),
+                )
+            )
+            return run
+
     async def get(self, run_id: str) -> ReembedRun | None:
         async with self._engine.connect() as connection:
             value = (
@@ -447,7 +483,9 @@ class SqliteReembedStore:
                     )
                 )
             ).scalar_one_or_none()
-        return None if value is None else _RUN.validate_json(value)
+            if value is None:
+                return None
+            return await self._reconciled(connection, _RUN.validate_json(value))
 
     async def live_generation_id(self) -> str | None:
         """The currently published vector pointer, without requiring a complete identity."""
@@ -474,6 +512,7 @@ class SqliteReembedStore:
             if checkpoint is None:
                 raise ReembedError(f"no re-embedding run {run_id!r} exists")
             run = _RUN.validate_json(checkpoint)
+            run = await self._reconciled(connection, run)
             if run.state not in {ReembedState.FAILED, ReembedState.SUPERSEDED}:
                 raise ReembedError("only failed or superseded shadow generations may be cleaned")
             generation_id = run.shadow_generation_id or _generation_id(run_id)
@@ -505,9 +544,8 @@ class SqliteReembedStore:
             return renewed
 
     async def release(self, run_id: str, lease: ReembedLease) -> None:
-        """Expire the exact current fenced lease in one SQLite write transaction."""
+        """Expire the exact owner/generation fence, including after its TTL elapsed."""
         async with self._immediate() as connection:
-            await self._require_lease(connection, run_id, lease)
             now = self._clock()
             changed = await connection.execute(
                 update(models.ReembedRunRecord)
@@ -515,7 +553,6 @@ class SqliteReembedStore:
                     models.ReembedRunRecord.id == run_id,
                     models.ReembedRunRecord.lease_owner == lease.owner_token,
                     models.ReembedRunRecord.lease_generation == lease.generation,
-                    models.ReembedRunRecord.lease_expires_at == lease.expires_at,
                 )
                 .values(lease_expires_at=now, updated_at=utcnow())
             )
@@ -538,6 +575,8 @@ class SqliteReembedStore:
     ) -> ReembedRun:
         async with self._immediate() as connection:
             await self._require_lease(connection, run.id, lease)
+            if await self._receipt(connection, run.id) is not None:
+                raise ReembedError("a terminal publication receipt cannot be overwritten")
             saved = ReembedRun(
                 id=run.id,
                 commitment=run.commitment,
@@ -697,7 +736,37 @@ class SqliteReembedStore:
                     run_id=run.id, receipt_json=_json(_RECEIPT, receipt), created_at=utcnow()
                 )
             )
+            terminal = _run_from_receipt(run, receipt, revision=run.revision + 1)
+            checkpoint = await connection.execute(
+                update(models.ReembedRunRecord)
+                .where(
+                    models.ReembedRunRecord.id == run.id,
+                    models.ReembedRunRecord.revision == run.revision,
+                )
+                .values(
+                    state=terminal.state.value,
+                    checkpoint_json=_json(_RUN, terminal),
+                    revision=terminal.revision,
+                    updated_at=utcnow(),
+                )
+            )
+            if checkpoint.rowcount != 1:
+                raise ReembedError("publication raced a journal checkpoint")
             return receipt
+
+    async def _receipt(self, connection: AsyncConnection, run_id: str) -> PublicationReceipt | None:
+        value = (
+            await connection.execute(
+                select(models.ReembedPublicationReceipt.receipt_json).where(
+                    models.ReembedPublicationReceipt.run_id == run_id
+                )
+            )
+        ).scalar_one_or_none()
+        return None if value is None else _RECEIPT.validate_json(value)
+
+    async def _reconciled(self, connection: AsyncConnection, run: ReembedRun) -> ReembedRun:
+        receipt = await self._receipt(connection, run.id)
+        return run if receipt is None else _run_from_receipt(run, receipt, revision=run.revision)
 
     async def _require_bound_snapshot(self, connection: AsyncConnection, run: ReembedRun) -> None:
         row = (
@@ -1160,6 +1229,32 @@ class LanceShadowGenerations:
                 chunk.embed_text, document_id=chunk.document_id, embed=fingerprint
             )
         )
+
+
+def _run_from_receipt(run: ReembedRun, receipt: PublicationReceipt, *, revision: int) -> ReembedRun:
+    state = (
+        ReembedState.SUPERSEDED
+        if run.state is ReembedState.SUPERSEDED
+        else (
+            ReembedState.PUBLISHED
+            if receipt.outcome is PublishOutcome.PUBLISHED
+            else ReembedState.SUPERSEDED
+        )
+    )
+    return ReembedRun(
+        id=run.id,
+        commitment=run.commitment,
+        state=state,
+        document_after=run.document_after,
+        active_document_id=run.active_document_id,
+        chunk_after=run.chunk_after,
+        documents_completed=run.documents_completed,
+        chunks_completed=run.chunks_completed,
+        shadow_generation_id=run.shadow_generation_id or receipt.published_generation_id,
+        receipt=receipt,
+        revision=revision,
+        failure="",
+    )
 
 
 __all__ = [

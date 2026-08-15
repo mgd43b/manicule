@@ -1251,10 +1251,10 @@ class ApplicationService:
             target_dimension=target_dimension,
         )
 
-    async def reembed_start(self) -> r.ReembedRunReport:
+    async def reembed_start(self, run_id: str) -> r.ReembedRunReport:
         """Create a durable plan and return its recovery id before embedding begins."""
         ingestion = await self._backend.ingestion()
-        run = await ingestion.reembed_start(secrets.token_hex(16), secrets.token_urlsafe(24))
+        run = await ingestion.reembed_start(run_id, secrets.token_urlsafe(24))
         return _reembed_run_report(run)
 
     async def reembed_resume(self, run_id: str) -> r.ReembedRunReport:

@@ -865,6 +865,7 @@ class _Ingestion:
         from manicule.ingest.reembed import plan_reembed_commitment  # noqa: PLC0415
         from manicule.storage.reembed import SqliteReembedCorpus  # noqa: PLC0415
 
+        await self._require_reembed_backend()
         await self._runtime.documents()
         corpus = SqliteReembedCorpus(self._runtime.require_engine())
         embedder = await self._runtime.embedder()
@@ -881,10 +882,18 @@ class _Ingestion:
     async def reembed_start(self, run_id: str, owner_token: str) -> ReembedRun:
         from manicule.ingest.reembed import (  # noqa: PLC0415
             ReembedCapacityError,
+            discard_reembed_snapshot,
             plan_reembed_commitment,
             start_reembed,
         )
+        from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
 
+        await self._require_reembed_backend()
+        await self._runtime.documents()
+        authority = SqliteReembedStore(self._runtime.require_engine())
+        existing = await authority.get(run_id)
+        if existing is not None:
+            return existing
         corpus, authority, _shadows, embedder = await self._reembed_components()
         commitment = await plan_reembed_commitment(corpus, embedder.fingerprint)
         if not commitment.plan.runnable:
@@ -902,14 +911,18 @@ class _Ingestion:
         # Starting is deliberately a durable, non-embedding checkpoint.  The operator receives
         # the run id before the expensive step begins, so a process exit can always be recovered
         # with ``resume`` rather than losing the only handle to the journal row.
-        return await start_reembed(
-            run_id,
-            owner_token=owner_token,
-            corpus=corpus,
-            target=embedder.fingerprint,
-            journal=authority,
-            commitment=commitment,
-        )
+        try:
+            return await start_reembed(
+                run_id,
+                owner_token=owner_token,
+                corpus=corpus,
+                target=embedder.fingerprint,
+                journal=authority,
+                commitment=commitment,
+            )
+        except BaseException as error:
+            await discard_reembed_snapshot(corpus, commitment.snapshot.id, error)
+            raise
 
     async def reembed_resume(self, run_id: str, owner_token: str) -> ReembedRun:
         from manicule.storage.engine import VECTORS_DIRNAME  # noqa: PLC0415
@@ -919,6 +932,7 @@ class _Ingestion:
             SqliteReembedStore,
         )
 
+        await self._require_reembed_backend()
         await self._runtime.documents()
         engine = self._runtime.require_engine()
         authority = SqliteReembedStore(engine)
@@ -964,6 +978,7 @@ class _Ingestion:
             SqliteReembedStore,
         )
 
+        await self._require_reembed_backend()
         await self._runtime.documents()
         authority = SqliteReembedStore(self._runtime.require_engine())
         return await LanceShadowGenerations(
@@ -989,6 +1004,18 @@ class _Ingestion:
             LanceShadowGenerations(self._runtime.settings.data_dir / VECTORS_DIRNAME, authority),
             await self._runtime.embedder(),
         )
+
+    async def _require_reembed_backend(self) -> None:
+        from manicule.ingest.reembed import ReembedError  # noqa: PLC0415
+        from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
+
+        vectors = await self._runtime.vectors()
+        if not isinstance(vectors, PublishedLanceVectorStore):
+            raise ReembedError(
+                "durable re-embedding requires the built-in SQLite/Lance vector backend; "
+                "the configured custom backend does not implement named shadow generations, "
+                "atomic publication, inspection, and cleanup"
+            )
 
     def _require_reembed_capacity(self, run: ReembedRun) -> None:
         self._require_reembed_capacity_bytes(run.commitment.plan.temporary_disk_bytes)

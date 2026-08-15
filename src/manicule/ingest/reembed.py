@@ -18,6 +18,7 @@ cannot roll a newer generation back.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -288,6 +289,10 @@ class ReembedCorpus(Protocol):
 
     async def begin_snapshot(self) -> CorpusSnapshot: ...
 
+    async def discard_snapshot(self, snapshot_id: str) -> None:
+        """Delete an unbound snapshot and every private row it owns."""
+        ...
+
     async def documents(
         self, snapshot: CorpusSnapshot, *, after: str | None, limit: int
     ) -> Sequence[SnapshotDocument]:
@@ -322,6 +327,10 @@ class ReembedJournal(Protocol):
         ttl_seconds: float,
     ) -> tuple[ReembedRun, ReembedLease]:
         """Atomically create the run and mint its first fenced lease."""
+        ...
+
+    async def create_released(self, run_id: str, commitment: ReembedCommitment) -> ReembedRun:
+        """Atomically create an immediately acquirable run with no live lease owner."""
         ...
 
     async def get(self, run_id: str) -> ReembedRun | None: ...
@@ -446,14 +455,18 @@ async def plan_reembed_commitment(
     """Build the private durable commitment behind a public aggregate plan."""
     _validate_knobs(document_page, target_batch_tokens, chunks_per_second)
     snapshot = await corpus.begin_snapshot()
-    return await _plan_snapshot(
-        corpus,
-        snapshot,
-        target,
-        document_page=document_page,
-        target_batch_tokens=target_batch_tokens,
-        chunks_per_second=chunks_per_second,
-    )
+    try:
+        return await _plan_snapshot(
+            corpus,
+            snapshot,
+            target,
+            document_page=document_page,
+            target_batch_tokens=target_batch_tokens,
+            chunks_per_second=chunks_per_second,
+        )
+    except BaseException as error:
+        await _discard_after_failure(corpus, snapshot.id, error)
+        raise
 
 
 async def start_reembed(
@@ -485,17 +498,7 @@ async def start_reembed(
             f"{commitment.plan.unrepairable_documents} document(s) have no stored chunks. "
             "Re-embedding never falls back to a connector or parser; repair local inputs first."
         )
-    run, lease = await journal.create(
-        run_id,
-        commitment,
-        owner_token=owner_token,
-        ttl_seconds=lease_ttl_seconds,
-    )
-    # ``start`` is an operator-visible recovery checkpoint, not the expensive worker phase.
-    # Hand the lease back before returning so a later command/process can acquire a fresh fence
-    # immediately instead of spuriously refusing for the full TTL.
-    await journal.release(run.id, lease)
-    return run
+    return await journal.create_released(run_id, commitment)
 
 
 async def resume_reembed(
@@ -527,6 +530,40 @@ async def resume_reembed(
     if run.state is ReembedState.FAILED:
         raise ReembedError(f"re-embedding run {run_id!r} failed validation: {run.failure}")
     lease = await journal.acquire(run.id, owner_token, ttl_seconds=lease_ttl_seconds)
+    failure: BaseException | None = None
+    try:
+        return await _resume_owned(
+            run,
+            lease=lease,
+            corpus=corpus,
+            embedder=embedder,
+            journal=journal,
+            shadow=shadow,
+            publisher=publisher,
+            document_page=document_page,
+            target_batch_tokens=target_batch_tokens,
+            lease_ttl_seconds=lease_ttl_seconds,
+        )
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        await _release_after_operation(journal, run.id, lease, failure)
+
+
+async def _resume_owned(
+    run: ReembedRun,
+    *,
+    lease: ReembedLease,
+    corpus: ReembedCorpus,
+    embedder: Embedder,
+    journal: ReembedJournal,
+    shadow: ShadowVectorGeneration,
+    publisher: ReembedPublisher,
+    document_page: int,
+    target_batch_tokens: int,
+    lease_ttl_seconds: float,
+) -> ReembedRun:
     generation = await shadow.open_or_create(
         run.id,
         fingerprint=embedder.fingerprint,
@@ -596,17 +633,18 @@ async def resume_reembed(
             expected_corpus_revision=run.commitment.snapshot.revision,
             lease=lease,
         )
-        terminal = (
-            ReembedState.PUBLISHED
-            if receipt.outcome is PublishOutcome.PUBLISHED
-            else ReembedState.SUPERSEDED
-        )
-        run, _ = await _save(
-            journal,
-            replace(run, state=terminal, receipt=receipt),
-            lease,
-            lease_ttl_seconds,
-        )
+        reconciled = await journal.get(run.id)
+        if (
+            reconciled is None
+            or reconciled.receipt != receipt
+            or reconciled.state
+            not in {
+                ReembedState.PUBLISHED,
+                ReembedState.SUPERSEDED,
+            }
+        ):
+            raise ReembedError("publication receipt was not reconciled into durable run state")
+        run = reconciled
     return run
 
 
@@ -829,6 +867,56 @@ async def _save(
     return saved, lease
 
 
+async def _discard_after_failure(
+    corpus: ReembedCorpus, snapshot_id: str, failure: BaseException
+) -> None:
+    cleanup = asyncio.create_task(corpus.discard_snapshot(snapshot_id))
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # Preserve the caller's cancellation, but finish removing private durable rows
+            # before it escapes. A second cancellation cannot strand the cleanup task.
+            continue
+        except Exception:  # noqa: BLE001 - reported on the original failure below
+            break
+    try:
+        cleanup.result()
+    except Exception as cleanup_error:  # noqa: BLE001 - annotate and preserve original
+        failure.add_note(
+            f"discarding the unbound re-embedding snapshot also failed: {cleanup_error}"
+        )
+
+
+async def discard_reembed_snapshot(
+    corpus: ReembedCorpus, snapshot_id: str, failure: BaseException
+) -> None:
+    """Cancellation-safe cleanup for a commitment that never became a durable run."""
+    await _discard_after_failure(corpus, snapshot_id, failure)
+
+
+async def _release_after_operation(
+    journal: ReembedJournal,
+    run_id: str,
+    lease: ReembedLease,
+    failure: BaseException | None,
+) -> None:
+    release = asyncio.create_task(journal.release(run_id, lease))
+    while not release.done():
+        try:
+            await asyncio.shield(release)
+        except asyncio.CancelledError:
+            continue
+        except Exception:  # noqa: BLE001 - released below without masking the primary error
+            break
+    try:
+        release.result()
+    except BaseException as release_error:
+        if failure is None:
+            raise
+        failure.add_note(f"releasing the re-embedding lease also failed: {release_error}")
+
+
 def _validate_knobs(document_page: int, target_batch_tokens: int, rate: float) -> None:
     if document_page < 1 or target_batch_tokens < 1:
         raise ValueError("document_page and target_batch_tokens must be at least 1")
@@ -920,6 +1008,7 @@ __all__ = [
     "SnapshotChunkDigester",
     "SnapshotDocument",
     "SnapshotInventoryDigester",
+    "discard_reembed_snapshot",
     "plan_reembed",
     "plan_reembed_commitment",
     "resume_reembed",

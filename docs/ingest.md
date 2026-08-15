@@ -1551,7 +1551,7 @@ the one way nobody should have to find it out.
 
 ```
 manicule reembed plan
-manicule reembed start
+manicule reembed start RUN_ID       # choose and record this before invoking the command
 manicule reembed execute RUN_ID     # `resume` is an alias
 manicule reembed status RUN_ID      # `inspect` is an alias
 manicule reembed abandon RUN_ID
@@ -1566,9 +1566,11 @@ one-way target identity. The transient plan snapshot is deleted before the comma
 Source ids, URIs, snapshot/revision handles, weights paths, complete configuration and inventory
 digests never cross an operator or network surface.
 
-`start` performs the same exact-target plan, checks local temporary capacity, persists the
-complete snapshot and journal row, releases its fenced planning lease, and returns the recovery
-id **before embedding starts**. A capacity refusal is typed, nonzero, and leaves neither an
+`start` performs the same exact-target plan, checks local temporary capacity, and atomically
+persists the complete snapshot and an immediately acquirable, ownerless journal row under the
+id the operator supplied **before embedding starts**. There is no create-then-release gap. If a
+control reply is lost, replaying `start` with the same id returns the same run without taking a
+second snapshot. A capacity refusal is typed, nonzero, and leaves neither an
 unreachable run nor a retained transient snapshot. `execute`/`resume` acquires a new
 monotonically fenced lease, builds a named shadow generation in bounded pages, checkpoints after
 each page, independently inspects every retrieval-critical stored field, seals the exact digest,
@@ -1576,6 +1578,19 @@ then asks SQLite for one atomic pointer/fingerprint/inventory compare-and-swap. 
 the old generation throughout the build. A process exit is recovered by running `resume` with
 the same id; publication receipts make a publish-before-checkpoint retry return the original
 winner rather than roll a newer one back.
+
+Every snapshot scan failure and cancellation removes its unbound durable snapshot under a
+cancellation-shielded cleanup. Every orderly execute failure or cancellation likewise releases
+its owner/generation fence so a new process can retry or abandon immediately; a process that
+actually dies runs no cleanup, so its lease still requires TTL expiry and a higher-generation
+takeover. Publication writes its receipt and terminal checkpoint in the same SQLite transaction.
+For installations upgraded from the earlier split checkpoint, the receipt remains authoritative:
+status and resume report `published`, and abandon cannot turn the live run into `failed`.
+
+The workflow currently requires the built-in SQLite/Lance backend. A custom vector store is
+refused before a snapshot, model, or run is constructed unless it supplies the complete named
+shadow-generation, inspection, atomic-publication and cleanup contract; ordinary `VectorStore`
+methods are not enough to emulate that safely.
 
 After a successful publication the runtime explicitly prepares its long-lived pointer-following
 vector handle for the configured target. A handle still prepared for the old fingerprint refuses

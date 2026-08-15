@@ -782,7 +782,7 @@ def build_surface(service: ApplicationService, *, read_only: bool = False) -> Su
         it can consume unbounded accelerator, disk, and time.
 
         Args:
-            run_id: The opaque recovery id returned by ``manicule reembed start``.
+            run_id: The opaque recovery id chosen for ``manicule reembed start``.
         """
         return await dispatch("reembed_status", lambda: service.reembed_status(run_id))
 

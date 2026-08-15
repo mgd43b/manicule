@@ -3,24 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import lancedb
 import pytest
-from sqlalchemy import insert, select, update
+from pydantic import TypeAdapter
+from sqlalchemy import func, insert, select, update
 
+from manicule.core.embedding import Vector
 from manicule.ingest.reembed import (
+    CorpusSnapshot,
     PublishOutcome,
     ReembedError,
+    ReembedRun,
     ReembedState,
     SnapshotChunk,
+    SnapshotDocument,
+    plan_reembed_commitment,
     resume_reembed,
     start_reembed,
 )
 from manicule.ingest.sweeps import sweep_vectors
 from manicule.storage import models
 from manicule.storage.engine import VECTORS_DIRNAME
+from manicule.storage.migrator import downgrade
 from manicule.storage.reembed import (
     LanceShadowGenerations,
     SqliteReembedCorpus,
@@ -43,7 +51,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    from manicule.ingest.reembed import ReembedLease, ReembedRun, ShadowGeneration
+    from manicule.ingest.reembed import ReembedLease, ShadowGeneration
     from manicule.storage.docstore import SqliteDocStore
 
 
@@ -56,6 +64,38 @@ class Clock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+class FailingSnapshotCorpus(SqliteReembedCorpus):
+    def __init__(self, engine: AsyncEngine, failure: BaseException) -> None:
+        super().__init__(engine)
+        self._failure = failure
+
+    @override
+    async def documents(
+        self, snapshot: CorpusSnapshot, *, after: str | None, limit: int
+    ) -> list[SnapshotDocument]:
+        del snapshot, after, limit
+        raise self._failure
+
+
+class BlockingEmbedder(HashEmbedder):
+    def __init__(self) -> None:
+        super().__init__(dimension=4)
+        self.entered = asyncio.Event()
+
+    @override
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        self.entered.set()
+        await asyncio.Event().wait()
+        return await super().embed(texts)
+
+
+class FailingEmbedder(HashEmbedder):
+    @override
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        del texts
+        raise OSError("synthetic embedding failure")
 
 
 async def seeded_run(
@@ -119,6 +159,98 @@ async def seeded_run(
         lease=lease,
     )
     return authority, shadows, run, lease, generation, source, [0.0, 1.0, 0.0, 0.0], corpus
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("synthetic snapshot scan failure"), asyncio.CancelledError()],
+    ids=["io-error", "cancellation"],
+)
+async def test_failed_or_canceled_plan_removes_every_private_snapshot_row(
+    engine: AsyncEngine, store: SqliteDocStore, failure: BaseException
+) -> None:
+    await store.ensure_workspace()
+    old = fingerprint(dimension=4, model_id="old/model")
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(models.IndexState).values(
+                id=1,
+                vector_table=table_name(old),
+                embed_fingerprint=old.model_dump_json(),
+                vector_inventory_digest=None,
+                created_at=utcnow(),
+                updated_at=utcnow(),
+            )
+        )
+    corpus = FailingSnapshotCorpus(engine, failure)
+
+    with pytest.raises(type(failure)):
+        await plan_reembed_commitment(corpus, HashEmbedder(dimension=4).fingerprint)
+
+    async with engine.connect() as connection:
+        counts = [
+            (await connection.execute(select(func.count()).select_from(model))).scalar_one()
+            for model in (
+                models.ReembedCorpusSnapshot,
+                models.ReembedSnapshotDocument,
+                models.ReembedSnapshotChunk,
+            )
+        ]
+    assert counts == [0, 0, 0]
+    await downgrade(engine, "6e31b7d592ac")
+
+
+async def test_canceled_resume_releases_fence_for_immediate_takeover_and_abandon(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    clock = Clock()
+    authority, shadows, run, _, _, _, _, corpus = await seeded_run(
+        engine, store, data_dir, clock, run_id="cancel-release"
+    )
+    embedder = BlockingEmbedder()
+    task = asyncio.create_task(
+        resume_reembed(
+            run.id,
+            owner_token="owner-a",  # noqa: S106 - synthetic fence identity
+            corpus=corpus,
+            embedder=embedder,
+            journal=authority,
+            shadow=shadows,
+            publisher=authority,
+        )
+    )
+    await asyncio.wait_for(embedder.entered.wait(), timeout=2.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    takeover = await authority.acquire(run.id, "owner-b", ttl_seconds=30.0)
+    abandoned = await authority.abandon(run.id, lease=takeover)
+    assert abandoned.state is ReembedState.FAILED
+    assert await authority.live_generation_id() == run.commitment.snapshot.live.generation_id
+
+
+async def test_failed_resume_releases_fence_for_an_immediate_retry(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    clock = Clock()
+    authority, shadows, run, _, _, _, _, corpus = await seeded_run(
+        engine, store, data_dir, clock, run_id="failure-release"
+    )
+
+    with pytest.raises(OSError, match="synthetic embedding failure"):
+        await resume_reembed(
+            run.id,
+            owner_token="owner-a",  # noqa: S106 - synthetic fence identity
+            corpus=corpus,
+            embedder=FailingEmbedder(dimension=4),
+            journal=authority,
+            shadow=shadows,
+            publisher=authority,
+        )
+
+    takeover = await authority.acquire(run.id, "owner-b", ttl_seconds=30.0)
+    await authority.assert_current(run.id, takeover)
 
 
 async def test_on_disk_shadow_validates_publishes_and_runtime_follows_pointer(
@@ -318,7 +450,7 @@ async def test_inventory_cas_records_superseded_without_changing_live_rows(
     assert await authority.live_generation_id() == run.commitment.snapshot.live.generation_id
 
 
-async def test_publish_receipt_survives_checkpoint_crash_and_cleanup_is_terminal_only(
+async def test_publish_receipt_is_atomic_and_cannot_be_downgraded_or_replayed(
     engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
 ) -> None:
     clock = Clock()
@@ -337,14 +469,41 @@ async def test_publish_receipt_survives_checkpoint_crash_and_cleanup_is_terminal
         expected_corpus_revision=run.commitment.snapshot.revision,
         lease=lease,
     )
-    terminal = await authority.save(
-        replace(run, state=ReembedState.SUPERSEDED, shadow_generation_id=generation.id),
-        expected_revision=run.revision,
-        lease=lease,
+    terminal = await authority.get(run.id)
+    assert terminal is not None
+    assert terminal.state is ReembedState.PUBLISHED
+    stale = replace(terminal, state=ReembedState.READY, receipt=None)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(models.ReembedRunRecord)
+            .where(models.ReembedRunRecord.id == run.id)
+            .values(
+                state=ReembedState.READY.value,
+                checkpoint_json=TypeAdapter(ReembedRun).dump_json(stale).decode("utf-8"),
+            )
+        )
+    reconciled = await authority.get(run.id)
+    assert reconciled is not None
+    assert reconciled.state is ReembedState.PUBLISHED
+    assert reconciled.receipt == first
+    resumed = await resume_reembed(
+        run.id,
+        owner_token="retry-owner",  # noqa: S106 - synthetic fence identity
+        corpus=SqliteReembedCorpus(engine),
+        embedder=HashEmbedder(dimension=4),
+        journal=authority,
+        shadow=shadows,
+        publisher=authority,
     )
-    assert terminal.state is ReembedState.SUPERSEDED
-    with pytest.raises(ReembedError, match="live shadow generation"):
-        await shadows.cleanup_terminal(run.id)
+    assert resumed.state is ReembedState.PUBLISHED
+    with pytest.raises(ReembedError, match="terminal publication decision"):
+        await authority.abandon(run.id, lease=lease)
+    with pytest.raises(ReembedError, match="receipt cannot be overwritten"):
+        await authority.save(
+            replace(run, state=ReembedState.FAILED, failure="stale downgrade"),
+            expected_revision=run.revision,
+            lease=lease,
+        )
     async with engine.begin() as connection:
         await connection.execute(
             update(models.IndexState)
@@ -367,8 +526,8 @@ async def test_publish_receipt_survives_checkpoint_crash_and_cleanup_is_terminal
             )
         ).scalar_one() == "reembed-competing-winner"
 
-    assert await shadows.cleanup_terminal(run.id)
-    assert not shadows.directory(generation.id).exists()
+    with pytest.raises(ReembedError, match="only failed or superseded"):
+        await shadows.cleanup_terminal(run.id)
 
 
 async def test_explicit_abandonment_makes_an_unfinished_generation_cleanup_eligible(

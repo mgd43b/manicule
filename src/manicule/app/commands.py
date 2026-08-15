@@ -269,7 +269,7 @@ BINDERS: Mapping[str, Binder] = {
         batch=args.count("batch", default=DEFAULT_SWEEP_BATCH), dry_run=args.flag("dry_run")
     ),
     "reembed_plan": lambda service, args, report: service.reembed_plan(),
-    "reembed_start": lambda service, args, report: service.reembed_start(),
+    "reembed_start": lambda service, args, report: service.reembed_start(args.text("run_id")),
     "reembed_resume": lambda service, args, report: service.reembed_resume(args.text("run_id")),
     "reembed_abandon": lambda service, args, report: service.reembed_abandon(args.text("run_id")),
     "reembed_cleanup": lambda service, args, report: service.reembed_cleanup(args.text("run_id")),
