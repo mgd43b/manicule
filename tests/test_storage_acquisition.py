@@ -596,7 +596,7 @@ async def test_recovery_supersedes_a_run_from_an_obsolete_connector_position(
     )
 
 
-async def test_settled_cleanup_is_bounded_and_never_discards_retry_work(
+async def test_cleanup_is_bounded_and_discards_only_superseded_retry_work(
     store: SqliteDocStore,
 ) -> None:
     settled = await _claimed_run(store, "settled", "finished")
@@ -663,6 +663,23 @@ async def test_settled_cleanup_is_bounded_and_never_discards_retry_work(
         expires_at=_NOW + timedelta(minutes=1),
     )
     assert replacement is not None
+    await store.append_acquisition_record(
+        replacement.id,
+        0,
+        _source("authoritative-retry"),
+        lease_owner="replacement-owner",
+        lease_generation=replacement.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        replacement.id,
+        "authoritative-retry",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="replacement-owner",
+        lease_generation=replacement.lease_generation,
+        now=_NOW,
+    )
     retry = await store.get_acquisition_run(retry.id)
     assert retry is not None
     assert retry.superseded_at is not None
@@ -675,6 +692,50 @@ async def test_settled_cleanup_is_bounded_and_never_discards_retry_work(
     records = await store.list_acquisition_records(retry.id)
     assert len(records) == 1
     assert records[0].state is AcquisitionRecordState.RETRY
+
+    removed = await store.cleanup_acquisition_history(
+        datetime(2100, 1, 1, tzinfo=UTC), limit=10
+    )
+
+    assert removed == 2
+    assert await store.get_acquisition_run(retry.id) is None
+    authoritative = await store.get_acquisition_run(replacement.id)
+    assert authoritative is not None
+    records = await store.list_acquisition_records(replacement.id)
+    assert [record.state for record in records] == [AcquisitionRecordState.RETRY]
+
+
+async def test_stale_generation_cannot_publish_connector_run_metadata(
+    store: SqliteDocStore,
+) -> None:
+    stale = await _claimed_run(store, "diagnostic-run", "wiki", "stale-owner")
+    successor = await store.claim_acquisition_run(
+        stale.id,
+        "successor-owner",
+        now=_NOW + timedelta(minutes=2),
+        expires_at=_NOW + timedelta(minutes=3),
+    )
+    assert successor is not None
+    assert await store.record_acquisition_run_metadata(
+        successor.id,
+        "successor-owner",
+        successor.lease_generation,
+        now=_NOW + timedelta(minutes=2),
+        updates={"last_run": {"outcome": "successor"}},
+        release=False,
+    )
+
+    assert not await store.record_acquisition_run_metadata(
+        stale.id,
+        "stale-owner",
+        stale.lease_generation,
+        now=_NOW,
+        updates={"last_run": {"outcome": "stale"}},
+        release=True,
+    )
+    assert (await store.connector_metadata("wiki"))["last_run"] == {
+        "outcome": "successor"
+    }
 
 
 async def test_orderly_release_is_generation_fenced_and_immediately_claimable(

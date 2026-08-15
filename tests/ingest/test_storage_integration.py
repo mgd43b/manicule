@@ -1373,6 +1373,9 @@ async def test_takeover_fences_fetch_side_last_seen_and_status_writes(
 
     assert report.error_type == "AcquisitionLeaseLostError"
     assert after == before, "the stale worker changed last-seen/version metadata or status"
+    if unchanged:
+        records = await store.list_acquisition_records(durable.id)
+        assert [record.state for record in records] == [AcquisitionRecordState.ACQUIRING]
 
 
 @pytest.mark.parametrize("fetch_fails", [False, True])

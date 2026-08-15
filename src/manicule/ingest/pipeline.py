@@ -873,9 +873,10 @@ class IngestPipeline:
         """
         if self._acquisitions is not None:
             # Settled journal rows are diagnostic history, not recovery input. Bound this pass
-            # so starting one connector cannot monopolize the workspace writer; positive-state
-            # cleanup guarantees no incomplete inventory, retry, or retained indexing input is
-            # ever aged out. Blob collection remains its own mark-and-sweep operation.
+            # so starting one connector cannot monopolize the workspace writer. Active work on
+            # the authoritative run never ages out; superseded work may, because its incremented
+            # generation makes it impossible to resume. Blob collection remains its own
+            # mark-and-sweep operation.
             now = self._acquisition_clock()
             await self._acquisitions.cleanup_acquisition_history(
                 now - timedelta(seconds=self._acquisition_history_s),
@@ -954,33 +955,37 @@ class IngestPipeline:
                 run.report.error_type = type(exc).__name__
                 run.report.error_message = str(exc)
                 run.report.error = f"{type(exc).__name__}: {exc}"
-        if run.acquisitions is not None and not crashed:
-            try:
-                await self._release_orderly_acquisition(run)
-            except Exception as exc:  # noqa: BLE001 - an unreleased lease makes this run incomplete
+        await self._record_run_completion(run, crashed=crashed)
+        return run.report
+
+    async def _record_run_completion(self, run: _Sync, *, crashed: bool) -> None:
+        """Publish diagnostics only while this invocation still owns their durable order."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:
+            await self._store.record_connector_metadata(
+                run.connector.name, run.report.as_metadata()
+            )
+            return
+        recorded = True
+        try:
+            recorded = await acquisitions.record_acquisition_run_metadata(
+                run.acquisition_run_id,
+                run.lease_owner,
+                run.lease_generation,
+                now=self._acquisition_clock(),
+                updates=run.report.as_metadata(),
+                release=not crashed,
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not hide the run outcome
+            if not crashed:
                 run.report.error_type = type(exc).__name__
                 run.report.error_message = str(exc)
                 run.report.error = f"{type(exc).__name__}: {exc}"
-        await self._store.record_connector_metadata(connector.name, run.report.as_metadata())
-        return run.report
-
-    async def _release_orderly_acquisition(self, run: _Sync) -> None:
-        """Release normal unfinished work; crashes never reach this fenced operation."""
-        acquisitions = run.acquisitions
-        if acquisitions is None:  # pragma: no cover - caller checks the durable path
-            return
-        durable = await acquisitions.get_acquisition_run(run.acquisition_run_id)
-        if durable is None or durable.state is AcquisitionRunState.SETTLED:
-            return
-        released = await acquisitions.release_acquisition_lease(
-            run.acquisition_run_id,
-            run.lease_owner,
-            run.lease_generation,
-            now=self._acquisition_clock(),
-        )
-        if not released:
-            msg = "the unfinished acquisition lease changed before orderly release"
-            raise AcquisitionLeaseLostError(msg)
+        if not recorded and not crashed:
+            msg = "the acquisition generation changed before diagnostics and release"
+            run.report.error_type = AcquisitionLeaseLostError.__name__
+            run.report.error_message = msg
+            run.report.error = f"{AcquisitionLeaseLostError.__name__}: {msg}"
 
     async def _drive(self, run: _Sync) -> None:
         """Start every stage, and return when discovery is spent and every acceptance is done.
@@ -1375,18 +1380,16 @@ class IngestPipeline:
                 await self._keep_acquisition_lease_live(
                     run, acquisitions, self._acquisition_clock(), force=True
                 )
-                await acquisitions.transition_acquisition_record(
+                await acquisitions.settle_unchanged_acquisition_record(
                     run.acquisition_run_id,
                     record.source.source_id,
-                    AcquisitionRecordState.ACQUIRING,
-                    AcquisitionRecordState.UNCHANGED,
+                    existing.id,  # pyright: ignore[reportOptionalMemberAccess]
                     lease_owner=run.lease_owner,
                     lease_generation=run.lease_generation,
                     now=self._acquisition_clock(),
                     blob_ref=existing.original_ref if existing is not None else None,
                     fetched_version_token=record.source.version_token,
                 )
-                await self._record_seen(existing.id)  # pyright: ignore[reportOptionalMemberAccess]
                 run.report.record(
                     DocumentOutcome(
                         source_id=record.source.source_id,

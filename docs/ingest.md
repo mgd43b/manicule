@@ -1674,6 +1674,13 @@ mutation and every publication boundary is fenced by that generation. A source c
 `acquiring` becomes retry work at takeover, while `indexing` remains the exact checkpoint needed
 to replay partially expanded containers from retained bytes without source access.
 
+An unchanged-token result is one fenced transaction too: it moves the journal record to
+`unchanged` and refreshes the indexed document's `last_seen_at` under the same writer lock. A
+takeover cannot land between durable coverage and presence bookkeeping. The public `last_run`
+diagnostic is likewise written under the exact run generation; on an orderly return that write
+and lease release are one transaction. A stale worker may return its own in-memory report, but
+it cannot overwrite the successor's connector diagnostic.
+
 The pipeline's renewal immediately before publication is only a fast failure and lease refresh;
 it is not the publication lock. Every attempt-owned relational mutation starts its own SQLite
 transaction with a conditional write that validates workspace, run, owner, generation, expiry,
@@ -1689,13 +1696,14 @@ run leases and can progress independently; every claim and record predicate rema
 scoped.
 
 The retention policy is positive-state and deliberately asymmetric. Incomplete enumeration,
-`retry`, `acquired`, and `indexing` records are retained without an age cutoff because they are
-recovery input. When a newer successful run has already advanced beyond an older unfinished
-base watermark, recovery records `superseded_at` and the replacement run id, then increments the
-older generation before starting from the current position. Superseded history is eligible for
-the same 30-day cleanup only when it contains no retry or local-derivation backlog. Settled
-journal history is retained for 30 days and removed in bounded batches at sync startup. Deleting
-a settled run releases only its acquisition references. Blob GC still
+`retry`, `acquired`, and `indexing` records on the authoritative run are retained without an age
+cutoff because they are recovery input. When a newer successful run has already advanced beyond
+an older unfinished base watermark, recovery records `superseded_at` and the replacement run
+id, then increments the older generation before starting from the current position. That older
+backlog can never progress after fencing, so superseded history becomes eligible for bounded
+30-day cleanup even when its records have active-state names. Settled journal history has the
+same retention period, but a malformed settled run with active records is preserved. Deleting
+eligible history releases only its acquisition references. Blob GC still
 uses its full publication/version/acquisition mark set, so a blob is removed only after no live
 publication, history row, acquisition record, or staging marker names it.
 

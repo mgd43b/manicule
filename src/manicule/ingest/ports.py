@@ -405,6 +405,19 @@ class AcquisitionStore(Protocol):
         now: datetime,
     ) -> bool: ...
 
+    async def record_acquisition_run_metadata(
+        self,
+        run_id: str,
+        owner: str,
+        generation: int,
+        *,
+        now: datetime,
+        updates: Metadata,
+        release: bool,
+    ) -> bool:
+        """Publish diagnostics, optionally releasing, under the exact run generation."""
+        ...
+
     async def transition_acquisition_run(
         self,
         run_id: str,
@@ -441,6 +454,21 @@ class AcquisitionStore(Protocol):
         fetched_version_token: str | UnsetValue | None = UNSET,
         diagnostic: AcquisitionDiagnostic | None = None,
     ) -> AcquisitionRecord: ...
+
+    async def settle_unchanged_acquisition_record(
+        self,
+        run_id: str,
+        source_id: str,
+        document_id: str,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+        blob_ref: str | None = None,
+        fetched_version_token: str | None = None,
+    ) -> AcquisitionRecord:
+        """Atomically mark durable coverage and refresh the indexed document's presence."""
+        ...
 
     async def commit_acquisition_watermark(
         self,
