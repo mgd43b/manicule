@@ -53,6 +53,17 @@ async def _fetched(instance: FakeConfluence, source_id: str, **overrides: object
         await connector.teardown()
 
 
+async def _server_fetched(instance: FakeConfluence, source_id: str):  # noqa: ANN202
+    """The Server/DC equivalent, kept separate so deployment routing is part of every test."""
+    connector = await connected(instance, server_config(instance.base_url))
+    try:
+        found = await drain(connector.discover(None))
+        ref = next(document.ref for document in found if document.source_id == source_id)
+        return await connector.fetch(ref)
+    finally:
+        await connector.teardown()
+
+
 async def test_a_cloud_page_arrives_as_a_typed_document_tree() -> None:
     """ADF is the reason Cloud is worth a separate path: a codeBlock says it is code.
 
@@ -110,6 +121,140 @@ async def test_a_server_page_arrives_as_storage_format() -> None:
     assert raw.as_text() == "<h2>Restart</h2><p>drain first</p>"
     assert raw.metadata[ANCESTORS] == ["OPS", "Platform"]
     assert raw.metadata["body_format"] == "storage"
+
+
+async def test_an_explicitly_empty_server_storage_body_is_a_valid_page() -> None:
+    """Empty content is a source fact; only an absent or malformed value is unavailable."""
+    instance = FakeConfluence(
+        base_url=SERVER_BASE,
+        pages=[FakePage(id="1", title="Empty Page", space="OPS", version=7, storage="")],
+    )
+
+    raw = await _server_fetched(instance, "1")
+
+    assert raw.as_bytes() == b""
+    assert raw.metadata[VERSION_TOKEN] == "7"
+
+
+@pytest.mark.parametrize(
+    "storage_body_override",
+    [{}, None, [], {"value": None}, {"value": 7}],
+    ids=["missing-value", "null-storage", "list-storage", "null-value", "non-string-value"],
+)
+async def test_a_server_storage_response_without_a_string_value_is_refused(
+    storage_body_override: object,
+) -> None:
+    """A malformed expansion must not be normalized into an authoritative empty page."""
+    instance = FakeConfluence(
+        base_url=SERVER_BASE,
+        pages=[
+            FakePage(
+                id="1",
+                title="Runbook",
+                space="OPS",
+                version=7,
+                storage_body_override=storage_body_override,
+            )
+        ],
+    )
+
+    with pytest.raises(BodyUnavailableError, match=r"no string value.*storage format body"):
+        await _server_fetched(instance, "1")
+
+
+async def test_cloud_storage_fallback_uses_the_same_missing_body_refusal() -> None:
+    """Deployment changes the preferred representation, not what counts as source content."""
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1",
+                title="Runbook",
+                space="OPS",
+                version=7,
+                adf_available=False,
+                storage_body_override={},
+            )
+        ]
+    )
+
+    with pytest.raises(BodyUnavailableError, match=r"no string value.*storage format body"):
+        await _fetched(instance, "1")
+
+
+async def test_a_missing_server_body_retries_and_indexes_when_the_source_recovers() -> None:
+    """A first-fetch refusal holds the watermark back and is recoverable on the next run."""
+    instance = FakeConfluence(
+        base_url=SERVER_BASE,
+        pages=[
+            FakePage(
+                id="1",
+                title="Runbook",
+                space="OPS",
+                version=7,
+                storage_body_override={},
+            )
+        ],
+    )
+    connector = await connected(instance, server_config(instance.base_url))
+    pipeline, store, _ = build()
+    try:
+        refused = await pipeline.run(connector)
+
+        assert refused.unrecorded == 1
+        assert connector.name not in store.watermarks
+        assert await store.find_document(connector.name, "1") is None
+
+        instance.pages["1"] = replace(
+            instance.pages["1"], storage_body_override={"value": "<p>recovered body</p>"}
+        )
+        recovered = await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    document = await store.find_document(connector.name, "1")
+    assert recovered.indexed == 1
+    assert document is not None
+    assert document.version_token == "7"  # noqa: S105 - a change token, not a credential
+    assert any("recovered body" in chunk.text for chunk in store.chunks[document.id])
+    assert connector.name in store.watermarks
+
+
+async def test_a_missing_server_refresh_preserves_the_last_indexed_revision() -> None:
+    """A malformed newer response cannot erase the last source body known to be real."""
+    instance = FakeConfluence(
+        base_url=SERVER_BASE,
+        pages=[
+            FakePage(
+                id="1",
+                title="Runbook",
+                space="OPS",
+                version=6,
+                storage="<p>version six</p>",
+            )
+        ],
+    )
+    connector = await connected(instance, server_config(instance.base_url))
+    pipeline, store, _ = build()
+    try:
+        await pipeline.run(connector)
+        before = await store.find_document(connector.name, "1")
+        assert before is not None
+        chunks_before = list(store.chunks[before.id])
+
+        instance.pages["1"] = replace(instance.pages["1"], version=7, storage_body_override={})
+        refreshed = await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    after = await store.find_document(connector.name, "1")
+    assert refreshed.indexed == 1, "the accurate older revision remains servable"
+    assert after is not None
+    assert after.version_token == "6", (  # noqa: S105 - a change token, not a credential
+        "the malformed revision seven was never certified"
+    )
+    assert after.content_hash == before.content_hash
+    assert store.chunks[after.id] == chunks_before
+    assert "BodyUnavailableError" in str(after.metadata["last_ingest_error"])
 
 
 async def test_a_body_older_than_discovery_reported_is_fetched_again() -> None:

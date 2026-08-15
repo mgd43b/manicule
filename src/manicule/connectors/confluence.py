@@ -14,9 +14,8 @@ protocol so that no connector can quietly omit it.
 
 **Structure is fetched, not recovered.** Cloud bodies arrive as Atlassian Document Format — a
 typed node tree — and go to :class:`~manicule.parsers.adf.ADFParser`. Server and Data Center
-have no ADF, so their bodies arrive as storage format and go to the HTML parser, which is a
-real parser rather than a pass that strips angle brackets. Neither of those parsers lives here;
-this module's job ends at handing over bytes and saying honestly what they are.
+have no ADF, so their XHTML vocabulary goes to the dedicated Confluence storage parser. Neither
+parser lives here; this module's job ends at handing over bytes and saying honestly what they are.
 
 **The index is not permission-aware.** Everything is fetched as the configured account, so the
 index holds whatever that account can read and anyone who can search this installation can
@@ -1000,15 +999,7 @@ class ConfluenceConnector:
     async def _adf_body(self, page_id: str) -> _Body:
         url = f"{self._client.url(_V2_PAGE_PATH)}/{page_id}"
         payload = await self._client.get_json(url, [("body-format", ADF_BODY)])
-        body = _obj(_obj(payload.get("body")).get(ADF_BODY))
-        value = _str(body.get("value"))
-        if not value:
-            msg = (
-                f"page {page_id} came back with no Atlassian Document Format body. The page "
-                f"exists, so this is the source declining the format rather than the page "
-                f"being empty."
-            )
-            raise BodyUnavailableError(msg)
+        value = _body_value(payload, ADF_BODY, page_id=page_id, allow_empty=False)
         links = _obj(payload.get("_links"))
         version = _obj(payload.get("version"))
         return _Body(
@@ -1030,7 +1021,7 @@ class ConfluenceConnector:
     async def _storage_body(self, page_id: str) -> _Body:
         url = f"{self._client.url(CONTENT_PATH)}/{page_id}"
         payload = await self._client.get_json(url, [("expand", _STORAGE_EXPAND)])
-        body = _obj(_obj(payload.get("body")).get(STORAGE_BODY))
+        value = _body_value(payload, STORAGE_BODY, page_id=page_id, allow_empty=True)
         links = _obj(payload.get("_links"))
         space_key = _str(_obj(payload.get("space")).get("key"))
         version = _obj(payload.get("version"))
@@ -1038,7 +1029,7 @@ class ConfluenceConnector:
             page_id=page_id,
             title=_str(payload.get("title")),
             version=_int(version.get("number")) or 0,
-            body=_str(body.get("value")),
+            body=value,
             body_format=STORAGE_BODY,
             space_key=space_key,
             ancestors=(space_key, *_ancestor_titles(payload)) if space_key else (),
@@ -1296,6 +1287,25 @@ def _join(base: str, path: str) -> str:
 
 def _obj(value: object) -> Mapping[str, object]:
     return cast("Mapping[str, object]", value) if isinstance(value, dict) else {}
+
+
+def _body_value(
+    payload: Mapping[str, object], body_format: str, *, page_id: str, allow_empty: bool
+) -> str:
+    """Read an explicitly present string body without turning a malformed response into empty."""
+    bodies = _obj(payload.get("body"))
+    representation = _obj(bodies.get(body_format))
+    value = representation.get("value")
+    if isinstance(value, str) and (allow_empty or value.strip()):
+        return value.strip()
+    label = "Atlassian Document Format" if body_format == ADF_BODY else "storage format"
+    empty = isinstance(value, str)
+    reason = "an empty value" if empty else "no string value"
+    msg = (
+        f"page {page_id} came back with {reason} for its {label} body. The page exists, so "
+        "this response cannot certify content for the requested representation."
+    )
+    raise BodyUnavailableError(msg)
 
 
 def _str(value: object) -> str:

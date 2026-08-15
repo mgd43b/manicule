@@ -72,6 +72,9 @@ _QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
 _STATUS_FIELD = re.compile(r"(?<![\w.])status\s*(?:=|!=|<|>|\bin\b|\bnot\b)", re.IGNORECASE)
 """``status`` used as a field in a comparison, which is what Data Center refuses."""
 
+_DEFAULT_STORAGE_BODY = object()
+"""Sentinel separating the ordinary body shape from an explicitly malformed test response."""
+
 
 @dataclass(slots=True)
 class FakePage:
@@ -100,6 +103,13 @@ class FakePage:
 
     adf: Mapping[str, object] = field(default_factory=lambda: paragraph("body text"))
     storage: str = "<p>body text</p>"
+
+    storage_body_override: object = _DEFAULT_STORAGE_BODY
+    """Exact ``body.storage`` response value, when a test needs a malformed source shape.
+
+    The sentinel emits the ordinary object containing :attr:`storage`. Passing ``{}``, ``None``
+    or a scalar models a successful response that omitted or corrupted the requested expansion.
+    """
     ancestors: tuple[str, ...] = ()
     """Ancestor titles, outermost first, for a fixture that only cares about breadcrumbs.
 
@@ -625,6 +635,11 @@ class FakeConfluence:
         page = self.pages.get(page_id)
         if page is None:
             return httpx.Response(404, json={"message": "no such page"})
+        storage_body = (
+            {"value": page.storage, "representation": "storage"}
+            if page.storage_body_override is _DEFAULT_STORAGE_BODY
+            else page.storage_body_override
+        )
         return httpx.Response(
             200,
             json={
@@ -640,7 +655,7 @@ class FakeConfluence:
                     "when": page.when,
                 },
                 "ancestors": self._ancestor_rows(page),
-                "body": {"storage": {"value": page.storage, "representation": "storage"}},
+                "body": {"storage": storage_body},
                 "_links": {
                     "base": self.base_url,
                     "webui": f"/spaces/{page.space}/pages/{page.id}/{page.title}",
