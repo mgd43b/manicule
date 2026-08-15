@@ -560,7 +560,9 @@ parse_memory_limit   default: 1 GiB per worker
   joins every termination before propagating cancellation, including repeated cancellation.
   Each checkout is bound to a lifecycle generation, so a late result, release or replacement
   from an attempt held across teardown can only retire its old worker, never repopulate the
-  stopped pool.
+  stopped pool. Checkout owns permit selection and lazy-spawn readiness through finalization:
+  cancellation restores the selected permit or reaps the partially started worker before it
+  propagates, including repeated cancellation during that cleanup.
 - **Workers hold no store handles.** They receive bytes and return blocks. Everything
   transactional happens in the parent, which is what keeps `storage.md` §8.2's ordering true
   regardless of how many workers died.

@@ -791,6 +791,9 @@ class _PoolStopped:
     """The pool generation that owned an attempt was closed by teardown."""
 
 
+_NO_PERMIT = object()
+
+
 class WorkerPool:
     """A fixed pool of parse workers, each given one attempt at a time.
 
@@ -1050,6 +1053,26 @@ class WorkerPool:
                 raise outcome
 
     async def _acquire(self, generation: int) -> _Worker | _PoolStopped | None:
+        """Own checkout through selection, close cleanup and any lazy spawn."""
+        checkout = asyncio.create_task(self._acquire_owned(generation))
+        try:
+            return await asyncio.shield(checkout)
+        except asyncio.CancelledError:
+            checkout.cancel()
+            while not checkout.done():
+                try:
+                    await asyncio.shield(checkout)
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+                except BaseException:  # noqa: BLE001 - caller cancellation has precedence
+                    break
+            with contextlib.suppress(BaseException):
+                checkout.result()
+            raise
+
+    async def _acquire_owned(self, generation: int) -> _Worker | _PoolStopped | None:
         """Take a permit from the queue, and a worker with it.
 
         The queue holds *permits*, not workers: an entry may be ``None`` where a spawn has not
@@ -1062,49 +1085,61 @@ class WorkerPool:
                 return _PoolStopped()
             closed = self._closed
 
-        permit_task = asyncio.create_task(self._idle.get())
+        permit_task: asyncio.Task[_Worker | None] = asyncio.create_task(self._idle.get())
         closed_task = asyncio.create_task(closed.wait())
+        permit: _Worker | object | None = _NO_PERMIT
         try:
             done, _ = await asyncio.wait(
                 (permit_task, closed_task), return_when=asyncio.FIRST_COMPLETED
             )
+            if closed_task in done:
+                closed_task.result()
+                if permit_task in done:
+                    permit = permit_task.result()
+                else:
+                    permit = _NO_PERMIT
+                    permit_task.cancel()
+                closed_task.cancel()
+                await asyncio.gather(permit_task, closed_task, return_exceptions=True)
+                if permit is not _NO_PERMIT:
+                    await self._restore_permit(cast("_Worker | None", permit), generation)
+                return _PoolStopped()
+
+            # Record ownership before the first cleanup await. Cancellation during the close
+            # task's join must restore this exact permit rather than silently shrinking the
+            # pool.
+            permit = permit_task.result()
+            await self._finish_permit_selection(closed_task)
+            if permit is not None:
+                return permit
+            async with self._lifecycle:
+                if not self._started or generation != self._generation:
+                    return _PoolStopped()
+                # Holding the lifecycle lock across readiness means teardown either precedes
+                # this spawn or owns the resulting child; cancellation is handled by `_spawn`,
+                # which reaps an appended child before it propagates.
+                worker = await self._try_spawn()
+                if worker is None:
+                    # The permit goes back so the count is unchanged, and the next attempt
+                    # tries again.
+                    self._idle.put_nowait(None)
+                    permit = _NO_PERMIT
+                return worker
         except BaseException:
-            permit_task.cancel()
+            if not permit_task.done():
+                permit_task.cancel()
             closed_task.cancel()
             await asyncio.gather(permit_task, closed_task, return_exceptions=True)
-            if permit_task.done() and not permit_task.cancelled():
-                restoring = asyncio.create_task(
-                    self._restore_permit(permit_task.result(), generation)
-                )
-                await _join_despite_cancellation(restoring)
-                restoring.result()
-            raise
-        if closed_task in done:
-            closed_task.result()
-            if permit_task.done() and not permit_task.cancelled():
+            if permit is _NO_PERMIT and permit_task.done() and not permit_task.cancelled():
                 permit = permit_task.result()
-                if permit is not None:
-                    await asyncio.to_thread(permit.terminate)
-            else:
-                permit_task.cancel()
-            await asyncio.gather(permit_task, return_exceptions=True)
-            return _PoolStopped()
+            if permit is not _NO_PERMIT:
+                await self._restore_permit(cast("_Worker | None", permit), generation)
+            raise
+
+    async def _finish_permit_selection(self, closed_task: asyncio.Task[bool]) -> None:
+        """Join the losing close waiter before checkout transfers its worker."""
         closed_task.cancel()
         await asyncio.gather(closed_task, return_exceptions=True)
-        permit = permit_task.result()
-        if permit is not None:
-            return permit
-        async with self._lifecycle:
-            if not self._started or generation != self._generation:
-                return _PoolStopped()
-            # Holding the lifecycle lock across readiness means teardown either precedes this
-            # spawn or owns the resulting child; it can never miss a process still in flight.
-            worker = await self._try_spawn()
-            if worker is None:
-                # The permit goes back so the count is unchanged, and the next attempt tries
-                # again.
-                self._idle.put_nowait(None)
-            return worker
 
     async def _restore_permit(self, permit: _Worker | None, generation: int) -> None:
         """Return a permit consumed at the same instant its checkout was canceled."""
@@ -1174,13 +1209,31 @@ class WorkerPool:
         child.close()
         worker = _Worker(process=process, connection=parent)
         self._live.append(worker)
-        ready = await asyncio.to_thread(_await_ready, parent)
+        readiness = asyncio.create_task(asyncio.to_thread(_await_ready, parent))
+        try:
+            ready = await asyncio.shield(readiness)
+        except BaseException:
+            # Once appended, this coroutine owns the child until it returns a `_Worker`.
+            # Stop it, join the pipe-reading thread, and reach retire's endpoint before
+            # cancellation can propagate; otherwise both a child and a thread lose an owner.
+            _stop(worker)
+            with contextlib.suppress(BaseException):
+                await _join_despite_cancellation(readiness)
+            retiring = asyncio.create_task(self._retire(worker))
+            await _join_despite_cancellation(retiring)
+            with contextlib.suppress(BaseException):
+                retiring.result()
+            raise
         if ready is None or ready.error:
             # A worker that never said hello has an unknown pipe state: its greeting may still
             # be in flight, and the next reply read would return it instead of a result — a
             # blameless document recorded as killed. One that said hello *and* reported an
             # error cannot serve at all. Either way it is not a worker.
-            await self._retire(worker)
+            retiring = asyncio.create_task(self._retire(worker))
+            interrupted = await _join_despite_cancellation(retiring)
+            retiring.result()
+            if interrupted:
+                raise asyncio.CancelledError
             detail = ready.error if ready is not None else "it never reported itself ready"
             msg = f"a parse worker could not start: {detail}"
             raise RuntimeError(msg)
