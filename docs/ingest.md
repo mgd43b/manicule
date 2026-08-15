@@ -558,6 +558,9 @@ parse_memory_limit   default: 1 GiB per worker
   started state or its permits until every spawn/readiness wait reaches an endpoint; a
   canceled setup reaps the partial pool and is reusable. Teardown snapshots every worker and
   joins every termination before propagating cancellation, including repeated cancellation.
+  Each checkout is bound to a lifecycle generation, so a late result, release or replacement
+  from an attempt held across teardown can only retire its old worker, never repopulate the
+  stopped pool.
 - **Workers hold no store handles.** They receive bytes and return blocks. Everything
   transactional happens in the parent, which is what keeps `storage.md` §8.2's ordering true
   regardless of how many workers died.

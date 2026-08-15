@@ -310,6 +310,57 @@ async def test_repeated_cancel_during_multiworker_teardown_reaps_every_snapshot(
     assert pool._live == []  # pyright: ignore[reportPrivateUsage]
 
 
+async def test_teardown_fences_a_checked_out_attempt_before_reusable_setup(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late release from an old generation cannot repopulate a stopped pool."""
+    del manicule_environment
+    baseline = {child.pid for child in multiprocessing.active_children()}
+    pool = WorkerPool(_config(tmp_path), workers=2, timeout_s=5.0)
+    await pool.setup()
+    replied = asyncio.Event()
+    release = asyncio.Event()
+    original_dispatch = pool._dispatch  # pyright: ignore[reportPrivateUsage]
+
+    async def held_dispatch(worker: object, request: object) -> object:
+        result = await original_dispatch(worker, request)  # pyright: ignore[reportArgumentType]
+        replied.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(pool, "_dispatch", held_dispatch)
+    attempt = asyncio.create_task(pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)))
+    await asyncio.wait_for(replied.wait(), timeout=10)
+
+    await pool.teardown()
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 0  # pyright: ignore[reportPrivateUsage]
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+    release.set()
+    result = await asyncio.wait_for(attempt, timeout=10)
+    assert result.attempt.outcome is Outcome.PARSED
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 0  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(pool, "_dispatch", original_dispatch)
+    await pool.setup()
+    assert len(pool._live) == 2  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 2  # pyright: ignore[reportPrivateUsage]
+    active = {child.pid for child in multiprocessing.active_children()}
+    assert len(active - baseline) == 2
+    after = await asyncio.wait_for(
+        pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)), timeout=10
+    )
+    assert after.attempt.outcome is Outcome.PARSED
+    assert len(pool._live) == 2  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 2  # pyright: ignore[reportPrivateUsage]
+    await pool.teardown()
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+
 def test_the_default_worker_count_leaves_a_core_for_the_parent() -> None:
     """The parent does the embedding and every write, so it is not a spare."""
     count = default_worker_count()

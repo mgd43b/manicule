@@ -786,6 +786,11 @@ class _Killed:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class _PoolStopped:
+    """The pool generation that owned an attempt was closed by teardown."""
+
+
 class WorkerPool:
     """A fixed pool of parse workers, each given one attempt at a time.
 
@@ -814,6 +819,9 @@ class WorkerPool:
         self._kills: dict[str, int] = {}
         self._started = False
         self._lifecycle = asyncio.Lock()
+        self._generation = 0
+        self._closed = asyncio.Event()
+        self._closed.set()
 
     @property
     def size(self) -> int:
@@ -863,12 +871,16 @@ class WorkerPool:
             permits = spawning.result()
             for permit in permits:
                 self._idle.put_nowait(permit)
+            self._generation += 1
+            self._closed = asyncio.Event()
             self._started = True
 
     async def teardown(self) -> None:
         """Stop every worker, including ones still holding a document."""
         async with self._lifecycle:
             self._started = False
+            self._generation += 1
+            self._closed.set()
             self._drain_idle()
             # The cleanup task owns this snapshot until every worker reaches terminate's known
             # endpoint.  Clearing `_live` first is safe only because cancellation cannot detach
@@ -906,7 +918,11 @@ class WorkerPool:
         decline: a chain of three timeouts must not end at ``unsupported_media_type``.
         """
         await self.setup()
-        worker = await self._acquire()
+        generation = self._generation
+        worker = await self._acquire(generation)
+        if isinstance(worker, _PoolStopped):
+            reason = "parse worker pool stopped during this attempt"
+            return AttemptResult([], Attempt(parser=name, outcome=Outcome.FAILED, reason=reason))
         if worker is None:
             self._kills["spawn failed"] = self._kills.get("spawn failed", 0) + 1
             reason = "no parse worker could be started for this attempt"
@@ -929,7 +945,7 @@ class WorkerPool:
             # process-level accident on the ingest loop's exception path and end the batch,
             # which is exactly the guarantee this whole module exists to hold. So it is
             # recorded against the document, the worker is replaced, and the run continues.
-            interrupted = await self._complete_replacement(worker)
+            interrupted = await self._complete_replacement(worker, generation)
             if interrupted:
                 raise asyncio.CancelledError from None
             self._kills["dispatch failed"] = self._kills.get("dispatch failed", 0) + 1
@@ -940,11 +956,11 @@ class WorkerPool:
             # swallowing them would make Ctrl-C wait for a corpus. The worker still has to go:
             # a canceled await leaves one whose state nobody knows, and replacing it is
             # cheaper than reasoning about what it was in the middle of.
-            await self._complete_replacement(worker)
+            await self._complete_replacement(worker, generation)
             raise
         if isinstance(outcome, _Killed):
             self._kills[outcome.reason] = self._kills.get(outcome.reason, 0) + 1
-            interrupted = await self._complete_replacement(worker)
+            interrupted = await self._complete_replacement(worker, generation)
             if interrupted:
                 raise asyncio.CancelledError
             return AttemptResult(
@@ -958,11 +974,13 @@ class WorkerPool:
 
         worker.documents += 1
         if worker.documents >= self._max_documents:
-            interrupted = await self._complete_replacement(worker)
+            interrupted = await self._complete_replacement(worker, generation)
             if interrupted:
                 raise asyncio.CancelledError
         else:
-            await self._idle.put(worker)
+            interrupted = await self._complete_return(worker, generation)
+            if interrupted:
+                raise asyncio.CancelledError
         return outcome.result
 
     async def run_before_parse(
@@ -1031,7 +1049,7 @@ class WorkerPool:
             if isinstance(outcome, BaseException):
                 raise outcome
 
-    async def _acquire(self) -> _Worker | None:
+    async def _acquire(self, generation: int) -> _Worker | _PoolStopped | None:
         """Take a permit from the queue, and a worker with it.
 
         The queue holds *permits*, not workers: an entry may be ``None`` where a spawn has not
@@ -1039,14 +1057,63 @@ class WorkerPool:
         many spawns have failed — the invariant whose loss turns a transient ``OSError`` into a
         run that blocks forever on an empty queue.
         """
-        permit = await self._idle.get()
+        async with self._lifecycle:
+            if not self._started or generation != self._generation:
+                return _PoolStopped()
+            closed = self._closed
+
+        permit_task = asyncio.create_task(self._idle.get())
+        closed_task = asyncio.create_task(closed.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (permit_task, closed_task), return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            permit_task.cancel()
+            closed_task.cancel()
+            await asyncio.gather(permit_task, closed_task, return_exceptions=True)
+            if permit_task.done() and not permit_task.cancelled():
+                restoring = asyncio.create_task(
+                    self._restore_permit(permit_task.result(), generation)
+                )
+                await _join_despite_cancellation(restoring)
+                restoring.result()
+            raise
+        if closed_task in done:
+            closed_task.result()
+            if permit_task.done() and not permit_task.cancelled():
+                permit = permit_task.result()
+                if permit is not None:
+                    await asyncio.to_thread(permit.terminate)
+            else:
+                permit_task.cancel()
+            await asyncio.gather(permit_task, return_exceptions=True)
+            return _PoolStopped()
+        closed_task.cancel()
+        await asyncio.gather(closed_task, return_exceptions=True)
+        permit = permit_task.result()
         if permit is not None:
             return permit
-        worker = await self._try_spawn()
-        if worker is None:
-            # The permit goes back so the count is unchanged, and the next attempt tries again.
-            await self._idle.put(None)
-        return worker
+        async with self._lifecycle:
+            if not self._started or generation != self._generation:
+                return _PoolStopped()
+            # Holding the lifecycle lock across readiness means teardown either precedes this
+            # spawn or owns the resulting child; it can never miss a process still in flight.
+            worker = await self._try_spawn()
+            if worker is None:
+                # The permit goes back so the count is unchanged, and the next attempt tries
+                # again.
+                self._idle.put_nowait(None)
+            return worker
+
+    async def _restore_permit(self, permit: _Worker | None, generation: int) -> None:
+        """Return a permit consumed at the same instant its checkout was canceled."""
+        async with self._lifecycle:
+            if self._started and generation == self._generation:
+                self._idle.put_nowait(permit)
+                return
+        if permit is not None:
+            await self._retire(permit)
 
     async def _dispatch(self, worker: _Worker, request: _Request) -> _Reply | _Killed:
         """Send one request and wait for its reply, entirely off the event loop.
@@ -1125,7 +1192,7 @@ class WorkerPool:
             self._live.remove(worker)
         await asyncio.to_thread(worker.terminate)
 
-    async def _replace(self, worker: _Worker) -> None:
+    async def _replace(self, worker: _Worker, generation: int) -> None:
         """Stop a worker and return its permit, with a fresh worker on it if one can be had.
 
         One method rather than the pair repeated at four call sites, because the pair is only
@@ -1134,13 +1201,31 @@ class WorkerPool:
         a permit per failure ends a long run blocked on an empty queue with nothing said.
         """
         await self._retire(worker)
-        await self._idle.put(await self._try_spawn())
+        async with self._lifecycle:
+            if not self._started or generation != self._generation:
+                return
+            # Teardown cannot snapshot between append-to-live and permit publication.
+            self._idle.put_nowait(await self._try_spawn())
 
-    async def _complete_replacement(self, worker: _Worker) -> bool:
+    async def _complete_replacement(self, worker: _Worker, generation: int) -> bool:
         """Reach retire/spawn/permit restoration despite repeated caller cancellation."""
-        replacement = asyncio.create_task(self._replace(worker))
+        replacement = asyncio.create_task(self._replace(worker, generation))
         interrupted = await _join_despite_cancellation(replacement)
         replacement.result()
+        return interrupted
+
+    async def _return_or_retire(self, worker: _Worker, generation: int) -> None:
+        async with self._lifecycle:
+            if self._started and generation == self._generation:
+                self._idle.put_nowait(worker)
+                return
+        await self._retire(worker)
+
+    async def _complete_return(self, worker: _Worker, generation: int) -> bool:
+        """Publish a release only to its owning generation, joined through cancellation."""
+        returning = asyncio.create_task(self._return_or_retire(worker, generation))
+        interrupted = await _join_despite_cancellation(returning)
+        returning.result()
         return interrupted
 
 
