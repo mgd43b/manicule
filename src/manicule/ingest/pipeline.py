@@ -239,6 +239,8 @@ class BlobSink(Protocol):
 
     async def complete_acquisition(self, key: str) -> None: ...
 
+    async def reconcile_acquisition_markers(self) -> None: ...
+
 
 class NoRetention:
     """The blob sink that keeps nothing, and says so.
@@ -270,6 +272,9 @@ class NoRetention:
 
     async def complete_acquisition(self, key: str) -> None:
         del key
+
+    async def reconcile_acquisition_markers(self) -> None:
+        return
 
 
 class Change(StrEnum):
@@ -878,6 +883,7 @@ class IngestPipeline:
             # generation makes it impossible to resume. Blob collection remains its own
             # mark-and-sweep operation.
             now = self._acquisition_clock()
+            await self._blobs.reconcile_acquisition_markers()
             await self._acquisitions.cleanup_acquisition_history(
                 now - timedelta(seconds=self._acquisition_history_s),
                 limit=self._acquisition_cleanup_batch,

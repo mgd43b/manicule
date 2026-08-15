@@ -2247,6 +2247,81 @@ async def test_crash_after_file_retention_before_journal_association_uses_stagin
     assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 
+async def test_crash_after_acquired_association_reconciles_marker_before_history_cleanup(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """A committed association makes its marker redundant before superseded GC releases it."""
+
+    class CrashAfterAssociationBlobStore(BlobStore):
+        @override
+        async def complete_acquisition(self, key: str) -> None:
+            del key
+            raise RuntimeError("synthetic crash after ACQUIRED commit")
+
+    connector = fakes.DictConnector(
+        {"public-associated": "public associated bytes"}, name="associated-marker-source"
+    )
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = fakes.BlockChunker()
+    crashing_blobs = CrashAfterAssociationBlobStore(engine, data_dir)
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=crashing_blobs,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_clock=lease_clock,
+        acquisition_lease_s=1,
+        detect_glossary=False,
+    )
+
+    report = await pipeline.run(connector)
+
+    assert report.error_type == "RuntimeError"
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    record = (await store.list_acquisition_records(durable.id))[0]
+    assert record.state is AcquisitionRecordState.ACQUIRED
+    assert record.blob_ref is not None
+    staging = crashing_blobs.root / "acquisition-staging"
+    assert len(list(staging.iterdir())) == 1
+
+    await store.set_watermark(
+        connector.name,
+        Watermark(value="successor-position", observed_at=lease_clock()),
+    )
+    lease_clock.advance(2)
+    successor = await store.claim_or_create_acquisition_run(
+        connector.name,
+        "successor-run",
+        "successor-owner",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=1),
+    )
+    assert successor is not None
+    superseded = await store.get_acquisition_run(durable.id)
+    assert superseded is not None
+    assert superseded.superseded_at is not None
+
+    restarted_blobs = BlobStore(engine, data_dir)
+    await restarted_blobs.reconcile_acquisition_markers()
+    assert list(staging.iterdir()) == []
+    assert await store.cleanup_acquisition_history(
+        datetime(2100, 1, 1, tzinfo=UTC), limit=10
+    ) == 1
+
+    assert await store.get_acquisition_run(durable.id) is None
+    assert await restarted_blobs.collect_garbage() == [record.blob_ref]
+    assert await restarted_blobs.get(record.blob_ref) is None
+
+
 @pytest.mark.parametrize(
     ("failure", "code"),
     [

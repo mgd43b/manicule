@@ -341,11 +341,14 @@ class BlobStore:
                 compression,
             )
         )
+        run_id, separator, source_id = key.partition("\0")
         payload = json.dumps(
             {
                 "blob_ref": acquired.content_hash,
                 "compression": stored.compression,
                 "acquired_source": acquired.model_dump(mode="json"),
+                "run_id": run_id if separator else None,
+                "source_id": source_id if separator else None,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -396,7 +399,55 @@ class BlobStore:
             if self._staging_cleanup_complete:
                 return
             await self.cleanup_staging_partials()
+            await self.reconcile_acquisition_markers()
             self._staging_cleanup_complete = True
+
+    async def reconcile_acquisition_markers(self) -> None:
+        """Remove markers whose exact journal association already committed.
+
+        This completes before acquisition-history cleanup. It deliberately visits every live
+        marker: bounding the pass could delete a superseded association whose marker was beyond
+        the bound, destroying the only evidence that the marker had become redundant.
+        """
+        root = self._root / "acquisition-staging"
+        if not root.exists():
+            return
+        for path in root.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                payload = json.loads(await asyncio.to_thread(path.read_text, "utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or not await self._association_committed(
+                cast("dict[str, object]", payload)
+            ):
+                continue
+            await self._durable_thread_call(lambda path=path: self._unlink_durable(path))
+
+    async def _association_committed(self, payload: dict[str, object]) -> bool:
+        run_id = payload.get("run_id")
+        source_id = payload.get("source_id")
+        blob_ref = payload.get("blob_ref")
+        acquired_source = payload.get("acquired_source")
+        if not all(isinstance(value, str) for value in (run_id, source_id, blob_ref)):
+            return False
+        if not isinstance(acquired_source, dict):
+            return False
+        async with self._sessions() as session:
+            record = (
+                await session.execute(
+                    select(models.AcquisitionRecord).where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        models.AcquisitionRecord.source_id == source_id,
+                    )
+                )
+            ).scalar_one_or_none()
+        return bool(
+            record is not None
+            and record.blob_ref == blob_ref
+            and cast("object", record.acquired_source) == acquired_source
+        )
 
     async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None:
         """Recover a staged blob/envelope pair without contacting its source."""
@@ -440,6 +491,7 @@ class BlobStore:
 
     async def _staged_blob_refs(self) -> set[str]:
         await self.cleanup_staging_partials()
+        await self.reconcile_acquisition_markers()
         root = self._root / "acquisition-staging"
         if not root.exists():
             return set()

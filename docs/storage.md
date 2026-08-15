@@ -1869,9 +1869,13 @@ authoritative run's incomplete enumeration, retry, acquired, or indexing work, w
 overlap cannot pin blob references forever. Cascading record deletion merely releases
 acquisition references. Publications and retained bytes remain governed by their own tables,
 and blob mark-and-sweep still includes publications, version history, acquisition records and
-staging markers. This makes cleanup reclaim truly unreachable bytes without turning it into an
-implicit deletion of resumable backlog. `alembic check` continues to enforce model/migration
-parity.
+staging markers. Before history cleanup and again during blob inventory, a staging marker whose
+run/source identity, blob hash and acquired envelope exactly match a committed acquisition
+record is durably removed: it protects only the pre-association crash window and is redundant
+after that commit. This ordering prevents a crash between association and marker unlink from
+pinning the blob after its superseded record is deleted. Cleanup can therefore reclaim truly
+unreachable bytes without turning it into an implicit deletion of resumable backlog. `alembic
+check` continues to enforce model/migration parity.
 
 ---
 
