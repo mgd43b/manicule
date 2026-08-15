@@ -36,14 +36,18 @@ def upgrade() -> None:
         ).fetchall()
         if not records:
             break
-        for record_id, run_id, source_id in records:
-            marker_name = hashlib.blake2b(
-                f"{run_id}\0{source_id}".encode(), digest_size=20
-            ).hexdigest()
-            connection.execute(
-                sa.text("UPDATE acquisition_records SET marker_name = :marker WHERE id = :id"),
-                {"marker": marker_name, "id": record_id},
-            )
+        connection.execute(
+            sa.text("UPDATE acquisition_records SET marker_name = :marker WHERE id = :id"),
+            [
+                {
+                    "marker": hashlib.blake2b(
+                        f"{run_id}\0{source_id}".encode(), digest_size=20
+                    ).hexdigest(),
+                    "id": record_id,
+                }
+                for record_id, run_id, source_id in records
+            ],
+        )
         cursor = records[-1][0]
     op.create_index(
         "ix_acquisition_records_marker_name",
