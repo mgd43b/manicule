@@ -1157,6 +1157,8 @@ class ReembedCorpusSnapshot(Base):
     complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     document_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    inventory_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    chunk_inventory_digest: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
 

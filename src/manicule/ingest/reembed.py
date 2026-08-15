@@ -112,20 +112,53 @@ class SnapshotChunkDigester:
 
     def __init__(self) -> None:
         self._digest = hashlib.sha256()
+        self._previous_chunk: tuple[str, int, str] | None = None
         self._previous: tuple[str, int, str, str, str, int] | None = None
 
     def add(self, stored: SnapshotChunk) -> None:
-        key = (
+        chunk_key = (
             stored.chunk.document_id,
             stored.chunk.position,
             stored.chunk.id,
+        )
+        key = (
+            *chunk_key,
             stored.vector_id,
             stored.publication_id,
             stored.sequence,
         )
-        if self._previous is not None and key <= self._previous:
+        if (self._previous_chunk is not None and chunk_key <= self._previous_chunk) or (
+            self._previous is not None and key <= self._previous
+        ):
             raise ValueError("snapshot chunk rows must be strictly keyset ordered")
+        self._previous_chunk = chunk_key
         self._previous = key
+        _hash_bytes(self._digest, _canonical_chunk(stored))
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+
+class SnapshotInventoryDigester:
+    """Canonical full-document inventory in the same order used by planning."""
+
+    def __init__(self, revision: str) -> None:
+        self._digest = hashlib.sha256()
+        self._previous_document_id: str | None = None
+        self._active_document_id: str | None = None
+        _hash_value(self._digest, revision)
+
+    def add_document(self, stored: SnapshotDocument) -> None:
+        document_id = stored.document.id
+        if self._previous_document_id is not None and document_id <= self._previous_document_id:
+            raise ValueError("snapshot documents must be strictly keyset ordered")
+        self._previous_document_id = document_id
+        self._active_document_id = document_id
+        _hash_bytes(self._digest, _canonical_document(stored))
+
+    def add_chunk(self, stored: SnapshotChunk) -> None:
+        if stored.chunk.document_id != self._active_document_id:
+            raise ValueError("snapshot chunks must immediately follow their owning document")
         _hash_bytes(self._digest, _canonical_chunk(stored))
 
     def hexdigest(self) -> str:
@@ -688,9 +721,8 @@ async def _plan_snapshot(
     target_batch_tokens: int,
     chunks_per_second: float,
 ) -> ReembedCommitment:
-    digest = hashlib.sha256()
+    digest = SnapshotInventoryDigester(snapshot.revision)
     chunk_digest = SnapshotChunkDigester()
-    _hash_value(digest, snapshot.revision)
     documents_count = chunks_count = input_bytes = unrepairable = 0
     peak_memory = 0
     after: str | None = None
@@ -702,7 +734,7 @@ async def _plan_snapshot(
         document_page_bytes = sum(len(_canonical_document(document)) for document in documents)
         peak_memory = max(peak_memory, document_page_bytes)
         for document in documents:
-            _hash_bytes(digest, _canonical_document(document))
+            digest.add_document(document)
             domain_document = document.document
             documents_count += 1
             chunk_after: ChunkKey | None = None
@@ -718,8 +750,7 @@ async def _plan_snapshot(
                     break
                 found = True
                 for stored_chunk in chunks:
-                    canonical = _canonical_chunk(stored_chunk)
-                    _hash_bytes(digest, canonical)
+                    digest.add_chunk(stored_chunk)
                     chunk_digest.add(stored_chunk)
                     input_bytes += len(stored_chunk.chunk.embed_text.encode("utf-8"))
                 chunks_count += len(chunks)
@@ -856,6 +887,7 @@ __all__ = [
     "SnapshotChunk",
     "SnapshotChunkDigester",
     "SnapshotDocument",
+    "SnapshotInventoryDigester",
     "plan_reembed",
     "resume_reembed",
     "start_reembed",

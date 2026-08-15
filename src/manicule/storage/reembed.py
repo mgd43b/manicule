@@ -26,7 +26,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from manicule.core.content import Chunk
 from manicule.core.embedding import EmbedFingerprint, Vector, embedding_input_identity
-from manicule.core.ids import vector_id
 from manicule.ingest.reembed import (
     ChunkKey,
     CorpusSnapshot,
@@ -43,6 +42,7 @@ from manicule.ingest.reembed import (
     SnapshotChunk,
     SnapshotChunkDigester,
     SnapshotDocument,
+    SnapshotInventoryDigester,
 )
 from manicule.storage import models
 from manicule.storage.rows import to_chunk, to_document
@@ -117,21 +117,23 @@ class SqliteReembedCorpus:
                     complete=False,
                     document_count=0,
                     chunk_count=0,
+                    inventory_digest="",
+                    chunk_inventory_digest="",
                     created_at=utcnow(),
                 )
             )
             session = AsyncSession(bind=connection, expire_on_commit=False)
             try:
-                documents_count, chunks_count, inventory = await self._materialize(
+                documents_count, chunks_count, inventory, chunk_inventory = await self._materialize(
                     connection, session, snapshot_id
                 )
             finally:
                 await session.close()
-            live = LivePublication(state.vector_table, fingerprint, inventory)
+            live = LivePublication(state.vector_table, fingerprint, chunk_inventory)
             await connection.execute(
                 update(models.IndexState)
                 .where(models.IndexState.id == _INDEX_STATE_ID)
-                .values(vector_inventory_digest=inventory, updated_at=utcnow())
+                .values(vector_inventory_digest=chunk_inventory, updated_at=utcnow())
             )
             await connection.execute(
                 update(models.ReembedCorpusSnapshot)
@@ -141,6 +143,8 @@ class SqliteReembedCorpus:
                     complete=True,
                     document_count=documents_count,
                     chunk_count=chunks_count,
+                    inventory_digest=inventory,
+                    chunk_inventory_digest=chunk_inventory,
                 )
             )
             await connection.commit()
@@ -223,10 +227,21 @@ class SqliteReembedCorpus:
 
     async def _materialize(
         self, connection: AsyncConnection, session: AsyncSession, snapshot_id: str
-    ) -> tuple[int, int, str]:
+    ) -> tuple[int, int, str, str]:
         document_after: str | None = None
         documents_count = chunks_count = 0
-        digest = SnapshotChunkDigester()
+        inventory = SnapshotInventoryDigester(
+            str(
+                (
+                    await connection.execute(
+                        select(models.ReembedCorpusSnapshot.revision).where(
+                            models.ReembedCorpusSnapshot.id == snapshot_id
+                        )
+                    )
+                ).scalar_one()
+            )
+        )
+        chunk_digest = SnapshotChunkDigester()
         while True:
             statement = select(models.Document).where(models.Document.deleted_at.is_(None))
             if document_after is not None:
@@ -251,11 +266,13 @@ class SqliteReembedCorpus:
                     last_seen_at=row.last_seen_at,
                     deleted_at=row.deleted_at,
                 )
+                document_json = _json(_SNAPSHOT_DOCUMENT, stored_document)
+                inventory.add_document(_SNAPSHOT_DOCUMENT.validate_json(document_json))
                 await connection.execute(
                     insert(models.ReembedSnapshotDocument).values(
                         snapshot_id=snapshot_id,
                         document_id=row.id,
-                        payload_json=_json(_SNAPSHOT_DOCUMENT, stored_document),
+                        payload_json=document_json,
                     )
                 )
                 chunk_after: tuple[int, str] | None = None
@@ -288,14 +305,17 @@ class SqliteReembedCorpus:
                             sequence=chunk_row.seq,
                             created_at=chunk_row.created_at,
                         )
-                        digest.add(stored_chunk)
+                        chunk_json = _json(_SNAPSHOT_CHUNK, stored_chunk)
+                        persisted_chunk = _SNAPSHOT_CHUNK.validate_json(chunk_json)
+                        inventory.add_chunk(persisted_chunk)
+                        chunk_digest.add(persisted_chunk)
                         await connection.execute(
                             insert(models.ReembedSnapshotChunk).values(
                                 snapshot_id=snapshot_id,
                                 document_id=row.id,
                                 position=chunk_row.position,
                                 chunk_id=chunk_row.id,
-                                payload_json=_json(_SNAPSHOT_CHUNK, stored_chunk),
+                                payload_json=chunk_json,
                             )
                         )
                         chunks_count += 1
@@ -303,7 +323,12 @@ class SqliteReembedCorpus:
                     chunk_after = (last.position, last.id)
                 documents_count += 1
             document_after = page[-1].id
-        return documents_count, chunks_count, digest.hexdigest()
+        return (
+            documents_count,
+            chunks_count,
+            inventory.hexdigest(),
+            chunk_digest.hexdigest(),
+        )
 
     async def _require_snapshot(self, snapshot: CorpusSnapshot) -> None:
         async with self._engine.connect() as connection:
@@ -655,6 +680,8 @@ class SqliteReembedStore:
             or _LIVE.validate_json(row.live_json) != snapshot.live
             or row.document_count != run.commitment.plan.documents
             or row.chunk_count != run.commitment.plan.chunks
+            or row.inventory_digest != run.commitment.inventory_digest
+            or row.chunk_inventory_digest != run.commitment.chunk_inventory_digest
         ):
             raise ReembedError("publication is not bound to a durable complete-corpus snapshot")
 
@@ -880,9 +907,7 @@ class LanceShadowGenerations:
             try:
                 await self._authority.assert_locked(connection, generation.run_id, lease)
             except ReembedError:
-                await store.delete_chunks(
-                    [vector_id(generation.id, stored.chunk.id) for stored in chunks]
-                )
+                await store.delete_chunks([stored.vector_id for stored in chunks])
                 raise
 
     async def inspect(
@@ -937,6 +962,14 @@ class LanceShadowGenerations:
                 lineage_valid = lineage_valid and self._row_lineage(
                     row, generation, stored, fingerprint
                 )
+        physical_rows = await store.count()
+        if physical_rows != rows_count:
+            # The keyset columns are validated data, not a trusted primary key. Corruption can
+            # collapse more than one physical row onto the same cursor; the independent table
+            # count makes such a skipped suffix a validation failure rather than a false seal.
+            lineage_valid = False
+            finite = False
+            rows_count = physical_rows
         if await store.storage_revision() != revision:
             raise ReembedError("shadow changed during inspection")
         await self._authority.assert_current(generation.run_id, lease)
@@ -1074,7 +1107,7 @@ class LanceShadowGenerations:
     ) -> bool:
         chunk = stored.chunk
         return bool(
-            str(row["id"]) == vector_id(generation.id, chunk.id)
+            str(row["id"]) == stored.vector_id
             and str(row["chunk_id"]) == chunk.id
             and str(row["publication_id"]) == stored.publication_id
             and str(row["document_id"]) == chunk.document_id

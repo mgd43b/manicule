@@ -230,8 +230,9 @@ async def test_durable_reembed_downgrade_refuses_saved_or_published_state(
             await connection.execute(
                 text(
                     "INSERT INTO reembed_corpus_snapshots "
-                    "(id, revision, live_json, complete, document_count, chunk_count, created_at) "
-                    "VALUES ('private-snapshot-id', '1', '{}', 0, 0, 0, "
+                    "(id, revision, live_json, complete, document_count, chunk_count, "
+                    "inventory_digest, chunk_inventory_digest, created_at) "
+                    "VALUES ('private-snapshot-id', '1', '{}', 0, 0, 0, '', '', "
                     "'2026-01-01T00:00:00+00:00')"
                 )
             )

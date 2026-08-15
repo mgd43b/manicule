@@ -10,7 +10,6 @@ import lancedb
 import pytest
 from sqlalchemy import insert, select, update
 
-from manicule.core.ids import vector_id
 from manicule.ingest.reembed import (
     PublishOutcome,
     ReembedError,
@@ -19,6 +18,7 @@ from manicule.ingest.reembed import (
     resume_reembed,
     start_reembed,
 )
+from manicule.ingest.sweeps import sweep_vectors
 from manicule.storage import models
 from manicule.storage.engine import VECTORS_DIRNAME
 from manicule.storage.reembed import (
@@ -127,6 +127,9 @@ async def test_on_disk_shadow_validates_publishes_and_runtime_follows_pointer(
     authority, shadows, run, lease, generation, source, vector, _ = await seeded_run(
         engine, store, data_dir, clock, run_id="durable-handoff"
     )
+    live = PublishedLanceVectorStore(data_dir / VECTORS_DIRNAME, engine)
+    await live.ensure_ready(fingerprint(dimension=4, model_id="old/model"))
+    assert (await live.search([1.0, 0.0, 0.0, 0.0], 1))[0].publication_id == source.publication_id
 
     await shadows.upsert(generation, [source], [vector], lease=lease)
     inspection = await shadows.inspect(generation, lease=lease)
@@ -157,14 +160,17 @@ async def test_on_disk_shadow_validates_publishes_and_runtime_follows_pointer(
     assert str(revision) == run.commitment.snapshot.revision
     with pytest.raises(ReembedError, match="sealed shadow generation"):
         await shadows.upsert(generation, [source], [vector], lease=lease)
-    live = PublishedLanceVectorStore(data_dir / VECTORS_DIRNAME, engine)
-    await live.ensure_ready(HashEmbedder(dimension=4).fingerprint)
     rows = await live.search(vector, 1)
     assert len(rows) == 1
     assert rows[0].publication_id == source.publication_id
     assert (
         await store.get_document(source.chunk.document_id)
     ).publication_id == source.publication_id  # type: ignore[union-attr]
+    await store.replace_chunks(source.chunk.document_id, [])
+    assert source.vector_id in await store.take_tombstones(10)
+    swept = await sweep_vectors(store, live)
+    assert swept.vectors_removed == 1
+    assert await live.count() == 0
     await live.teardown()
 
 
@@ -344,8 +350,19 @@ async def test_explicit_abandonment_makes_an_unfinished_generation_cleanup_eligi
     assert not shadows.directory(generation.id).exists()
 
 
-async def test_publication_requires_the_complete_durable_snapshot_record(
-    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+@pytest.mark.parametrize(
+    "snapshot_change",
+    [
+        {"complete": False},
+        {"inventory_digest": "same-count-wrong-document-inventory"},
+        {"chunk_inventory_digest": "same-count-wrong-chunk-inventory"},
+    ],
+)
+async def test_publication_requires_the_complete_digest_bound_snapshot_record(
+    engine: AsyncEngine,
+    store: SqliteDocStore,
+    data_dir: Path,
+    snapshot_change: dict[str, object],
 ) -> None:
     clock = Clock()
     authority, shadows, run, lease, generation, source, vector, _ = await seeded_run(
@@ -358,7 +375,7 @@ async def test_publication_requires_the_complete_durable_snapshot_record(
         await connection.execute(
             update(models.ReembedCorpusSnapshot)
             .where(models.ReembedCorpusSnapshot.id == run.commitment.snapshot.id)
-            .values(complete=False)
+            .values(**snapshot_change)
         )
 
     with pytest.raises(ReembedError, match="durable complete-corpus snapshot"):
@@ -459,7 +476,7 @@ async def test_inspection_recomputes_every_retrieval_and_source_identity_column(
         str(shadows.directory(generation.id))
     )
     table = await connection.open_table(table_name(HashEmbedder(dimension=4).fingerprint))
-    physical_id = vector_id(generation.id, source.chunk.id)
+    physical_id = source.vector_id
     await table.update(where=f"id = {quote(physical_id)}", updates={column: corrupt_value})
 
     inspection = await shadows.inspect(generation, lease=lease)
@@ -500,7 +517,55 @@ async def test_inspection_pages_are_stably_keyset_bounded(data_dir: Path) -> Non
     ]
     assert keys == sorted(keys)
     assert len(set(keys)) == 513
+
+    connection = await lancedb.connect_async(  # pyright: ignore[reportUnknownMemberType]
+        str(data_dir / "bounded-shadow")
+    )
+    table = await connection.open_table(table_name(target))
+    await table.update(updates={"document_id": "duplicate", "position": 0, "chunk_id": "duplicate"})
+    duplicate_pages = [page async for page in shadow.inspection_pages(page_size=256)]
+    assert [len(page) for page in duplicate_pages] == [256, 256, 1]
+    assert len({str(row["id"]) for page in duplicate_pages for row in page}) == 513
     await shadow.teardown()
+
+
+async def test_inspection_does_not_skip_more_than_a_page_of_duplicate_logical_keys(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    clock = Clock()
+    _, shadows, _, lease, generation, source, vector, _ = await seeded_run(
+        engine, store, data_dir, clock, run_id="duplicate-logical-rows"
+    )
+    corrupt = LanceVectorStore(shadows.directory(generation.id))
+    await corrupt.open_existing(HashEmbedder(dimension=4).fingerprint)
+    duplicates = [
+        replace(source, vector_id=f"duplicate-physical-{index}", sequence=index)
+        for index in range(300)
+    ]
+    await corrupt.upsert_snapshot(
+        duplicates,
+        [vector for _ in duplicates],
+        publication_id=generation.id,
+    )
+    connection = await lancedb.connect_async(  # pyright: ignore[reportUnknownMemberType]
+        str(shadows.directory(generation.id))
+    )
+    table = await connection.open_table(table_name(HashEmbedder(dimension=4).fingerprint))
+    await table.update(
+        updates={
+            "id": "duplicate-physical",
+            "document_id": "duplicate",
+            "position": 0,
+            "chunk_id": "duplicate",
+        }
+    )
+
+    inspection = await shadows.inspect(generation, lease=lease)
+
+    assert inspection.rows == 300
+    assert inspection.unique_chunks == 0
+    assert not inspection.lineage_valid
+    await corrupt.teardown()
 
 
 async def test_new_publication_supersedes_a_prior_publish_before_checkpoint_winner(

@@ -491,6 +491,7 @@ class LanceVectorStore:
         rows: list[dict[str, object]] = []
         for stored, vector in zip(chunks, vectors, strict=True):
             row = self._row(stored.chunk, vector, fingerprint, publication_id)
+            row[ID_COLUMN] = stored.vector_id
             row[SOURCE_VECTOR_ID_COLUMN] = stored.vector_id
             row[SOURCE_PUBLICATION_COLUMN] = stored.publication_id
             row[PUBLICATION_COLUMN] = stored.publication_id
@@ -559,17 +560,21 @@ class LanceVectorStore:
             ColumnOrdering(column_name="document_id"),
             ColumnOrdering(column_name="position"),
             ColumnOrdering(column_name=CHUNK_ID_COLUMN),
+            ColumnOrdering(column_name=ID_COLUMN),
         ]
-        after: tuple[str, int, str] | None = None
+        after: tuple[str, int, str, str] | None = None
         while True:
             query = table.query().select(columns).order_by(ordering).limit(page_size)
             if after is not None:
-                document_id, position, chunk_id = after
+                document_id, position, chunk_id, physical_id = after
                 query = query.where(
                     f"document_id > {quote(document_id)} OR "
                     f"(document_id = {quote(document_id)} AND "
                     f"(position > {position} OR "
-                    f"(position = {position} AND {CHUNK_ID_COLUMN} > {quote(chunk_id)})))"
+                    f"(position = {position} AND "
+                    f"({CHUNK_ID_COLUMN} > {quote(chunk_id)} OR "
+                    f"({CHUNK_ID_COLUMN} = {quote(chunk_id)} AND "
+                    f"{ID_COLUMN} > {quote(physical_id)})))))"
                 )
             page = await query.to_list()
             if not page:
@@ -580,6 +585,7 @@ class LanceVectorStore:
                 str(last["document_id"]),
                 int(str(last["position"])),
                 str(last[CHUNK_ID_COLUMN]),
+                str(last[ID_COLUMN]),
             )
 
     async def storage_revision(self) -> str:
@@ -1106,7 +1112,10 @@ class PublishedLanceVectorStore:
         directory = self._directory / "generations" / key if key != "legacy" else self._directory
         store = self._stores.setdefault(key, LanceVectorStore(directory))
         if key != "legacy":
-            await store.open_existing(self._configured)
+            # A wrapper may outlive an atomic pointer flip. Its old startup fingerprint is
+            # configuration for the legacy writer, not authority over a newly published,
+            # self-describing immutable generation.
+            await store.open_existing()
         else:
             stored = await store.fingerprint()
             fingerprint = self._configured or stored

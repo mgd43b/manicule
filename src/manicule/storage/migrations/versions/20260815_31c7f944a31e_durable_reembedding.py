@@ -77,6 +77,8 @@ def upgrade() -> None:
         sa.Column("complete", sa.Boolean(), nullable=False),
         sa.Column("document_count", sa.Integer(), nullable=False),
         sa.Column("chunk_count", sa.Integer(), nullable=False),
+        sa.Column("inventory_digest", sa.Text(), nullable=False),
+        sa.Column("chunk_inventory_digest", sa.Text(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_reembed_corpus_snapshots")),
     )
