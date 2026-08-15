@@ -70,11 +70,14 @@ object** in this shape:
 | `op` | yes | The operation's name. **Identical to the MCP tool's name**, so a log line, a shell pipeline and a tool call all name one operation the same way |
 | `ok` | yes | Whether this succeeded. Read it first |
 | `workspace` | yes | The tenant the operation ran in — **including on failures**, because identity here is workspace-scoped and an answer whose scope is invisible cannot be audited |
-| `data` | yes, `null` when `ok` is false | The payload |
+| `data` | yes; usually `null` when `ok` is false | The payload, including partial ingest counters on an incomplete run |
 | `error` | yes, `null` when `ok` is true | What went wrong |
 
-Both keys are always present, one of them `null`. `exclude_none` is deliberately off: absent
-and null are the same thing to a shell pipeline and different things to a typed client.
+Both keys are always present. Ordinarily one is `null`; an incomplete ingest is the one
+deliberate exception and carries both a typed `error` and its partial `IngestReport` in `data`.
+That lets automation branch on `ok` without losing the durable counters it needs for diagnosis.
+`exclude_none` is deliberately off: absent and null are the same thing to a shell pipeline and
+different things to a typed client.
 
 ### Failures
 
@@ -109,6 +112,7 @@ reads `ok` first never has two shapes to parse:
 | `UnknownEntityError`, `UnknownComponentError`, `UnknownConversationError` | 404 |
 | `NameInUseError`, `FingerprintMismatchError` | 409 |
 | `RequestValidationError` | 422 |
+| an incomplete ingest carrying partial `data` | 503 |
 | `CrossWorkspaceError`, `OSError` | 500 |
 | anything else | 400 |
 
@@ -583,14 +587,54 @@ replayed conversation claim it had cited a version that did not exist yet.
 ### `index_path` / `connector_sync` / `import` → `IngestReport`
 
 `connector`, `discovered`, `ingested`, `skipped`, `failed`, `expanded`, `by_status`, `error`,
-`elapsed_ms`.
+`outcome`, `enumeration_completed`, `watermark_advanced`, `retry_required`,
+`intentionally_bounded`, `unrecorded`, `incomplete_reason`, `elapsed_ms`.
 
 `by_status` is the run's own counter table rather than a summary of it. A document that ended
 `no_extractable_text` is neither an ingest nor a failure, and collapsing the two would hide
 exactly the outcome that needs looking at.
 
-`error` non-empty means the run did not finish. **The watermark was not advanced**, so running
-it again resumes.
+`outcome` is the automation contract:
+
+| Outcome | Envelope / CLI | Meaning |
+|---|---|---|
+| `complete` | `ok: true`, exit 0 | Enumeration finished and every accepted item has a durable outcome. `failed > 0` may still be present when those failures are recorded and repairable. |
+| `bounded` | `ok: true`, exit 0 | `--limit` intentionally stopped a prefix. `intentionally_bounded` is true and no watermark advances. |
+| `incomplete` | `ok: false`, exit 1; HTTP 503 | An unexpected enumeration or pipeline failure occurred, or an accepted document left no durable record. Retry is required. |
+
+An incomplete envelope retains this payload in `data` and puts the same typed reason in
+`error` and `data.incomplete_reason`; counters therefore survive the failure signal. The old
+free-form `data.error` remains for compatibility, but new callers should branch on `ok` and
+`data.outcome`, never parse it. `enumeration_completed` answers only whether the source walk
+finished: it can be true while `outcome` is `incomplete` when `unrecorded > 0`.
+
+The control socket proxies the same envelope unchanged. MCP returns it as a tool result. The
+scheduler counts `incomplete` as a failure and retries on its next interval. `connector_list`
+exposes `last_outcome`, `retry_required`, `last_error_type`,
+`last_enumeration_completed`, and `last_watermark_advanced` from the connector's last-run
+metadata, so an operator need not infer failure from a missing `last_synced_at`.
+
+Before this contract, a cursor expiry could return `ok: true` with `data.error` populated. It
+now retains the counters while failing explicitly:
+
+```json
+{
+  "op": "connector_sync",
+  "ok": false,
+  "data": {
+    "outcome": "incomplete",
+    "enumeration_completed": false,
+    "watermark_advanced": false,
+    "retry_required": true,
+    "discovered": 200,
+    "ingested": 180
+  },
+  "error": {
+    "type": "CursorExpiredError",
+    "message": "the search cursor expired"
+  }
+}
+```
 
 ### `doctor` → `Diagnosis`
 

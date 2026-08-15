@@ -246,9 +246,8 @@ class ScheduledSource:
     """One source's schedule, and what its last automatic run did.
 
     Kept so that the server can be asked what its scheduler has been doing without reading a
-    log. ``failures`` counts refusals the sync reported — a disabled source, an expired session —
-    and nothing ends a loop short of the server stopping, which is why there is no third counter
-    for that.
+    log. ``failures`` counts both refusals and returned incomplete outcomes; nothing ends a loop
+    short of the server stopping, so either kind is retried on the next interval.
     """
 
     name: str
@@ -268,9 +267,13 @@ class ScheduledSource:
     session and a person has to sign in, as against an instance that was unreachable and will
     probably be reachable at twenty past. Both are refusals; only one of them needs anybody.
 
-    Cleared by a run that succeeds. Nothing else clears it: a failure of a different kind on a
-    source that is also waiting to be signed in to leaves it set, because it is still true.
+    Cleared by any returned ingest report, because reaching the pipeline proves session
+    acquisition succeeded even when a later cursor or store failure makes that run incomplete.
     """
+
+    last_outcome: str = ""
+    retry_required: bool = False
+    last_error_type: str = ""
 
 
 class Scheduler:
@@ -366,7 +369,7 @@ class Scheduler:
         while True:
             await self._sleep(interval_s)
             try:
-                await self._service.connector_sync(name)
+                report = await self._service.connector_sync(name)
             except asyncio.CancelledError:
                 raise
             except SessionMissingError as exc:
@@ -393,8 +396,29 @@ class Scheduler:
                 record.failures += 1
                 announce(f"scheduled sync of {name!r} failed: {exc}")
             else:
-                record.runs += 1
+                # A returned report proves this source got past session acquisition. Keeping a
+                # prior missing-session flag raised would send the operator to sign in for a
+                # later cursor or store failure that needs a retry instead.
                 record.awaiting_sign_in = False
+                record.last_outcome = report.outcome
+                record.retry_required = report.retry_required
+                record.last_error_type = (
+                    report.incomplete_reason.type if report.incomplete_reason is not None else ""
+                )
+                if report.retry_required:
+                    record.failures += 1
+                    detail = (
+                        report.incomplete_reason.message
+                        if report.incomplete_reason is not None
+                        else report.error
+                    )
+                    announce(
+                        f"scheduled sync of {name!r} was incomplete and will be retried: "
+                        f"{record.last_error_type or 'IncompleteIngestError'}: "
+                        f"{detail}"
+                    )
+                else:
+                    record.runs += 1
 
 
 def announce(message: str) -> None:

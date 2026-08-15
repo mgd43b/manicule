@@ -12,7 +12,9 @@ The envelope carries four things before any payload:
     tool call all name the same operation the same way.
 
 ``ok``
-    Whether ``data`` or ``error`` is present. Exactly one of the two always is.
+    Whether the operation completed successfully. Most failures carry only ``error``; an
+    incomplete ingest also retains its partial counters in ``data`` so retry automation does
+    not have to choose between the failure signal and the work already committed.
 
 ``workspace``
     Which tenant the operation ran in. Present on **every** envelope, including failures,
@@ -75,6 +77,33 @@ class Envelope(BaseModel):
     data: dict[str, JsonValue] | None = None
     error: ErrorInfo | None = None
 
+    @model_validator(mode="after")
+    def one_outcome_shape(self) -> Self:
+        """Hold the data/error invariant at every constructor, not only in the helpers."""
+        if self.ok:
+            if self.data is None or self.error is not None:
+                msg = "a successful envelope requires data and forbids error"
+                raise ValueError(msg)
+            return self
+        if self.error is None:
+            msg = "a failed envelope requires error"
+            raise ValueError(msg)
+        if self.data is None:
+            return self
+        partial = IngestReport.model_validate(self.data)
+        if (
+            self.op not in {"index_path", "connector_sync", "import"}
+            or partial.outcome != "incomplete"
+            or not partial.retry_required
+            or partial.incomplete_reason != self.error
+        ):
+            msg = (
+                "a failed envelope may retain data only for a retry-required incomplete "
+                "IngestReport whose reason matches error"
+            )
+            raise ValueError(msg)
+        return self
+
     def as_json(self) -> dict[str, Any]:
         """The envelope as plain JSON-safe data.
 
@@ -91,9 +120,17 @@ def succeeded(op: str, workspace: str, payload: Payload) -> Envelope:
     return Envelope(op=op, ok=True, workspace=workspace, data=payload.model_dump(mode="json"))
 
 
-def failed(op: str, workspace: str, error: ErrorInfo) -> Envelope:
-    """Wrap a failure. The only way a failed result is built."""
-    return Envelope(op=op, ok=False, workspace=workspace, error=error)
+def failed(
+    op: str, workspace: str, error: ErrorInfo, *, payload: IngestReport | None = None
+) -> Envelope:
+    """Wrap a failure, retaining a partial result when the operation produced one."""
+    return Envelope(
+        op=op,
+        ok=False,
+        workspace=workspace,
+        data=payload.model_dump(mode="json") if payload is not None else None,
+        error=error,
+    )
 
 
 type CheckState = Literal["ok", "degraded", "failing", "unknown"]
@@ -1211,6 +1248,9 @@ class AuthProviders(Payload):
 # --- ingest --------------------------------------------------------------------------------
 
 
+type IngestOutcome = Literal["complete", "bounded", "incomplete"]
+
+
 class IngestReport(Payload):
     """What one ingest run did. Shared by ``index_path``, ``connector_sync`` and ``import``.
 
@@ -1227,6 +1267,13 @@ class IngestReport(Payload):
     expanded: int = Field(default=0, ge=0)
     by_status: dict[str, int] = Field(default_factory=dict)
     error: str = ""
+    outcome: IngestOutcome = "complete"
+    enumeration_completed: bool = True
+    watermark_advanced: bool = False
+    retry_required: bool = False
+    intentionally_bounded: bool = False
+    unrecorded: int = Field(default=0, ge=0)
+    incomplete_reason: ErrorInfo | None = None
     elapsed_ms: int = Field(default=0, ge=0)
 
 
@@ -1350,6 +1397,11 @@ class ConnectorSummary(Payload):
     last_synced_at: str | None = None
     status: str = ""
     documents: int | None = Field(default=None, ge=0)
+    last_outcome: IngestOutcome | None = None
+    retry_required: bool = False
+    last_error_type: str = ""
+    last_enumeration_completed: bool | None = None
+    last_watermark_advanced: bool | None = None
 
 
 class ConnectorList(Payload):
@@ -1740,6 +1792,7 @@ __all__ = [
     "Identity",
     "ImportReport",
     "IndexStatus",
+    "IngestOutcome",
     "IngestReport",
     "InitReport",
     "Payload",

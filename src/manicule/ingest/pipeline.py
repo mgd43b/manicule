@@ -279,6 +279,8 @@ class RunReport:
     skipped_hash: int = 0
     by_status: dict[str, int] = field(default_factory=dict[str, int])
     error: str = ""
+    error_type: str = ""
+    error_message: str = ""
 
     limited: bool = False
     """Whether ``--limit`` stopped discovery before the source was exhausted.
@@ -304,6 +306,9 @@ class RunReport:
     moves beyond it, no later sync enumerates it again and nothing anywhere reports a problem.
     """
 
+    enumeration_completed: bool = True
+    """Whether discovery exhausted the source rather than stopping or raising."""
+
     glossary_failures: list[str] = field(default_factory=list[str])
     """One line per document whose definitions the detector could not read.
 
@@ -320,6 +325,9 @@ class RunReport:
     Counts only, never content. It is what makes "the bound held" checkable by a test and by
     ``doctor`` (``docs/ingest.md`` §14) rather than a claim about code somebody has read.
     """
+
+    watermark_advanced: bool = False
+    """Whether this run persisted a new connector position."""
 
     @property
     def indexed(self) -> int:
@@ -395,8 +403,20 @@ class RunReport:
                 "skipped_hash": self.skipped_hash,
                 "by_status": dict(self.by_status),
                 "error": self.error,
+                "error_type": self.error_type,
+                "error_message": self.error_message,
                 "limited": self.limited,
                 "unrecorded": self.unrecorded,
+                "outcome": (
+                    "incomplete"
+                    if self.error or self.unrecorded
+                    else "bounded"
+                    if self.limited
+                    else "complete"
+                ),
+                "enumeration_completed": self.enumeration_completed,
+                "watermark_advanced": self.watermark_advanced,
+                "retry_required": bool(self.error or self.unrecorded),
                 "glossary_failures": list(self.glossary_failures),
                 "stages": self.stages.as_metadata(),
             }
@@ -697,7 +717,10 @@ class IngestPipeline:
             # the other stages, so what is left is to say so and leave the watermark alone.
             # Documents that were mid-write when it happened are in a non-terminal status, which
             # is what the recovery sweep (`docs/ingest.md` §6.4) exists to finish.
-            run.report.error = _first_failure(failures)
+            first, detail = _first_failure(failures)
+            run.report.error_type = type(first).__name__
+            run.report.error_message = str(first)
+            run.report.error = detail
         except BaseException:
             stages.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -707,7 +730,12 @@ class IngestPipeline:
         run.report.stages = self._stage_report(run)
         run.report.settle()
         if run.report.complete:
-            await self._advance_watermark(connector)
+            try:
+                run.report.watermark_advanced = await self._advance_watermark(connector)
+            except Exception as exc:  # noqa: BLE001 - a checkpoint failure makes this run retry
+                run.report.error_type = type(exc).__name__
+                run.report.error_message = str(exc)
+                run.report.error = f"{type(exc).__name__}: {exc}"
         await self._store.record_connector_metadata(connector.name, run.report.as_metadata())
         return run.report
 
@@ -738,6 +766,7 @@ class IngestPipeline:
         (unclean, may not).
         """
         stream = run.connector.discover(run.watermark)
+        run.report.enumeration_completed = False
         try:
             async for discovered in stream:
                 if run.stop.is_set():
@@ -749,7 +778,11 @@ class IngestPipeline:
                 if run.limit is not None and run.accepted >= run.limit:
                     run.report.limited = True
                     break
+            else:
+                run.report.enumeration_completed = True
         except Exception as exc:  # noqa: BLE001 - an enumeration failure is not a crash
+            run.report.error_type = type(exc).__name__
+            run.report.error_message = str(exc)
             run.report.error = f"{type(exc).__name__}: {exc}"
         finally:
             closer = getattr(stream, "aclose", None)
@@ -872,7 +905,7 @@ class IngestPipeline:
             peak_bodies=run.bodies_held.peak,
         )
 
-    async def _advance_watermark(self, connector: Connector) -> None:
+    async def _advance_watermark(self, connector: Connector) -> bool:
         """Record how far a complete run got, if the connector can say.
 
         **Only on a complete run**, and that is the whole of resumability. An interrupted sync
@@ -910,6 +943,8 @@ class IngestPipeline:
         reached = connector.watermark
         if reached is not None:
             await self._store.set_watermark(connector.name, reached)
+            return True
+        return False
 
     async def ingest(
         self, connector: Connector, discovered: DiscoveredDoc
@@ -2071,7 +2106,7 @@ def _report_progress(run: _Sync) -> None:
     )
 
 
-def _first_failure(failures: BaseExceptionGroup[Exception]) -> str:
+def _first_failure(failures: BaseExceptionGroup[Exception]) -> tuple[Exception, str]:
     """One line for what stopped the stages, from however many of them noticed.
 
     Several ingest workers meeting the same dead store produce several identical exceptions, and
@@ -2082,7 +2117,7 @@ def _first_failure(failures: BaseExceptionGroup[Exception]) -> str:
     flattened = _leaves(failures)
     first = flattened[0]
     detail = f"{type(first).__name__}: {first}"
-    return detail if len(flattened) == 1 else f"{detail} (and {len(flattened) - 1} more)"
+    return first, detail if len(flattened) == 1 else f"{detail} (and {len(flattened) - 1} more)"
 
 
 def _leaves(failures: BaseExceptionGroup[Exception]) -> list[Exception]:

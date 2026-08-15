@@ -11,14 +11,16 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import pytest
 from sqlalchemy import text
 
+from manicule.connectors import CursorExpiredError
 from manicule.core.content import IN_FLIGHT, DocumentStatus, Retention
 from manicule.core.embedding import IndexFingerprints
 from manicule.core.ids import content_hash, document_id
+from manicule.core.sources import Watermark
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
 from manicule.ingest.recovery import requeue_interrupted
@@ -31,10 +33,12 @@ from tests.fakes import HashEmbedder
 from tests.ingest import fakes
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from pathlib import Path
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from manicule.core.sources import DiscoveredDoc
     from manicule.storage.docstore import SqliteDocStore
 
 
@@ -514,6 +518,62 @@ async def test_run_counters_land_on_the_connector_row(
     recorded = await store.connector_metadata("memory")
     assert isinstance(recorded["last_run"], dict)
     assert recorded["last_run"]["discovered"] == 1
+    await vectors.teardown()
+
+
+async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(
+    store: SqliteDocStore,
+    data_dir: Path,
+) -> None:
+    """The real connector row distinguishes partial durable progress from its later checkpoint."""
+
+    class Expiring(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__({"a": "alpha", "b": "beta"})
+            self.expires = True
+
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return Watermark(value="position-2", observed_at=datetime.now(UTC))
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            async for found in super().discover(watermark):
+                yield found
+                if self.expires:
+                    raise CursorExpiredError("the search cursor expired")
+
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(store, vectors)
+    connector = Expiring()
+
+    assert await store.connector_metadata("memory") == {}
+    assert await store.get_watermark("memory") is None
+
+    failed = await pipeline.run(connector)
+    after_failure = await store.connector_metadata("memory")
+    assert failed.error_type == "CursorExpiredError"
+    assert failed.indexed == 1
+    assert len(await store.list_documents()) == 1
+    assert await store.get_watermark("memory") is None
+    assert after_failure["last_synced_at"] is None
+    assert after_failure["last_run"]["outcome"] == "incomplete"
+    assert after_failure["last_run"]["watermark_advanced"] is False
+
+    connector.expires = False
+    completed = await pipeline.run(connector)
+    after_retry = await store.connector_metadata("memory")
+    watermark = await store.get_watermark("memory")
+    assert completed.complete
+    assert completed.watermark_advanced
+    assert len(await store.list_documents()) == 2
+    assert watermark is not None
+    assert watermark.value == "position-2"
+    assert isinstance(after_retry["last_synced_at"], str)
+    assert after_retry["last_run"]["outcome"] == "complete"
+    assert after_retry["last_run"]["watermark_advanced"] is True
     await vectors.teardown()
 
 

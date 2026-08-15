@@ -16,10 +16,11 @@ number somebody has to re-derive and state, which is the point.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
 
+from manicule.connectors import CursorExpiredError
 from manicule.core.content import Chunk, Document, DocumentStatus, RawDocument
 from manicule.core.ids import content_hash
 from manicule.ingest.middleware import MiddlewareRunner
@@ -554,9 +555,13 @@ class _Positioned(fakes.ObservedConnector):
         async for found in super().discover(watermark):
             if self.fail_after is not None and emitted >= self.fail_after:
                 msg = "the search cursor expired"
-                raise RuntimeError(msg)
+                raise CursorExpiredError(msg)
             emitted += 1
             yield found
+
+
+def _last_run(store: fakes.MemoryIngestStore) -> dict[str, Any]:
+    return cast("dict[str, Any]", store.connector_meta["memory"]["last_run"])
 
 
 async def test_a_complete_run_advances_the_watermark_however_the_documents_finished() -> None:
@@ -571,6 +576,7 @@ async def test_a_complete_run_advances_the_watermark_however_the_documents_finis
     report = await pipeline.run(_Positioned(corpus(12)))
 
     assert report.complete
+    assert report.watermark_advanced
     assert store.watermarks["memory"].value == "position-1"
 
 
@@ -583,8 +589,71 @@ async def test_a_partial_discovery_does_not_advance_the_watermark() -> None:
     report = await pipeline.run(connector)
 
     assert not report.clean
+    assert not report.watermark_advanced
     assert "cursor expired" in report.error
+    recorded = _last_run(store)
+    assert recorded["outcome"] == "incomplete"
+    assert recorded["enumeration_completed"] is False
+    assert recorded["retry_required"] is True
+    assert recorded["error_type"] == "CursorExpiredError"
     assert store.watermarks == {}, "a run that did not finish enumerating has no position to save"
+
+
+async def test_a_complete_retry_after_cursor_expiry_advances_the_watermark_once() -> None:
+    """Partial documents stay durable, and the next full walk is the one that checkpoints."""
+
+    class CountingStore(fakes.MemoryIngestStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.watermark_writes = 0
+
+        @override
+        async def set_watermark(self, connector: str, watermark: Watermark) -> None:
+            self.watermark_writes += 1
+            await super().set_watermark(connector, watermark)
+
+    store = CountingStore()
+    pipeline, _, _ = build(store=store, fetch_concurrency=4, parse_workers=2)
+    connector = _Positioned(corpus(12))
+    connector.fail_after = 4
+
+    failed = await pipeline.run(connector)
+    assert failed.indexed == 4
+    assert store.watermark_writes == 0
+    assert len(store.documents) == 4
+
+    connector.fail_after = None
+    completed = await pipeline.run(connector)
+    assert completed.complete
+    assert completed.watermark_advanced
+    assert store.watermark_writes == 1
+    assert len(store.documents) == 12
+    recorded = _last_run(store)
+    assert recorded["outcome"] == "complete"
+    assert recorded["retry_required"] is False
+
+
+async def test_a_watermark_store_failure_is_an_incomplete_result_with_partial_counters() -> None:
+    class RefusingCheckpoint(fakes.MemoryIngestStore):
+        @override
+        async def set_watermark(self, connector: str, watermark: Watermark) -> None:
+            del connector, watermark
+            msg = "the checkpoint store is unavailable"
+            raise OSError(msg)
+
+    store = RefusingCheckpoint()
+    pipeline, _, _ = build(store=store, fetch_concurrency=4, parse_workers=2)
+
+    report = await pipeline.run(_Positioned(corpus(4)))
+
+    assert report.indexed == 4
+    assert report.error_type == "OSError"
+    assert not report.complete
+    recorded = _last_run(store)
+    assert recorded["outcome"] == "incomplete"
+    assert recorded["enumeration_completed"] is True
+    assert recorded["retry_required"] is True
+    assert recorded["watermark_advanced"] is False
 
 
 async def test_a_document_that_left_no_record_at_all_holds_the_watermark_back() -> None:
@@ -607,6 +676,10 @@ async def test_a_document_that_left_no_record_at_all_holds_the_watermark_back() 
     assert report.clean, "a fetch failure is not an enumeration failure"
     assert report.unrecorded == 1
     assert not report.complete
+    recorded = _last_run(store)
+    assert recorded["outcome"] == "incomplete"
+    assert recorded["enumeration_completed"] is True
+    assert recorded["retry_required"] is True
     assert store.watermarks == {}
 
 
@@ -627,6 +700,7 @@ async def test_a_failure_that_did_leave_a_row_does_not_hold_the_watermark_back()
     assert report.by_status[DocumentStatus.FAILED.value] == 6
     assert report.unrecorded == 0
     assert report.complete
+    assert report.watermark_advanced
     assert store.watermarks["memory"].value == "position-1"
 
 
@@ -665,6 +739,11 @@ async def test_a_run_stopped_by_a_limit_is_bounded_rather_than_clean() -> None:
     assert report.limited, "but discovery stopped before the source was exhausted"
     assert not report.complete
     assert store.watermarks == {}
+    recorded = _last_run(store)
+    assert recorded["outcome"] == "bounded"
+    assert recorded["enumeration_completed"] is False
+    assert recorded["retry_required"] is False
+    assert recorded["watermark_advanced"] is False
 
 
 async def test_members_found_inside_a_container_do_not_consume_the_limit() -> None:

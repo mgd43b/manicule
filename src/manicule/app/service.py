@@ -886,6 +886,16 @@ class ApplicationService:
         summaries: list[r.ConnectorSummary] = []
         for name, configured in sorted(self.settings.connectors.items()):
             metadata = await store.connector_metadata(name)
+            recorded = metadata.get("last_run")
+            last_run = cast("dict[str, Any]", recorded) if isinstance(recorded, dict) else {}
+            raw_outcome = last_run.get("outcome")
+            last_outcome: r.IngestOutcome | None = (
+                cast("r.IngestOutcome", raw_outcome)
+                if raw_outcome in {"complete", "bounded", "incomplete"}
+                else None
+            )
+            raw_enumeration_completed = last_run.get("enumeration_completed")
+            raw_watermark_advanced = last_run.get("watermark_advanced")
             summaries.append(
                 r.ConnectorSummary(
                     name=name,
@@ -895,6 +905,17 @@ class ApplicationService:
                     last_synced_at=_text_or_none(metadata.get("last_synced_at")),
                     status=_text(metadata.get("status")),
                     documents=await store.count_documents(source=name),
+                    last_outcome=last_outcome,
+                    retry_required=last_run.get("retry_required") is True,
+                    last_error_type=_text(last_run.get("error_type")),
+                    last_enumeration_completed=(
+                        raw_enumeration_completed
+                        if isinstance(raw_enumeration_completed, bool)
+                        else None
+                    ),
+                    last_watermark_advanced=(
+                        raw_watermark_advanced if isinstance(raw_watermark_advanced, bool) else None
+                    ),
                 )
             )
         return r.ConnectorList(count=len(summaries), connectors=tuple(summaries))
@@ -4559,6 +4580,20 @@ def _summary(document: Document, *, chunk_count: int | None = None) -> r.Documen
 
 
 def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
+    incomplete = bool(report.error or report.unrecorded)
+    bounded = report.limited and not incomplete
+    reason: r.ErrorInfo | None = None
+    if incomplete:
+        reason = r.ErrorInfo(
+            type=report.error_type or "IncompleteIngestError",
+            message=report.error_message
+            or (
+                f"{report.unrecorded} accepted document(s) left no durable record"
+                if report.unrecorded
+                else report.error
+            ),
+            hint="Run the same ingest operation again; its watermark was not advanced.",
+        )
     return r.IngestReport(
         connector=report.connector,
         discovered=report.discovered,
@@ -4568,6 +4603,13 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         expanded=report.expanded,
         by_status=dict(report.by_status),
         error=report.error,
+        outcome="incomplete" if incomplete else "bounded" if bounded else "complete",
+        enumeration_completed=report.enumeration_completed,
+        watermark_advanced=report.watermark_advanced,
+        retry_required=incomplete,
+        intentionally_bounded=bounded,
+        unrecorded=report.unrecorded,
+        incomplete_reason=reason,
         elapsed_ms=_millis(started),
     )
 
