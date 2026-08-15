@@ -790,6 +790,36 @@ async def test_a_content_addressed_publication_is_physically_immutable(tmp_path:
     assert found[0].score == pytest.approx(1.0)
 
 
+async def test_generation_validation_scopes_all_documents_to_the_exact_publication(
+    tmp_path: Path,
+) -> None:
+    store = await prepared(tmp_path / "multi-document-publication")
+    first = chunk("first", document_id="document-1")
+    second = chunk("second", document_id="document-2")
+    unrelated = chunk("unrelated", document_id="document-old")
+    await store.upsert([unrelated], [[1.0, 0.0, 0.0, 0.0]], publication_id="generation")
+    assert not await store.publication_is_complete(
+        "generation", [], embedding_fingerprint=fingerprint().canonical()
+    )
+    assert await store.publication_is_complete(
+        "empty-generation", [], embedding_fingerprint=fingerprint().canonical()
+    )
+    await store.upsert([first], [[0.0, 1.0, 0.0, 0.0]], publication_id="generation")
+
+    assert not await store.publication_is_complete(
+        "generation", [first, second], embedding_fingerprint=fingerprint().canonical()
+    )
+    await store.upsert([second], [[0.0, 0.0, 1.0, 0.0]], publication_id="generation")
+    assert not await store.publication_is_complete(
+        "generation", [first, second], embedding_fingerprint=fingerprint().canonical()
+    )
+    await store.upsert([first], [[0.0, 1.0, 0.0, 0.0]], publication_id="generation-clean")
+    await store.upsert([second], [[0.0, 0.0, 1.0, 0.0]], publication_id="generation-clean")
+    assert await store.publication_is_complete(
+        "generation-clean", [first, second], embedding_fingerprint=fingerprint().canonical()
+    )
+
+
 async def test_a_reused_vector_is_the_stored_vector_to_the_last_bit(
     store: LanceVectorStore,
 ) -> None:

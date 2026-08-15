@@ -15,13 +15,14 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import AsyncIterator
+from typing import override
 
 from pydantic import BaseModel, Field
 
 from manicule.container import keys
 from manicule.core.anchors import Anchor, Unlocated
-from manicule.core.content import BlockKind, ParsedBlock, RawDocument
-from manicule.core.protocols import Parser
+from manicule.core.content import BlockKind, Chunk, Document, ParsedBlock, RawDocument
+from manicule.core.protocols import Middleware, Parser
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
 
 HANGING_MEDIA_TYPE = "text/x-hangs"
@@ -118,6 +119,74 @@ class CrashingParser:
         return None
 
 
+class ExpandingMiddleware(Middleware):
+    """Returns a bounded-looking chunk with an enormous embedding body."""
+
+    name = "expanding"
+    mutates_embedded_text = True
+
+    def __init__(self, config: HostileConfig) -> None:
+        self._config = config
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        del document
+        suffix = "x" * (self._config.chunk_megabytes * 1024 * 1024)
+        return [
+            chunk.model_copy(update={"embed_text": chunk.embed_text + suffix}) for chunk in chunks
+        ]
+
+
+class StatefulMiddleware(Middleware):
+    """Requires all three hooks to run on one component instance in order."""
+
+    name = "stateful"
+    mutates_embedded_text = True
+
+    def __init__(self) -> None:
+        self._stage = 0
+
+    @override
+    async def before_parse(self, raw: RawDocument) -> RawDocument:
+        if self._stage != 0:
+            raise RuntimeError("before_parse did not start the middleware session")
+        self._stage = 1
+        return raw
+
+    @override
+    async def after_parse(self, document: Document, blocks: list[ParsedBlock]) -> list[ParsedBlock]:
+        del document
+        if self._stage != 1:
+            raise RuntimeError("after_parse ran on a different middleware session")
+        self._stage = 2
+        return blocks
+
+    @override
+    async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+        del document
+        if self._stage != 2:  # noqa: PLR2004 - third hook in the explicit state machine
+            raise RuntimeError("after_chunk ran on a different middleware session")
+        self._stage = 3
+        return [
+            chunk.model_copy(update={"embed_text": f"{chunk.embed_text}|stateful"})
+            for chunk in chunks
+        ]
+
+
+class HangingMiddleware(Middleware):
+    """Blocks inside a relational stage so cancellation ownership is measurable."""
+
+    name = "hanging-stage"
+
+    def __init__(self, config: HostileConfig) -> None:
+        self._config = config
+
+    @override
+    async def before_parse(self, raw: RawDocument) -> RawDocument:
+        time.sleep(self._config.hang_seconds)  # noqa: ASYNC251 - deliberately uncooperative
+        return raw
+
+
 class HostilePlugin:
     """The plugin object the entry point resolves to."""
 
@@ -150,6 +219,23 @@ class HostilePlugin:
             summary="Ends the interpreter mid-parse, the way a native crash does.",
             media_types={CRASHING_MEDIA_TYPE},
         )
+        registry.add(
+            keys.MIDDLEWARE.named("expanding"),
+            lambda context: ExpandingMiddleware(_config(context)),
+            config_model=HostileConfig,
+            summary="Amplifies chunk output so parent-side materialization can be detected.",
+        )
+        registry.add(
+            keys.MIDDLEWARE.named("stateful"),
+            lambda context: StatefulMiddleware(),
+            summary="Requires one component instance across every document hook.",
+        )
+        registry.add(
+            keys.MIDDLEWARE.named("hanging-stage"),
+            lambda context: HangingMiddleware(_config(context)),
+            config_model=HostileConfig,
+            summary="Blocks inside middleware so cancellation cleanup can be proven.",
+        )
 
 
 def _config(context: BuildContext) -> HostileConfig:
@@ -163,6 +249,9 @@ _plugin: Plugin = PLUGIN
 _hanging: Parser = HangingParser(HostileConfig())
 _greedy: Parser = GreedyParser(HostileConfig())
 _crashing: Parser = CrashingParser(HostileConfig())
+_expanding: Middleware = ExpandingMiddleware(HostileConfig())
+_stateful: Middleware = StatefulMiddleware()
+_hanging_stage: Middleware = HangingMiddleware(HostileConfig())
 
 __all__ = [
     "CRASHING_MEDIA_TYPE",
@@ -170,8 +259,11 @@ __all__ = [
     "HANGING_MEDIA_TYPE",
     "PLUGIN",
     "CrashingParser",
+    "ExpandingMiddleware",
     "GreedyParser",
+    "HangingMiddleware",
     "HangingParser",
     "HostileConfig",
     "HostilePlugin",
+    "StatefulMiddleware",
 ]

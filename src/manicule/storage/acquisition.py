@@ -45,7 +45,7 @@ from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import next_observation, utcnow
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import AsyncIterator, Mapping, Sequence
     from datetime import datetime
 
     from sqlalchemy import CursorResult
@@ -269,33 +269,20 @@ def _manifest_member(row: models.AcquisitionRecord) -> dict[str, object]:
 
 
 async def _manifest_digest(session: AsyncSession, run_id: str) -> str:
-    """Hash a manifest in bounded keyset pages after every acquisition outcome is final."""
+    """Hash an ordered manifest through one cursor while retaining one ORM row at a time."""
     digest = hashlib.blake2b(digest_size=32)
-    after = -1
-    while True:
-        rows = (
-            (
-                await session.execute(
-                    select(models.AcquisitionRecord)
-                    .where(
-                        models.AcquisitionRecord.run_id == run_id,
-                        models.AcquisitionRecord.sequence > after,
-                    )
-                    .order_by(models.AcquisitionRecord.sequence)
-                    .limit(100)
-                )
-            )
-            .scalars()
-            .all()
+    rows = await session.stream_scalars(
+        select(models.AcquisitionRecord)
+        .where(models.AcquisitionRecord.run_id == run_id)
+        .order_by(models.AcquisitionRecord.sequence)
+        .execution_options(yield_per=1)
+    )
+    async for record in rows:
+        digest.update(
+            json.dumps(_manifest_member(record), sort_keys=True, separators=(",", ":")).encode()
         )
-        if not rows:
-            return digest.hexdigest()
-        for record in rows:
-            digest.update(
-                json.dumps(_manifest_member(record), sort_keys=True, separators=(",", ":")).encode()
-            )
-            digest.update(b"\n")
-        after = rows[-1].sequence
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 async def _canonicalize_snapshot_diagnostics(session: AsyncSession, run_id: str) -> None:
@@ -387,6 +374,11 @@ def _matching_run_identity(
         and row.scope_inventory_complete is scope_inventory_complete
         and stored_policy is promotion_policy
     )
+
+
+async def snapshot_manifest_matches(session: AsyncSession, run_id: str, expected: str) -> bool:
+    """Verify one canonical manifest inside a caller-owned transaction."""
+    return await _manifest_matches(session, run_id, expected)
 
 
 class AcquisitionJournalMixin(WorkspaceScoped):
@@ -1247,6 +1239,27 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 )
             ).scalars()
             return [_record(row) for row in rows]
+
+    async def iter_acquisition_records(
+        self,
+        run_id: str,
+        *,
+        states: Sequence[AcquisitionRecordState] | None = None,
+    ) -> AsyncIterator[AcquisitionRecord]:
+        """Stream one ordered manifest with one SQL statement and one-record ORM batches."""
+        async with self._sessions() as session:
+            await self._required_run_row(session, run_id)
+            statement = select(models.AcquisitionRecord).where(
+                models.AcquisitionRecord.run_id == run_id,
+                models.AcquisitionRecord.workspace_id == self._workspace_id,
+            )
+            if states:
+                statement = statement.where(models.AcquisitionRecord.state.in_(states))
+            rows = await session.stream_scalars(
+                statement.order_by(models.AcquisitionRecord.sequence).execution_options(yield_per=1)
+            )
+            async for row in rows:
+                yield _record(row)
 
     @translate_storage_capacity_errors
     async def transition_acquisition_record(  # noqa: PLR0912, PLR0915 - one atomic state edge
@@ -2147,4 +2160,5 @@ __all__ = [
     "AcquisitionJournalMixin",
     "AcquisitionWatermarkConflictError",
     "InvalidAcquisitionTransitionError",
+    "snapshot_manifest_matches",
 ]

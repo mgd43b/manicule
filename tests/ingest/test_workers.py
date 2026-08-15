@@ -8,9 +8,15 @@ under test — a deadline that fires against native code, a memory bound that ca
 
 from __future__ import annotations
 
+import asyncio
+import multiprocessing
+import os
+import socket
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 from manicule_plugin_example import MEDIA_TYPE as EXAMPLE_MEDIA_TYPE
@@ -18,35 +24,43 @@ from manicule_plugin_hostile import (
     CRASHING_MEDIA_TYPE,
     GREEDY_MEDIA_TYPE,
     HANGING_MEDIA_TYPE,
+    StatefulMiddleware,
 )
 
-from manicule.core.content import DocumentStatus, RawDocument
+import manicule.ingest.workers as worker_module
+from manicule.core.anchors import Unlocated
+from manicule.core.content import BlockKind, Chunk, DocumentStatus, ParsedBlock, RawDocument
 from manicule.ingest.limits import (
     ADDRESS_SPACE_HEADROOM,
     limit_address_space,
     resident_bytes,
 )
+from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.workers import (
     MEGABYTE,
     InProcessRunner,
+    StageFailure,
     WorkerConfig,
     WorkerPool,
     default_worker_count,
 )
 from manicule.parsers.chain import Outcome, run_chain
+from tests.embedding_support import write_tokenizer
 from tests.ingest import fakes
+from tests.storage_helpers import make_document
 
 pytestmark = pytest.mark.slow
 
 
 def _config(tmp_path: Path, **overrides: object) -> WorkerConfig:
-    return WorkerConfig(
-        data_dir=tmp_path / "data",
-        cache_dir=tmp_path / "cache",
-        parser_fallbacks={},
-        plugin_config={},
-        **overrides,  # pyright: ignore[reportArgumentType] - test-local keyword passthrough
-    )
+    values: dict[str, object] = {
+        "data_dir": tmp_path / "data",
+        "cache_dir": tmp_path / "cache",
+        "parser_fallbacks": {},
+        "plugin_config": {},
+        **overrides,
+    }
+    return WorkerConfig.model_validate(values)
 
 
 def _raw(media_type: str, content: str = "alpha") -> RawDocument:
@@ -182,6 +196,376 @@ async def test_a_killed_worker_is_replaced_and_the_pool_keeps_working(
     )
 
 
+async def test_repeated_cancel_during_parser_retire_restores_the_only_permit(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exchange thread and replacement reach a known endpoint before cancel propagates."""
+    del manicule_environment
+    async with WorkerPool(_config(tmp_path), workers=1, timeout_s=60.0) as pool:
+        baseline_children = len(multiprocessing.active_children())
+        retiring = asyncio.Event()
+        release = asyncio.Event()
+        original_retire = pool._retire  # pyright: ignore[reportPrivateUsage]
+
+        async def delayed_retire(worker: object) -> None:
+            retiring.set()
+            await release.wait()
+            await original_retire(worker)  # pyright: ignore[reportArgumentType]
+
+        monkeypatch.setattr(pool, "_retire", delayed_retire)
+        parsing = asyncio.create_task(pool.run_attempt("hanging", _raw(HANGING_MEDIA_TYPE)))
+        await asyncio.sleep(0.05)
+        parsing.cancel()
+        await asyncio.wait_for(retiring.wait(), timeout=10)
+        parsing.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await parsing
+
+        assert len(multiprocessing.active_children()) == baseline_children
+        async with asyncio.timeout(10):
+            after = await pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE))
+        assert after.attempt.outcome is Outcome.PARSED
+        assert len(multiprocessing.active_children()) == baseline_children
+
+
+async def test_cancel_during_spawn_rolls_setup_back_to_a_reusable_pool(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canceled readiness wait cannot leave `_started` true over a missing permit."""
+    del manicule_environment
+    baseline = {child.pid for child in multiprocessing.active_children()}
+    entered = threading.Event()
+    release = threading.Event()
+    original = worker_module._await_ready  # pyright: ignore[reportPrivateUsage]
+
+    def delayed_ready(connection: object, timeout: float = 60.0) -> object:
+        entered.set()
+        release.wait(timeout=10)
+        return original(connection, timeout)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(worker_module, "_await_ready", delayed_ready)
+    pool = WorkerPool(_config(tmp_path), workers=1, timeout_s=5.0)
+    starting = asyncio.create_task(pool.setup())
+    assert await asyncio.to_thread(entered.wait, 10)
+    starting.cancel()
+    starting.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+    monkeypatch.setattr(worker_module, "_await_ready", original)
+    await pool.setup()
+    result = await asyncio.wait_for(
+        pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)), timeout=10
+    )
+    assert result.attempt.outcome is Outcome.PARSED
+    await pool.teardown()
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+
+async def test_repeated_cancel_during_multiworker_teardown_reaps_every_snapshot(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown remains the owner of every snapshotted child through repeated cancellation."""
+    del manicule_environment
+    baseline = {child.pid for child in multiprocessing.active_children()}
+    pool = WorkerPool(_config(tmp_path), workers=3, timeout_s=5.0)
+    await pool.setup()
+    owned = {worker.pid for worker in pool._live}  # pyright: ignore[reportPrivateUsage]
+    assert len(owned) == 3
+
+    entered = 0
+    entered_lock = threading.Lock()
+    all_entered = threading.Event()
+    release = threading.Event()
+    original = worker_module._Worker.terminate  # pyright: ignore[reportPrivateUsage]
+
+    def delayed_terminate(worker: object) -> None:
+        nonlocal entered
+        with entered_lock:
+            entered += 1
+            if entered == 3:
+                all_entered.set()
+        release.wait(timeout=10)
+        original(worker)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(worker_module._Worker, "terminate", delayed_terminate)  # pyright: ignore[reportPrivateUsage]
+    stopping = asyncio.create_task(pool.teardown())
+    assert await asyncio.to_thread(all_entered.wait, 10)
+    stopping.cancel()
+    stopping.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+
+    active = {child.pid for child in multiprocessing.active_children()}
+    assert not (owned & active)
+    assert active == baseline
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_teardown_fences_a_checked_out_attempt_before_reusable_setup(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late release from an old generation cannot repopulate a stopped pool."""
+    del manicule_environment
+    baseline = {child.pid for child in multiprocessing.active_children()}
+    pool = WorkerPool(_config(tmp_path), workers=2, timeout_s=5.0)
+    await pool.setup()
+    replied = asyncio.Event()
+    release = asyncio.Event()
+    original_dispatch = pool._dispatch  # pyright: ignore[reportPrivateUsage]
+
+    async def held_dispatch(worker: object, request: object) -> object:
+        result = await original_dispatch(worker, request)  # pyright: ignore[reportArgumentType]
+        replied.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(pool, "_dispatch", held_dispatch)
+    attempt = asyncio.create_task(pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)))
+    await asyncio.wait_for(replied.wait(), timeout=10)
+
+    await pool.teardown()
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 0  # pyright: ignore[reportPrivateUsage]
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+    release.set()
+    result = await asyncio.wait_for(attempt, timeout=10)
+    assert result.attempt.outcome is Outcome.PARSED
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 0  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(pool, "_dispatch", original_dispatch)
+    await pool.setup()
+    assert len(pool._live) == 2  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 2  # pyright: ignore[reportPrivateUsage]
+    active = {child.pid for child in multiprocessing.active_children()}
+    assert len(active - baseline) == 2
+    after = await asyncio.wait_for(
+        pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)), timeout=10
+    )
+    assert after.attempt.outcome is Outcome.PARSED
+    assert len(pool._live) == 2  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 2  # pyright: ignore[reportPrivateUsage]
+    await pool.teardown()
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+
+async def test_repeated_cancel_after_permit_selection_restores_exact_width(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation while joining the losing close waiter cannot consume the worker."""
+    del manicule_environment
+    async with WorkerPool(_config(tmp_path), workers=1, timeout_s=5.0) as pool:
+        selected = asyncio.Event()
+        hold_selection = asyncio.Event()
+        restoring = asyncio.Event()
+        release_restore = asyncio.Event()
+        original = pool._finish_permit_selection  # pyright: ignore[reportPrivateUsage]
+        original_restore = pool._restore_permit  # pyright: ignore[reportPrivateUsage]
+
+        async def held_finish(closed_task: asyncio.Task[bool]) -> None:
+            selected.set()
+            await hold_selection.wait()
+            await original(closed_task)
+
+        async def held_restore(permit: object, generation: int) -> None:
+            restoring.set()
+            await release_restore.wait()
+            await original_restore(permit, generation)  # pyright: ignore[reportArgumentType]
+
+        monkeypatch.setattr(pool, "_finish_permit_selection", held_finish)
+        monkeypatch.setattr(pool, "_restore_permit", held_restore)
+        attempt = asyncio.create_task(pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)))
+        await asyncio.wait_for(selected.wait(), timeout=10)
+        attempt.cancel()
+        await asyncio.wait_for(restoring.wait(), timeout=10)
+        attempt.cancel()
+        release_restore.set()
+        with pytest.raises(asyncio.CancelledError):
+            await attempt
+
+        assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+        assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setattr(pool, "_finish_permit_selection", original)
+        monkeypatch.setattr(pool, "_restore_permit", original_restore)
+        after = await asyncio.wait_for(
+            pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)), timeout=10
+        )
+        assert after.attempt.outcome is Outcome.PARSED
+        assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+        assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_repeated_cancel_during_lazy_spawn_readiness_restores_exact_width(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The empty permit and appended child remain owned through readiness cancellation."""
+    del manicule_environment
+    baseline = {child.pid for child in multiprocessing.active_children()}
+    pool = WorkerPool(_config(tmp_path), workers=1, timeout_s=5.0)
+    await pool.setup()
+    worker = await pool._idle.get()  # pyright: ignore[reportPrivateUsage]
+    assert worker is not None
+    await pool._retire(worker)  # pyright: ignore[reportPrivateUsage]
+    pool._idle.put_nowait(None)  # pyright: ignore[reportPrivateUsage]
+
+    entered = threading.Event()
+    stopped = asyncio.Event()
+    release = threading.Event()
+    original = worker_module._await_ready  # pyright: ignore[reportPrivateUsage]
+    original_stop = worker_module._stop  # pyright: ignore[reportPrivateUsage]
+
+    def delayed_ready(connection: object, timeout: float = 60.0) -> object:
+        entered.set()
+        release.wait(timeout=10)
+        return original(connection, timeout)  # pyright: ignore[reportArgumentType]
+
+    def observed_stop(worker: object) -> None:
+        original_stop(worker)  # pyright: ignore[reportArgumentType]
+        stopped.set()
+
+    monkeypatch.setattr(worker_module, "_await_ready", delayed_ready)
+    monkeypatch.setattr(worker_module, "_stop", observed_stop)
+    attempt = asyncio.create_task(pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)))
+    assert await asyncio.to_thread(entered.wait, 10)
+    attempt.cancel()
+    await asyncio.wait_for(stopped.wait(), timeout=10)
+    attempt.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await attempt
+
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+    monkeypatch.setattr(worker_module, "_await_ready", original)
+    monkeypatch.setattr(worker_module, "_stop", original_stop)
+
+    after = await asyncio.wait_for(
+        pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)), timeout=10
+    )
+    assert after.attempt.outcome is Outcome.PARSED
+    assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
+    await pool.teardown()
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+
+async def test_repeated_cancel_at_completed_checkout_handoff_restores_exact_width(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed worker remains owned until the shield hands it to `run_attempt`."""
+    del manicule_environment
+    async with WorkerPool(_config(tmp_path), workers=1, timeout_s=5.0) as pool:
+        completed = asyncio.Event()
+        hold_delivery = asyncio.Event()
+        restoring = asyncio.Event()
+        release_restore = asyncio.Event()
+        original_delivery = pool._deliver_checkout  # pyright: ignore[reportPrivateUsage]
+        original_restore = pool._restore_permit  # pyright: ignore[reportPrivateUsage]
+
+        async def held_delivery(
+            checkout: asyncio.Task[object],
+        ) -> object:
+            result = await asyncio.shield(checkout)
+            completed.set()
+            await hold_delivery.wait()
+            return result
+
+        async def held_restore(worker: object, generation: int) -> None:
+            restoring.set()
+            await release_restore.wait()
+            await original_restore(worker, generation)  # pyright: ignore[reportArgumentType]
+
+        monkeypatch.setattr(pool, "_deliver_checkout", held_delivery)
+        monkeypatch.setattr(pool, "_restore_permit", held_restore)
+        attempt = asyncio.create_task(pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)))
+        await asyncio.wait_for(completed.wait(), timeout=10)
+        attempt.cancel()
+        await asyncio.wait_for(restoring.wait(), timeout=10)
+        attempt.cancel()
+        release_restore.set()
+        with pytest.raises(asyncio.CancelledError):
+            await attempt
+
+        assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+        assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setattr(pool, "_deliver_checkout", original_delivery)
+        monkeypatch.setattr(pool, "_restore_permit", original_restore)
+        after = await asyncio.wait_for(
+            pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)), timeout=10
+        )
+        assert after.attempt.outcome is Outcome.PARSED
+        assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+        assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_teardown_joins_replacement_retirement_before_exact_width_restart(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removal from `_live` cannot expose an old child beyond teardown's endpoint."""
+    del manicule_environment
+    baseline = {child.pid for child in multiprocessing.active_children()}
+    pool = WorkerPool(_config(tmp_path), workers=1, timeout_s=5.0, max_documents=1)
+    await pool.setup()
+    assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+    old_pid = pool._live[0].pid  # pyright: ignore[reportPrivateUsage]
+    terminating = threading.Event()
+    release = threading.Event()
+    original = worker_module._Worker.terminate  # pyright: ignore[reportPrivateUsage]
+
+    def held_old_terminate(worker: worker_module._Worker) -> None:  # pyright: ignore[reportPrivateUsage]
+        if worker.pid == old_pid:
+            terminating.set()
+            release.wait(timeout=10)
+        original(worker)
+
+    monkeypatch.setattr(worker_module._Worker, "terminate", held_old_terminate)  # pyright: ignore[reportPrivateUsage]
+    attempt = asyncio.create_task(pool.run_attempt("example", _raw(EXAMPLE_MEDIA_TYPE)))
+    assert await asyncio.to_thread(terminating.wait, 10)
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
+
+    stopping = asyncio.create_task(pool.teardown())
+    await asyncio.sleep(0)
+    assert not stopping.done(), "teardown must join the removed worker's retirement"
+    release.set()
+    result = await asyncio.wait_for(attempt, timeout=10)
+    assert result.attempt.outcome is Outcome.PARSED
+    await asyncio.wait_for(stopping, timeout=10)
+    assert pool._live == []  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 0  # pyright: ignore[reportPrivateUsage]
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+    monkeypatch.setattr(worker_module._Worker, "terminate", original)  # pyright: ignore[reportPrivateUsage]
+    await pool.setup()
+    assert len(pool._live) == 1  # pyright: ignore[reportPrivateUsage]
+    assert pool._idle.qsize() == 1  # pyright: ignore[reportPrivateUsage]
+    assert len({child.pid for child in multiprocessing.active_children()} - baseline) == 1
+    await pool.teardown()
+    assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+
 def test_the_default_worker_count_leaves_a_core_for_the_parent() -> None:
     """The parent does the embedding and every write, so it is not a spare."""
     count = default_worker_count()
@@ -240,6 +624,246 @@ async def test_an_archive_is_expanded_rather_than_parsed_for_blocks() -> None:
 
     assert result.attempt.outcome is Outcome.PARSED
     assert len(result.members) == 2
+
+
+async def test_complete_parsed_block_reply_is_refused_before_crossing_budget() -> None:
+    """The child reply budget covers ordinary blocks, not only container members."""
+    runner = InProcessRunner({"lines": fakes.LineParser()})
+
+    result = await runner.run_attempt(
+        "lines",
+        _raw("text/plain", "x" * 16_384),
+        max_output_bytes=1_024,
+        memory_limit_bytes=64 * MEGABYTE,
+    )
+
+    assert result.blocks == []
+    assert result.members == ()
+    assert result.attempt.outcome is Outcome.FAILED
+    assert result.attempt.reason == "memory_bound"
+
+
+async def test_middleware_and_chunker_output_never_materializes_in_serving_parent(
+    tmp_path: Path, manicule_environment: Path
+) -> None:
+    """An oversized hook result is measured in the disposable child, not this process."""
+    del manicule_environment
+    config = _config(
+        tmp_path,
+        middleware=("expanding",),
+        plugin_config={"middleware.expanding": {"chunk_megabytes": 16}},
+        memory_limit_bytes=1024 * MEGABYTE,
+    )
+    raw = _raw("text/plain", "small source")
+    document = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=raw.as_bytes(),
+        uri=raw.uri,
+        media_type=raw.media_type,
+    )
+    blocks = [
+        ParsedBlock(
+            kind=BlockKind.PROSE,
+            text="small source",
+            anchor=Unlocated(reason="worker isolation regression"),
+        )
+    ]
+    parent_before = resident_bytes(os.getpid())
+    async with WorkerPool(config, workers=1, timeout_s=30.0) as pool:
+        result = await pool.run_after_parse_and_chunk(
+            document,
+            blocks,
+            max_output_bytes=64 * 1024,
+            memory_limit_bytes=1024 * MEGABYTE,
+            title="Hostile expansion",
+            media_type=raw.media_type,
+            detect_glossary=True,
+        )
+    parent_after = resident_bytes(os.getpid())
+
+    assert result.reason is StageFailure.MEMORY_BOUND
+    assert result.value is None
+    if parent_before is not None and parent_after is not None:
+        assert parent_after - parent_before < 8 * MEGABYTE
+
+
+async def test_stage_session_never_attempts_model_discovery_network(
+    tmp_path: Path,
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chunking uses a local resolved tokenizer, never an embedder factory or HF discovery."""
+    del manicule_environment
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.settimeout(0.05)
+    attempted = threading.Event()
+    stopped = threading.Event()
+
+    def observe() -> None:
+        while not stopped.is_set():
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            attempted.set()
+            connection.close()
+
+    observer = threading.Thread(target=observe, name="stage-network-observer", daemon=True)
+    observer.start()
+    port = listener.getsockname()[1]
+    monkeypatch.setenv("HF_ENDPOINT", f"http://127.0.0.1:{port}")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty-hf-home"))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    tokenizer_file = tmp_path / "resolved-model" / "tokenizer.json"
+    write_tokenizer(tokenizer_file)
+    config = _config(
+        tmp_path,
+        stage_tokenizer_file=tokenizer_file,
+        stage_tokenizer_id="local-test-tokenizer",
+        stage_max_tokens=512,
+        stage_overlap_tokens=64,
+    )
+    try:
+        async with WorkerPool(config, workers=1, timeout_s=10.0) as pool:
+            result = await pool.run_before_parse(
+                _raw("text/plain"),
+                max_output_bytes=MEGABYTE,
+                memory_limit_bytes=1024 * MEGABYTE,
+            )
+    finally:
+        stopped.set()
+        listener.close()
+        observer.join(timeout=1)
+
+    assert result.reason is None
+    assert not attempted.is_set(), "the isolated offline stage opened a network socket"
+
+
+async def test_one_production_stage_session_preserves_stateful_middleware_parity(
+    tmp_path: Path, manicule_environment: Path
+) -> None:
+    del manicule_environment
+    config = _config(
+        tmp_path,
+        middleware=("stateful",),
+        memory_limit_bytes=4096 * MEGABYTE,
+    )
+    raw = _raw("text/plain", "stateful source")
+    document = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=raw.as_bytes(),
+        uri=raw.uri,
+        media_type=raw.media_type,
+    )
+    blocks = [
+        ParsedBlock(
+            kind=BlockKind.PROSE,
+            text="stateful source",
+            anchor=Unlocated(reason="stateful middleware regression"),
+        )
+    ]
+    live = MiddlewareRunner((StatefulMiddleware(),))
+    assert live.declarations() == ("stateful@",)
+    assert await live.before_parse(raw) == raw
+    await live.after_parse(document, blocks)
+
+    async with WorkerPool(config, workers=1, timeout_s=30.0) as pool:
+        session = await pool.open_stage_session(memory_limit_bytes=4096 * MEGABYTE)
+        try:
+            before = await session.run_before_parse(
+                raw,
+                max_output_bytes=MEGABYTE,
+                memory_limit_bytes=4096 * MEGABYTE,
+            )
+            offline = await session.run_after_parse_and_chunk(
+                document,
+                blocks,
+                max_output_bytes=MEGABYTE,
+                memory_limit_bytes=4096 * MEGABYTE,
+                title="Stateful",
+                media_type=raw.media_type,
+                detect_glossary=False,
+            )
+        finally:
+            await session.aclose()
+
+    assert before.reason is None
+    assert before.value == raw
+    assert offline.reason is None
+    raw_stage = cast("object", offline.value)
+    assert isinstance(raw_stage, tuple)
+    stage_value = cast("tuple[object, ...]", raw_stage)
+    assert len(stage_value) == 2
+    chunks_value, entries = stage_value
+    assert isinstance(chunks_value, tuple)
+    chunk_candidates = cast("tuple[object, ...]", chunks_value)
+    assert all(isinstance(chunk, Chunk) for chunk in chunk_candidates)
+    chunks = cast("tuple[Chunk, ...]", chunk_candidates)
+    assert entries == ()
+    assert chunks
+    base_chunks = [
+        chunk.model_copy(update={"embed_text": chunk.embed_text.removesuffix("|stateful")})
+        for chunk in chunks
+    ]
+    live_chunks = await live.after_chunk(document, base_chunks)
+    assert [chunk.embed_text for chunk in chunks] == [chunk.embed_text for chunk in live_chunks]
+
+
+async def test_repeated_stage_cancellation_reaps_every_owned_child(
+    tmp_path: Path, manicule_environment: Path
+) -> None:
+    del manicule_environment
+    config = _config(
+        tmp_path,
+        middleware=("hanging-stage",),
+        plugin_config={"middleware.hanging-stage": {"hang_seconds": 60}},
+        memory_limit_bytes=4096 * MEGABYTE,
+    )
+    async with WorkerPool(config, workers=1, timeout_s=60.0) as pool:
+        baseline = {child.pid for child in multiprocessing.active_children()}
+        for _ in range(3):
+            session = await pool.open_stage_session(memory_limit_bytes=4096 * MEGABYTE)
+            blocked = asyncio.create_task(
+                session.run_before_parse(
+                    _raw("text/plain"),
+                    max_output_bytes=MEGABYTE,
+                    memory_limit_bytes=4096 * MEGABYTE,
+                )
+            )
+            await asyncio.sleep(0.05)
+            blocked.cancel()
+            blocked.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+            await session.aclose()
+            assert {child.pid for child in multiprocessing.active_children()} == baseline
+
+
+async def test_stage_timeout_is_typed_and_carries_no_private_exception(
+    tmp_path: Path, manicule_environment: Path
+) -> None:
+    del manicule_environment
+    config = _config(
+        tmp_path,
+        middleware=("hanging-stage",),
+        plugin_config={"middleware.hanging-stage": {"hang_seconds": 60}},
+        memory_limit_bytes=4096 * MEGABYTE,
+    )
+    async with WorkerPool(config, workers=1, timeout_s=0.1, poll_interval_s=0.01) as pool:
+        result = await pool.run_before_parse(
+            _raw("text/plain"),
+            max_output_bytes=MEGABYTE,
+            memory_limit_bytes=4096 * MEGABYTE,
+        )
+
+    assert result.reason is StageFailure.TIMEOUT
+    assert result.value is None
 
 
 def test_a_deadline_measured_in_this_process_would_not_have_fired() -> None:

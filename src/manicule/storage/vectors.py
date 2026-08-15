@@ -792,6 +792,121 @@ class LanceVectorStore:
             )
         return verdicts
 
+    async def publication_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        """Whether one unpublished generation holds an exact readable vector per chunk.
+
+        Unlike :meth:`stored_vectors`, this never searches another publication or falls back
+        by embedding-input identity. It is the validation fence immediately before an atomic
+        relational generation flip, so an old readable vector is not evidence that the new
+        publication is complete.
+        """
+        fingerprint = await self.fingerprint()
+        table = await self._existing_table()
+        if fingerprint is None or table is None:
+            return not chunks and await self.publication_row_count(publication_id) == 0
+        if fingerprint.canonical() != embedding_fingerprint:
+            return False
+        if await self.publication_row_count(publication_id) != len(chunks):
+            return False
+        for start in range(0, len(chunks), IDENTITY_QUERY_PAGE):
+            page = chunks[start : start + IDENTITY_QUERY_PAGE]
+            if not await self.publication_page_is_complete(
+                publication_id, page, embedding_fingerprint=embedding_fingerprint
+            ):
+                return False
+        return True
+
+    async def publication_row_count(self, publication_id: str) -> int:
+        """Count every physical row in a publication, including unexpected extras."""
+        table = await self._existing_table()
+        if table is None:
+            return 0
+        return await table.count_rows(f"{PUBLICATION_COLUMN} = {quote(publication_id)}")
+
+    async def publication_page_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        """Validate one bounded chunk page without accepting rows from another publication."""
+        if len(chunks) > IDENTITY_QUERY_PAGE:
+            raise ValueError("vector validation page exceeds the fixed bound")
+        fingerprint = await self.fingerprint()
+        table = await self._existing_table()
+        if fingerprint is None or table is None:
+            return not chunks
+        if fingerprint.canonical() != embedding_fingerprint:
+            return False
+        if not chunks:
+            return True
+        chunk_ids = ", ".join(quote(chunk.id) for chunk in chunks)
+        records = await (
+            table.query()
+            .where(
+                f"{PUBLICATION_COLUMN} = {quote(publication_id)} "
+                f"AND {CHUNK_ID_COLUMN} IN ({chunk_ids})"
+            )
+            .select([CHUNK_ID_COLUMN, IDENTITY_COLUMN, CHUNK_COLUMN, VECTOR_COLUMN])
+            .limit(len(chunks) + 1)
+            .to_list()
+        )
+        by_id = {str(record[CHUNK_ID_COLUMN]): record for record in records}
+        return len(records) == len(chunks) == len(by_id) and all(
+            chunk.id in by_id
+            and self._verdict(chunk, by_id[chunk.id], fingerprint).state is VectorState.READABLE
+            for chunk in chunks
+        )
+
+    async def copy_publication(
+        self,
+        source_publication_id: str,
+        target_publication_id: str,
+        chunks: Sequence[Chunk],
+    ) -> None:
+        """Copy one bounded, identity-verified checkpoint page for lease takeover."""
+        if not chunks:
+            return
+        if len(chunks) > IDENTITY_QUERY_PAGE:
+            raise ValueError("vector takeover page exceeds the fixed bound")
+        fingerprint = await self.fingerprint()
+        table = await self._existing_table()
+        if fingerprint is None or table is None:
+            raise VectorStoreStateError("checkpoint vectors are unavailable for takeover")
+        if not await self.publication_page_is_complete(
+            source_publication_id,
+            chunks,
+            embedding_fingerprint=fingerprint.canonical(),
+        ):
+            raise VectorStoreStateError("checkpoint vector page is incomplete or stale")
+        listed = ", ".join(quote(chunk.id) for chunk in chunks)
+        records = await (
+            table.query()
+            .where(
+                f"{PUBLICATION_COLUMN} = {quote(source_publication_id)} "
+                f"AND {CHUNK_ID_COLUMN} IN ({listed})"
+            )
+            .select([CHUNK_ID_COLUMN, VECTOR_COLUMN])
+            .limit(len(chunks) + 1)
+            .to_list()
+        )
+        vectors_by_id = {
+            str(record[CHUNK_ID_COLUMN]): tuple(float(value) for value in record[VECTOR_COLUMN])
+            for record in records
+        }
+        await self.upsert(
+            chunks,
+            [vectors_by_id[chunk.id] for chunk in chunks],
+            publication_id=target_publication_id,
+        )
+
     async def _rows_for(
         self,
         table: AsyncTable,
@@ -1138,6 +1253,55 @@ class PublishedLanceVectorStore:
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> Mapping[str, StoredVector]:
         async with self._operation() as store:
             return await store.stored_vectors(chunks)
+
+    async def publication_row_count(self, publication_id: str) -> int:
+        """Count a rebuild namespace in the currently pinned live generation."""
+        async with self._operation() as store:
+            return await store.publication_row_count(publication_id)
+
+    async def publication_page_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        """Validate one rebuild page without crossing the live pointer boundary."""
+        async with self._operation() as store:
+            return await store.publication_page_is_complete(
+                publication_id,
+                chunks,
+                embedding_fingerprint=embedding_fingerprint,
+            )
+
+    async def publication_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        """Validate an exact rebuild namespace in one pinned live generation."""
+        async with self._operation() as store:
+            return await store.publication_is_complete(
+                publication_id,
+                chunks,
+                embedding_fingerprint=embedding_fingerprint,
+            )
+
+    async def copy_publication(
+        self,
+        source_publication_id: str,
+        target_publication_id: str,
+        chunks: Sequence[Chunk],
+    ) -> None:
+        """Replay takeover vectors without accidentally crossing a #187 pointer swap."""
+        async with self._operation() as store:
+            await store.copy_publication(
+                source_publication_id,
+                target_publication_id,
+                chunks,
+            )
 
     @asynccontextmanager
     async def _operation(self) -> AsyncGenerator[LanceVectorStore]:

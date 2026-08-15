@@ -514,6 +514,21 @@ async def test_text_is_compressed_and_binary_is_not(engine: AsyncEngine, data_di
     assert binary.stored_bytes == binary.size_bytes
 
 
+async def test_rebuild_inventory_streams_compressed_verification_without_decompress_allocation(
+    engine: AsyncEngine, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    stored = await blobs.put(b"bounded prose " * 10_000, "text/plain")
+    assert isinstance(stored, StoredBlob)
+    assert stored.compression == "gzip"
+
+    def forbidden(_: bytes) -> bytes:
+        raise AssertionError("inventory must not call gzip.decompress")
+
+    monkeypatch.setattr("manicule.storage.blobs.gzip.decompress", forbidden)
+    assert await blobs.contains(stored.hash)
+
+
 def test_media_types_are_classified_by_whether_compression_helps() -> None:
     """A ``+json`` suffix is still JSON, and an absent media type is not a guess."""
     assert should_compress("text/plain")

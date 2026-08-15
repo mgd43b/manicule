@@ -1302,10 +1302,73 @@ class BlobStore:
         raw = path.read_bytes()
         return gzip.decompress(raw) if compression == "gzip" else raw
 
+    async def get_bounded(self, digest: str, *, max_bytes: int) -> bytes | None:
+        """Read at most ``max_bytes`` of verified-size input into memory.
+
+        The SQLite size is checked before opening or decompressing the representation. The
+        streamed verifier is deliberately separate: callers can inventory a corpus without
+        ever allocating one source body.
+        """
+        if max_bytes < 0:
+            raise ValueError("max_bytes must not be negative")
+        async with self._sessions() as session:
+            row = await session.get(models.Blob, digest)
+        if row is None or row.size_bytes > max_bytes:
+            return None
+        path = self.path_for(digest)
+
+        def bounded_read() -> bytes | None:
+            try:
+                if not path.is_file():
+                    return None
+                if row.compression == "gzip":
+                    with gzip.open(path, "rb") as handle:
+                        data = handle.read(max_bytes + 1)
+                else:
+                    if path.stat().st_size > max_bytes:
+                        return None
+                    data = path.read_bytes()
+            except (OSError, EOFError):
+                return None
+            return data if len(data) <= max_bytes else None
+
+        return await asyncio.to_thread(bounded_read)
+
     async def verify(self, digest: str) -> bool:
         """Whether the stored bytes still hash to their own name."""
         data = await self.get(digest)
         return data is not None and content_hash(data) == digest
+
+    async def contains(self, digest: str) -> bool:
+        """Whether a rebuild may rely on this exact local input.
+
+        Stronger than a path-existence check: a corrupt local file is missing as an offline
+        rebuild input. Verification hashes a fixed-size stream and never materializes or
+        fully decompresses a source body in memory.
+        """
+        async with self._sessions() as session:
+            row = await session.get(models.Blob, digest)
+        if row is None:
+            return False
+        path = self.path_for(digest)
+
+        def streamed() -> bool:
+            try:
+                hasher = hashlib.blake2b(digest_size=16)
+                hasher.update(row.size_bytes.to_bytes(8, "big"))
+                total = 0
+                opener = gzip.open if row.compression == "gzip" else open
+                with opener(path, "rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > row.size_bytes:
+                            return False
+                        hasher.update(chunk)
+                return total == row.size_bytes and hasher.hexdigest() == digest
+            except (OSError, EOFError):
+                return False
+
+        return await asyncio.to_thread(streamed)
 
     async def collect_garbage(self) -> Sequence[str]:
         """Delete blobs nothing references. Mark and sweep, never refcounts.

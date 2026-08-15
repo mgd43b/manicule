@@ -45,6 +45,7 @@ from manicule.core.acquisition import (
     SnapshotPromotionPolicy,
 )
 from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
+from manicule.core.rebuild import RebuildState
 from manicule.core.reconciliation import ReconciliationRunState
 from manicule.storage.types import UtcDateTime, utcnow
 
@@ -120,6 +121,10 @@ def _acquisition_record_state_enum() -> Enum:
 
 def _reconciliation_run_state_enum() -> Enum:
     return _value_enum(ReconciliationRunState, "reconciliation_run_state")
+
+
+def _rebuild_state_enum() -> Enum:
+    return _value_enum(RebuildState, "rebuild_state")
 
 
 class Base(DeclarativeBase):
@@ -1318,6 +1323,107 @@ class ReembedPublicationReceipt(Base):
     )
 
 
+class DerivedGeneration(Base):
+    """Durable control row for one unpublished or published corpus replacement."""
+
+    __tablename__ = "derived_generations"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    snapshot_run_id: Mapped[str] = mapped_column(
+        ForeignKey("acquisition_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    snapshot_membership_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    publication_identity_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    target: Mapped[JsonValue] = mapped_column(JSON, nullable=False)
+    state: Mapped[RebuildState] = mapped_column(
+        _rebuild_state_enum(), nullable=False, default=RebuildState.PLANNED
+    )
+    next_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    documents_built: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chunks_built: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    vectors_reused: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    vectors_embedded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    vector_publication_id: Mapped[str | None] = mapped_column(Text)
+    expected_vector_table: Mapped[str | None] = mapped_column(Text)
+    expected_vector_inventory_digest: Mapped[str | None] = mapped_column(Text)
+    published_vector_inventory_digest: Mapped[str | None] = mapped_column(Text)
+    fence_generation: Mapped[int | None] = mapped_column(Integer)
+    lease_owner: Mapped[str | None] = mapped_column(Text)
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    diagnostic_code: Mapped[str | None] = mapped_column(Text)
+    diagnostic_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    published_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "snapshot_run_id",
+            "target_digest",
+            "publication_identity_digest",
+            name="uq_derived_generation_plan",
+        ),
+        Index("ix_derived_generations_workspace_state", "workspace_id", "state"),
+        Index(
+            "uq_derived_generations_workspace_fence",
+            "workspace_id",
+            "fence_generation",
+            unique=True,
+            sqlite_where=text("fence_generation IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "expected_item_count >= 0 AND next_sequence >= 0 AND documents_built >= 0 "
+            "AND chunks_built >= 0 AND vectors_reused >= 0 AND vectors_embedded >= 0 "
+            "AND lease_generation >= 0 AND diagnostic_count >= 0 "
+            "AND (fence_generation IS NULL OR fence_generation >= 1)",
+            name="derived_generation_counts_are_not_negative",
+        ),
+        CheckConstraint(
+            "(state = 'published') = (published_at IS NOT NULL)",
+            name="derived_generation_publication_timestamp_matches_state",
+        ),
+    )
+
+
+class DerivedGenerationItem(Base):
+    """One deterministic document replacement staged beside the live corpus."""
+
+    __tablename__ = "derived_generation_items"
+
+    generation_id: Mapped[str] = mapped_column(
+        ForeignKey("derived_generations.id", ondelete="CASCADE"), primary_key=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    payload_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    document_id: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[JsonValue] = mapped_column(JSON, nullable=False)
+    temporary_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        Index(
+            "uq_derived_generation_items_document",
+            "generation_id",
+            "document_id",
+            unique=True,
+        ),
+        CheckConstraint(
+            "sequence >= 0 AND temporary_bytes >= 0",
+            name="derived_generation_item_counts_are_not_negative",
+        ),
+        WITHOUT_ROWID,
+    )
+
+
 class VectorTombstone(Base):
     """A chunk id deleted from SQLite whose vector has not yet been swept.
 
@@ -1361,6 +1467,8 @@ __all__ = [
     "Connector",
     "Conversation",
     "CorpusRevision",
+    "DerivedGeneration",
+    "DerivedGenerationItem",
     "Document",
     "DocumentTag",
     "DocumentVersion",

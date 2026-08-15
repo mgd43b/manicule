@@ -10,8 +10,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import object_session
 
 from manicule.core.acquisition import (
     AcquiredSource,
@@ -31,6 +32,7 @@ from manicule.core.errors import UnknownEntityError
 from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityRefusedError, CapacityResource
+from manicule.storage import acquisition as acquisition_storage
 from manicule.storage.acquisition import (
     AcquisitionConflictError,
     AcquisitionCoverageError,
@@ -227,6 +229,105 @@ async def test_records_page_forward_by_sequence_without_loading_the_run(
         [2, 3],
         [4],
     ]
+
+
+async def test_large_manifest_hash_and_iterator_each_use_one_bounded_select(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = await store.create_acquisition_run(
+        "large-streamed-manifest",
+        "wiki",
+        source_scope="space:large",
+        scope_fingerprint="large",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+    run = await store.claim_acquisition_run(
+        created.id, "worker", now=_NOW, expires_at=_NOW + timedelta(minutes=5)
+    )
+    assert run is not None
+    count = 64
+    diagnostic = AcquisitionDiagnostic(
+        stage=AcquisitionStage.ACQUISITION,
+        code=AcquisitionFailureCode.AUTHENTICATION,
+    )
+    for sequence in range(count):
+        source_id = f"page-{sequence:04d}"
+        await store.append_acquisition_record(
+            run.id,
+            sequence,
+            _source(source_id),
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+        await store.transition_acquisition_record(
+            run.id,
+            source_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.RETRY,
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+            diagnostic=diagnostic,
+        )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        _watermark("large"),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint="large",
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+
+    record_selects = 0
+
+    def count_record_selects(*args: object) -> None:
+        nonlocal record_selects
+        statement = args[2]
+        if (
+            isinstance(statement, str)
+            and statement.lstrip().upper().startswith("SELECT")
+            and "FROM acquisition_records" in statement
+        ):
+            record_selects += 1
+
+    original_member = acquisition_storage._manifest_member  # pyright: ignore[reportPrivateUsage]
+
+    def assert_one_resident_record(row: object) -> dict[str, object]:
+        session = object_session(row)
+        assert session is not None
+        resident = sum(
+            isinstance(value, acquisition_storage.models.AcquisitionRecord)
+            for value in session.identity_map.values()
+        )
+        assert resident == 1
+        return original_member(row)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(acquisition_storage, "_manifest_member", assert_one_resident_record)
+    event.listen(engine.sync_engine, "before_cursor_execute", count_record_selects)
+    try:
+        assert await store.verify_snapshot_manifest(run.id)
+        assert record_selects == 1
+        record_selects = 0
+        sequences = [record.sequence async for record in store.iter_acquisition_records(run.id)]
+        assert sequences == list(range(count))
+        assert record_selects == 1
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_record_selects)
 
 
 async def test_concurrent_journal_reservations_cannot_exceed_the_record_limit(

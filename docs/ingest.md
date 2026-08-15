@@ -173,7 +173,7 @@ before:store   after:store
 class Middleware(Protocol):
     stage: PipelineStage
     order: int
-    mutates_embedded_text: bool          # §3.3
+    mutates_embedded_text: bool  # §3.3
 
     async def run(self, value: T) -> T: ...
 ```
@@ -272,8 +272,8 @@ So the capability boundary is expressed in the type rather than in prose. `Chunk
 
 ```python
 class Chunk(BaseModel):
-    text:       str = Field(frozen=True)   # citable; immutable after parse
-    embed_text: str                        # mutable, and a fingerprint input
+    text: str = Field(frozen=True)  # citable; immutable after parse
+    embed_text: str  # mutable, and a fingerprint input
 ```
 
 That stops in-place mutation. It does not stop a middleware constructing replacement `Chunk`
@@ -554,6 +554,19 @@ parse_memory_limit   default: 1 GiB per worker
   manicule prevents.
 - **A killed worker is replaced immediately**; the pool size is what the run depends on, not
   the identity of any worker.
+- **Pool lifecycle owns its children through cancellation.** Setup does not publish the
+  started state or its permits until every spawn/readiness wait reaches an endpoint; a
+  canceled setup reaps the partial pool and is reusable. Teardown snapshots every worker and
+  joins every termination before propagating cancellation, including repeated cancellation.
+  Each checkout is bound to a lifecycle generation, so a late result, release or replacement
+  from an attempt held across teardown can only retire its old worker, never repopulate the
+  stopped pool. Checkout owns permit selection and lazy-spawn readiness through finalization:
+  cancellation restores the selected permit or reaps the partially started worker before it
+  propagates, including repeated cancellation during that cleanup. Ownership ends only when
+  the completed checkout is delivered to the attempt; cancellation in that handoff window
+  restores the worker as well. Replacement removal, termination and publication are serialized
+  with teardown, so teardown cannot return between removal from the live set and physical child
+  reaping or allow the next setup to overlap that old generation.
 - **Workers hold no store handles.** They receive bytes and return blocks. Everything
   transactional happens in the parent, which is what keeps `storage.md` §8.2's ordering true
   regardless of how many workers died.
@@ -1479,6 +1492,99 @@ They are not interchangeable, and the price of each is the reason:
 | `index_state.chunk_fingerprint` | the chunker, its budget, its tokenizer or a grammar changes | a re-index; the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything |
 | `index_state.embed_fingerprint` | the model, its dimension or its normalization changes | `ingest.reindex.re_embed` | an embedding pass, no parsing |
 | `documents.glossary_fp` | any detection or normalization rule changes, or a dependency of one does | `document reindex --stale-glossary` | a pass over stored text; **no GPU at all** |
+
+### 10.4 Offline derived-generation rebuilds
+
+A parser-routing, parser, chunker, tokenizer, size or overlap change that must replace a whole
+source scope uses `OfflineGenerationRebuilder`; it does not use the per-document repair loop.
+The distinction is the publication boundary. A repair deliberately commits one document at a
+time, while a generation rebuild keeps its document, chunk, glossary, FTS and vector output
+beside the active corpus until the complete replacement validates.
+
+The only source input is a promoted acquisition manifest. The runner accepts a read-only blob
+source and has no connector dependency, fetch method or source-crawl fallback. Planning verifies
+the manifest once, pages it in bounded batches, stream-verifies each retained blob without
+allocating or fully decompressing it, and returns only
+aggregate counts plus bounded manifest sequence numbers for missing inputs. A missing or corrupt
+blob is a typed refusal; it is never permission to contact the source.
+
+`index_state` and its named vector directory are installation-wide, while an acquisition manifest
+names one connector scope. Until a coordinator can bind several promoted manifests into one
+generation, the explicit safe boundary is an installation with exactly one promoted connector
+scope and no live documents outside that workspace/source. Planning refuses broader installations
+with `workspace_scope_changed`, and lease checks plus the publication transaction repeat the gate;
+a second connector promoted after planning therefore cannot create mixed global fingerprints.
+
+`derived_generations` records the immutable snapshot and target identities, its canonical
+membership hash and expected item count, resource bounds, forward-only state and checkpoint
+counters. Its unique plan identity also includes the bound live vector table and inventory
+digest, so a #187 pointer swap leaves a pristine stale plan inert and a retry can create a new
+generation against the winner. Publication records the resulting inventory digest; while that
+exact result remains live, repeating the same dry run or run returns the published generation
+idempotently rather than planning its own output again. The scope gate, live binding read,
+published-result lookup and new-plan insert share one writer-serialized SQLite transaction, so a
+concurrent pointer swap cannot turn that replay decision into a mixed-time observation. Planning
+remains `PLANNED`; only a
+successful owner claim enters `BUILDING`, and dry
+run or missing-input refusal never claims a worker lease. Each claim has an expiry, renewable
+owner token, lease generation and monotonically allocated scope fence. An expired lease may be
+taken over, but its former owner cannot checkpoint or publish; publication also refuses any
+generation fenced by a newer non-terminal rebuild for the same connector scope.
+
+`derived_generation_items` stores deterministic
+relational replacements keyed by `(generation_id, sequence)`. A retry must reproduce the same
+payload digest at a sequence. Vectors are staged under a physical namespace derived from the
+generation, unique invocation owner and lease generation. A takeover therefore never shares a
+vector mutation target with the expired worker. Before resuming its sequence checkpoint, it
+copies only the identity-verified vectors named by already-durable item payloads from the
+last durably certified predecessor namespace into its own, in byte-bounded pages. The durable
+source marker advances by lease-fenced CAS only after every copied page and the exact target
+row count validate; a crash or cancellation midway therefore leaves the prior complete source
+available to the next takeover. The lease is renewed and checked
+immediately before and after each awaited vector write. Vectors are reusable only
+when the vector store proves both the stored embedding-input identity and the target embedding
+identity. Validation requires exactly one readable vector in that unpublished publication for
+every replacement chunk; an old publication cannot satisfy the check.
+
+Preparation uses the production worker-backed parser chain, middleware before and after parsing
+and chunking, container/member expansion, chunker/tokenizer configuration and glossary detector,
+all constructed without a connector. Input pages are bounded, a single retained blob
+larger than the memory ceiling is refused, and the deterministic preflight accounts for source,
+replacement payload, embedding scratch, Lance data, SQLite/WAL and FTS amplification before
+mutation. Container members use live ingest's identity helpers and breadth-first queue. Parser
+replies and the complete middleware/after-parse/chunker/after-chunk path run behind spawned-
+process boundaries with target-derived resident-memory and serialized-reply limits. One child,
+component container and event loop serve all hooks for one document, preserving stateful live-
+ingest semantics. Cancellation kills, reaps and joins that owned child before propagating, even
+under repeated cancellation. Only typed resource/output overruns report `memory_bound`; timeout,
+worker death, configuration, hook and protocol failures report bounded derivation failure without
+child exception text. Thus an
+oversized hook, chunker or expansion is refused before its output is deserialized in the serving
+parent. The parent accounts live objects structurally, without making a second serialized copy,
+and reduces each child/member budget by the nodes and breadth-first queue it already retains.
+Parser-attempt cancellation likewise kills the worker, joins the blocking pipe exchange and
+completes retire/replacement plus permit restoration before propagating, including repeated
+cancellation during replacement.
+Execution repeats the exact cumulative capacity check before each durable stage.
+
+Publication is one SQLite transaction. It re-verifies the complete canonical manifest and exact
+contiguous replacement coverage, verifies that the snapshot is still the newest promoted
+manifest for its connector scope, ties every replacement back to that manifest's blob
+and acquired-source envelope, replaces documents, chunks and glossary rows, rebuilds FTS when
+its tokenizer changed, and runs the external-content FTS integrity check before advancing index
+identity and marking the generation published. Tokenizer syntax is probed before any live row is
+changed. The plan also persists the exact #187 live `vector_table` and
+`vector_inventory_digest`. Every external vector mutation checks that binding, and publication
+compares it again inside the writer transaction. A concurrent named-generation pointer swap wins
+and leaves all relational rows unchanged. Successful publication keeps the bound physical pointer
+and recomputes #187's canonical active-chunk inventory digest in bounded keyset pages before the
+commit; the corpus-revision triggers then prevent an older re-embed snapshot from publishing over
+those changed chunks. Existing WAL
+readers retain their old database snapshot until they finish. A crash, cancellation or validation
+failure leaves the old generation active and the new rows inert. Publication is a joined
+irreversible task: cancellation waits for its atomic outcome instead of abandoning a background
+commit. Resumption starts at the durable
+sequence checkpoint rather than redoing committed batches.
 
 Two properties follow from the table that are easy to get wrong in either direction.
 

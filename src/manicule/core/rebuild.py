@@ -1,0 +1,205 @@
+"""Vocabulary for offline, generation-safe corpus rebuilds."""
+
+from __future__ import annotations
+
+import hashlib
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from manicule.core.acquisition import AcquiredSource
+from manicule.core.content import Chunk, Document
+from manicule.core.glossary import GlossaryEntry
+
+
+class RebuildState(StrEnum):
+    """Forward-only lifecycle of a replacement derived generation."""
+
+    PLANNED = "planned"
+    BUILDING = "building"
+    VALIDATING = "validating"
+    PUBLISHED = "published"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
+class RebuildRefusalCode(StrEnum):
+    """Bounded reasons a rebuild can refuse before parsing any content."""
+
+    SNAPSHOT_NOT_PROMOTED = "snapshot_not_promoted"
+    SNAPSHOT_CHANGED = "snapshot_changed"
+    WORKSPACE_SCOPE_CHANGED = "workspace_scope_changed"
+    MISSING_LOCAL_INPUT = "missing_local_input"
+    MEMORY_BOUND = "memory_bound"
+    TEMP_DISK_BOUND = "temp_disk_bound"
+    INVALID_REPLACEMENT = "invalid_replacement"
+    DERIVATION_FAILED = "derivation_failed"
+
+
+class RebuildTarget(BaseModel):
+    """Every producer identity and resource bound that defines a rebuild."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    parser_routing: str = Field(min_length=1)
+    parser_set: tuple[str, ...]
+    chunk_fingerprint: str = Field(min_length=1)
+    embedding_fingerprint: str = Field(min_length=1)
+    glossary_fingerprint: str = Field(min_length=1)
+    fts_tokenizer: str = Field(min_length=1)
+    batch_documents: int = Field(default=32, gt=0, le=1024)
+    max_memory_bytes: int = Field(gt=0)
+    max_temporary_bytes: int = Field(gt=0)
+
+
+class MissingSnapshotInput(BaseModel):
+    """Aggregate-safe identity of one manifest position that cannot be rebuilt locally."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sequence: int = Field(ge=0)
+    code: RebuildRefusalCode = RebuildRefusalCode.MISSING_LOCAL_INPUT
+
+
+class RebuildEstimate(BaseModel):
+    """Deterministic, bounded dry-run result; it contains no source text or URI."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    generation_id: str = Field(min_length=1)
+    snapshot_run_id: str = Field(min_length=1)
+    documents: int = Field(ge=0)
+    expected_items: int = Field(ge=0)
+    known_source_bytes: int = Field(ge=0)
+    estimated_chunks: int = Field(ge=0)
+    estimated_seconds: float = Field(ge=0)
+    estimated_peak_memory_bytes: int = Field(ge=0)
+    estimated_temporary_bytes: int = Field(ge=0)
+    missing_count: int = Field(ge=0)
+    missing: tuple[MissingSnapshotInput, ...] = ()
+    missing_truncated: bool = False
+    refusal: RebuildRefusalCode | None = None
+
+    @property
+    def runnable(self) -> bool:
+        return self.missing_count == 0 and self.refusal is None
+
+
+class SnapshotRebuildInput(BaseModel):
+    """One immutable member of the promoted acquisition manifest."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sequence: int = Field(ge=0)
+    blob_ref: str = Field(min_length=1)
+    source: AcquiredSource
+    title: str = ""
+    version_token: str | None = None
+
+
+class DerivedReplacement(BaseModel):
+    """All relational output for one document in an unpublished generation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    document: Document
+    chunks: tuple[Chunk, ...] = ()
+    glossary: tuple[GlossaryEntry, ...] = ()
+    members: tuple[DerivedReplacement, ...] = ()
+    parse_fingerprint: str | None = None
+    vector_reused: int = Field(default=0, ge=0)
+    vector_embedded: int = Field(default=0, ge=0)
+
+    def validate_identity(self) -> None:
+        """Refuse a mixed or internally inconsistent staged document."""
+        if any(chunk.document_id != self.document.id for chunk in self.chunks):
+            raise ValueError("a replacement chunk names another document")
+        if tuple(chunk.position for chunk in self.chunks) != tuple(range(len(self.chunks))):
+            raise ValueError("replacement chunk positions must be contiguous from zero")
+        chunk_ids = {chunk.id for chunk in self.chunks}
+        if any(
+            entry.document_id != self.document.id or entry.chunk_id not in chunk_ids
+            for entry in self.glossary
+        ):
+            raise ValueError("a replacement glossary entry is outside its document's chunks")
+        if self.vector_reused + self.vector_embedded != len(self.chunks):
+            raise ValueError("every replacement chunk must have exactly one staged vector")
+        for member in self.members:
+            member.validate_identity()
+        flattened = self.flattened()
+        document_ids = [item.document.id for item in flattened]
+        chunk_ids = [chunk.id for item in flattened for chunk in item.chunks]
+        if len(document_ids) != len(set(document_ids)):
+            raise ValueError("container members must have distinct document identities")
+        if len(chunk_ids) != len(set(chunk_ids)):
+            raise ValueError("container members must have distinct chunk identities")
+
+    def flattened(self) -> tuple[DerivedReplacement, ...]:
+        """Breadth-first durable documents represented by one snapshot member."""
+        result: list[DerivedReplacement] = []
+        queue: list[DerivedReplacement] = [self]
+        while queue:
+            current = queue.pop(0)
+            result.append(current)
+            queue.extend(current.members)
+        return tuple(result)
+
+    def flattened_chunks(self) -> tuple[Chunk, ...]:
+        return tuple(chunk for replacement in self.flattened() for chunk in replacement.chunks)
+
+
+class RebuildCheckpoint(BaseModel):
+    """Durable progress returned after an idempotent batch commit."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    generation_id: str
+    state: RebuildState
+    next_sequence: int = Field(ge=0)
+    documents_built: int = Field(ge=0)
+    chunks_built: int = Field(ge=0)
+    vectors_reused: int = Field(ge=0)
+    vectors_embedded: int = Field(ge=0)
+    lease_owner: str | None = None
+    lease_generation: int = Field(default=0, ge=0)
+    fence_generation: int | None = Field(default=None, ge=1)
+    diagnostic_code: RebuildRefusalCode | None = None
+    diagnostic_count: int = Field(default=0, ge=0)
+    predecessor_vector_publication_id: str | None = None
+
+    @property
+    def vector_publication_id(self) -> str:
+        """Lease-fenced physical namespace for this invocation's vector mutations."""
+        if self.lease_owner is None or self.lease_generation <= 0:
+            raise ValueError("generation has no claimed vector publication")
+        return vector_publication_id(self.generation_id, self.lease_owner, self.lease_generation)
+
+
+def vector_publication_id(generation_id: str, owner: str, lease_generation: int) -> str:
+    """Name a vector staging namespace that a takeover can never share."""
+    if not owner or lease_generation <= 0:
+        raise ValueError("vector publication identity requires a claimed lease")
+    owner_hash = hashlib.sha256(owner.encode()).hexdigest()[:16]
+    return f"{generation_id}.{lease_generation}.{owner_hash}"
+
+
+class RebuildRefusedError(RuntimeError):
+    """A typed refusal containing only bounded aggregate-safe diagnostics."""
+
+    def __init__(self, code: RebuildRefusalCode, estimate: RebuildEstimate) -> None:
+        super().__init__(code.value)
+        self.code = code
+        self.estimate = estimate
+
+
+__all__ = [
+    "DerivedReplacement",
+    "MissingSnapshotInput",
+    "RebuildCheckpoint",
+    "RebuildEstimate",
+    "RebuildRefusalCode",
+    "RebuildRefusedError",
+    "RebuildState",
+    "RebuildTarget",
+    "SnapshotRebuildInput",
+]

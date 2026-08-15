@@ -698,7 +698,7 @@ class Runtime:
             vectors=vectors,
         )
         pool = WorkerPool(
-            worker_config(settings),
+            worker_config(settings, chunker=chunker, embedder=embedder),
             workers=settings.ingest.parse_workers,
             timeout_s=settings.ingest.parse_timeout_s,
             poll_interval_s=settings.ingest.memory_poll_interval_s,
