@@ -1881,6 +1881,20 @@ It also refuses with an aggregate count while any acquired envelope remains, inc
 history: removing that column would silently discard the only complete recipe for reconstructing
 the retained source bytes. Diagnostics contain counts only, never source ids, URIs or metadata.
 
+The first snapshot-aware startup also migrates pre-snapshot publications that already own
+retained originals. It scans one workspace and connector in keyset pages, validates each blob
+against its content address, and writes the result through the same immutable acquisition
+manifest API used by a live sync. Deterministic run and item identities make a crash or repeated
+startup resume without duplicate ownership. Missing and corrupt files become typed omission
+counts; no connector is resolved, no publication is changed, and every healthy manifest record
+is immediately an independent blob-GC root.
+
+These manifests explicitly set `scope_inventory_complete = false`. Their membership is a fact
+about locally published documents, not proof that the remote source was fully enumerated. They
+are therefore always reported as partial, cannot commit a watermark, and cannot authorize
+deletion reconciliation. A later ordinary durable enumeration may establish those stronger
+facts; the migration never infers them from historical document rows.
+
 Blob durability includes the directory entries, not only file contents. New shard parents are
 created one level at a time and their parents are fsynced; after the temporary file is fsynced
 and atomically renamed, the destination directory is fsynced before a blob row or acquisition

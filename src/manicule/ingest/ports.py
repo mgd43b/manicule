@@ -351,6 +351,7 @@ class AcquisitionStore(Protocol):
         *,
         source_scope: str = "",
         scope_fingerprint: str = "",
+        scope_inventory_complete: bool = True,
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
     ) -> AcquisitionRun: ...
 
