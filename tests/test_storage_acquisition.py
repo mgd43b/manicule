@@ -397,6 +397,101 @@ async def test_below_floor_recovery_and_idempotency_can_shrink_or_settle_backlog
     assert settled.state is AcquisitionRunState.SETTLED
 
 
+@pytest.mark.parametrize("force_locked_recheck", [False, True])
+async def test_exact_snapshot_run_identity_is_idempotent_before_headroom(
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    force_locked_recheck: bool,
+) -> None:
+    store = SqliteDocStore(engine, min_disk_headroom_bytes=8)
+    await store.ensure_workspace()
+    created = await store.create_acquisition_run(
+        "snapshot-identity",
+        "wiki",
+        source_scope="space:ENG",
+        scope_fingerprint="scope-eng-v1",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+
+    if force_locked_recheck:
+
+        async def miss_fast_path(session: AsyncSession, run_id: str) -> AcquisitionRun | None:
+            del session, run_id
+            return None
+
+        monkeypatch.setattr(store, "_run_row", miss_fast_path)
+
+    def unexpected_headroom(path: object) -> SimpleNamespace:
+        del path
+        raise AssertionError("an exact idempotent identity must not perform a growth check")
+
+    monkeypatch.setattr("manicule.storage.acquisition.shutil.disk_usage", unexpected_headroom)
+
+    repeated = await store.create_acquisition_run(
+        created.id,
+        "wiki",
+        source_scope="space:ENG",
+        scope_fingerprint="scope-eng-v1",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+
+    assert repeated == created
+
+
+@pytest.mark.parametrize("force_locked_recheck", [False, True])
+@pytest.mark.parametrize(
+    ("source_scope", "scope_fingerprint", "promotion_policy"),
+    [
+        ("space:OTHER", "scope-eng-v1", SnapshotPromotionPolicy.ALLOW_OMISSIONS),
+        ("space:ENG", "scope-other-v1", SnapshotPromotionPolicy.ALLOW_OMISSIONS),
+        ("space:ENG", "scope-eng-v1", SnapshotPromotionPolicy.REQUIRE_COMPLETE),
+    ],
+    ids=("source-scope", "scope-fingerprint", "promotion-policy"),
+)
+async def test_changed_snapshot_run_identity_conflicts_before_headroom(
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    source_scope: str,
+    scope_fingerprint: str,
+    promotion_policy: SnapshotPromotionPolicy,
+    *,
+    force_locked_recheck: bool,
+) -> None:
+    store = SqliteDocStore(engine, min_disk_headroom_bytes=8)
+    await store.ensure_workspace()
+    await store.create_acquisition_run(
+        "snapshot-identity-conflict",
+        "wiki",
+        source_scope="space:ENG",
+        scope_fingerprint="scope-eng-v1",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+
+    if force_locked_recheck:
+
+        async def miss_fast_path(session: AsyncSession, run_id: str) -> AcquisitionRun | None:
+            del session, run_id
+            return None
+
+        monkeypatch.setattr(store, "_run_row", miss_fast_path)
+
+    def unexpected_headroom(path: object) -> SimpleNamespace:
+        del path
+        raise AssertionError("identity conflicts must be reported before a growth check")
+
+    monkeypatch.setattr("manicule.storage.acquisition.shutil.disk_usage", unexpected_headroom)
+
+    with pytest.raises(AcquisitionConflictError, match="requested run identity"):
+        await store.create_acquisition_run(
+            "snapshot-identity-conflict",
+            "wiki",
+            source_scope=source_scope,
+            scope_fingerprint=scope_fingerprint,
+            promotion_policy=promotion_policy,
+        )
+
+
 async def test_concurrent_idempotent_writers_recheck_before_the_disk_floor(
     engine: AsyncEngine,
     monkeypatch: pytest.MonkeyPatch,

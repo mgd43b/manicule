@@ -363,6 +363,29 @@ def _matching_record(
     return _record(row)
 
 
+def _matching_run_identity(
+    row: models.AcquisitionRun,
+    *,
+    workspace_id: str,
+    connector: str,
+    source_scope: str,
+    scope_fingerprint: str,
+    promotion_policy: SnapshotPromotionPolicy,
+) -> bool:
+    """Whether a durable run is exactly the immutable snapshot identity requested."""
+    try:
+        stored_policy = SnapshotPromotionPolicy(row.promotion_policy)
+    except ValueError:
+        return False
+    return (
+        row.workspace_id == workspace_id
+        and row.connector_name == connector
+        and row.source_scope == source_scope
+        and row.scope_fingerprint == scope_fingerprint
+        and stored_policy is promotion_policy
+    )
+
+
 class AcquisitionJournalMixin(WorkspaceScoped):
     """Workspace-scoped durable run and record operations."""
 
@@ -383,7 +406,14 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         async with self._sessions() as session:
             existing = await self._run_row(session, run_id)
         if existing is not None:
-            if existing.workspace_id != self._workspace_id or existing.connector_name != connector:
+            if not _matching_run_identity(
+                existing,
+                workspace_id=self._workspace_id,
+                connector=connector,
+                source_scope=source_scope,
+                scope_fingerprint=scope_fingerprint,
+                promotion_policy=promotion_policy,
+            ):
                 raise AcquisitionConflictError(
                     "acquisition run conflicts with requested run identity"
                 )
@@ -392,9 +422,13 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             await self._begin_capacity_guard(session)
             existing = await session.get(models.AcquisitionRun, run_id)
             if existing is not None:
-                if (
-                    existing.workspace_id != self._workspace_id
-                    or existing.connector_name != connector
+                if not _matching_run_identity(
+                    existing,
+                    workspace_id=self._workspace_id,
+                    connector=connector,
+                    source_scope=source_scope,
+                    scope_fingerprint=scope_fingerprint,
+                    promotion_policy=promotion_policy,
                 ):
                     raise AcquisitionConflictError(
                         "acquisition run conflicts with requested run identity"
@@ -424,11 +458,15 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             row = await session.get(models.AcquisitionRun, run_id)
             if (
                 row is None
-                or row.workspace_id != self._workspace_id
                 or row.connector_id != connector_row.id
-                or row.source_scope != source_scope
-                or row.scope_fingerprint != scope_fingerprint
-                or SnapshotPromotionPolicy(row.promotion_policy) is not promotion_policy
+                or not _matching_run_identity(
+                    row,
+                    workspace_id=self._workspace_id,
+                    connector=connector,
+                    source_scope=source_scope,
+                    scope_fingerprint=scope_fingerprint,
+                    promotion_policy=promotion_policy,
+                )
             ):
                 msg = f"acquisition run {run_id!r} conflicts with the requested run identity"
                 raise AcquisitionConflictError(msg)
