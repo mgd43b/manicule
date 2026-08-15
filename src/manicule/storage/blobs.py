@@ -17,11 +17,13 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from itertools import islice
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
-from sqlalchemy import delete, select, union
+from sqlalchemy import and_, delete, select, union
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.acquisition import AcquiredSource
@@ -31,8 +33,7 @@ from manicule.storage import models
 from manicule.storage.engine import BLOBS_DIRNAME, session_factory
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-    from pathlib import Path
+    from collections.abc import Iterator, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -48,6 +49,8 @@ _COMPRESSIBLE_PREFIXES = ("text/", "application/json", "application/xml")
 _COMPRESSIBLE_SUFFIXES = ("+json", "+xml")
 STAGING_PARTIAL_STALE_SECONDS = 24 * 60 * 60
 STAGING_PARTIAL_CLEANUP_LIMIT = 1_000
+STAGING_MARKER_RECONCILE_LIMIT = 100
+LEGACY_MARKER_RETENTION = timedelta(days=30)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +113,9 @@ class BlobStore:
         self._sessions = sessions or session_factory(engine)
         self._staging_cleanup_lock = asyncio.Lock()
         self._staging_cleanup_complete = False
+        self._legacy_scan: Iterator[os.DirEntry[str]] | None = None
+        self._legacy_scan_complete = False
+        self._marker_cursor = ""
 
     @property
     def root(self) -> Path:
@@ -120,8 +126,11 @@ class BlobStore:
         return self._root / "blake2b" / digest[:2] / digest[2:4] / digest
 
     def _stage_path(self, key: str) -> Path:
-        name = hashlib.blake2b(key.encode(), digest_size=20).hexdigest()
-        return self._root / "acquisition-staging" / name
+        return self._root / "acquisition-staging" / self._stage_name(key)
+
+    @staticmethod
+    def _stage_name(key: str) -> str:
+        return hashlib.blake2b(key.encode(), digest_size=20).hexdigest()
 
     def _stage_partial_root(self) -> Path:
         return self._root / "acquisition-staging-partials"
@@ -342,24 +351,77 @@ class BlobStore:
             )
         )
         run_id, separator, source_id = key.partition("\0")
+        marker: dict[str, object] = {
+            "blob_ref": acquired.content_hash,
+            "compression": stored.compression,
+            "acquired_source": acquired.model_dump(mode="json"),
+            "run_id": run_id if separator else None,
+            "source_id": source_id if separator else None,
+        }
+        await self._record_marker(self._stage_name(key), marker, legacy=False)
         payload = json.dumps(
-            {
-                "blob_ref": acquired.content_hash,
-                "compression": stored.compression,
-                "acquired_source": acquired.model_dump(mode="json"),
-                "run_id": run_id if separator else None,
-                "source_id": source_id if separator else None,
-            },
+            marker,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        await self._durable_thread_call(
-            lambda: self._write_durable(
-                self._stage_path(key), payload, temporary_dir=self._stage_partial_root()
+        try:
+            await self._durable_thread_call(
+                lambda: self._write_durable(
+                    self._stage_path(key), payload, temporary_dir=self._stage_partial_root()
+                )
             )
-        )
+        except BaseException:
+            # Cancellation is propagated only after the joined thread reaches a known endpoint.
+            # If it published the marker, its inventory must survive the canceled coroutine.
+            if not self._stage_path(key).exists():
+                await self._forget_markers([self._stage_name(key)])
+            raise
         await self._record_blob(stored, raw.media_type)
         return Retention(ref=stored.hash), acquired
+
+    async def _record_marker(
+        self,
+        name: str,
+        payload: dict[str, object],
+        *,
+        legacy: bool,
+        created_at: datetime | None = None,
+    ) -> None:
+        await self._record_markers([(name, payload, legacy, created_at or datetime.now(UTC))])
+
+    async def _record_markers(
+        self,
+        markers: Sequence[tuple[str, dict[str, object], bool, datetime]],
+    ) -> None:
+        if not markers:
+            return
+        async with self._sessions.begin() as session:
+            await session.execute(
+                sqlite_insert(models.AcquisitionMarker)
+                .values(
+                    [
+                        {
+                            "name": name,
+                            "run_id": payload.get("run_id"),
+                            "source_id": payload.get("source_id"),
+                            "blob_ref": payload.get("blob_ref"),
+                            "acquired_source": payload.get("acquired_source"),
+                            "legacy": legacy,
+                            "created_at": created_at,
+                        }
+                        for name, payload, legacy, created_at in markers
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=[models.AcquisitionMarker.name])
+            )
+
+    async def _forget_markers(self, names: Sequence[str]) -> None:
+        if not names:
+            return
+        async with self._sessions.begin() as session:
+            await session.execute(
+                delete(models.AcquisitionMarker).where(models.AcquisitionMarker.name.in_(names))
+            )
 
     async def cleanup_staging_partials(
         self,
@@ -402,52 +464,148 @@ class BlobStore:
             await self.reconcile_acquisition_markers()
             self._staging_cleanup_complete = True
 
-    async def reconcile_acquisition_markers(self) -> None:
-        """Remove markers whose exact journal association already committed.
+    async def reconcile_acquisition_markers(self) -> bool:
+        """Advance one bounded legacy-scan and indexed-reconciliation page.
 
-        This completes before acquisition-history cleanup. It deliberately visits every live
-        marker: bounding the pass could delete a superseded association whose marker was beyond
-        the bound, destroying the only evidence that the marker had become redundant.
+        ``False`` means legacy files remain unindexed, so callers must defer history deletion
+        and blob collection. Indexed markers themselves block their run in the cleanup query.
         """
+        inventory_complete = await self._index_legacy_marker_page()
+        await self._reconcile_marker_page()
+        return inventory_complete
+
+    async def _index_legacy_marker_page(self) -> bool:  # noqa: PLR0912 - validates legacy data
         root = self._root / "acquisition-staging"
         if not root.exists():
-            return
-        for path in root.iterdir():
-            if not path.is_file():
-                continue
-            try:
-                payload = json.loads(await asyncio.to_thread(path.read_text, "utf-8"))
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, dict) or not await self._association_committed(
-                cast("dict[str, object]", payload)
-            ):
-                continue
-            await self._durable_thread_call(lambda path=path: self._unlink_durable(path))
-
-    async def _association_committed(self, payload: dict[str, object]) -> bool:
-        run_id = payload.get("run_id")
-        source_id = payload.get("source_id")
-        blob_ref = payload.get("blob_ref")
-        acquired_source = payload.get("acquired_source")
-        if not all(isinstance(value, str) for value in (run_id, source_id, blob_ref)):
-            return False
-        if not isinstance(acquired_source, dict):
-            return False
+            self._legacy_scan_complete = True
+            return True
+        if self._legacy_scan_complete:
+            return True
+        if self._legacy_scan is None:
+            self._legacy_scan = os.scandir(root)
+        entries = list(islice(self._legacy_scan, STAGING_MARKER_RECONCILE_LIMIT))
+        if not entries:
+            close = getattr(self._legacy_scan, "close", None)
+            if close is not None:
+                close()
+            self._legacy_scan = None
+            self._legacy_scan_complete = True
+            return True
+        names = [entry.name for entry in entries if entry.is_file()]
         async with self._sessions() as session:
-            record = (
-                await session.execute(
-                    select(models.AcquisitionRecord).where(
-                        models.AcquisitionRecord.run_id == run_id,
-                        models.AcquisitionRecord.source_id == source_id,
+            known = set(
+                (
+                    await session.execute(
+                        select(models.AcquisitionMarker.name).where(
+                            models.AcquisitionMarker.name.in_(names)
+                        )
                     )
                 )
-            ).scalar_one_or_none()
-        return bool(
-            record is not None
-            and record.blob_ref == blob_ref
-            and cast("object", record.acquired_source) == acquired_source
-        )
+                .scalars()
+                .all()
+            )
+        parsed: list[tuple[os.DirEntry[str], dict[str, object]]] = []
+        source_ids: set[str] = set()
+        for entry in entries:
+            if not entry.is_file() or entry.name in known:
+                continue
+            try:
+                raw = json.loads(await asyncio.to_thread(Path(entry.path).read_text, "utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                raw = {}
+            payload = cast("dict[str, object]", raw) if isinstance(raw, dict) else {}
+            acquired = payload.get("acquired_source")
+            acquired_mapping = (
+                cast("dict[str, object]", acquired) if isinstance(acquired, dict) else {}
+            )
+            if isinstance(acquired_mapping.get("source_id"), str):
+                source_ids.add(cast("str", acquired_mapping["source_id"]))
+            parsed.append((entry, payload))
+        inferred: dict[str, tuple[str, str]] = {}
+        if source_ids:
+            async with self._sessions() as session:
+                records = (
+                    (
+                        await session.execute(
+                            select(
+                                models.AcquisitionRecord.run_id,
+                                models.AcquisitionRecord.source_id,
+                            ).where(models.AcquisitionRecord.source_id.in_(source_ids))
+                        )
+                    )
+                    .tuples()
+                    .all()
+                )
+            inferred = {
+                self._stage_name(f"{run_id}\0{source_id}"): (run_id, source_id)
+                for run_id, source_id in records
+            }
+        markers: list[tuple[str, dict[str, object], bool, datetime]] = []
+        for entry, payload in parsed:
+            explicit_run = payload.get("run_id")
+            explicit_source = payload.get("source_id")
+            identity = (
+                (explicit_run, explicit_source)
+                if isinstance(explicit_run, str) and isinstance(explicit_source, str)
+                else inferred.get(entry.name)
+            )
+            if identity is not None:
+                payload["run_id"], payload["source_id"] = identity
+            try:
+                created_at = datetime.fromtimestamp(entry.stat().st_mtime, UTC)
+            except FileNotFoundError:
+                continue
+            markers.append((entry.name, payload, True, created_at))
+        await self._record_markers(markers)
+        return False
+
+    async def _reconcile_marker_page(self) -> None:
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        models.AcquisitionMarker,
+                        models.AcquisitionRun.superseded_at,
+                        models.AcquisitionRecord.blob_ref,
+                        models.AcquisitionRecord.acquired_source,
+                    )
+                    .outerjoin(
+                        models.AcquisitionRun,
+                        models.AcquisitionRun.id == models.AcquisitionMarker.run_id,
+                    )
+                    .outerjoin(
+                        models.AcquisitionRecord,
+                        and_(
+                            models.AcquisitionRecord.run_id == models.AcquisitionMarker.run_id,
+                            models.AcquisitionRecord.source_id
+                            == models.AcquisitionMarker.source_id,
+                        ),
+                    )
+                    .where(models.AcquisitionMarker.name > self._marker_cursor)
+                    .order_by(models.AcquisitionMarker.name)
+                    .limit(STAGING_MARKER_RECONCILE_LIMIT)
+                )
+            ).all()
+        if not rows:
+            self._marker_cursor = ""
+            return
+        remove: list[str] = []
+        cutoff = datetime.now(UTC) - LEGACY_MARKER_RETENTION
+        for marker, superseded_at, record_blob_ref, record_acquired_source in rows:
+            path = self._root / "acquisition-staging" / marker.name
+            exact_association = (
+                marker.blob_ref is not None
+                and marker.blob_ref == record_blob_ref
+                and cast("object", marker.acquired_source) == record_acquired_source
+            )
+            expired_orphan = marker.run_id is None and marker.created_at < cutoff
+            removable = superseded_at is not None or exact_association or expired_orphan
+            if path.exists() and not removable:
+                continue
+            await self._durable_thread_call(lambda path=path: self._unlink_durable(path))
+            remove.append(marker.name)
+        await self._forget_markers(remove)
+        self._marker_cursor = rows[-1][0].name
 
     async def resume_acquisition(self, key: str) -> tuple[Retention, AcquiredSource] | None:
         """Recover a staged blob/envelope pair without contacting its source."""
@@ -478,6 +636,7 @@ class BlobStore:
         """Remove a staging marker only after the journal association commits."""
         path = self._stage_path(key)
         await self._durable_thread_call(lambda: self._unlink_durable(path))
+        await self._forget_markers([path.name])
 
     @classmethod
     def _unlink_durable(cls, path: Path) -> None:
@@ -488,29 +647,6 @@ class BlobStore:
             if not path.parent.exists():
                 return
         cls._fsync_directory(path.parent)
-
-    async def _staged_blob_refs(self) -> set[str]:
-        await self.cleanup_staging_partials()
-        await self.reconcile_acquisition_markers()
-        root = self._root / "acquisition-staging"
-        if not root.exists():
-            return set()
-        refs: set[str] = set()
-        for path in root.iterdir():
-            if not path.is_file() or path.name.endswith(".partial"):
-                continue
-            try:
-                payload = json.loads(await asyncio.to_thread(path.read_text, "utf-8"))
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                continue
-            ref = (
-                cast("dict[str, object]", payload).get("blob_ref")
-                if isinstance(payload, dict)
-                else None
-            )
-            if isinstance(ref, str):
-                refs.add(ref)
-        return refs
 
     async def get(self, digest: str) -> bytes | None:
         """Read retained bytes back, or ``None`` if they are not held."""
@@ -543,6 +679,9 @@ class BlobStore:
         Returns:
             The hashes that were collected.
         """
+        await self.cleanup_staging_partials()
+        if not await self.reconcile_acquisition_markers():
+            return []
         async with self._sessions() as session:
             referenced_documents = select(models.Document.original_ref).where(
                 models.Document.original_ref.is_not(None)
@@ -553,6 +692,9 @@ class BlobStore:
             referenced_acquisitions = select(models.AcquisitionRecord.blob_ref).where(
                 models.AcquisitionRecord.blob_ref.is_not(None)
             )
+            referenced_markers = select(models.AcquisitionMarker.blob_ref).where(
+                models.AcquisitionMarker.blob_ref.is_not(None)
+            )
             unreferenced = (
                 (
                     await session.execute(
@@ -562,6 +704,7 @@ class BlobStore:
                                     referenced_documents,
                                     referenced_versions,
                                     referenced_acquisitions,
+                                    referenced_markers,
                                 )
                             )
                         )
@@ -571,11 +714,8 @@ class BlobStore:
                 .all()
             )
 
-        staged = await self._staged_blob_refs()
         collected: list[str] = []
         for digest in unreferenced:
-            if digest in staged:
-                continue
             async with self._sessions.begin() as session:
                 await session.execute(delete(models.Blob).where(models.Blob.hash == digest))
             self.path_for(digest).unlink(missing_ok=True)

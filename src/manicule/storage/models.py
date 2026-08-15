@@ -183,6 +183,25 @@ class Blob(Base):
     )
 
 
+class AcquisitionMarker(Base):
+    """Durable inventory for a filesystem acquisition-recovery marker."""
+
+    __tablename__ = "acquisition_markers"
+
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    run_id: Mapped[str | None] = mapped_column(Text)
+    source_id: Mapped[str | None] = mapped_column(Text)
+    blob_ref: Mapped[str | None] = mapped_column(Text)
+    acquired_source: Mapped[JsonValue | None] = mapped_column(JSON)
+    legacy: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        Index("ix_acquisition_markers_run_id", "run_id"),
+        Index("ix_acquisition_markers_blob_ref", "blob_ref"),
+    )
+
+
 # --- connectors --------------------------------------------------------------------------
 
 

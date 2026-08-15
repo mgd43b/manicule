@@ -233,7 +233,7 @@ Sixteen carry over from the shape `PLAN.md` §2 names. Eight are additions, each
 one of the sixteen cannot do. `alembic_version` and the FTS5 shadow tables also exist and are
 managed, not modeled.
 
-### 4.1 The eight additions
+### 4.1 The nine additions
 
 | Table | Why it must exist |
 |---|---|
@@ -243,6 +243,7 @@ managed, not modeled.
 | `vector_tombstones` | Chunk IDs deleted from SQLite whose vectors have not yet been swept from LanceDB. §8.2. |
 | `acquisition_runs` | Durable connector-run lifecycle, base and candidate watermarks, generation-fenced lease, completion markers and bounded aggregate counters, including unchanged source coverage separately from indexed work. It separates discovering source coverage from publishing derived content. |
 | `acquisition_records` | One idempotent source identity per run, with the validated fetched envelope, acquisition/indexing state and retained-blob reference. Acquired and indexing states require the blob; the acquired transition also stores the fetched URI, media type, encoding, metadata, byte length and content hash atomically. Unchanged remains a distinct terminal provenance state. A discovery record is acknowledged only after this row commits. |
+| `acquisition_markers` | Indexed inventory of filesystem recovery markers. It blocks history cleanup until marker ownership is reconciled and contributes blob hashes to GC without a directory-wide scan. |
 | `glossary_entries` | Definitions detected in document chunks, with their display form, expansion, location and confidence. The document/chunk foreign keys keep citations authoritative. |
 | `glossary_aliases` | Normalized alternate lookup keys for glossary entries. A composite key prevents duplicate aliases and cascading deletion keeps them tied to their definition. |
 
@@ -1868,14 +1869,16 @@ states only for settled, non-superseded history. Age alone can therefore never e
 authoritative run's incomplete enumeration, retry, acquired, or indexing work, while a fenced
 overlap cannot pin blob references forever. Cascading record deletion merely releases
 acquisition references. Publications and retained bytes remain governed by their own tables,
-and blob mark-and-sweep still includes publications, version history, acquisition records and
-staging markers. Before history cleanup and again during blob inventory, a staging marker whose
-run/source identity, blob hash and acquired envelope exactly match a committed acquisition
-record is durably removed: it protects only the pre-association crash window and is redundant
-after that commit. This ordering prevents a crash between association and marker unlink from
-pinning the blob after its superseded record is deleted. Cleanup can therefore reclaim truly
-unreachable bytes without turning it into an implicit deletion of resumable backlog. `alembic
-check` continues to enforce model/migration parity.
+and blob mark-and-sweep includes marker references through the indexed
+`acquisition_markers` table. Reconciliation and legacy-file admission are bounded pages with
+batched database reads. History cleanup excludes runs still named by the inventory and is
+deferred entirely until the bounded legacy scanner completes one pass, so association evidence
+cannot disappear before its marker decision. Exact committed associations are redundant;
+superseded pre-association markers are unrecoverable by definition and are removed;
+authoritative pre-association markers remain. Unmatched legacy markers receive a 30-day safe
+harbor before expiring. This ordering prevents either crash window from pinning a blob forever
+without turning cleanup into an implicit deletion of resumable backlog. `alembic check`
+continues to enforce model/migration parity.
 
 ---
 

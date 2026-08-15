@@ -1448,6 +1448,6 @@ async def test_acquired_envelope_downgrade_refuses_with_aggregate_redacted_count
         assert secret_id not in message
         assert secret_uri not in message
         assert body.decode() not in message
-        assert await current(engine) == "b7e4d921ac60"
+        assert await current(engine) == "e83a21f96c40"
     finally:
         await engine.dispose()

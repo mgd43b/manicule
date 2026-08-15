@@ -239,7 +239,7 @@ class BlobSink(Protocol):
 
     async def complete_acquisition(self, key: str) -> None: ...
 
-    async def reconcile_acquisition_markers(self) -> None: ...
+    async def reconcile_acquisition_markers(self) -> bool: ...
 
 
 class NoRetention:
@@ -273,8 +273,8 @@ class NoRetention:
     async def complete_acquisition(self, key: str) -> None:
         del key
 
-    async def reconcile_acquisition_markers(self) -> None:
-        return
+    async def reconcile_acquisition_markers(self) -> bool:
+        return True
 
 
 class Change(StrEnum):
@@ -883,11 +883,11 @@ class IngestPipeline:
             # generation makes it impossible to resume. Blob collection remains its own
             # mark-and-sweep operation.
             now = self._acquisition_clock()
-            await self._blobs.reconcile_acquisition_markers()
-            await self._acquisitions.cleanup_acquisition_history(
-                now - timedelta(seconds=self._acquisition_history_s),
-                limit=self._acquisition_cleanup_batch,
-            )
+            if await self._blobs.reconcile_acquisition_markers():
+                await self._acquisitions.cleanup_acquisition_history(
+                    now - timedelta(seconds=self._acquisition_history_s),
+                    limit=self._acquisition_cleanup_batch,
+                )
         watermark = await self._store.get_watermark(connector.name)
         acquisition = await self._start_acquisition(connector, watermark)
 

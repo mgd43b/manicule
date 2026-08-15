@@ -962,6 +962,12 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         .where(
                             models.AcquisitionRun.workspace_id == self._workspace_id,
                             models.AcquisitionRun.updated_at < cutoff,
+                            ~exists(
+                                select(models.AcquisitionMarker.name).where(
+                                    models.AcquisitionMarker.run_id
+                                    == models.AcquisitionRun.id
+                                )
+                            ),
                             or_(
                                 models.AcquisitionRun.superseded_at.is_not(None),
                                 and_(

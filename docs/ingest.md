@@ -813,11 +813,20 @@ Blob retention also writes a run-and-record-keyed staging envelope before the jo
 if the process stops in that narrow window, takeover recovers the staged hash and fetched source
 envelope instead of downloading the body again. The marker is removed only after the fenced
 `ACQUIRED` transition commits and pins the same blob.
-If the process dies after that commit but before unlinking the marker, the marker's run/source
-identity, blob hash and acquired envelope are compared with the durable journal association at
-startup and before blob inventory. An exact match makes the marker redundant and it is durably
-unlinked before superseded-history cleanup can remove the association. Thus a stale marker
-cannot remain a permanent blob-GC root after the run that justified it ages out.
+Every new marker is registered in an indexed relational inventory before its file can exist. If
+the process dies after association but before unlink, a bounded reconciliation page compares
+run/source identity, blob hash and acquired envelope with the journal; an exact match makes the
+marker redundant. A superseded run's marker is removed even when the association never
+committed, because its incremented generation can never resume. History cleanup excludes every
+run still named by the inventory, so it cannot erase the evidence before either decision.
+Authoritative pre-association markers remain resumable.
+
+Older marker files are admitted to the inventory in bounded directory pages and matched to
+journal records in one batched query, including legacy payloads without run/source fields by
+checking their hashed run-and-source key. Until a complete legacy pass finishes, history cleanup
+and blob collection fail closed. Unmatched legacy files receive a 30-day safe-harbor entry and
+then expire; indexed marker blob references participate directly in GC's SQL mark set. No sync
+or inventory call walks the directory or performs one query per marker.
 Durable staging writes are joined before task cancellation returns. A process death can still
 leave a temporary staging file; acquisition startup and blob inventory remove only day-old
 partials from a partial-only directory, in genuinely bounded batches whose report contains

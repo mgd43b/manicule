@@ -7,13 +7,16 @@ import json
 import os
 import stat
 import threading
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy import text
 
+from manicule.core.acquisition import AcquiredSource, AcquisitionRecordState, AcquisitionSource
 from manicule.core.content import RawDocument
 from manicule.core.ids import content_hash
+from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.storage.blobs import (
     BlobStore,
     OmittedBlob,
@@ -459,6 +462,143 @@ async def test_the_sweep_reclaims_only_unreferenced_blobs(
     assert collected == [dropped.hash]
     assert await blobs.get(kept.hash) == b"referenced bytes"
     assert await blobs.get(dropped.hash) is None
+
+
+async def test_preassociation_marker_supersession_releases_only_the_fenced_blob(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    now = datetime(2026, 8, 15, 12, tzinfo=UTC)
+
+    async def staged_run(run_id: str, connector: str, body: bytes) -> tuple[str, str]:
+        await store.create_acquisition_run(run_id, connector)
+        run = await store.claim_acquisition_run(
+            run_id, "owner", now=now, expires_at=now + timedelta(minutes=1)
+        )
+        assert run is not None
+        source_id = f"{run_id}-source"
+        source = DiscoveredDoc(ref=DocRef(source_id=source_id, uri=f"memory:{source_id}"))
+        await store.append_acquisition_record(
+            run_id,
+            0,
+            AcquisitionSource.from_discovered(source),
+            lease_owner="owner",
+            lease_generation=run.lease_generation,
+            now=now,
+        )
+        await store.transition_acquisition_record(
+            run_id,
+            source_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="owner",
+            lease_generation=run.lease_generation,
+            now=now,
+        )
+        raw = RawDocument(
+            source_id=source_id, uri=f"memory:{source_id}", media_type="text/plain", content=body
+        )
+        retained, _ = await blobs.retain_acquisition(f"{run_id}\0{source_id}", raw)
+        assert retained.ref is not None
+        return source_id, retained.ref
+
+    stale_source, stale_ref = await staged_run("stale-run", "stale", b"stale bytes")
+    live_source, live_ref = await staged_run("live-run", "live", b"live bytes")
+    live_path = blobs._stage_path(  # pyright: ignore[reportPrivateUsage]
+        f"live-run\0{live_source}"
+    )
+    legacy_payload = json.loads(live_path.read_text())
+    legacy_payload.pop("run_id")
+    legacy_payload.pop("source_id")
+    live_path.write_text(json.dumps(legacy_payload))
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("DELETE FROM acquisition_markers WHERE name = :name"),
+            {"name": live_path.name},
+        )
+    await store.set_watermark(
+        "stale", Watermark(value="new", observed_at=now)
+    )
+    replacement = await store.claim_or_create_acquisition_run(
+        "stale",
+        "replacement",
+        "replacement-owner",
+        now=now + timedelta(minutes=2),
+        expires_at=now + timedelta(minutes=3),
+    )
+    assert replacement is not None
+
+    restarted = BlobStore(engine, data_dir)
+    assert not await restarted.reconcile_acquisition_markers()
+    assert await restarted.reconcile_acquisition_markers()
+    assert await restarted.resume_acquisition(f"stale-run\0{stale_source}") is None
+    assert await restarted.resume_acquisition(f"live-run\0{live_source}") is not None
+    assert await store.cleanup_acquisition_history(
+        datetime(2100, 1, 1, tzinfo=UTC), limit=10
+    ) == 1
+    assert await restarted.collect_garbage() == [stale_ref]
+    assert await restarted.get(live_ref) == b"live bytes"
+
+
+async def test_legacy_marker_is_inferred_or_expires_without_blocking_forever(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    stored = await blobs.put(b"legacy orphan", "text/plain")
+    assert isinstance(stored, StoredBlob)
+    key = "missing-run\0legacy-source"
+    path = blobs._stage_path(key)  # pyright: ignore[reportPrivateUsage]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_raw = RawDocument(
+        source_id="legacy-source",
+        uri="memory:legacy-source",
+        media_type="text/plain",
+        content=b"legacy orphan",
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "blob_ref": stored.hash,
+                "compression": "none",
+                "acquired_source": AcquiredSource.from_raw(legacy_raw).model_dump(mode="json"),
+            }
+        )
+    )
+    old = (datetime.now(UTC) - timedelta(days=31)).timestamp()
+    os.utime(path, (old, old))
+
+    restarted = BlobStore(engine, data_dir)
+    assert not await restarted.reconcile_acquisition_markers()
+    assert not path.exists()
+    assert await restarted.reconcile_acquisition_markers()
+    assert await restarted.collect_garbage() == [stored.hash]
+
+
+async def test_large_forged_marker_directory_reconciles_in_bounded_pages(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    staging = blobs.root / "acquisition-staging"
+    staging.mkdir(parents=True)
+    for index in range(250):
+        (staging / f"forged-{index:04d}").write_text("{}")
+
+    assert not await blobs.reconcile_acquisition_markers()
+    async with engine.connect() as connection:
+        first = (
+            await connection.execute(text("SELECT count(*) FROM acquisition_markers"))
+        ).scalar_one()
+    assert first == 100
+    assert not await blobs.reconcile_acquisition_markers()
+    assert not await blobs.reconcile_acquisition_markers()
+    assert await blobs.reconcile_acquisition_markers()
+    async with engine.connect() as connection:
+        final = (
+            await connection.execute(text("SELECT count(*) FROM acquisition_markers"))
+        ).scalar_one()
+    assert final == 250
 
 
 async def test_a_leaked_file_is_found_by_the_directory_scan(

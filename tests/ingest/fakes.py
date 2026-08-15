@@ -1363,5 +1363,5 @@ class MemoryBlobs:
     async def complete_acquisition(self, key: str) -> None:
         self.staged.pop(key, None)
 
-    async def reconcile_acquisition_markers(self) -> None:
-        return
+    async def reconcile_acquisition_markers(self) -> bool:
+        return True
