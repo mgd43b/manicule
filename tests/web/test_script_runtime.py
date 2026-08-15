@@ -8,17 +8,20 @@ import subprocess
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from manicule.web import rendering
 
 _NODE = shutil.which("node")
 if _NODE is None:
-    msg = "the JavaScript runtime tests require node"
-    raise RuntimeError(msg)
+    pytest.skip("the JavaScript runtime tests require node", allow_module_level=True)
 NODE: str = _NODE
 SCRIPT = Path(rendering.HERE) / "static" / "manicule.js"
 BOOT = r"""
 const fs = require("fs");
 const vm = require("vm");
+globalThis.window = globalThis;
+globalThis.location = {reload() {}};
 let source = fs.readFileSync(process.argv[1], "utf8");
 const start = "  startTheme();\n  startPalette();\n  startChat();\n  startActions();";
 const expose = "  globalThis.hooks = { json: json, runAction: runAction, " +
@@ -45,8 +48,8 @@ def run_javascript(body: str) -> dict[str, object]:
     return cast("dict[str, object]", json.loads(completed.stdout))
 
 
-def test_mutations_report_envelope_non_json_and_network_failures_and_serialize() -> None:
-    """Every rejection is visible, and one shared status cannot host two racing actions."""
+def test_mutations_report_every_failure_and_queue_shared_status_actions() -> None:
+    """Shared status actions run in order, remain visible, and can be retried after failure."""
     result = run_javascript(
         r"""
 function element() {
@@ -74,27 +77,61 @@ globalThis.fetch = () => Promise.reject(new Error("offline"));
 await hooks.runAction(control, status, "Working…", () => hooks.json("POST", "/x", {}), () => {});
 const network = status.textContent;
 
+const queueStatus = element();
+const history = [];
+let visible = "";
+Object.defineProperty(queueStatus, "textContent", {
+  get() { return visible; },
+  set(value) { visible = value; history.push(value); }
+});
+const firstControl = element();
+const secondControl = element();
 let release;
-let calls = 0;
+const order = [];
 const held = new Promise(resolve => { release = resolve; });
-const first = hooks.runAction(control, status, "Working…", () => {
-  calls += 1;
+const first = hooks.runAction(firstControl, queueStatus, "First…", () => {
+  order.push("first");
   return held;
 }, () => {});
-await hooks.runAction(control, status, "Working…", () => {
-  calls += 1;
+const second = hooks.runAction(secondControl, queueStatus, "Second…", () => {
+  order.push("second");
+  return Promise.resolve({
+    status: 409, envelope: {ok: false, error: {type: "bad", message: "second"}}
+  });
+}, () => {});
+await hooks.runAction(secondControl, queueStatus, "Duplicate…", () => {
+  order.push("duplicate");
   return Promise.resolve({status: 200, envelope: {ok: true}});
 }, () => {});
-release({status: 400, envelope: {ok: false, error: {type: "bad", message: "no"}}});
-await first;
-console.log(JSON.stringify({envelope, nonJson, network, calls}));
+const queuedDisabled = secondControl.disabled;
+release({
+  status: 409, envelope: {ok: false, error: {type: "bad", message: "first"}}
+});
+await Promise.all([first, second]);
+const retryable = !firstControl.disabled && !secondControl.disabled;
+await hooks.runAction(secondControl, queueStatus, "Retry…", () => {
+  order.push("retry");
+  return Promise.resolve({status: 200, envelope: {ok: true}});
+}, (result, node) => {
+  node.setAttribute("role", "status");
+  node.setAttribute("data-action-state", "success");
+  node.textContent = "Retried.";
+});
+console.log(JSON.stringify({
+  envelope, nonJson, network, queuedDisabled, retryable, order, history,
+  retryDisabled: secondControl.disabled
+}));
 """
     )
     assert result == {
         "envelope": {"message": "conflict: already exists", "role": "alert", "disabled": False},
         "nonJson": "The request was refused (502).",
         "network": "The service could not be reached. Try again.",
-        "calls": 1,
+        "queuedDisabled": True,
+        "retryable": True,
+        "order": ["first", "second", "retry"],
+        "history": ["First…", "bad: first", "Second…", "bad: second", "Retry…", "Retried."],
+        "retryDisabled": False,
     }
 
 

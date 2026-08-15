@@ -22,6 +22,7 @@
   "use strict";
 
   var THEME_KEY = "manicule.theme";
+  var ACTION_QUEUES = new WeakMap();
 
   function json(method, path, body) {
     var options = {
@@ -78,24 +79,78 @@
     }
   }
 
-  function runAction(control, node, pending, request, success) {
-    node = nearbyStatus(control, node);
-    if (node.getAttribute("data-action-running") === "true") { return Promise.resolve(); }
-    node.setAttribute("data-action-running", "true");
-    busy(control, true);
-    actionState(node, "pending", pending);
-    return Promise.resolve().then(request).then(function (result) {
+  function actionQueue(node) {
+    var queue = ACTION_QUEUES.get(node);
+    if (!queue) {
+      queue = { active: false, pending: [], reloadRequested: false, reloadTimer: null };
+      ACTION_QUEUES.set(node, queue);
+    }
+    return queue;
+  }
+
+  function advanceActionQueue(node) {
+    var queue = actionQueue(node);
+    if (queue.active) { return; }
+    var job = queue.pending.shift();
+    if (!job) {
+      if (queue.reloadRequested && !queue.reloadTimer) {
+        queue.reloadTimer = window.setTimeout(function () { window.location.reload(); }, 250);
+      }
+      return;
+    }
+    queue.active = true;
+    job.control.removeAttribute("data-action-queued");
+    job.control.setAttribute("data-action-running", "true");
+    actionState(node, "pending", job.pending);
+
+    function finish() {
+      job.control.removeAttribute("data-action-running");
+      busy(job.control, false);
+      job.resolve();
+      window.setTimeout(function () {
+        queue.active = false;
+        advanceActionQueue(node);
+      }, 250);
+    }
+
+    Promise.resolve().then(job.request).then(function (result) {
       if (!result.envelope || !result.envelope.ok) {
-        node.removeAttribute("data-action-running");
-        busy(control, false);
+        queue.reloadRequested = false;
         actionState(node, "error", failure(result));
+        finish();
         return;
       }
-      success(result, node);
+      job.success(result, node);
+      finish();
     }).catch(function () {
-      node.removeAttribute("data-action-running");
-      busy(control, false);
+      queue.reloadRequested = false;
       actionState(node, "error", "The service could not be reached. Try again.");
+      finish();
+    });
+  }
+
+  function runAction(control, node, pending, request, success) {
+    node = nearbyStatus(control, node);
+    if (control.getAttribute("data-action-queued") === "true" ||
+        control.getAttribute("data-action-running") === "true") {
+      return Promise.resolve();
+    }
+    var queue = actionQueue(node);
+    if (queue.reloadTimer) {
+      window.clearTimeout(queue.reloadTimer);
+      queue.reloadTimer = null;
+    }
+    busy(control, true);
+    control.setAttribute("data-action-queued", "true");
+    return new Promise(function (resolve) {
+      queue.pending.push({
+        control: control,
+        pending: pending,
+        request: request,
+        success: success,
+        resolve: resolve,
+      });
+      advanceActionQueue(node);
     });
   }
 
@@ -103,8 +158,8 @@
    * the server from one envelope; re-rendering it there keeps one description of what a
    * listing is, instead of a second one written in this file that can disagree. */
   function reloadAfterChange(result, node, message) {
+    actionQueue(node).reloadRequested = true;
     actionState(node, "success", message + " Reloading…");
-    window.setTimeout(function () { window.location.reload(); }, 250);
   }
 
   function act(selector, node, pending, success, request) {
@@ -583,8 +638,6 @@
             feedback: button.getAttribute("data-feedback"),
           });
         }, function (result, node) {
-          node.removeAttribute("data-action-running");
-          busy(button, false);
           actionState(node, "success", "Recorded.");
         });
       });
@@ -615,8 +668,6 @@
           return json("POST", "/api/v1/admin/connectors/" + encodeURIComponent(element.getAttribute("data-sync")) + "/sync", {});
         }, function (result, node) {
           var report = result.envelope.data || {};
-          node.removeAttribute("data-action-running");
-          busy(element, false);
           actionState(node, "success", "Ingested " + report.ingested + ", skipped " + report.skipped +
                       ", failed " + report.failed + (report.error ? " — " + report.error : ""));
         });
@@ -678,8 +729,6 @@
            * not logged, and gone as soon as this page is left. */
           secret.hidden = false;
           say(secret, result.envelope.data.secret);
-          node.removeAttribute("data-action-running");
-          busy(submit, false);
           actionState(node, "success", "Copy this now — only a digest is kept, so it cannot be shown again.");
         });
       });
