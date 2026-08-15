@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -96,7 +97,7 @@ from manicule.parsers.expansion import ExpandedMember, MemberFailure
 from manicule.parsers.versions import parse_fingerprint
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
     from manicule.core.content import Chunk, Metadata
     from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
@@ -118,6 +119,13 @@ turns that into a frame on its own tick, which is what keeps a slow reader from 
 backpressure on the pipeline.
 """
 
+type _PublicationFence = Callable[[], Awaitable[None]]
+
+
+_publication_fence: ContextVar[_PublicationFence | None] = ContextVar(
+    "acquisition_publication_fence", default=None
+)
+
 
 class _StageError(Exception):
     """One stage's failure, carrying where it happened.
@@ -131,6 +139,10 @@ class _StageError(Exception):
         super().__init__(detail)
         self.stage = stage
         self.detail = detail
+
+
+class _LostAcquisitionLeaseError(RuntimeError):
+    """The current acquisition attempt no longer owns its fencing generation."""
 
 
 class _SupersededError(Exception):
@@ -671,9 +683,9 @@ class IngestPipeline:
         if acquisitions is None:
             return _AcquisitionStart(watermark=watermark)
         selected = await acquisitions.latest_unsettled_acquisition_run(connector.name)
+        owner = f"pipeline:{uuid4().hex}"
         if selected is None:
             run_id = uuid4().hex
-            owner = f"pipeline:{run_id}"
             selected = await acquisitions.create_acquisition_run(run_id, connector.name)
         else:
             if selected.state not in {
@@ -686,7 +698,6 @@ class IngestPipeline:
                 )
                 raise RuntimeError(msg)
             run_id = selected.id
-            owner = selected.lease_owner or f"pipeline:{run_id}"
         now = self._acquisition_clock()
         claimed = await acquisitions.claim_acquisition_run(
             run_id,
@@ -856,19 +867,23 @@ class IngestPipeline:
             producer = self._discover_into
 
         refs, bodies = run.refs, run.bodies
-        async with asyncio.TaskGroup() as stages:
-            stages.create_task(producer(run, refs), name="discover")
-            for worker in range(self._fetch_workers):
-                stages.create_task(self._fetch_into(run, refs, bodies), name=f"fetch-{worker}")
-            for worker in range(self._ingest_workers):
-                stages.create_task(self._ingest_from(run, bodies), name=f"ingest-{worker}")
+        if run.acquisitions is not None:
+            async with asyncio.TaskGroup() as ownership:
+                work = ownership.create_task(
+                    self._run_local_stages(run, producer, refs, bodies), name="journal-work"
+                )
+                ownership.create_task(
+                    self._heartbeat_acquisition_until_done(run, work), name="lease-heartbeat"
+                )
+        else:
+            await self._run_local_stages(run, producer, refs, bodies)
         if (
             run.acquisitions is not None
             and run.report.enumeration_completed
             and run.report.complete
         ):
             now = self._acquisition_clock()
-            await self._keep_acquisition_lease_live(run, run.acquisitions, now)
+            await self._keep_acquisition_lease_live(run, run.acquisitions, now, force=True)
             await run.acquisitions.transition_acquisition_run(
                 run.acquisition_run_id,
                 AcquisitionRunState.ACQUIRING,
@@ -877,6 +892,41 @@ class IngestPipeline:
                 lease_generation=run.lease_generation,
                 now=now,
             )
+
+    async def _run_local_stages(
+        self,
+        run: _Sync,
+        producer: Callable[[_Sync, Conveyor[DiscoveredDoc | AcquisitionRecord]], Awaitable[None]],
+        refs: Conveyor[DiscoveredDoc | AcquisitionRecord],
+        bodies: Conveyor[_Fetched],
+    ) -> None:
+        """Run the bounded local stages while the ownership task fences the whole group."""
+
+        async def produce() -> None:
+            await producer(run, refs)
+
+        async with asyncio.TaskGroup() as stages:
+            stages.create_task(produce(), name="discover")
+            for worker in range(self._fetch_workers):
+                stages.create_task(self._fetch_into(run, refs, bodies), name=f"fetch-{worker}")
+            for worker in range(self._ingest_workers):
+                stages.create_task(self._ingest_from(run, bodies), name=f"ingest-{worker}")
+
+    async def _heartbeat_acquisition_until_done(
+        self, run: _Sync, work: asyncio.Task[None]
+    ) -> None:
+        """Renew independently of document mutations and stop all work if ownership is lost."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - created only for journal runs
+            return
+        interval = self._acquisition_lease_s / 3
+        while not work.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(work), timeout=interval)
+            except TimeoutError:
+                await self._keep_acquisition_lease_live(
+                    run, acquisitions, self._acquisition_clock(), force=True
+                )
 
     async def _discover_into(
         self, run: _Sync, refs: Conveyor[DiscoveredDoc | AcquisitionRecord]
@@ -887,12 +937,12 @@ class IngestPipeline:
         watermark: exhausted (may advance), stopped at ``limit`` (bounded, may not), and raised
         (unclean, may not).
         """
-        stream = run.connector.discover(run.watermark)
         run.report.enumeration_completed = False
+        if run.limit is not None and run.accepted >= run.limit:
+            run.report.limited = True
+            return
+        stream = run.connector.discover(run.watermark)
         try:
-            if run.limit is not None and run.accepted >= run.limit:
-                run.report.limited = True
-                return
             async for discovered in stream:
                 if run.stop.is_set():
                     break
@@ -928,8 +978,11 @@ class IngestPipeline:
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover - caller selects this path structurally
             return
-        stream = run.connector.discover(run.watermark)
         run.report.enumeration_completed = False
+        if run.limit is not None and run.accepted >= run.limit:
+            run.report.limited = True
+            return
+        stream = run.connector.discover(run.watermark)
         try:
             async for discovered in stream:
                 if run.stop.is_set():
@@ -972,11 +1025,20 @@ class IngestPipeline:
                 await closer()
 
     async def _keep_acquisition_lease_live(
-        self, run: _Sync, acquisitions: AcquisitionStore, now: datetime
+        self,
+        run: _Sync,
+        acquisitions: AcquisitionStore,
+        now: datetime,
+        *,
+        force: bool = False,
     ) -> None:
         """Renew near expiry; every following journal mutation is generation-fenced."""
         renewal_margin = timedelta(seconds=self._acquisition_lease_s / 3)
-        if run.lease_expires_at is not None and now + renewal_margin < run.lease_expires_at:
+        if (
+            not force
+            and run.lease_expires_at is not None
+            and now + renewal_margin < run.lease_expires_at
+        ):
             return
         expires_at = now + timedelta(seconds=self._acquisition_lease_s)
         renewed = await acquisitions.renew_acquisition_lease(
@@ -989,6 +1051,15 @@ class IngestPipeline:
         if not renewed:
             _raise_lost_acquisition_lease(run.acquisition_run_id)
         run.lease_expires_at = expires_at
+
+    async def _fence_acquisition_publication(self, run: _Sync) -> None:
+        """Prove ownership immediately before a journal consumer makes bytes servable."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - callback exists only for journal runs
+            return
+        await self._keep_acquisition_lease_live(
+            run, acquisitions, self._acquisition_clock(), force=True
+        )
 
     async def _journal_into(
         self, run: _Sync, refs: Conveyor[DiscoveredDoc | AcquisitionRecord]
@@ -1099,13 +1170,19 @@ class IngestPipeline:
             bodies.finish()
 
     async def _settle_journal_record(self, run: _Sync, outcome: DocumentOutcome) -> None:
-        """Close transitional direct-fetch work, or leave an unrecorded source retryable."""
+        """Close transitional direct-fetch work without claiming blob-backed acquisition."""
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover - caller has a journal record
             return
-        target = (
-            AcquisitionRecordState.SETTLED if outcome.document_id else AcquisitionRecordState.RETRY
-        )
+        if outcome.skipped:
+            target = AcquisitionRecordState.UNCHANGED
+        elif outcome.document_id:
+            # Explicitly feature-gated in __init__. This temporary #176 consumer fetched and
+            # published the source directly; it must not pass through ACQUIRED or INDEXING,
+            # whose #175 contract requires a retained blob that this path does not produce.
+            target = AcquisitionRecordState.SETTLED
+        else:
+            target = AcquisitionRecordState.RETRY
         now = self._acquisition_clock()
         await self._keep_acquisition_lease_live(run, acquisitions, now)
         await acquisitions.transition_acquisition_record(
@@ -1136,6 +1213,11 @@ class IngestPipeline:
         stages, and :meth:`run` records it as the run's error.
         """
         while (fetched := await bodies.take()) is not None:
+            fence_token = (
+                _publication_fence.set(lambda: self._fence_acquisition_publication(run))
+                if run.acquisitions is not None
+                else None
+            )
             try:
                 outcomes = await self.ingest_raw(
                     fetched.raw,
@@ -1145,6 +1227,8 @@ class IngestPipeline:
                     existing=fetched.existing,
                 )
             finally:
+                if fence_token is not None:
+                    _publication_fence.reset(fence_token)
                 # The other half of the pair entered in the fetch stage: this body is no longer
                 # held. In a `finally`, so a document that failed still releases its accounting —
                 # the deadlock this whole design has to avoid is a permit that a failure keeps.
@@ -1810,6 +1894,7 @@ class IngestPipeline:
         publication = self._publication_of(document, [])
         settled = document.model_copy(update={"publication_id": publication})
         entries, glossary_fp, glossary_detail = self._derive_definitions(settled, [])
+        await self._check_publication_fence()
         committed = await self._store.publish_document(
             settled,
             [],
@@ -1862,6 +1947,7 @@ class IngestPipeline:
                 await self._store.stage_vectors(publication, chunks)
             await self._vectors.upsert(chunks, vectors, publication_id=publication)
             entries, glossary_fp, glossary_detail = self._derive_definitions(document, chunks)
+            await self._check_publication_fence()
             committed = await self._store.publish_document(
                 indexed_document,
                 chunks,
@@ -1873,6 +1959,8 @@ class IngestPipeline:
                 glossary_fp=glossary_fp,
                 original_omitted_reason=retention.omitted_reason,
             )
+        except _LostAcquisitionLeaseError:
+            raise
         except Exception as exc:  # noqa: BLE001 - a store failure is this document's
             return await self._demote(
                 document, existing, PipelineStage.STORE, f"{type(exc).__name__}: {exc}"
@@ -1900,12 +1988,19 @@ class IngestPipeline:
         Raises:
             _SupersededError: The stored document is no longer ``expected``, so nothing was written.
         """
+        await self._check_publication_fence()
         if expected is None:
             return await self._store.upsert_document(document)
         committed = await self._store.commit_document(document, expected=expected)
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
         return committed.stored
+
+    async def _check_publication_fence(self) -> None:
+        """Run the task-local acquisition fence at the last point before publication."""
+        fence = _publication_fence.get()
+        if fence is not None:
+            await fence()
 
     async def _store_definitions(self, document: Document, chunks: Sequence[Chunk]) -> str:
         """Read this document's glossary definitions and make them its stored ones.
@@ -2529,7 +2624,7 @@ def _writer_of(store: object) -> GlossaryWriter | None:
 
 def _raise_lost_acquisition_lease(run_id: str) -> None:
     msg = f"acquisition lease for run {run_id!r} was lost"
-    raise RuntimeError(msg)
+    raise _LostAcquisitionLeaseError(msg)
 
 
 def _with_status(document: Document, result: ChainResult) -> Document:

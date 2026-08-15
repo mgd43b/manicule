@@ -928,6 +928,7 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
     store = GatedJournal()
     await store.ensure_workspace()
     clock = fakes.ManualClock()
+    lease_clock = fakes.ManualLeaseClock()
     connector = fakes.ExpiringCursorConnector(
         {f"public-doc-{number}": f"line {number}" for number in range(10)},
         clock=clock,
@@ -949,6 +950,7 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
             chunk_fingerprint=chunker.fingerprint,
             shutdown_grace_s=0,
             detect_glossary=False,
+            acquisition_clock=lease_clock,
         )
 
     task = asyncio.create_task(pipeline().run(connector))
@@ -967,6 +969,11 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
     assert await store.get_watermark(connector.name) is None
 
     pages_before_resume = connector.pages_requested
+    with pytest.raises(RuntimeError, match="could not be claimed"):
+        await pipeline().run(connector)
+    assert connector.pages_requested == pages_before_resume
+
+    lease_clock.advance(301)
     resumed = await pipeline().run(connector)
 
     assert connector.pages_requested == pages_before_resume, "the source was rediscovered"
@@ -1043,6 +1050,55 @@ async def test_duplicate_discovery_is_one_durable_record_and_one_publication(
     assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 
+async def test_expired_worker_is_fenced_before_publication_after_takeover(
+    store: SqliteDocStore,
+) -> None:
+    """An embed begun by one generation cannot publish after a successor takes the run."""
+    lease_clock = fakes.ManualLeaseClock()
+    embedder = fakes.GatedEmbedder()
+    chunker = fakes.BlockChunker()
+    connector = fakes.DictConnector(
+        {"public-fenced-document": "public synthetic line"}, name="fenced-synthetic-source"
+    )
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=embedder,
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=1,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await embedder.gate.wait_for(1)
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+
+    lease_clock.advance(2)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=1),
+    )
+    assert successor is not None
+    assert successor.lease_generation > durable.lease_generation
+
+    embedder.gate.open()
+    report = await task
+    stored = await store.find_document(connector.name, "public-fenced-document")
+
+    assert report.indexed == 0
+    assert report.error_type == "_LostAcquisitionLeaseError"
+    assert stored is None, "the expired generation made no document revision servable"
+
+
 async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
     store: SqliteDocStore,
 ) -> None:
@@ -1051,6 +1107,7 @@ async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
         pause_after=9,
     )
     chunker = fakes.BlockChunker()
+    lease_clock = fakes.ManualLeaseClock()
     pipeline = IngestPipeline(
         store=store,
         acquisitions=store,
@@ -1062,6 +1119,7 @@ async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
         middleware=MiddlewareRunner(()),
         chunk_fingerprint=chunker.fingerprint,
         detect_glossary=False,
+        acquisition_clock=lease_clock,
     )
 
     report = await pipeline.run(connector, limit=3)
@@ -1075,6 +1133,18 @@ async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
     assert durable.enumeration_completed_at is None
     assert durable.candidate_watermark is None
     assert await store.get_watermark(connector.name) is None
+
+    lease_clock.advance(301)
+    repeated = await pipeline.run(connector, limit=3)
+    same_run = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert repeated.limited
+    assert repeated.indexed == 0
+    assert connector.yields == 3, "a satisfied limit must not even open the source iterator"
+    assert same_run is not None
+    assert same_run.id == durable.id
+    assert same_run.discovered_count == 3
+    assert len(await store.list_acquisition_records(durable.id)) == 3
 
 
 async def test_a_re_parse_reads_retained_bytes_rather_than_the_network(

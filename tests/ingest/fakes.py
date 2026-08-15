@@ -12,7 +12,7 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Collection, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import override
 
 from manicule.connectors import CursorExpiredError
@@ -1067,6 +1067,19 @@ class ManualClock:
     def advance(self, seconds: float) -> None:
         """Move time forward by exactly ``seconds`` without sleeping."""
         self.now += seconds
+
+
+class ManualLeaseClock:
+    """A timezone-aware acquisition clock advanced without sleeping."""
+
+    def __init__(self) -> None:
+        self.now = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
 
 
 class ClockedGatedEmbedder(GatedEmbedder):
