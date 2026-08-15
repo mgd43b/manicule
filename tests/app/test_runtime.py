@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from manicule.app.runtime import Runtime
+from manicule.app.runtime import AssemblyError, Runtime
 from manicule.app.service import ApplicationService, pre_upgrade_destination
 from manicule.config.settings import Settings
 from manicule.container import keys
@@ -577,6 +577,22 @@ async def test_the_runtime_wires_the_durable_offline_indexing_path(
         pipeline = await opened.pipeline()
 
         assert pipeline._acquisitions is not None  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_retention_refuses_a_store_without_durable_acquisition_at_assembly(
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A third-party store missing the journal fails before any ingest work can start."""
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+
+        async def incomplete_documents() -> object:
+            return object()
+
+        monkeypatch.setattr(opened, "documents", incomplete_documents)
+
+        with pytest.raises(AssemblyError, match="does not provide durable source acquisition"):
+            await opened.pipeline()
 
 
 async def test_retention_disabled_runtime_uses_the_supported_live_derivation_path(
