@@ -25,6 +25,7 @@ from manicule.core.errors import (
     UnknownComponentError,
     UnknownEntityError,
 )
+from manicule.ingest.capacity import CapacityRefusedError
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -60,6 +61,9 @@ _HINTS: dict[type[Exception], str] = {
     CrossWorkspaceError: (
         "Something returned data belonging to another workspace and it was refused. This is a "
         "defect, not a configuration problem — report it with the message above."
+    ),
+    CapacityRefusedError: (
+        "Free durable ingest capacity or raise the configured limit, then retry."
     ),
 }
 """What to do about each kind of failure, in the words of whoever has to do it.

@@ -61,7 +61,16 @@ def build_doc_store(context: BuildContext) -> DocStore:
         )
         raise ConfigError(msg)
     engine = create_engine(context.data_dir, echo=config.echo)
-    return SqliteDocStore(engine, workspace_id=context.settings.workspace)
+    ingest = context.settings.ingest
+    return SqliteDocStore(
+        engine,
+        workspace_id=context.settings.workspace,
+        data_dir=context.data_dir,
+        max_journal_records=ingest.max_journal_records,
+        max_journal_metadata_bytes=ingest.max_journal_metadata_bytes,
+        max_acquired_blob_backlog_bytes=ingest.max_acquired_blob_backlog_bytes,
+        min_disk_headroom_bytes=ingest.min_disk_headroom_bytes,
+    )
 
 
 def build_vector_store(context: BuildContext) -> VectorStore:

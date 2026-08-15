@@ -262,6 +262,29 @@ def test_paths_expand_the_home_shorthand() -> None:
     assert "~" not in str(settings.data_dir)
 
 
+def test_durable_ingest_backlogs_have_finite_default_bounds() -> None:
+    ingest = Settings().ingest
+
+    assert ingest.max_journal_records > 0
+    assert ingest.max_journal_metadata_bytes > 0
+    assert ingest.max_acquired_blob_backlog_bytes > 0
+    assert ingest.min_disk_headroom_bytes > 0
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_journal_records",
+        "max_journal_metadata_bytes",
+        "max_acquired_blob_backlog_bytes",
+        "min_disk_headroom_bytes",
+    ],
+)
+def test_a_durable_ingest_bound_cannot_be_disabled_with_zero(field: str) -> None:
+    with pytest.raises(ValidationError, match=field):
+        Settings(ingest={field: 0})  # pyright: ignore[reportArgumentType]
+
+
 # --- secrets ------------------------------------------------------------------------------
 
 

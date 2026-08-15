@@ -35,6 +35,7 @@ from manicule.container.container import Container, build_container
 from manicule.core.content import RawDocument
 from manicule.core.errors import ManiculeError, PolicyError, UnknownEntityError
 from manicule.core.lifecycle import HealthState
+from manicule.ingest.capacity import CapacityRefusedError
 from manicule.ingest.recovery import InstanceLock
 from manicule.plugins.manifest import ComponentKind
 
@@ -609,7 +610,12 @@ class Runtime:
         await self.documents()
         if not self._settings.storage.retain_source_bytes:
             return NoRetention()
-        return BlobStore(self.require_engine(), self._settings.data_dir)
+        return BlobStore(
+            self.require_engine(),
+            self._settings.data_dir,
+            min_disk_headroom_bytes=self._settings.ingest.min_disk_headroom_bytes,
+            max_acquired_blob_backlog_bytes=(self._settings.ingest.max_acquired_blob_backlog_bytes),
+        )
 
     async def pipeline(self) -> IngestPipeline:
         """The ingest pipeline, refused before construction if it cannot write to this index."""
@@ -861,7 +867,13 @@ class _Ingestion:
                 if limit is not None and report.discovered >= limit:
                     break
         except Exception as exc:  # noqa: BLE001 - an enumeration failure is not a crash
-            report.error = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, CapacityRefusedError):
+                report.enumeration_completed = False
+                report.refuse_capacity(exc)
+            else:
+                report.error_type = type(exc).__name__
+                report.error_message = str(exc)
+                report.error = f"{type(exc).__name__}: {exc}"
         finally:
             closer = getattr(stream, "aclose", None)
             if closer is not None:
@@ -1226,13 +1238,18 @@ class _Ingestion:
                 media_type=entry.media_type,
                 content=content,
             )
-            outcomes = await pipeline.ingest_raw(
-                raw,
-                source=entry.source,
-                version_token=entry.version_token,
-                title=entry.title,
-                force=force,
-            )
+            try:
+                outcomes = await pipeline.ingest_raw(
+                    raw,
+                    source=entry.source,
+                    version_token=entry.version_token,
+                    title=entry.title,
+                    force=force,
+                )
+            except CapacityRefusedError as error:
+                report.enumeration_completed = False
+                report.refuse_capacity(error)
+                break
             for position, outcome in enumerate(outcomes):
                 report.record(outcome, expanded=position > 0)
         return report

@@ -20,6 +20,11 @@ watches a directory, so that the optional dependency it needs is paid for only b
 
 from __future__ import annotations
 
+from manicule.ingest.capacity import (
+    CapacityDiagnostic,
+    CapacityRefusedError,
+    CapacityResource,
+)
 from manicule.ingest.embedding import batch_size, embed_chunks
 from manicule.ingest.middleware import MiddlewareRunner, declarations, text_digest
 from manicule.ingest.pipeline import (
@@ -46,6 +51,9 @@ from manicule.ingest.workers import (
 __all__ = [
     "AttemptResult",
     "BlobSink",
+    "CapacityDiagnostic",
+    "CapacityRefusedError",
+    "CapacityResource",
     "Change",
     "DocumentOutcome",
     "InProcessRunner",

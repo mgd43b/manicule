@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from typing import TYPE_CHECKING, Any, cast, override
+from typing import TYPE_CHECKING, Any, Never, cast, override
 
 import pytest
 from typer.testing import CliRunner
 
-from manicule.api.envelopes import SERVICE_UNAVAILABLE
+from manicule.api.envelopes import SERVICE_UNAVAILABLE, status_for
 from manicule.app import commands, control
 from manicule.app.commands import Command
 from manicule.app.dispatch import run_op
@@ -21,6 +21,7 @@ from manicule.cli import main as cli
 from manicule.cli import proxy
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors.sessions import SessionVault
+from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.pipeline import RunReport
 from manicule.mcp.server import build_server
 from tests.api.support import client_for
@@ -50,6 +51,27 @@ def _incomplete() -> RunReport:
         error_message="the search cursor expired",
         enumeration_completed=False,
     )
+
+
+def _capacity_incomplete() -> RunReport:
+    report = RunReport(
+        connector="synthetic-wiki",
+        enumeration_completed=False,
+        glossary_failures=[
+            "private-source-id: https://private.invalid/doc?token=fake-secret-cinder"
+        ],
+    )
+    report.refuse_capacity(
+        CapacityRefusedError(
+            CapacityDiagnostic(
+                resource=CapacityResource.JOURNAL_METADATA_BYTES,
+                limit=100,
+                used=90,
+                requested=20,
+            )
+        )
+    )
+    return report
 
 
 async def _envelope(service: ApplicationService) -> Envelope:
@@ -141,6 +163,104 @@ async def test_pending_durable_derivation_is_a_retry_required_failure_envelope()
     assert envelope.error.type == "IncompleteIngestError"
 
 
+async def test_capacity_refusal_is_typed_retryable_and_aggregate_only() -> None:
+    service, _ = _service(_capacity_incomplete())
+    envelope = await _envelope(service)
+
+    assert envelope.ok is False
+    assert envelope.error is not None
+    assert envelope.error.type == "CapacityRefusedError"
+    assert envelope.data is not None
+    assert envelope.data["outcome"] == "incomplete"
+    assert envelope.data["retry_required"] is True
+    assert envelope.data["watermark_advanced"] is False
+    rendered = json.dumps(envelope.as_json(), sort_keys=True)
+    assert "journal_metadata_bytes" in rendered
+    for private in (
+        "source_id",
+        "private-source-id",
+        "private.invalid",
+        "uri",
+        "title",
+        "body",
+        "secret",
+        "token=",
+    ):
+        assert private not in rendered.lower()
+
+    metadata = _capacity_incomplete().as_metadata()
+    persisted = json.dumps(metadata, sort_keys=True)
+    assert '"limit": 100' in persisted
+    assert '"used": 90' in persisted
+    assert '"requested": 20' in persisted
+    for private in (
+        "source_id",
+        "private-source-id",
+        "private.invalid",
+        "uri",
+        "title",
+        "body",
+        "secret",
+        "token=",
+    ):
+        assert private not in persisted.lower()
+
+
+async def test_watch_batch_preserves_a_child_capacity_refusal(tmp_path: Path) -> None:
+    service, backend = _service(_capacity_incomplete())
+    envelope = await run_op(
+        "index_changes",
+        service.workspace,
+        lambda: service.index_changes([tmp_path], source="synthetic-wiki"),
+    )
+
+    assert envelope.ok is False
+    assert envelope.error is not None
+    assert envelope.error.type == "CapacityRefusedError"
+    assert envelope.data is not None
+    assert envelope.data["outcome"] == "incomplete"
+    assert envelope.data["retry_required"] is True
+    assert backend.ingestion_.paths == [tmp_path]
+
+
+async def test_archive_capacity_refusal_requires_a_forced_recovery_import(tmp_path: Path) -> None:
+    service, backend = _service(_capacity_incomplete())
+    archive = tmp_path / "private-archive-cinder"
+    archive.mkdir()
+
+    report = await service.import_corpus(archive)
+
+    assert report.retry_required is True
+    assert report.incomplete_reason is not None
+    assert report.incomplete_reason.type == "CapacityRefusedError"
+    assert "force enabled" in report.incomplete_reason.hint
+    assert backend.ingestion_.imported == [archive]
+    rendered = repr(report.model_dump(mode="json"))
+    assert "private-archive-cinder" not in rendered
+
+
+async def test_raw_repair_capacity_refusal_is_typed_nonzero_and_http_503() -> None:
+    refusal = CapacityRefusedError(
+        CapacityDiagnostic(
+            resource=CapacityResource.DISK_HEADROOM_BYTES,
+            limit=100,
+            used=90,
+            requested=20,
+        )
+    )
+
+    async def repair() -> Never:
+        raise refusal
+
+    envelope = await run_op("document_reindex", "default", repair)
+
+    assert envelope.ok is False
+    assert envelope.error is not None
+    assert envelope.error.type == "CapacityRefusedError"
+    assert "Free durable ingest capacity" in envelope.error.hint
+    assert status_for(envelope) == SERVICE_UNAVAILABLE
+
+
 def test_json_and_human_cli_fail_for_the_same_incomplete_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -166,6 +286,33 @@ def test_json_and_human_cli_fail_for_the_same_incomplete_outcome(
     assert "outcome" in human.stdout
     assert "incomplete" in human.stdout
     assert "retry required" in human.stdout
+
+
+def test_capacity_refusal_makes_cli_nonzero_without_private_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _ = _service(_capacity_incomplete())
+
+    async def dispatch(command: Command) -> Envelope:
+        return await run_op(
+            command.op,
+            service.workspace,
+            lambda: commands.run(service, command, commands.silent),
+        )
+
+    monkeypatch.setattr(cli, "_dispatch", dispatch)
+    runner = CliRunner()
+    results = (
+        runner.invoke(cli.app, ["--json", "connector", "sync", "synthetic-wiki"]),
+        runner.invoke(cli.app, ["--json", "index", ".", "--reindex"]),
+    )
+
+    for result in results:
+        assert result.exit_code == 1
+        assert "CapacityRefusedError" in result.stdout
+        assert "journal_metadata_bytes" in result.stdout
+        for private in ("source_id", "uri", "title", "body", "secret", "token="):
+            assert private not in result.stdout.lower()
 
 
 def test_multi_connector_shell_orchestration_does_not_log_incomplete_as_completed(

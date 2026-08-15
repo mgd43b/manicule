@@ -12,6 +12,7 @@ enforced in five places is a boundary enforced in whichever of them somebody rem
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sqlalchemy import event, select
@@ -98,11 +99,27 @@ class WorkspaceScoped:
         *,
         workspace_id: str = DEFAULT_WORKSPACE,
         sessions: async_sessionmaker[AsyncSession] | None = None,
+        data_dir: Path | None = None,
+        max_journal_records: int = 1_000_000,
+        max_journal_metadata_bytes: int = 1024 * 1024 * 1024,
+        max_acquired_blob_backlog_bytes: int = 20 * 1024 * 1024 * 1024,
+        min_disk_headroom_bytes: int = 2 * 1024 * 1024 * 1024,
     ) -> None:
         self._engine = engine
         self._workspace_id = workspace_id
         self._sessions = sessions or session_factory(engine)
         self._generation = _CommitCounter(engine)
+        self._max_journal_records = max_journal_records
+        self._max_journal_metadata_bytes = max_journal_metadata_bytes
+        self._max_acquired_blob_backlog_bytes = max_acquired_blob_backlog_bytes
+        database = engine.url.database
+        if data_dir is not None:
+            self._storage_root = data_dir
+        elif database is None or database in {"", ":memory:"}:
+            self._storage_root = None
+        else:
+            self._storage_root = Path(database).parent
+        self._min_disk_headroom_bytes = min_disk_headroom_bytes
 
     @property
     def workspace_id(self) -> str:
