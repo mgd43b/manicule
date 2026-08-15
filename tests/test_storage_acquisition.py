@@ -1436,6 +1436,8 @@ async def test_acquired_envelope_downgrade_refuses_with_aggregate_redacted_count
             acquired_source=_acquired(body, secret_id),
         )
 
+        # Downstream migrations are clean here; isolate this migration's own refusal boundary.
+        await downgrade(engine, "c41d7ea923b8")
         with pytest.raises(RuntimeError) as refused:
             await downgrade(engine, "f7c2a91d4e63")
 
@@ -1444,6 +1446,6 @@ async def test_acquired_envelope_downgrade_refuses_with_aggregate_redacted_count
         assert secret_id not in message
         assert secret_uri not in message
         assert body.decode() not in message
-        assert await current(engine) == "e4b81a7c2d90"
+        assert await current(engine) == "c41d7ea923b8"
     finally:
         await engine.dispose()

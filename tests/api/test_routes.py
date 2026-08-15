@@ -23,7 +23,7 @@ of them kept in two files is a list that gets extended in one.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastmcp.exceptions import ToolError
@@ -462,6 +462,28 @@ def test_no_route_generates_sidecar_manifests() -> None:
         f"operator's corpus directory at a path the request names, so it stays on the command "
         f"line where a person is present."
     )
+
+
+def test_reembed_network_surface_has_operator_action_and_status_parity() -> None:
+    """Authenticated admins receive the same explicit run lifecycle as other surfaces."""
+    reembed = sorted(
+        (
+            route.name,
+            route.path,
+            sorted(cast("set[str] | None", getattr(route, "methods", None)) or ()),
+        )
+        for route in walk_routes()
+        if "reembed" in route.name.lower() or "reembed" in route.path.lower()
+    )
+    assert reembed == [
+        ("reembed_abandon", "/api/v1/admin/reembed/{run_id}/abandon", ["POST"]),
+        ("reembed_cleanup", "/api/v1/admin/reembed/{run_id}", ["DELETE"]),
+        ("reembed_plan", "/api/v1/admin/reembed", ["GET"]),
+        ("reembed_resume", "/api/v1/admin/reembed/{run_id}/resume", ["POST"]),
+        ("reembed_start", "/api/v1/admin/reembed/{run_id}/start", ["POST"]),
+        ("reembed_status", "/api/v1/admin/reembed/{run_id}", ["GET"]),
+        ("ui_reembed", "/ui/reembed", ["GET"]),
+    ]
 
 
 def test_deleting_a_document_is_soft_and_there_is_no_hard_variant() -> None:

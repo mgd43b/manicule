@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     )
     from manicule.generation.sharing import ShareLink
     from manicule.ingest.pipeline import RunReport, Watching
+    from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
@@ -174,6 +175,20 @@ class Ingesting(Protocol):
                 translate it; the container raises it.
         """
         ...
+
+    async def reembed_plan(self) -> tuple[ReembedPlan, str, int]: ...
+
+    async def reembed_start(self, run_id: str, owner_token: str) -> ReembedRun: ...
+
+    async def reembed_resume(self, run_id: str, owner_token: str) -> ReembedRun: ...
+
+    async def reembed_status(self, run_id: str) -> ReembedRun | None: ...
+
+    async def reembed_abandon(self, run_id: str, owner_token: str) -> ReembedRun: ...
+
+    async def reembed_cleanup(self, run_id: str) -> bool: ...
+
+    async def reembed_recover_pending(self) -> ReembedRecovery: ...
 
     async def reindex(self, document_id: str) -> ReindexReport:
         """Re-parse one document from its retained bytes. No network."""

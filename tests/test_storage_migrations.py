@@ -8,22 +8,34 @@ from __future__ import annotations
 
 import importlib
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from pydantic import TypeAdapter
 from sqlalchemy import text
 
+from manicule.app.service import _reembed_run_report  # pyright: ignore[reportPrivateUsage]
 from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.retrieval import Filter
+from manicule.ingest.reembed import (
+    CorpusSnapshot,
+    LivePublication,
+    ReembedCommitment,
+    ReembedPlan,
+    ReembedRun,
+    ReembedState,
+)
 from manicule.retrieval.hydration import visible_documents
 from manicule.storage.autogen import include_name, include_object
 from manicule.storage.engine import create_engine
 from manicule.storage.fts import FTS_SHADOW_TABLES
 from manicule.storage.migrator import alembic_config, current, downgrade, head_revision, upgrade
 from manicule.storage.models import Base
+from manicule.storage.reembed import SqliteReembedStore
 from manicule.storage.vectors import LanceVectorStore
 from tests.fakes import HashEmbedder
 from tests.storage_helpers import make_chunk, make_document
@@ -216,6 +228,187 @@ async def test_downgrade_refuses_to_expose_retired_real_vector_generations(
         assert [candidate.publication_id for candidate in admitted] == [document.publication_id]
     finally:
         await vectors.teardown()
+        await engine.dispose()
+
+
+@pytest.mark.contract
+async def test_durable_reembed_downgrade_refuses_saved_or_published_state(
+    data_dir: Path,
+) -> None:
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO workspaces (id, name, mode, settings, created_at) "
+                    "VALUES ('default', 'Default', 'personal', '{}', "
+                    "'2026-01-01T00:00:00+00:00')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO reembed_corpus_snapshots "
+                    "(id, workspace_id, revision, live_json, complete, document_count, "
+                    "chunk_count, inventory_digest, chunk_inventory_digest, created_at) "
+                    "VALUES ('private-snapshot-id', 'default', '1', '{}', 0, 0, 0, '', '', "
+                    "'2026-01-01T00:00:00+00:00')"
+                )
+            )
+
+        with pytest.raises(
+            RuntimeError, match="refusing to downgrade durable re-embedding"
+        ) as caught:
+            await downgrade(engine, "6e31b7d592ac")
+        assert "private-snapshot-id" not in str(caught.value)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
+async def test_workspace_scope_migration_backfills_and_keeps_legacy_snapshot_rows(
+    data_dir: Path,
+) -> None:
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="31c7f944a31e")
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO workspaces (id, name, mode, settings, created_at) "
+                    "VALUES ('alpha', 'Alpha', 'personal', '{}', "
+                    "'2026-01-01T00:00:00+00:00'), "
+                    "('beta', 'Beta', 'personal', '{}', "
+                    "'2026-01-01T00:00:00+00:00')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO reembed_corpus_snapshots "
+                    "(id, revision, live_json, complete, document_count, chunk_count, "
+                    "inventory_digest, chunk_inventory_digest, created_at) VALUES "
+                    "('legacy-snapshot', '1', '{}', 1, 1, 1, 'documents', 'chunks', "
+                    "'2026-01-01T00:00:00+00:00')"
+                )
+            )
+            plan = ReembedPlan(
+                documents=3,
+                chunks=7,
+                input_bytes=101,
+                estimated_seconds=3.5,
+                peak_memory_bytes=2048,
+                temporary_disk_bytes=4096,
+            )
+            commitment = ReembedCommitment(
+                plan=plan,
+                snapshot=CorpusSnapshot(
+                    "legacy-snapshot",
+                    "1",
+                    LivePublication("legacy-table", "legacy-fingerprint", "chunks"),
+                ),
+                target_fingerprint="private-target-fingerprint",
+                target_config="private-target-config",
+                target_dimension=4,
+                inventory_digest="documents",
+                chunk_inventory_digest="chunks",
+            )
+            for run in (
+                ReembedRun(
+                    id="legacy-partial",
+                    commitment=commitment,
+                    state=ReembedState.BUILDING,
+                    documents_completed=2,
+                    chunks_completed=5,
+                ),
+                ReembedRun(
+                    id="legacy-terminal",
+                    commitment=commitment,
+                    state=ReembedState.PUBLISHED,
+                    documents_completed=3,
+                    chunks_completed=7,
+                ),
+            ):
+                commitment_payload = TypeAdapter(ReembedCommitment).dump_python(commitment)
+                checkpoint_payload = TypeAdapter(ReembedRun).dump_python(run)
+                # Reproduce the exact payload shape written before workspace scoping existed.
+                commitment_payload["snapshot"].pop("workspace_id")
+                commitment_payload.pop("build_plan")
+                checkpoint_payload.pop("workspace_id")
+                checkpoint_payload.pop("workspace_documents_completed")
+                checkpoint_payload.pop("workspace_chunks_completed")
+                checkpoint_payload["commitment"]["snapshot"].pop("workspace_id")
+                checkpoint_payload["commitment"].pop("build_plan")
+                await connection.execute(
+                    text(
+                        "INSERT INTO reembed_runs "
+                        "(id, commitment_json, state, checkpoint_json, revision, lease_owner, "
+                        "lease_generation, lease_expires_at, created_at, updated_at) VALUES "
+                        "(:id, :commitment, :state, :checkpoint, 0, NULL, 0, NULL, "
+                        "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+                    ),
+                    {
+                        "id": run.id,
+                        "commitment": json.dumps(commitment_payload),
+                        "state": run.state.value,
+                        "checkpoint": json.dumps(checkpoint_payload),
+                    },
+                )
+            await connection.execute(
+                text(
+                    "INSERT INTO reembed_snapshot_documents "
+                    "(snapshot_id, document_id, payload_json) VALUES "
+                    "('legacy-snapshot', 'doc', '{\"workspace_id\":\"alpha\"}')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO reembed_snapshot_chunks "
+                    "(snapshot_id, document_id, position, chunk_id, payload_json) VALUES "
+                    "('legacy-snapshot', 'doc', 0, 'chunk', '{}')"
+                )
+            )
+
+        await upgrade(engine)
+
+        async with engine.connect() as connection:
+            assert (
+                await connection.execute(
+                    text(
+                        "SELECT workspace_id FROM reembed_corpus_snapshots "
+                        "WHERE id = 'legacy-snapshot'"
+                    )
+                )
+            ).scalar_one() == "alpha"
+            assert (
+                await connection.execute(text("SELECT count(*) FROM reembed_snapshot_documents"))
+            ).scalar_one() == 1
+            assert (
+                await connection.execute(text("SELECT count(*) FROM reembed_snapshot_chunks"))
+            ).scalar_one() == 1
+
+        alpha = SqliteReembedStore(engine, "alpha")
+        beta = SqliteReembedStore(engine, "beta")
+        partial = await alpha.get("legacy-partial")
+        terminal = await alpha.get("legacy-terminal")
+        assert partial is not None
+        assert terminal is not None
+        assert _reembed_run_report(partial).documents_completed == 2
+        assert _reembed_run_report(partial).chunks_completed == 5
+        assert _reembed_run_report(terminal).documents_completed == 3
+        assert _reembed_run_report(terminal).chunks_completed == 7
+
+        lease = await alpha.acquire("legacy-partial", "replacement-owner", ttl_seconds=30)
+        resumed = await alpha.save(
+            replace(partial, documents_completed=3, chunks_completed=6),
+            expected_revision=partial.revision,
+            lease=lease,
+        )
+        # Full-installation progress may advance without leaking another tenant's counts.
+        assert _reembed_run_report(resumed).documents_completed == 2
+        assert _reembed_run_report(resumed).chunks_completed == 5
+        assert await beta.get("legacy-partial") is None
+        assert await beta.get("legacy-terminal") is None
+    finally:
         await engine.dispose()
 
 

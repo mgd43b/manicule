@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import os
 import secrets
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -55,18 +56,49 @@ if TYPE_CHECKING:
     )
     from manicule.config.settings import Settings
     from manicule.core.fingerprints import GlossaryFingerprint
-    from manicule.core.protocols import Connector, Parser, VectorStore
+    from manicule.core.protocols import Connector, Embedder, Parser, VectorStore
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
     from manicule.ingest.ports import IngestStore
+    from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
     from manicule.plugins.registry import Discovery
+    from manicule.storage.reembed import (
+        LanceShadowGenerations,
+        SqliteReembedCorpus,
+        SqliteReembedStore,
+    )
 
 ARCHIVE_MANIFEST = "manicule-export.json"
 """The file that makes an exported directory an archive rather than a pile of blobs."""
 
 ARCHIVE_VERSION = 1
 """Bumped when the archive layout changes in a way an older import cannot read."""
+
+
+async def _recover_reembed_runs(
+    run_ids: Sequence[str], resume: Callable[[str], Awaitable[object]]
+) -> ReembedRecovery:
+    """Attempt every run independently and expose only aggregate error classes."""
+    from manicule.ingest.reembed import ReembedRecovery  # noqa: PLC0415
+
+    recovered = 0
+    failures = 0
+    failure_types: set[str] = set()
+    for run_id in run_ids:
+        try:
+            await resume(run_id)
+        except Exception as error:  # noqa: BLE001 - each durable run is an isolation boundary
+            failures += 1
+            failure_types.add(type(error).__name__)
+        else:
+            recovered += 1
+    return ReembedRecovery(
+        recovered=recovered,
+        failures=failures,
+        failure_types=tuple(sorted(failure_types)),
+    )
+
 
 KEY_PREFIX = "mnk_"
 """What every API key starts with.
@@ -212,7 +244,28 @@ class Runtime:
         one.
         """
         try:
-            await self._container.aclose()
+            close_error: Exception | None = None
+            try:
+                await self._container.aclose()
+            except Exception as error:  # noqa: BLE001 - teardown must still close vector handles
+                close_error = error
+            try:
+                vectors = self._slots.get("vectors")
+                if vectors is not None and vectors.value is not None:
+                    from manicule.storage.vectors import (  # noqa: PLC0415
+                        PublishedLanceVectorStore,
+                    )
+
+                    if isinstance(vectors.value, PublishedLanceVectorStore):
+                        await vectors.value.teardown()
+            except Exception as vector_error:
+                if close_error is None:
+                    raise
+                close_error.add_note(
+                    f"closing the published vector handle also failed: {vector_error}"
+                )
+            if close_error is not None:
+                raise close_error  # noqa: TRY301 - preserve the container's original exception
         except Exception as during_teardown:
             if pending is None:
                 raise
@@ -263,6 +316,10 @@ class Runtime:
         removing rows.
         """
         return await self._once("vectors", self._build_vectors)
+
+    async def embedder(self) -> Embedder:
+        """The configured embedder, exposed for index-maintenance orchestration."""
+        return await self._container.aget(keys.EMBEDDER)
 
     async def prepared_vectors(self) -> VectorStore:
         """The vector store, committed to the configured embedder's space.
@@ -434,7 +491,19 @@ class Runtime:
         return at != head_revision()
 
     async def _build_vectors(self) -> VectorStore:
-        return await self._container.aget(keys.VECTOR_STORE)
+        from manicule.storage.engine import VECTORS_DIRNAME  # noqa: PLC0415
+        from manicule.storage.vectors import (  # noqa: PLC0415
+            LanceVectorStore,
+            PublishedLanceVectorStore,
+        )
+
+        await self.documents()
+        store = await self._container.aget(keys.VECTOR_STORE)
+        if isinstance(store, LanceVectorStore):
+            return PublishedLanceVectorStore(
+                self._settings.data_dir / VECTORS_DIRNAME, self.require_engine()
+            )
+        return store
 
     async def _build_prepared_vectors(self) -> VectorStore:
         store = await self.vectors()
@@ -449,8 +518,8 @@ class Runtime:
         # Before the dense leg is ever asked a question. A store that has not been prepared
         # raises rather than returning nothing, so an empty index would answer every search
         # with an error about vector spaces.
-        await self.prepared_vectors()
-        return await build_retriever(self._container)
+        vectors = await self.prepared_vectors()
+        return await build_retriever(self._container, vectors=vectors)
 
     async def _build_answerer(self) -> Answering:
         from manicule.generation.answering import Answerer  # noqa: PLC0415 - heavy
@@ -815,6 +884,222 @@ class _Ingestion:
         readings of one configuration.
         """
         return await self._runtime.connector(name)
+
+    async def reembed_plan(self) -> tuple[ReembedPlan, str, int]:
+        """Price from a transient durable snapshot, with no embedding or source access."""
+        from manicule.ingest.reembed import (  # noqa: PLC0415
+            discard_reembed_snapshot,
+            plan_reembed_commitment,
+        )
+        from manicule.storage.reembed import SqliteReembedCorpus  # noqa: PLC0415
+
+        await self._require_reembed_backend()
+        await self._runtime.documents()
+        corpus = SqliteReembedCorpus(self._runtime.require_engine(), self._runtime.workspace)
+        embedder = await self._runtime.embedder()
+        commitment = await plan_reembed_commitment(corpus, embedder.fingerprint)
+        try:
+            return (
+                commitment.plan,
+                hashlib.sha256(commitment.target_fingerprint.encode("utf-8")).hexdigest(),
+                commitment.target_dimension,
+            )
+        finally:
+            await discard_reembed_snapshot(corpus, commitment.snapshot.id)
+
+    async def reembed_start(self, run_id: str, owner_token: str) -> ReembedRun:
+        from manicule.ingest.reembed import (  # noqa: PLC0415
+            ReembedCapacityError,
+            discard_reembed_snapshot,
+            plan_reembed_commitment,
+            start_reembed,
+        )
+        from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
+
+        await self._require_reembed_backend()
+        await self._runtime.documents()
+        authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
+        existing = await authority.get(run_id)
+        if existing is not None:
+            return existing
+        corpus, authority, _shadows, embedder = await self._reembed_components()
+        commitment = await plan_reembed_commitment(corpus, embedder.fingerprint)
+        if not commitment.execution_plan.runnable:
+            error = PolicyError(
+                "one or more stored documents have no chunks. "
+                "Re-embedding never falls back to a connector or parser; repair local inputs "
+                "first."
+            )
+            await discard_reembed_snapshot(corpus, commitment.snapshot.id, error)
+            raise error
+        try:
+            self._require_reembed_capacity_bytes(commitment.execution_plan.temporary_disk_bytes)
+        except ReembedCapacityError as error:
+            await discard_reembed_snapshot(corpus, commitment.snapshot.id, error)
+            raise
+        # Starting is deliberately a durable, non-embedding checkpoint.  The operator receives
+        # the run id before the expensive step begins, so a process exit can always be recovered
+        # with ``resume`` rather than losing the only handle to the journal row.
+        try:
+            return await start_reembed(
+                run_id,
+                owner_token=owner_token,
+                corpus=corpus,
+                target=embedder.fingerprint,
+                journal=authority,
+                commitment=commitment,
+            )
+        except BaseException as error:
+            await discard_reembed_snapshot(corpus, commitment.snapshot.id, error)
+            raise
+
+    async def reembed_resume(self, run_id: str, owner_token: str) -> ReembedRun:
+        from manicule.storage.engine import VECTORS_DIRNAME  # noqa: PLC0415
+        from manicule.storage.reembed import (  # noqa: PLC0415
+            LanceShadowGenerations,
+            SqliteReembedCorpus,
+            SqliteReembedStore,
+        )
+
+        await self._require_reembed_backend()
+        await self._runtime.documents()
+        engine = self._runtime.require_engine()
+        authority = SqliteReembedStore(engine, self._runtime.workspace)
+        run = await authority.get(run_id)
+        if run is None:
+            raise UnknownEntityError("no durable re-embedding run has that id")
+        # Refuse for local disk before constructing a potentially multi-gigabyte model runtime.
+        self._require_reembed_capacity(run)
+        corpus = SqliteReembedCorpus(engine, self._runtime.workspace)
+        shadows = LanceShadowGenerations(
+            self._runtime.settings.data_dir / VECTORS_DIRNAME, authority
+        )
+        embedder = await self._runtime.embedder()
+        return await self._resume_reembed(
+            run_id=run_id,
+            owner_token=owner_token,
+            corpus=corpus,
+            authority=authority,
+            shadows=shadows,
+            embedder=embedder,
+        )
+
+    async def reembed_status(self, run_id: str) -> ReembedRun | None:
+        from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
+
+        await self._runtime.documents()
+        return await SqliteReembedStore(
+            self._runtime.require_engine(), self._runtime.workspace
+        ).get(run_id)
+
+    async def reembed_abandon(self, run_id: str, owner_token: str) -> ReembedRun:
+        from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
+
+        await self._runtime.documents()
+        authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
+        if await authority.get(run_id) is None:
+            raise UnknownEntityError("no durable re-embedding run has that id")
+        lease = await authority.acquire(run_id, owner_token, ttl_seconds=30.0)
+        return await authority.abandon(run_id, lease=lease)
+
+    async def reembed_cleanup(self, run_id: str) -> bool:
+        from manicule.storage.engine import VECTORS_DIRNAME  # noqa: PLC0415
+        from manicule.storage.reembed import (  # noqa: PLC0415
+            LanceShadowGenerations,
+            SqliteReembedStore,
+        )
+
+        await self._require_reembed_backend()
+        await self._runtime.documents()
+        authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
+        return await LanceShadowGenerations(
+            self._runtime.settings.data_dir / VECTORS_DIRNAME, authority
+        ).cleanup_terminal(run_id)
+
+    async def reembed_recover_pending(self) -> ReembedRecovery:
+        """Resume ownerless runs after a serving-process restart, scoped to this workspace."""
+        import secrets  # noqa: PLC0415
+
+        from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
+
+        await self._require_reembed_backend()
+        await self._runtime.documents()
+        authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
+        return await _recover_reembed_runs(
+            await authority.recoverable_run_ids(),
+            lambda run_id: self.reembed_resume(run_id, secrets.token_urlsafe(24)),
+        )
+
+    async def _reembed_components(
+        self,
+    ) -> tuple[SqliteReembedCorpus, SqliteReembedStore, LanceShadowGenerations, Embedder]:
+        from manicule.storage.engine import VECTORS_DIRNAME  # noqa: PLC0415
+        from manicule.storage.reembed import (  # noqa: PLC0415
+            LanceShadowGenerations,
+            SqliteReembedCorpus,
+            SqliteReembedStore,
+        )
+
+        await self._runtime.documents()
+        engine = self._runtime.require_engine()
+        authority = SqliteReembedStore(engine, self._runtime.workspace)
+        return (
+            SqliteReembedCorpus(engine, self._runtime.workspace),
+            authority,
+            LanceShadowGenerations(self._runtime.settings.data_dir / VECTORS_DIRNAME, authority),
+            await self._runtime.embedder(),
+        )
+
+    async def _require_reembed_backend(self) -> None:
+        from manicule.ingest.reembed import ReembedError  # noqa: PLC0415
+        from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
+
+        vectors = await self._runtime.vectors()
+        if not isinstance(vectors, PublishedLanceVectorStore):
+            raise ReembedError(
+                "durable re-embedding requires the built-in SQLite/Lance vector backend; "
+                "the configured custom backend does not implement named shadow generations, "
+                "atomic publication, inspection, and cleanup"
+            )
+
+    def _require_reembed_capacity(self, run: ReembedRun) -> None:
+        self._require_reembed_capacity_bytes(run.commitment.execution_plan.temporary_disk_bytes)
+
+    def _require_reembed_capacity_bytes(self, required: int) -> None:
+        from manicule.ingest.reembed import ReembedCapacityError  # noqa: PLC0415
+
+        available = shutil.disk_usage(self._runtime.settings.data_dir).free
+        if required > available:
+            raise ReembedCapacityError(
+                "re-embedding does not have enough local temporary disk capacity; free local "
+                "disk space and retry (resume an existing durable run with the same id)"
+            )
+
+    async def _resume_reembed(
+        self,
+        *,
+        run_id: str,
+        owner_token: str,
+        corpus: SqliteReembedCorpus,
+        authority: SqliteReembedStore,
+        shadows: LanceShadowGenerations,
+        embedder: Embedder,
+    ) -> ReembedRun:
+        from manicule.ingest.reembed import ReembedState, resume_reembed  # noqa: PLC0415
+
+        run = await resume_reembed(
+            run_id,
+            owner_token=owner_token,
+            corpus=corpus,
+            embedder=embedder,
+            journal=authority,
+            shadow=shadows,
+            publisher=authority,
+        )
+        if run.state is ReembedState.PUBLISHED:
+            vectors = await self._runtime.vectors()
+            await vectors.ensure_ready(embedder.fingerprint)
+        return run
 
     async def reindex(self, document_id: str) -> ReindexReport:
         from manicule.ingest.reindex import reindex_document  # noqa: PLC0415

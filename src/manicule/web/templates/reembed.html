@@ -1,0 +1,34 @@
+{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+<section class="panel">
+  <h2>Dry-run plan</h2>
+  {% if panels.plan.ok %}
+  <dl>
+    <dt>Documents</dt><dd>{{ panels.plan.data.documents }}</dd>
+    <dt>Chunks</dt><dd>{{ panels.plan.data.chunks }}</dd>
+    <dt>Input bytes</dt><dd>{{ panels.plan.data.input_bytes }}</dd>
+    <dt>Estimated seconds</dt><dd>{{ panels.plan.data.estimated_seconds }}</dd>
+    <dt>Temporary disk bytes</dt><dd>{{ panels.plan.data.temporary_disk_bytes }}</dd>
+    <dt>Unrepairable documents</dt><dd>{{ panels.plan.data.unrepairable_documents }}</dd>
+  </dl>
+  {% else %}{{ m.failed(panels.plan) }}{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Durable run</h2>
+  <form method="get" action="/ui/reembed">
+    <label>Run ID <input name="run_id" value="{{ run_id }}" maxlength="200" required></label>
+    <button type="submit">Inspect</button>
+  </form>
+</section>
+
+{% if panels.status is defined %}
+<section class="panel"><h2>Status</h2>
+  {% if panels.status.ok %}
+  <p>{{ m.state(panels.status.data.state) }}</p>
+  <p>{{ panels.status.data.documents_completed }} documents · {{ panels.status.data.chunks_completed }} chunks</p>
+  {% else %}{{ m.failed(panels.status) }}{% endif %}
+</section>
+{% endif %}
+{% endblock %}

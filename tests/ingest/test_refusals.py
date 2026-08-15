@@ -44,6 +44,12 @@ def chunk(*, max_tokens: int = 256, middleware: tuple[str, ...] = ()) -> ChunkFi
     )
 
 
+class PublishedMemoryVectors(fakes.MemoryVectors):
+    @property
+    def publication_pointer(self) -> str:
+        return "reembed-synthetic-generation"
+
+
 def provisional_chunk() -> ChunkFingerprint:
     """A chunker that counted with a stand-in vocabulary, as the chunker itself would build it."""
     return ChunkFingerprint(
@@ -215,6 +221,16 @@ async def test_a_first_ingest_records_which_table_its_vectors_are_in() -> None:
 
     assert committed.vector_table == table_name(embed())
     assert store.state.vector_table == table_name(embed())
+
+
+async def test_a_published_generation_pointer_is_not_replaced_by_its_inner_table_name() -> None:
+    store = fakes.MemoryIngestStore()
+    vectors = PublishedMemoryVectors()
+
+    committed = await check_before_run(embed=embed(), chunk=chunk(), store=store, vectors=vectors)
+
+    assert committed.vector_table == "reembed-synthetic-generation"
+    assert store.state.vector_table == "reembed-synthetic-generation"
 
 
 async def test_an_index_with_no_vector_store_records_no_table() -> None:

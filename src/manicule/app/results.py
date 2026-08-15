@@ -676,6 +676,45 @@ class EmbeddingCost(Payload):
     """
 
 
+class ReembedPlanReport(Payload):
+    """Aggregate-only offline vector migration price; no source or storage identifiers."""
+
+    dry_run: bool = True
+    documents: int = Field(ge=0)
+    chunks: int = Field(ge=0)
+    input_bytes: int = Field(ge=0)
+    estimated_seconds: float = Field(ge=0)
+    peak_memory_bytes: int = Field(ge=0)
+    temporary_disk_bytes: int = Field(ge=0)
+    unrepairable_documents: int = Field(ge=0)
+    target_identity: str = Field(description="SHA-256 identity of the exact target embedder.")
+    target_dimension: int = Field(gt=0)
+
+
+class ReembedRunReport(Payload):
+    """Aggregate durable progress for one operator-created re-embedding run."""
+
+    run_id: str
+    state: str
+    documents: int = Field(ge=0)
+    chunks: int = Field(ge=0)
+    documents_completed: int = Field(ge=0)
+    chunks_completed: int = Field(ge=0)
+    estimated_remaining_seconds: float = Field(ge=0)
+    retry_required: bool
+    terminal: bool
+    published: bool
+    target_identity: str
+    target_dimension: int = Field(gt=0)
+
+
+class ReembedCleanupReport(Payload):
+    """Whether terminal shadow storage was physically removed."""
+
+    run_id: str
+    removed: bool
+
+
 class StaleReparseReport(Payload):
     """What a corpus-wide re-parse of stale documents did.
 
@@ -1811,6 +1850,9 @@ __all__ = [
     "PluginSummary",
     "QueryLogEntry",
     "QueryLogPage",
+    "ReembedCleanupReport",
+    "ReembedPlanReport",
+    "ReembedRunReport",
     "ResetReport",
     "RestoreReport",
     "SearchHit",

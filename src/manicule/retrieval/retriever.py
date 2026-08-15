@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 
     from manicule.container.container import Container
     from manicule.core.glossary import GlossaryMatch
-    from manicule.core.protocols import DocStore
+    from manicule.core.protocols import DocStore, VectorStore
     from manicule.core.retrieval import Query
     from manicule.retrieval.assembly import ContextAssembler
     from manicule.retrieval.ports import GlossarySource
@@ -618,7 +618,7 @@ def _exhausted_budget(spans: Sequence[tracing.StageSpan]) -> bool:
     )
 
 
-async def build_retriever(container: Container) -> Retriever:
+async def build_retriever(container: Container, *, vectors: VectorStore | None = None) -> Retriever:
     """Assemble the whole of retrieval from configuration and what plugins registered.
 
     The composition root for this subsystem, and it lives here rather than as a branch in the
@@ -635,6 +635,7 @@ async def build_retriever(container: Container) -> Retriever:
     from manicule.container import keys  # noqa: PLC0415 - avoids a package-level import cycle
     from manicule.core.protocols import Reranker  # noqa: PLC0415
     from manicule.retrieval.assembly import ContextAssembler  # noqa: PLC0415
+    from manicule.retrieval.dense import DenseStage  # noqa: PLC0415
     from manicule.retrieval.fusion import RRFStage  # noqa: PLC0415
     from manicule.retrieval.ports import GlossarySource  # noqa: PLC0415
     from manicule.retrieval.profile import Profiles  # noqa: PLC0415
@@ -644,6 +645,11 @@ async def build_retriever(container: Container) -> Retriever:
     rag = settings.rag
     profiles = Profiles(rag.overrides)
     stages = await container.retrieval_pipeline()
+    if vectors is not None:
+        stages = [
+            stage.with_vectors(vectors) if isinstance(stage, DenseStage) else stage
+            for stage in stages
+        ]
     docstore = await container.aget(keys.DOC_STORE)
     embedder = await container.aget(keys.EMBEDDER)
 

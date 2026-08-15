@@ -253,9 +253,9 @@ class IndexFingerprints(BaseModel):
     chunk: ChunkFingerprint | None = None
     vector_table: str | None = Field(
         default=None,
-        description="Which vector table holds the vectors. A pointer rather than a constant, "
-        "because a re-embed builds its replacement alongside the live one and there is a "
-        "window in which the index is neither the old thing nor the new one.",
+        description="Which vector table or named generation holds the vectors. A pointer "
+        "rather than a constant, because a re-embed builds its replacement alongside the "
+        "live one and atomically moves the pointer after validation.",
     )
 
     @property

@@ -13,11 +13,11 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 | Area | Items | Ticket |
 |---|---:|---|
 | CLI | 48 | #8 — **built** |
-| MCP tools | 29 | #8 — **built** |
+| MCP tools | 30 | #8 — **built** |
 | HTTP endpoints | 56 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **191** | |
+| **Total** | **192** | |
 
 ## CLI — 48
 
@@ -99,13 +99,13 @@ of those, so the mapping is noted where it is not obvious. The output shape is a
 - `ask --repl` — the interactive prompt, which is also what `ask` with no question does at a
   terminal.
 
-## MCP tools — 29
+## MCP tools — 30
 
-Ticket: #8 — **built.** Twenty-eight tools over the same application service the command
+Ticket: #8 — **built.** Twenty-nine tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
-**All twenty-eight over stdio; the thirteen read-only ones over a socket.** MCP is also served
+**All twenty-nine over stdio; the fourteen read-only ones over a socket.** MCP is also served
 at `/mcp/` on the HTTP port, and every mutating tool is *absent* from that surface rather than
 refused on it — see [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are
 unreachable from a network by construction, and a socket has to replace that property rather
@@ -132,6 +132,7 @@ than assume it.
 - [x] `document_reindex`
 - [x] `index_path`
 - [x] `index_status`
+- [x] `reembed_status`
 - [x] `plugin_add`
 - [x] `plugin_list`
 - [x] `plugin_remove`

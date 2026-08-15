@@ -915,6 +915,35 @@ def render_collection_orphans(out: Console, payload: r.CollectionOrphans) -> Non
         )
 
 
+def render_reembed_plan(out: Console, payload: r.ReembedPlanReport) -> None:
+    out.print(
+        f"[bold]{payload.documents}[/bold] documents, [bold]{payload.chunks}[/bold] chunks; "
+        f"about {payload.estimated_seconds:.1f}s"
+    )
+    out.print(
+        f"peak memory {payload.peak_memory_bytes} bytes; temporary disk "
+        f"{payload.temporary_disk_bytes} bytes; target {payload.target_identity[:12]} "
+        f"({payload.target_dimension} dimensions)"
+    )
+    if payload.unrepairable_documents:
+        out.print(f"[red]{payload.unrepairable_documents} document(s) cannot be rebuilt[/red]")
+
+
+def render_reembed_run(out: Console, payload: r.ReembedRunReport) -> None:
+    out.print(f"[bold]{escape(payload.state)}[/bold] {escape(payload.run_id)}")
+    out.print(
+        f"{payload.documents_completed}/{payload.documents} documents; "
+        f"{payload.chunks_completed}/{payload.chunks} chunks"
+    )
+    if payload.retry_required:
+        out.print("[dim]retry required: use `manicule reembed resume RUN_ID`[/dim]")
+
+
+def render_reembed_cleanup(out: Console, payload: r.ReembedCleanupReport) -> None:
+    action = "removed" if payload.removed else "already absent"
+    out.print(f"{action}: {escape(payload.run_id)}")
+
+
 RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.AnswerResultPayload: lambda out, p: render_answer(out, _as(r.AnswerResultPayload, p)),
     r.SearchResult: lambda out, p: render_search(out, _as(r.SearchResult, p)),
@@ -924,6 +953,11 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.DocumentReindexed: lambda out, p: render_document_reindexed(out, _as(r.DocumentReindexed, p)),
     r.StaleReparseReport: lambda out, p: render_stale_reparse(out, _as(r.StaleReparseReport, p)),
     r.StaleGlossaryReport: lambda out, p: render_stale_glossary(out, _as(r.StaleGlossaryReport, p)),
+    r.ReembedPlanReport: lambda out, p: render_reembed_plan(out, _as(r.ReembedPlanReport, p)),
+    r.ReembedRunReport: lambda out, p: render_reembed_run(out, _as(r.ReembedRunReport, p)),
+    r.ReembedCleanupReport: lambda out, p: render_reembed_cleanup(
+        out, _as(r.ReembedCleanupReport, p)
+    ),
     r.IngestReport: lambda out, p: render_ingest(out, _as(r.IngestReport, p)),
     r.IndexStatus: lambda out, p: render_index_status(out, _as(r.IndexStatus, p)),
     r.Stats: lambda out, p: render_stats(out, _as(r.Stats, p)),

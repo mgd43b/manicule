@@ -1130,7 +1130,7 @@ of the blast-radius ladder (`storage.md` §1):
 |---|---|---|---|---|
 | **re-detect glossary** | `chunks.text` | 0 | none | `document reindex --stale-glossary` |
 | `repair` | `chunks` | 1–2 | none | `ingest.reindex.repair`, no command |
-| `re-embed` | `chunks.embed_text` | 2 | none | `ingest.reindex.re_embed`, no command |
+| **re-embed** | `chunks.embed_text` | 2 | none | `reembed plan/start/execute/status/abandon/cleanup` |
 | **re-parse** | `blobs` | 3 | none | `document reindex <id>`, `document reindex --stale` |
 | a forced sync | the source | 4 | yes, rate-limited, **may fail** | `index <path> --reindex`, for a path |
 
@@ -1154,10 +1154,8 @@ not reproducible. Everything above it is a pure function of what is already on d
 the whole return on retaining bytes, and it is why re-parse is a first-class verb rather
 than a flag on sync.
 
-The right-hand column is there because most of this table is **not** an operator-facing command,
-and listing them all as commands would describe an interface nobody can type. Repair runs on the
-recovery path and re-embed has no shipped surface at all, so both are reachable only from
-Python. Re-parse has both ends of its verb. And rung 4 ships for a *path* — `index <path>
+The right-hand column is there because not every rung is an operator-facing command. Repair runs
+on the recovery path. Re-embed and re-parse have explicit verbs. And rung 4 ships for a *path* — `index <path>
 --reindex` skips change detection — while a configured connector has no `--force`, so the only
 way to make one re-fetch today is to change what the source reports.
 
@@ -1548,6 +1546,78 @@ whether the machine spends an afternoon embedding, and finding that out from the
 the one way nobody should have to find it out.
 
 ---
+
+### 10.3 Durable whole-index re-embedding
+
+```
+manicule reembed plan
+manicule reembed start RUN_ID       # choose and record this before invoking the command
+manicule reembed execute RUN_ID     # `resume` is an alias
+manicule reembed status RUN_ID      # `inspect` is an alias
+manicule reembed abandon RUN_ID
+manicule reembed cleanup RUN_ID
+```
+
+This workflow reads the authoritative SQLite document and chunk rows into an immutable,
+keyset-readable snapshot. It never calls a connector, blob fallback, parser or chunker. `plan`
+also makes **zero embedding forward passes**: it reports aggregate document/chunk/input counts,
+bounded peak-memory and temporary-disk estimates, elapsed-time estimate, target dimension and a
+one-way target identity. The transient plan snapshot is deleted before the command returns.
+Source ids, URIs, snapshot/revision handles, weights paths, complete configuration and inventory
+digests never cross an operator or network surface.
+
+`start` performs the same exact-target plan, checks local temporary capacity, and atomically
+persists the complete snapshot and an immediately acquirable, ownerless journal row under the
+id the operator supplied **before embedding starts**. There is no create-then-release gap. If a
+control reply is lost, replaying `start` with the same id returns the same run without taking a
+second snapshot. A capacity refusal is typed, nonzero, and leaves neither an
+unreachable run nor a retained transient snapshot. `execute`/`resume` acquires a new
+monotonically fenced lease, builds a named shadow generation in bounded pages, checkpoints after
+each page, independently inspects every retrieval-critical stored field, seals the exact digest,
+then asks SQLite for one atomic pointer/fingerprint/inventory compare-and-swap. Live reads stay on
+the old generation throughout the build. A process exit is recovered by running `resume` with
+the same id; publication receipts make a publish-before-checkpoint retry return the original
+winner rather than roll a newer one back.
+
+Every snapshot scan failure and cancellation removes its unbound durable snapshot under a
+cancellation-shielded cleanup. Every orderly execute failure or cancellation likewise releases
+its owner/generation fence so a new process can retry or abandon immediately; a process that
+actually dies runs no cleanup, so its lease still requires TTL expiry and a higher-generation
+takeover. Publication writes its receipt and terminal checkpoint in the same SQLite transaction.
+For installations upgraded from the earlier split checkpoint, the receipt remains authoritative:
+status and resume report `published`, and abandon cannot turn the live run into `failed`.
+
+The workflow currently requires the built-in SQLite/Lance backend. A custom vector store is
+refused before a snapshot, model, or run is constructed unless it supplies the complete named
+shadow-generation, inspection, atomic-publication and cleanup contract; ordinary `VectorStore`
+methods are not enough to emulate that safely.
+
+After a successful publication the runtime explicitly prepares its long-lived pointer-following
+vector handle for the configured target. A handle still prepared for the old fingerprint refuses
+searches and writes with `VectorStoreReprepareRequiredError`, including same-dimension changes;
+it never silently applies an old embedder to the new generation. Cleanup obtains an exclusive
+generation pin and only removes failed or superseded, non-live storage, so an in-flight reader
+cannot lose its directory. `abandon` makes an unfinished run terminal without moving the live
+pointer.
+
+Snapshots, runs, generations and receipts are keyed by workspace as well as their opaque id, and
+every journal, lease, publication and cleanup lookup repeats that ownership predicate. The vector
+pointer is installation-wide, however, so its immutable snapshot and replacement generation cover
+all workspaces; otherwise publishing Alpha would make Beta's vectors disappear. The public plan
+and progress projection counts only the owning workspace, while private build accounting and
+capacity checks cover the full installation. Legacy state is backfilled only when its stored
+document payloads identify exactly one owning workspace (or an empty legacy database has exactly
+one workspace); ambiguous state refuses migration rather than guessing ownership.
+
+The serving scheduler runs one restart-recovery job for ownerless nonterminal runs in its active
+workspace. It records aggregate recovered/failure counts, while the durable run remains the
+authoritative status. Each run is isolated: one corrupt or transient refusal is counted by error
+class and recovery continues with later runs, without logging ids, paths or messages. This is
+process-crash recovery, not connector scheduling: no connector or parser is called, and a live
+fenced owner is never taken over before lease expiry. The local CLI and authenticated admin HTTP
+routes expose plan, start, resume, abandon and cleanup. `/ui/reembed` is read-only plan/status and
+contains no mutation controls or JavaScript handlers. MCP retains the aggregate read-only
+`reembed_status` tool. No network or browser surface lists opaque run ids.
 
 ## 11. `reconcile()` and deletion
 

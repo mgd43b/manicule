@@ -19,6 +19,7 @@ AREAS: tuple[str, ...] = (
     "settings",
     "workspaces",
     "admin",
+    "reembed",
     "auth",
     "layout",
 )
@@ -38,6 +39,7 @@ NAVIGATION: tuple[tuple[str, str, str], ...] = (
     ("workspaces", "/ui/workspaces", "Workspaces"),
     ("health", "/ui/health", "Health"),
     ("admin", "/ui/admin", "Admin"),
+    ("reembed", "/ui/reembed", "Re-embed"),
     ("auth", "/ui/auth", "API keys"),
     ("settings", "/ui/settings", "Settings"),
 )

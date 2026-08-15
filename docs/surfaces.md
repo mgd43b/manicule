@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Twenty-eight MCP tools and twenty-one CLI commands. They are not a one-to-one mapping: some
+Twenty-nine MCP tools and twenty-two CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -268,6 +268,12 @@ server and the built command tree.
 | `document_delete` | ✓ | `document delete` | what was removed, and how |
 | `document_reindex` | ✓ | `document reindex <id>` | what was repaired |
 | `document_reindex_stale` | — | `document reindex --stale` | counts for a corpus-wide re-parse |
+| `reembed_plan` | — | `reembed plan` | aggregate cost and capacity estimates |
+| `reembed_start` | — | `reembed start <run-id>` | ownerless durable run under an id chosen before the call |
+| `reembed_resume` | — | `reembed execute` / `reembed resume` | aggregate durable progress/publication result |
+| `reembed_status` | ✓ | `reembed status` / `reembed inspect` | private-safe aggregate durable progress |
+| `reembed_abandon` | — | `reembed abandon` | terminal state without a live-pointer change |
+| `reembed_cleanup` | — | `reembed cleanup` | whether terminal non-live storage was removed |
 | `doctor` | ✓ | `doctor` | diagnostics |
 | `connector_list` | ✓ | `connector list` | configured sources |
 | `connector_sync` | ✓ | `connector sync` | run counters |
@@ -303,10 +309,11 @@ server and the built command tree.
 ### Operations with no MCP tool, and why
 
 `reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,
-`connector_sidecar`, `collection_orphans`, `document_reindex_stale` and the `auth` verbs are
+`connector_sidecar`, `collection_orphans`, `document_reindex_stale`, the five mutating or
+corpus-scanning `reembed` operations and the `auth` verbs are
 command-line only. Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
-assistant can call unattended should not be able to do any of that. The twenty-eight tools read
+assistant can call unattended should not be able to do any of that. The twenty-nine tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
 surface. Four of these absences are asserted by name in `tests/app/test_surface_parity.py` —
 `collection_orphans`, `connector_sidecar`, `connector_login` and `document_reindex_stale`,
@@ -320,6 +327,13 @@ caller able to start one has the machine's accelerator for an hour, which is the
 already made for refusing a benchmark endpoint. `document_reindex` stays on every surface,
 because one document is a bound.
 
+MCP retains only `reembed_status`: an assistant cannot spend corpus-sized accelerator, disk and
+time unattended. Authenticated admin HTTP has plan/start/resume/abandon/cleanup parity. The Web
+page is deliberately read-only: it displays a workspace-safe plan and accepts an opaque id for
+status, but has no mutation controls or JavaScript action handlers and never lists or discovers
+runs. Workspace ownership is checked before a supplied id resolves, so another tenant's id is the
+same sanitized not-found as an unknown id.
+
 `connector_login` is in that list for the credential reason and for one more: it reads a secret
 from a terminal without echoing it. A surface that cannot do that would have to accept the
 secret as a parameter, and a session cookie in a tool call is a session cookie in a transcript.
@@ -327,7 +341,7 @@ secret as a parameter, and a session cookie in a tool call is a session cookie i
 ### 4.1 What each tool says it does, and why that is not permission
 
 Every tool publishes the four hints MCP defines — `readOnlyHint`, `destructiveHint`,
-`idempotentHint`, `openWorldHint` — in `tools/list`. Thirteen of the twenty-eight say they only
+`idempotentHint`, `openWorldHint` — in `tools/list`. Fourteen of the twenty-nine say they only
 read.
 
 **They are a description, and nothing in manicule reads them back.** No tool is gated on its own
@@ -918,7 +932,7 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | conversations | `GET`/`POST /api/v1/conversations`, `GET /api/v1/conversations/{id}/messages`, `PATCH`/`DELETE /api/v1/conversations/{id}`, `POST`/`DELETE /api/v1/conversations/{id}/share`, `GET /shared/{token}` |
 | collections | `GET`/`POST /api/v1/collections`, `PATCH`/`DELETE /api/v1/collections/{id}`, `POST /api/v1/collections/{id}/name`, `GET /api/v1/collections/{id}/counts`, `GET /api/v1/collections/{id}/documents`, `POST`/`DELETE /api/v1/collections/{id}/documents/{docId}` |
 | tags | `GET`/`POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`, `POST`/`DELETE /api/v1/documents/{docId}/tags/{tagId}` |
-| admin | `GET /api/v1/admin/stats`, `/query-logs`, `/audit-logs`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync` |
+| admin | `GET /api/v1/admin/stats`, `/reembed/{run_id}`, `/query-logs`, `/audit-logs`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync` |
 | plugins | `GET /api/v1/plugins`, `GET /api/v1/plugins/search`, `POST`/`DELETE /api/v1/plugins/{name}` |
 | auth | `GET /auth/providers`, `GET /auth/session`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}` |
 | workbench | `GET /api/v1/workbench?document_id=…` |
@@ -1036,6 +1050,7 @@ unattended caller reaches, so each of them is absent rather than merely guarded:
 | creating a connector | A connector holds credentials and reaches a remote system. Sources are declared in configuration, where the whole set is reviewable in one place |
 | a benchmark endpoint | A benchmark on request is one HTTP call away from an unusable installation |
 | `config get` / `config set` | Reading and writing configuration over the network is how an installation gets repointed at a different data directory |
+| `reembed plan/start/execute/abandon/cleanup` | A full-corpus snapshot or accelerator/disk migration is an unbounded local operator action; only aggregate status is remotely readable |
 
 `tests/api/test_routes.py` asserts each absence by name. An absence with no test is an absence
 that comes back.

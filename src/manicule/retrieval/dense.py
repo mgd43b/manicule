@@ -98,6 +98,23 @@ class DenseStage:
         """The settings this leg ran under, for the record."""
         return dict(self._config.model_dump(mode="json"))
 
+    def with_vectors(self, vectors: VectorStore) -> DenseStage:
+        """Return this configured leg bound to the vector handle retrieval must use.
+
+        Runtime storage may decorate the configured plugin store with a live-generation
+        resolver.  Retrieval stages are constructed by the plugin container, so the
+        composition root explicitly rebinds the built-in dense leg to that decorated handle
+        rather than letting it retain the undecorated store it captured during construction.
+        """
+        return DenseStage(
+            embedder=self._embedder,
+            vectors=vectors,
+            docstore=self._docstore,
+            profiles=self._profiles,
+            config=self._config,
+            name=self.name,
+        )
+
     async def run(self, query: Query, candidates: list[Candidate]) -> list[Candidate]:
         """Search, scope, floor, and merge into ``candidates`` without touching it."""
         profile = self._profiles.for_query(query)

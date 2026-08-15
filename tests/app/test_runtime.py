@@ -12,6 +12,7 @@ none of them has any business loading a multi-gigabyte model to answer.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 from pathlib import Path
@@ -19,7 +20,11 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from manicule.app.runtime import AssemblyError, Runtime
+from manicule.app.runtime import (
+    AssemblyError,
+    Runtime,
+    _recover_reembed_runs,  # pyright: ignore[reportPrivateUsage]
+)
 from manicule.app.service import ApplicationService, pre_upgrade_destination
 from manicule.config.settings import Settings
 from manicule.container import keys
@@ -38,6 +43,42 @@ STALE_INSTALL = (
     "an entry point declared in pyproject.toml is missing from the installed distribution. "
     "Run `uv sync --reinstall-package manicule` and try again."
 )
+
+
+async def test_reembed_restart_recovery_continues_after_one_run_refuses() -> None:
+    attempted: list[str] = []
+
+    async def resume(run_id: str) -> None:
+        attempted.append(run_id)
+        if run_id == "private-corrupt-id":
+            raise RuntimeError("synthetic private failure with /private/path")
+
+    outcome = await _recover_reembed_runs(("private-corrupt-id", "private-healthy-id"), resume)
+
+    assert attempted == ["private-corrupt-id", "private-healthy-id"]
+    assert outcome.recovered == 1
+    assert outcome.failures == 1
+    assert outcome.failure_types == ("RuntimeError",)
+    assert "private" not in repr(outcome)
+
+
+async def test_reembed_restart_recovery_deduplicates_failure_classes() -> None:
+    async def resume(_run_id: str) -> None:
+        raise RuntimeError("synthetic private failure")
+
+    outcome = await _recover_reembed_runs(("private-one", "private-two"), resume)
+
+    assert outcome.recovered == 0
+    assert outcome.failures == 2
+    assert outcome.failure_types == ("RuntimeError",)
+
+
+async def test_reembed_restart_recovery_does_not_swallow_cancellation() -> None:
+    async def resume(_run_id: str) -> None:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _recover_reembed_runs(("private-run-id",), resume)
 
 
 @pytest.fixture
@@ -354,6 +395,29 @@ async def test_the_vector_store_is_prepared_before_anything_writes_a_vector(
         held = await prepared.fingerprint()
         assert held is not None
         assert held.dimension == HashEmbedder().fingerprint.dimension
+
+
+async def test_retrieval_uses_the_same_published_vector_handle_as_ingest(
+    manicule_environment: Path,
+) -> None:
+    """The dense plugin must not retain the undecorated, unprepared Lance store.
+
+    The runtime wraps Lance with the generation-following handle used by ingestion.  Retrieval
+    stages are assembled by the plugin container, whose dense factory initially sees the
+    underlying store.  A real index followed by a real search catches any failure to rebind
+    that stage: the underlying handle refuses the query because nobody prepared it.
+    """
+    source = manicule_environment / "published-handle.md"
+    source.write_text("# Durable snapshots\n\nOffline rebuilds retain durable source bytes.")
+
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        service = ApplicationService(opened)
+        indexed = await service.index_path(source)
+        found = await service.search("durable source", limit=1)
+
+    assert indexed.ingested == 1
+    assert len(found.hits) == 1
+    assert found.hits[0].title == source.name
 
 
 async def test_the_runtime_disposes_its_engine_on_the_way_out(

@@ -46,6 +46,59 @@ async def stats(service: Service, caller: AdminPrincipal) -> Response:
     return await respond("index_status", service, service.index_status)
 
 
+@router.get(
+    "/reembed/{run_id}",
+    name="reembed_status",
+    summary="Aggregate progress for a durable re-embedding run.",
+)
+async def reembed_status(service: Service, caller: AdminPrincipal, run_id: str) -> Response:
+    """Read private-safe progress; starting or executing migrations remains operator-only."""
+    del caller
+    return await respond("reembed_status", service, lambda: service.reembed_status(run_id))
+
+
+@router.get("/reembed", name="reembed_plan", summary="Aggregate dry-run re-embedding plan.")
+async def reembed_plan(service: Service, caller: AdminPrincipal) -> Response:
+    del caller
+    return await respond("reembed_plan", service, service.reembed_plan)
+
+
+@router.post(
+    "/reembed/{run_id}/start", name="reembed_start", summary="Create a durable re-embedding run."
+)
+async def reembed_start(service: Service, caller: AdminPrincipal, run_id: str) -> Response:
+    del caller
+    return await respond("reembed_start", service, lambda: service.reembed_start(run_id))
+
+
+@router.post(
+    "/reembed/{run_id}/resume", name="reembed_resume", summary="Resume a durable re-embedding run."
+)
+async def reembed_resume(service: Service, caller: AdminPrincipal, run_id: str) -> Response:
+    del caller
+    return await respond("reembed_resume", service, lambda: service.reembed_resume(run_id))
+
+
+@router.post(
+    "/reembed/{run_id}/abandon",
+    name="reembed_abandon",
+    summary="Abandon an unfinished durable re-embedding run.",
+)
+async def reembed_abandon(service: Service, caller: AdminPrincipal, run_id: str) -> Response:
+    del caller
+    return await respond("reembed_abandon", service, lambda: service.reembed_abandon(run_id))
+
+
+@router.delete(
+    "/reembed/{run_id}",
+    name="reembed_cleanup",
+    summary="Clean terminal non-live re-embedding storage.",
+)
+async def reembed_cleanup(service: Service, caller: AdminPrincipal, run_id: str) -> Response:
+    del caller
+    return await respond("reembed_cleanup", service, lambda: service.reembed_cleanup(run_id))
+
+
 @router.get("/query-logs", name="query_logs", summary="Retrieval telemetry, newest first.")
 async def query_logs(
     service: Service,

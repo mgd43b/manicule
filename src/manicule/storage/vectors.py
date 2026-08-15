@@ -55,14 +55,20 @@ document is the thing that has to change if they are wrong:
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import math
+import os
+import re
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Final
 
 import lancedb
 from lancedb.pydantic import LanceModel
 from lancedb.pydantic import Vector as FixedSizeVector
+from lancedb.query import ColumnOrdering
 from pydantic import create_model
 
 from manicule.core.content import LEGACY_PUBLICATION, Chunk
@@ -82,13 +88,15 @@ from manicule.core.ids import vector_id
 from manicule.core.retrieval import Candidate, Filter
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
     from pathlib import Path
 
     from lancedb.db import AsyncConnection
     from lancedb.table import AsyncTable
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
     from manicule.core.embedding import Vector
+    from manicule.ingest.reembed import SnapshotChunk
 
 META_TABLE: Final = "_manicule_meta"
 """Where the fingerprint lives, beside the vectors it describes."""
@@ -104,6 +112,10 @@ PUBLICATION_COLUMN: Final = "publication_id"
 VECTOR_COLUMN: Final = "vector"
 CHUNK_COLUMN: Final = "chunk_json"
 IDENTITY_COLUMN: Final = "embed_identity"
+SOURCE_VECTOR_ID_COLUMN: Final = "source_vector_id"
+SOURCE_PUBLICATION_COLUMN: Final = "source_publication_id"
+SOURCE_SEQUENCE_COLUMN: Final = "source_sequence"
+SOURCE_CREATED_AT_COLUMN: Final = "source_created_at"
 DISTANCE_COLUMN: Final = "_distance"
 
 IDENTITY_QUERY_PAGE: Final = 512
@@ -159,6 +171,30 @@ class VectorStoreStateError(ManiculeError):
     Both are wiring or tampering, not user error, and both are fatal to the operation:
     guessing the fingerprint is exactly the mistake the meta table exists to prevent.
     """
+
+
+class VectorStoreReprepareRequiredError(VectorStoreStateError):
+    """The live publication moved to a vector space this handle has not prepared."""
+
+
+@asynccontextmanager
+async def generation_pin(directory: Path, *, exclusive: bool = False) -> AsyncGenerator[None]:
+    """Cross-process pin preventing cleanup from deleting a generation during an operation."""
+    pins = directory.parent / ".pins"
+    pins.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(pins / f"{directory.name}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    try:
+        while True:
+            try:
+                fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(0.01)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def fingerprint_hash(fingerprint: EmbedFingerprint) -> str:
@@ -316,6 +352,10 @@ def _row_model(dimension: int) -> type[LanceModel]:
         "position": (int, ...),
         CHUNK_COLUMN: (str, ...),
         IDENTITY_COLUMN: (str, ...),
+        SOURCE_VECTOR_ID_COLUMN: (str | None, None),
+        SOURCE_PUBLICATION_COLUMN: (str | None, None),
+        SOURCE_SEQUENCE_COLUMN: (int | None, None),
+        SOURCE_CREATED_AT_COLUMN: (str | None, None),
     }
     return create_model("ManiculeVectorRow", __base__=LanceModel, **fields)
 
@@ -391,6 +431,30 @@ class LanceVectorStore:
             self._connection = None
         self._table = None
 
+    async def open_existing(self, expected: EmbedFingerprint | None = None) -> EmbedFingerprint:
+        """Open an already published directory; never create metadata or an empty table."""
+        async with self._lock:
+            if not self._directory.exists():
+                raise VectorStoreStateError(
+                    f"published vector generation {self._directory} does not exist"
+                )
+            connection = await self._connect()
+            stored = await self._stored_fingerprint(connection)
+            if stored is None:
+                raise VectorStoreStateError(
+                    f"published vector generation {self._directory} has no fingerprint metadata"
+                )
+            if expected is not None:
+                stored.require_match(expected)
+            name = table_name(stored)
+            if name not in await self._table_names(connection):
+                raise VectorStoreStateError(
+                    f"published vector generation {self._directory} is missing {name}"
+                )
+            self._table = await connection.open_table(name)
+            self._fingerprint = stored
+            return stored
+
     async def fingerprint(self) -> EmbedFingerprint | None:
         """The fingerprint these vectors were built with, or ``None`` if there are none."""
         if self._fingerprint is not None:
@@ -437,6 +501,126 @@ class LanceVectorStore:
         # takeover, but it can neither overwrite the successor's identical generation nor make
         # the row servable without the transaction-fenced relational pointer flip.
         await merge.when_not_matched_insert_all().execute(rows)
+
+    async def upsert_snapshot(
+        self,
+        chunks: Sequence[SnapshotChunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str,
+    ) -> None:
+        """Write a shadow page with its complete source-row identity."""
+        table, fingerprint = self._ready()
+        if len(chunks) != len(vectors):
+            raise ValueError(
+                f"{len(chunks)} snapshot chunk(s) were offered with {len(vectors)} vector(s)"
+            )
+        if not chunks:
+            return
+        rows: list[dict[str, object]] = []
+        for stored, vector in zip(chunks, vectors, strict=True):
+            row = self._row(stored.chunk, vector, fingerprint, publication_id)
+            row[ID_COLUMN] = stored.vector_id
+            row[SOURCE_VECTOR_ID_COLUMN] = stored.vector_id
+            row[SOURCE_PUBLICATION_COLUMN] = stored.publication_id
+            row[PUBLICATION_COLUMN] = stored.publication_id
+            row[SOURCE_SEQUENCE_COLUMN] = stored.sequence
+            row[SOURCE_CREATED_AT_COLUMN] = (
+                None if stored.created_at is None else stored.created_at.isoformat()
+            )
+            rows.append(row)
+        await (
+            table.merge_insert(ID_COLUMN)
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(rows)
+        )
+
+    async def inspection_rows(self) -> list[dict[str, Any]]:
+        """Physical rows needed to validate a named shadow generation."""
+        table, _ = self._ready()
+        return (
+            await table.query()
+            .select(
+                [
+                    ID_COLUMN,
+                    CHUNK_ID_COLUMN,
+                    PUBLICATION_COLUMN,
+                    VECTOR_COLUMN,
+                    CHUNK_COLUMN,
+                    "document_id",
+                    "kind",
+                    "lang",
+                    "position",
+                    IDENTITY_COLUMN,
+                    SOURCE_VECTOR_ID_COLUMN,
+                    SOURCE_PUBLICATION_COLUMN,
+                    SOURCE_SEQUENCE_COLUMN,
+                    SOURCE_CREATED_AT_COLUMN,
+                ]
+            )
+            .to_list()
+        )
+
+    async def inspection_pages(
+        self, *, page_size: int = 256
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        """Read physical validation rows in bounded, stable keyset pages."""
+        if page_size < 1:
+            raise ValueError("inspection page size must be positive")
+        table, _ = self._ready()
+        columns = [
+            ID_COLUMN,
+            CHUNK_ID_COLUMN,
+            PUBLICATION_COLUMN,
+            VECTOR_COLUMN,
+            CHUNK_COLUMN,
+            "document_id",
+            "kind",
+            "lang",
+            "position",
+            IDENTITY_COLUMN,
+            SOURCE_VECTOR_ID_COLUMN,
+            SOURCE_PUBLICATION_COLUMN,
+            SOURCE_SEQUENCE_COLUMN,
+            SOURCE_CREATED_AT_COLUMN,
+        ]
+        ordering = [
+            ColumnOrdering(column_name="document_id"),
+            ColumnOrdering(column_name="position"),
+            ColumnOrdering(column_name=CHUNK_ID_COLUMN),
+            ColumnOrdering(column_name=ID_COLUMN),
+        ]
+        after: tuple[str, int, str, str] | None = None
+        while True:
+            query = table.query().select(columns).order_by(ordering).limit(page_size)
+            if after is not None:
+                document_id, position, chunk_id, physical_id = after
+                query = query.where(
+                    f"document_id > {quote(document_id)} OR "
+                    f"(document_id = {quote(document_id)} AND "
+                    f"(position > {position} OR "
+                    f"(position = {position} AND "
+                    f"({CHUNK_ID_COLUMN} > {quote(chunk_id)} OR "
+                    f"({CHUNK_ID_COLUMN} = {quote(chunk_id)} AND "
+                    f"{ID_COLUMN} > {quote(physical_id)})))))"
+                )
+            page = await query.to_list()
+            if not page:
+                return
+            yield page
+            last = page[-1]
+            after = (
+                str(last["document_id"]),
+                int(str(last["position"])),
+                str(last[CHUNK_ID_COLUMN]),
+                str(last[ID_COLUMN]),
+            )
+
+    async def storage_revision(self) -> str:
+        """The immutable Lance commit version currently visible through this handle."""
+        table, _ = self._ready()
+        return str(await table.version())
 
     async def delete_document(self, document_id: str) -> None:
         """Remove every vector belonging to a document. Idempotent."""
@@ -873,6 +1057,156 @@ class LanceVectorStore:
             return await connection.open_table(name)
 
 
+class PublishedLanceVectorStore:
+    """A live vector handle that follows SQLite's publication pointer between operations.
+
+    Legacy ``chunks__…`` pointers resolve to the root directory. Re-embedding generation
+    pointers resolve to their named sibling directory. Each operation pins one generation for
+    its duration, so cleanup cannot remove it in flight. A pointer flip to a different
+    fingerprint requires :meth:`ensure_ready` with that fingerprint before any operation;
+    same dimensions are not evidence that two embedding spaces are compatible.
+    """
+
+    def __init__(
+        self,
+        directory: Path,
+        engine: AsyncEngine,
+        *,
+        operation_hook: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        self._directory = directory
+        self._engine = engine
+        self._stores: dict[str, LanceVectorStore] = {}
+        self._middleware: tuple[str, ...] = ()
+        self._configured: EmbedFingerprint | None = None
+        self._publication_pointer: str | None = None
+        self._operation_hook = operation_hook
+
+    @property
+    def publication_pointer(self) -> str | None:
+        """The SQLite pointer resolved by the most recent operation."""
+        return self._publication_pointer
+
+    async def ensure_ready(
+        self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
+    ) -> None:
+        self._middleware = tuple(embed_text_middleware)
+        self._configured = fingerprint
+        async with self._operation() as store:
+            await store.ensure_ready(fingerprint, embed_text_middleware=embed_text_middleware)
+
+    async def teardown(self) -> None:
+        for store in self._stores.values():
+            await store.teardown()
+        self._stores.clear()
+
+    async def fingerprint(self) -> EmbedFingerprint | None:
+        async with self._operation() as store:
+            return await store.fingerprint()
+
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = LEGACY_PUBLICATION,
+    ) -> None:
+        async with self._operation() as store:
+            await store.upsert(chunks, vectors, publication_id=publication_id)
+
+    async def delete_document(self, document_id: str) -> None:
+        async with self._operation() as store:
+            await store.delete_document(document_id)
+
+    async def delete_chunks(self, chunk_ids: Sequence[str]) -> None:
+        async with self._operation() as store:
+            await store.delete_chunks(chunk_ids)
+
+    async def search(
+        self,
+        vector: Vector,
+        k: int,
+        filter: Filter | None = None,  # noqa: A002 - protocol spelling
+    ) -> list[Candidate]:
+        async with self._operation() as store:
+            return await store.search(vector, k, filter)
+
+    async def count(self) -> int:
+        async with self._operation() as store:
+            return await store.count()
+
+    async def stored_vectors(self, chunks: Sequence[Chunk]) -> Mapping[str, StoredVector]:
+        async with self._operation() as store:
+            return await store.stored_vectors(chunks)
+
+    @asynccontextmanager
+    async def _operation(self) -> AsyncGenerator[LanceVectorStore]:
+        """Pin and revalidate one pointer before exposing its store to an operation."""
+        while True:
+            pointer = await self._pointer()
+            key = _published_generation_key(pointer)
+            directory = (
+                self._directory / "generations" / key if key != "legacy" else self._directory
+            )
+            if key == "legacy":
+                self._publication_pointer = pointer
+                store = await self._prepared_store(key, directory)
+                if self._operation_hook is not None:
+                    await self._operation_hook()
+                yield store
+                return
+            async with generation_pin(directory):
+                if await self._pointer() != pointer:
+                    continue
+                self._publication_pointer = pointer
+                store = await self._prepared_store(key, directory)
+                if self._operation_hook is not None:
+                    await self._operation_hook()
+                yield store
+                return
+
+    async def _pointer(self) -> str | None:
+        from sqlalchemy import select  # noqa: PLC0415 - storage remains lazy
+
+        from manicule.storage import models  # noqa: PLC0415 - avoids import cycle at startup
+
+        async with self._engine.connect() as connection:
+            value = (
+                await connection.execute(
+                    select(models.IndexState.vector_table).where(models.IndexState.id == 1)
+                )
+            ).scalar_one_or_none()
+        return None if value is None else str(value)
+
+    async def _prepared_store(self, key: str, directory: Path) -> LanceVectorStore:
+        store = self._stores.setdefault(key, LanceVectorStore(directory))
+        if key != "legacy":
+            stored = await store.open_existing()
+            if self._configured is not None and stored.canonical() != self._configured.canonical():
+                raise VectorStoreReprepareRequiredError(
+                    "the live vector publication changed embedding fingerprints; prepare this "
+                    "handle with the live embedder before searching or writing"
+                )
+        else:
+            stored = await store.fingerprint()
+            fingerprint = self._configured or stored
+            if fingerprint is not None:
+                await store.ensure_ready(fingerprint, embed_text_middleware=self._middleware)
+        return store
+
+
+def _published_generation_key(pointer: str | None) -> str:
+    """Map a database pointer to one safe local directory component."""
+    if pointer is None or not pointer.startswith("reembed-"):
+        return "legacy"
+    if re.fullmatch(r"reembed-[A-Za-z0-9._-]+", pointer) is None:
+        raise VectorStoreStateError(
+            "the published vector generation pointer is invalid; repair index state before "
+            "searching or writing vectors"
+        )
+    return pointer
+
+
 __all__ = [
     "EXEMPT_FILTER_FIELDS",
     "FILTERABLE_COLUMNS",
@@ -880,10 +1214,17 @@ __all__ = [
     "IDENTITY_COLUMN",
     "META_TABLE",
     "PUSHED_DOWN_FILTER_FIELDS",
+    "SOURCE_CREATED_AT_COLUMN",
+    "SOURCE_PUBLICATION_COLUMN",
+    "SOURCE_SEQUENCE_COLUMN",
+    "SOURCE_VECTOR_ID_COLUMN",
     "TABLE_PREFIX",
     "LanceVectorStore",
+    "PublishedLanceVectorStore",
+    "VectorStoreReprepareRequiredError",
     "VectorStoreStateError",
     "fingerprint_hash",
+    "generation_pin",
     "membership",
     "predicate_for",
     "quote",

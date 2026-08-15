@@ -444,6 +444,41 @@ async def admin(
     )
 
 
+# --- re-embedding -----------------------------------------------------------------------------
+
+
+async def _reembed_page(
+    service: Service,
+    caller: Operator,
+    *,
+    run_id: str = "",
+) -> HTMLResponse:
+    panels = {"plan": await panel("reembed_plan", service, service.reembed_plan)}
+    if run_id:
+        panels["status"] = await panel(
+            "reembed_status", service, lambda: service.reembed_status(run_id)
+        )
+    return render(
+        "reembed.html",
+        area="reembed",
+        title="Re-embed",
+        service=service,
+        caller=caller,
+        panels=panels,
+        extra={"run_id": run_id},
+    )
+
+
+@router.get("/reembed", name="ui_reembed", summary="Plan and inspect durable re-embedding.")
+async def reembed_page(
+    service: Service,
+    caller: Operator,
+    *,
+    run_id: Annotated[str, Query(max_length=200)] = "",
+) -> HTMLResponse:
+    return await _reembed_page(service, caller, run_id=run_id)
+
+
 # --- settings ---------------------------------------------------------------------------------
 
 

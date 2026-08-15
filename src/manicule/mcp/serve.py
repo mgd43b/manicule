@@ -116,7 +116,7 @@ def address_for(
 
     ``tools`` counts what *this* transport offers rather than what the module registers, so the
     line an operator reads at startup says how many tools the thing they just started actually
-    has. Reporting twenty-eight for a socket that carries thirteen would be the banner
+    has. Reporting twenty-nine for a socket that carries fourteen would be the banner
     disagreeing with ``tools/list`` on the one number somebody would check.
 
     Raises:
