@@ -196,7 +196,11 @@ async def _run_with_current_omissions(
     reason_rows = (
         await session.execute(
             select(models.AcquisitionRecord.snapshot_diagnostic, func.count())
-            .where(models.AcquisitionRecord.run_id == row.id, missing)
+            .where(
+                models.AcquisitionRecord.run_id == row.id,
+                models.AcquisitionRecord.state == AcquisitionRecordState.RETRY,
+                missing,
+            )
             .group_by(models.AcquisitionRecord.snapshot_diagnostic)
         )
     ).all()
