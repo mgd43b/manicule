@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic import TypeAdapter
@@ -56,7 +58,8 @@ from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import utcnow
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import AsyncGenerator, Iterator, Sequence
+    from contextlib import AbstractAsyncContextManager
     from datetime import datetime
 
     from sqlalchemy import CursorResult
@@ -73,6 +76,37 @@ class BlobInventory(Protocol):
     """Cheap local existence check used by planning; no bytes cross this boundary."""
 
     async def contains(self, digest: str) -> bool: ...
+
+    def evidence_fence(self, digests: Sequence[str]) -> AbstractAsyncContextManager[None]: ...
+
+    async def evidence_identity(
+        self,
+        digest: str,
+        *,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+        verify_content: bool,
+    ) -> str | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceDescriptor:
+    sequence: int
+    source_id: str
+    blob_ref: str
+    acquired_content_hash: str
+    algo: str
+    size_bytes: int
+    stored_bytes: int
+    compression: str
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceFence:
+    inventory_digest: str
+    verification_digest: str
+    lease_generation: int
 
 
 class GenerationVectorInventory(Protocol):
@@ -509,6 +543,11 @@ class SqliteRebuildStore(WorkspaceScoped):
     ) -> RebuildCheckpoint:
         if not owner or expires_at <= now:
             raise ValueError("a generation lease needs an owner and a future expiry")
+        async with self._sessions() as session:
+            observed = await self._required_generation(session, generation_id)
+            published = observed.state is RebuildState.PUBLISHED
+        if published:
+            return await self._repair_published_generation(generation_id, now=now)
         async with self._sessions.begin() as session:
             # Take SQLite's writer slot before reading max(fence_generation). The unique index
             # is the second guard; this ordering avoids turning ordinary concurrent claims into
@@ -523,8 +562,10 @@ class SqliteRebuildStore(WorkspaceScoped):
             )
             generation = await self._required_generation(session, generation_id)
             if generation.state is RebuildState.PUBLISHED:
-                await self._settle_published_generation(session, generation, now=now)
-                return _checkpoint(generation)
+                # A publisher won after the read-only probe. Release SQLite's writer slot
+                # before the evidence preflight, then re-enter through the fenced replay path.
+                await session.rollback()
+                return await self._repair_published_generation(generation_id, now=now)
             if generation.state in {RebuildState.FAILED, RebuildState.CANCELED}:
                 raise RebuildTerminalGenerationError("generation is terminal")
             if generation.lease_expires_at is not None and generation.lease_expires_at > now:
@@ -553,6 +594,20 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation.updated_at = now
             await session.flush()
             return _checkpoint(generation, predecessor_vector_publication_id=predecessor)
+
+    async def _repair_published_generation(
+        self, generation_id: str, *, now: datetime
+    ) -> RebuildCheckpoint:
+        async with (
+            self._publication_evidence_fence(generation_id) as evidence_fence,
+            self._sessions.begin() as session,
+        ):
+            generation = await self._required_generation(session, generation_id)
+            if generation.state is not RebuildState.PUBLISHED:
+                raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
+            await self._require_evidence_fence(session, generation, evidence_fence)
+            await self._settle_published_generation(session, generation, now=now)
+            return _checkpoint(generation)
 
     async def renew_generation(
         self,
@@ -905,8 +960,9 @@ class SqliteRebuildStore(WorkspaceScoped):
                 after = pairs[-1][0].sequence
             if await self._publication_row_count(physical_publication) != expected_vectors:
                 raise RebuildPublicationValidationError
+        await self._record_evidence_verification(generation_id)
 
-    async def publish_generation(  # noqa: PLR0912, PLR0915 - one atomic boundary
+    async def publish_generation(
         self,
         generation_id: str,
         *,
@@ -914,8 +970,60 @@ class SqliteRebuildStore(WorkspaceScoped):
         lease_generation: int,
         now: datetime,
     ) -> RebuildCheckpoint:
+        await self._assert_prepublication_scope(generation_id)
+        async with self._publication_evidence_fence(generation_id) as evidence_fence:
+            return await self._publish_generation_atomic(
+                generation_id,
+                owner=owner,
+                lease_generation=lease_generation,
+                now=now,
+                evidence_fence=evidence_fence,
+            )
+
+    async def _assert_prepublication_scope(self, generation_id: str) -> None:
+        """Preserve typed scope/snapshot refusal precedence before evidence-fence checks."""
+        async with self._sessions() as session:
+            generation = await self._required_generation(session, generation_id)
+            if generation.state is RebuildState.PUBLISHED:
+                return
+            run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
+            if run is None or run.workspace_id != self._workspace_id or run.promoted_at is None:
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+            newer = (
+                await session.execute(
+                    select(models.AcquisitionRun.id)
+                    .where(
+                        models.AcquisitionRun.workspace_id == self._workspace_id,
+                        models.AcquisitionRun.connector_name == run.connector_name,
+                        models.AcquisitionRun.scope_fingerprint == run.scope_fingerprint,
+                        models.AcquisitionRun.promoted_at.is_not(None),
+                    )
+                    .order_by(
+                        models.AcquisitionRun.promoted_at.desc(),
+                        models.AcquisitionRun.id.desc(),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if newer != run.id:
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+            if not await self._is_only_promoted_scope(
+                session, run.connector_name, run.scope_fingerprint
+            ):
+                raise RebuildPublicationConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED)
+
+    async def _publish_generation_atomic(  # noqa: PLR0912, PLR0915
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: datetime,
+        evidence_fence: _EvidenceFence,
+    ) -> RebuildCheckpoint:
         async with self._sessions.begin() as session:
             existing = await self._required_generation(session, generation_id)
+            await self._require_evidence_fence(session, existing, evidence_fence)
             if existing.state is RebuildState.PUBLISHED:
                 await self._settle_published_generation(session, existing, now=now)
                 return _checkpoint(existing)
@@ -1066,6 +1174,26 @@ class SqliteRebuildStore(WorkspaceScoped):
             await self._settle_published_generation(session, generation, now=now)
             await session.flush()
             return _checkpoint(generation)
+
+    async def _require_evidence_fence(
+        self,
+        session: AsyncSession,
+        generation: models.DerivedGeneration,
+        evidence_fence: _EvidenceFence,
+    ) -> None:
+        if (
+            generation.evidence_inventory_digest != evidence_fence.inventory_digest
+            or generation.evidence_verification_digest != evidence_fence.verification_digest
+            or generation.evidence_verification_lease_generation != evidence_fence.lease_generation
+            or generation.lease_generation != evidence_fence.lease_generation
+        ):
+            raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+        descriptors = await self._evidence_descriptors(session, generation)
+        if (
+            self._evidence_inventory_digest(generation, descriptors)
+            != evidence_fence.inventory_digest
+        ):
+            raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
 
     async def _settle_published_generation(
         self,
@@ -1281,6 +1409,209 @@ class SqliteRebuildStore(WorkspaceScoped):
             session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
         return document.id
 
+    async def _evidence_descriptors(
+        self,
+        session: AsyncSession,
+        generation: models.DerivedGeneration,
+    ) -> tuple[_EvidenceDescriptor, ...]:
+        rows = (
+            await session.execute(
+                select(
+                    models.AcquisitionRecord.sequence,
+                    models.AcquisitionRecord.source_id,
+                    models.AcquisitionRecord.blob_ref,
+                    models.AcquisitionRecord.acquired_source,
+                    models.Blob.algo,
+                    models.Blob.size_bytes,
+                    models.Blob.stored_bytes,
+                    models.Blob.compression,
+                )
+                .join(models.Blob, models.Blob.hash == models.AcquisitionRecord.blob_ref)
+                .where(
+                    models.AcquisitionRecord.run_id == generation.snapshot_run_id,
+                    models.AcquisitionRecord.workspace_id == self._workspace_id,
+                    models.AcquisitionRecord.blob_ref.is_not(None),
+                    models.AcquisitionRecord.acquired_source.is_not(None),
+                )
+                .order_by(models.AcquisitionRecord.sequence)
+            )
+        ).all()
+        descriptors: list[_EvidenceDescriptor] = []
+        for sequence, source_id, blob_ref, acquired_source, algo, size, stored, compression in rows:
+            try:
+                acquired = AcquiredSource.model_validate(acquired_source)
+            except ValueError as exc:
+                raise RebuildPublicationValidationError from exc
+            if (
+                not isinstance(blob_ref, str)
+                or blob_ref != acquired.content_hash
+                or algo != "blake2b"
+                or compression not in {"none", "gzip"}
+            ):
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+            descriptors.append(
+                _EvidenceDescriptor(
+                    sequence=sequence,
+                    source_id=source_id,
+                    blob_ref=blob_ref,
+                    acquired_content_hash=acquired.content_hash,
+                    algo=algo,
+                    size_bytes=size,
+                    stored_bytes=stored,
+                    compression=compression,
+                )
+            )
+        return tuple(descriptors)
+
+    def _evidence_inventory_digest(
+        self,
+        generation: models.DerivedGeneration,
+        descriptors: Sequence[_EvidenceDescriptor],
+    ) -> str:
+        return hashlib.sha256(
+            _canonical(
+                {
+                    "version": 1,
+                    "workspace_id": self._workspace_id,
+                    "generation_id": generation.id,
+                    "snapshot_run_id": generation.snapshot_run_id,
+                    "snapshot_membership_hash": generation.snapshot_membership_hash,
+                    "expected_item_count": generation.expected_item_count,
+                    "evidence": [
+                        {
+                            "sequence": item.sequence,
+                            "source_id": item.source_id,
+                            "blob_ref": item.blob_ref,
+                            "acquired_content_hash": item.acquired_content_hash,
+                            "algo": item.algo,
+                            "size_bytes": item.size_bytes,
+                            "stored_bytes": item.stored_bytes,
+                            "compression": item.compression,
+                        }
+                        for item in descriptors
+                    ],
+                }
+            )
+        ).hexdigest()
+
+    async def _evidence_verification_digest(
+        self,
+        inventory_digest: str,
+        descriptors: Sequence[_EvidenceDescriptor],
+        *,
+        verify_content: bool,
+    ) -> str:
+        identities: dict[str, str] = {}
+        for item in descriptors:
+            if item.blob_ref in identities:
+                continue
+            identity = await self._blobs.evidence_identity(
+                item.blob_ref,
+                size_bytes=item.size_bytes,
+                stored_bytes=item.stored_bytes,
+                compression=item.compression,
+                verify_content=verify_content,
+            )
+            if identity is None:
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+            identities[item.blob_ref] = identity
+        return hashlib.sha256(
+            _canonical(
+                {
+                    "version": 1,
+                    "inventory_digest": inventory_digest,
+                    "representations": [
+                        {"blob_ref": item.blob_ref, "identity": identities[item.blob_ref]}
+                        for item in descriptors
+                    ],
+                }
+            )
+        ).hexdigest()
+
+    async def _record_evidence_verification(self, generation_id: str) -> None:
+        """Hash retained bytes without a SQLite writer, then persist one exact fence."""
+        async with self._sessions() as session:
+            generation = await self._required_generation(session, generation_id)
+            if generation.state not in {RebuildState.VALIDATING, RebuildState.PUBLISHED}:
+                raise RebuildPublicationValidationError
+            lease_generation = generation.lease_generation
+            descriptors = await self._evidence_descriptors(session, generation)
+            inventory_digest = self._evidence_inventory_digest(generation, descriptors)
+        digests = tuple(item.blob_ref for item in descriptors)
+        async with self._blobs.evidence_fence(digests):
+            verification_digest = await self._evidence_verification_digest(
+                inventory_digest, descriptors, verify_content=True
+            )
+            # Catch an uncoordinated filesystem change before reserving SQLite's writer slot.
+            if (
+                await self._evidence_verification_digest(
+                    inventory_digest, descriptors, verify_content=False
+                )
+                != verification_digest
+            ):
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+            async with self._sessions.begin() as session:
+                current = await self._required_generation(session, generation_id)
+                if (
+                    current.state not in {RebuildState.VALIDATING, RebuildState.PUBLISHED}
+                    or current.lease_generation != lease_generation
+                ):
+                    raise RebuildLeaseConflictError("generation lease changed during verification")
+                await self._verify_complete_header(session, current)
+                current_descriptors = await self._evidence_descriptors(session, current)
+                current_inventory = self._evidence_inventory_digest(current, current_descriptors)
+                if current_inventory != inventory_digest:
+                    raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+                current.evidence_inventory_digest = inventory_digest
+                current.evidence_verification_digest = verification_digest
+                current.evidence_verification_lease_generation = lease_generation
+                current.evidence_verified_at = utcnow()
+                current.updated_at = utcnow()
+
+    @contextlib.asynccontextmanager
+    async def _publication_evidence_fence(
+        self, generation_id: str
+    ) -> AsyncGenerator[_EvidenceFence]:
+        async with self._sessions() as session:
+            generation = await self._required_generation(session, generation_id)
+            if generation.state is RebuildState.PUBLISHED and (
+                generation.evidence_inventory_digest is None
+                or generation.evidence_verification_digest is None
+            ):
+                needs_legacy_verification = True
+            else:
+                needs_legacy_verification = False
+        if needs_legacy_verification:
+            await self._record_evidence_verification(generation_id)
+        async with self._sessions() as session:
+            generation = await self._required_generation(session, generation_id)
+            descriptors = await self._evidence_descriptors(session, generation)
+            inventory_digest = self._evidence_inventory_digest(generation, descriptors)
+            persisted_inventory = generation.evidence_inventory_digest
+            persisted_verification = generation.evidence_verification_digest
+            persisted_lease = generation.evidence_verification_lease_generation
+            lease_generation = generation.lease_generation
+        if (
+            persisted_inventory is None
+            or persisted_verification is None
+            or persisted_lease != lease_generation
+            or persisted_inventory != inventory_digest
+        ):
+            raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+        digests = tuple(item.blob_ref for item in descriptors)
+        async with self._blobs.evidence_fence(digests):
+            # Re-read the cheap identity after acquiring the durable representation fence.
+            observed = await self._evidence_verification_digest(
+                inventory_digest, descriptors, verify_content=False
+            )
+            if observed != persisted_verification:
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+            yield _EvidenceFence(
+                inventory_digest=inventory_digest,
+                verification_digest=observed,
+                lease_generation=lease_generation,
+            )
+
     async def _verify_complete_header(
         self,
         session: AsyncSession,
@@ -1373,34 +1704,6 @@ class SqliteRebuildStore(WorkspaceScoped):
             or not (partial_is_honest or complete_is_honest)
         ):
             raise RebuildPublicationValidationError
-        await self._verify_retained_evidence(session, generation.snapshot_run_id)
-
-    async def _verify_retained_evidence(self, session: AsyncSession, snapshot_run_id: str) -> None:
-        """Re-hash every represented source blob at the publication transaction fence."""
-        after = -1
-        while True:
-            rows = list(
-                (
-                    await session.execute(
-                        select(models.AcquisitionRecord)
-                        .where(
-                            models.AcquisitionRecord.run_id == snapshot_run_id,
-                            models.AcquisitionRecord.workspace_id == self._workspace_id,
-                            models.AcquisitionRecord.blob_ref.is_not(None),
-                            models.AcquisitionRecord.acquired_source.is_not(None),
-                            models.AcquisitionRecord.sequence > after,
-                        )
-                        .order_by(models.AcquisitionRecord.sequence)
-                        .limit(_EVIDENCE_PAGE)
-                    )
-                ).scalars()
-            )
-            if not rows:
-                return
-            for row in rows:
-                if row.blob_ref is None or not await self._blobs.contains(row.blob_ref):
-                    raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
-            after = rows[-1].sequence
 
     async def _evidence_page(
         self,

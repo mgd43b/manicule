@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
@@ -79,6 +80,80 @@ class ReplayBarrierRebuildStore(SqliteRebuildStore):
             vector_table=vector_table,
             vector_inventory_digest=vector_inventory_digest,
         )
+
+
+class CountingEvidenceBlobStore(BlobStore):
+    """Count full representation hashes separately from cheap fence probes."""
+
+    full_verifications = 0
+    cheap_probes = 0
+
+    @override
+    async def evidence_identity(
+        self,
+        digest: str,
+        *,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+        verify_content: bool,
+    ) -> str | None:
+        if verify_content:
+            self.full_verifications += 1
+        else:
+            self.cheap_probes += 1
+        return await super().evidence_identity(
+            digest,
+            size_bytes=size_bytes,
+            stored_bytes=stored_bytes,
+            compression=compression,
+            verify_content=verify_content,
+        )
+
+
+class GatedEvidenceBlobStore(CountingEvidenceBlobStore):
+    """Pause after one full streamed hash and before fence persistence."""
+
+    verification_started: asyncio.Event
+    verification_release: asyncio.Event
+    armed = False
+    blocked = False
+
+    @override
+    async def evidence_identity(
+        self,
+        digest: str,
+        *,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+        verify_content: bool,
+    ) -> str | None:
+        identity = await super().evidence_identity(
+            digest,
+            size_bytes=size_bytes,
+            stored_bytes=stored_bytes,
+            compression=compression,
+            verify_content=verify_content,
+        )
+        if verify_content and self.armed and not self.blocked:
+            self.blocked = True
+            self.verification_started.set()
+            await self.verification_release.wait()
+        return identity
+
+
+class ArmingEvidenceVerificationStore(SqliteRebuildStore):
+    """Arm a gated blob store only for the durable validation pass, not planning."""
+
+    def __init__(self, *args: Any, blobs: GatedEvidenceBlobStore, **kwargs: Any) -> None:
+        self.gated_blobs = blobs
+        super().__init__(*args, blobs=blobs, **kwargs)
+
+    @override
+    async def _record_evidence_verification(self, generation_id: str) -> None:
+        self.gated_blobs.armed = True
+        await super()._record_evidence_verification(generation_id)
 
 
 class FailingGlossaryPublicationStore(SqliteRebuildStore):
@@ -505,6 +580,8 @@ async def staged_glossary_generation(
     data_dir: Path,
     *,
     rebuild_type: type[SqliteRebuildStore] = SqliteRebuildStore,
+    blobs: BlobStore | None = None,
+    large_evidence: bool = False,
 ) -> tuple[SqliteRebuildStore, RebuildCheckpoint, tuple[Document, ...]]:
     """Stage two aliased replacements under a real FK-on SQLite generation."""
     raws = (
@@ -512,7 +589,8 @@ async def staged_glossary_generation(
             source_id="glossary-one",
             uri="https://wiki.example.test/glossary-one",
             media_type="text/plain",
-            content="Network Operations Workspace (NOW, NETOPS)",
+            content="Network Operations Workspace (NOW, NETOPS)"
+            + ("\n" + "x" * 2_500_000 if large_evidence else ""),
         ),
         RawDocument(
             source_id="glossary-two",
@@ -523,12 +601,16 @@ async def staged_glossary_generation(
     )
     run_id, blob_refs = await promoted_snapshot_many(store, engine, data_dir, raws)
     target, embed = rebuild_target()
+    if large_evidence:
+        target = target.model_copy(
+            update={"max_memory_bytes": 20_000_000, "max_temporary_bytes": 50_000_000}
+        )
     vectors = LanceVectorStore(data_dir / "vectors")
     await vectors.ensure_ready(embed)
     rebuilds = rebuild_type(
         engine,
         workspace_id=store.workspace_id,
-        blobs=BlobStore(engine, data_dir),
+        blobs=blobs or BlobStore(engine, data_dir),
         vectors=vectors,
     )
     plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
@@ -555,7 +637,11 @@ async def staged_glossary_generation(
                 "status": DocumentStatus.INDEXED,
             }
         )
-        chunk = make_chunk(document, 0, raw.as_text())
+        chunk = make_chunk(
+            document,
+            0,
+            "Synthetic bounded derived chunk" if large_evidence else raw.as_text(),
+        )
         acronym = "NOW" if sequence == 0 else "NOS"
         entries = [
             GlossaryEntry(
@@ -845,7 +931,7 @@ async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omiss
     assert "wiki.example.test" not in rendered
 
 
-@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "ref", "manifest"])
 async def test_publication_rechecks_retained_blob_integrity_before_settlement(
     store: SqliteDocStore,
     engine: AsyncEngine,
@@ -867,11 +953,39 @@ async def test_publication_rechecks_retained_blob_integrity_before_settlement(
         )
     assert isinstance(snapshot_id, str)
     assert isinstance(blob_ref, str)
-    path = BlobStore(engine, data_dir).path_for(blob_ref)
+    blobs = BlobStore(engine, data_dir)
+    path = blobs.path_for(blob_ref)
     if damage == "missing":
         path.unlink()
-    else:
+    elif damage == "corrupt":
         path.write_bytes(b"synthetic corrupt evidence")
+    elif damage == "ref":
+        replacement = await blobs.put(b"synthetic replacement evidence", "text/plain")
+        assert isinstance(replacement, StoredBlob)
+        sessions = session_factory(engine)
+        async with sessions.begin() as session:
+            await session.execute(
+                update(models.AcquisitionRecord)
+                .where(
+                    models.AcquisitionRecord.run_id == snapshot_id,
+                    models.AcquisitionRecord.blob_ref == blob_ref,
+                )
+                .values(blob_ref=replacement.hash)
+            )
+    else:
+        sessions = session_factory(engine)
+        async with sessions.begin() as session:
+            record = (
+                await session.execute(
+                    select(models.AcquisitionRecord)
+                    .where(models.AcquisitionRecord.run_id == snapshot_id)
+                    .order_by(models.AcquisitionRecord.sequence)
+                    .limit(1)
+                )
+            ).scalar_one()
+            source_record = dict(cast("dict[str, Any]", record.source_record))
+            source_record["title"] = "Synthetic changed manifest title"
+            record.source_record = cast("Any", source_record)
 
     with pytest.raises(RebuildPublicationConflictError) as caught:
         await rebuilds.publish_generation(
@@ -891,6 +1005,170 @@ async def test_publication_rechecks_retained_blob_integrity_before_settlement(
     }
 
 
+async def test_slow_evidence_verification_does_not_hold_sqlite_writer_slot(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    blobs = GatedEvidenceBlobStore(engine, data_dir)
+    blobs.verification_started = asyncio.Event()
+    blobs.verification_release = asyncio.Event()
+    build = asyncio.create_task(
+        staged_glossary_generation(
+            store,
+            engine,
+            data_dir,
+            rebuild_type=ArmingEvidenceVerificationStore,
+            blobs=blobs,
+            large_evidence=True,
+        )
+    )
+    await asyncio.wait_for(blobs.verification_started.wait(), timeout=5)
+
+    started = monotonic()
+    sessions = session_factory(engine)
+    async with asyncio.timeout(5), sessions.begin() as session:
+        await session.execute(
+            update(models.Connector)
+            .where(models.Connector.workspace_id == store.workspace_id)
+            .values(error_message="synthetic unrelated writer probe")
+        )
+    elapsed = monotonic() - started
+
+    assert elapsed < 5
+    blobs.verification_release.set()
+    rebuilds, claimed, _ = await build
+    generation = await rebuilds.checkpoint(claimed.generation_id)
+    assert generation.state is RebuildState.VALIDATING
+
+
+async def test_canceled_evidence_verification_leaves_no_fence_and_retry_recovers(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    blobs = GatedEvidenceBlobStore(engine, data_dir)
+    blobs.verification_started = asyncio.Event()
+    blobs.verification_release = asyncio.Event()
+    build = asyncio.create_task(
+        staged_glossary_generation(
+            store,
+            engine,
+            data_dir,
+            rebuild_type=ArmingEvidenceVerificationStore,
+            blobs=blobs,
+        )
+    )
+    await asyncio.wait_for(blobs.verification_started.wait(), timeout=5)
+    build.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await build
+
+    sessions = session_factory(engine)
+    async with sessions() as session:
+        row = (await session.execute(select(models.DerivedGeneration))).scalar_one()
+        generation_id = row.id
+        lease_generation = row.lease_generation
+        assert row.state is RebuildState.VALIDATING
+        assert row.evidence_verification_digest is None
+
+    target, embed = rebuild_target()
+    del target
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    await rebuilds.validate_generation(generation_id)
+    published = await rebuilds.publish_generation(
+        generation_id,
+        owner="glossary-publisher",
+        lease_generation=lease_generation,
+        now=NOW,
+    )
+    assert published.state is RebuildState.PUBLISHED
+
+
+async def test_successor_takeover_fences_slow_stale_evidence_verifier(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    blobs = GatedEvidenceBlobStore(engine, data_dir)
+    blobs.verification_started = asyncio.Event()
+    blobs.verification_release = asyncio.Event()
+    build = asyncio.create_task(
+        staged_glossary_generation(
+            store,
+            engine,
+            data_dir,
+            rebuild_type=ArmingEvidenceVerificationStore,
+            blobs=blobs,
+        )
+    )
+    await asyncio.wait_for(blobs.verification_started.wait(), timeout=5)
+    sessions = session_factory(engine)
+    async with sessions() as session:
+        generation = (await session.execute(select(models.DerivedGeneration))).scalar_one()
+        generation_id = generation.id
+
+    successor = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+    )
+    claimed = await successor.claim_generation(
+        generation_id,
+        "successor-verifier",
+        now=NOW + timedelta(minutes=10),
+        expires_at=NOW + timedelta(minutes=20),
+    )
+    blobs.verification_release.set()
+
+    with pytest.raises(RebuildLeaseConflictError, match="lease changed during verification"):
+        await build
+    async with sessions() as session:
+        generation = await session.get(models.DerivedGeneration, generation_id)
+    assert generation is not None
+    assert generation.lease_owner == "successor-verifier"
+    assert generation.lease_generation == claimed.lease_generation
+    assert generation.evidence_verification_digest is None
+
+
+async def test_publication_uses_one_durable_hash_fence_without_rehashing(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    blobs = CountingEvidenceBlobStore(engine, data_dir)
+    rebuilds, claimed, _ = await staged_glossary_generation(store, engine, data_dir, blobs=blobs)
+    full_before_publication = blobs.full_verifications
+    cheap_before_publication = blobs.cheap_probes
+    # One planning pass and one durable verification pass over two unique retained blobs.
+    assert full_before_publication == 4
+
+    published = await rebuilds.publish_generation(
+        claimed.generation_id,
+        owner="glossary-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+
+    assert published.state is RebuildState.PUBLISHED
+    assert blobs.full_verifications == full_before_publication
+    assert blobs.cheap_probes == cheap_before_publication + 2
+    sessions = session_factory(engine)
+    async with sessions() as session:
+        generation = await session.get(models.DerivedGeneration, claimed.generation_id)
+    assert generation is not None
+    assert generation.evidence_inventory_digest
+    assert generation.evidence_verification_digest
+    assert generation.evidence_verification_lease_generation == claimed.lease_generation
+
+
 async def test_published_replay_repairs_a_legacy_unsettled_handoff_exactly_once(
     store: SqliteDocStore,
     engine: AsyncEngine,
@@ -907,6 +1185,10 @@ async def test_published_replay_repairs_a_legacy_unsettled_handoff_exactly_once(
     async with sessions.begin() as session:
         generation = await session.get(models.DerivedGeneration, claimed.generation_id)
         assert generation is not None
+        generation.evidence_inventory_digest = None
+        generation.evidence_verification_digest = None
+        generation.evidence_verification_lease_generation = None
+        generation.evidence_verified_at = None
         run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
         assert run is not None
         run.state = AcquisitionRunState.INDEXING
@@ -936,6 +1218,70 @@ async def test_published_replay_repairs_a_legacy_unsettled_handoff_exactly_once(
     assert repaired.acquired_blob_bytes == 0
     assert {record.state for record in records} == {AcquisitionRecordState.SETTLED}
     assert await store.verify_snapshot_manifest(snapshot_id)
+
+
+async def test_slow_legacy_published_replay_verification_does_not_block_writer(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    rebuilds, claimed, _ = await staged_glossary_generation(
+        store, engine, data_dir, large_evidence=True
+    )
+    await rebuilds.publish_generation(
+        claimed.generation_id,
+        owner="glossary-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    sessions = session_factory(engine)
+    async with sessions.begin() as session:
+        generation = await session.get(models.DerivedGeneration, claimed.generation_id)
+        assert generation is not None
+        generation.evidence_inventory_digest = None
+        generation.evidence_verification_digest = None
+        generation.evidence_verification_lease_generation = None
+        generation.evidence_verified_at = None
+        run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
+        assert run is not None
+        run.state = AcquisitionRunState.INDEXING
+        await session.execute(
+            update(models.AcquisitionRecord)
+            .where(models.AcquisitionRecord.run_id == run.id)
+            .values(state=AcquisitionRecordState.INDEXING)
+        )
+
+    blobs = GatedEvidenceBlobStore(engine, data_dir)
+    blobs.verification_started = asyncio.Event()
+    blobs.verification_release = asyncio.Event()
+    blobs.armed = True
+    repair_store = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=blobs,
+    )
+    repair = asyncio.create_task(
+        repair_store.claim_generation(
+            claimed.generation_id,
+            "legacy-repair",
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(minutes=1),
+        )
+    )
+    await asyncio.wait_for(blobs.verification_started.wait(), timeout=5)
+
+    started = monotonic()
+    async with asyncio.timeout(5), sessions.begin() as session:
+        await session.execute(
+            update(models.Connector)
+            .where(models.Connector.workspace_id == store.workspace_id)
+            .values(error_message="synthetic replay writer probe")
+        )
+    assert monotonic() - started < 5
+    blobs.verification_release.set()
+
+    repaired = await repair
+    assert repaired.state is RebuildState.PUBLISHED
 
 
 @pytest.mark.asyncio

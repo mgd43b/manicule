@@ -864,12 +864,19 @@ of the resume and requires it not to move. This is a mode of the existing config
 not a second crawler or an export path.
 
 An offline generation publication is the other consumer of that hand-off. Its relational pointer
-swap and the settlement of the exact acquisition manifest share one SQLite transaction. The
-publication transaction rechecks workspace, connector instance, promoted snapshot identity,
-canonical membership hash, generation lease/fence, staged replacement inventory, live vector
-binding, and the existence and content hash of every represented retained blob before it changes
-either side. It then moves the represented retained records to terminal derivation state and
-refreshes the run counters in the same commit that makes the generation `PUBLISHED`. A complete
+swap and the settlement of the exact acquisition manifest share one SQLite transaction. Before
+reserving SQLite's writer slot, validation streams and hashes each unique represented blob once,
+then durably records a private digest binding the workspace, generation lease, promoted run,
+canonical membership, exact evidence inventory, blob descriptors and stable filesystem
+representations. Publication takes the blob representation fence, compares cheap current
+identities with that durable verification, and holds the fence across the short atomic database
+operation. Inside that operation it rechecks the persisted verification identity plus workspace,
+connector instance, promoted snapshot, membership, lease/fence, staged replacement inventory and
+live vector binding; it performs no corpus blob reads. A crash before the verification digest is
+committed leaves no usable fence, a stale lease cannot commit one, and retry or legacy published
+replay verifies outside the writer transaction before proceeding. Publication then moves the
+represented retained records to terminal derivation state and refreshes the run counters in the
+same commit that makes the generation `PUBLISHED`. A complete
 manifest becomes `SETTLED`. An allowed-partial manifest derives only its evidence-bearing members;
 its typed omitted records remain omitted and visible as pending source retry even though the
 derivation run is settled, rather than requiring fabricated derived rows or being hidden by

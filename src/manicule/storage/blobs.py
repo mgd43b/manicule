@@ -1350,25 +1350,105 @@ class BlobStore:
             row = await session.get(models.Blob, digest)
         if row is None:
             return False
+        return (
+            await self.evidence_identity(
+                digest,
+                size_bytes=row.size_bytes,
+                stored_bytes=row.stored_bytes,
+                compression=row.compression,
+                verify_content=True,
+            )
+            is not None
+        )
+
+    @contextlib.asynccontextmanager
+    async def evidence_fence(self, digests: Sequence[str]) -> AsyncGenerator[None]:
+        """Exclude managed representation changes while a verified publication commits."""
+        async with self._durable_locks([f"blob:{digest}" for digest in digests]):
+            yield
+
+    async def evidence_identity(
+        self,
+        digest: str,
+        *,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+        verify_content: bool,
+    ) -> str | None:
+        """Return a cheap stable representation identity, optionally after one full hash.
+
+        The identity binds the descriptor and the exact named inode. A caller can therefore
+        hash outside SQLite's writer transaction, persist the identity, and later reject a
+        replaced, truncated, removed, or metadata-changed representation with only ``stat``.
+        """
         path = self.path_for(digest)
 
-        def streamed() -> bool:
+        def inspect() -> str | None:  # noqa: PLR0911 - every invalid representation fails closed
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
             try:
-                hasher = hashlib.blake2b(digest_size=16)
-                hasher.update(row.size_bytes.to_bytes(8, "big"))
-                total = 0
-                opener = gzip.open if row.compression == "gzip" else open
-                with opener(path, "rb") as handle:
-                    while chunk := handle.read(1024 * 1024):
-                        total += len(chunk)
-                        if total > row.size_bytes:
-                            return False
-                        hasher.update(chunk)
-                return total == row.size_bytes and hasher.hexdigest() == digest
+                descriptor = os.open(path, flags)
+            except OSError:
+                return None
+            try:
+                before = os.fstat(descriptor)
+                if not stat.S_ISREG(before.st_mode) or before.st_size != stored_bytes:
+                    return None
+                if verify_content:
+                    hasher = hashlib.blake2b(digest_size=16)
+                    hasher.update(size_bytes.to_bytes(8, "big"))
+                    total = 0
+                    with os.fdopen(os.dup(descriptor), "rb") as raw:
+                        handle = gzip.GzipFile(fileobj=raw) if compression == "gzip" else raw
+                        with contextlib.closing(handle):
+                            while chunk := handle.read(1024 * 1024):
+                                total += len(chunk)
+                                if total > size_bytes:
+                                    return None
+                                hasher.update(chunk)
+                    if total != size_bytes or hasher.hexdigest() != digest:
+                        return None
+                after = os.fstat(descriptor)
+                named = path.stat(follow_symlinks=False)
             except (OSError, EOFError):
-                return False
+                return None
+            finally:
+                os.close(descriptor)
+            fields = (
+                "v1",
+                digest,
+                size_bytes,
+                stored_bytes,
+                compression,
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            observed = (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            named_observed = (
+                named.st_dev,
+                named.st_ino,
+                named.st_mode,
+                named.st_size,
+                named.st_mtime_ns,
+                named.st_ctime_ns,
+            )
+            if observed != fields[5:] or named_observed != observed:
+                return None
+            encoded = json.dumps(fields, separators=(",", ":")).encode()
+            return hashlib.sha256(encoded).hexdigest()
 
-        return await asyncio.to_thread(streamed)
+        return await asyncio.to_thread(inspect)
 
     async def collect_garbage(self) -> Sequence[str]:
         """Delete blobs nothing references. Mark and sweep, never refcounts.
