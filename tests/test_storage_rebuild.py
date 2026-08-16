@@ -17,6 +17,7 @@ from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, DocumentStatus, RawDocument
 from manicule.core.embedding import EmbedFingerprint, Pooling
 from manicule.core.fingerprints import ChunkFingerprint
+from manicule.core.glossary import DefinitionForm, GlossaryEntry
 from manicule.core.ids import chunk_id, content_hash
 from manicule.core.rebuild import (
     DerivedReplacement,
@@ -68,6 +69,20 @@ class ReplayBarrierRebuildStore(SqliteRebuildStore):
             vector_table=vector_table,
             vector_inventory_digest=vector_inventory_digest,
         )
+
+
+class FailingGlossaryPublicationStore(SqliteRebuildStore):
+    """Fail after a later evidence page has added its relational replacement."""
+
+    published_items = 0
+
+    @override
+    async def _publish_item(self, *args: object, **kwargs: object) -> str:
+        result = await super()._publish_item(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        self.published_items += 1
+        if self.published_items == 2:
+            raise RuntimeError("synthetic glossary publication failure")
+        return result
 
 
 async def promoted_snapshot(
@@ -156,6 +171,91 @@ async def promoted_snapshot(
         now=NOW,
     )
     return run.id, blob.hash, raw
+
+
+async def promoted_snapshot_many(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    raws: tuple[RawDocument, ...],
+) -> tuple[str, tuple[str, ...]]:
+    """Promote several retained inputs so publication must cross evidence pages."""
+    run = await store.create_acquisition_run(
+        "promoted-glossary-run",
+        "wiki",
+        source_scope="scope:glossary-v1",
+        scope_fingerprint="glossary-v1",
+    )
+    claimed = await store.claim_acquisition_run(
+        run.id, "worker", now=NOW, expires_at=NOW + timedelta(minutes=5)
+    )
+    assert claimed is not None
+    for sequence, raw in enumerate(raws):
+        source = AcquisitionSource.from_discovered(
+            DiscoveredDoc(
+                ref=DocRef(source_id=raw.source_id, uri=raw.uri),
+                version_token="v2",  # noqa: S106 - source revision, not a credential
+                title="Synthetic glossary",
+                media_type=raw.media_type,
+                size_bytes=len(raw.as_bytes()),
+            )
+        )
+        await store.append_acquisition_record(
+            run.id,
+            sequence,
+            source,
+            lease_owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        Watermark(value="v2", observed_at=NOW),
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    blobs = BlobStore(engine, data_dir)
+    blob_refs: list[str] = []
+    for raw in raws:
+        blob = await blobs.put(raw.as_bytes(), raw.media_type)
+        assert isinstance(blob, StoredBlob)
+        blob_refs.append(blob.hash)
+        await store.transition_acquisition_record(
+            run.id,
+            raw.source_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+        await store.transition_acquisition_record(
+            run.id,
+            raw.source_id,
+            AcquisitionRecordState.ACQUIRING,
+            AcquisitionRecordState.ACQUIRED,
+            lease_owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+            blob_ref=blob.hash,
+            acquired_source=AcquiredSource.from_raw(raw),
+            fetched_version_token="v2",  # noqa: S106 - source revision, not a credential
+        )
+    await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint="glossary-v1",
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    return run.id, tuple(blob_refs)
 
 
 async def publish_one_replacement(
@@ -252,6 +352,185 @@ def rebuild_target() -> tuple[RebuildTarget, EmbedFingerprint]:
         ),
         embed,
     )
+
+
+async def staged_glossary_generation(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    *,
+    rebuild_type: type[SqliteRebuildStore] = SqliteRebuildStore,
+) -> tuple[SqliteRebuildStore, RebuildCheckpoint, tuple[Document, ...]]:
+    """Stage two aliased replacements under a real FK-on SQLite generation."""
+    raws = (
+        RawDocument(
+            source_id="glossary-one",
+            uri="https://wiki.example.test/glossary-one",
+            media_type="text/plain",
+            content="Network Operations Workspace (NOW, NETOPS)",
+        ),
+        RawDocument(
+            source_id="glossary-two",
+            uri="https://wiki.example.test/glossary-two",
+            media_type="text/plain",
+            content="Network Operations Service (NOS, NETOPS)",
+        ),
+    )
+    run_id, blob_refs = await promoted_snapshot_many(store, engine, data_dir, raws)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = rebuild_type(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    claimed = await rebuilds.claim_generation(
+        plan.generation_id,
+        "glossary-publisher",
+        now=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    replacements: list[tuple[int, DerivedReplacement]] = []
+    documents: list[Document] = []
+    for sequence, (raw, blob_ref) in enumerate(zip(raws, blob_refs, strict=True)):
+        document = make_document(
+            source="wiki",
+            source_id=raw.source_id,
+            body=raw.as_bytes(),
+            uri=raw.uri,
+            media_type=raw.media_type,
+        ).model_copy(
+            update={
+                "publication_id": plan.generation_id,
+                "original_ref": blob_ref,
+                "version_token": "v2",
+                "status": DocumentStatus.INDEXED,
+            }
+        )
+        chunk = make_chunk(document, 0, raw.as_text())
+        acronym = "NOW" if sequence == 0 else "NOS"
+        entries = [
+            GlossaryEntry(
+                acronym=acronym,
+                display=acronym,
+                expansion=(
+                    "Network Operations Workspace"
+                    if sequence == 0
+                    else "Network Operations Service"
+                ),
+                document_id=document.id,
+                chunk_id=chunk.id,
+                form=DefinitionForm.PARENTHETICAL,
+                confidence=0.9,
+                aliases=("NETOPS",),
+            )
+        ]
+        if sequence == 0:
+            entries.append(
+                GlossaryEntry(
+                    acronym="SOC",
+                    display="SOC",
+                    expansion="Security Operations Center",
+                    document_id=document.id,
+                    chunk_id=chunk.id,
+                    form=DefinitionForm.PARENTHETICAL,
+                    confidence=0.9,
+                    aliases=("SECOPS",),
+                )
+            )
+        replacement = DerivedReplacement(
+            document=document,
+            chunks=(chunk,),
+            glossary=tuple(entries),
+            parse_fingerprint="plain@2",
+            vector_embedded=1,
+        )
+        replacements.append((sequence, replacement))
+        documents.append(document)
+        await vectors.upsert(
+            [chunk],
+            [[1.0, 0.0, 0.0, 0.0]],
+            publication_id=claimed.vector_publication_id,
+        )
+    checkpoint = await rebuilds.stage_replacements(
+        plan.generation_id,
+        replacements,
+        expected_next_sequence=0,
+        owner="glossary-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    await rebuilds.begin_validation(
+        plan.generation_id,
+        owner="glossary-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    await rebuilds.validate_generation(plan.generation_id)
+    return rebuilds, checkpoint, tuple(documents)
+
+
+async def test_atomic_publication_flushes_glossary_parents_before_alias_evidence_pages(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    rebuilds, claimed, documents = await staged_glossary_generation(store, engine, data_dir)
+
+    published = await rebuilds.publish_generation(
+        claimed.generation_id,
+        owner="glossary-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+
+    assert published.state is RebuildState.PUBLISHED
+    assert [len(await store.glossary_entries(document.id)) for document in documents] == [2, 1]
+    async with engine.connect() as connection:
+        assert (await connection.execute(text("PRAGMA foreign_key_check"))).all() == []
+        aliases = (
+            (
+                await connection.execute(
+                    select(models.GlossaryAlias.key).order_by(models.GlossaryAlias.entry_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert sorted(aliases) == ["NETOPS", "NETOPS", "SECOPS"], (
+        "the repeated alias crosses the one-row evidence pages without orphaning either parent"
+    )
+
+
+async def test_glossary_publication_failure_rolls_back_every_relational_live_row(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    rebuilds, claimed, documents = await staged_glossary_generation(
+        store, engine, data_dir, rebuild_type=FailingGlossaryPublicationStore
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic glossary publication failure"):
+        await rebuilds.publish_generation(
+            claimed.generation_id,
+            owner="glossary-publisher",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+
+    assert [await store.get_document(document.id) for document in documents] == [None, None]
+    async with engine.connect() as connection:
+        assert (await connection.execute(select(models.GlossaryEntry.id))).scalars().all() == []
+        assert (await connection.execute(select(models.GlossaryAlias.key))).scalars().all() == []
+        assert (await connection.execute(text("PRAGMA foreign_key_check"))).all() == []
+        assert (
+            await connection.execute(select(models.IndexState.id).where(models.IndexState.id == 1))
+        ).scalar_one_or_none() is None
+    assert (await rebuilds.checkpoint(claimed.generation_id)).state is RebuildState.VALIDATING
 
 
 @pytest.mark.asyncio

@@ -1055,6 +1055,7 @@ class _Ingestion:
             chunk_fingerprint=chunk_fingerprint,
             middleware=middleware,
             parse_runner=runner,
+            detect_glossary=settings.rag.glossary.detect_on_ingest,
         )
         return store, rebuilder, target
 
