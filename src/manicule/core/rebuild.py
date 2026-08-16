@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from manicule.core.acquisition import AcquiredSource
 from manicule.core.content import Chunk, Document
+from manicule.core.errors import ManiculeError
 from manicule.core.glossary import GlossaryEntry
 
 
@@ -157,6 +158,7 @@ class RebuildCheckpoint(BaseModel):
 
     generation_id: str
     state: RebuildState
+    expected_items: int = Field(default=0, ge=0)
     next_sequence: int = Field(ge=0)
     documents_built: int = Field(ge=0)
     chunks_built: int = Field(ge=0)
@@ -185,7 +187,7 @@ def vector_publication_id(generation_id: str, owner: str, lease_generation: int)
     return f"{generation_id}.{lease_generation}.{owner_hash}"
 
 
-class RebuildRefusedError(RuntimeError):
+class RebuildRefusedError(ManiculeError):
     """A typed refusal containing only bounded aggregate-safe diagnostics."""
 
     def __init__(self, code: RebuildRefusalCode, estimate: RebuildEstimate) -> None:

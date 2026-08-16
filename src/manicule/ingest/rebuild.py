@@ -61,7 +61,12 @@ class RebuildStore(Protocol):
     """Durable shadow-generation operations required by the offline runner."""
 
     async def plan_rebuild(
-        self, snapshot_run_id: str, target: RebuildTarget, *, missing_limit: int
+        self,
+        snapshot_run_id: str,
+        target: RebuildTarget,
+        *,
+        missing_limit: int,
+        persist: bool = True,
     ) -> RebuildEstimate: ...
 
     async def checkpoint(self, generation_id: str) -> RebuildCheckpoint: ...
@@ -717,7 +722,9 @@ class OfflineGenerationRebuilder:
     ) -> RebuildEstimate:
         if missing_limit <= 0 or missing_limit > MAX_MISSING_DETAILS:
             raise ValueError("missing_limit must be between 1 and 1000")
-        return await self._store.plan_rebuild(snapshot_run_id, target, missing_limit=missing_limit)
+        return await self._store.plan_rebuild(
+            snapshot_run_id, target, missing_limit=missing_limit, persist=False
+        )
 
     async def run(  # noqa: PLR0912, PLR0915 - explicit terminal/refusal/lease stages
         self,
@@ -732,7 +739,9 @@ class OfflineGenerationRebuilder:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         owner = owner or f"offline-rebuild-{uuid4()}"
-        estimate = await self.dry_run(snapshot_run_id, target, missing_limit=missing_limit)
+        estimate = await self._store.plan_rebuild(
+            snapshot_run_id, target, missing_limit=missing_limit, persist=True
+        )
         if not estimate.runnable:
             raise RebuildRefusedError(
                 estimate.refusal or RebuildRefusalCode.MISSING_LOCAL_INPUT, estimate

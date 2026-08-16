@@ -34,6 +34,7 @@ from manicule.core.errors import (
     UnknownComponentError,
     UnknownEntityError,
 )
+from manicule.core.rebuild import RebuildRefusedError
 from manicule.ingest.capacity import CapacityRefusedError
 
 if TYPE_CHECKING:
@@ -73,6 +74,9 @@ _HINTS: dict[type[Exception], str] = {
     ),
     CapacityRefusedError: (
         "Free durable ingest capacity or raise the configured limit, then retry."
+    ),
+    RebuildRefusedError: (
+        "Inspect `rebuild plan` for aggregate missing-input and capacity estimates, then retry."
     ),
 }
 """What to do about each kind of failure, in the words of whoever has to do it.

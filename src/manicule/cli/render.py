@@ -1002,7 +1002,8 @@ def render_rebuild_plan(out: Console, payload: r.RebuildPlanReport) -> None:
 def render_rebuild_run(out: Console, payload: r.RebuildRunReport) -> None:
     out.print(f"[bold]{escape(payload.state)}[/bold] {escape(payload.generation_id)}")
     out.print(
-        f"{payload.documents_built} documents, {payload.chunks_built} chunks; "
+        f"{payload.documents_built}/{payload.expected_items} documents, "
+        f"{payload.chunks_built} chunks; "
         f"{payload.vectors_reused} vectors reused, {payload.vectors_embedded} embedded"
     )
     if payload.diagnostic_code:

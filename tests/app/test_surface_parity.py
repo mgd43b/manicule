@@ -645,6 +645,10 @@ def test_the_scheduler_lifecycle_plan_produces_the_same_read_only_envelope(
     scheduler = Scheduler(service, {})
     scheduled = asyncio.run(scheduler.plan_lifecycle(Command(tool, command_arguments)))
     assert _comparable(scheduled) == _comparable(_tool(service, tool, arguments))
+    data = cast("dict[str, Any]", scheduled["data"])
+    lifecycle = cast("dict[str, Any]", data["lifecycle"])
+    assert lifecycle["dry_run"] is True
+    assert lifecycle["outcome"] == "deferred"
 
 
 def test_the_scheduler_refuses_lifecycle_write_authority(service: ApplicationService) -> None:

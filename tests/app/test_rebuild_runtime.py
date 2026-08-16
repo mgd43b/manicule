@@ -63,6 +63,9 @@ async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capabili
         plan = await (await runtime.ingestion()).rebuild_plan(snapshot.id)
         assert plan.runnable
         assert plan.documents == 3
+        assert await (await runtime.ingestion()).rebuild_status(plan.generation_id) is None, (
+            "read-only planning must not create a durable generation"
+        )
 
         checkpoint = await (await runtime.ingestion()).rebuild_run(snapshot.id, "runtime-owner")
 

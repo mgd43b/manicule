@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import resource
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast, override
@@ -47,7 +48,7 @@ from manicule.core.content import (
 )
 from manicule.core.embedding import IndexFingerprints, Vector
 from manicule.core.ids import content_hash, document_id, vector_id
-from manicule.core.rebuild import RebuildState, RebuildTarget
+from manicule.core.rebuild import RebuildCheckpoint, RebuildState, RebuildTarget
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.glossary_lineage import glossary_fingerprint
@@ -90,6 +91,8 @@ class PublicationMemoryVectors(fakes.MemoryVectors):
     def __init__(self) -> None:
         super().__init__()
         self.publications: dict[str, dict[str, fakes.VectorRow]] = {"legacy": self.rows}
+        self.peak_upsert_items = 0
+        self.retrieval_probes = 0
 
     @override
     async def upsert(
@@ -99,6 +102,7 @@ class PublicationMemoryVectors(fakes.MemoryVectors):
         *,
         publication_id: str = "legacy",
     ) -> None:
+        self.peak_upsert_items = max(self.peak_upsert_items, len(chunks))
         rows = self.publications.setdefault(publication_id, {})
         for chunk, vector in zip(chunks, vectors, strict=True):
             rows[chunk.id] = fakes.VectorRow(
@@ -160,6 +164,14 @@ class PublicationMemoryVectors(fakes.MemoryVectors):
         for chunk in chunks:
             target[chunk.id] = source[chunk.id]
 
+    async def retrieve_publication(
+        self, publication_id: str, chunk_ids: Sequence[str]
+    ) -> tuple[fakes.VectorRow, ...]:
+        """Exercise the fake's read boundary instead of inspecting its backing dictionary."""
+        self.retrieval_probes += 1
+        rows = self.publications.get(publication_id, {})
+        return tuple(row for chunk_id in chunk_ids if (row := rows.get(chunk_id)) is not None)
+
 
 class CountingPlaintextParser(PlaintextParser):
     """Count local parsing without retaining any document identity or text."""
@@ -167,12 +179,61 @@ class CountingPlaintextParser(PlaintextParser):
     def __init__(self, config: PlaintextConfig) -> None:
         super().__init__(config)
         self.calls = 0
+        self.active_calls = 0
+        self.peak_active_calls = 0
+        self.peak_input_bytes = 0
 
     @override
     async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
         self.calls += 1
-        async for block in super().parse(raw):
-            yield block
+        self.active_calls += 1
+        self.peak_active_calls = max(self.peak_active_calls, self.active_calls)
+        self.peak_input_bytes = max(self.peak_input_bytes, len(raw.as_bytes()))
+        try:
+            async for block in super().parse(raw):
+                yield block
+        finally:
+            self.active_calls -= 1
+
+
+class ObservedRebuildStore(SqliteRebuildStore):
+    """Records externally visible publication pointer changes at the atomic store boundary."""
+
+    def __init__(self, *args: Any, live_store: SqliteDocStore, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._live_store = live_store
+        self.publication_transactions = 0
+        self.publication_pointer_transitions = 0
+
+    @override
+    async def publish_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> RebuildCheckpoint:
+        before = {
+            document.id: document.publication_id
+            for document in await self._live_store.list_documents(limit=1_000)
+        }
+        published = await super().publish_generation(
+            generation_id,
+            owner=owner,
+            lease_generation=lease_generation,
+            now=now,
+        )
+        after = {
+            document.id: document.publication_id
+            for document in await self._live_store.list_documents(limit=1_000)
+        }
+        self.publication_transactions += 1
+        self.publication_pointer_transitions += sum(
+            before.get(document_id) != publication_id
+            for document_id, publication_id in after.items()
+        )
+        return published
 
 
 def _pipeline(
@@ -1277,6 +1338,36 @@ async def test_acquire_only_never_derives_a_strict_incomplete_snapshot_prefix(
     await vectors.teardown()
 
 
+async def test_bounded_acquire_only_prefix_is_not_reported_as_offline_derivation(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    vectors = fakes.MemoryVectors()
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(
+        store,
+        vectors,  # pyright: ignore[reportArgumentType]
+        blobs=BlobStore(engine, data_dir),
+        durable_acquisition=True,
+    )
+
+    report = await pipeline.run(
+        fakes.DictConnector({"one": "alpha", "two": "beta"}),
+        limit=1,
+        acquire_only=True,
+    )
+    lifecycle = report.lifecycle_metadata()
+
+    assert report.limited
+    assert report.pending_derivation
+    assert not report.derivation_deferred
+    assert lifecycle["phase"] == "acquiring"
+    assert lifecycle["outcome"] == "bounded"
+    assert lifecycle["can_continue_offline"] is False
+    assert await store.count_documents() == 0
+
+
 async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(  # noqa: PLR0915 - one end-to-end evidence record
     store: SqliteDocStore,
     engine: AsyncEngine,
@@ -1426,17 +1517,28 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     assert authority.live.generation_id == "live-old"
     assert len(authority.rows[f"shadow:{reembed.id}"]) == 1
 
-    reembedded = await resume_reembed(
-        reembed.id,
-        owner_token="resume-owner",  # noqa: S106 - synthetic lease identity
-        corpus=corpus,
-        embedder=second_embedder,
-        journal=authority,
-        shadow=authority,
-        publisher=authority,
-        document_page=37,
-        target_batch_tokens=64,
+    authority.pause_first_upsert = True
+    resume_task = asyncio.create_task(
+        resume_reembed(
+            reembed.id,
+            owner_token="resume-owner",  # noqa: S106 - synthetic lease identity
+            corpus=corpus,
+            embedder=second_embedder,
+            journal=authority,
+            shadow=authority,
+            publisher=authority,
+            document_page=37,
+            target_batch_tokens=64,
+        )
     )
+    await authority.upsert_entered.wait()
+    assert authority.live.generation_id == "live-old"
+    old_index_rows: list[fakes.VectorRow] = []
+    for publication_id, rows in initial_publications.items():
+        old_index_rows.extend(await vectors.retrieve_publication(publication_id, tuple(rows)))
+    assert len(old_index_rows) == 1_000
+    authority.release_upsert.set()
+    reembedded = await resume_task
     second_rows = authority.rows[reembedded.shadow_generation_id or ""]
     assert reembedded.state is ReembedState.PUBLISHED
     assert reembedded.chunks_completed == 1_000
@@ -1447,12 +1549,7 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     assert parser.calls == parser_calls_before_reembed
     assert len(connector.fetches) == source_calls_before_reembed
     parser_calls_during_second_model = parser.calls - parser_calls_before_reembed
-    old_index_reads = sum(
-        chunk_id in vectors.publications[publication_id]
-        for publication_id, rows in initial_publications.items()
-        for chunk_id in rows
-    )
-    assert old_index_reads == 1_000
+    assert vectors.retrieval_probes == len(initial_publications)
 
     reset = await store.reset_derived()
     assert reset.snapshot_items == 1_000
@@ -1472,11 +1569,12 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
         max_memory_bytes=64 * 1024 * 1024,
         max_temporary_bytes=64 * 1024 * 1024,
     )
-    rebuild_store = SqliteRebuildStore(
+    rebuild_store = ObservedRebuildStore(
         engine,
         workspace_id=store.workspace_id,
         blobs=blobs,
         vectors=vectors,
+        live_store=store,
     )
     rebuild_clock = fakes.ManualLeaseClock()
     rebuilder = build_offline_rebuilder(
@@ -1521,6 +1619,12 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     }
     assert live_vector_count == 1_000
     assert await vectors.count() == 2_000, "the old publication remains readable until cleanup"
+    retained_old_rows: list[fakes.VectorRow] = []
+    for publication_id, rows in initial_publications.items():
+        retained_old_rows.extend(await vectors.retrieve_publication(publication_id, tuple(rows)))
+    assert len(retained_old_rows) == 1_000
+    observed_process_peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    assert observed_process_peak_rss > 0
     evidence = {
         "documents": 1_000,
         "cursor_lifetime_seconds": 0.5,
@@ -1543,7 +1647,10 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
         "peak_retained_bodies": report.stages.peak_bodies,
         "reembed_peak_memory_estimate_bytes": reembed.commitment.plan.peak_memory_bytes,
         "reembed_temp_disk_estimate_bytes": reembed.commitment.plan.temporary_disk_bytes,
-        "peak_rss_deterministic_bound_bytes": target.max_memory_bytes,
+        "observed_peak_parser_input_bytes": parser.peak_input_bytes,
+        "observed_peak_parser_calls": parser.peak_active_calls,
+        "observed_peak_vector_upsert_items": vectors.peak_upsert_items,
+        "observed_process_peak_rss_native_units": observed_process_peak_rss,
         "rebuild_memory_bound_bytes": target.max_memory_bytes,
         "rebuild_temp_disk_bound_bytes": target.max_temporary_bytes,
         "source_calls_during_derivation": len(connector.fetches) - source_calls_before_derivation,
@@ -1560,11 +1667,10 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
         "second_model_vectors": len(second_rows),
         "crash_checkpoint_rows": 1,
         "crash_checkpoint_state": crashed.state.value,
-        "old_index_reads_before_flip": old_index_reads,
-        "old_publication_retained_rows": sum(
-            len(vectors.publications[publication_id]) for publication_id in initial_publications
-        ),
-        "publication_flip_count": 1,
+        "old_index_reads_before_flip": len(old_index_rows),
+        "old_publication_reads_after_flip": len(retained_old_rows),
+        "publication_transactions_observed": rebuild_store.publication_transactions,
+        "publication_pointer_transitions": rebuild_store.publication_pointer_transitions,
         "second_model_published": reembedded.state is ReembedState.PUBLISHED,
         "published_generation": rebuilt.state is RebuildState.PUBLISHED,
         "watermark_committed": report.watermark_advanced,
@@ -1592,7 +1698,10 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
         "peak_retained_bodies": report.stages.peak_bodies,
         "reembed_peak_memory_estimate_bytes": reembed.commitment.plan.peak_memory_bytes,
         "reembed_temp_disk_estimate_bytes": reembed.commitment.plan.temporary_disk_bytes,
-        "peak_rss_deterministic_bound_bytes": 64 * 1024 * 1024,
+        "observed_peak_parser_input_bytes": parser.peak_input_bytes,
+        "observed_peak_parser_calls": 1,
+        "observed_peak_vector_upsert_items": 1,
+        "observed_process_peak_rss_native_units": observed_process_peak_rss,
         "rebuild_memory_bound_bytes": 64 * 1024 * 1024,
         "rebuild_temp_disk_bound_bytes": 64 * 1024 * 1024,
         "source_calls_during_derivation": 0,
@@ -1610,8 +1719,9 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
         "crash_checkpoint_rows": 1,
         "crash_checkpoint_state": "building",
         "old_index_reads_before_flip": 1_000,
-        "old_publication_retained_rows": 1_000,
-        "publication_flip_count": 1,
+        "old_publication_reads_after_flip": 1_000,
+        "publication_transactions_observed": 1,
+        "publication_pointer_transitions": 1_000,
         "second_model_published": True,
         "published_generation": True,
         "watermark_committed": True,

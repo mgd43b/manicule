@@ -265,7 +265,7 @@ def _lifecycle_plan_report(plan: LifecyclePlan) -> r.LifecycleReport:
         confirmation=plan.confirmation,
         lifecycle=r.LifecycleProgress(
             phase=phase,
-            outcome="running",
+            outcome="deferred",
             dry_run=True,
             enumerated_items=plan.eligible_items + plan.protected_items,
             pending_items=plan.eligible_items,
@@ -325,7 +325,7 @@ def _rebuild_plan_report(estimate: RebuildEstimate) -> r.RebuildPlanReport:
         runnable=estimate.runnable,
         lifecycle=r.LifecycleProgress(
             phase="rebuilding",
-            outcome="running" if estimate.runnable else "refused",
+            outcome="deferred" if estimate.runnable else "refused",
             dry_run=True,
             enumerated_items=estimate.documents,
             failed_items=estimate.missing_count,
@@ -355,9 +355,11 @@ def _rebuild_run_report(checkpoint: RebuildCheckpoint) -> r.RebuildRunReport:
     phase: r.LifecyclePhase = (
         "failed" if failed else "canceled" if canceled else "complete" if terminal else "rebuilding"
     )
+    pending = 0 if terminal else max(0, checkpoint.expected_items - checkpoint.documents_built)
     return r.RebuildRunReport(
         generation_id=checkpoint.generation_id,
         state=checkpoint.state.value,
+        expected_items=checkpoint.expected_items,
         next_sequence=checkpoint.next_sequence,
         documents_built=checkpoint.documents_built,
         chunks_built=checkpoint.chunks_built,
@@ -371,10 +373,10 @@ def _rebuild_run_report(checkpoint: RebuildCheckpoint) -> r.RebuildRunReport:
             outcome=outcome,
             acquired_items=checkpoint.documents_built,
             reused_items=checkpoint.vectors_reused,
-            pending_items=0,
+            pending_items=pending,
             derived_generation_identity=checkpoint.generation_id,
             can_continue_offline=not terminal,
-            estimated_remaining_items=0,
+            estimated_remaining_items=pending,
         ),
     )
 

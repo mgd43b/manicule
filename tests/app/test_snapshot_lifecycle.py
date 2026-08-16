@@ -6,6 +6,7 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from manicule.app.dispatch import run_op
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
 from manicule.core.acquisition import (
@@ -13,6 +14,11 @@ from manicule.core.acquisition import (
     AcquisitionRunState,
     SnapshotCompleteness,
     SnapshotPromotionPolicy,
+)
+from manicule.core.rebuild import (
+    RebuildEstimate,
+    RebuildRefusalCode,
+    RebuildRefusedError,
 )
 from manicule.core.sources import Watermark
 from manicule.mcp.server import build_server
@@ -115,3 +121,42 @@ def test_corrupt_verify_is_a_failed_envelope_on_http_and_mcp() -> None:
     assert http["ok"] is result["ok"] is False
     assert cast("dict[str, Any]", http["error"])["type"] == "SnapshotVerificationError"
     assert cast("dict[str, Any]", result["error"])["type"] == "SnapshotVerificationError"
+
+
+async def test_rebuild_plan_is_deferred_and_live_status_reports_remaining_items() -> None:
+    service = ApplicationService(_backend())
+
+    plan = await service.rebuild_plan("snapshot-aggregate-1")
+    status = await service.rebuild_status(plan.generation_id)
+
+    assert plan.lifecycle.dry_run
+    assert plan.lifecycle.outcome == "deferred"
+    assert status.expected_items == 2
+    assert status.lifecycle.pending_items == 1
+    assert status.lifecycle.estimated_remaining_items == 1
+
+
+async def test_rebuild_refusal_is_a_typed_failure_envelope() -> None:
+    estimate = RebuildEstimate(
+        generation_id="aggregate-generation",
+        snapshot_run_id="aggregate-snapshot",
+        documents=2,
+        expected_items=2,
+        known_source_bytes=10,
+        estimated_chunks=2,
+        estimated_seconds=1,
+        estimated_peak_memory_bytes=100,
+        estimated_temporary_bytes=200,
+        missing_count=1,
+        refusal=RebuildRefusalCode.MISSING_LOCAL_INPUT,
+    )
+
+    async def refused():  # noqa: ANN202 - inferred failure-only coroutine
+        raise RebuildRefusedError(RebuildRefusalCode.MISSING_LOCAL_INPUT, estimate)
+
+    envelope = await run_op("rebuild_run", "default", refused)
+
+    assert envelope.ok is False
+    assert envelope.error is not None
+    assert envelope.error.type == "RebuildRefusedError"
+    assert envelope.error.message == "missing_local_input"

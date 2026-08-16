@@ -920,6 +920,7 @@ class FakeIngestion:
         return RebuildCheckpoint(
             generation_id="aggregate-generation",
             state=RebuildState.PUBLISHED,
+            expected_items=2,
             next_sequence=2,
             documents_built=2,
             chunks_built=7,
@@ -931,6 +932,7 @@ class FakeIngestion:
         return RebuildCheckpoint(
             generation_id=generation_id,
             state=RebuildState.BUILDING,
+            expected_items=2,
             next_sequence=1,
             documents_built=1,
             chunks_built=3,

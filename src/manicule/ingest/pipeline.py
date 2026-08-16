@@ -616,7 +616,7 @@ class RunReport:
         return {
             "phase": (
                 "rebuilding"
-                if self.pending_derivation
+                if self.pending_derivation and bool(self.snapshot_completeness)
                 else "acquiring"
                 if self.retry_required
                 else "complete"
@@ -624,12 +624,12 @@ class RunReport:
             "outcome": (
                 "refused"
                 if capacity is not None
+                else "bounded"
+                if self.limited
                 else "incomplete"
                 if self.retry_required
                 else "deferred"
                 if self.derivation_deferred
-                else "bounded"
-                if self.limited
                 else "complete"
             ),
             "dry_run": False,
@@ -653,8 +653,8 @@ class RunReport:
             "backlog_bytes": 0,
             "oldest_backlog_age_seconds": None,
             "can_continue_offline": (
-                self.pending_derivation
-                or (bool(self.snapshot_completeness) and self.snapshot_omissions == 0)
+                bool(self.snapshot_completeness)
+                and (self.pending_derivation or self.snapshot_omissions == 0)
             ),
             "rate_items_per_second": 0,
             "estimated_remaining_items": pending,
@@ -1244,7 +1244,9 @@ class IngestPipeline:
                     await self._report_snapshot_omissions(run)
                 if run.acquire_only:
                     await self._mark_pending_derivation(run, acquisitions)
-                    run.report.derivation_deferred = run.report.pending_derivation
+                    # A retained prefix is not a rebuildable snapshot. Only promotion makes
+                    # acquire-only an offline derivation hand-off.
+                    run.report.derivation_deferred = False
                     return
                 await owned(self._index_acquired(run), "journal-indexing")
                 await self._mark_pending_derivation(run, acquisitions)

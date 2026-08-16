@@ -841,6 +841,7 @@ class RebuildRunReport(Payload):
 
     generation_id: str
     state: str
+    expected_items: int = Field(ge=0)
     next_sequence: int = Field(ge=0)
     documents_built: int = Field(ge=0)
     chunks_built: int = Field(ge=0)

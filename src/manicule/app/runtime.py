@@ -965,7 +965,9 @@ class _Ingestion:
             return None
         return run, await store.verify_snapshot_manifest(run.id)
 
-    async def _rebuild_components(self, snapshot_run_id: str):  # noqa: ANN202
+    async def _rebuild_components(  # noqa: ANN202
+        self, snapshot_run_id: str, *, prepare_vectors: bool = True
+    ):
         """Assemble the connector-free production offline rebuild stack and exact target."""
         import json  # noqa: PLC0415
 
@@ -988,7 +990,11 @@ class _Ingestion:
         blobs = await self._runtime.blobs()
         if not isinstance(blobs, BlobStore):
             raise ManiculeError("offline rebuild requires retained local source bytes")
-        vectors = await self._runtime.prepared_vectors()
+        vectors = (
+            await self._runtime.prepared_vectors()
+            if prepare_vectors
+            else await self._runtime.vectors()
+        )
         store = SqliteRebuildStore(
             self._runtime.require_engine(),
             workspace_id=self._runtime.workspace,
@@ -1053,7 +1059,9 @@ class _Ingestion:
         return store, rebuilder, target
 
     async def rebuild_plan(self, snapshot_run_id: str):  # noqa: ANN202
-        _, rebuilder, target = await self._rebuild_components(snapshot_run_id)
+        _, rebuilder, target = await self._rebuild_components(
+            snapshot_run_id, prepare_vectors=False
+        )
         return await rebuilder.dry_run(snapshot_run_id, target)
 
     async def rebuild_run(self, snapshot_run_id: str, owner: str):  # noqa: ANN202
@@ -1064,7 +1072,7 @@ class _Ingestion:
         from manicule.storage.rebuild import SqliteRebuildStore  # noqa: PLC0415
 
         blobs = await self._runtime.blobs()
-        vectors = await self._runtime.prepared_vectors()
+        vectors = await self._runtime.vectors()
         store = SqliteRebuildStore(
             self._runtime.require_engine(),
             workspace_id=self._runtime.workspace,
