@@ -111,6 +111,7 @@ NOT_OPERATIONS: frozenset[str] = frozenset(
         "ui_document",
         "ui_documents",
         "ui_health",
+        "ui_lifecycle",
         "ui_plugins",
         "ui_reembed",
         "ui_script",

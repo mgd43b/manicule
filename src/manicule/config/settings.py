@@ -493,6 +493,23 @@ class StorageSettings(Section):
         description="Keep fetched bytes so re-parsing never means re-fetching. Turning this "
         "off makes every re-index a re-crawl.",
     )
+    lifecycle_plan_schedule_s: float | None = Field(
+        default=None,
+        gt=0,
+        description="Seconds between aggregate lifecycle dry runs in a served process. None "
+        "disables scheduled planning; this setting never authorizes cleanup or deletion.",
+    )
+    source_history_retention_days: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional age cutoff included in scheduled source-history dry runs.",
+    )
+    snapshot_plan_run_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Optional snapshot identity to include in scheduled deletion dry runs. "
+        "The scheduler records aggregate impact only and cannot confirm deletion.",
+    )
 
 
 class IngestSettings(Section):

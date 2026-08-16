@@ -29,6 +29,7 @@ failure of a lenient reader is an operation that ran with an argument nobody sen
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -116,6 +117,16 @@ class Arguments:
             self._refuse(name, "a whole number or nothing", value)
         return value
 
+    def timestamp(self, name: str) -> datetime:
+        value = self.text(name)
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{self.op} requires {name} to be an ISO-8601 timestamp") from exc
+        if parsed.tzinfo is None:
+            raise ValueError(f"{self.op} requires {name} to include a UTC offset")
+        return parsed
+
     def path(self, name: str) -> Path:
         return Path(self.text(name))
 
@@ -170,17 +181,22 @@ class Command:
         vocabulary it always has: an operation nobody classified is a writer, which is the safe
         direction to be wrong in.
 
-        **``collection_orphans`` is the one operation whose answer is not a property of its
-        name.** Called plainly it lists live documents belonging to no collection, which is a
-        read; called with ``delete`` it moves every one of them to the trash, which is not.
+        ``collection_orphans`` is one operation whose answer is not a property of its name.
+        Called plainly it lists live documents belonging to no collection, which is a read;
+        called with ``delete`` it moves every one of them to the trash, which is not.
         Classifying it by name meant picking one, and the pick was "read" — so
         ``manicule collection orphans --confirm`` trashed documents *without* the writer lock,
         and once a server exists it would do that to a data directory another process owns.
         Naming it here is narrower than reclassifying the operation, which would make the
-        listing take an exclusive lock it has no use for.
+        listing take an exclusive lock it has no use for. Lifecycle operations have the same
+        invocation boundary: their aggregate dry runs are reads, while applying the plan is a
+        write. Each command routes its normal dry run through the read path; this check also
+        keeps a serialized dry-run command honest when called directly.
         """
         if self.op == "collection_orphans":
             return Arguments(self.op, self.arguments).flag("delete")
+        if self.op.startswith("lifecycle_") and Arguments(self.op, self.arguments).flag("dry_run"):
+            return False
         return writes_by_name(self.op)
 
     def invoke(self, workspace: str) -> control.Invoke:
@@ -284,6 +300,20 @@ BINDERS: Mapping[str, Binder] = {
         watching=report,
     ),
     "init": lambda service, args, report: service.initialize(force=args.flag("force")),
+    "lifecycle_reset_derived": lambda service, args, report: service.lifecycle_reset_derived(
+        dry_run=args.flag("dry_run")
+    ),
+    "lifecycle_cleanup_generations": lambda service, args, report: (
+        service.lifecycle_cleanup_generations(dry_run=args.flag("dry_run"))
+    ),
+    "lifecycle_release_history": lambda service, args, report: service.lifecycle_release_history(
+        args.timestamp("cutoff"), dry_run=args.flag("dry_run")
+    ),
+    "lifecycle_delete_snapshot": lambda service, args, report: service.lifecycle_delete_snapshot(
+        args.text("run_id"),
+        confirmation=args.optional_text("confirmation"),
+        dry_run=args.flag("dry_run"),
+    ),
     "plugin_add": lambda service, args, report: service.plugin_add(args.text("name")),
     "plugin_remove": lambda service, args, report: service.plugin_remove(args.text("name")),
     "reset_index": lambda service, args, report: service.reset_index(),

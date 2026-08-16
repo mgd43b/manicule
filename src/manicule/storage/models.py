@@ -784,6 +784,7 @@ class DocumentVersion(Base):
     chunk_count: Mapped[int | None] = mapped_column(Integer)
     changes: Mapped[JsonValue] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    bytes_released_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
 
     __table_args__ = (
         UniqueConstraint("document_id", "version", name="uq_document_versions_document_id_version"),

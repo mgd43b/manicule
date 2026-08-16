@@ -27,8 +27,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import sys
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, cast
 
 from manicule.app import commands, control
 from manicule.app.dispatch import run_op
@@ -64,6 +65,15 @@ __all__ = [
     "Serving",
     "announce",
 ]
+
+_LIFECYCLE_PLAN_OPS = frozenset(
+    {
+        "lifecycle_reset_derived",
+        "lifecycle_cleanup_generations",
+        "lifecycle_release_history",
+        "lifecycle_delete_snapshot",
+    }
+)
 
 
 class ControlHandler:
@@ -286,6 +296,31 @@ class ScheduledReembedRecovery:
     last_error_type: str = ""
 
 
+def _empty_lifecycle_reports() -> dict[str, dict[str, object]]:
+    return {}
+
+
+@dataclass(slots=True)
+class ScheduledLifecyclePlans:
+    """Aggregate-only outcome of the configured lifecycle planning loop."""
+
+    interval_s: float
+    runs: int = 0
+    failures: int = 0
+    reports: dict[str, dict[str, object]] = field(default_factory=_empty_lifecycle_reports)
+    last_error_type: str = ""
+
+
+class SchedulerConfiguration(dict[str, float]):
+    """Connector intervals plus the separately typed lifecycle planning cadence."""
+
+    lifecycle_interval_s: float | None
+
+    def __init__(self, sources: Mapping[str, float], *, lifecycle_interval_s: float | None) -> None:
+        super().__init__(sources)
+        self.lifecycle_interval_s = lifecycle_interval_s
+
+
 class Scheduler:
     """Syncs that happen because configuration said so.
 
@@ -327,19 +362,29 @@ class Scheduler:
         sources: Mapping[str, float],
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._service = service
         self._sources = dict(sources)
         self._sleep = sleep
+        self._now = now
+        self._lifecycle_interval_s = (
+            sources.lifecycle_interval_s if isinstance(sources, SchedulerConfiguration) else None
+        )
         self._tasks: set[asyncio.Task[None]] = set()
         self.scheduled: dict[str, ScheduledSource] = {
             name: ScheduledSource(name=name, interval_s=interval)
             for name, interval in self._sources.items()
         }
         self.reembedding = ScheduledReembedRecovery()
+        self.lifecycle = (
+            ScheduledLifecyclePlans(interval_s=self._lifecycle_interval_s)
+            if self._lifecycle_interval_s is not None
+            else None
+        )
 
     @staticmethod
-    def configure(service: ApplicationService) -> dict[str, float]:
+    def configure(service: ApplicationService) -> SchedulerConfiguration:
         """Which sources this installation schedules, and how often.
 
         A source with no ``schedule_s`` is not scheduled, and a source configured
@@ -349,21 +394,93 @@ class Scheduler:
         source loudly — a scheduler that ran one anyway would make the switch a lie in the one
         place nobody is watching.
         """
-        return {
-            name: configured.schedule_s
-            for name, configured in service.settings.connectors.items()
-            if configured.schedule_s is not None and configured.enabled
-        }
+        return SchedulerConfiguration(
+            {
+                name: configured.schedule_s
+                for name, configured in service.settings.connectors.items()
+                if configured.schedule_s is not None and configured.enabled
+            },
+            lifecycle_interval_s=service.settings.storage.lifecycle_plan_schedule_s,
+        )
 
     def start(self) -> None:
         """Begin every source's loop. Returns immediately; the loops run until :meth:`aclose`."""
         recovery = asyncio.create_task(self._recover_reembedding(), name="recover:reembedding")
         self._tasks.add(recovery)
         recovery.add_done_callback(self._tasks.discard)
+        if self._lifecycle_interval_s is not None:
+            lifecycle = asyncio.create_task(
+                self._run_lifecycle(self._lifecycle_interval_s),
+                name="schedule:lifecycle-plans",
+            )
+            self._tasks.add(lifecycle)
+            lifecycle.add_done_callback(self._tasks.discard)
         for name, interval in self._sources.items():
             task = asyncio.create_task(self._run(name, interval), name=f"schedule:{name}")
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
+
+    async def plan_lifecycle(self, command: commands.Command) -> dict[str, JsonValue]:
+        """Run one scheduler-owned lifecycle dry run through the canonical dispatcher.
+
+        Retention schedulers may inspect aggregate impact, but they receive no destructive
+        authority: the command must be one of the four lifecycle operations and must explicitly
+        carry ``dry_run=true``.  The returned envelope is consequently identical to a proxied
+        CLI invocation of the same plan.
+        """
+        if command.op not in _LIFECYCLE_PLAN_OPS or command.writes():
+            raise ValueError("the scheduler may run lifecycle aggregate dry runs only")
+        envelope = await run_op(
+            command.op,
+            self._service.workspace,
+            lambda: commands.run(self._service, command, lambda _message: None),
+        )
+        return envelope.as_json()
+
+    async def _run_lifecycle(self, interval_s: float) -> None:
+        """Plan configured lifecycle boundaries on cadence; never apply one."""
+        record = self.lifecycle
+        if record is None:  # defensive: construction and start normally make this impossible
+            return
+        while True:
+            await self._sleep(interval_s)
+            settings = self._service.settings.storage
+            commands_: list[commands.Command] = [
+                commands.Command("lifecycle_reset_derived", {"dry_run": True}),
+                commands.Command("lifecycle_cleanup_generations", {"dry_run": True}),
+            ]
+            if settings.source_history_retention_days is not None:
+                cutoff = self._now() - timedelta(days=settings.source_history_retention_days)
+                commands_.append(
+                    commands.Command(
+                        "lifecycle_release_history",
+                        {"cutoff": cutoff.isoformat(), "dry_run": True},
+                    )
+                )
+            if settings.snapshot_plan_run_id is not None:
+                commands_.append(
+                    commands.Command(
+                        "lifecycle_delete_snapshot",
+                        {
+                            "run_id": settings.snapshot_plan_run_id,
+                            "dry_run": True,
+                        },
+                    )
+                )
+            record.runs += 1
+            for command in commands_:
+                envelope = await self.plan_lifecycle(command)
+                if envelope["ok"] is True:
+                    data = envelope["data"]
+                    record.reports[command.op] = (
+                        cast("dict[str, object]", data) if isinstance(data, dict) else {}
+                    )
+                else:
+                    record.failures += 1
+                    error = envelope["error"]
+                    record.last_error_type = (
+                        str(error.get("type", "")) if isinstance(error, dict) else ""
+                    )
 
     async def _recover_reembedding(self) -> None:
         """Resume ownerless durable runs once at startup; run status remains authoritative."""

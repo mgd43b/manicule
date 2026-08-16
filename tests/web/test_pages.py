@@ -14,6 +14,7 @@ whole set, because a per-page test proves a property of the page somebody wrote 
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import pytest
@@ -57,14 +58,37 @@ PAGE_FOR_AREA: dict[str, str] = {
     "workspaces": "/ui/workspaces",
     "admin": "/ui/admin",
     "reembed": "/ui/reembed",
+    "lifecycle": "/ui/lifecycle",
     "auth": "/ui/auth",
 }
 
 
-def test_the_thirteen_areas_are_the_twelve_pages_and_the_frame() -> None:
+def test_the_fourteen_areas_are_the_thirteen_pages_and_the_frame() -> None:
     """The area list and the pages cannot drift apart without this failing."""
     assert set(PAGE_FOR_AREA) | {"layout"} == set(AREAS)
-    assert len(AREAS) == 13
+    assert len(AREAS) == 14
+
+
+def test_lifecycle_history_form_submits_an_offset_aware_cutoff_through_its_rendered_action() -> (
+    None
+):
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client:
+        rendered = client.get("/ui/lifecycle")
+        assert rendered.status_code == 200
+        form = re.search(
+            r'<form method="get" action="([^"]+)">.*?name="before".*?</form>',
+            rendered.text,
+            flags=re.DOTALL,
+        )
+        assert form is not None
+        assert 'pattern=".*(Z|[+-][0-9]{2}:[0-9]{2})"' in form.group(0)
+        submitted = client.get(
+            form.group(1),
+            params={"before": "2026-07-01T00:00:00Z"},
+        )
+    assert submitted.status_code == 200
+    assert "release_source_history" in submitted.text
 
 
 def test_every_navigable_area_is_in_the_navigation() -> None:

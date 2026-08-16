@@ -228,6 +228,82 @@ async def publish_one_replacement(
     )
 
 
+def rebuild_target() -> tuple[RebuildTarget, EmbedFingerprint]:
+    """One stable same-target commitment for publication/reset regressions."""
+    embed = EmbedFingerprint(
+        model_id="test/embed",
+        dimension=4,
+        pooling=Pooling.MEAN,
+        normalized=True,
+        tokenizer_id="test/tokenizer",
+        max_sequence_length=128,
+    )
+    return (
+        RebuildTarget(
+            parser_routing="routing-v2",
+            parser_set=("plain@2",),
+            chunk_fingerprint="chunk-v2",
+            embedding_fingerprint=embed.canonical(),
+            glossary_fingerprint="glossary-v2",
+            fts_tokenizer="unicode61",
+            batch_documents=1,
+            max_memory_bytes=1_000_000,
+            max_temporary_bytes=1_000_000,
+        ),
+        embed,
+    )
+
+
+@pytest.mark.asyncio
+async def test_derived_reset_turns_same_target_published_replay_into_actionable_plan(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run_id, blob_ref, raw = await promoted_snapshot(store, engine, data_dir)
+    document = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=b"old text",
+        uri=raw.uri,
+        media_type=raw.media_type,
+    ).model_copy(update={"original_ref": blob_ref})
+    await store.upsert_document(document)
+    await store.replace_chunks(document.id, [make_chunk(document, 0, "old text")])
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    planned = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    published = await publish_one_replacement(
+        rebuilds,
+        vectors,
+        estimate_id=planned.generation_id,
+        target=target,
+        document=document,
+        raw=raw,
+        blob_ref=blob_ref,
+        owner="publisher",
+    )
+    replay = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    assert replay.generation_id == published.generation_id
+    assert (await rebuilds.checkpoint(replay.generation_id)).state is RebuildState.PUBLISHED
+
+    await store.reset_derived()
+    async for page in store.obsolete_generation_publications():
+        for generation in page:
+            await store.cleanup_obsolete_generation(generation.generation_id)
+
+    actionable = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    assert actionable.generation_id == published.generation_id
+    assert (await rebuilds.checkpoint(actionable.generation_id)).state is RebuildState.PLANNED
+
+
 async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempotent(  # noqa: PLR0915
     store: SqliteDocStore,
     engine: AsyncEngine,

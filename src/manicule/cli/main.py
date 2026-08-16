@@ -53,8 +53,8 @@ if TYPE_CHECKING:
     from manicule.generation.answers import AnswerEvent
 
 RESET_NEEDS_CONFIRMATION = (
-    "this deletes every document, chunk and vector in this workspace and cannot be undone. "
-    "Pass --yes to confirm."
+    "this removes the workspace's derived search state while retaining durable source snapshots. "
+    "Search remains unavailable until an offline rebuild completes. Pass --yes to confirm."
 )
 """Why ``reset-index`` refuses without ``--yes``.
 
@@ -595,6 +595,10 @@ PAYLOADS: dict[str, type[Payload]] = {
     "reembed_status": r.ReembedRunReport,
     "reembed_abandon": r.ReembedRunReport,
     "reembed_cleanup": r.ReembedCleanupReport,
+    "lifecycle_reset_derived": r.LifecycleReport,
+    "lifecycle_cleanup_generations": r.LifecycleReport,
+    "lifecycle_release_history": r.LifecycleReport,
+    "lifecycle_delete_snapshot": r.LifecycleReport,
     "doctor": r.Diagnosis,
     "connector_list": r.ConnectorList,
     "connector_login": r.ConnectorSignedIn,
@@ -1440,13 +1444,108 @@ def import_corpus(
 @app.command("reset-index")
 def reset_index(
     yes: Annotated[
-        bool, typer.Option("--yes", help="Confirm. Required; this cannot be undone.")
+        bool,
+        typer.Option(
+            "--yes",
+            help="Confirm the derived reset. Source snapshots and history are retained.",
+        ),
     ] = False,
 ) -> None:
-    """Delete every document, chunk and vector in this workspace."""
+    """Reset derived search state while retaining durable source snapshots."""
     if not yes:
         raise typer.BadParameter(RESET_NEEDS_CONFIRMATION)
     submit(Command("reset_index"))
+
+
+@app.command("reset-derived")
+def reset_derived(
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Report aggregate impact without changing state.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", help="Confirm the derived-only reset.")] = False,
+) -> None:
+    """Reset chunks, FTS, glossary and vectors; retain snapshots and source history."""
+    if not dry_run and not yes:
+        raise typer.BadParameter("reset-derived requires --yes, or use --dry-run")
+    if dry_run:
+        emit(
+            "lifecycle_reset_derived",
+            lambda service: service.lifecycle_reset_derived(dry_run=True),
+        )
+        return
+    submit(Command("lifecycle_reset_derived", {"dry_run": dry_run}))
+
+
+@app.command("cleanup-derived-generations")
+def cleanup_derived_generations(
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Remove eligible terminal generations.")
+    ] = False,
+) -> None:
+    """Plan by default; remove only obsolete terminal derived generations with --yes."""
+    if not yes:
+        emit(
+            "lifecycle_cleanup_generations",
+            lambda service: service.lifecycle_cleanup_generations(dry_run=True),
+        )
+        return
+    submit(Command("lifecycle_cleanup_generations", {"dry_run": not yes}))
+
+
+@app.command("release-source-history")
+def release_source_history(
+    before: Annotated[
+        str, typer.Argument(help="Release historical versions older than this ISO-8601 time.")
+    ],
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Apply the retention release; otherwise dry-run.")
+    ] = False,
+) -> None:
+    """Release eligible prior source versions without touching current snapshots."""
+    if not yes:
+        from datetime import datetime  # noqa: PLC0415 - only this command parses a timestamp
+
+        try:
+            cutoff = datetime.fromisoformat(before.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise typer.BadParameter("before must be an ISO-8601 timestamp") from exc
+        emit(
+            "lifecycle_release_history",
+            lambda service: service.lifecycle_release_history(cutoff, dry_run=True),
+        )
+        return
+    submit(
+        Command(
+            "lifecycle_release_history",
+            {"cutoff": before, "dry_run": not yes},
+        )
+    )
+
+
+@app.command("snapshot-delete")
+def snapshot_delete(
+    run_id: Annotated[str, typer.Argument(help="The promoted snapshot run identity.")],
+    confirm: Annotated[
+        str | None,
+        typer.Option(
+            "--confirm",
+            help="Exact token from the latest dry run. Omit it to perform the dry run.",
+        ),
+    ] = None,
+) -> None:
+    """Plan deletion by default; delete authoritative snapshot ownership only with its token."""
+    if confirm is None:
+        emit(
+            "lifecycle_delete_snapshot",
+            lambda service: service.lifecycle_delete_snapshot(run_id, dry_run=True),
+        )
+        return
+    submit(
+        Command(
+            "lifecycle_delete_snapshot",
+            {"run_id": run_id, "confirmation": confirm, "dry_run": False},
+        )
+    )
 
 
 @app.command()

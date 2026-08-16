@@ -1,0 +1,41 @@
+{% extends layout %}
+{% import "macros.html" as m %}
+{% macro lifecycle_plan(title, envelope) %}
+<section class="panel">
+  <h2>{{ title }}</h2>
+  {% if envelope.ok %}
+  <p>{{ envelope.data.operation }}</p>
+  <dl>
+    <dt>Eligible items</dt><dd>{{ envelope.data.eligible_items }}</dd>
+    <dt>Eligible bytes</dt><dd>{{ envelope.data.eligible_bytes }}</dd>
+    <dt>Protected items</dt><dd>{{ envelope.data.protected_items }}</dd>
+    <dt>Snapshot items</dt><dd>{{ envelope.data.snapshot_items }}</dd>
+    <dt>Unrecoverable items</dt><dd>{{ envelope.data.unrecoverable_items }}</dd>
+    <dt>Unrecoverable bytes</dt><dd>{{ envelope.data.unrecoverable_bytes }}</dd>
+  </dl>
+  {% else %}{{ m.failed(envelope) }}{% endif %}
+</section>
+{% endmacro %}
+{% block content %}
+{{ lifecycle_plan("Derived-only reset", panels.reset) }}
+{{ lifecycle_plan("Obsolete derived generations", panels.cleanup) }}
+
+<section class="panel">
+  <h2>Historical source retention</h2>
+  <form method="get" action="/ui/lifecycle">
+    <label>Release bytes before <input name="before" value="{{ before }}" type="text" placeholder="2026-07-01T00:00:00Z" pattern=".*(Z|[+-][0-9]{2}:[0-9]{2})" required></label>
+    <button type="submit">Dry run</button>
+  </form>
+</section>
+{% if panels.history is defined %}{{ lifecycle_plan("Historical source retention plan", panels.history) }}{% endif %}
+
+<section class="panel">
+  <h2>Current snapshot deletion</h2>
+  <form method="get" action="/ui/lifecycle">
+    <label>Snapshot run ID <input name="run_id" value="{{ run_id }}" maxlength="200" required></label>
+    <button type="submit">Dry run</button>
+  </form>
+  <p>This page never deletes a snapshot. Confirmation remains a separate operator action.</p>
+</section>
+{% if panels.snapshot is defined %}{{ lifecycle_plan("Snapshot deletion plan", panels.snapshot) }}{% endif %}
+{% endblock %}

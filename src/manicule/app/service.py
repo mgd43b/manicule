@@ -31,7 +31,7 @@ import secrets
 import time
 import tomllib
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -54,6 +54,7 @@ from manicule.core.errors import ConfigError, ManiculeError, PolicyError, Unknow
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id
 from manicule.core.retrieval import Filter, Query, RetrievalProfile
+from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
 from manicule.core.version import CORE_VERSION
 from manicule.ingest.reindex import DEFAULT_SWEEP_BATCH
 
@@ -150,6 +151,32 @@ def _reembed_run_report(run: ReembedRun) -> r.ReembedRunReport:
             run.commitment.target_fingerprint.encode("utf-8")
         ).hexdigest(),
         target_dimension=run.commitment.target_dimension,
+    )
+
+
+def _lifecycle_plan_report(plan: LifecyclePlan) -> r.LifecycleReport:
+    return r.LifecycleReport(
+        operation=plan.operation.value,
+        dry_run=True,
+        eligible_items=plan.eligible_items,
+        eligible_bytes=plan.eligible_bytes,
+        protected_items=plan.protected_items,
+        protected_bytes=plan.protected_bytes,
+        snapshot_items=plan.snapshot_items,
+        unrecoverable_items=plan.unrecoverable_items,
+        unrecoverable_bytes=plan.unrecoverable_bytes,
+        confirmation=plan.confirmation,
+    )
+
+
+def _lifecycle_outcome_report(outcome: LifecycleOutcome) -> r.LifecycleReport:
+    return r.LifecycleReport(
+        operation=outcome.operation.value,
+        dry_run=False,
+        removed_items=outcome.removed_items,
+        released_bytes=outcome.released_bytes,
+        snapshot_items=outcome.snapshot_items,
+        source_contacted=outcome.source_contacted,
     )
 
 
@@ -3268,14 +3295,60 @@ class ApplicationService:
         return payload
 
     async def reset_index(self) -> r.ResetReport:
-        """Delete every document, chunk and vector in this workspace.
+        """Delete derived chunks and vectors while retaining durable source snapshots.
 
-        Irreversible, and the surfaces make the caller say so: the CLI requires ``--yes`` and
-        there is no MCP tool for it at all.
+        Disruptive until an offline rebuild republishes search state, so the CLI requires
+        ``--yes``. The MCP and HTTP forms expose only the aggregate dry run.
         """
         maintenance = await self._backend.maintenance()
         documents, chunks, vectors = await maintenance.reset_index()
-        return r.ResetReport(documents=documents, chunks=chunks, vectors_removed=vectors)
+        plan = await maintenance.plan_reset_derived()
+        return r.ResetReport(
+            documents=documents,
+            chunks=chunks,
+            vectors_removed=vectors,
+            snapshots_retained=plan.snapshot_items,
+        )
+
+    async def lifecycle_reset_derived(self, *, dry_run: bool = False) -> r.LifecycleReport:
+        maintenance = await self._backend.maintenance()
+        if dry_run:
+            return _lifecycle_plan_report(await maintenance.plan_reset_derived())
+        return _lifecycle_outcome_report(await maintenance.reset_derived())
+
+    async def lifecycle_cleanup_generations(self, *, dry_run: bool = False) -> r.LifecycleReport:
+        maintenance = await self._backend.maintenance()
+        if dry_run:
+            return _lifecycle_plan_report(await maintenance.plan_derived_generation_cleanup())
+        return _lifecycle_outcome_report(await maintenance.cleanup_derived_generations())
+
+    async def lifecycle_release_history(
+        self, cutoff: datetime, *, dry_run: bool = False
+    ) -> r.LifecycleReport:
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise PolicyError("source history retention cutoff must include a UTC offset")
+        maintenance = await self._backend.maintenance()
+        if dry_run:
+            return _lifecycle_plan_report(await maintenance.plan_source_history_release(cutoff))
+        return _lifecycle_outcome_report(await maintenance.release_source_history(cutoff))
+
+    async def lifecycle_delete_snapshot(
+        self,
+        run_id: str,
+        *,
+        confirmation: str | None = None,
+        dry_run: bool = True,
+    ) -> r.LifecycleReport:
+        maintenance = await self._backend.maintenance()
+        if dry_run:
+            return _lifecycle_plan_report(await maintenance.plan_snapshot_deletion(run_id))
+        if confirmation is None:
+            raise PolicyError(
+                "snapshot deletion requires the confirmation token printed by its dry run"
+            )
+        return _lifecycle_outcome_report(
+            await maintenance.delete_snapshot(run_id, confirmation=confirmation)
+        )
 
     async def initialize(self, *, force: bool = False) -> r.InitReport:
         """Write a starting configuration, choosing what this machine can actually run.

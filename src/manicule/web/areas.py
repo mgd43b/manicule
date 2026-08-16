@@ -1,4 +1,4 @@
-"""The twelve areas, named as data.
+"""The application areas, named as data.
 
 In a module of their own because both the pages and the frame that renders them need the list,
 and a constant defined in one and imported by the other is how a circular import starts. It is
@@ -20,10 +20,11 @@ AREAS: tuple[str, ...] = (
     "workspaces",
     "admin",
     "reembed",
+    "lifecycle",
     "auth",
     "layout",
 )
-"""Twelve areas. ``layout`` is the one that is not a page.
+"""All areas. ``layout`` is the one that is not a page.
 
 It is the frame every other area is rendered inside, and ``tests/web/test_pages.py`` asserts it
 by checking that every template extends it — not by looking for a route that does not exist.
@@ -40,6 +41,7 @@ NAVIGATION: tuple[tuple[str, str, str], ...] = (
     ("health", "/ui/health", "Health"),
     ("admin", "/ui/admin", "Admin"),
     ("reembed", "/ui/reembed", "Re-embed"),
+    ("lifecycle", "/ui/lifecycle", "Lifecycle"),
     ("auth", "/ui/auth", "API keys"),
     ("settings", "/ui/settings", "Settings"),
 )

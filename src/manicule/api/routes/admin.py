@@ -22,6 +22,7 @@ is a way to make an installation unusable with one HTTP request.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query, Response
@@ -97,6 +98,67 @@ async def reembed_abandon(service: Service, caller: AdminPrincipal, run_id: str)
 async def reembed_cleanup(service: Service, caller: AdminPrincipal, run_id: str) -> Response:
     del caller
     return await respond("reembed_cleanup", service, lambda: service.reembed_cleanup(run_id))
+
+
+@router.get("/lifecycle/reset-derived", name="lifecycle_reset_derived")
+async def lifecycle_reset_derived(service: Service, caller: AdminPrincipal) -> Response:
+    """Aggregate dry run only; destructive lifecycle actions remain local operator actions."""
+    del caller
+    return await respond(
+        "lifecycle_reset_derived",
+        service,
+        lambda: service.lifecycle_reset_derived(dry_run=True),
+    )
+
+
+@router.get(
+    "/lifecycle/derived-generations",
+    name="lifecycle_cleanup_generations",
+    summary="Aggregate dry run for obsolete derived-generation cleanup.",
+)
+async def lifecycle_cleanup_generations(service: Service, caller: AdminPrincipal) -> Response:
+    del caller
+    return await respond(
+        "lifecycle_cleanup_generations",
+        service,
+        lambda: service.lifecycle_cleanup_generations(dry_run=True),
+    )
+
+
+@router.get(
+    "/lifecycle/source-history",
+    name="lifecycle_release_history",
+    summary="Aggregate dry run for historical source retention release.",
+)
+async def lifecycle_release_history(
+    service: Service,
+    caller: AdminPrincipal,
+    before: datetime,
+) -> Response:
+    del caller
+    return await respond(
+        "lifecycle_release_history",
+        service,
+        lambda: service.lifecycle_release_history(before, dry_run=True),
+    )
+
+
+@router.get(
+    "/lifecycle/snapshots/{run_id}",
+    name="lifecycle_delete_snapshot",
+    summary="Aggregate local-loss plan and confirmation token for snapshot deletion.",
+)
+async def lifecycle_delete_snapshot(
+    service: Service,
+    caller: AdminPrincipal,
+    run_id: str,
+) -> Response:
+    del caller
+    return await respond(
+        "lifecycle_delete_snapshot",
+        service,
+        lambda: service.lifecycle_delete_snapshot(run_id, dry_run=True),
+    )
 
 
 @router.get("/query-logs", name="query_logs", summary="Retrieval telemetry, newest first.")

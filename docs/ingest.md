@@ -1586,6 +1586,52 @@ irreversible task: cancellation waits for its atomic outcome instead of abandoni
 commit. Resumption starts at the durable
 sequence checkpoint rather than redoing committed batches.
 
+### 10.5 Source and derived lifecycle boundaries
+
+Lifecycle work is four operations, not one broadly destructive reset:
+
+```text
+manicule reset-derived --dry-run
+manicule reset-derived --yes
+manicule cleanup-derived-generations          # dry-run
+manicule cleanup-derived-generations --yes
+manicule release-source-history BEFORE        # dry-run
+manicule release-source-history BEFORE --yes
+manicule snapshot-delete RUN_ID               # dry-run, prints a token
+manicule snapshot-delete RUN_ID --confirm TOKEN
+```
+
+`reset-index` remains a compatibility operation, but now observes the same derived-only
+boundary: it deletes chunks, FTS, glossary and vectors, marks retained document rows pending,
+and leaves acquisition manifests, original blob references and document-version history intact.
+It never resolves a connector. A promoted snapshot can therefore be verified and used by the
+offline generation rebuild immediately after the reset.
+
+Generation cleanup selects only `failed`, `canceled`, or superseded `published` generations.
+The newest published generation, every publication still named by a live document, and every
+planned/building/validating generation are protected. Physical vector-publication rows are
+removed before the relational control row; a crash between those idempotent steps leaves a
+terminal control row whose retry completes cleanup, while the readable publication is never
+eligible.
+
+Historical source release is a policy cutoff over prior `document_versions`. Its dry run counts
+rows and distinct bytes that would have no remaining document, snapshot, marker or retained-
+history owner. Shared content is priced once and remains a GC root wherever it is still owned.
+The query and delete are set-based, so the aggregate plan never materializes the corpus.
+
+Snapshot deletion is deliberately harder. Only a promoted, settled snapshot with no recovery
+marker, resumable work or derived-generation reference can be planned. The plan reports snapshot
+items and the item/unique-byte aggregate that becomes locally unrecoverable, without source ids,
+URIs, titles, blob hashes or metadata. Execution requires the exact confirmation token from that
+current plan. Deleting the manifest only releases its ownership. The ordinary mark-and-sweep
+collector still rechecks current documents, history, every other promoted or resumable snapshot,
+and recovery markers before it can unlink a blob.
+
+Each relational mutation is one transaction. Cancellation before commit changes nothing;
+cancellation after commit observes the completed state on retry. None of these operations has a
+connector, parser, or source-crawl fallback, and every shared outcome says
+`source_contacted: false`.
+
 Two properties follow from the table that are easy to get wrong in either direction.
 
 **A parser bump is not a substitute for a detector bump.** It would migrate the media types that

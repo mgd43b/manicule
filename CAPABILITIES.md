@@ -13,11 +13,11 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 | Area | Items | Ticket |
 |---|---:|---|
 | CLI | 48 | #8 — **built** |
-| MCP tools | 30 | #8 — **built** |
-| HTTP endpoints | 56 | #11 — **built** |
+| MCP tools | 34 | #8 — **built** |
+| HTTP endpoints | 60 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **192** | |
+| **Total** | **200** | |
 
 ## CLI — 48
 
@@ -98,14 +98,17 @@ of those, so the mapping is noted where it is not obvious. The output shape is a
   non-loopback address, and no configuration file can supply it.
 - `ask --repl` — the interactive prompt, which is also what `ask` with no question does at a
   terminal.
+- `reset-derived`, `cleanup-derived-generations`, `release-source-history`, and
+  `snapshot-delete` — distinct lifecycle boundaries; the last requires a token from its
+  aggregate dry run before it releases authoritative snapshot ownership.
 
-## MCP tools — 30
+## MCP tools — 34
 
-Ticket: #8 — **built.** Twenty-nine tools over the same application service the command
+Ticket: #8 — **built.** Thirty-three tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
-**All twenty-nine over stdio; the fourteen read-only ones over a socket.** MCP is also served
+**All thirty-three over stdio; the eighteen read-only ones over a socket.** MCP is also served
 at `/mcp/` on the HTTP port, and every mutating tool is *absent* from that surface rather than
 refused on it — see [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are
 unreachable from a network by construction, and a socket has to replace that property rather
@@ -132,6 +135,10 @@ than assume it.
 - [x] `document_reindex`
 - [x] `index_path`
 - [x] `index_status`
+- [x] `lifecycle_cleanup_generations`
+- [x] `lifecycle_delete_snapshot`
+- [x] `lifecycle_release_history`
+- [x] `lifecycle_reset_derived`
 - [x] `reembed_status`
 - [x] `plugin_add`
 - [x] `plugin_list`
@@ -149,7 +156,7 @@ mints a credential or changes what the installation is, and a surface called una
 not be able to do any of that. `collection orphans` moves every document outside every
 collection into the trash, which in a corpus where collections are optional is most of it.
 
-## HTTP endpoints — 56
+## HTTP endpoints — 60
 
 Ticket: #11 — **built.** Twelve route groups over the same application service the CLI and the
 MCP server use: health · documents · chat · conversations · collections · tags · admin ·
@@ -173,6 +180,10 @@ name — an absence with no test is an absence that comes back.
 - [x] `GET    /api/v1/admin/audit-logs`
 - [ ] ~~`GET    /api/v1/admin/benchmark`~~ — a benchmark run on request, from a surface an unattended caller reaches, is one HTTP call away from an unusable installation
 - [x] `GET    /api/v1/admin/connectors`
+- [x] `GET    /api/v1/admin/lifecycle/derived-generations` — aggregate dry run only
+- [x] `GET    /api/v1/admin/lifecycle/reset-derived` — aggregate dry run only
+- [x] `GET    /api/v1/admin/lifecycle/snapshots/:runId` — aggregate impact and token; no delete
+- [x] `GET    /api/v1/admin/lifecycle/source-history` — aggregate dry run only
 - [x] `GET    /api/v1/admin/plugins`
 - [x] `GET    /api/v1/admin/query-logs`
 - [x] `GET    /api/v1/admin/search-quality`
