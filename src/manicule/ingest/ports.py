@@ -519,7 +519,7 @@ class AcquisitionStore(Protocol):
     ) -> AcquisitionRun: ...
 
     async def latest_promoted_snapshot(
-        self, connector: str, scope_fingerprint: str
+        self, connector: str, scope_fingerprint: str | None
     ) -> AcquisitionRun | None: ...
 
     async def reusable_snapshot_record(

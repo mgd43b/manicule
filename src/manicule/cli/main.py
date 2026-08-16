@@ -515,9 +515,15 @@ async def _dispatch(command: Command) -> Envelope:
     which is what keeps ``manicule init`` from requiring a server before there is anything for
     one to serve.
     """
-    if not command.writes():
+    # A rebuild plan is a read, but its target is the exact parser/chunker/embedder identity of
+    # the runtime that will execute it. When that runtime is already served, asking it avoids a
+    # second model/device construction and prevents two processes from disagreeing about the
+    # configured target. Other reads intentionally remain local and available during writes.
+    if not command.writes() and command.op != "rebuild_plan":
         return await _locally(command)
     served = proxy.listening(STATE.overrides)
+    if not command.writes() and served is None:
+        return await _locally(command)
     if served is None:
         return proxy.refuse(
             command, workspace=STATE.workspace or UNKNOWN_WORKSPACE, overrides=STATE.overrides
@@ -1017,7 +1023,7 @@ def rebuild_plan(
     snapshot_id: Annotated[str, typer.Argument(help="Promoted durable source snapshot id.")],
 ) -> None:
     """Price a connector-free rebuild without parsing or embedding."""
-    emit("rebuild_plan", lambda service: service.rebuild_plan(snapshot_id))
+    submit(Command("rebuild_plan", {"snapshot_id": snapshot_id}))
 
 
 @rebuild_app.command("execute")

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
 
 from manicule.app.runtime import Runtime
+from manicule.app.service import ApplicationService
 from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.core.rebuild import RebuildState
@@ -38,6 +39,94 @@ def _runtime(
         ),
         discovery=found,
     )
+
+
+async def test_acquire_only_runtime_never_constructs_the_derived_stack(tmp_path: Path) -> None:
+    source = tmp_path / "synthetic-source"
+    source.mkdir()
+    for number in range(10):
+        (source / f"document-{number}.txt").write_text(f"synthetic document {number}")
+    calls = 0
+
+    def forbidden_embedder(_context: object) -> NoReturn:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("the embedding device must not be constructed for acquire-only")
+
+    found = discover()
+    found.registry.bind("acquire-only-runtime-test").add(
+        keys.EMBEDDER.named("local"), forbidden_embedder
+    )
+    runtime = Runtime(
+        Settings(
+            data_dir=tmp_path / "data",
+            embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
+            storage={"retain_source_bytes": True},  # pyright: ignore[reportArgumentType]
+            connectors={
+                "synthetic-files": {
+                    "type": "filesystem",
+                    "options": {"root": str(source)},
+                }
+            },  # pyright: ignore[reportArgumentType]
+        ),
+        discovery=found,
+    )
+
+    async with runtime:
+        result = await ApplicationService(runtime).connector_sync(
+            "synthetic-files", acquire_only=True
+        )
+        status = await ApplicationService(runtime).snapshot_status("synthetic-files")
+
+        assert result.discovered == 10
+        assert result.lifecycle.enumerated_items == 10
+        assert result.lifecycle.acquired_items == 10
+        assert result.lifecycle.pending_items == status.lifecycle.pending_items
+        assert status.lifecycle.enumerated_items == result.lifecycle.enumerated_items
+        assert status.lifecycle.acquired_items == result.lifecycle.acquired_items
+        assert status.lifecycle.omitted_items == result.lifecycle.omitted_items
+        assert status.lifecycle.failed_items == result.lifecycle.failed_items
+        assert calls == 0
+        documents = cast("SqliteDocStore", await runtime.documents())
+        assert await documents.count_documents() == 0
+        assert "pipeline" not in runtime._slots  # pyright: ignore[reportPrivateUsage]
+        assert "vectors" not in runtime._slots  # pyright: ignore[reportPrivateUsage]
+        assert "prepared_vectors" not in runtime._slots  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_snapshot_status_after_restart_uses_no_connector_factory(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    connector = fakes.DictConnector({"one": "alpha", "two": "beta"}, name="synthetic-wiki")
+    async with _runtime(data_dir, CountingEmbedder()) as runtime:
+        report = await (await runtime.acquisition_pipeline()).run(connector, acquire_only=True)
+        expected = report.lifecycle_metadata()
+
+    restarted = Runtime(
+        Settings(
+            data_dir=data_dir,
+            connectors={
+                "synthetic-wiki": {
+                    "type": "filesystem",
+                    "options": {"root": str(tmp_path / "unreachable-source")},
+                }
+            },  # pyright: ignore[reportArgumentType]
+        )
+    )
+
+    async def forbidden_connector(_name: str) -> NoReturn:
+        raise AssertionError("snapshot status must not construct or authenticate a connector")
+
+    restarted.connector = forbidden_connector  # type: ignore[method-assign]
+    async with restarted:
+        service = ApplicationService(restarted)
+        status = await service.snapshot_status("synthetic-wiki")
+        verified = await service.snapshot_verify(status.snapshot_id)
+        assert status.lifecycle.enumerated_items == expected["enumerated_items"]
+        assert status.lifecycle.acquired_items == expected["acquired_items"]
+        assert status.lifecycle.omitted_items == expected["omitted_items"]
+        assert status.lifecycle.failed_items == expected["failed_items"]
+        assert verified.lifecycle == status.lifecycle
+        assert verified.verified
 
 
 async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capability(

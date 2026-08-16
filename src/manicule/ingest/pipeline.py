@@ -53,7 +53,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, cast, runtime_checkable
 from uuid import uuid4
 
 from manicule.connectors.errors import (
@@ -69,6 +69,7 @@ from manicule.core.acquisition import (
     AcquisitionFence,
     AcquisitionRecord,
     AcquisitionRecordState,
+    AcquisitionRun,
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
@@ -452,6 +453,12 @@ class RunReport:
     derivation_deferred: bool = False
     """Whether pending derivation was the requested acquire-only terminal outcome."""
 
+    durable_acquired: int | None = None
+    durable_reused: int | None = None
+    durable_failed: int | None = None
+    durable_pending: int | None = None
+    """Journal aggregates used when durable acquisition, rather than streaming, owns truth."""
+
     snapshot_completeness: Literal["", "complete", "partial"] = ""
     snapshot_omissions: int = 0
     snapshot_omission_reasons: dict[str, int] = field(default_factory=dict[str, int])
@@ -594,13 +601,30 @@ class RunReport:
         model into ingest. The service validates the same closed shape before exposing it.
         """
         accepted = self.stages.accepted
-        reused = self.skipped_version + self.skipped_hash
-        failed = self.by_status.get(DocumentStatus.FAILED.value, 0)
+        reused = (
+            self.durable_reused
+            if self.durable_reused is not None
+            else self.skipped_version + self.skipped_hash
+        )
+        failed = (
+            self.durable_failed
+            if self.durable_failed is not None
+            else self.by_status.get(DocumentStatus.FAILED.value, 0)
+        )
         pending = (
-            max(0, accepted - self.indexed - self.skipped_version - self.skipped_hash)
-            if self.pending_derivation
-            else self.unrecorded
-            + (self.snapshot_omissions if self.snapshot_completeness != "partial" else 0)
+            self.durable_pending
+            if self.durable_pending is not None
+            else (
+                max(0, accepted - self.indexed - self.skipped_version - self.skipped_hash)
+                if self.pending_derivation
+                else self.unrecorded
+                + (self.snapshot_omissions if self.snapshot_completeness != "partial" else 0)
+            )
+        )
+        acquired = (
+            self.durable_acquired
+            if self.durable_acquired is not None
+            else max(0, accepted - reused - self.snapshot_omissions)
         )
         capacity = self.capacity_refusal
         refusal: Metadata | None = None
@@ -634,7 +658,7 @@ class RunReport:
             ),
             "dry_run": False,
             "enumerated_items": self.discovered,
-            "acquired_items": max(0, accepted - reused - self.snapshot_omissions),
+            "acquired_items": acquired,
             "reused_items": reused,
             "omitted_items": self.snapshot_omissions,
             "failed_items": failed,
@@ -770,13 +794,13 @@ class IngestPipeline:
         self,
         *,
         store: IngestStore,
-        chunker: Chunker,
-        embedder: Embedder,
-        vectors: VectorStore,
-        runner: ParseRunner,
-        resolve_chain: Callable[[str], Sequence[str]],
-        middleware: MiddlewareRunner,
-        chunk_fingerprint: ChunkFingerprint,
+        chunker: Chunker | None = None,
+        embedder: Embedder | None = None,
+        vectors: VectorStore | None = None,
+        runner: ParseRunner | None = None,
+        resolve_chain: Callable[[str], Sequence[str]] | None = None,
+        middleware: MiddlewareRunner | None = None,
+        chunk_fingerprint: ChunkFingerprint | None = None,
         workspace: str = "default",
         blobs: BlobSink | None = None,
         fetch_concurrency: int = 8,
@@ -796,12 +820,20 @@ class IngestPipeline:
         acquisition_cleanup_batch: int = 100,
         snapshot_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
     ) -> None:
+        derived = (chunker, embedder, vectors, runner, resolve_chain, middleware, chunk_fingerprint)
+        if any(component is None for component in derived) and not all(
+            component is None for component in derived
+        ):
+            msg = "derived ingest components must be supplied together or all omitted"
+            raise TypeError(msg)
+        self._derivation_enabled = chunk_fingerprint is not None
         # Second of the two places this is refused, and not a redundant one.
         # `check_before_run` is the once-per-run boundary and is what an operator meets; this
         # one is the boundary in *code*, because a pipeline is constructible without going
         # through that function and everything it writes is permanent. A chunker counting with
         # a stand-in vocabulary must not be able to reach a store at all.
-        require_measured(chunk_fingerprint)
+        if chunk_fingerprint is not None:
+            require_measured(chunk_fingerprint)
         self._store = store
         # Explicit protocol injection keeps the legacy bounded path available to protocol-only
         # stores and unit tests. Production wires the SQLite acquisition store here, making the
@@ -818,13 +850,17 @@ class IngestPipeline:
         self._acquisition_history_s = max(0.0, acquisition_history_s)
         self._acquisition_cleanup_batch = max(1, acquisition_cleanup_batch)
         self._snapshot_policy = snapshot_policy
-        self._chunker = chunker
-        self._embedder = embedder
-        self._vectors = vectors
-        self._runner = runner
-        self._resolve_chain = resolve_chain
-        self._middleware = middleware
-        self._chunk_fingerprint = chunk_fingerprint
+        # These casts preserve the narrow, non-optional types throughout the derived path. An
+        # acquisition-only pipeline never enters that path, and ``run`` refuses any other use
+        # before source work begins. Keeping ``None`` here is important: it proves this is not a
+        # dummy model, parser, or vector index disguised as architectural separation.
+        self._chunker = cast("Chunker", chunker)
+        self._embedder = cast("Embedder", embedder)
+        self._vectors = cast("VectorStore", vectors)
+        self._runner = cast("ParseRunner", runner)
+        self._resolve_chain = cast("Callable[[str], Sequence[str]]", resolve_chain)
+        self._middleware = cast("MiddlewareRunner", middleware)
+        self._chunk_fingerprint = cast("ChunkFingerprint", chunk_fingerprint)
         self._workspace = workspace
         self._blobs = blobs or NoRetention()
         self._max_fetch_bytes = max_fetch_bytes
@@ -835,7 +871,11 @@ class IngestPipeline:
         # the store has to be able to hold the result — a pipeline that detected definitions
         # and had nowhere to put them would spend the work on every document and produce
         # nothing, which reads from the outside as a detector that finds nothing.
-        self._glossary = glossary if glossary is not None else _writer_of(store)
+        self._glossary = (
+            (glossary if glossary is not None else _writer_of(store))
+            if self._derivation_enabled
+            else None
+        )
         self._detect_glossary = detect_glossary and self._glossary is not None
         # Read once per pipeline rather than per document: it digests two source files and the
         # answer cannot change under a running process. `None` where the store cannot hold
@@ -845,7 +885,7 @@ class IngestPipeline:
             None
             if self._glossary is None
             else glossary_fingerprint(
-                enabled=detect_glossary, middleware=middleware.chain()
+                enabled=detect_glossary, middleware=self._middleware.chain()
             ).canonical()
         )
         # --- how many of each stage a run may occupy, all derived here and nowhere else ------
@@ -1035,6 +1075,12 @@ class IngestPipeline:
                 ingest worker, so it must not block and must not raise — the one implementation
                 appends to a list. ``None`` is the ordinary case and costs a branch per document.
         """
+        if not acquire_only and not self._derivation_enabled:
+            msg = "this runtime was assembled for source acquisition only"
+            raise RuntimeError(msg)
+        if acquire_only and self._acquisitions is None:
+            msg = "acquire-only requires durable source-byte retention"
+            raise RuntimeError(msg)
         if self._acquisitions is not None:
             # Settled journal rows are diagnostic history, not recovery input. Bound this pass
             # so starting one connector cannot monopolize the workspace writer. Active work on
@@ -1153,6 +1199,10 @@ class IngestPipeline:
                 await stages
             raise
 
+        if run.acquisitions is not None:
+            durable = await run.acquisitions.get_acquisition_run(run.acquisition_run_id)
+            if durable is not None:
+                self._hydrate_durable_report(run, durable)
         run.report.stages = self._stage_report(run)
         run.report.settle()
         if run.acquisitions is None and run.report.complete:
@@ -1164,6 +1214,34 @@ class IngestPipeline:
                 run.report.error = f"{type(exc).__name__}: {exc}"
         await self._record_run_completion(run, crashed=crashed)
         return run.report
+
+    @staticmethod
+    def _hydrate_durable_report(run: _Sync, durable: AcquisitionRun) -> None:
+        """Make the immediate result one projection of the row later status reads.
+
+        Discovery deliberately does not increment the legacy streaming counter on the journal
+        path: durability acknowledges each reference instead. Reading the aggregate back once
+        at the terminal boundary avoids inventing a second counter and also covers takeover of
+        an enumeration completed by an earlier process.
+        """
+        report = run.report
+        run.accepted = durable.discovered_count
+        report.discovered = durable.discovered_count
+        report.durable_acquired = durable.acquired_count
+        report.durable_reused = durable.unchanged_count
+        report.durable_failed = durable.retry_count
+        report.durable_pending = max(
+            0, durable.acquired_count - durable.indexed_count - durable.unchanged_count
+        )
+        report.snapshot_omissions = durable.omission_count
+        report.snapshot_omission_reasons = {
+            code.value: count for code, count in durable.omission_reasons.items()
+        }
+        report.snapshot_completeness = (
+            durable.completeness.value if durable.completeness is not None else ""
+        )
+        report.candidate_watermark_present = durable.candidate_watermark is not None
+        report.watermark_advanced = durable.watermark_committed_at is not None
 
     async def _record_run_completion(self, run: _Sync, *, crashed: bool) -> None:
         """Publish diagnostics only while this invocation still owns their durable order."""

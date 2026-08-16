@@ -965,6 +965,38 @@ async def test_claim_or_create_serializes_repeated_sync_requests(
     assert sum(run is not None for run in persisted) == 1
 
 
+async def test_current_omissions_exclude_active_records_until_they_need_retry(
+    store: SqliteDocStore,
+) -> None:
+    run = await _claimed_run(store)
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        _source(),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+
+    active = await store.latest_unsettled_acquisition_run("wiki")
+    assert active is not None
+    assert active.omission_count == 0
+
+    await store.transition_acquisition_record(
+        run.id,
+        "page-1",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    retryable = await store.latest_unsettled_acquisition_run("wiki")
+    assert retryable is not None
+    assert retryable.omission_count == 1
+    assert retryable.omission_reasons == {AcquisitionFailureCode.UNKNOWN: 1}
+
+
 async def test_claim_reconciles_every_legacy_overlap_to_one_authoritative_safe_run(
     store: SqliteDocStore,
 ) -> None:

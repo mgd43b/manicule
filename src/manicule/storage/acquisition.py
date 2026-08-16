@@ -176,6 +176,45 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
     )
 
 
+async def _run_with_current_omissions(
+    session: AsyncSession, row: models.AcquisitionRun
+) -> AcquisitionRun:
+    """Project retryable missing evidence into an unfinished run's aggregate view.
+
+    Strict snapshots deliberately remain unfrozen while a missing body can be retried, so their
+    stored final omission fields are still zero. Status and the immediate acquisition result
+    nevertheless need the current bounded aggregate; derive it in SQL without loading member
+    identities or mutating the retryable manifest. Migrated unverified records intentionally
+    remain ``UNCHANGED`` so they can be reacquired, but their missing evidence remains an
+    omission; modern unchanged records always carry validated reusable evidence.
+    """
+    result = _run(row)
+    if row.acquisition_completed_at is not None:
+        return result
+    missing = or_(
+        models.AcquisitionRecord.blob_ref.is_(None),
+        models.AcquisitionRecord.acquired_source.is_(None),
+    )
+    reportable = models.AcquisitionRecord.state.in_(
+        (AcquisitionRecordState.RETRY, AcquisitionRecordState.UNCHANGED)
+    )
+    reason_rows = (
+        await session.execute(
+            select(models.AcquisitionRecord.snapshot_diagnostic, func.count())
+            .where(models.AcquisitionRecord.run_id == row.id, reportable, missing)
+            .group_by(models.AcquisitionRecord.snapshot_diagnostic)
+        )
+    ).all()
+    reasons: dict[AcquisitionFailureCode, int] = {}
+    omissions = 0
+    for raw, count in reason_rows:
+        diagnostic = _safe_snapshot_diagnostic(raw)
+        code = diagnostic.code if diagnostic is not None else AcquisitionFailureCode.UNKNOWN
+        reasons[code] = reasons.get(code, 0) + count
+        omissions += count
+    return result.model_copy(update={"omission_count": omissions, "omission_reasons": reasons})
+
+
 def _record(row: models.AcquisitionRecord) -> AcquisitionRecord:
     return AcquisitionRecord(
         run_id=row.run_id,
@@ -498,20 +537,27 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             return _WATERMARK.validate_python(row.watermark)
 
     async def latest_promoted_snapshot(
-        self, connector: str, scope_fingerprint: str
+        self, connector: str, scope_fingerprint: str | None
     ) -> AcquisitionRun | None:
-        """Return the newest authoritative manifest for this exact connector scope."""
+        """Return the newest authoritative manifest for a persisted connector scope.
+
+        ``None`` selects the newest locally persisted scope for status inspection. Mutation and
+        reuse callers always supply the exact fingerprint; the scope-free form exists only so a
+        status read never has to construct or authenticate a live connector.
+        """
         async with self._sessions() as session:
+            predicates = [
+                models.AcquisitionRun.workspace_id == self._workspace_id,
+                models.AcquisitionRun.connector_name == connector,
+                models.AcquisitionRun.superseded_at.is_(None),
+                models.AcquisitionRun.promoted_at.is_not(None),
+            ]
+            if scope_fingerprint is not None:
+                predicates.append(models.AcquisitionRun.scope_fingerprint == scope_fingerprint)
             row = (
                 await session.execute(
                     select(models.AcquisitionRun)
-                    .where(
-                        models.AcquisitionRun.workspace_id == self._workspace_id,
-                        models.AcquisitionRun.connector_name == connector,
-                        models.AcquisitionRun.superseded_at.is_(None),
-                        models.AcquisitionRun.scope_fingerprint == scope_fingerprint,
-                        models.AcquisitionRun.promoted_at.is_not(None),
-                    )
+                    .where(*predicates)
                     .order_by(
                         models.AcquisitionRun.promoted_at.desc(),
                         models.AcquisitionRun.id.desc(),
@@ -626,7 +672,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
     async def get_acquisition_run(self, run_id: str) -> AcquisitionRun | None:
         async with self._sessions() as session:
             row = await self._run_row(session, run_id)
-            return None if row is None else _run(row)
+            return None if row is None else await _run_with_current_omissions(session, row)
 
     async def latest_unsettled_acquisition_run(
         self, connector: str, *, scope_fingerprint: str | None = None
@@ -649,7 +695,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     ).limit(1)
                 )
             ).scalar_one_or_none()
-            return None if row is None else _run(row)
+            return None if row is None else await _run_with_current_omissions(session, row)
 
     @translate_storage_capacity_errors
     async def claim_or_create_acquisition_run(
