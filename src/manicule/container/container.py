@@ -54,8 +54,19 @@ from manicule.plugins.registry import (
     ComponentRecord,
     ComponentRegistry,
     Discovery,
+    MetadataContext,
     discover,
 )
+
+
+class _MetadataResolver:
+    """The descriptor-only dependency view exposed to metadata factories."""
+
+    def __init__(self, container: Container) -> None:
+        self._container = container
+
+    def get(self, key: ComponentKey[object]) -> object:
+        return self._container.metadata(key)
 
 
 class NoConfig(BaseModel):
@@ -82,6 +93,8 @@ class Container:
         self._pending: list[tuple[ComponentKind, str]] = []
         self._started: list[tuple[ComponentKind, str]] = []
         self._resolving: list[str] = []
+        self._metadata: dict[tuple[ComponentKind, str], object] = {}
+        self._metadata_resolving: list[str] = []
 
     # --- resolution -----------------------------------------------------------------
 
@@ -121,6 +134,43 @@ class Container:
         instance = self.get(key)
         await self._setup_pending()
         return instance
+
+    def metadata(self, key: ComponentKey[object]) -> object:
+        """Resolve configured metadata without invoking a component factory."""
+        resolved = self._resolve_name(key)
+        slot = (resolved.kind, resolved.name or "")
+        if slot in self._metadata:
+            return self._metadata[slot]
+        record = self.registry.record(resolved)
+        if record.metadata_factory is None:
+            raise ConfigError(
+                f"{resolved} provides no metadata-only identity; rebuild planning cannot "
+                "construct executable components to discover it"
+            )
+        label = str(resolved)
+        if label in self._metadata_resolving:
+            cycle = " -> ".join(
+                [
+                    *self._metadata_resolving[self._metadata_resolving.index(label) :],
+                    label,
+                ]
+            )
+            raise CircularDependencyError(f"component metadata dependencies form a cycle: {cycle}")
+        self._metadata_resolving.append(label)
+        try:
+            value = record.metadata_factory(
+                MetadataContext(
+                    settings=self.settings,
+                    config=self._config_for(record),
+                    data_dir=self.settings.data_dir,
+                    cache_dir=self.settings.cache_dir,
+                    components=_MetadataResolver(self),
+                )
+            )
+        finally:
+            self._metadata_resolving.pop()
+        self._metadata[slot] = value
+        return value
 
     def _resolve_name[T](self, key: ComponentKey[T]) -> ComponentKey[T]:
         if key.name is not None:

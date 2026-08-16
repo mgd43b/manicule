@@ -996,18 +996,81 @@ class _Ingestion:
             return None
         return run, await store.verify_snapshot_manifest(run.id)
 
-    async def _rebuild_components(  # noqa: ANN202
-        self, snapshot_run_id: str, *, prepare_vectors: bool = True
-    ):
-        """Assemble the connector-free production offline rebuild stack and exact target."""
+    def _rebuild_target(self):  # noqa: ANN202
+        """Resolve the configured rebuild identity from declarations, never components."""
         import json  # noqa: PLC0415
 
+        from manicule.core.embedding import EmbedFingerprint  # noqa: PLC0415
+        from manicule.core.fingerprints import ChunkFingerprint  # noqa: PLC0415
         from manicule.core.rebuild import RebuildTarget  # noqa: PLC0415
+        from manicule.ingest.glossary_lineage import glossary_fingerprint  # noqa: PLC0415
+        from manicule.parsers.versions import parse_fingerprint  # noqa: PLC0415
+        from manicule.plugins.registry import MiddlewareMetadata  # noqa: PLC0415
+        from manicule.storage import models  # noqa: PLC0415
+
+        chunk = self._runtime.container.metadata(keys.CHUNKER)
+        embed = self._runtime.container.metadata(keys.EMBEDDER)
+        if not isinstance(chunk, ChunkFingerprint):
+            raise ManiculeError("configured chunker metadata did not declare a fingerprint")
+        if not isinstance(embed, EmbedFingerprint):
+            raise ManiculeError("configured embedder metadata did not declare a fingerprint")
+        if chunk.tokenizer_id != embed.tokenizer_id:
+            raise ManiculeError(
+                "configured chunker metadata names a tokenizer different from the embedder"
+            )
+        if chunk.max_tokens > embed.max_sequence_length:
+            raise ManiculeError(
+                "configured chunker metadata exceeds the embedder's declared context window"
+            )
+        middleware: list[MiddlewareMetadata] = []
+        for name in self._runtime.settings.plugins.middleware:
+            declaration = self._runtime.container.metadata(keys.MIDDLEWARE.named(name))
+            if not isinstance(declaration, MiddlewareMetadata):
+                raise ManiculeError(
+                    f"middleware {name!r} metadata did not declare its fingerprint behavior"
+                )
+            middleware.append(declaration)
+        chain = tuple(sorted(f"{item.name}@" for item in middleware))
+        embedded = tuple(
+            sorted(f"{item.name}@" for item in middleware if item.mutates_embedded_text)
+        )
+        chunk = chunk.with_middleware(embedded)
+        settings = self._runtime.settings
+        parser_names = tuple(self._runtime.container.registry.names(ComponentKind.PARSER))
+        parser_set = tuple(
+            fingerprint.canonical()
+            for name in parser_names
+            if (fingerprint := parse_fingerprint(name)) is not None
+        )
+        routing = hashlib.sha256(
+            json.dumps(
+                {"fallbacks": settings.parser_fallbacks, "parsers": parser_names},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        glossary = glossary_fingerprint(
+            enabled=settings.rag.glossary.detect_on_ingest,
+            middleware=chain,
+        )
+        return RebuildTarget(
+            parser_routing=routing,
+            parser_set=parser_set,
+            chunk_fingerprint=chunk.canonical(),
+            embedding_fingerprint=embed.canonical(),
+            embedding_config=embed.model_dump_json(),
+            glossary_fingerprint=glossary.canonical(),
+            fts_tokenizer=models.FTS_TOKENIZER,
+            batch_documents=max(1, min(32, settings.ingest.max_documents_per_worker)),
+            max_memory_bytes=settings.ingest.parse_memory_limit_mb * 1024 * 1024,
+            max_temporary_bytes=settings.ingest.max_acquired_blob_backlog_bytes,
+        )
+
+    async def _rebuild_components(self, snapshot_run_id: str):  # noqa: ANN202
+        """Assemble the connector-free production offline rebuild stack and exact target."""
         from manicule.ingest.rebuild import build_offline_rebuilder  # noqa: PLC0415
         from manicule.ingest.workers import WorkerPool, worker_config  # noqa: PLC0415
         from manicule.parsers.chain import ParserChain  # noqa: PLC0415
-        from manicule.parsers.versions import parse_fingerprint  # noqa: PLC0415
-        from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.blobs import BlobStore  # noqa: PLC0415
         from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
         from manicule.storage.rebuild import SqliteRebuildStore  # noqa: PLC0415
@@ -1021,11 +1084,7 @@ class _Ingestion:
         blobs = await self._runtime.blobs()
         if not isinstance(blobs, BlobStore):
             raise ManiculeError("offline rebuild requires retained local source bytes")
-        vectors = (
-            await self._runtime.prepared_vectors()
-            if prepare_vectors
-            else await self._runtime.vectors()
-        )
+        vectors = await self._runtime.prepared_vectors()
         store = SqliteRebuildStore(
             self._runtime.require_engine(),
             workspace_id=self._runtime.workspace,
@@ -1037,35 +1096,24 @@ class _Ingestion:
         middleware = await self._runtime.middleware()
         chunk_fingerprint = chunker.fingerprint.with_middleware(middleware.declarations())
         settings = self._runtime.settings
-        parser_names = tuple(self._runtime.container.registry.names(ComponentKind.PARSER))
-        parser_set = tuple(
-            fingerprint.canonical()
-            for name in parser_names
-            if (fingerprint := parse_fingerprint(name)) is not None
-        )
-        routing = hashlib.sha256(
-            json.dumps(
-                {
-                    "fallbacks": settings.parser_fallbacks,
-                    "parsers": parser_names,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
-        glossary = await self.glossary_fingerprint()
-        target = RebuildTarget(
-            parser_routing=routing,
-            parser_set=parser_set,
-            chunk_fingerprint=chunk_fingerprint.canonical(),
-            embedding_fingerprint=embedder.fingerprint.canonical(),
-            embedding_config=embedder.fingerprint.model_dump_json(),
-            glossary_fingerprint=glossary.canonical(),
-            fts_tokenizer=models.FTS_TOKENIZER,
-            batch_documents=max(1, min(32, settings.ingest.max_documents_per_worker)),
-            max_memory_bytes=settings.ingest.parse_memory_limit_mb * 1024 * 1024,
-            max_temporary_bytes=settings.ingest.max_acquired_blob_backlog_bytes,
-        )
+        target = self._rebuild_target()
+        routing = target.parser_routing
+        actual_glossary = await self.glossary_fingerprint()
+        mismatches: list[str] = []
+        if (
+            target.embedding_fingerprint != embedder.fingerprint.canonical()
+            or target.embedding_config != embedder.fingerprint.model_dump_json()
+        ):
+            mismatches.append("embedder")
+        if target.chunk_fingerprint != chunk_fingerprint.canonical():
+            mismatches.append("chunker or middleware")
+        if target.glossary_fingerprint != actual_glossary.canonical():
+            mismatches.append("glossary middleware")
+        if mismatches:
+            raise ManiculeError(
+                "component metadata disagrees with the executable rebuild stack: "
+                + ", ".join(mismatches)
+            )
         runner = WorkerPool(
             worker_config(settings, chunker=chunker, embedder=embedder),
             workers=settings.ingest.parse_workers,
@@ -1091,10 +1139,30 @@ class _Ingestion:
         return store, rebuilder, target
 
     async def rebuild_plan(self, snapshot_run_id: str):  # noqa: ANN202
-        _, rebuilder, target = await self._rebuild_components(
-            snapshot_run_id, prepare_vectors=False
+        from manicule.ingest.rebuild import MAX_MISSING_DETAILS  # noqa: PLC0415
+        from manicule.storage.blobs import BlobStore  # noqa: PLC0415
+        from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+        from manicule.storage.rebuild import SqliteRebuildStore  # noqa: PLC0415
+
+        documents = await self._runtime.documents()
+        if not isinstance(documents, SqliteDocStore):
+            raise ManiculeError("offline rebuild requires the built-in SQLite document store")
+        if await documents.get_acquisition_run(snapshot_run_id) is None:
+            raise UnknownEntityError("no durable source snapshot has that id")
+        blobs = await self._runtime.blobs()
+        if not isinstance(blobs, BlobStore):
+            raise ManiculeError("offline rebuild requires retained local source bytes")
+        store = SqliteRebuildStore(
+            self._runtime.require_engine(),
+            workspace_id=self._runtime.workspace,
+            blobs=blobs,
         )
-        return await rebuilder.dry_run(snapshot_run_id, target)
+        return await store.plan_rebuild(
+            snapshot_run_id,
+            self._rebuild_target(),
+            missing_limit=MAX_MISSING_DETAILS,
+            persist=False,
+        )
 
     async def rebuild_run(self, snapshot_run_id: str, owner: str):  # noqa: ANN202
         _, rebuilder, target = await self._rebuild_components(snapshot_run_id)

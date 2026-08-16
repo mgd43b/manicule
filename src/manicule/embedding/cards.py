@@ -151,6 +151,24 @@ def read_card(
             nothing either, or the two disagree.
     """
     path, resolved = _fetch(model_id, revision)
+    return _read_card_at(
+        model_id,
+        path,
+        resolved,
+        pooling_override=pooling_override,
+        max_sequence_length_override=max_sequence_length_override,
+    )
+
+
+def _read_card_at(
+    model_id: str,
+    path: Path,
+    resolved: str | None,
+    *,
+    pooling_override: Pooling | None,
+    max_sequence_length_override: int | None,
+) -> ModelCard:
+    """Interpret one already-resolved declaration directory."""
     config = read_json(path / "config.json", model_id)
     pooling_config = read_json_if_present(path / "1_Pooling" / "config.json")
 
@@ -176,6 +194,40 @@ def read_card(
         max_sequence_length=usable,
         special_token_count=specials,
         path=path,
+    )
+
+
+def read_cached_card(
+    model_id: str,
+    *,
+    revision: str | None = None,
+    pooling_override: Pooling | None = None,
+    max_sequence_length_override: int | None = None,
+) -> ModelCard:
+    """Read a model declaration already on disk, with network access structurally disabled."""
+    local = Path(model_id).expanduser()
+    if local.is_dir():
+        return read_card(
+            model_id,
+            revision=revision,
+            pooling_override=pooling_override,
+            max_sequence_length_override=max_sequence_length_override,
+        )
+    from manicule.embedding.runtimes.hub import cached_snapshot  # noqa: PLC0415
+
+    path = cached_snapshot(model_id, CARD_FILES, revision)
+    if path is None:
+        raise ConfigError(
+            "configured embedding metadata is not cached locally; rebuild planning never "
+            "contacts a model repository"
+        )
+    resolved = path.name if path.parent.name == "snapshots" else revision
+    return _read_card_at(
+        model_id,
+        path,
+        resolved,
+        pooling_override=pooling_override,
+        max_sequence_length_override=max_sequence_length_override,
     )
 
 
@@ -444,6 +496,7 @@ __all__ = [
     "CARD_FILES",
     "ModelCard",
     "load_tokenizer",
+    "read_cached_card",
     "read_card",
     "read_json",
     "read_json_if_present",

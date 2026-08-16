@@ -18,6 +18,7 @@ from manicule.core.embedding import Pooling
 from manicule.core.errors import ConfigError
 from manicule.embedding.artifacts import (
     MLX_WEIGHTS,
+    describe_artifact,
     mlx_repo,
     mlx_weights,
     onnx_weights,
@@ -396,6 +397,21 @@ def test_qualified_identity_is_bound_to_both_artifact_commits(
 def test_remote_override_without_immutable_revision_is_refused() -> None:
     with pytest.raises(ConfigError, match="40-character commit"):
         resolve_artifact("onnx", "acme/model", "1" * 40, override="acme/export")
+
+
+def test_metadata_description_matches_remote_resolution_without_weight_io() -> None:
+    described = describe_artifact(
+        "onnx", "acme/model", "1" * 40, override="acme/export", revision="2" * 40
+    )
+    resolved = resolve_artifact(
+        "onnx", "acme/model", "1" * 40, override="acme/export", revision="2" * 40
+    )
+    assert described == resolved
+
+
+def test_metadata_description_refuses_to_hash_local_weight_files(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="cannot hash local model weights"):
+        describe_artifact("mlx", str(tmp_path), None)
 
 
 def test_weights_revision_without_override_is_refused() -> None:

@@ -178,7 +178,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         *,
         workspace_id: str,
         blobs: BlobInventory,
-        vectors: GenerationVectorInventory,
+        vectors: GenerationVectorInventory | None = None,
         sessions: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         super().__init__(engine, workspace_id=workspace_id, sessions=sessions)
@@ -187,6 +187,11 @@ class SqliteRebuildStore(WorkspaceScoped):
         self._acquisition = AcquisitionJournalMixin(
             engine, workspace_id=workspace_id, sessions=sessions
         )
+
+    def _required_vectors(self) -> GenerationVectorInventory:
+        if self._vectors is None:
+            raise RuntimeError("this metadata-only rebuild store has no vector capability")
+        return self._vectors
 
     async def plan_rebuild(  # noqa: PLR0911, PLR0912, PLR0915 - ordered validation boundary
         self,
@@ -598,12 +603,12 @@ class SqliteRebuildStore(WorkspaceScoped):
                         lease_generation,
                         now=checked_at,
                     )
-                    await self._vectors.copy_publication(
+                    await self._required_vectors().copy_publication(
                         source_publication_id,
                         target_publication,
                         page,
                     )
-                    if not await self._vectors.publication_page_is_complete(
+                    if not await self._required_vectors().publication_page_is_complete(
                         target_publication,
                         page,
                         embedding_fingerprint=target.embedding_fingerprint,
@@ -618,7 +623,10 @@ class SqliteRebuildStore(WorkspaceScoped):
                         now=utcnow(),
                     )
             after = rows[-1].sequence
-        if await self._vectors.publication_row_count(target_publication) != expected_vectors:
+        if (
+            await self._required_vectors().publication_row_count(target_publication)
+            != expected_vectors
+        ):
             raise RuntimeError("replayed vector publication is not exact")
         async with self._sessions.begin() as session:
             generation = await self._required_generation(session, generation_id)
@@ -798,14 +806,17 @@ class SqliteRebuildStore(WorkspaceScoped):
                     chunks = replacement.flattened_chunks()
                     expected_vectors += len(chunks)
                     for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                        if not await self._vectors.publication_page_is_complete(
+                        if not await self._required_vectors().publication_page_is_complete(
                             physical_publication,
                             page,
                             embedding_fingerprint=target.embedding_fingerprint,
                         ):
                             raise RuntimeError("replacement vector publication is incomplete")
                 after = pairs[-1][0].sequence
-            if await self._vectors.publication_row_count(physical_publication) != expected_vectors:
+            if (
+                await self._required_vectors().publication_row_count(physical_publication)
+                != expected_vectors
+            ):
                 raise RuntimeError("replacement vector publication is incomplete")
 
     async def publish_generation(  # noqa: PLR0912, PLR0915 - one atomic boundary
@@ -911,7 +922,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                     chunks = replacement.flattened_chunks()
                     expected_vectors += len(chunks)
                     for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                        if not await self._vectors.publication_page_is_complete(
+                        if not await self._required_vectors().publication_page_is_complete(
                             physical_publication,
                             page,
                             embedding_fingerprint=target.embedding_fingerprint,
@@ -927,7 +938,10 @@ class SqliteRebuildStore(WorkspaceScoped):
                         snapshot=snapshot,
                     )
                 after = pairs[-1][0].sequence
-            if await self._vectors.publication_row_count(physical_publication) != expected_vectors:
+            if (
+                await self._required_vectors().publication_row_count(physical_publication)
+                != expected_vectors
+            ):
                 raise RebuildPublicationValidationError
 
             if run.completeness is SnapshotCompleteness.COMPLETE:
