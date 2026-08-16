@@ -19,6 +19,8 @@ from manicule.core.rebuild import (
     RebuildCheckpoint,
     RebuildEstimate,
     RebuildLeaseConflictError,
+    RebuildPublicationConflictError,
+    RebuildPublicationValidationError,
     RebuildRefusalCode,
     RebuildState,
     RebuildTarget,
@@ -838,10 +840,10 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation = await self._required_generation(session, generation_id)
             self._require_lease(generation, owner, lease_generation, now)
             if generation.state is not RebuildState.VALIDATING:
-                raise RuntimeError("generation must validate before publication")
+                raise RebuildPublicationValidationError
             run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
             if run is None or run.workspace_id != self._workspace_id or run.promoted_at is None:
-                raise RuntimeError("the rebuild snapshot is no longer promoted")
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
             newer = (
                 await session.execute(
                     select(models.AcquisitionRun.id)
@@ -859,11 +861,11 @@ class SqliteRebuildStore(WorkspaceScoped):
                 )
             ).scalar_one_or_none()
             if newer != run.id:
-                raise RuntimeError("a newer promoted snapshot superseded this rebuild")
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
             if not await self._is_only_promoted_scope(
                 session, run.connector_name, run.scope_fingerprint
             ):
-                raise RuntimeError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED.value)
+                raise RebuildPublicationConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED)
             await self._require_live_vector_binding(session, generation)
 
             highest_fence = (
@@ -888,7 +890,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 )
             ).scalar_one_or_none()
             if highest_fence != generation.fence_generation:
-                raise RebuildLeaseConflictError("a newer rebuild generation holds the fence")
+                raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
 
             await self._verify_complete_header(session, generation)
             target = RebuildTarget.model_validate(generation.target)
@@ -914,7 +916,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                             page,
                             embedding_fingerprint=target.embedding_fingerprint,
                         ):
-                            raise RuntimeError("replacement vector publication is incomplete")
+                            raise RebuildPublicationValidationError
                     await self._publish_item(
                         session,
                         replacement=replacement,
@@ -926,7 +928,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                     )
                 after = pairs[-1][0].sequence
             if await self._vectors.publication_row_count(physical_publication) != expected_vectors:
-                raise RuntimeError("replacement vector publication is incomplete")
+                raise RebuildPublicationValidationError
 
             if run.completeness is SnapshotCompleteness.COMPLETE:
                 await session.execute(
@@ -975,9 +977,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             observed_table != generation.expected_vector_table
             or observed_inventory != generation.expected_vector_inventory_digest
         ):
-            raise RebuildLeaseConflictError(
-                "live vector publication changed after rebuild planning"
-            )
+            raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
 
     async def _is_only_promoted_scope(
         self, session: AsyncSession, connector_name: str, scope_fingerprint: str
@@ -1075,7 +1075,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         document = replacement.document
         expected_id = document_id(self._workspace_id, connector_name, document.source_id)
         if document.id != expected_id or document.source != connector_name:
-            raise RuntimeError("replacement document identity is outside its snapshot")
+            raise RebuildPublicationValidationError
         self._require_snapshot_match(replacement, snapshot)
         return await self._publish_member(
             session,
@@ -1097,7 +1097,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         document = replacement.document
         expected_id = document_id(self._workspace_id, connector_name, document.source_id)
         if document.id != expected_id or document.source != connector_name:
-            raise RuntimeError("replacement document identity is outside its source scope")
+            raise RebuildPublicationValidationError
         for member in replacement.members:
             await self._publish_member(
                 session,
@@ -1110,10 +1110,10 @@ class SqliteRebuildStore(WorkspaceScoped):
         if stored is None:
             stored = models.Document(id=document.id, workspace_id=self._workspace_id)
             session.add(stored)
-        elif stored.workspace_id != self._workspace_id:
-            raise RuntimeError("replacement document belongs to another workspace")
-        elif stored.publication_id == vector_publication:
-            raise RuntimeError("duplicate document in replacement generation")
+        elif (
+            stored.workspace_id != self._workspace_id or stored.publication_id == vector_publication
+        ):
+            raise RebuildPublicationValidationError
         # Populate every non-null document field before the following deletes trigger ORM
         # autoflush. A replacement published into an empty corpus creates this row; leaving it
         # as only id/workspace until after a query makes SQLite correctly refuse the transient
@@ -1175,12 +1175,12 @@ class SqliteRebuildStore(WorkspaceScoped):
                 session, run.id, generation.snapshot_membership_hash
             )
         ):
-            raise RuntimeError(RebuildRefusalCode.SNAPSHOT_CHANGED.value)
+            raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
         if (
             generation.next_sequence != generation.expected_item_count
             or generation.documents_built != generation.expected_item_count
         ):
-            raise RuntimeError("replacement generation has incomplete checkpoint coverage")
+            raise RebuildPublicationValidationError
         item_count = (
             await session.execute(
                 select(func.count(models.DerivedGenerationItem.sequence)).where(
@@ -1197,7 +1197,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             )
         ).scalar_one()
         if item_count != generation.expected_item_count or snapshot_count != item_count:
-            raise RuntimeError("snapshot and replacement membership are not exact and contiguous")
+            raise RebuildPublicationValidationError
 
     async def _evidence_page(
         self,
@@ -1239,7 +1239,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             or [item.sequence for item in items] != expected
             or [snapshot.sequence for snapshot in snapshots] != expected
         ):
-            raise RuntimeError("snapshot and replacement membership are not exact and contiguous")
+            raise RebuildPublicationValidationError
         return list(zip(items, snapshots, strict=True))
 
     def _validated_replacement(
@@ -1249,10 +1249,15 @@ class SqliteRebuildStore(WorkspaceScoped):
     ) -> DerivedReplacement:
         digest = hashlib.sha256(_canonical(row.payload)).hexdigest()
         if digest != row.payload_digest:
-            raise RuntimeError(RebuildRefusalCode.INVALID_REPLACEMENT.value)
-        replacement = _REPLACEMENT.validate_python(row.payload)
-        replacement.validate_identity()
-        self._require_snapshot_match(replacement, snapshot)
+            raise RebuildPublicationValidationError
+        try:
+            replacement = _REPLACEMENT.validate_python(row.payload)
+            replacement.validate_identity()
+            self._require_snapshot_match(replacement, snapshot)
+        except RebuildPublicationValidationError:
+            raise
+        except (RuntimeError, ValueError) as exc:
+            raise RebuildPublicationValidationError from exc
         return replacement
 
     @staticmethod
@@ -1278,7 +1283,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             or document.media_type != acquired.media_type
             or document.version_token != expected_version
         ):
-            raise RuntimeError("replacement document does not match its retained snapshot input")
+            raise RebuildPublicationValidationError
 
     @staticmethod
     def _temporary_cost(

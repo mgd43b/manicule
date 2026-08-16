@@ -22,6 +22,8 @@ from manicule.core.ids import chunk_id, content_hash
 from manicule.core.rebuild import (
     DerivedReplacement,
     RebuildCheckpoint,
+    RebuildPublicationConflictError,
+    RebuildPublicationValidationError,
     RebuildRefusalCode,
     RebuildState,
     RebuildTarget,
@@ -791,13 +793,14 @@ async def test_second_connector_promotion_fences_a_single_scope_rebuild(
         lease_generation=claimed.lease_generation,
         now=NOW,
     )
-    with pytest.raises(RuntimeError, match="workspace_scope_changed"):
+    with pytest.raises(RebuildPublicationConflictError) as caught:
         await rebuilds.publish_generation(
             first.generation_id,
             owner="first-worker",
             lease_generation=claimed.lease_generation,
             now=NOW,
         )
+    assert caught.value.code is RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
 
 
 async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # noqa: PLR0915
@@ -931,13 +934,14 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         else:
             index_state.vector_table = "reembed-interleaving-winner"
             index_state.vector_inventory_digest = "interleaving-inventory"
-    with pytest.raises(RebuildLeaseConflictError, match="live vector publication changed"):
+    with pytest.raises(RebuildPublicationConflictError) as caught:
         await rebuilds.publish_generation(
             estimate.generation_id,
             owner="worker",
             lease_generation=claimed.lease_generation,
             now=NOW,
         )
+    assert caught.value.code is RebuildRefusalCode.PUBLICATION_CONFLICT
     async with sessions.begin() as session:
         index_state = await session.get(models.IndexState, 1)
         assert index_state is not None
@@ -959,13 +963,14 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         record.source_record = cast(
             "JsonValue", {**original_source_record, "uri": "https://tampered.invalid"}
         )
-    with pytest.raises(RuntimeError, match="snapshot_changed"):
+    with pytest.raises(RebuildPublicationConflictError) as caught:
         await rebuilds.publish_generation(
             estimate.generation_id,
             owner="worker",
             lease_generation=claimed.lease_generation,
             now=NOW,
         )
+    assert caught.value.code is RebuildRefusalCode.SNAPSHOT_CHANGED
     async with sessions.begin() as session:
         record = (
             await session.execute(
@@ -985,13 +990,14 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         now=NOW,
         expires_at=NOW + timedelta(minutes=5),
     )
-    with pytest.raises(RebuildLeaseConflictError, match="newer rebuild"):
+    with pytest.raises(RebuildPublicationConflictError) as caught:
         await rebuilds.publish_generation(
             estimate.generation_id,
             owner="worker",
             lease_generation=claimed.lease_generation,
             now=NOW,
         )
+    assert caught.value.code is RebuildRefusalCode.PUBLICATION_CONFLICT
     await rebuilds.cancel_generation(
         newer_plan.generation_id,
         owner="new-worker",
@@ -1040,8 +1046,9 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
                 models.DerivedGenerationItem.generation_id == estimate.generation_id
             )
         )
-    with pytest.raises(RuntimeError, match="exact and contiguous"):
+    with pytest.raises(RebuildPublicationValidationError) as caught:
         await rebuilds.validate_generation(estimate.generation_id)
+    assert caught.value.code is RebuildRefusalCode.INVALID_REPLACEMENT
 
 
 async def test_expired_owner_is_fenced_after_takeover(  # noqa: PLR0915 - one takeover timeline

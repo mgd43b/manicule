@@ -22,6 +22,8 @@ from manicule.connectors.sessions import SessionVault
 from manicule.core.rebuild import (
     RebuildDerivationError,
     RebuildLeaseError,
+    RebuildPublicationConflictError,
+    RebuildRefusalCode,
     RebuildStorageError,
     RebuildTerminalError,
     RebuildTerminalGenerationError,
@@ -70,13 +72,30 @@ async def test_expected_rebuild_failures_have_stable_status_and_recovery_guidanc
     assert not any(marker in rendered for marker in PRIVATE_MARKERS)
 
 
-def test_http_mcp_and_web_share_the_same_private_safe_rebuild_failure() -> None:
+@pytest.mark.parametrize(
+    ("internal", "expected_type", "expected_status"),
+    [
+        (
+            IntegrityError(
+                "INSERT INTO private_table VALUES (?)",
+                ("private body cookie=secret",),
+                RuntimeError("/private/machine/workspace.sqlite"),
+            ),
+            "RebuildStorageError",
+            SERVICE_UNAVAILABLE,
+        ),
+        (
+            RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED),
+            "RebuildLeaseError",
+            CONFLICT,
+        ),
+    ],
+)
+def test_http_mcp_and_web_share_the_same_private_safe_rebuild_failure(
+    internal: Exception, expected_type: str, expected_status: int
+) -> None:
     backend = FakeBackend()
-    backend.ingestion_.rebuild_failure = IntegrityError(
-        "INSERT INTO private_table VALUES (?)",
-        ("private body cookie=secret",),
-        RuntimeError("/private/machine/workspace.sqlite"),
-    )
+    backend.ingestion_.rebuild_failure = internal
     service = ApplicationService(backend)
 
     with client_for(backend) as client:
@@ -94,9 +113,9 @@ def test_http_mcp_and_web_share_the_same_private_safe_rebuild_failure() -> None:
         )
     ).envelope.as_json()
 
-    assert response.status_code == SERVICE_UNAVAILABLE
+    assert response.status_code == expected_status
     assert http == mcp_result == web
-    assert cast("dict[str, Any]", http["error"])["type"] == "RebuildStorageError"
+    assert cast("dict[str, Any]", http["error"])["type"] == expected_type
     rendered = str(http).lower()
     assert not any(marker in rendered for marker in PRIVATE_MARKERS)
 

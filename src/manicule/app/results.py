@@ -79,6 +79,7 @@ type LifecycleRefusalCode = Literal[
     "invalid_replacement",
     "derivation_failed",
     "storage_failed",
+    "publication_conflict",
     "confirmation_required",
     "retention_policy",
     "shared_reference",
