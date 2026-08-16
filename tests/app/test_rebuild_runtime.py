@@ -91,9 +91,7 @@ async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capabili
         update={"model_id": "second/model", "max_sequence_length": 1024}
     )
     async with _runtime(data_dir, resumed_embedder) as resumed:
-        published = await (await resumed.ingestion()).reembed_resume(
-            "second-model", "resume-owner"
-        )
+        published = await (await resumed.ingestion()).reembed_resume("second-model", "resume-owner")
 
         assert published.state is ReembedState.PUBLISHED
         assert published.chunks_completed == 3

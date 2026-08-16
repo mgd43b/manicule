@@ -144,13 +144,12 @@ class PublicationMemoryVectors(fakes.MemoryVectors):
         *,
         embedding_fingerprint: str,
     ) -> bool:
-        return (
-            await self.publication_row_count(publication_id) == len(chunks)
-            and await self.publication_page_is_complete(
-                publication_id,
-                chunks,
-                embedding_fingerprint=embedding_fingerprint,
-            )
+        return await self.publication_row_count(publication_id) == len(
+            chunks
+        ) and await self.publication_page_is_complete(
+            publication_id,
+            chunks,
+            embedding_fingerprint=embedding_fingerprint,
         )
 
     async def copy_publication(
