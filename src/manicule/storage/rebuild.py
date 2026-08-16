@@ -194,6 +194,12 @@ class SqliteRebuildStore(WorkspaceScoped):
             raise RuntimeError("this metadata-only rebuild store has no vector capability")
         return self._vectors
 
+    async def _publication_row_count(self, publication_id: str) -> int:
+        try:
+            return await self._required_vectors().publication_row_count(publication_id)
+        except ManiculeError as exc:
+            raise RebuildPublicationValidationError from exc
+
     async def plan_rebuild(  # noqa: PLR0911, PLR0912, PLR0915 - ordered validation boundary
         self,
         snapshot_run_id: str,
@@ -631,10 +637,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                         now=utcnow(),
                     )
             after = rows[-1].sequence
-        if (
-            await self._required_vectors().publication_row_count(target_publication)
-            != expected_vectors
-        ):
+        if await self._publication_row_count(target_publication) != expected_vectors:
             raise RebuildPublicationValidationError
         async with self._sessions.begin() as session:
             generation = await self._required_generation(session, generation_id)
@@ -824,10 +827,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                         ):
                             raise RebuildPublicationValidationError
                 after = pairs[-1][0].sequence
-            if (
-                await self._required_vectors().publication_row_count(physical_publication)
-                != expected_vectors
-            ):
+            if await self._publication_row_count(physical_publication) != expected_vectors:
                 raise RebuildPublicationValidationError
 
     async def publish_generation(  # noqa: PLR0912, PLR0915 - one atomic boundary
@@ -949,10 +949,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                         snapshot=snapshot,
                     )
                 after = pairs[-1][0].sequence
-            if (
-                await self._required_vectors().publication_row_count(physical_publication)
-                != expected_vectors
-            ):
+            if await self._publication_row_count(physical_publication) != expected_vectors:
                 raise RebuildPublicationValidationError
 
             if run.completeness is SnapshotCompleteness.COMPLETE:

@@ -1285,6 +1285,23 @@ async def test_expired_owner_is_fenced_after_takeover(  # noqa: PLR0915 - one ta
     assert invalid.value.code is RebuildRefusalCode.INVALID_REPLACEMENT
     assert await certified_publication() == first.vector_publication_id
 
+    async def unavailable_replay_inventory(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        raise VectorStoreStateError("private inventory /private/vectors")
+
+    monkeypatch.setattr(vectors, "publication_row_count", unavailable_replay_inventory)
+    with pytest.raises(RebuildPublicationValidationError) as invalid:
+        await rebuilds.copy_checkpointed_vectors(
+            plan.generation_id,
+            first.vector_publication_id,
+            owner="second",
+            lease_generation=second.lease_generation,
+            now=takeover_now,
+        )
+    assert invalid.value.code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert "/private" not in str(invalid.value)
+    assert await certified_publication() == first.vector_publication_id
+
     monkeypatch.setattr(vectors, "publication_row_count", original_row_count)
     monkeypatch.setattr(vectors, "copy_publication", crash_after_page)
     with pytest.raises(RuntimeError, match="crashed after the first replay page"):
