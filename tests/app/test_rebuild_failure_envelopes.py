@@ -83,9 +83,7 @@ def test_http_mcp_and_web_share_the_same_private_safe_rebuild_failure() -> None:
         response = client.get("/api/v1/admin/rebuild/generations/generation-public")
     http = cast("dict[str, Any]", response.json())
     mcp = asyncio.run(
-        build_server(service).call_tool(
-            "rebuild_status", {"generation_id": "generation-public"}
-        )
+        build_server(service).call_tool("rebuild_status", {"generation_id": "generation-public"})
     )
     mcp_result = cast("dict[str, Any]", mcp.structured_content)
     web = asyncio.run(
