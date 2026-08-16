@@ -11,7 +11,7 @@ import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Protocol, cast, override, runtime_checkable
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast, override, runtime_checkable
 from uuid import uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -729,6 +729,36 @@ class OfflineGenerationRebuilder:
             raise cancellation
         return result
 
+    async def _fail_build_conflict(
+        self,
+        checkpoint: RebuildCheckpoint,
+        owner: str,
+        error: RebuildPublicationConflictError,
+    ) -> NoReturn:
+        await self._store.fail_generation(
+            checkpoint.generation_id,
+            error.code,
+            owner=owner,
+            lease_generation=checkpoint.lease_generation,
+            now=self._clock(),
+        )
+        raise RebuildLeaseError from error
+
+    async def _fail_build_validation(
+        self,
+        checkpoint: RebuildCheckpoint,
+        owner: str,
+        error: RebuildPublicationValidationError,
+    ) -> NoReturn:
+        await self._store.fail_generation(
+            checkpoint.generation_id,
+            error.code,
+            owner=owner,
+            lease_generation=checkpoint.lease_generation,
+            now=self._clock(),
+        )
+        raise RebuildValidationError from error
+
     async def dry_run(
         self, snapshot_run_id: str, target: RebuildTarget, *, missing_limit: int = 100
     ) -> RebuildEstimate:
@@ -762,6 +792,8 @@ class OfflineGenerationRebuilder:
             raise RebuildTerminalError from exc
         except RebuildLeaseConflictError as exc:
             raise RebuildLeaseError from exc
+        except RebuildPublicationValidationError as exc:
+            raise RebuildValidationError from exc
         except (SQLAlchemyError, OSError) as exc:
             # Driver messages can contain statement text and bound parameter values. The cause
             # is retained for server diagnostics but can never cross the application boundary.
@@ -804,14 +836,19 @@ class OfflineGenerationRebuilder:
         if checkpoint.state in {RebuildState.FAILED, RebuildState.CANCELED}:
             raise RebuildTerminalError
         if checkpoint.predecessor_vector_publication_id is not None:
-            await self._store.copy_checkpointed_vectors(
-                checkpoint.generation_id,
-                checkpoint.predecessor_vector_publication_id,
-                owner=owner,
-                lease_generation=checkpoint.lease_generation,
-                now=self._clock(),
-                cancel=cancel,
-            )
+            try:
+                await self._store.copy_checkpointed_vectors(
+                    checkpoint.generation_id,
+                    checkpoint.predecessor_vector_publication_id,
+                    owner=owner,
+                    lease_generation=checkpoint.lease_generation,
+                    now=self._clock(),
+                    cancel=cancel,
+                )
+            except RebuildPublicationConflictError as exc:
+                await self._fail_build_conflict(checkpoint, owner, exc)
+            except RebuildPublicationValidationError as exc:
+                await self._fail_build_validation(checkpoint, owner, exc)
 
         while checkpoint.next_sequence < estimate.documents:
             if cancel is not None and cancel.is_set():
@@ -821,13 +858,25 @@ class OfflineGenerationRebuilder:
                     lease_generation=checkpoint.lease_generation,
                     now=self._clock(),
                 )
-            inputs = await self._store.snapshot_inputs(
-                checkpoint.generation_id,
-                after_sequence=checkpoint.next_sequence - 1,
-                limit=target.batch_documents,
-            )
-            if not inputs:
-                raise RuntimeError("promoted snapshot changed or has a non-contiguous manifest")
+            try:
+                inputs = await self._store.snapshot_inputs(
+                    checkpoint.generation_id,
+                    after_sequence=checkpoint.next_sequence - 1,
+                    limit=target.batch_documents,
+                )
+                expected_sequences = list(
+                    range(checkpoint.next_sequence, checkpoint.next_sequence + len(inputs))
+                )
+            except RebuildPublicationConflictError as exc:
+                await self._fail_build_conflict(checkpoint, owner, exc)
+            except RebuildPublicationValidationError as exc:
+                await self._fail_build_validation(checkpoint, owner, exc)
+            if not inputs or [item.sequence for item in inputs] != expected_sequences:
+                await self._fail_build_conflict(
+                    checkpoint,
+                    owner,
+                    RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED),
+                )
             for item in inputs:
                 if item.source.byte_length * 6 + 4096 > target.max_memory_bytes:
                     await self._store.fail_generation(
@@ -941,14 +990,19 @@ class OfflineGenerationRebuilder:
                     checkpoint.lease_generation,
                     now=self._clock(),
                 )
-                checkpoint = await self._store.stage_replacements(
-                    checkpoint.generation_id,
-                    [(item.sequence, prepared.replacement)],
-                    expected_next_sequence=checkpoint.next_sequence,
-                    owner=owner,
-                    lease_generation=checkpoint.lease_generation,
-                    now=self._clock(),
-                )
+                try:
+                    checkpoint = await self._store.stage_replacements(
+                        checkpoint.generation_id,
+                        [(item.sequence, prepared.replacement)],
+                        expected_next_sequence=checkpoint.next_sequence,
+                        owner=owner,
+                        lease_generation=checkpoint.lease_generation,
+                        now=self._clock(),
+                    )
+                except RebuildPublicationConflictError as exc:
+                    await self._fail_build_conflict(checkpoint, owner, exc)
+                except RebuildPublicationValidationError as exc:
+                    await self._fail_build_validation(checkpoint, owner, exc)
                 renewed_at = self._clock()
                 checkpoint = await self._store.renew_generation(
                     checkpoint.generation_id,
@@ -965,12 +1019,17 @@ class OfflineGenerationRebuilder:
                 lease_generation=checkpoint.lease_generation,
                 now=self._clock(),
             )
-        checkpoint = await self._store.begin_validation(
-            checkpoint.generation_id,
-            owner=owner,
-            lease_generation=checkpoint.lease_generation,
-            now=self._clock(),
-        )
+        try:
+            checkpoint = await self._store.begin_validation(
+                checkpoint.generation_id,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+            )
+        except RebuildPublicationConflictError as exc:
+            await self._fail_build_conflict(checkpoint, owner, exc)
+        except RebuildPublicationValidationError as exc:
+            await self._fail_build_validation(checkpoint, owner, exc)
         if cancel is not None and cancel.is_set():
             return await self._store.cancel_generation(
                 checkpoint.generation_id,

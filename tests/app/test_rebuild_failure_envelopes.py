@@ -23,6 +23,7 @@ from manicule.core.rebuild import (
     RebuildDerivationError,
     RebuildLeaseError,
     RebuildPublicationConflictError,
+    RebuildPublicationValidationError,
     RebuildRefusalCode,
     RebuildStorageError,
     RebuildTerminalError,
@@ -88,6 +89,11 @@ async def test_expected_rebuild_failures_have_stable_status_and_recovery_guidanc
             RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED),
             "RebuildLeaseError",
             CONFLICT,
+        ),
+        (
+            RebuildPublicationValidationError(),
+            "RebuildValidationError",
+            UNPROCESSABLE,
         ),
     ],
 )

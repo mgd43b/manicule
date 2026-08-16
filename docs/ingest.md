@@ -1611,6 +1611,11 @@ atomic transaction. A changed snapshot/scope/fence becomes a `RebuildLeaseError`
 bounded durable diagnostic; incomplete replacement or vector evidence becomes
 `RebuildValidationError`. Neither path serializes the storage exception text, and both mark the
 still-owned generation failed before returning so cleanup and retry remain explicit.
+The same boundary applies before publication: takeover replay verifies every copied vector page
+and its exact inventory, every resumed manifest page starts at the durable checkpoint, and retry
+output must match an already-staged digest. Expected corruption or snapshot movement receives the
+same bounded validation/conflict envelopes and failed cleanup state. An unexpected worker crash
+is different: it keeps the checkpoint resumable and does not manufacture a validation diagnosis.
 
 ### 10.5 Source and derived lifecycle boundaries
 

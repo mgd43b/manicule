@@ -22,6 +22,7 @@ from manicule.core.rebuild import (
     RebuildLeaseConflictError,
     RebuildLeaseError,
     RebuildPublicationConflictError,
+    RebuildPublicationValidationError,
     RebuildRefusalCode,
     RebuildRefusedError,
     RebuildState,
@@ -435,6 +436,69 @@ class PublicationConflictStore(FakeStore):
         raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
 
 
+class ResumeVectorValidationStore(FakeStore):
+    @override
+    async def claim_generation(
+        self, generation_id: str, owner: str, *, now: object, expires_at: object
+    ) -> RebuildCheckpoint:
+        checkpoint = await super().claim_generation(
+            generation_id, owner, now=now, expires_at=expires_at
+        )
+        return checkpoint.model_copy(
+            update={"predecessor_vector_publication_id": "private-predecessor"}
+        )
+
+    @override
+    async def copy_checkpointed_vectors(
+        self,
+        generation_id: str,
+        source_publication_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+        cancel: asyncio.Event | None = None,
+    ) -> None:
+        del generation_id, source_publication_id, owner, lease_generation, now, cancel
+        raise RebuildPublicationValidationError
+
+
+class ManifestChangedStore(FakeStore):
+    @override
+    async def snapshot_inputs(
+        self, generation_id: str, *, after_sequence: int, limit: int
+    ) -> list[SnapshotRebuildInput]:
+        del generation_id, after_sequence, limit
+        raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+
+
+class NoncontiguousManifestStore(FakeStore):
+    @override
+    async def snapshot_inputs(
+        self, generation_id: str, *, after_sequence: int, limit: int
+    ) -> list[SnapshotRebuildInput]:
+        items = list(
+            await super().snapshot_inputs(generation_id, after_sequence=after_sequence, limit=limit)
+        )
+        return [items[0].model_copy(update={"sequence": items[0].sequence + 1})]
+
+
+class CorruptCheckpointStore(FakeStore):
+    @override
+    async def stage_replacements(
+        self,
+        generation_id: str,
+        replacements: Sequence[tuple[int, DerivedReplacement]],
+        *,
+        expected_next_sequence: int,
+        owner: str,
+        lease_generation: int,
+        now: object,
+    ) -> RebuildCheckpoint:
+        del generation_id, replacements, expected_next_sequence, owner, lease_generation, now
+        raise RebuildPublicationValidationError
+
+
 class PublicationLeaseLossStore(FakeStore):
     @override
     async def publish_generation(
@@ -547,6 +611,57 @@ async def test_publication_snapshot_conflict_is_bounded_and_marks_generation_fai
         ).run("promoted-run", target())
 
     assert store.failed_code is RebuildRefusalCode.SNAPSHOT_CHANGED
+    assert store.published is False
+
+
+@pytest.mark.asyncio
+async def test_corrupt_resume_vectors_are_bounded_and_mark_generation_failed() -> None:
+    item, body = source(0, "body")
+    store = ResumeVectorValidationStore([item])
+
+    with pytest.raises(RebuildValidationError, match="offline rebuild validation failed"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert store.published is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_type", [ManifestChangedStore, NoncontiguousManifestStore])
+async def test_changed_resume_manifest_is_bounded_and_marks_generation_failed(
+    store_type: type[FakeStore],
+) -> None:
+    item, body = source(0, "body")
+    store = store_type([item])
+
+    with pytest.raises(RebuildLeaseError, match="offline rebuild lease was lost"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.SNAPSHOT_CHANGED
+    assert store.published is False
+
+
+@pytest.mark.asyncio
+async def test_corrupt_checkpoint_is_bounded_and_marks_generation_failed() -> None:
+    item, body = source(0, "body")
+    store = CorruptCheckpointStore([item])
+
+    with pytest.raises(RebuildValidationError, match="offline rebuild validation failed"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.INVALID_REPLACEMENT
     assert store.published is False
 
 
@@ -684,6 +799,7 @@ async def test_checkpoint_crash_retries_without_duplicate_generation_or_rows() -
     )
     with pytest.raises(RuntimeError, match="checkpoint crash"):
         await runner.run("promoted-run", target())
+    assert store.failed_code is None
     result = await runner.run("promoted-run", target())
     assert result.state is RebuildState.PUBLISHED
     assert sorted(store.staged) == [0, 1, 2]

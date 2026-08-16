@@ -207,7 +207,7 @@ class RebuildTerminalGenerationError(RebuildLeaseConflictError):
 
 
 class RebuildPublicationConflictError(RebuildLeaseConflictError):
-    """Publication evidence changed after validation but before the atomic swap."""
+    """Generation evidence changed during build, resume, validation or publication."""
 
     def __init__(self, code: RebuildRefusalCode) -> None:
         super().__init__(code.value)
@@ -215,7 +215,7 @@ class RebuildPublicationConflictError(RebuildLeaseConflictError):
 
 
 class RebuildPublicationValidationError(RuntimeError):
-    """The staged replacement failed a bounded publication-time invariant."""
+    """The staged replacement failed a bounded build or publication invariant."""
 
     def __init__(self, code: RebuildRefusalCode = RebuildRefusalCode.INVALID_REPLACEMENT) -> None:
         super().__init__(code.value)

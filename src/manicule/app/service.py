@@ -59,9 +59,11 @@ from manicule.core.rebuild import (
     RebuildLeaseConflictError,
     RebuildLeaseError,
     RebuildOperationError,
+    RebuildPublicationValidationError,
     RebuildStorageError,
     RebuildTerminalError,
     RebuildTerminalGenerationError,
+    RebuildValidationError,
 )
 from manicule.core.retrieval import Filter, Query, RetrievalProfile
 from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
@@ -1264,6 +1266,8 @@ class ApplicationService:
             raise RebuildTerminalError from exc
         except RebuildLeaseConflictError as exc:
             raise RebuildLeaseError from exc
+        except RebuildPublicationValidationError as exc:
+            raise RebuildValidationError from exc
         except (SQLAlchemyError, OSError) as exc:
             raise RebuildStorageError from exc
         return _rebuild_plan_report(estimate)
@@ -1279,6 +1283,8 @@ class ApplicationService:
             raise RebuildTerminalError from exc
         except RebuildLeaseConflictError as exc:
             raise RebuildLeaseError from exc
+        except RebuildPublicationValidationError as exc:
+            raise RebuildValidationError from exc
         except (SQLAlchemyError, OSError) as exc:
             raise RebuildStorageError from exc
         return _rebuild_run_report(checkpoint)
@@ -1294,6 +1300,8 @@ class ApplicationService:
             raise RebuildTerminalError from exc
         except RebuildLeaseConflictError as exc:
             raise RebuildLeaseError from exc
+        except RebuildPublicationValidationError as exc:
+            raise RebuildValidationError from exc
         except (SQLAlchemyError, OSError) as exc:
             raise RebuildStorageError from exc
         if checkpoint is None:

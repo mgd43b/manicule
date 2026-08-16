@@ -12,6 +12,7 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.acquisition import AcquiredSource, AcquisitionSource, SnapshotCompleteness
+from manicule.core.errors import ManiculeError
 from manicule.core.ids import document_id, glossary_entry_id
 from manicule.core.rebuild import (
     DerivedReplacement,
@@ -549,7 +550,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RebuildLeaseConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED.value)
             await self._require_live_vector_binding(session, generation)
 
-    async def copy_checkpointed_vectors(
+    async def copy_checkpointed_vectors(  # noqa: PLR0912 - explicit replay validation stages
         self,
         generation_id: str,
         source_publication_id: str,
@@ -592,7 +593,10 @@ class SqliteRebuildStore(WorkspaceScoped):
             if not rows:
                 break
             for row in rows:
-                replacement = _REPLACEMENT.validate_python(row.payload)
+                try:
+                    replacement = _REPLACEMENT.validate_python(row.payload)
+                except (RuntimeError, ValueError) as exc:
+                    raise RebuildPublicationValidationError from exc
                 chunks = replacement.flattened_chunks()
                 expected_vectors += len(chunks)
                 for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
@@ -603,17 +607,21 @@ class SqliteRebuildStore(WorkspaceScoped):
                         lease_generation,
                         now=checked_at,
                     )
-                    await self._required_vectors().copy_publication(
-                        source_publication_id,
-                        target_publication,
-                        page,
-                    )
-                    if not await self._required_vectors().publication_page_is_complete(
-                        target_publication,
-                        page,
-                        embedding_fingerprint=target.embedding_fingerprint,
-                    ):
-                        raise RuntimeError("replayed vector page failed exact validation")
+                    try:
+                        await self._required_vectors().copy_publication(
+                            source_publication_id,
+                            target_publication,
+                            page,
+                        )
+                        page_complete = await self._required_vectors().publication_page_is_complete(
+                            target_publication,
+                            page,
+                            embedding_fingerprint=target.embedding_fingerprint,
+                        )
+                    except ManiculeError as exc:
+                        raise RebuildPublicationValidationError from exc
+                    if not page_complete:
+                        raise RebuildPublicationValidationError
                     if cancel is not None and cancel.is_set():
                         raise asyncio.CancelledError
                     await self.assert_generation_lease(
@@ -627,7 +635,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             await self._required_vectors().publication_row_count(target_publication)
             != expected_vectors
         ):
-            raise RuntimeError("replayed vector publication is not exact")
+            raise RebuildPublicationValidationError
         async with self._sessions.begin() as session:
             generation = await self._required_generation(session, generation_id)
             self._require_lease(generation, owner, lease_generation, utcnow())
@@ -645,7 +653,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation = await self._required_generation(session, generation_id)
             run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
             if run is None or run.workspace_id != self._workspace_id or run.promoted_at is None:
-                raise RuntimeError("the rebuild snapshot is no longer promoted")
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
             snapshot_run_id = generation.snapshot_run_id
         records = await self._acquisition.list_acquisition_records(
             snapshot_run_id,
@@ -655,7 +663,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         result: list[SnapshotRebuildInput] = []
         for record in records:
             if record.blob_ref is None or record.acquired_source is None:
-                raise RuntimeError("a promoted snapshot member has no retained input")
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
             result.append(
                 SnapshotRebuildInput(
                     sequence=record.sequence,
@@ -698,18 +706,18 @@ class SqliteRebuildStore(WorkspaceScoped):
         now: datetime,
     ) -> RebuildCheckpoint:
         if not replacements:
-            raise ValueError("a checkpoint batch must not be empty")
+            raise RebuildPublicationValidationError
         if [sequence for sequence, _ in replacements] != list(
             range(expected_next_sequence, expected_next_sequence + len(replacements))
         ):
-            raise ValueError("checkpoint sequences must be contiguous")
+            raise RebuildPublicationValidationError
         async with self._sessions.begin() as session:
             generation = await self._required_generation(session, generation_id)
             self._require_lease(generation, owner, lease_generation, now)
             if generation.state is not RebuildState.BUILDING:
-                raise RuntimeError("generation is not accepting replacement rows")
+                raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
             if generation.next_sequence != expected_next_sequence:
-                raise RuntimeError("generation checkpoint moved")
+                raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
             current_vector_publication = vector_publication_id(
                 generation_id, owner, lease_generation
             )
@@ -719,9 +727,12 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RebuildLeaseConflictError("checkpoint vectors were not replayed")
             target = RebuildTarget.model_validate(generation.target)
             for sequence, replacement in replacements:
-                replacement.validate_identity()
+                try:
+                    replacement.validate_identity()
+                except ValueError as exc:
+                    raise RebuildPublicationValidationError from exc
                 if replacement.document.publication_id != generation_id:
-                    raise ValueError("replacement document does not name its generation")
+                    raise RebuildPublicationValidationError
                 payload = _payload(replacement)
                 encoded = _canonical(payload)
                 temporary_bytes = self._temporary_cost(replacement, target, len(encoded))
@@ -731,7 +742,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 )
                 if existing is not None:
                     if existing.payload_digest != digest:
-                        raise RuntimeError("retry produced different derived output")
+                        raise RebuildPublicationValidationError
                     continue
                 session.add(
                     models.DerivedGenerationItem(
@@ -782,7 +793,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             if generation.state is RebuildState.PUBLISHED:
                 return _checkpoint(generation)
             if generation.state not in {RebuildState.BUILDING, RebuildState.VALIDATING}:
-                raise RuntimeError("generation cannot be validated from its current state")
+                raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
             generation.state = RebuildState.VALIDATING
             generation.updated_at = now
             return _checkpoint(generation)
@@ -791,7 +802,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         async with self._sessions() as session:
             generation = await self._required_generation(session, generation_id)
             if generation.state not in {RebuildState.VALIDATING, RebuildState.PUBLISHED}:
-                raise RuntimeError("generation is not ready for validation")
+                raise RebuildPublicationValidationError
             await self._verify_complete_header(session, generation)
             target = RebuildTarget.model_validate(generation.target)
             physical_publication = vector_publication_id(
@@ -811,13 +822,13 @@ class SqliteRebuildStore(WorkspaceScoped):
                             page,
                             embedding_fingerprint=target.embedding_fingerprint,
                         ):
-                            raise RuntimeError("replacement vector publication is incomplete")
+                            raise RebuildPublicationValidationError
                 after = pairs[-1][0].sequence
             if (
                 await self._required_vectors().publication_row_count(physical_publication)
                 != expected_vectors
             ):
-                raise RuntimeError("replacement vector publication is incomplete")
+                raise RebuildPublicationValidationError
 
     async def publish_generation(  # noqa: PLR0912, PLR0915 - one atomic boundary
         self,
