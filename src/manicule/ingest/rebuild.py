@@ -1054,6 +1054,15 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
             raise RebuildStorageError from exc
+        except RebuildPublicationValidationError as exc:
+            await self._store.fail_generation(
+                checkpoint.generation_id,
+                exc.code,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+            )
+            raise RebuildValidationError from exc
         except (RuntimeError, ValueError) as exc:
             await self._store.fail_generation(
                 checkpoint.generation_id,
@@ -1099,7 +1108,16 @@ class OfflineGenerationRebuilder:
             # The publication transaction can discover that this worker no longer owns the
             # lease. The new owner alone may mutate the durable generation from here.
             raise
-        except (RebuildPublicationValidationError, RuntimeError, ValueError) as exc:
+        except RebuildPublicationValidationError as exc:
+            await self._store.fail_generation(
+                checkpoint.generation_id,
+                exc.code,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+            )
+            raise RebuildValidationError from exc
+        except (RuntimeError, ValueError) as exc:
             # The store's publication protocol reports bounded invariant failures as its typed
             # validation error. RuntimeError remains a compatibility boundary for third-party
             # stores implementing the protocol: its arbitrary text stays chained locally and

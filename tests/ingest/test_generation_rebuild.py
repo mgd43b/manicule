@@ -463,6 +463,22 @@ class ResumeVectorValidationStore(FakeStore):
         raise RebuildPublicationValidationError
 
 
+class ResumeMemoryBoundStore(ResumeVectorValidationStore):
+    @override
+    async def copy_checkpointed_vectors(
+        self,
+        generation_id: str,
+        source_publication_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+        cancel: asyncio.Event | None = None,
+    ) -> None:
+        del generation_id, source_publication_id, owner, lease_generation, now, cancel
+        raise RebuildPublicationValidationError(RebuildRefusalCode.MEMORY_BOUND)
+
+
 class ManifestChangedStore(FakeStore):
     @override
     async def snapshot_inputs(
@@ -615,9 +631,18 @@ async def test_publication_snapshot_conflict_is_bounded_and_marks_generation_fai
 
 
 @pytest.mark.asyncio
-async def test_corrupt_resume_vectors_are_bounded_and_mark_generation_failed() -> None:
+@pytest.mark.parametrize(
+    ("store_type", "expected_code"),
+    [
+        (ResumeVectorValidationStore, RebuildRefusalCode.INVALID_REPLACEMENT),
+        (ResumeMemoryBoundStore, RebuildRefusalCode.MEMORY_BOUND),
+    ],
+)
+async def test_corrupt_resume_vectors_are_bounded_and_mark_generation_failed(
+    store_type: type[FakeStore], expected_code: RebuildRefusalCode
+) -> None:
     item, body = source(0, "body")
-    store = ResumeVectorValidationStore([item])
+    store = store_type([item])
 
     with pytest.raises(RebuildValidationError, match="offline rebuild validation failed"):
         await OfflineGenerationRebuilder(
@@ -626,7 +651,7 @@ async def test_corrupt_resume_vectors_are_bounded_and_mark_generation_failed() -
             deriver=FakeDeriver(),
         ).run("promoted-run", target())
 
-    assert store.failed_code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert store.failed_code is expected_code
     assert store.published is False
 
 

@@ -131,7 +131,7 @@ def _vector_pages(chunks: Sequence[Chunk], *, max_bytes: int) -> Iterator[tuple[
     for chunk in chunks:
         cost = len(chunk.model_dump_json().encode())
         if cost > budget:
-            raise RuntimeError(RebuildRefusalCode.MEMORY_BOUND.value)
+            raise RebuildPublicationValidationError(RebuildRefusalCode.MEMORY_BOUND)
         if page and held + cost > budget:
             yield tuple(page)
             page = []
