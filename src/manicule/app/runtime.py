@@ -649,6 +649,38 @@ class Runtime:
         """The ingest pipeline, refused before construction if it cannot write to this index."""
         return await self._once("pipeline", self._build_pipeline)
 
+    async def acquisition_pipeline(self) -> IngestPipeline:
+        """The source-only pipeline, assembled without requesting any derived component."""
+        return await self._once("acquisition_pipeline", self._build_acquisition_pipeline)
+
+    async def _build_acquisition_pipeline(self) -> IngestPipeline:
+        from manicule.ingest.pipeline import IngestPipeline  # noqa: PLC0415
+        from manicule.ingest.ports import AcquisitionStore as AcquisitionSurface  # noqa: PLC0415
+        from manicule.ingest.ports import FencedIngestStore  # noqa: PLC0415
+
+        settings = self._settings
+        if not settings.storage.retain_source_bytes:
+            raise AssemblyError("acquire-only requires retained source bytes")
+        store = await self.documents()
+        if not isinstance(store, AcquisitionSurface) or not isinstance(store, FencedIngestStore):
+            msg = (
+                f"the configured document store {type(store).__name__} does not provide durable "
+                "source acquisition"
+            )
+            raise AssemblyError(msg)
+        return IngestPipeline(
+            store=store,  # pyright: ignore[reportArgumentType] - checked surfaces above
+            acquisitions=store,
+            workspace=settings.workspace,
+            blobs=await self.blobs(),
+            fetch_concurrency=settings.ingest.fetch_concurrency,
+            parse_workers=1,
+            queue_depth_factor=settings.ingest.queue_depth_factor,
+            shutdown_grace_s=settings.ingest.shutdown_grace_s,
+            max_fetch_bytes=settings.ingest.max_fetch_bytes,
+            snapshot_policy=settings.ingest.snapshot_promotion_policy,
+        )
+
     async def _build_pipeline(self) -> IngestPipeline:
         from manicule.ingest.pipeline import IngestPipeline  # noqa: PLC0415
         from manicule.ingest.ports import (  # noqa: PLC0415
@@ -916,7 +948,11 @@ class _Ingestion:
         watching: Watching | None = None,
         acquire_only: bool = False,
     ) -> RunReport:
-        pipeline = await self._runtime.pipeline()
+        pipeline = (
+            await self._runtime.acquisition_pipeline()
+            if acquire_only
+            else await self._runtime.pipeline()
+        )
         return await pipeline.run(
             await self._runtime.connector(connector),
             limit=limit,
@@ -935,20 +971,15 @@ class _Ingestion:
         return await self._runtime.connector(name)
 
     async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None:
-        """Read the active or newest promoted manifest for one exact connector scope."""
-        from manicule.ingest.pipeline import snapshot_scope  # noqa: PLC0415
+        """Read the active or newest promoted manifest from durable local identity."""
         from manicule.ingest.ports import AcquisitionStore  # noqa: PLC0415
 
         store = await self._runtime.documents()
         if not isinstance(store, AcquisitionStore):
             return None
-        built = await self._runtime.connector(connector)
-        _, scope_fingerprint = snapshot_scope(built)
-        run = await store.latest_unsettled_acquisition_run(
-            connector, scope_fingerprint=scope_fingerprint
-        )
+        run = await store.latest_unsettled_acquisition_run(connector)
         if run is None:
-            run = await store.latest_promoted_snapshot(connector, scope_fingerprint)
+            run = await store.latest_promoted_snapshot(connector, None)
         if run is None:
             return None
         return run, False

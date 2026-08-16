@@ -5192,8 +5192,16 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         connector=report.connector,
         discovered=report.discovered,
         ingested=report.indexed,
-        skipped=report.skipped_version + report.skipped_hash,
-        failed=report.by_status.get(DocumentStatus.FAILED.value, 0),
+        skipped=(
+            report.durable_reused
+            if report.durable_reused is not None
+            else report.skipped_version + report.skipped_hash
+        ),
+        failed=(
+            report.durable_failed
+            if report.durable_failed is not None
+            else report.by_status.get(DocumentStatus.FAILED.value, 0)
+        ),
         expanded=report.expanded,
         by_status=dict(report.by_status),
         error=report.error,
