@@ -1134,6 +1134,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         for chunk in replacement.chunks:
             session.add(from_chunk(chunk, document.id, vector_publication))
         await session.flush()
+        aliases: list[tuple[str, str]] = []
         for entry in replacement.glossary:
             entry_id = glossary_entry_id(entry.chunk_id, entry.acronym, entry.expansion)
             session.add(
@@ -1149,8 +1150,15 @@ class SqliteRebuildStore(WorkspaceScoped):
                     confidence=entry.confidence,
                 )
             )
-            for alias in dict.fromkeys(entry.aliases):
-                session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
+            aliases.extend((entry_id, alias) for alias in dict.fromkeys(entry.aliases))
+        # SQLAlchemy cannot infer an insert dependency between these independently-created ORM
+        # rows because the models deliberately expose no relationship collection. Flush every
+        # glossary parent before making any alias pending. This is also the evidence-page
+        # boundary: the next page query autoflushes, so merely delaying the aliases until the
+        # end of this method would still leave SQLite free to see a child before its parent.
+        await session.flush()
+        for entry_id, alias in aliases:
+            session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
         return document.id
 
     async def _verify_complete_header(

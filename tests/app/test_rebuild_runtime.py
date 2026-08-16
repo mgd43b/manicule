@@ -11,6 +11,7 @@ from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.core.rebuild import RebuildState
 from manicule.core.source_lifecycle import LifecycleRefusalError
+from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.reembed import ReembedState
 from manicule.plugins.registry import discover
 from manicule.storage.docstore import SqliteDocStore
@@ -21,7 +22,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _runtime(data_dir: Path, embedder: CountingEmbedder) -> Runtime:
+def _runtime(
+    data_dir: Path, embedder: CountingEmbedder, *, detect_glossary: bool = True
+) -> Runtime:
     found = discover()
     found.registry.bind("offline-rebuild-runtime-test").add(
         keys.EMBEDDER.named("local"), lambda _: embedder
@@ -31,6 +34,7 @@ def _runtime(data_dir: Path, embedder: CountingEmbedder) -> Runtime:
             data_dir=data_dir,
             embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
             ingest={"parse_workers": 1},  # pyright: ignore[reportArgumentType]
+            rag={"glossary": {"detect_on_ingest": detect_glossary}},  # pyright: ignore[reportArgumentType]
         ),
         discovery=found,
     )
@@ -44,7 +48,8 @@ async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capabili
     embedder.fingerprint = embedder.fingerprint.model_copy(update={"max_sequence_length": 1024})
     connector = fakes.DictConnector(
         {
-            "one": " ".join(["alpha"] * 100),
+            "one": "The Network Operations Workspace (NOW, NETOPS) coordinates tickets. "
+            + " ".join(["alpha"] * 100),
             "two": " ".join(["beta"] * 100),
             "three": " ".join(["gamma"] * 100),
         },
@@ -74,6 +79,10 @@ async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capabili
         assert checkpoint.chunks_built == 3
         assert tuple(connector.fetches) == source_calls
         assert await documents.count_documents() == 3
+        first = next(
+            document for document in await documents.list_documents() if document.source_id == "one"
+        )
+        assert (await documents.glossary_entries(first.id))[0].aliases == ("NETOPS",)
 
     second = CountingEmbedder()
     second.fingerprint = second.fingerprint.model_copy(
@@ -109,3 +118,34 @@ async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capabili
         assert rebuilt_again.state is RebuildState.PUBLISHED
         assert rebuilt_again.documents_built == 3
         assert tuple(connector.fetches) == source_calls
+
+
+async def test_runtime_rebuild_honors_disabled_glossary_identity_without_source_calls(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "disabled-data"
+    embedder = CountingEmbedder()
+    embedder.fingerprint = embedder.fingerprint.model_copy(update={"max_sequence_length": 1024})
+    connector = fakes.DictConnector(
+        {"glossary": "The Network Operations Workspace (NOW, NETOPS) coordinates tickets."},
+        name="disabled-runtime-snapshot",
+    )
+    connector.media_types["glossary"] = "text/plain"
+
+    async with _runtime(data_dir, embedder, detect_glossary=False) as runtime:
+        acquired = await (await runtime.pipeline()).run(connector, acquire_only=True)
+        source_calls = tuple(connector.fetches)
+        documents = cast("SqliteDocStore", await runtime.documents())
+        snapshot = await documents.latest_unsettled_acquisition_run(connector.name)
+        assert acquired.derivation_deferred
+        assert snapshot is not None
+
+        ingestion = await runtime.ingestion()
+        disabled = glossary_fingerprint(enabled=False, middleware=()).canonical()
+        published = await ingestion.rebuild_run(snapshot.id, owner="disabled-runtime-owner")
+
+        assert published.state is RebuildState.PUBLISHED
+        assert tuple(connector.fetches) == source_calls
+        document = (await documents.list_documents())[0]
+        assert await documents.glossary_entries(document.id) == []
+        assert await documents.glossary_lineage(document.id) == disabled
