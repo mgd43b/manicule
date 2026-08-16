@@ -764,6 +764,11 @@ async def test_derivation_failure_is_bounded_and_marks_generation_failed() -> No
             "offline rebuild lease was lost",
         ),
         (
+            RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED),
+            RebuildLeaseError,
+            "offline rebuild lease was lost",
+        ),
+        (
             RebuildTerminalGenerationError("terminal secret"),
             RebuildTerminalError,
             "offline rebuild generation is terminal",

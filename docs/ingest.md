@@ -863,6 +863,23 @@ it considers a new enumeration; the acquisition test records the source call cou
 of the resume and requires it not to move. This is a mode of the existing configured connector,
 not a second crawler or an export path.
 
+An offline generation publication is the other consumer of that hand-off. Its relational pointer
+swap and the settlement of the exact acquisition manifest share one SQLite transaction. The
+publication transaction rechecks workspace, connector instance, promoted snapshot identity,
+canonical membership hash, generation lease/fence, staged replacement inventory and live vector
+binding before it changes either side. It then moves the represented retained records to terminal
+derivation state, refreshes the run counters and marks the run `SETTLED` in the same commit that
+makes the generation `PUBLISHED`. A published replay repeats those checks and idempotently repairs
+an older published-but-`INDEXING` hand-off before reporting success.
+
+Settlement is not source deletion. Acquisition backlog counters become zero, while the manifest's
+blob references remain unchanged and continue to pin the promoted source bytes. Snapshot
+verification, connector-free rebuild planning and later rebuilds under another derived identity
+therefore remain available. Releasing source history or deleting a snapshot is still a separate,
+guarded lifecycle operation. Aggregate status consequently changes from `rebuilding`/`running`
+with pending work to `complete`/`complete` with zero pending and backlog items; it exposes snapshot
+and generation identities but never member ids, titles, URLs, bodies, blob hashes or credentials.
+
 First indexing, offline-snapshot indexing and re-parse all enter the same derivation function
 with a retained reference. That function parses the bytes it was given and records that existing
 reference; it does not retain the top-level body again. Container members are different documents

@@ -21,6 +21,7 @@ from manicule.cli import main as cli
 from manicule.config.settings import Settings
 from manicule.connectors.sessions import SessionVault
 from manicule.container import keys
+from manicule.core.acquisition import AcquisitionRecordState, AcquisitionRunState
 from manicule.core.errors import ManiculeError
 from manicule.core.rebuild import RebuildState
 from manicule.core.source_lifecycle import LifecycleRefusalError
@@ -40,7 +41,11 @@ if TYPE_CHECKING:
 
 
 def _runtime(
-    data_dir: Path, embedder: CountingEmbedder, *, detect_glossary: bool = True
+    data_dir: Path,
+    embedder: CountingEmbedder,
+    *,
+    detect_glossary: bool = True,
+    connector_name: str | None = None,
 ) -> Runtime:
     found = discover()
     found.registry.bind("offline-rebuild-runtime-test").add(
@@ -51,6 +56,16 @@ def _runtime(
     return Runtime(
         Settings(
             data_dir=data_dir,
+            connectors=(
+                {}
+                if connector_name is None
+                else {
+                    connector_name: {
+                        "type": "filesystem",
+                        "options": {"root": str(data_dir / "disabled-source")},
+                    }
+                }
+            ),  # pyright: ignore[reportArgumentType]
             embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
             ingest={"parse_workers": 1},  # pyright: ignore[reportArgumentType]
             rag={"glossary": {"detect_on_ingest": detect_glossary}},  # pyright: ignore[reportArgumentType]
@@ -386,7 +401,7 @@ async def test_snapshot_status_after_restart_uses_no_connector_factory(tmp_path:
         assert verified.verified
 
 
-async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capability(
+async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capability(  # noqa: PLR0915
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
@@ -402,7 +417,7 @@ async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capabili
         name="runtime-snapshot",
     )
     connector.media_types.update({"one": "text/plain", "two": "text/plain", "three": "text/plain"})
-    async with _runtime(data_dir, embedder) as runtime:
+    async with _runtime(data_dir, embedder, connector_name=connector.name) as runtime:
         acquired = await (await runtime.pipeline()).run(connector, acquire_only=True)
         source_calls = tuple(connector.fetches)
         documents = cast("SqliteDocStore", await runtime.documents())
@@ -418,12 +433,42 @@ async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capabili
             "read-only planning must not create a durable generation"
         )
 
+        async def forbidden_connector(_name: str) -> NoReturn:
+            raise AssertionError("offline publication must not construct a connector")
+
+        runtime.connector = forbidden_connector  # type: ignore[method-assign]
+
         checkpoint = await (await runtime.ingestion()).rebuild_run(snapshot.id, "runtime-owner")
+        status = await ApplicationService(runtime).snapshot_status(connector.name)
+        settled = await documents.get_acquisition_run(snapshot.id)
+        records = await documents.list_acquisition_records(snapshot.id)
+        metadata = await documents.connector_metadata(connector.name)
 
         assert checkpoint.state is RebuildState.PUBLISHED
         assert checkpoint.documents_built == 3
         assert checkpoint.chunks_built == 3
         assert tuple(connector.fetches) == source_calls
+        assert settled is not None
+        assert settled.state is AcquisitionRunState.SETTLED
+        assert {record.state for record in records} == {AcquisitionRecordState.SETTLED}
+        assert status.state == "settled"
+        assert status.lifecycle.phase == "complete"
+        assert status.lifecycle.outcome == "complete"
+        assert status.lifecycle.pending_items == 0
+        assert status.lifecycle.backlog_items == 0
+        assert status.lifecycle.can_continue_offline
+        assert await documents.verify_snapshot_manifest(snapshot.id)
+        last_run = cast("Mapping[str, Any]", metadata["last_run"])
+        metadata_lifecycle = cast("Mapping[str, Any]", last_run["lifecycle"])
+        assert last_run["outcome"] == "complete"
+        assert last_run["retry_required"] is False
+        assert metadata_lifecycle["phase"] == "complete"
+        assert metadata_lifecycle["outcome"] == "complete"
+        assert metadata_lifecycle["pending_items"] == 0
+        assert metadata_lifecycle["backlog_items"] == 0
+        public_metadata = json.dumps(metadata, sort_keys=True)
+        assert "Network Operations Workspace" not in public_metadata
+        assert "https://wiki.example.test/content/" not in public_metadata
         assert await documents.count_documents() == 3
         first = next(
             document for document in await documents.list_documents() if document.source_id == "one"
@@ -457,13 +502,33 @@ async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capabili
         rebuilt_again = await (await resumed.ingestion()).rebuild_run(
             snapshot_id, "post-reset-owner"
         )
-        with pytest.raises(LifecycleRefusalError, match="resumable work"):
+        with pytest.raises(LifecycleRefusalError, match="anchors a derived generation"):
             await (await resumed.maintenance()).plan_snapshot_deletion(snapshot_id)
 
         assert reset.snapshot_items == 3
         assert rebuilt_again.state is RebuildState.PUBLISHED
         assert rebuilt_again.documents_built == 3
         assert tuple(connector.fetches) == source_calls
+
+    sync_embedder = CountingEmbedder()
+    sync_embedder.fingerprint = sync_embedder.fingerprint.model_copy(
+        update={"model_id": "second/model", "max_sequence_length": 1024}
+    )
+    async with _runtime(data_dir, sync_embedder) as sync_runtime:
+        unchanged = await (await sync_runtime.pipeline()).run(connector)
+
+        assert tuple(connector.fetches) == source_calls
+        assert sync_embedder.texts == 0
+        assert unchanged.indexed == 0
+        assert unchanged.lifecycle_metadata()["reused_items"] == 3
+
+        connector.documents["three"] = " ".join(["changed"] * 100)
+        changed = await (await sync_runtime.pipeline()).run(connector)
+
+        assert tuple(connector.fetches) == (*source_calls, "three")
+        assert sync_embedder.texts == 1
+        assert changed.indexed == 1
+        assert changed.lifecycle_metadata()["reused_items"] == 2
 
 
 async def test_runtime_rebuild_honors_disabled_glossary_identity_without_source_calls(

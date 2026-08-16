@@ -420,6 +420,219 @@ async def snapshot_manifest_matches(session: AsyncSession, run_id: str, expected
     return await _manifest_matches(session, run_id, expected)
 
 
+async def settle_published_snapshot(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    run_id: str,
+    expected_membership_hash: str,
+    expected_item_count: int,
+    derived_generation_identity: str,
+    now: datetime,
+) -> None:
+    """Retire exactly the acquisition work proven by a published generation.
+
+    The caller owns the transaction that makes the derived generation live. Keeping this
+    operation on that same session makes publication and acquisition settlement one commit.
+    Snapshot evidence and blob references are immutable inputs here: settlement changes only
+    derivation work state and its aggregate counters, so retained source ownership remains
+    available for later connector-free rebuilds.
+
+    This is deliberately idempotent. A published replay may use it to repair a legacy
+    publication whose acquisition run was left in ``INDEXING`` after the response was lost or
+    the process restarted.
+    """
+    if expected_item_count < 0:
+        raise ValueError("expected_item_count must not be negative")
+    if not expected_membership_hash or not derived_generation_identity:
+        raise ValueError("published settlement identities must not be empty")
+    run = (
+        await session.execute(
+            select(models.AcquisitionRun).where(
+                models.AcquisitionRun.id == run_id,
+                models.AcquisitionRun.workspace_id == workspace_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if (
+        run is None
+        or run.promoted_at is None
+        or run.acquisition_completed_at is None
+        or run.membership_hash != expected_membership_hash
+        or run.discovered_count != expected_item_count
+        or run.state
+        not in {
+            AcquisitionRunState.ACQUIRING,
+            AcquisitionRunState.INDEXING,
+            AcquisitionRunState.SETTLED,
+        }
+        or not await snapshot_manifest_matches(session, run_id, expected_membership_hash)
+    ):
+        raise AcquisitionConflictError("published generation no longer proves its source snapshot")
+
+    record_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(models.AcquisitionRecord)
+            .where(
+                models.AcquisitionRecord.run_id == run_id,
+                models.AcquisitionRecord.workspace_id == workspace_id,
+                models.AcquisitionRecord.connector_id == run.connector_id,
+            )
+        )
+    ).scalar_one()
+    if record_count != expected_item_count:
+        raise AcquisitionConflictError("published generation inventory does not match its snapshot")
+
+    # RETRY is eligible only when the publication boundary has already validated retained
+    # evidence and a replacement for every manifest member. Missing-byte retries can never
+    # reach this function through a valid generation.
+    await session.execute(
+        update(models.AcquisitionRecord)
+        .where(
+            models.AcquisitionRecord.run_id == run_id,
+            models.AcquisitionRecord.workspace_id == workspace_id,
+            models.AcquisitionRecord.connector_id == run.connector_id,
+            models.AcquisitionRecord.state.in_(
+                (
+                    AcquisitionRecordState.ACQUIRED,
+                    AcquisitionRecordState.INDEXING,
+                    AcquisitionRecordState.RETRY,
+                )
+            ),
+        )
+        .values(state=AcquisitionRecordState.SETTLED, diagnostic=None, updated_at=now)
+    )
+    active = (
+        await session.execute(
+            select(func.count())
+            .select_from(models.AcquisitionRecord)
+            .where(
+                models.AcquisitionRecord.run_id == run_id,
+                models.AcquisitionRecord.workspace_id == workspace_id,
+                models.AcquisitionRecord.state.in_(
+                    (
+                        AcquisitionRecordState.DISCOVERED,
+                        AcquisitionRecordState.ACQUIRING,
+                        AcquisitionRecordState.ACQUIRED,
+                        AcquisitionRecordState.INDEXING,
+                        AcquisitionRecordState.RETRY,
+                    )
+                ),
+            )
+        )
+    ).scalar_one()
+    if active:
+        raise AcquisitionConflictError(
+            "published generation did not settle every represented acquisition record"
+        )
+
+    count_rows = (
+        await session.execute(
+            select(models.AcquisitionRecord.state, func.count())
+            .where(models.AcquisitionRecord.run_id == run_id)
+            .group_by(models.AcquisitionRecord.state)
+        )
+    ).all()
+    counts: dict[AcquisitionRecordState, int] = {}
+    for state, count in count_rows:
+        counts[state] = count
+    run.acquired_count = sum(
+        counts.get(state, 0)
+        for state in (
+            AcquisitionRecordState.ACQUIRED,
+            AcquisitionRecordState.INDEXING,
+            AcquisitionRecordState.SETTLED,
+        )
+    )
+    run.indexed_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(models.AcquisitionRecord)
+            .where(
+                models.AcquisitionRecord.run_id == run_id,
+                models.AcquisitionRecord.state == AcquisitionRecordState.SETTLED,
+                models.AcquisitionRecord.blob_ref.is_not(None),
+            )
+        )
+    ).scalar_one()
+    run.unchanged_count = counts.get(AcquisitionRecordState.UNCHANGED, 0)
+    run.retry_count = counts.get(AcquisitionRecordState.RETRY, 0)
+    run.acquired_blob_bytes = 0
+    run.state = AcquisitionRunState.SETTLED
+    run.diagnostic = None
+    run.updated_at = now
+    latest_promoted = (
+        await session.execute(
+            select(models.AcquisitionRun.id)
+            .where(
+                models.AcquisitionRun.workspace_id == workspace_id,
+                models.AcquisitionRun.connector_id == run.connector_id,
+                models.AcquisitionRun.scope_fingerprint == run.scope_fingerprint,
+                models.AcquisitionRun.promoted_at.is_not(None),
+            )
+            .order_by(models.AcquisitionRun.promoted_at.desc(), models.AcquisitionRun.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if latest_promoted != run.id:
+        return
+    connector = await session.get(models.Connector, run.connector_id)
+    if (
+        connector is None
+        or connector.workspace_id != workspace_id
+        or connector.name != run.connector_name
+    ):
+        raise AcquisitionConflictError("published generation connector identity changed")
+    raw_metadata = connector.run_metadata
+    metadata = dict(cast("dict[str, Any]", raw_metadata)) if isinstance(raw_metadata, dict) else {}
+    raw_last_run = metadata.get("last_run")
+    last_run = dict(cast("dict[str, Any]", raw_last_run)) if isinstance(raw_last_run, dict) else {}
+    raw_lifecycle = last_run.get("lifecycle")
+    lifecycle = (
+        dict(cast("dict[str, Any]", raw_lifecycle)) if isinstance(raw_lifecycle, dict) else {}
+    )
+    lifecycle.update(
+        {
+            "phase": "complete",
+            "outcome": "complete",
+            "enumerated_items": run.discovered_count,
+            "acquired_items": run.acquired_count,
+            "reused_items": run.unchanged_count,
+            "omitted_items": run.omission_count,
+            "failed_items": run.retry_count,
+            "pending_items": 0,
+            "snapshot_completeness": str(run.completeness or ""),
+            "reproducibility_policy": str(run.promotion_policy),
+            "snapshot_identity": run.id,
+            "snapshot_promoted": True,
+            "source_generation_identity": expected_membership_hash,
+            "derived_generation_identity": derived_generation_identity,
+            "candidate_watermark_present": run.candidate_watermark is not None,
+            "committed_watermark_present": run.watermark_committed_at is not None,
+            "backlog_items": 0,
+            "backlog_bytes": 0,
+            "oldest_backlog_age_seconds": None,
+            "can_continue_offline": True,
+            "estimated_remaining_items": 0,
+            "estimated_remaining_seconds": 0,
+            "refusal": None,
+        }
+    )
+    last_run.update(
+        {
+            "outcome": "complete",
+            "retry_required": False,
+            "derivation_deferred": False,
+            "snapshot_completeness": str(run.completeness or ""),
+            "snapshot_omissions": run.omission_count,
+            "lifecycle": lifecycle,
+        }
+    )
+    metadata["last_run"] = last_run
+    connector.run_metadata = cast("Any", metadata)
+
+
 class AcquisitionJournalMixin(WorkspaceScoped):
     """Workspace-scoped durable run and record operations."""
 
@@ -2206,5 +2419,6 @@ __all__ = [
     "AcquisitionJournalMixin",
     "AcquisitionWatermarkConflictError",
     "InvalidAcquisitionTransitionError",
+    "settle_published_snapshot",
     "snapshot_manifest_matches",
 ]
