@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
 from pydantic import JsonValue
@@ -74,7 +74,9 @@ class ReplayBarrierRebuildStore(SqliteRebuildStore):
 class FailingGlossaryPublicationStore(SqliteRebuildStore):
     """Fail after a later evidence page has added its relational replacement."""
 
-    published_items = 0
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.published_items = 0
 
     @override
     async def _publish_item(self, *args: object, **kwargs: object) -> str:
